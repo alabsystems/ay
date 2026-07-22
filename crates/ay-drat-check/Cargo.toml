@@ -1,0 +1,25 @@
+[package]
+name = "ay-drat-check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/ay-drat-check"
+description = "DRAT/DRUP proof-checking library for SAT solver certificates"
+readme.workspace = true
+
+[lib]
+name = "ay_drat_check"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror.workspace = true
+ay-proof-common.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = "1"

@@ -1,0 +1,60 @@
+; Mimics SMT-LIB storecomm_t1_np_sf_ai_00010 benchmark pattern
+; 10 stores in forward vs reverse order with store-forwarding reads
+; Expected: unsat
+(set-logic QF_AX)
+(set-info :status unsat)
+(declare-sort Index 0)
+(declare-sort Elem 0)
+(declare-fun a0 () (Array Index Elem))
+(declare-fun i0 () Index)
+(declare-fun i1 () Index)
+(declare-fun i2 () Index)
+(declare-fun i3 () Index)
+(declare-fun i4 () Index)
+(declare-fun i5 () Index)
+(declare-fun i6 () Index)
+(declare-fun i7 () Index)
+(declare-fun i8 () Index)
+(declare-fun i9 () Index)
+(declare-fun e0 () Elem)
+(declare-fun e1 () Elem)
+(declare-fun e2 () Elem)
+(declare-fun e3 () Elem)
+(declare-fun e4 () Elem)
+(declare-fun e5 () Elem)
+(declare-fun e6 () Elem)
+(declare-fun e7 () Elem)
+(declare-fun e8 () Elem)
+(declare-fun e9 () Elem)
+
+; All indices pairwise distinct
+(assert (distinct i0 i1 i2 i3 i4 i5 i6 i7 i8 i9))
+
+; Forward: store i0..i9
+(define-fun f0 () (Array Index Elem) (store a0 i0 e0))
+(define-fun f1 () (Array Index Elem) (store f0 i1 e1))
+(define-fun f2 () (Array Index Elem) (store f1 i2 e2))
+(define-fun f3 () (Array Index Elem) (store f2 i3 e3))
+(define-fun f4 () (Array Index Elem) (store f3 i4 e4))
+(define-fun f5 () (Array Index Elem) (store f4 i5 e5))
+(define-fun f6 () (Array Index Elem) (store f5 i6 e6))
+(define-fun f7 () (Array Index Elem) (store f6 i7 e7))
+(define-fun f8 () (Array Index Elem) (store f7 i8 e8))
+(define-fun fwd () (Array Index Elem) (store f8 i9 e9))
+
+; Reverse: store i9..i0
+(define-fun r0 () (Array Index Elem) (store a0 i9 e9))
+(define-fun r1 () (Array Index Elem) (store r0 i8 e8))
+(define-fun r2 () (Array Index Elem) (store r1 i7 e7))
+(define-fun r3 () (Array Index Elem) (store r2 i6 e6))
+(define-fun r4 () (Array Index Elem) (store r3 i5 e5))
+(define-fun r5 () (Array Index Elem) (store r4 i4 e4))
+(define-fun r6 () (Array Index Elem) (store r5 i3 e3))
+(define-fun r7 () (Array Index Elem) (store r6 i2 e2))
+(define-fun r8 () (Array Index Elem) (store r7 i1 e1))
+(define-fun rev () (Array Index Elem) (store r8 i0 e0))
+
+; The two arrays should be equal: read from each at i0
+(assert (not (= (select fwd i0) (select rev i0))))
+(check-sat)
+(exit)

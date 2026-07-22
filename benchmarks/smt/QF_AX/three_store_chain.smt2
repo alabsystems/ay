@@ -1,0 +1,18 @@
+; Three-hop equality chain: d = c, c = b, b = store(a, i, v)
+; select(d, i) must equal v
+; Expected: unsat
+(set-logic QF_AX)
+(declare-sort Index 0)
+(declare-sort Element 0)
+(declare-fun a () (Array Index Element))
+(declare-fun b () (Array Index Element))
+(declare-fun c () (Array Index Element))
+(declare-fun d () (Array Index Element))
+(declare-fun i () Index)
+(declare-fun v () Element)
+(assert (= b (store a i v)))
+(assert (= c b))
+(assert (= d c))
+(assert (not (= (select d i) v)))
+(check-sat)
+(exit)

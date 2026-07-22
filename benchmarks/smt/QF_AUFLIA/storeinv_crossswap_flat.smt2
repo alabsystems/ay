@@ -1,0 +1,18 @@
+; Cross-swap at 2 indices, fully flattened (no let)
+; Expected: unsat
+(set-logic QF_AUFLIA)
+(set-info :status unsat)
+(declare-fun a1 () (Array Int Int))
+(declare-fun a2 () (Array Int Int))
+(declare-fun i1 () Int)
+(declare-fun i2 () Int)
+; v0 = store(a2, i1, select(a1, i1))
+; v1 = store(a1, i1, select(a2, i1))
+; lhs = store(v1, i2, select(v0, i2))
+; rhs = store(v0, i2, select(v1, i2))
+; assert lhs = rhs and a1 != a2
+(assert (= (store (store a1 i1 (select a2 i1)) i2 (select (store a2 i1 (select a1 i1)) i2))
+           (store (store a2 i1 (select a1 i1)) i2 (select (store a1 i1 (select a2 i1)) i2))))
+(assert (not (= a1 a2)))
+(check-sat)
+(exit)

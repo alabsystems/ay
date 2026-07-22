@@ -1,0 +1,15 @@
+[package]
+name = "ay-allsat"
+description = "Solution enumeration (ALL-SAT) solver for AY"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+tracing.workspace = true
+ay-sat.workspace = true
+
+[lints]
+workspace = true

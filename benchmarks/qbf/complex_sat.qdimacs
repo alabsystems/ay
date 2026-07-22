@@ -1,0 +1,8 @@
+c exists a forall b exists c. (a OR b OR c) AND (a OR NOT b OR c)
+c SAT: set a=T or c=T
+p cnf 3 2
+e 1 0
+a 2 0
+e 3 0
+1 2 3 0
+1 -2 3 0

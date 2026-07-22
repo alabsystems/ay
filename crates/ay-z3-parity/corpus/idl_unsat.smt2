@@ -1,0 +1,11 @@
+; expected: unsat
+; QF_IDL — an integer difference cycle with no solution.
+(set-logic QF_IDL)
+(set-info :status unsat)
+(declare-const x Int)
+(declare-const y Int)
+(declare-const z Int)
+(assert (<= (- x y) (- 1)))
+(assert (<= (- y z) (- 1)))
+(assert (<= (- z x) (- 1)))
+(check-sat)

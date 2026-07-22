@@ -1,0 +1,16 @@
+; storeinv nf size=2: cross-swap at 2 indices using nested let
+; Expected: unsat
+(set-logic QF_AUFLIA)
+(set-info :status unsat)
+(declare-fun a1 () (Array Int Int))
+(declare-fun a2 () (Array Int Int))
+(declare-fun i1 () Int)
+(declare-fun i2 () Int)
+(declare-fun sk ((Array Int Int) (Array Int Int)) Int)
+(assert (let ((?v_0 (store a2 i1 (select a1 i1)))
+              (?v_1 (store a1 i1 (select a2 i1))))
+          (= (store ?v_1 i2 (select ?v_0 i2))
+             (store ?v_0 i2 (select ?v_1 i2)))))
+(assert (let ((?v_0 (sk a1 a2))) (not (= (select a1 ?v_0) (select a2 ?v_0)))))
+(check-sat)
+(exit)

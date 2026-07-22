@@ -1,0 +1,10 @@
+(set-logic QF_AUFLIA)
+; Array with arithmetic constraints on stored values
+(declare-fun a () (Array Int Int))
+(declare-fun b () (Array Int Int))
+(assert (= b (store a 0 10)))
+(assert (= b (store b 1 20)))
+(assert (> (+ (select b 0) (select b 1)) 31))
+(check-sat)
+; Expected: unsat (10 + 20 = 30, not > 31)
+(exit)

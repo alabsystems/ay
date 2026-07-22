@@ -1,0 +1,9 @@
+# SAT-COMP must-solve list — benchmarks AY must continue to solve at 20s timeout
+# Format: <relative-path> <expected-result>
+# Updated: 2026-03-20 at 8ff147576 (W1 measurement, 3/23)
+#
+# These benchmarks are confirmed solved on committed HEAD. Any regression
+# (timeout or wrong answer) on these benchmarks is a P1 bug.
+benchmarks/sat/satcomp2024-sample/08ccc34df5d8eb9e9d45278af3dc093d-simon-r16-1.sanitized.cnf SAT
+benchmarks/sat/satcomp2024-sample/ef330d1b144055436a2d576601191ea5-crn_11_99_u.cnf UNSAT
+benchmarks/sat/satcomp2024-sample/7083b70c1976162e2693d7a493717ffd-battleship-14-26-sat.cnf SAT

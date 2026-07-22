@@ -1,0 +1,17 @@
+c QIF benchmark 5/7: partial bit-mask leak. l = h AND 0b0011.
+c
+c Vars: 1..4 = h1 (LSB) .. h4 (MSB), secret 4-bit value.
+c        5 = l1, 6 = l2 — observable bottom-2 bits (l = h AND mask).
+c Logic: l1 <-> h1, l2 <-> h2. Bits h3, h4 are unconstrained
+c (perfectly secret); bits h1, h2 are perfectly leaked.
+c Models: 16 (4 secret bits, observables forced).
+c Leakage: 2 bits of 4 = 50% disclosure.
+c
+c Reference: Koepf & Basin, "An Information-Theoretic Model for
+c Adaptive Side-Channel Attacks", CCS 2007 — masking partial-leak
+c canonical example.
+p cnf 6 4
+-5 1 0
+5 -1 0
+-6 2 0
+6 -2 0

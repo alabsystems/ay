@@ -1,0 +1,8 @@
+(set-logic QF_ALIA)
+(declare-const a (Array Int Int))
+(declare-const b (Array Int Int))
+(declare-const c (Array Int Int))
+(assert (= a c))
+(assert (not (= b a)))
+(assert (= (select (store (store (store a 0 5) 1 6) 2 7) 9) 0))
+(check-sat)

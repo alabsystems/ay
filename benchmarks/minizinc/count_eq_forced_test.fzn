@@ -1,0 +1,8 @@
+% Force y=10, x_i in [0..3]: impossible to have count > 0, so obj must be 0
+var 0..3: x1 :: output_var;
+var 0..3: x2 :: output_var;
+var 0..2: obj :: output_var;
+array [1..2] of var int: xs = [x1, x2];
+constraint fzn_count_eq(xs, 10, obj);
+constraint int_le(1, obj);
+solve satisfy;

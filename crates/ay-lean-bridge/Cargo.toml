@@ -1,0 +1,21 @@
+[package]
+name = "ay-lean-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Lean 4 integration for AY SMT solver"
+readme.workspace = true
+
+[dependencies]
+ay.workspace = true
+ay-core.workspace = true
+thiserror.workspace = true
+num-bigint.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

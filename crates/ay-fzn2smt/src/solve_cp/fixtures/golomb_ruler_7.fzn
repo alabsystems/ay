@@ -1,0 +1,65 @@
+% Golomb Ruler with 7 marks: minimize ruler length
+% Marks m[1..7] where m[1]=0, m[i] < m[i+1]
+% All pairwise differences are distinct
+var 0..0: m1 :: output_var;
+var 1..50: m2 :: output_var;
+var 2..50: m3 :: output_var;
+var 3..50: m4 :: output_var;
+var 4..50: m5 :: output_var;
+var 5..50: m6 :: output_var;
+var 6..50: m7 :: output_var;
+% Ordering: m1 < m2 < m3 < m4 < m5 < m6 < m7
+constraint int_lt(m1, m2);
+constraint int_lt(m2, m3);
+constraint int_lt(m3, m4);
+constraint int_lt(m4, m5);
+constraint int_lt(m5, m6);
+constraint int_lt(m6, m7);
+% All C(7,2)=21 pairwise differences must be distinct
+% d_ij = m[j] - m[i] for i<j
+var 1..50: d12 :: output_var;
+var 1..50: d13 :: output_var;
+var 1..50: d14 :: output_var;
+var 1..50: d15 :: output_var;
+var 1..50: d16 :: output_var;
+var 1..50: d17 :: output_var;
+var 1..50: d23 :: output_var;
+var 1..50: d24 :: output_var;
+var 1..50: d25 :: output_var;
+var 1..50: d26 :: output_var;
+var 1..50: d27 :: output_var;
+var 1..50: d34 :: output_var;
+var 1..50: d35 :: output_var;
+var 1..50: d36 :: output_var;
+var 1..50: d37 :: output_var;
+var 1..50: d45 :: output_var;
+var 1..50: d46 :: output_var;
+var 1..50: d47 :: output_var;
+var 1..50: d56 :: output_var;
+var 1..50: d57 :: output_var;
+var 1..50: d67 :: output_var;
+% Define differences
+constraint int_lin_eq([-1, 1, -1], [m1, m2, d12], 0);
+constraint int_lin_eq([-1, 1, -1], [m1, m3, d13], 0);
+constraint int_lin_eq([-1, 1, -1], [m1, m4, d14], 0);
+constraint int_lin_eq([-1, 1, -1], [m1, m5, d15], 0);
+constraint int_lin_eq([-1, 1, -1], [m1, m6, d16], 0);
+constraint int_lin_eq([-1, 1, -1], [m1, m7, d17], 0);
+constraint int_lin_eq([-1, 1, -1], [m2, m3, d23], 0);
+constraint int_lin_eq([-1, 1, -1], [m2, m4, d24], 0);
+constraint int_lin_eq([-1, 1, -1], [m2, m5, d25], 0);
+constraint int_lin_eq([-1, 1, -1], [m2, m6, d26], 0);
+constraint int_lin_eq([-1, 1, -1], [m2, m7, d27], 0);
+constraint int_lin_eq([-1, 1, -1], [m3, m4, d34], 0);
+constraint int_lin_eq([-1, 1, -1], [m3, m5, d35], 0);
+constraint int_lin_eq([-1, 1, -1], [m3, m6, d36], 0);
+constraint int_lin_eq([-1, 1, -1], [m3, m7, d37], 0);
+constraint int_lin_eq([-1, 1, -1], [m4, m5, d45], 0);
+constraint int_lin_eq([-1, 1, -1], [m4, m6, d46], 0);
+constraint int_lin_eq([-1, 1, -1], [m4, m7, d47], 0);
+constraint int_lin_eq([-1, 1, -1], [m5, m6, d56], 0);
+constraint int_lin_eq([-1, 1, -1], [m5, m7, d57], 0);
+constraint int_lin_eq([-1, 1, -1], [m6, m7, d67], 0);
+% All differences distinct
+constraint fzn_all_different_int([d12, d13, d14, d15, d16, d17, d23, d24, d25, d26, d27, d34, d35, d36, d37, d45, d46, d47, d56, d57, d67]);
+solve :: int_search([m2, m3, m4, m5, m6, m7], first_fail, indomain_min, complete) minimize m7;

@@ -1,0 +1,21 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# MPS / CPLEX LP format parser + basic MIP/LP solver driver.
+
+[package]
+name = "ay-lp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MPS/LP format parser and MIP/LP solver driver for AY"
+readme.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

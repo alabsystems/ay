@@ -1,0 +1,24 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "ay-dispatch"
+description = "Shared engine-dispatch primitives: problem classification, engine selection, bandit-based scheduling (Part of #8775)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+rustc-hash.workspace = true
+
+[dev-dependencies]
+# Deterministic RNG for bandit tests via a simple xorshift PRNG
+# (no external crate needed; kept in test code).

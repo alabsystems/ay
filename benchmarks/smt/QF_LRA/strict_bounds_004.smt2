@@ -1,0 +1,6 @@
+; Test unsatisfiable strict bounds (no value between 5 and 5)
+(set-logic QF_LRA)
+(declare-const x Real)
+(assert (> x 5.0))
+(assert (< x 5.0))
+(check-sat)

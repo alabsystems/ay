@@ -1,0 +1,85 @@
+AY — Pseudo-Boolean Competition (PB-COMP) Solver Description
+
+Author: Andrew Yates
+URL: https://github.com/alabsystems/ay
+License: Apache-2.0
+
+1. Identity and tracks
+
+AY is a Rust pseudo-Boolean solver. It enters the linear tracks DEC-LIN (PBS),
+OPT-LIN (PBO), and the WBO tracks SOFT-LIN and PARTIAL-LIN, plus the non-linear
+DEC-NLC / OPT-NLC tracks (non-linear terms are linearized). It is a COMPLETE
+solver: given enough time and memory it decides satisfiability / proves
+optimality; it prefers UNKNOWN over any unchecked answer.
+
+2. Build and run contract
+
+  ./build.sh                       # builds ./ay-pb from the bundled Rust source
+  ./run.sh BENCHNAME               # NOCERT: solve, print result to stdout
+  ./run.sh BENCHNAME PROOFFILE     # CERT: also write a VeriPB proof to PROOFFILE
+
+The CPU limit is read from the TIMELIMIT (or TIMEOUT) environment variable in
+seconds. Output follows the PB-COMP format: `c` comments; `o <int>` on each
+objective improvement (flushed immediately); exactly one `s` line of
+SATISFIABLE / UNSATISFIABLE / OPTIMUM FOUND / UNKNOWN / UNSUPPORTED; and a `v`
+line assigning every variable (`-x` = false) on SAT/OPTIMUM. SIGTERM is trapped
+so the best incumbent and its objective are flushed before SIGKILL.
+
+3. Architecture
+
+AY solves pseudo-Boolean constraints with a native cutting-planes CDCL engine:
+  - Watched-slack propagation over general PB constraints, with a unit-cardinality
+    fast path (RoundingSat-style; Elffers & Nordstrom, SAT 2018).
+  - Conflict analysis by generalized resolution with the proven round-to-one
+    division rule (reduce the reason, then divide), saturation, GCD, and
+    conservative weakening, over a dense var-indexed accumulator.
+  - VSIDS-style branching, LBD + activity learned-constraint database reduction,
+    Luby/LBD restarts, and phase saving.
+
+Optimization uses an order-based core-guided (OLL / RC2) loop with totalizer
+relaxation of unsatisfiable cores, with stratification and hardening, alongside
+linear and binary-search refinement; the engine reports OPTIMUM only after
+re-verifying the witness against every original constraint and confirming
+lower-bound = objective. A sound lower bound is also obtained from an
+exact-rational LP relaxation tightened by clique and cover cutting planes (the
+bound is derived via LP duality in exact arithmetic, so it can only prune, never
+mislead). Weighted Boolean Optimization (WBO) instances are reduced to
+pseudo-Boolean optimization. For the CERT tracks, AY emits VeriPB proofs of
+unsatisfiability / optimality.
+
+Additional reasoning layers (all sound, applied before/around search):
+  - Presolve failed-literal probing with forced fixings (only fixings that are
+    propagation consequences of the original constraints).
+  - Lex-leader symmetry breaking for verified instance automorphisms
+    (interchangeable variables / matrix symmetry), off the proof path.
+  - reduceToCardinality overflow fallback that keeps conflict analysis sound on
+    large-coefficient instances.
+
+Parallel track: AY runs a parallel portfolio (NBCORE / AY_PB_PARALLEL, enabled
+by default in run.sh on all competition cores) that races diverse strategies —
+native PB-CDCL, SAT-encoded, core-guided, and binary-search — on independent
+worker threads and returns the first PROVEN result; each worker independently
+verifies its own answer, so the portfolio only relays a sound verdict. The
+portfolio is applied to DECISION instances; OPTIMIZATION instances take the
+sequential full-budget path so worker core-contention never degrades incumbent
+quality (the primal-search incumbent wins are preserved exactly).
+
+AY contains NO per-instance recognizers, precomputed answers, or content-hash
+lookups: every result is produced by the general solver from the input alone.
+
+4. Soundness
+
+Correctness is prioritized over speed. Learned constraints are produced only by
+sound cutting-planes derivations (validated by semantic-entailment tests);
+optimum claims are witness-checked; a wrong answer is never knowingly emitted.
+
+5. References
+
+  [1] Elffers, Nordstrom. "Divide and Conquer: Towards Faster Pseudo-Boolean
+      Solving." IJCAI 2018.
+  [2] Ignatiev, Morgado, Marques-Silva. "RC2: an Efficient MaxSAT Solver."
+      JSAT 2019.
+  [3] Gocht, McCreesh, Nordstrom. "VeriPB: proof logging for pseudo-Boolean
+      solving."
+  [4] Pseudo-Boolean Competition 2026 (PB'26).
+      https://www.cril.univ-artois.fr/PB26/

@@ -1,0 +1,30 @@
+% Graph Coloring: 3-color the Petersen graph (10 vertices, 15 edges)
+var 1..3: c1 :: output_var;
+var 1..3: c2 :: output_var;
+var 1..3: c3 :: output_var;
+var 1..3: c4 :: output_var;
+var 1..3: c5 :: output_var;
+var 1..3: c6 :: output_var;
+var 1..3: c7 :: output_var;
+var 1..3: c8 :: output_var;
+var 1..3: c9 :: output_var;
+var 1..3: c10 :: output_var;
+% Outer cycle: 1-2-3-4-5-1
+constraint int_ne(c1, c2);
+constraint int_ne(c2, c3);
+constraint int_ne(c3, c4);
+constraint int_ne(c4, c5);
+constraint int_ne(c5, c1);
+% Inner star: 6-8-10-7-9-6
+constraint int_ne(c6, c8);
+constraint int_ne(c8, c10);
+constraint int_ne(c10, c7);
+constraint int_ne(c7, c9);
+constraint int_ne(c9, c6);
+% Spokes: 1-6, 2-7, 3-8, 4-9, 5-10
+constraint int_ne(c1, c6);
+constraint int_ne(c2, c7);
+constraint int_ne(c3, c8);
+constraint int_ne(c4, c9);
+constraint int_ne(c5, c10);
+solve satisfy;

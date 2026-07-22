@@ -1,0 +1,7 @@
+(set-logic QF_S)
+(declare-const x String)
+(declare-const y String)
+(assert (str.prefixof (str.++ x "a") (str.++ "a" y)))
+(assert (= (str.++ x y) (str.++ y x)))
+(assert (not (= y "")))
+(check-sat)

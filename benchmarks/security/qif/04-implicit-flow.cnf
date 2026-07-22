@@ -1,0 +1,16 @@
+c QIF benchmark 4/7: implicit information flow via conditional branch.
+c
+c Vars: 1=p (public guard), 2=s (secret bit), 3=l (observable output).
+c Logic: l = (if p then s else NOT s).
+c Even though l is computed inside a branch on a public condition,
+c the observable still uniquely determines s under both branches
+c (just with opposite polarity). Total leak: 1 bit.
+c Models: 4 total (s freely chosen, l forced from (p, s)).
+c
+c Reference: Heusser & Malacaria, ACSAC 2010, Sec 5.2 — implicit-flow
+c showing that branch-only leakage analyses miss this pattern.
+p cnf 3 4
+-1 -2 3 0
+-1 2 -3 0
+1 -2 -3 0
+1 2 3 0

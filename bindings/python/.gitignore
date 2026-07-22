@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Bundled AY cdylib: staged into ayz3/ at build time, NOT committed (it is a
+# large binary, ~40MB release). The wheel includes it via package-data.
+ayz3/libay_ffi.dylib
+ayz3/libay_ffi.so
+ayz3/ay_ffi.dll
+
+# Build / packaging artifacts.
+build/
+dist/
+*.egg-info/
+.eggs/
+*.whl

@@ -1,0 +1,22 @@
+[package]
+name = "ay-fp"
+description = "Floating-point theory solver for AY"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ay-core.workspace = true
+tracing.workspace = true
+num-bigint.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+ay-sat.workspace = true

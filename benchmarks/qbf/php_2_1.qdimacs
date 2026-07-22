@@ -1,0 +1,7 @@
+c Pigeonhole PHP(2,1): 2 pigeons, 1 hole
+c UNSAT: cannot place 2 pigeons in 1 hole
+p cnf 2 3
+e 1 2 0
+1 0
+2 0
+-1 -2 0

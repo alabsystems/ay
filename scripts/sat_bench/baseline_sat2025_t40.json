@@ -1,0 +1,846 @@
+{
+ "timeout": 40.0,
+ "summary": {
+  "n": 55,
+  "timeout": 40.0,
+  "ay_solved": 11,
+  "ay_par2": 3640.2361935809995,
+  "kissat_solved": 15,
+  "kissat_par2": 3331.074237043,
+  "disagreements": [],
+  "gap_kissat_solves_ay_doesnt": [
+   "546f8e069aa4_intel047_Iter78.cnf",
+   "9a839badecb2_anbul-dated-5-15-u.cnf",
+   "9b5f767eb5c1_uniqinv40prop.cnf",
+   "c21096fa2f55_case17.normalised.cnf"
+  ],
+  "ay_only_solves": []
+ },
+ "results": [
+  {
+   "cnf": "0876c518e565_mp1-klieber2017s-0500-023-t12.cnf",
+   "path": "/tmp/satcampaign/cnf/0876c518e565_mp1-klieber2017s-0500-023-t12.cnf",
+   "ay": {
+    "verdict": "SAT",
+    "time": 35.875590916,
+    "rc": 10
+   },
+   "kissat": {
+    "verdict": "SAT",
+    "time": 8.945602125,
+    "rc": 10
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "0a4880c0e882_b19_1.cnf",
+   "path": "/tmp/satcampaign/cnf/0a4880c0e882_b19_1.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.017510208000004,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.00972025,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "0ae917c2e0c1_dislog_a14_x14_n24.cnf",
+   "path": "/tmp/satcampaign/cnf/0ae917c2e0c1_dislog_a14_x14_n24.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.04979970800001,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.00905120800002,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "0c9bcbc815cf_par32-2.shuffled-as.sat03-1534.cnf",
+   "path": "/tmp/satcampaign/cnf/0c9bcbc815cf_par32-2.shuffled-as.sat03-1534.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.02158062500001,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.00607037499998,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "115fa7f61704_Circuit_multiplier24.cnf",
+   "path": "/tmp/satcampaign/cnf/115fa7f61704_Circuit_multiplier24.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.05298291700001,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.007964791000006,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "21415e807689_clqcl_50_6_5.normalised.cnf",
+   "path": "/tmp/satcampaign/cnf/21415e807689_clqcl_50_6_5.normalised.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.08719991600003,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.01111958399997,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "21b173943af5_shuffling-1-s1769330284-of-bench-sat04-422.used-as.sat04-561.cnf",
+   "path": "/tmp/satcampaign/cnf/21b173943af5_shuffling-1-s1769330284-of-bench-sat04-422.used-as.sat04-561.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.05541158300002,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.01142633400002,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "2bdfcf23ac18_1-ET-256-K-65.sanitized.cnf",
+   "path": "/tmp/satcampaign/cnf/2bdfcf23ac18_1-ET-256-K-65.sanitized.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.07062116700001,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.011708750000025,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "30f64b3b0870_lockchart-group1-L200-K289-p8d4j1.normalised.cnf",
+   "path": "/tmp/satcampaign/cnf/30f64b3b0870_lockchart-group1-L200-K289-p8d4j1.normalised.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.025187208000034,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.014523415999975,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "3a1f1b4b9a52_MVRoundRobin_n16_d10_v3.cnf",
+   "path": "/tmp/satcampaign/cnf/3a1f1b4b9a52_MVRoundRobin_n16_d10_v3.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.04756233299997,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.007839624999974,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "3c0db78733bb_rook-52-0-1.cnf",
+   "path": "/tmp/satcampaign/cnf/3c0db78733bb_rook-52-0-1.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 42.14248629200006,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.03549558299994,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "3cda1cbfbcab_lockchart-group2-rnd0.3-L19-K38-P8D4J1_3.cnf",
+   "path": "/tmp/satcampaign/cnf/3cda1cbfbcab_lockchart-group2-rnd0.3-L19-K38-P8D4J1_3.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.039805791999925,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.00871145799999,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "45742d067cc8_mchess_20.cnf",
+   "path": "/tmp/satcampaign/cnf/45742d067cc8_mchess_20.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.047799208000015,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.011209915999984,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "4761df10c93b_arles_thres10_p10_r8188.cnf",
+   "path": "/tmp/satcampaign/cnf/4761df10c93b_arles_thres10_p10_r8188.cnf",
+   "ay": {
+    "verdict": "UNSAT",
+    "time": 0.02552541599993674,
+    "rc": 20
+   },
+   "kissat": {
+    "verdict": "UNSAT",
+    "time": 0.006563792000065405,
+    "rc": 20
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "4c7e09f07702_Ptn-7824-b19.cnf",
+   "path": "/tmp/satcampaign/cnf/4c7e09f07702_Ptn-7824-b19.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.059685500000114,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.013271958999894,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "546f8e069aa4_intel047_Iter78.cnf",
+   "path": "/tmp/satcampaign/cnf/546f8e069aa4_intel047_Iter78.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.02842137499988,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "SAT",
+    "time": 13.758424832999935,
+    "rc": 10
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "5c24cfeff639_c7552.cnf",
+   "path": "/tmp/satcampaign/cnf/5c24cfeff639_c7552.cnf",
+   "ay": {
+    "verdict": "UNSAT",
+    "time": 1.4953771660000257,
+    "rc": 20
+   },
+   "kissat": {
+    "verdict": "UNSAT",
+    "time": 0.5263367909999488,
+    "rc": 20
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "5c47810953b2_oski15a01b20s_opt.cnf",
+   "path": "/tmp/satcampaign/cnf/5c47810953b2_oski15a01b20s_opt.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.05643424999994,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.294231459,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "65f7145996bb_test_v7_r12_vr10_c1_s18160.smt2-stp212.cnf",
+   "path": "/tmp/satcampaign/cnf/65f7145996bb_test_v7_r12_vr10_c1_s18160.smt2-stp212.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.040688374999945,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.14891558299996,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "663bb5659e42_SCPC-500-13.cnf",
+   "path": "/tmp/satcampaign/cnf/663bb5659e42_SCPC-500-13.cnf",
+   "ay": {
+    "verdict": "UNSAT",
+    "time": 21.369700917000046,
+    "rc": 20
+   },
+   "kissat": {
+    "verdict": "UNSAT",
+    "time": 10.03411204200006,
+    "rc": 20
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "6e139783cfbc_x9-06068.sat.sanitized.cnf",
+   "path": "/tmp/satcampaign/cnf/6e139783cfbc_x9-06068.sat.sanitized.cnf",
+   "ay": {
+    "verdict": "SAT",
+    "time": 0.3236162499999864,
+    "rc": 10
+   },
+   "kissat": {
+    "verdict": "SAT",
+    "time": 0.3726080000001275,
+    "rc": 10
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "6f40bd5ac85e_harder-fphp-016-015.sat05-1230.reshuffled-07.cnf",
+   "path": "/tmp/satcampaign/cnf/6f40bd5ac85e_harder-fphp-016-015.sat05-1230.reshuffled-07.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.04626683300012,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.01616549999994,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "6fab31665147_stb_664_50.apx_2_DC-ST.cnf",
+   "path": "/tmp/satcampaign/cnf/6fab31665147_stb_664_50.apx_2_DC-ST.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.02329574999999,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.00777549999998,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "76bef98aafe7_bp4_CB_CSO_LP_FPBEQ_FPBLE.normalised.cnf",
+   "path": "/tmp/satcampaign/cnf/76bef98aafe7_bp4_CB_CSO_LP_FPBEQ_FPBLE.normalised.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 42.03360449999991,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.01117079200003,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "77e655b23c0a_SC25_Timetable_C_495_E_43_Cl_35_D_7_T_58.normalised.cnf",
+   "path": "/tmp/satcampaign/cnf/77e655b23c0a_SC25_Timetable_C_495_E_43_Cl_35_D_7_T_58.normalised.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.02148224999996,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.012619749999885,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "818c585e5986_g2-hwmcc15deep-oski15a10b10s-k20.cnf",
+   "path": "/tmp/satcampaign/cnf/818c585e5986_g2-hwmcc15deep-oski15a10b10s-k20.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.020672791999914,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.036637832999986,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "8b267f95678c_ER_500_20_4.apx_1_DC-AD.cnf",
+   "path": "/tmp/satcampaign/cnf/8b267f95678c_ER_500_20_4.apx_1_DC-AD.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.019753792000074,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.00768112499986,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "8e62c5d47920_SC25_Timetable_C_393_E_45_Cl_26_D_7_T_50.normalised.cnf",
+   "path": "/tmp/satcampaign/cnf/8e62c5d47920_SC25_Timetable_C_393_E_45_Cl_26_D_7_T_50.normalised.cnf",
+   "ay": {
+    "verdict": "SAT",
+    "time": 21.600635999999895,
+    "rc": 10
+   },
+   "kissat": {
+    "verdict": "SAT",
+    "time": 14.947130000000016,
+    "rc": 10
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "8e81131a0c4f_16_16_booth_dadda_origin_and_and_dadda_origin_bit28.cnf",
+   "path": "/tmp/satcampaign/cnf/8e81131a0c4f_16_16_booth_dadda_origin_and_and_dadda_origin_bit28.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.026931417000014,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.008164292000174,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "9118e7688550_ramsey_3_6_18.normalised.cnf",
+   "path": "/tmp/satcampaign/cnf/9118e7688550_ramsey_3_6_18.normalised.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.02207433300009,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.007065583999974,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "98e8aa2ace21_bp4_TCO_CSO_IXA_LP_ZR.normalised.cnf",
+   "path": "/tmp/satcampaign/cnf/98e8aa2ace21_bp4_TCO_CSO_IXA_LP_ZR.normalised.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 42.03980258299998,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.00869008299969,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "9a839badecb2_anbul-dated-5-15-u.cnf",
+   "path": "/tmp/satcampaign/cnf/9a839badecb2_anbul-dated-5-15-u.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 42.02178737500026,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNSAT",
+    "time": 13.33106195900018,
+    "rc": 20
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "9b5f767eb5c1_uniqinv40prop.cnf",
+   "path": "/tmp/satcampaign/cnf/9b5f767eb5c1_uniqinv40prop.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.021798750000016,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNSAT",
+    "time": 11.659834333000163,
+    "rc": 20
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "9dd565d002c3_sqrt-mitern169.cnf",
+   "path": "/tmp/satcampaign/cnf/9dd565d002c3_sqrt-mitern169.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.02562483299971,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.00702295800011,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "a8608545f9ae_rbsat-v945c61409g3.cnf",
+   "path": "/tmp/satcampaign/cnf/a8608545f9ae_rbsat-v945c61409g3.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.02271083400001,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.00580712500005,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "ad9eb96bac59_AProVE07-21.cnf",
+   "path": "/tmp/satcampaign/cnf/ad9eb96bac59_AProVE07-21.cnf",
+   "ay": {
+    "verdict": "UNSAT",
+    "time": 29.9840711249999,
+    "rc": 20
+   },
+   "kissat": {
+    "verdict": "UNSAT",
+    "time": 0.8315547090001019,
+    "rc": 20
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "b1c8eaa002ac_cliquecolouring_n15_k7_c6.sanitized.cnf",
+   "path": "/tmp/satcampaign/cnf/b1c8eaa002ac_cliquecolouring_n15_k7_c6.sanitized.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.02451595799994,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.00810966600011,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "c21096fa2f55_case17.normalised.cnf",
+   "path": "/tmp/satcampaign/cnf/c21096fa2f55_case17.normalised.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.01722199999995,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "SAT",
+    "time": 17.590325166000184,
+    "rc": 10
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "c86b261162ce_ITC2021_Middle_9.xml.cnf",
+   "path": "/tmp/satcampaign/cnf/c86b261162ce_ITC2021_Middle_9.xml.cnf",
+   "ay": {
+    "verdict": "SAT",
+    "time": 1.3882963749997543,
+    "rc": 10
+   },
+   "kissat": {
+    "verdict": "SAT",
+    "time": 3.8743342919997303,
+    "rc": 10
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "cb66276897e4_RoundRobin_n17_d13.cnf",
+   "path": "/tmp/satcampaign/cnf/cb66276897e4_RoundRobin_n17_d13.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.021689416999834,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.009788124999886,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "ccc66f699505_VanDerWaerden_pd_2-3-23_505.cnf",
+   "path": "/tmp/satcampaign/cnf/ccc66f699505_VanDerWaerden_pd_2-3-23_505.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.013309542000115,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.004995667,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "cdf559a186b5_at-least-two-traffic_kkb_unknown.cnf",
+   "path": "/tmp/satcampaign/cnf/cdf559a186b5_at-least-two-traffic_kkb_unknown.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.52840979099983,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.010736791,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "d35dfc38e168_16_2.cnf",
+   "path": "/tmp/satcampaign/cnf/d35dfc38e168_16_2.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.64019508299998,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.004987207999875,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "d6afa5689d75_grs-160-48.cnf",
+   "path": "/tmp/satcampaign/cnf/d6afa5689d75_grs-160-48.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 42.21137770899986,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.008727917000215,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "dbe12d6d2e34_bp4_BC012_CSO_AM_FPBEQ_FPBLE_ZR.normalised.cnf",
+   "path": "/tmp/satcampaign/cnf/dbe12d6d2e34_bp4_BC012_CSO_AM_FPBEQ_FPBLE_ZR.normalised.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.03217566600006,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.008184999999685,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "ddc308b079b0_ncc_none_2_17_4_3_0_0_435991723.cnf",
+   "path": "/tmp/satcampaign/cnf/ddc308b079b0_ncc_none_2_17_4_3_0_0_435991723.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.03844408299983,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.087181957999746,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "ddf9620410e6_oddball_57_5_tto_zp.normalised.cnf",
+   "path": "/tmp/satcampaign/cnf/ddf9620410e6_oddball_57_5_tto_zp.normalised.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 42.064925250000215,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.13763191600037,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "de8988028668_sudoku-N30-16.cnf",
+   "path": "/tmp/satcampaign/cnf/de8988028668_sudoku-N30-16.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.0219860000002,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.05707804099984,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "e207ba2df644_fermat-834855329100173267.cnf",
+   "path": "/tmp/satcampaign/cnf/e207ba2df644_fermat-834855329100173267.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.04496100000006,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.006442917000186,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "e2d2b011b080_59-129706.cnf",
+   "path": "/tmp/satcampaign/cnf/e2d2b011b080_59-129706.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.0328153749997,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.007648042000255,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "e4ac15cf2373_2013113162201nw.shuffled-as.sat03-1668.cnf",
+   "path": "/tmp/satcampaign/cnf/e4ac15cf2373_2013113162201nw.shuffled-as.sat03-1668.cnf",
+   "ay": {
+    "verdict": "SAT",
+    "time": 5.076727124999707,
+    "rc": 10
+   },
+   "kissat": {
+    "verdict": "SAT",
+    "time": 4.379912666999644,
+    "rc": 10
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "e707c7e87816_Break_triple_14_48.xml.cnf",
+   "path": "/tmp/satcampaign/cnf/e707c7e87816_Break_triple_14_48.xml.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.02883883300001,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.00820250000015,
+    "rc": 0
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "ed6d842f96d1_battleship-16-31-sat.cnf",
+   "path": "/tmp/satcampaign/cnf/ed6d842f96d1_battleship-16-31-sat.cnf",
+   "ay": {
+    "verdict": "SAT",
+    "time": 0.024030250000123488,
+    "rc": 10
+   },
+   "kissat": {
+    "verdict": "SAT",
+    "time": 0.14720224999973652,
+    "rc": 10
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "efc1b7cc3861_oddball_19_4_ttf.normalised.cnf",
+   "path": "/tmp/satcampaign/cnf/efc1b7cc3861_oddball_19_4_ttf.normalised.cnf",
+   "ay": {
+    "verdict": "UNSAT",
+    "time": 3.072622041000159,
+    "rc": 20
+   },
+   "kissat": {
+    "verdict": "UNSAT",
+    "time": 30.66923408399998,
+    "rc": 20
+   },
+   "disagree": false
+  },
+  {
+   "cnf": "fdefca5f5236_oddball_29_4_ttf.normalised.cnf",
+   "path": "/tmp/satcampaign/cnf/fdefca5f5236_oddball_29_4_ttf.normalised.cnf",
+   "ay": {
+    "verdict": "UNKNOWN",
+    "time": 40.020102457999656,
+    "rc": 124
+   },
+   "kissat": {
+    "verdict": "UNKNOWN",
+    "time": 40.00858891600001,
+    "rc": 0
+   },
+   "disagree": false
+  }
+ ]
+}

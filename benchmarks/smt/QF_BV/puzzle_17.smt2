@@ -1,0 +1,12 @@
+; QF_BV benchmark: puzzle_17
+(set-logic QF_BV)
+(declare-fun v0 () (_ BitVec 8))
+(declare-fun v1 () (_ BitVec 8))
+(declare-fun v2 () (_ BitVec 8))
+(assert (= (bvxor v1 v2) #x51))
+(assert (= (bvxor v2 v1) #x84))
+(assert (= (bvxor v0 v1) #x7a))
+(assert (= (bvadd v1 v2) #x92))
+(assert (= (bvor v0 v1) #xa3))
+(check-sat)
+(exit)

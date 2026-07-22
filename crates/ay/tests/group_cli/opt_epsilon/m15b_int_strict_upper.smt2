@@ -1,0 +1,7 @@
+(declare-const x Real)
+(declare-const i Int)
+(assert (< x i))
+(assert (<= i 5))
+(maximize x)
+(check-sat)
+(get-objectives)

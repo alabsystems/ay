@@ -1,0 +1,21 @@
+FROM rust:1.95-bookworm
+
+# Install necessary build tools for compiling the solver and building GMP/MPFR for musl
+RUN apt-get update && apt-get install -y \
+    musl-tools \
+    build-essential \
+    m4 \
+    python3 \
+    python3-pip \
+    jq \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add the linux musl target for static binary compilation
+RUN rustup target add x86_64-unknown-linux-musl
+
+# Set working directory
+WORKDIR /workspace
+
+# Set default command to drop into a bash shell
+CMD ["bash"]

@@ -1,0 +1,717 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates
+// Licensed under the Apache License, Version 2.0
+
+//! Consumer-facing proof export API for UNSAT results.
+//!
+//! Provides [`UnsatProofArtifact`] as a portable proof certificate that
+//! downstream consumers (downstream proof consumers) can use without
+//! linking against executor internals, plus a strict proof verdict and
+//! consumer acceptance helpers.
+
+use ay_core::{AletheRule, ProofStep};
+use ay_proof::{
+    check_proof_collecting_trust, check_proof_partial, check_proof_strict,
+    check_proof_with_quality, export_alethe_with_problem_scope, PartialProofCheck, ProofCheckError,
+    ProofQuality,
+};
+use num_rational::BigRational;
+
+use crate::array_proof_check::{check_array_clause, ArrayStepVerdict};
+use crate::bv_proof_check::{
+    check_bv_assertions_unsat, check_bv_clause, problem_mixes_int_and_bv, BvStepVerdict,
+};
+
+/// Exported strict-verification verdict for an UNSAT proof artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StrictProofVerdict {
+    /// Strict proof validation succeeded with the returned quality metrics.
+    Verified(ProofQuality),
+    /// Strict proof validation rejected the artifact with a stable explanation.
+    Rejected(String),
+}
+
+/// Consumer-facing acceptance mode for an UNSAT proof artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProofAcceptanceMode {
+    /// Require strict proof validation to have succeeded.
+    Strict,
+    /// Require strict validation plus the restricted-rule-subset strict subset.
+    RestrictedRuleSubset,
+}
+
+/// Error returned when an UNSAT proof artifact is not acceptable at a
+/// consumer boundary.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProofAcceptanceError {
+    /// Strict proof validation failed.
+    #[error("strict proof verification failed: {reason}")]
+    StrictRejected {
+        /// Stable rejection detail from the strict checker.
+        reason: String,
+    },
+    /// Strict validation succeeded, but the proof is outside the restricted rule subset.
+    #[error("proof is not in the restricted-rule-subset strict subset")]
+    NotRestrictedRuleSubset,
+}
+
+/// Structured Farkas payload for a theory lemma in the exported proof.
+///
+/// Coefficients are promoted to [`BigRational`] so downstream consumers can
+/// use the certificate without depending on ay-core's internal `Rational64`
+/// representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FarkasCertificate {
+    /// Index of the `TheoryLemma` step in the exported proof DAG.
+    pub proof_step_index: u32,
+    /// Non-negative coefficients for the lemma's input constraints.
+    pub coefficients: Vec<BigRational>,
+}
+
+/// A portable UNSAT proof certificate for downstream consumers.
+///
+/// Contains rendered Alethe proof text, diagnostic quality metrics, a strict
+/// proof verdict, and a restricted-rule-subset flag for consumers that need a stricter
+/// acceptance boundary than the raw solver result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[must_use]
+pub struct UnsatProofArtifact {
+    /// Diagnostic (non-strict) quality metrics: trust/hole/resolution/theory counts.
+    ///
+    /// This is a diagnostic summary. It does **not** imply full semantic
+    /// verification — theory lemmas and generic rules are accepted as axioms.
+    /// Use [`strict_verdict`](Self::strict_verdict) for the exported strict verdict.
+    pub quality: ProofQuality,
+    /// Rendered Alethe proof text (SMT-LIB compatible).
+    pub alethe: String,
+    /// Partial check result from the internal checker.
+    pub partial_check: Option<PartialProofCheck>,
+    /// Consumer-visible strict proof verdict.
+    pub strict_verdict: StrictProofVerdict,
+    /// Whether every proof step uses only rules in the restricted-rule-subset subset
+    /// **and** the proof passes strict semantic validation.
+    ///
+    /// True only when:
+    /// 1. [`strict_verdict`](Self::strict_verdict) is [`StrictProofVerdict::Verified`]
+    /// 2. Every `Step` rule is in the restricted rule whitelist
+    /// 3. Every `TheoryLemma` kind is in the restricted-rule-subset subset (EUF only)
+    pub restricted_rule_subset: bool,
+    /// Serialized LRAT certificate for the SAT backbone proof, when available.
+    ///
+    /// This is exported only when the stored clause trace is complete enough
+    /// to replay into a standalone LRAT certificate.
+    pub lrat_certificate: Option<Vec<u8>>,
+    /// Structured Farkas certificates extracted from arithmetic theory lemmas.
+    pub farkas_certificates: Vec<FarkasCertificate>,
+}
+
+/// Internal evaluation of all three proof quality signals.
+///
+/// Computed once per artifact export, preventing redundant proof walks.
+struct ProofArtifactEvaluation {
+    /// Non-strict diagnostic quality (theory lemmas treated as axioms).
+    diagnostic_quality: ProofQuality,
+    /// Partial check result from the internal checker.
+    partial_check: PartialProofCheck,
+    /// Result of `check_proof_strict` — `Ok` when every step is semantically
+    /// verified, `Err` when any step fails strict validation.
+    strict_quality: Result<ProofQuality, ProofCheckError>,
+}
+
+/// Convert the strict checker result into the stable consumer-facing verdict.
+///
+/// Production goes through [`strict_verdict_with_deferred_trust`]; this plain
+/// conversion is exercised directly by the artifact-boundary tests.
+#[cfg(test)]
+pub(super) fn strict_verdict_from_result(
+    strict_quality: Result<ProofQuality, ProofCheckError>,
+) -> StrictProofVerdict {
+    match strict_quality {
+        Ok(quality) => StrictProofVerdict::Verified(quality),
+        Err(error) => StrictProofVerdict::Rejected(error.to_string()),
+    }
+}
+
+/// Compute the strict verdict, but rescue a proof whose ONLY strict failure is a
+/// `trust` step demoted from genuine bit-vector / array theory reasoning.
+///
+/// Rationale: `ay` correctly decides many BV/array clauses UNSAT, then exports
+/// the learned theory clause as an Alethe `trust` step (the Alethe BV/array
+/// proof-rule set is incomplete). The plain strict checker rejects every `trust`
+/// step by rule name, so a genuinely-discharged BV tautology is demoted to
+/// `Unknown`. This routine consolidates the two existing-but-unwired soundness
+/// paths:
+///
+/// 1. [`check_proof_collecting_trust`] runs the FULL strict structural check
+///    (every non-trust rule at the strict boundary) but DEFERS each `trust`
+///    step, returning its conclusion clause. If any non-trust step fails strict
+///    validation, this errors and we stay [`StrictProofVerdict::Rejected`].
+/// 2. Each deferred trust clause is then INDEPENDENTLY re-discharged by the
+///    fail-closed semantic checkers ([`check_bv_clause`] / [`check_array_clause`]
+///    in `ay-dpll`), which assert `¬clause` into a fresh solver and require
+///    UNSAT. A clause is accepted ONLY when an independent solve confirms it is a
+///    genuine theory tautology ([`BvStepVerdict::Valid`] /
+///    [`ArrayStepVerdict::Valid`]). `Unchecked` / `Invalid` (or a forged or
+///    non-tautological clause) keeps the verdict Rejected.
+///
+/// Acceptance here stays at the SmtBacked / strict-checked tier: `ay`'s checker
+/// is the trusted base. It does NOT claim kernel-`Certified`.
+fn strict_verdict_with_deferred_trust(
+    strict_quality: Result<ProofQuality, ProofCheckError>,
+    diagnostic_quality: &ProofQuality,
+    proof: &ay_core::Proof,
+    terms: &ay_core::TermStore,
+    assertions: &[ay_core::TermId],
+    resolve_ctx: &ay_frontend::Context,
+) -> StrictProofVerdict {
+    // Fast path: the plain strict checker already accepted.
+    let plain_err = match strict_quality {
+        Ok(quality) => return StrictProofVerdict::Verified(quality),
+        Err(error) => error,
+    };
+
+    // Only trust-step rejections are candidates for the deferred-trust rescue.
+    // Any other strict failure is a real structural rejection — stay Rejected.
+    if !matches!(
+        plain_err,
+        ProofCheckError::TrustStep { .. } | ProofCheckError::StrictProofModeTrust { .. }
+    ) {
+        return StrictProofVerdict::Rejected(plain_err.to_string());
+    }
+
+    // FRESH-RE-SOLVE FORGED-UNSAT GUARD (dominant, fail-closed). We are here only
+    // because the proof leaned on a trust-fallback step (the plain strict checker
+    // rejected it as `TrustStep`/`StrictProofModeTrust`). Before honoring ANY of the
+    // deferred-trust accept paths below (`all_standalone` per-clause discharge OR the
+    // whole-problem `executor_reconfirms_unsat` fallback), independently re-decide the
+    // original problem assertions in a FRESH `Executor`. If that clean re-solve returns
+    // a DEFINITIVE SAT, the UNSAT verdict is FORGED — a satisfiable problem can never be
+    // genuinely UNSAT — so reject the proof and let the consumer downgrade to Unknown.
+    // This dominates `all_standalone`, closing the residual hole where every collected
+    // trust clause looks like a standalone theory tautology yet the overall UNSAT is
+    // forged (term-less Tseitin aux var in the split path; theory-conflict Farkas gap).
+    // SOUND: downgrade-only and gated on a DEFINITIVE SAT, so a genuine UNSAT (re-solves
+    // to UNSAT or Unknown, never SAT) is never disturbed and no false verdict is created.
+    if executor_redecides_definitive_sat(resolve_ctx) {
+        return StrictProofVerdict::Rejected(
+            "forged UNSAT: a fresh Executor independently re-decides the problem \
+             assertions as DEFINITIVE SAT, so the trust-fallback UNSAT proof is not \
+             reproducible and is downgraded fail-closed"
+                .to_string(),
+        );
+    }
+
+    // Re-run strict validation, this time deferring (collecting) trust clauses.
+    // A non-trust strict error here means the proof is genuinely unsound → stay
+    // Rejected with that error.
+    let collected = match check_proof_collecting_trust(proof, terms) {
+        Ok(collected) => collected,
+        Err(error) => return StrictProofVerdict::Rejected(error.to_string()),
+    };
+
+    // Defensive: if nothing was collected the plain checker should have accepted.
+    if collected.is_empty() {
+        return StrictProofVerdict::Rejected(plain_err.to_string());
+    }
+
+    // Independently discharge the collected trust clauses. PREFERRED (strongest):
+    // every clause is a genuine standalone theory tautology — a non-empty clause
+    // whose negation is UNSAT, or the terminal EMPTY trust clause re-solved against
+    // the whole problem. When EVERY collected clause discharges standalone, the
+    // proof's trust steps are each independently certified.
+    let all_standalone = collected
+        .iter()
+        .all(|(_, clause)| discharge_trust_clause(terms, clause, assertions).is_some());
+    if all_standalone {
+        return StrictProofVerdict::Verified(diagnostic_quality.clone());
+    }
+
+    // FALLBACK (still sound): some collected trust clause is CONTEXT-DEPENDENT —
+    // valid only given the other assertions, so it is not a standalone tautology.
+    // This is the norm for LIA `Generic` lemmas (e.g. an ite-arithmetic lemma whose
+    // proof is not Farkas-pure) and the terminal trust step. The independent
+    // certificate for such a proof is the SAME one the empty-terminal-clause path
+    // uses: re-decide the ORIGINAL problem assertions and confirm they are jointly
+    // UNSAT in a fresh solver (now LIA-capable via `pick_logic`). This certifies
+    // the CONCLUSION (the property holds) without trusting the proof's structure;
+    // a forged UNSAT for a satisfiable problem re-solves to SAT → Rejected, so it
+    // can never produce a false-PROVE.
+    //
+    // PRIMARY re-solve: a FRESH `Executor` over a CLONE of the original `TermStore`,
+    // asserting the ORIGINAL TermIds — the COMPLETE solve path (logic detection +
+    // ite-lifting + the full theory loop) on the parser-built term structure. This
+    // decides deep nested-ite LIA obligations (e.g. a 4-op chained-wrapping
+    // invariant) that the thin `Solver`+`Translator` re-build in
+    // `check_bv_assertions_unsat` re-constructs into a shape `solve_lia` leaves
+    // Unknown. `check_bv_assertions_unsat` stays as a SECONDARY for the rare cases
+    // the executor path declines. Both are independent fresh solves — a forged UNSAT
+    // re-solves to SAT and is Rejected.
+    if executor_reconfirms_unsat(resolve_ctx) {
+        return StrictProofVerdict::Verified(diagnostic_quality.clone());
+    }
+    match check_bv_assertions_unsat(terms, assertions) {
+        BvStepVerdict::Valid => StrictProofVerdict::Verified(diagnostic_quality.clone()),
+        BvStepVerdict::Invalid { .. } | BvStepVerdict::Unchecked { .. } => {
+            StrictProofVerdict::Rejected(
+                "deferred-trust discharge failed: a collected trust clause is not a \
+                 standalone theory tautology AND the problem assertions could not be \
+                 independently re-solved as UNSAT"
+                    .to_string(),
+            )
+        }
+    }
+}
+
+/// Independent whole-problem UNSAT re-confirmation through the COMPLETE `Executor`
+/// path. `check_bv_assertions_unsat` re-translates the assertions through the thin
+/// BV/LIA `Translator` into a fresh `Solver`; that re-built term structure defeats
+/// `solve_lia` on deep nested-ite obligations even though the original (parser-built)
+/// terms decide. This instead builds a FRESH `Executor`, sets its `TermStore` to a
+/// CLONE of the original `terms`, asserts the ORIGINAL `assertions` TermIds, and runs
+/// the full `check_sat` (logic detection → `solve_lia` with arithmetic-ite lifting).
+/// Returns `true` ONLY on an independently-reproduced UNSAT — a forged UNSAT of a
+/// satisfiable problem re-solves to SAT (or Unknown), so this can never yield a
+/// false-PROVE. Fresh executor state means it does not trust the original proof.
+fn executor_reconfirms_unsat(resolve_ctx: &ay_frontend::Context) -> bool {
+    if resolve_ctx.assertions.is_empty() {
+        return false;
+    }
+    // Fresh `Executor` over a CLONE of the full solving context (terms, assertions,
+    // logic, options incl. `:produce-proofs`) — the same setup the main solve used,
+    // so the complete `check_sat` path re-decides. Executor::new()'s own SAT/theory
+    // state is fresh; `check_sat` re-encodes the assertions from scratch.
+    let mut exec = crate::Executor::new();
+    exec.ctx = resolve_ctx.clone();
+    if !matches!(exec.check_sat(), Ok(result) if result.is_unsat()) {
+        return false;
+    }
+
+    // MIXED Int+BV FORGED-UNSAT GUARD (fail-closed, narrow). On the BV<->LIA bridge
+    // fragment the `Executor` can close the search with a fallback step on a bridge
+    // clause it cannot actually refute — the `#nia-oom` allocation VC
+    // (`count = bv2nat(bvshl(int2bv 1, int2bv 28))` against an integer ceiling and
+    // `u64::MAX` bounds) is SATISFIABLE yet re-solves to a forged `unsat`. A
+    // re-solve is only an INDEPENDENT certificate when its own refutation is
+    // STRICTLY VERIFIED end-to-end: `check_proof_strict` rejects not only `Trust`/
+    // `Hole` placeholders (the shape #nia-oom emits) but also any unsound/
+    // unverifiable theory lemma (a bogus Farkas / bit-blast `TheoryLemma`) — the
+    // same forge re-encoded as a different step kind. A re-solve whose proof is not
+    // strictly checkable is the same forge, not a certificate, so it does not
+    // confirm. Pure-BV / pure-LIA re-solves (e.g. the deep nested-ite LIA
+    // obligations this path exists to decide) are UNAFFECTED — the strict-proof
+    // gate is applied on the mixed fragment ONLY; they keep the unconditional
+    // confirmation below.
+    if problem_mixes_int_and_bv(&resolve_ctx.terms, &resolve_ctx.assertions) {
+        let Some(proof) = exec.last_proof() else {
+            return false;
+        };
+        return check_proof_strict(proof, exec.terms()).is_ok();
+    }
+    true
+}
+
+/// Fresh-re-solve forged-UNSAT guard: the DUAL of [`executor_reconfirms_unsat`].
+///
+/// Builds a FRESH [`crate::Executor`] over a CLONE of the original solving context
+/// and re-decides the problem assertions from scratch. Returns `true` ONLY when that
+/// independent solve returns a **definitive SAT** (a model exists) — i.e. the original
+/// UNSAT verdict is FORGED. A re-solve that returns `Unknown` (incomplete / timeout)
+/// returns `false`: we only downgrade on a positive, definitive contradiction of the
+/// UNSAT claim, never on a non-result. This is what makes the guard SOUND and
+/// downgrade-only — it can turn a forged `Verified` into `Rejected`, but a genuine
+/// UNSAT (which re-solves to UNSAT or Unknown, never SAT) is never disturbed, so the
+/// guard can never manufacture a false verdict.
+///
+/// Used as the DOMINANT gate in [`strict_verdict_with_deferred_trust`]: any proof that
+/// relied on a trust-fallback is only honored once we have confirmed the problem is not
+/// independently, definitively satisfiable. This catches the residual forged-UNSAT
+/// cases (e.g. a term-less Tseitin aux var in the split path, or a theory-conflict
+/// Farkas-recording gap) whose per-clause trust steps may each look like standalone
+/// theory tautologies (`all_standalone == true`) yet whose overall UNSAT is forged for
+/// a satisfiable problem.
+pub(crate) fn executor_redecides_definitive_sat(resolve_ctx: &ay_frontend::Context) -> bool {
+    if resolve_ctx.assertions.is_empty() {
+        // An empty assertion set is trivially SAT, but there is nothing to forge:
+        // never treat it as a forged-UNSAT signal.
+        return false;
+    }
+    let mut exec = crate::Executor::new();
+    exec.ctx = resolve_ctx.clone();
+    matches!(exec.check_sat(), Ok(result) if result.is_sat())
+}
+
+/// Independently discharge a single deferred trust step via the fail-closed
+/// semantic checkers. Returns `Some(())` ONLY when an independent solver run
+/// confirms the step's content UNSAT under the BV or array theory; `None` for
+/// any `Unchecked`/`Invalid`/unmodellable outcome.
+///
+/// Two shapes are handled, both fail-closed:
+///
+/// 1. NON-EMPTY trust clause `C`: prove `C` is a genuine theory tautology by
+///    refuting `¬C`. Try the BV checker first; on `Unchecked` fall back to the
+///    array checker. A clause accepted by EITHER is genuine; a clause both
+///    reject stays unaccepted.
+/// 2. EMPTY trust clause: this is the terminal `⊢ ⊥` certificate-free fallback
+///    `ay` emits when it decided the WHOLE problem UNSAT without a structured
+///    proof. There is nothing in the proof to re-check, so the only honest
+///    independent certificate is to re-solve the ORIGINAL problem `assertions`
+///    in a fresh solver and confirm they are jointly UNSAT
+///    ([`check_bv_assertions_unsat`]). A SAT/Unknown/unmodellable result keeps
+///    the step unaccepted. An empty assertion set is never accepted (an empty
+///    conjunction is satisfiable).
+fn discharge_trust_clause(
+    terms: &ay_core::TermStore,
+    clause: &[ay_core::TermId],
+    assertions: &[ay_core::TermId],
+) -> Option<()> {
+    // Terminal empty trust clause → re-discharge the original problem assertions.
+    if clause.is_empty() {
+        return match check_bv_assertions_unsat(terms, assertions) {
+            BvStepVerdict::Valid => Some(()),
+            // SAT/Unknown/unmodellable: the UNSAT claim is not independently
+            // reproducible. Never accept (fail closed).
+            BvStepVerdict::Invalid { .. } | BvStepVerdict::Unchecked { .. } => None,
+        };
+    }
+
+    match check_bv_clause(terms, clause) {
+        BvStepVerdict::Valid => return Some(()),
+        // Invalid: ¬clause is SAT → NOT a BV tautology. Never accept.
+        BvStepVerdict::Invalid { .. } => return None,
+        // Unchecked: the BV checker could not model it; try the array checker.
+        BvStepVerdict::Unchecked { .. } => {}
+    }
+    match check_array_clause(terms, clause) {
+        ArrayStepVerdict::Valid => Some(()),
+        ArrayStepVerdict::Skipped
+        | ArrayStepVerdict::Invalid { .. }
+        | ArrayStepVerdict::Unchecked { .. } => None,
+    }
+}
+
+/// Evaluate the proof through all three validation levels in a single pass.
+fn evaluate_proof_artifact_boundary(
+    proof: &ay_core::Proof,
+    terms: &ay_core::TermStore,
+) -> Option<ProofArtifactEvaluation> {
+    let diagnostic_quality = check_proof_with_quality(proof, terms).ok()?;
+    let (partial_check, _partial_err) = check_proof_partial(proof, terms);
+    let strict_quality = check_proof_strict(proof, terms);
+    Some(ProofArtifactEvaluation {
+        diagnostic_quality,
+        partial_check,
+        strict_quality,
+    })
+}
+
+/// Hard-coded whitelist of Alethe rules that a downstream checker can reconstruct as
+/// kernel proof terms. Derived from trust-free QF_BOOL and simple QF_UF
+/// proof evidence.
+fn is_restricted_rule_subset_rule(rule: &AletheRule) -> bool {
+    matches!(
+        rule,
+        // Propositional tautology rules (Tseitin clausification)
+        AletheRule::True
+            | AletheRule::False
+            | AletheRule::NotTrue
+            | AletheRule::NotFalse
+            | AletheRule::And
+            | AletheRule::AndPos(_)
+            | AletheRule::AndNeg
+            | AletheRule::NotAnd
+            | AletheRule::Or
+            | AletheRule::OrPos(_)
+            | AletheRule::OrNeg
+            | AletheRule::NotOr
+            | AletheRule::Implies
+            | AletheRule::ImpliesPos
+            | AletheRule::ImpliesNeg1
+            | AletheRule::ImpliesNeg2
+            | AletheRule::NotImplies1
+            | AletheRule::NotImplies2
+            | AletheRule::Equiv
+            | AletheRule::EquivPos1
+            | AletheRule::EquivPos2
+            | AletheRule::EquivNeg1
+            | AletheRule::EquivNeg2
+            | AletheRule::NotEquiv1
+            | AletheRule::NotEquiv2
+            | AletheRule::Ite
+            | AletheRule::ItePos1
+            | AletheRule::ItePos2
+            | AletheRule::IteNeg1
+            | AletheRule::IteNeg2
+            | AletheRule::NotIte1
+            | AletheRule::NotIte2
+            | AletheRule::XorPos1
+            | AletheRule::XorPos2
+            | AletheRule::XorNeg1
+            | AletheRule::XorNeg2
+            // Resolution and structural
+            | AletheRule::Resolution
+            | AletheRule::ThResolution
+            | AletheRule::Contraction
+            | AletheRule::Drup
+            // EUF equality rules
+            | AletheRule::Refl
+            | AletheRule::Symm
+            | AletheRule::Trans
+            | AletheRule::Cong
+            | AletheRule::EqReflexive
+            | AletheRule::EqTransitive
+            | AletheRule::EqCongruent
+            | AletheRule::EqCongruentPred
+            // Simplification (boolean only for now)
+            | AletheRule::AllSimplify
+            | AletheRule::BoolSimplify
+    )
+}
+
+/// Check whether all proof steps use only restricted-rule-subset rules.
+///
+/// Returns `true` only when:
+/// 1. `trust_count == 0` and `hole_count == 0`
+/// 2. Every `Step` rule is in the restricted rule whitelist
+/// 3. Every `TheoryLemma` kind is in the restricted-rule-subset subset (EUF only)
+fn check_restricted_rule_subset(quality: &ProofQuality, proof: &ay_core::Proof) -> bool {
+    use ay_core::TheoryLemmaKind;
+
+    if quality.trust_count > 0 || quality.hole_count > 0 {
+        return false;
+    }
+
+    for step in &proof.steps {
+        match step {
+            ProofStep::Step { rule, .. }
+                if !is_restricted_rule_subset_rule(rule) => {
+                    return false;
+                }
+            ProofStep::TheoryLemma { kind, .. }
+                // Only EUF theory lemmas are in the restricted-rule-subset first slice.
+                // Arithmetic (LraFarkas, LiaGeneric) and other theories are out
+                // of scope even when they don't export as `trust`.
+                if !matches!(
+                    kind,
+                    TheoryLemmaKind::EufTransitive
+                        | TheoryLemmaKind::EufCongruent
+                        | TheoryLemmaKind::EufCongruentPred
+                ) => {
+                    return false;
+                }
+            // Assume, Resolution, Anchor are always OK.
+            _ => {}
+        }
+    }
+    true
+}
+
+fn extract_farkas_certificates(proof: &ay_core::Proof) -> Vec<FarkasCertificate> {
+    proof
+        .steps
+        .iter()
+        .enumerate()
+        .filter_map(|(proof_step_index, step)| {
+            let ProofStep::TheoryLemma {
+                farkas: Some(annotation),
+                ..
+            } = step
+            else {
+                return None;
+            };
+            Some(FarkasCertificate {
+                proof_step_index: u32::try_from(proof_step_index).ok()?,
+                coefficients: annotation
+                    .coefficients
+                    .iter()
+                    .map(|coefficient| {
+                        BigRational::new(
+                            (*coefficient.numer()).into(),
+                            (*coefficient.denom()).into(),
+                        )
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+impl UnsatProofArtifact {
+    /// Accept this proof artifact at a consumer-facing boundary.
+    ///
+    /// `Strict` requires the strict checker to have accepted the proof.
+    /// `RestrictedRuleSubset` additionally requires the proof to remain inside the current
+    /// restricted-rule-subset strict subset.
+    #[must_use = "consumer boundaries must check whether an UNSAT proof artifact is acceptable"]
+    pub fn accept_for_consumer(
+        &self,
+        mode: ProofAcceptanceMode,
+    ) -> Result<(), ProofAcceptanceError> {
+        match (&self.strict_verdict, mode) {
+            (StrictProofVerdict::Verified(_), ProofAcceptanceMode::Strict) => Ok(()),
+            (StrictProofVerdict::Verified(_), ProofAcceptanceMode::RestrictedRuleSubset)
+                if self.restricted_rule_subset =>
+            {
+                Ok(())
+            }
+            (StrictProofVerdict::Verified(_), ProofAcceptanceMode::RestrictedRuleSubset) => {
+                Err(ProofAcceptanceError::NotRestrictedRuleSubset)
+            }
+            (StrictProofVerdict::Rejected(reason), _) => {
+                Err(ProofAcceptanceError::StrictRejected {
+                    reason: reason.clone(),
+                })
+            }
+        }
+    }
+}
+
+impl super::Solver {
+    /// Export the last UNSAT proof as a rendered Alethe certificate with
+    /// diagnostic quality metrics, a strict verdict, and a restricted-rule-subset compatibility flag.
+    ///
+    /// `strict_verdict` preserves the result of `check_proof_strict`.
+    /// `restricted_rule_subset` is `true` only when the strict verdict is verified
+    /// **and** every rule is in the restricted rule whitelist. The `quality` field
+    /// remains the non-strict diagnostic summary.
+    ///
+    /// Returns `None` if:
+    /// - The last result was not UNSAT
+    /// - Proof production was not enabled
+    /// - No proof was generated
+    #[must_use]
+    pub fn export_last_unsat_artifact(&self) -> Option<UnsatProofArtifact> {
+        let proof = self.executor.last_proof()?;
+        let terms = self.executor.terms();
+        let assertions = &self.executor.context().assertions;
+
+        let alethe = export_alethe_with_problem_scope(proof, terms, assertions);
+        let evaluation = evaluate_proof_artifact_boundary(proof, terms)?;
+
+        let restricted_rule_subset_ok =
+            check_restricted_rule_subset(&evaluation.diagnostic_quality, proof);
+        // Strict verdict with the deferred-trust rescue: a proof whose only
+        // strict failure is a `trust` step demoted from genuine BV/array theory
+        // reasoning is accepted IFF every such clause is independently
+        // re-discharged as a theory tautology (¬clause UNSAT). All other strict
+        // failures stay Rejected. Stays at the strict-checked (SmtBacked) tier.
+        let strict_verdict = {
+            // Deferred-trust validation can run fresh solvers. Those are
+            // semantic checks of this already-produced proof, not new caller
+            // decisions, so they must preserve the sealed CNF byte-for-byte.
+            let _export_suppression = crate::Executor::suppress_bv_cnf_export_for_internal_checks();
+            strict_verdict_with_deferred_trust(
+                evaluation.strict_quality,
+                &evaluation.diagnostic_quality,
+                proof,
+                terms,
+                assertions,
+                self.executor.context(),
+            )
+        };
+        let restricted_rule_subset =
+            matches!(&strict_verdict, StrictProofVerdict::Verified(_)) && restricted_rule_subset_ok;
+        let farkas_certificates = extract_farkas_certificates(proof);
+
+        Some(UnsatProofArtifact {
+            alethe,
+            quality: evaluation.diagnostic_quality,
+            partial_check: Some(evaluation.partial_check),
+            strict_verdict,
+            restricted_rule_subset,
+            lrat_certificate: self.executor.last_lrat_certificate().map(<[u8]>::to_vec),
+            farkas_certificates,
+        })
+    }
+
+    /// Export the last UNSAT proof as a portable, serializable bundle that can
+    /// be re-checked OFFLINE by [`ay_proof::re_check_bundle_strict`] — with no
+    /// solver run and without trusting this solver. The bundle carries the proof
+    /// steps, a checker-only term snapshot (so every embedded `TermId` resolves),
+    /// and the problem's asserted obligation term ids (so a consumer can bind the
+    /// proof's `assume` axioms to the obligation it discharges).
+    ///
+    /// Returns `None` under the same conditions as
+    /// [`export_last_unsat_artifact`](Self::export_last_unsat_artifact): the last
+    /// result was not UNSAT, proof production was not enabled, or no proof was
+    /// generated.
+    #[must_use]
+    pub fn export_last_unsat_bundle(&self) -> Option<ay_proof::SerializableProofBundle> {
+        let proof = self.executor.last_proof()?;
+        let terms = self.executor.terms();
+        let assertions = self.executor.context().assertions.to_vec();
+        Some(ay_proof::SerializableProofBundle::from_proof(
+            proof, terms, assertions,
+        ))
+    }
+
+    /// Render a term to a canonical, store-INDEPENDENT S-expression string
+    /// (variables by name; see [`ay_proof::render_term_canonical`]).
+    ///
+    /// This is the no-solve counterpart to the bundle: a consumer can render a
+    /// term it built in THIS solver and compare it, at the term level, against a
+    /// term embedded in a [`SerializableProofBundle`] produced by another solver
+    /// — WITHOUT running a solve and without sharing term ids. Used to bind an
+    /// embedded proof's obligation to an independently re-translated one.
+    #[must_use]
+    pub fn render_term_canonical(&self, term: super::Term) -> String {
+        ay_proof::render_term_canonical(self.executor.terms(), term.id())
+    }
+
+    /// Export the last UNSAT proof as rendered Alethe text.
+    ///
+    /// Returns `None` if the last result was not UNSAT or proofs were not enabled.
+    #[must_use]
+    pub fn export_last_proof_alethe(&self) -> Option<String> {
+        let proof = self.executor.last_proof()?;
+        let terms = self.executor.terms();
+        let assertions = &self.executor.context().assertions;
+        Some(export_alethe_with_problem_scope(proof, terms, assertions))
+    }
+
+    /// Get diagnostic (non-strict) quality metrics for the last UNSAT proof.
+    ///
+    /// This returns the same non-strict summary as `UnsatProofArtifact::quality`.
+    /// For the strict verdict, use [`last_strict_proof_quality`](Self::last_strict_proof_quality).
+    ///
+    /// Returns `None` if the last result was not UNSAT or proofs were not enabled.
+    #[must_use]
+    pub fn last_proof_quality(&self) -> Option<ProofQuality> {
+        let proof = self.executor.last_proof()?;
+        let terms = self.executor.terms();
+        check_proof_with_quality(proof, terms).ok()
+    }
+
+    /// Get strict proof validation result for the last UNSAT proof.
+    ///
+    /// Returns:
+    /// - `None` — no UNSAT proof available
+    /// - `Some(Ok(quality))` — strict validation succeeded
+    /// - `Some(Err(error))` — strict validation rejected the proof
+    ///
+    /// This is the authoritative proof validation result. Unlike
+    /// [`last_proof_quality`](Self::last_proof_quality), the strict checker
+    /// rejects theory lemmas without semantic validators and unvalidated
+    /// generic Alethe rules.
+    #[must_use]
+    pub fn last_strict_proof_quality(&self) -> Option<Result<ProofQuality, ProofCheckError>> {
+        let proof = self.executor.last_proof()?;
+        let terms = self.executor.terms();
+        Some(check_proof_strict(proof, terms))
+    }
+
+    /// Get partial check result for the last UNSAT proof.
+    ///
+    /// Returns `None` if the last result was not UNSAT or proofs were not enabled.
+    #[must_use]
+    pub fn last_partial_proof_check(&self) -> Option<PartialProofCheck> {
+        let proof = self.executor.last_proof()?;
+        let terms = self.executor.terms();
+        let (partial, _err) = check_proof_partial(proof, terms);
+        Some(partial)
+    }
+}

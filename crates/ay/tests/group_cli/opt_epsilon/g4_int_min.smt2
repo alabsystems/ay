@@ -1,0 +1,6 @@
+(declare-const x Int)
+(assert (>= x 0))
+(minimize x)
+(check-sat)
+(get-objectives)
+(get-value (x))

@@ -1,0 +1,6 @@
+(set-logic QF_ALIA)
+(declare-const a (Array Int Int))
+(declare-const x Int)
+(declare-const y Int)
+(assert (= ((as const (Array Int Int)) 8) (store (store a 2 (+ x y)) 1 5)))
+(check-sat)

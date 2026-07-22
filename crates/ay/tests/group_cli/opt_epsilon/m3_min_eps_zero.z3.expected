@@ -1,0 +1,8 @@
+sat
+(objectives
+ (x epsilon)
+)
+(
+  (define-fun x () Real
+    1.0)
+)

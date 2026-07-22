@@ -1,0 +1,12 @@
+(set-info :status sat)
+(set-logic QF_LRA)
+; x is the midpoint of a and b
+(declare-const a Real)
+(declare-const b Real)
+(declare-const x Real)
+(assert (> b a))
+(assert (= x (/ (+ a b) 2.0)))
+(assert (> x a))
+(assert (< x b))
+(check-sat)
+(exit)

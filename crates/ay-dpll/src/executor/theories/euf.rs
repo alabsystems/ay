@@ -1,0 +1,595 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates
+// Licensed under the Apache License, Version 2.0
+
+//! EUF, DT, and Array+EUF solving.
+
+mod array_congruence;
+mod array_fixpoint;
+mod array_patterns;
+mod array_row;
+mod dt;
+mod enum_sat;
+mod pigeonhole_core;
+#[cfg(test)]
+mod tests;
+
+use super::super::Executor;
+use crate::executor::theories::solve_harness::TheoryModels;
+use crate::executor_types::{Result, SolveResult};
+use crate::term_helpers::{collect_bool_arg_congruence_lemmas, or_implies_eq_endpoints};
+// #8529: Use deterministic hash sets in all builds.
+use ay_core::kani_compat::DetHashSet as HashSet;
+use ay_core::{TermId, TermStore, TheoryLemmaKind};
+use ay_euf::EufSolver;
+
+/// Collect all TermIds transitively reachable from the given root terms (#6726).
+/// Used to scope array axiom generation to terms in the current assertion set,
+/// excluding dead terms from popped scopes in the ordinary append-only
+/// history. The isolated speculative DT lane discards its entire suffix only
+/// after its solver state is dropped, before this scope is observed.
+pub(crate) fn reachable_term_set(terms: &TermStore, roots: &[TermId]) -> HashSet<TermId> {
+    let mut visited = ay_core::kani_compat::det_hash_set_with_capacity(roots.len() * 4);
+    let mut stack: Vec<TermId> = roots.to_vec();
+    while let Some(t) = stack.pop() {
+        if !visited.insert(t) {
+            continue;
+        }
+        for child in terms.children(t) {
+            stack.push(child);
+        }
+    }
+    visited
+}
+
+/// Controls whether array ROW/ROW2b axioms are generated eagerly during
+/// preprocessing or deferred to `ArraySolver::final_check()`.
+///
+/// Routes backed by `TheoryCombiner` (which includes `ArraySolver` with
+/// `set_defer_expensive_checks(true)`) already have runtime lazy ROW
+/// handling. Using `LazyRow2FinalCheck` on those routes avoids the
+/// O(selects × stores) eager blowup from ROW2b while preserving ROW1
+/// clauses that the SAT solver needs for basic store-chain reasoning.
+///
+/// Matches Z3's architecture: ROW1 (axiom 1) is always eager, ROW2b
+/// (axiom 2b upward) is deferred to `final_check_eh` (#6546 Packet 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::executor) enum ArrayAxiomMode {
+    /// Generate all axioms eagerly: structural + ROW1 + ROW2b.
+    /// Used by BV-array routes and paths without a lazy `ArraySolver`.
+    EagerAll,
+    /// Generate structural + ROW1 eagerly; defer ROW2b to
+    /// `ArraySolver::final_check()`. Matches Z3's default behavior
+    /// where `assert_store_axiom1` is always eager but `assert_store_axiom2`
+    /// with `m_array_delay_exp_axiom=true` defers expensive instances.
+    /// Used by TheoryCombiner-backed array routes (#6546 Packet 4).
+    LazyRow2FinalCheck,
+}
+
+impl Executor {
+    /// Check whether a term is in scope for array axiom generation (#6726).
+    /// Returns `true` when no scope filter is active (non-incremental mode),
+    /// when the term was created during the current fixpoint (idx >= start_len),
+    /// or when the term is reachable from current assertions.
+    #[inline]
+    fn term_in_array_scope(&self, term_id: TermId) -> bool {
+        match &self.array_axiom_scope {
+            None => true,
+            Some((reachable, start_len)) => {
+                (term_id.0 as usize) >= *start_len || reachable.contains(&term_id)
+            }
+        }
+    }
+
+    /// True when the TermStore holds a free quantifier `Var` node that is NOT
+    /// reachable from the current (ground) assertions — i.e. a leftover ghost of
+    /// a finite-domain-expanded / skolemized quantifier. After expansion replaces
+    /// `(forall ((v Bool)) (= (select a v) (select b v)))` with its ground
+    /// conjunction, the original `(select a v)` terms (index = the now-free `v`)
+    /// remain as dead terms in the ordinary append-only history. If the
+    /// array-axiom fixpoint were to treat that free `v` as a witness index,
+    /// sharing one free Bool `v`
+    /// as the extensionality / ROW witness across many array (dis)equalities
+    /// over-constrains the problem and yields spurious UNSAT. Detecting these
+    /// ghosts lets `solve_array_euf` enable reachability scoping, which keeps
+    /// legitimate fixpoint-created witnesses (idx >= start_len) and reachable
+    /// terms while excluding the unreachable ghosts. (#dis514 wrong-unsat)
+    pub(in crate::executor) fn has_unreachable_var_ghost(
+        &self,
+        reachable: &HashSet<TermId>,
+    ) -> bool {
+        let len = self.ctx.terms.len();
+        for idx in 0..len {
+            let t = TermId::new(idx as u32);
+            if matches!(self.ctx.terms.get(t), ay_core::TermData::Var(..))
+                && !reachable.contains(&t)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Cheap `Var`-tag scan: true if the TermStore holds any `Var` node at all.
+    /// Used to gate the more expensive `reachable_term_set` + ghost check — a
+    /// quantifier-free problem has no `Var` terms, so the ghost path is skipped.
+    pub(in crate::executor) fn store_has_free_var(&self) -> bool {
+        let len = self.ctx.terms.len();
+        (0..len).any(|idx| {
+            matches!(
+                self.ctx.terms.get(TermId::new(idx as u32)),
+                ay_core::TermData::Var(..)
+            )
+        })
+    }
+
+    #[allow(dead_code)]
+    fn push_array_axiom_assertion(&mut self, axiom: TermId) {
+        self.push_array_axiom_assertion_site(axiom, "unknown")
+    }
+
+    /// Debug-only helper: pretty-print a term to an s-expression up to
+    /// the given depth. Used by `AY_DEBUG_ARRAY_AXIOM_SITE` tracing.
+    fn pretty_print_term_for_debug(&self, term: TermId, depth: u32) -> String {
+        if depth == 0 {
+            return format!("#{}", term.0);
+        }
+        match self.ctx.terms.get(term) {
+            ay_core::TermData::Const(c) => format!("{c:?}"),
+            ay_core::TermData::Var(name, _) => format!("{}#{}", name, term.0),
+            ay_core::TermData::App(sym, args) => {
+                let mut s = format!("({}#{}", sym.name(), term.0);
+                for a in args {
+                    s.push(' ');
+                    s.push_str(&self.pretty_print_term_for_debug(*a, depth - 1));
+                }
+                s.push(')');
+                s
+            }
+            ay_core::TermData::Not(inner) => {
+                format!(
+                    "(not#{} {})",
+                    term.0,
+                    self.pretty_print_term_for_debug(*inner, depth - 1)
+                )
+            }
+            ay_core::TermData::Ite(c, t, e) => {
+                format!(
+                    "(ite#{} {} {} {})",
+                    term.0,
+                    self.pretty_print_term_for_debug(*c, depth - 1),
+                    self.pretty_print_term_for_debug(*t, depth - 1),
+                    self.pretty_print_term_for_debug(*e, depth - 1)
+                )
+            }
+            _ => format!("#{}", term.0),
+        }
+    }
+
+    // `pub(in crate::executor)`: also used by the RoundingMode finite-domain
+    // pass (executor/rm_domain.rs call sites in check_sat.rs /
+    // check_sat_assuming.rs) so its injected axioms carry the same
+    // proof/unsat-core provenance as the array/enum-coverage axioms.
+    pub(in crate::executor) fn push_array_axiom_assertion_site(
+        &mut self,
+        axiom: TermId,
+        site: &str,
+    ) {
+        // Do not retain or certify a generator result that simplified to the
+        // Boolean constant `true`.  Besides wasting assertion/proof space, the
+        // old site-based fallback labelled such tautologies as ROW2 even though
+        // they contain no read-over-write instance at all.
+        if axiom == self.ctx.terms.true_term() {
+            return;
+        }
+        if ay_core::debug_channel_active(ay_core::DebugChannel::ArrayAxiomSite) {
+            let pretty = self.pretty_print_term_for_debug(axiom, 3);
+            eprintln!(
+                "[array_axiom] site={} axiom=#{} pretty={}",
+                site, axiom.0, pretty
+            );
+        }
+        self.ctx.assertions.push(axiom);
+        if self.produce_proofs_enabled() {
+            // Proof attribution is a semantic boundary, not a diagnostic
+            // convenience.  Only advertise an Alethe ROW rule when the proof
+            // checker's own exact recognizer accepts the generated clause.
+            // All derived array consequences (congruence bridges, disjunctive
+            // store lemmas, finite-domain expansions, and so on) remain honest
+            // `Generic` lemmas until an explicit primitive proof expansion is
+            // available.  In particular, the `site` string must never decide a
+            // proof rule.
+            let clause = match self.ctx.terms.get(axiom) {
+                ay_core::TermData::App(sym, args) if sym.name() == "or" => args.clone(),
+                _ => vec![axiom],
+            };
+            if let Some(index_eq) = ay_proof::recognize_array_select_store(&self.ctx.terms, &clause)
+            {
+                let _ = self.proof_tracker.add_theory_lemma_with_kind(
+                    vec![axiom],
+                    TheoryLemmaKind::ArraySelectStore { index_eq },
+                );
+            } else {
+                let _ = self.proof_tracker.add_theory_lemma(vec![axiom]);
+            }
+        }
+    }
+
+    /// #mgr-uf-ackermann: emit pairwise functional-congruence (Ackermann)
+    /// instances for ground uninterpreted applications of the same symbol:
+    /// `(= a1 b1) ∧ … ∧ (= an bn) → (= f(a…) f(b…))`.
+    ///
+    /// Demand channel for the UFLIA model-based combination gap (U4_rand
+    /// class): the lazy Nelson-Oppen loop only enforces congruence between
+    /// application terms whose arguments are EUF-equal by *assertion*; a
+    /// candidate LIA model may then assign two argument tuples the same
+    /// values while their applications differ — a first-order-inconsistent
+    /// model the independent gate rightly rejects, fail-closing to unknown.
+    /// Asserting the Ackermann instances makes functional consistency visible
+    /// to the SAT+LIA search itself, so it either separates the argument
+    /// values or merges the application values.
+    ///
+    /// SOUNDNESS: every instance is a congruence tautology valid in every
+    /// interpretation of the uninterpreted symbols, recorded as a theory
+    /// lemma through `push_array_axiom_assertion_site`; verdicts remain
+    /// licensed by the solve pipeline + the independent model gate.
+    /// BOUND: pairs within each same-symbol group; `cap` fences quadratic
+    /// blowup (the stage only runs on otherwise-unknown ground problems).
+    /// Returns the number of clauses emitted.
+    pub(in crate::executor) fn add_uf_ackermann_congruence_clauses(&mut self, cap: usize) -> usize {
+        use ay_core::kani_compat::DetHashMap;
+        let should_stop = self.make_should_stop();
+        let mut groups: DetHashMap<(String, usize), Vec<(TermId, Vec<TermId>)>> =
+            DetHashMap::default();
+        for idx in 0..self.ctx.terms.len() {
+            let term_id = TermId(idx as u32);
+            if let ay_core::TermData::App(sym, args) = self.ctx.terms.get(term_id) {
+                if args.is_empty() || crate::features::is_builtin_symbol_name(sym.name()) {
+                    continue;
+                }
+                groups
+                    .entry((sym.name().to_string(), args.len()))
+                    .or_default()
+                    .push((term_id, args.clone()));
+            }
+        }
+        let mut keys: Vec<(String, usize)> = groups.keys().cloned().collect();
+        keys.sort_unstable();
+        let mut emitted = 0_usize;
+        for key in keys {
+            let apps = &groups[&key];
+            for i in 0..apps.len() {
+                for j in (i + 1)..apps.len() {
+                    if emitted >= cap || should_stop() {
+                        return emitted;
+                    }
+                    let (lhs_app, ref lhs_args) = apps[i];
+                    let (rhs_app, ref rhs_args) = apps[j];
+                    if self.ctx.terms.sort(lhs_app) != self.ctx.terms.sort(rhs_app)
+                        || lhs_args
+                            .iter()
+                            .zip(rhs_args.iter())
+                            .any(|(&a, &b)| self.ctx.terms.sort(a) != self.ctx.terms.sort(b))
+                    {
+                        // Same-named symbol at different signatures: skip.
+                        continue;
+                    }
+                    let mut disj: Vec<TermId> = Vec::with_capacity(lhs_args.len() + 1);
+                    for (&a, &b) in lhs_args.iter().zip(rhs_args.iter()) {
+                        if a == b {
+                            continue;
+                        }
+                        let arg_eq = self.ctx.terms.mk_eq(a, b);
+                        disj.push(self.ctx.terms.mk_not(arg_eq));
+                    }
+                    let app_eq = self.ctx.terms.mk_eq(lhs_app, rhs_app);
+                    disj.push(app_eq);
+                    let clause = if disj.len() == 1 {
+                        disj[0]
+                    } else {
+                        self.ctx.terms.mk_or(disj)
+                    };
+                    self.push_array_axiom_assertion_site(clause, "uf_ackermann");
+                    emitted += 1;
+                }
+            }
+        }
+        emitted
+    }
+
+    /// Solve QF_UF using eager DPLL(T) with theory-SAT interleaving.
+    ///
+    /// Uses `solve_incremental_split_loop_pipeline!` with `eager_extension: true`
+    /// so the EUF solver runs as a TheoryExtension during BCP. This ensures all
+    /// theory-relevant equality atoms are assigned by the SAT solver — the lazy
+    /// pipeline could leave them unassigned and miss congruence closure conflicts.
+    ///
+    /// Or-eq-lemma implications (transitivity shortcuts for eq_diamond patterns)
+    /// are injected as assertion-level implications that flow through Tseitin
+    /// encoding automatically.
+    pub(in crate::executor) fn solve_euf(&mut self) -> Result<SolveResult> {
+        if self.should_abort_theory_loop() {
+            return Ok(SolveResult::Unknown);
+        }
+        // Lift ITEs from equalities involving uninterpreted sorts.
+        self.ctx.assertions = self.ctx.terms.lift_arithmetic_ite_all(&self.ctx.assertions);
+
+        // Pre-compute or_eq_lemma pairs and inject as assertion-level
+        // implications (¬or_term ∨ eq_term). These flow through Tseitin
+        // encoding via pipeline_incremental_setup!, ensuring eq_terms become
+        // active theory atoms via collect_active_theory_atoms.
+        {
+            let mut seen: HashSet<(TermId, TermId)> = HashSet::default();
+            let len = self.ctx.terms.len();
+            for idx in 0..len {
+                let t = TermId(idx as u32);
+                if let Some((a, b)) = or_implies_eq_endpoints(&self.ctx.terms, t) {
+                    let eq_term = self.ctx.terms.mk_eq(a, b);
+                    if seen.insert((t, eq_term)) {
+                        let not_or = self.ctx.terms.mk_not(t);
+                        let implication = self.ctx.terms.mk_or(vec![not_or, eq_term]);
+                        self.ctx.assertions.push(implication);
+                    }
+                }
+            }
+        }
+
+        // #bool-arg-congruence: Inject functional-congruence lemmas for UF
+        // applications that differ only in Bool-sorted argument positions.
+        //
+        // When a UF `f` is applied to Bool arguments — e.g. `fb(true)` vs
+        // `fb(p0)`, or CLEARSY's `(bool (and ...))` vs `(bool (and ...'))` — the
+        // congruence axiom requires `f(a) = f(b)` whenever the Bool args `a`, `b`
+        // share a truth value. Those Bool args appear ONLY inside opaque UF
+        // applications, so the SAT layer never branches on them and the EUF
+        // truth-value class merge never fires (the args never reach EUF's
+        // `assigns`). The result is a non-congruent model accepted as SAT.
+        //
+        // Injecting the lemma `(/\_i a_i = b_i) -> (f(a) = f(b))` as the clause
+        // `\/_i ~(a_i = b_i) \/ (f(a) = f(b))` flows the Bool-arg equalities and
+        // the application equality through Tseitin into the SAT skeleton, so
+        // DPLL(T) decides the Bool args and EUF enforces the congruence. This is
+        // sound (a valid axiom instance) and complete over the Bool-arg gap.
+        //
+        // Always injected in the single-shot case (the former
+        // AY_EUF_BOOL_ARG_CONGRUENCE=0 opt-out is removed; ON was the
+        // default).
+        //
+        // SCOPE: eager lemma injection runs in NON-incremental (single
+        // check-sat) mode only. In deep incremental sessions (e.g. the
+        // 20190906-CLEARSY proof-obligation files: 100+ check-sats, dense
+        // equality structure) the lemmas' fresh equality atoms inflate the EUF
+        // proof-forest and the per-conflict `explain()` walk, collapsing
+        // completeness (121 -> ~50 solved check-sats — measured). Those
+        // incremental files are already SOUND under the base solver (0 z3
+        // conflicts across the CLEARSY sweep), so skipping the lemma there costs
+        // no soundness. The lemma is reserved for the single-shot case (the
+        // false-SAT witnesses, fuzz) where Bool UF-args are buried and would
+        // otherwise never reach EUF. (The former
+        // `AY_EUF_BOOL_ARG_LEMMA_INCREMENTAL=1` incremental force-enable is
+        // removed; OFF in incremental mode is the measured-sound default.)
+        if !self.incremental_mode {
+            let reachable = reachable_term_set(&self.ctx.terms, &self.ctx.assertions);
+            let lemmas = collect_bool_arg_congruence_lemmas(&self.ctx.terms, &reachable);
+            let mut seen: HashSet<(TermId, TermId)> = HashSet::default();
+            for lemma in lemmas {
+                if !seen.insert((lemma.app_a, lemma.app_b)) {
+                    continue;
+                }
+                // Consequent: f(a) = f(b). Skip degenerate self-equalities.
+                let app_eq = self.ctx.terms.mk_eq(lemma.app_a, lemma.app_b);
+                // Build clause literals: ~(a_i = b_i) for each differing Bool
+                // position, plus the consequent app_eq.
+                let mut clause_lits: Vec<TermId> = Vec::with_capacity(lemma.bool_pairs.len() + 1);
+                for (a, b) in &lemma.bool_pairs {
+                    let arg_eq = self.ctx.terms.mk_eq(*a, *b);
+                    let not_arg_eq = self.ctx.terms.mk_not(arg_eq);
+                    clause_lits.push(not_arg_eq);
+                }
+                clause_lits.push(app_eq);
+                let clause = self.ctx.terms.mk_or(clause_lits);
+                self.ctx.assertions.push(clause);
+            }
+        }
+
+        let solve_interrupt = self.solve_interrupt.clone();
+        let solve_deadline = self.solve_deadline.clone();
+        // #bool-arg-congruence: the SOUND post-SAT model-validation guard runs in
+        // BOTH incremental and non-incremental modes. It only ever downgrades a
+        // candidate `Sat` to `Unknown` (never asserts UNSAT), so it carries zero
+        // false-UNSAT risk. In incremental mode it is the soundness net for the
+        // Bool-arg congruence FALSE-SATs (e.g. `uf_inc_1560`: `pb` distinguishes
+        // `fb(p1)` / `fb(false)`, forcing `p1 = true`, which then refutes a
+        // duplicate-`distinct` — a backward-congruence chain the SAT layer never
+        // branches on because the Bool args live only inside opaque UF apps). The
+        // base solver alone false-SATs these (it accepts a non-congruent model);
+        // the eager congruence LEMMA that closes them non-incrementally is unsound
+        // across push/pop (its injected clauses leak through the persistent SAT
+        // state and emit false UNSATs), so the guard — not the lemma — is the
+        // incremental fix.
+        //
+        // Completeness cost: the guard refuses to certify a non-congruent model
+        // even when a *different* congruent model exists (z3 finds one), so on
+        // dense CLEARSY proof-obligation files it downgrades a small number of
+        // SAT verdicts that were backed by non-congruent models to `Unknown`
+        // (measured ~0.6% of aligned check-sats). This is a sound trade: those
+        // verdicts were certified against models that violate functional
+        // congruence. `AY_EUF_BOOL_ARG_VALIDATE=0` disables the guard entirely
+        // for experiments.
+        self.with_isolated_incremental_state(None, |this| {
+            solve_incremental_split_loop_pipeline!(this,
+                tag: "EUF",
+                persistent_sat_field: persistent_sat,
+                create_theory: {
+                    // The post-SAT Bool-arg congruence guard stays at its EUF
+                    // default (ON via `AY_EUF_BOOL_ARG_VALIDATE`) in both
+                    // incremental and non-incremental mode — it only downgrades
+                    // Sat -> Unknown, never asserts UNSAT.
+                    EufSolver::new(&this.ctx.terms)
+                },
+                extract_models: |theory| {
+                    theory.scope_model_to_roots(&this.ctx.assertions);
+                    let euf = theory.extract_model();
+                    theory.clear_model_scope();
+                    TheoryModels {
+                        euf: Some(euf),
+                        ..TheoryModels::default()
+                    }
+                },
+                max_splits: 1,
+                pre_theory_import: |_theory, _lc, _hc, _ds| {},
+                post_theory_export: |_theory| {
+                    (vec![], Default::default(), Default::default())
+                },
+                eager_extension: true,
+                pre_iter_check: |_s| {
+                    solve_interrupt
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                        || solve_deadline.expired()
+                },
+                // #6812 sound relaxation (QF_ALIA M3): accept a post-expression-split
+                // propositional UNSAT ONLY when a FRESH UF+LIA combiner re-derives
+                // UNSAT from the ORIGINAL `ctx.assertions` (verify-before-accept via
+                // `verify_post_split_unsat_via_fresh_solve`). Non-optimistic: any
+                // fresh verdict other than Unsat escalates to Unknown as before.
+                // Rescues Ackermannized array-UNSAT cores (e.g. pp-bloaddata) that
+                // solve_euf refutes only after expression splits.
+                verify_unsat_after_splits: true
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod array_axiom_attribution_tests {
+    use super::*;
+    use ay_core::{ArraySort, ProofStep, Sort, Symbol};
+
+    fn int_array_sort() -> Sort {
+        Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Int)))
+    }
+
+    #[test]
+    fn push_array_axiom_assertion_site_attributes_row1_as_positive() {
+        let mut exec = Executor::new();
+        exec.proof_tracker.enable();
+        let a = exec.ctx.terms.mk_var("a", int_array_sort());
+        let i = exec.ctx.terms.mk_var("i", Sort::Int);
+        let v = exec.ctx.terms.mk_var("v", Sort::Int);
+        let store = exec.ctx.terms.mk_store(a, i, v);
+        // Preserve the primitive ROW1 syntax: `mk_select` intentionally folds
+        // this exact read to `v` before proof attribution can inspect it.
+        let select = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("select"), [store, i], Sort::Int);
+        let row1 = exec.ctx.terms.mk_eq(select, v);
+
+        exec.push_array_axiom_assertion_site(row1, "row1_trivial");
+        let proof = exec.proof_tracker.take_proof();
+
+        match &proof.steps[0] {
+            ProofStep::TheoryLemma { kind, clause, .. } => {
+                assert_eq!(*kind, TheoryLemmaKind::ArraySelectStore { index_eq: true });
+                assert_eq!(clause, &vec![row1]);
+            }
+            other => panic!("expected theory lemma, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_array_axiom_assertion_site_attributes_row2_as_negative() {
+        let mut exec = Executor::new();
+        exec.proof_tracker.enable();
+        let a = exec.ctx.terms.mk_var("a", int_array_sort());
+        let i = exec.ctx.terms.mk_var("i", Sort::Int);
+        let j = exec.ctx.terms.mk_var("j", Sort::Int);
+        let v = exec.ctx.terms.mk_var("v", Sort::Int);
+        let store = exec.ctx.terms.mk_store(a, i, v);
+        let select_store = exec.ctx.terms.mk_select(store, j);
+        let select_base = exec.ctx.terms.mk_select(a, j);
+        let idx_eq = exec.ctx.terms.mk_eq(i, j);
+        let row2_eq = exec.ctx.terms.mk_eq(select_store, select_base);
+        let row2 = exec.ctx.terms.mk_or(vec![idx_eq, row2_eq]);
+
+        exec.push_array_axiom_assertion_site(row2, "row2_clause");
+        let proof = exec.proof_tracker.take_proof();
+
+        match &proof.steps[0] {
+            ProofStep::TheoryLemma { kind, clause, .. } => {
+                assert_eq!(*kind, TheoryLemmaKind::ArraySelectStore { index_eq: false });
+                assert_eq!(clause, &vec![row2]);
+            }
+            other => panic!("expected theory lemma, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_array_axiom_assertion_site_keeps_unchecked_extensionality_generic() {
+        let mut exec = Executor::new();
+        exec.proof_tracker.enable();
+        let a = exec.ctx.terms.mk_var("a", int_array_sort());
+        let b = exec.ctx.terms.mk_var("b", int_array_sort());
+        let k = exec.ctx.terms.mk_var("k", Sort::Int);
+        let array_eq = exec.ctx.terms.mk_eq(a, b);
+        let sel_a = exec.ctx.terms.mk_select(a, k);
+        let sel_b = exec.ctx.terms.mk_select(b, k);
+        let sel_eq = exec.ctx.terms.mk_eq(sel_a, sel_b);
+        let not_sel_eq = exec.ctx.terms.mk_not(sel_eq);
+        let ext = exec.ctx.terms.mk_or(vec![array_eq, not_sel_eq]);
+
+        exec.push_array_axiom_assertion_site(ext, "ext_axiom");
+        let proof = exec.proof_tracker.take_proof();
+
+        match &proof.steps[0] {
+            ProofStep::TheoryLemma { kind, clause, .. } => {
+                assert_eq!(*kind, TheoryLemmaKind::Generic);
+                assert_eq!(clause, &vec![ext]);
+            }
+            other => panic!("expected theory lemma, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_array_axiom_assertion_site_uses_shape_not_site_name() {
+        let mut exec = Executor::new();
+        exec.proof_tracker.enable();
+        let a = exec.ctx.terms.mk_var("a", int_array_sort());
+        let i = exec.ctx.terms.mk_var("i", Sort::Int);
+        let j = exec.ctx.terms.mk_var("j", Sort::Int);
+        let v = exec.ctx.terms.mk_var("v", Sort::Int);
+        let store = exec.ctx.terms.mk_store(a, i, v);
+        let select_store = exec.ctx.terms.mk_select(store, j);
+        let select_base = exec.ctx.terms.mk_select(a, j);
+        let idx_eq = exec.ctx.terms.mk_eq(i, j);
+        let row2_eq = exec.ctx.terms.mk_eq(select_store, select_base);
+        let row2 = exec.ctx.terms.mk_or(vec![idx_eq, row2_eq]);
+
+        // Deliberately pass a ROW1-looking diagnostic label.  The exact clause
+        // shape, not this string, must determine proof attribution.
+        exec.push_array_axiom_assertion_site(row2, "row1_trivial");
+        let proof = exec.proof_tracker.take_proof();
+
+        match &proof.steps[0] {
+            ProofStep::TheoryLemma { kind, clause, .. } => {
+                assert_eq!(*kind, TheoryLemmaKind::ArraySelectStore { index_eq: false });
+                assert_eq!(clause, &vec![row2]);
+            }
+            other => panic!("expected theory lemma, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_array_axiom_assertion_site_skips_true_axioms() {
+        let mut exec = Executor::new();
+        exec.proof_tracker.enable();
+        let assertions_before = exec.ctx.assertions.len();
+
+        let truth = exec.ctx.terms.true_term();
+        exec.push_array_axiom_assertion_site(truth, "store_value_cong");
+
+        assert_eq!(exec.ctx.assertions.len(), assertions_before);
+        assert_eq!(exec.proof_tracker.num_steps(), 0);
+    }
+}

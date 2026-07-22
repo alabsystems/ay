@@ -1,0 +1,12 @@
+(set-info :status unsat)
+(set-logic QF_LRA)
+; Triangle inequality: a + b >= c must hold, but we assert violation
+(declare-const a Real)
+(declare-const b Real)
+(declare-const c Real)
+(assert (= a 1.0))
+(assert (= b 2.0))
+(assert (= c 5.0))
+(assert (>= (+ a b) c))
+(check-sat)
+(exit)

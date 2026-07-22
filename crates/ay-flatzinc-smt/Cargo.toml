@@ -1,0 +1,28 @@
+# Author: Andrew Yates
+# FlatZinc to SMT-LIB2 translation for MiniZinc Challenge entry
+
+[package]
+name = "ay-flatzinc-smt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FlatZinc to SMT-LIB2 constraint translation"
+readme.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+
+[lints]
+workspace = true
+
+[dependencies]
+ay-flatzinc-parser.workspace = true
+ay-dpll.workspace = true
+ay-frontend.workspace = true
+ay-core.workspace = true
+num-traits.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ay-test-support.workspace = true

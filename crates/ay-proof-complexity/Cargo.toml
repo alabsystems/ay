@@ -1,0 +1,24 @@
+[package]
+name = "ay-proof-complexity"
+version.workspace = true
+edition.workspace = true
+description = "Proof complexity analysis tools for AY"
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+ay-core.workspace = true
+ay-sat.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

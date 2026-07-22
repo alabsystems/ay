@@ -1,0 +1,7 @@
+(set-logic ALL)
+(declare-const z (_ BitVec 2))
+(declare-const i Real)
+(declare-const q Bool)
+(assert (= (bv2nat z) (bv2nat z)))
+(assert (= (ite q i (- 1)) 0.0))
+(check-sat)

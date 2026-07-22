@@ -1,0 +1,10 @@
+; AY=sat z3=unsat (SOUNDNESS CONFLICT) logic=QF_SLIA
+(set-logic QF_SLIA)
+(declare-fun v1 () (Seq Int))
+(declare-fun v2 () (Seq Int))
+(declare-fun v7 () Int)
+(declare-fun v10 () Int)
+(assert (= v2 (seq.unit 0)))
+(assert (= v10 0))
+(assert (and (>= (- -3 4) (seq.nth v2 v10)) (not (<= v7 3))))
+(check-sat)

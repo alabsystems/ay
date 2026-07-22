@@ -1,0 +1,12 @@
+(set-logic QF_ALIA)
+; Nested stores at distinct indices: SAT
+(declare-const a (Array Int Int))
+(declare-const i Int)
+(declare-const j Int)
+(assert (> i 0))
+(assert (< i 10))
+(assert (= j (+ i 1)))
+(assert (= (select (store (store a i 1) j 2) i) 1))
+(assert (= (select (store (store a i 1) j 2) j) 2))
+(check-sat)
+(exit)

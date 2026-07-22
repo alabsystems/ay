@@ -1,0 +1,20 @@
+[package]
+name = "ay-intsat"
+description = "IntSat: CDCL-style conflict-driven ILP solver for LIA"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ay-core.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+num-integer.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

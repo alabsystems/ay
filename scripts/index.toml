@@ -1,0 +1,970 @@
+# AY script index, consumed by `ay scripts`. Public half; internal entries live
+# in scripts/index-internal.toml (never published). Every in-scope tracked
+# script has exactly one entry across the two files, or matches [policy].exempt
+# — `ay scripts check` enforces the bijection, fail-closed.
+#
+# Scope (fixed): the index covers runnable/sourceable scripts under scripts/,
+# competition/, benchmarks/, deploy/, proofs/, crates/**/proofs/, plus runnable
+# scripts under non-allowlisted dirs (docs/, reports/, tools/), which are
+# internal by definition. Out of scope: the [policy].exempt globs below.
+#
+# The index is authoritative; the only in-file metadata is the one-line
+# `# ay-script: <name>` header after the shebang.
+
+schema_version = 1
+
+[policy]
+exempt = [
+  "bindings/python/ayz3/**",     # library modules (ayz3_fuzz indexed once as `python -m ayz3_fuzz`)
+  "bindings/python/ayz3_fuzz/**", # covered by the single ayz3-fuzz entry
+  "bindings/python/tests/**",    # pytest-discovered
+  "bindings/python/examples/**", # README-documented examples
+  "bindings/python/conftest.py",
+  "bindings/python/setup.py",    # packaging convention
+  "third_party/**",              # vendored
+  "publish/**",                  # publication-repo shim
+]
+
+[[script]]
+name    = "sat-sweep"
+path    = "scripts/sweep.py"
+lang    = "python"
+group   = "bench.sat"
+summary = "Lightweight SAT sweep harness: one or more solvers over a DIMACS corpus at a fixed timeout."
+publish = "public"
+tools   = ["kissat"]
+requires = ["oom-guard"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "smt-diff-sweep"
+path    = "scripts/diff_sweep.py"
+lang    = "python"
+group   = "bench.smt"
+summary = "Differential SMT sweep: AY vs a field of competitor solvers over an .smt2 corpus."
+publish = "public"
+tools   = ["z3", "cvc5", "smtinterpol"]
+requires = ["oom-guard"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "smtcomp-restage"
+path    = "scripts/smtcomp_harness.py"
+lang    = "python"
+group   = "compare.smt"
+summary = "SMT-COMP 2025 restage harness: AY and the real 2025 entrants on the exact 2025 selection."
+publish = "public"
+requires = ["oom-guard"]
+cli     = "ay bench compare run smtcomp-2025"
+
+[[script]]
+name    = "chccomp-harness"
+path    = "scripts/chccomp_harness.py"
+lang    = "python"
+group   = "compare.chc"
+summary = "CHC-COMP multi-solver harness: AY vs Golem/Eldarica/Spacer with ground-truth cross-validation."
+publish = "public"
+tools   = ["golem", "eldarica", "z3"]
+requires = ["oom-guard"]
+cli     = "ay bench compare run chccomp-2025"
+
+[[script]]
+name    = "pbcomp-harness"
+path    = "scripts/pbcomp_harness.py"
+lang    = "python"
+group   = "compare.pb"
+summary = "PB-COMP harness: ay pb solve over OPB/WBO instances under competition budgets."
+publish = "public"
+requires = ["oom-guard"]
+cli     = "ay bench compare run pbcomp-2026"
+
+[[script]]
+name    = "pb-sweep"
+path    = "scripts/pb_sweep.py"
+lang    = "python"
+group   = "bench.pb"
+summary = "Pseudo-Boolean sweep: AY-PB vs a reference (RoundingSat) on OPB/WBO with verdict cross-checks."
+publish = "public"
+tools   = ["roundingsat"]
+requires = ["oom-guard"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "wind-tunnel"
+path    = "scripts/wind_tunnel.py"
+lang    = "python"
+group   = "bench.core"
+summary = "The Wind Tunnel: full-corpus PAR-2 evaluation with an independent output checker."
+publish = "public"
+requires = ["oom-guard"]
+cli_note = "campaign M0 methodology"
+
+[[script]]
+name    = "sat-compare"
+path    = "scripts/sat_bench/sat_compare.py"
+lang    = "python"
+group   = "compare.sat"
+summary = "Head-to-head SAT comparison harness: AY vs a reference (e.g. Kissat) with verdict cross-validation."
+publish = "public"
+requires = ["oom-guard"]
+cli     = "ay bench compare run satcomp-2025"
+docs    = "scripts/sat_bench/README.md"
+
+[[script]]
+name    = "sat-attribute"
+path    = "scripts/sat_bench/attribute.py"
+lang    = "python"
+group   = "bench.sat"
+summary = "Classify a sat_compare results JSON: bucket instances and attribute the gap by family."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+docs    = "scripts/sat_bench/README.md"
+
+[[script]]
+name    = "sat-bve-audit"
+path    = "scripts/sat_bench/audit.py"
+lang    = "python"
+group   = "bench.sat"
+summary = "Soundness audit for the BVE-enabled build: flag wrong answers on known-verdict instances."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+docs    = "scripts/sat_bench/README.md"
+
+[[script]]
+name    = "sat-combine-threeway"
+path    = "scripts/sat_bench/combine_threeway.py"
+lang    = "python"
+group   = "bench.sat"
+summary = "Combine the split three-way @300s result JSONs into the full-set verdict."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+docs    = "scripts/sat_bench/README.md"
+
+[[script]]
+name    = "sat-download-2025"
+path    = "scripts/sat_bench/download_2025.py"
+lang    = "python"
+group   = "corpus.fetch"
+summary = "Download a stratified sample of SAT-COMP main_2025 from GBD by content hash."
+publish = "public"
+cli_note = "no fronting subcommand yet; absorb into corpora.toml (gbd) post-0.1.0"
+
+[[script]]
+name    = "mzn-run"
+path    = "scripts/mzn_challenge/run.py"
+lang    = "python"
+group   = "compare.mzn"
+summary = "Run AY over the MiniZinc Challenge 2025 corpus; emit a results vector for the retroactive scorer."
+publish = "public"
+tools   = ["minizinc"]
+requires = ["oom-guard"]
+cli     = "ay bench compare run mznc-2025"
+
+[[script]]
+name    = "mzn-score"
+path    = "scripts/mzn_challenge/score.py"
+lang    = "python"
+group   = "compare.mzn"
+summary = "Retroactive MiniZinc Challenge scorer, validated against the official pairwise score tensor."
+publish = "public"
+entrypoint = "library"
+
+[[script]]
+name    = "mzn-score-ay"
+path    = "scripts/mzn_challenge/score_ay.py"
+lang    = "python"
+group   = "compare.mzn"
+summary = "Score an AY results vector against the real MiniZinc Challenge 2025 field."
+publish = "public"
+requires = ["mzn-score"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "mzn-setup"
+path    = "scripts/mzn_challenge/setup.sh"
+lang    = "bash"
+group   = "compare.mzn"
+summary = "Reconstitute the MiniZinc Challenge 2025 harness on a fresh machine (minizinc, corpus, fzn-exec)."
+publish = "public"
+tools   = ["minizinc"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "oom-guard"
+path    = "scripts/_oom_guard.py"
+lang    = "python"
+group   = "lib"
+summary = "Aggregate admission control for harness children: cap concurrency, hand each child MEMLIMIT/NBCORE env."
+publish = "public"
+entrypoint = "library"
+
+[[script]]
+name    = "oom-guard-tests"
+path    = "scripts/tests/test_oom_guard.py"
+lang    = "python"
+group   = "test"
+summary = "Tests for _oom_guard.py resource planning and the harness wiring."
+publish = "public"
+entrypoint = "test"
+
+[[script]]
+name    = "chccomp-campaign-oom-guard-tests"
+path    = "scripts/tests/test_chccomp_campaign_oom_guard.py"
+lang    = "python"
+group   = "test"
+summary = "Resource-envelope recording checks for the CHC campaign scripts."
+publish = "public"
+entrypoint = "test"
+
+[[script]]
+name    = "chc-parity-diff"
+path    = "scripts/chc_parity_diff.py"
+lang    = "python"
+group   = "bench.chc"
+summary = "CHC parity differential: ay --chc vs z3 fp.engine=spacer on a benchexec .set."
+publish = "public"
+tools   = ["z3"]
+requires = ["oom-guard"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "chc-flag-ab"
+path    = "scripts/chc_flag_ab.py"
+lang    = "python"
+group   = "bench.chc"
+summary = "A/B a set of ay --chc env configs on the ref_only instances from a baseline JSON."
+publish = "public"
+tools   = ["z3"]
+requires = ["oom-guard"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "chc-refonly-time"
+path    = "scripts/chc_refonly_time.py"
+lang    = "python"
+group   = "bench.chc"
+summary = "Measure how many ref_only instances AY closes at a longer, competition-realistic timeout."
+publish = "public"
+tools   = ["z3"]
+requires = ["oom-guard"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "chc-disagreement-audit"
+path    = "scripts/chc_disagreement_audit.py"
+lang    = "python"
+group   = "bench.chc"
+summary = "Arbitrate every AY-vs-ground-truth disagreement in a harness run."
+publish = "public"
+tools   = ["z3"]
+requires = ["oom-guard"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "chc-cert-check"
+path    = "scripts/chc_cert_check.py"
+lang    = "python"
+group   = "audit.chc"
+summary = "Independent CHC SAFE-certificate checker (external SMT arbiter)."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "chc-baseline-compare"
+path    = "scripts/chc_baseline_compare.py"
+lang    = "python"
+group   = "gate.chc"
+summary = "Compare current AY CHC results against a checked-in baseline snapshot."
+publish = "public"
+cli     = "ay submission"
+
+[[script]]
+name    = "chccomp-build-baseline"
+path    = "scripts/chccomp_build_baseline.py"
+lang    = "python"
+group   = "bench.chc"
+summary = "Assemble a CHC regression baseline from prior AY harness runs."
+publish = "public"
+status  = "deprecated"
+cli_note = "deprecated (zero refs); delete after one release"
+
+[[script]]
+name    = "chccomp-regression"
+path    = "scripts/chccomp_regression.py"
+lang    = "python"
+group   = "gate.chc"
+summary = "Regression safety net: re-run every baselined CHC solve; fail on wrong answers or regressions."
+publish = "public"
+requires = ["oom-guard"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "chccomp-track-sweep"
+path    = "scripts/chccomp_track_sweep.py"
+lang    = "python"
+group   = "bench.chc"
+summary = "Stratified-sample standings sweep across CHC-COMP tracks."
+publish = "public"
+requires = ["oom-guard"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "chccomp-late-preflight"
+path    = "scripts/chccomp_late_entry_preflight.py"
+lang    = "python"
+group   = "compat.chc"
+summary = "Compatibility wrapper for the Rust CHC-COMP late-entry preflight."
+publish = "public"
+status  = "deprecated"
+replaced_by = "ay submission"
+cli_note = "compat shim for ay submission"
+
+[[script]]
+name    = "chccomp-late-artifact-check"
+path    = "scripts/chccomp_late_entry_artifact_build_check.py"
+lang    = "python"
+group   = "compat.chc"
+summary = "Compatibility metadata for CHC-COMP late-entry artifact checks."
+publish = "public"
+status  = "deprecated"
+replaced_by = "ay submission"
+cli_note = "compat shim for ay submission"
+
+[[script]]
+name    = "rewrite-oracle-build"
+path    = "scripts/build_rewrite_oracle.py"
+lang    = "python"
+group   = "oracle.rewrite"
+summary = "Regenerate the fast-core rewrite golden oracle from AY harness results."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "rewrite-oracle-check"
+path    = "scripts/rewrite_oracle_check.py"
+lang    = "python"
+group   = "oracle.rewrite"
+summary = "Regression oracle for the hash-consing / fast-core rewrite: run a binary on the golden verdict set."
+publish = "public"
+requires = ["oom-guard"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "sat-soundness-gate"
+path    = "scripts/ci/sat_soundness_gate.sh"
+lang    = "bash"
+group   = "gate.soundness"
+summary = "SAT soundness gate: run ay on labeled vendored CNFs; fail the build on wrong verdicts."
+publish = "public"
+cli     = "ay gate"
+
+[[script]]
+name    = "smt-soundness-gate"
+path    = "scripts/ci/smt_soundness_gate.sh"
+lang    = "bash"
+group   = "gate.soundness"
+summary = "SMT soundness-differential gate; the in-tree pre-push net."
+publish = "public"
+cli     = "ay gate"
+
+[[script]]
+name    = "pre-push-hook"
+path    = "scripts/git-hooks/pre-push"
+lang    = "bash"
+group   = "hook"
+summary = "In-tree pre-push hook: runs the SMT soundness-differential gate before every push."
+publish = "public"
+entrypoint = "hook"
+docs    = "scripts/git-hooks/README.md"
+
+[[script]]
+name    = "smt-diff-fuzz"
+path    = "scripts/diff_fuzz.py"
+lang    = "python"
+group   = "fuzz"
+summary = "Differential SMT fuzzer: random well-typed formulas in a declared logic, AY vs Z3."
+publish = "public"
+tools   = ["z3"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "smt-diff-fuzz-dt"
+path    = "scripts/diff_fuzz_dt.py"
+lang    = "python"
+group   = "fuzz"
+summary = "Differential SMT fuzzer for datatypes (QF_DT, QF_UFDT, QF_UFDTLIA, AUFDTLIA)."
+publish = "public"
+tools   = ["z3"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "word-eq-diff-fuzz"
+path    = "scripts/fuzz/word_eq_diff_fuzz.py"
+lang    = "python"
+group   = "fuzz"
+summary = "Differential soundness fuzz for word-equation (string) solving."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "planted-sat-fuzz"
+path    = "scripts/fuzz/decompose_planted_sat_fuzz.py"
+lang    = "python"
+group   = "fuzz"
+summary = "Differential soundness fuzz for SCC equivalent-literal substitution on planted-SAT CNFs."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "z3py-cascade-check"
+path    = "scripts/verify_z3py_cascade.py"
+lang    = "python"
+group   = "audit.z3"
+summary = "Stock-z3py cascade verification against AY's libz3-compatible dylib."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "smtcomp-fetch"
+path    = "scripts/download_smtcomp_benchmarks.sh"
+lang    = "bash"
+group   = "corpus.fetch"
+summary = "Fetch SMT-LIB non-incremental benchmarks for a logic into benchmarks/smtcomp/<LOGIC>/."
+publish = "public"
+cli_note = "fold into corpora.toml http entries post-0.1.0"
+
+[[script]]
+name    = "satlib-fetch"
+path    = "scripts/download_satlib_benchmarks.sh"
+lang    = "bash"
+group   = "corpus.fetch"
+summary = "Fetch the SATLIB uniform-random 3-SAT sets the ay-sat soundness/DRAT tests resolve."
+publish = "public"
+status  = "deprecated"
+cli_note = "deprecated (zero refs); convert to corpora.toml entries post-0.1.0"
+
+[[script]]
+name    = "mzn-fetch"
+path    = "scripts/download_minizinc_benchmarks.sh"
+lang    = "bash"
+group   = "corpus.fetch"
+summary = "Fetch and compile the MiniZinc Challenge 2024 FlatZinc instances the ay-flatzinc tests resolve."
+publish = "public"
+status  = "deprecated"
+cli_note = "deprecated (zero refs); convert to corpora.toml entries post-0.1.0"
+
+[[script]]
+name    = "satcomp24-sample-fetch"
+path    = "scripts/fetch_satcomp_sample.sh"
+lang    = "bash"
+group   = "corpus.fetch"
+summary = "Fetch the SAT-COMP 2024 sample corpus from the public GBD mirror."
+publish = "public"
+cli     = "ay corpus download satcomp2024-sample"
+
+[[script]]
+name    = "satcomp25-sample-fetch"
+path    = "scripts/_fetch_sat2025_sample.sh"
+lang    = "bash"
+group   = "corpus.fetch"
+summary = "Fetch a size-bounded SAT-COMP 2025 main-track sample for local iteration benchmarking."
+publish = "public"
+cli_note = "no corpora.toml entry yet"
+
+[[script]]
+name    = "milp-compare"
+path    = "scripts/compare.py"
+lang    = "python"
+group   = "bench.milp"
+summary = "ay-milp vs HiGHS verdict agreement on the real .milp corpus."
+publish = "public"
+tools   = ["highs", "scip", "gurobi"]
+cli_note = "no fronting subcommand yet; rename file to milp_compare.py post-0.1.0"
+
+[[script]]
+name    = "milp2mps"
+path    = "scripts/milp2mps.py"
+lang    = "python"
+group   = "bench.milp"
+summary = "Convert the .milp serialization to standard MPS (bit-exact f64 fields)."
+publish = "public"
+tools   = ["highs", "scip", "gurobi"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "milp-refsolve"
+path    = "scripts/refsolve.py"
+lang    = "python"
+group   = "bench.milp"
+summary = "HiGHS + SCIP + Gurobi verdicts on the .milp corpus via the exact-MPS bridge."
+publish = "public"
+tools   = ["highs", "scip", "gurobi"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "lp-bench"
+path    = "scripts/lp_bench.py"
+lang    = "python"
+group   = "bench.milp"
+summary = "Time LP/MILP solvers on a corpus and compare verdicts."
+publish = "public"
+tools   = ["highs", "scip", "gurobi"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "miplib-bench"
+path    = "scripts/miplib_bench.py"
+lang    = "python"
+group   = "bench.milp"
+summary = "Run ay-milp and HiGHS on the same MPS files and compare verdicts."
+publish = "public"
+tools   = ["highs", "scip", "gurobi"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "solver-portfolio"
+path    = "scripts/solver_portfolio.py"
+lang    = "python"
+group   = "bench.milp"
+summary = "Run AY against a portfolio of reference MILP solvers at matched single-thread budgets."
+publish = "public"
+tools   = ["highs", "scip", "gurobi"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "maxsat-retro-report"
+path    = "scripts/maxsat_retro_report.py"
+lang    = "python"
+group   = "report.maxsat"
+summary = "Summarize ay maxsat bench JSON reports into the retroactive MSE leaderboard markdown."
+publish = "public"
+status  = "deprecated"
+cli_note = "deprecated (zero refs); candidate `ay maxsat bench --report` absorption"
+
+[[script]]
+name    = "maxsat-tournament-report"
+path    = "scripts/maxsat_tournament_report.py"
+lang    = "python"
+group   = "report.maxsat"
+summary = "Merge ay maxsat bench --solver JSON reports into a same-hardware tournament leaderboard."
+publish = "public"
+status  = "deprecated"
+cli_note = "deprecated (zero refs); candidate `ay maxsat bench --report` absorption"
+
+[[script]]
+name    = "pb-bench"
+path    = "scripts/pb_bench.sh"
+lang    = "sh"
+group   = "bench.pb"
+summary = "Parallel PB benchmark runner for AY."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "pb-cert-coverage"
+path    = "scripts/pb_cert_coverage.sh"
+lang    = "bash"
+group   = "bench.pb"
+summary = "PB certificate coverage probe: solve with --proof and check emitted proofs with VeriPB."
+publish = "public"
+tools   = ["veripb"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "pb-results-analyze"
+path    = "scripts/pb_results_analyze.py"
+lang    = "python"
+group   = "report.pb"
+summary = "Consolidate a PB competition results mirror into clean structured data."
+publish = "public"
+cli_note = "no fronting subcommand yet; seed for `bench compare import` parsers"
+
+[[script]]
+name    = "proof-overhead-gate"
+path    = "scripts/proof_overhead.py"
+lang    = "python"
+group   = "gate.pb"
+summary = "Proof Tap overhead gate: dense-tap proof-on vs plain, median <= 2x."
+publish = "public"
+requires = ["oom-guard"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "pb-audit"
+path    = "scripts/pb_audit.sh"
+lang    = "sh"
+group   = "bench.pb"
+summary = "PB soundness audit: verify SAT/OPTIMUM models with check_opb.py (broken: check_opb.py is untracked)."
+publish = "public"
+status  = "broken"
+cli_note = "broken; restore check_opb.py or exclude pre-0.1.0"
+
+[[script]]
+name    = "pb-ab-compare"
+path    = "scripts/pb_ab_compare.py"
+lang    = "python"
+group   = "bench.pb"
+summary = "A/B compare two ay-pb binaries over a PB corpus."
+publish = "public"
+status  = "deprecated"
+cli_note = "deprecated (zero refs)"
+
+[[script]]
+name    = "pb-package"
+path    = "scripts/pb_package.sh"
+lang    = "sh"
+group   = "competition.pb"
+summary = "Build a PB-COMP submission tarball from the current git HEAD."
+publish = "public"
+cli     = "ay submission"
+
+[[script]]
+name    = "cert-ci-gate"
+path    = "scripts/cert_ci.sh"
+lang    = "sh"
+group   = "gate.pb"
+summary = "CERT-track CI gate (campaign M0: CakePB/VeriPB CI harness, stage 1)."
+publish = "public"
+tools   = ["veripb"]
+cli_note = "switch to `ay tool which veripb` post-0.1.0"
+
+[[script]]
+name    = "linux-static-build"
+path    = "scripts/build_linux_static.sh"
+lang    = "bash"
+group   = "build.release"
+summary = "Build the static Linux competition binary."
+publish = "public"
+cli_note = "shipped caller cmd_submission.rs"
+
+[[script]]
+name    = "linux-static-validate"
+path    = "scripts/validate_linux_static_binary.sh"
+lang    = "bash"
+group   = "build.release"
+summary = "Validate a static Linux binary artifact (linkage and portability checks)."
+publish = "public"
+cli_note = "shipped caller cmd_submission.rs"
+
+[[script]]
+name    = "zig-cc"
+path    = "scripts/zig-cc-x86_64-linux-musl.sh"
+lang    = "bash"
+group   = "build.toolchain"
+summary = "Zig cross-compile cc shim (x86_64-linux-musl) for the static Linux build."
+publish = "public"
+entrypoint = "library"
+cli_note = "wired into .cargo/config.toml — do not move"
+
+[[script]]
+name    = "zig-cxx"
+path    = "scripts/zig-cxx-x86_64-linux-musl.sh"
+lang    = "bash"
+group   = "build.toolchain"
+summary = "Zig cross-compile c++ shim (x86_64-linux-musl) for the static Linux build."
+publish = "public"
+entrypoint = "library"
+cli_note = "wired into .cargo/config.toml — do not move"
+
+[[script]]
+name    = "zig-ar"
+path    = "scripts/zig-ar.sh"
+lang    = "bash"
+group   = "build.toolchain"
+summary = "Zig ar shim for the static Linux build."
+publish = "public"
+entrypoint = "library"
+cli_note = "wired into .cargo/config.toml — do not move"
+
+[[script]]
+name    = "zig-ranlib"
+path    = "scripts/zig-ranlib.sh"
+lang    = "bash"
+group   = "build.toolchain"
+summary = "Zig ranlib shim for the static Linux build."
+publish = "public"
+entrypoint = "library"
+cli_note = "wired into .cargo/config.toml — do not move"
+
+[[script]]
+name    = "satcomp-matrix-shim"
+path    = "scripts/run_satcomp_matrix.sh"
+lang    = "bash"
+group   = "compat.sat"
+summary = "Legacy SAT-COMP matrix wrapper; superseded by native ay verbs."
+publish = "public"
+status  = "deprecated"
+replaced_by = "ay"
+cli_note = "compat shim"
+
+[[script]]
+name    = "chccomp-docker-env"
+path    = "scripts/docker_test_env.sh"
+lang    = "bash"
+group   = "dev"
+summary = "Docker test environment for CHC-COMP runs."
+publish = "public"
+status  = "deprecated"
+cli_note = "deprecated (zero refs)"
+
+[[script]]
+name    = "public-clone-check"
+path    = "scripts/public-clone-check.sh"
+lang    = "bash"
+group   = "gate.release"
+summary = "Unauthenticated public-clone build evidence: simulate what a fresh clone of the public repo sees."
+publish = "public"
+cli_note = "shipped caller cmd_submission.rs"
+
+[[script]]
+name    = "setup-audit-tools"
+path    = "scripts/setup-audit-tools.sh"
+lang    = "bash"
+group   = "dev"
+summary = "Install the external checkers/solvers the z3-audit full-replacement replay needs."
+publish = "public"
+status  = "deprecated"
+replaced_by = "ay tool install --group audit"
+cli_note = "retired once tools.toml recipes land"
+
+[[script]]
+name    = "critical-solver-policy-gate"
+path    = "scripts/check_critical_solver_policy.sh"
+lang    = "bash"
+group   = "gate.release"
+summary = "Enforce that changes to critical solver files land with native solver gate evidence."
+publish = "public"
+cli     = "ay gate"
+
+[[script]]
+name    = "doc-reality-gate"
+path    = "scripts/check_doc_reality.sh"
+lang    = "bash"
+group   = "gate.release"
+summary = "placeholder: no checks configured"
+publish = "public"
+status  = "placeholder"
+cli     = "ay gate"
+
+[[script]]
+name    = "prof-hotspots"
+path    = "scripts/prof_hotspots.sh"
+lang    = "zsh"
+group   = "dev"
+summary = "Profile AY on a benchmark with macOS sample; print top-of-stack self-time."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "lra-bmc-validate"
+path    = "scripts/lra_bmc_validate.sh"
+lang    = "bash"
+group   = "audit.smt"
+summary = "File-aligned soundness + coverage validation for QF_LRA .bmc files."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "lra-ind-validate"
+path    = "scripts/lra_ind_validate.sh"
+lang    = "bash"
+group   = "audit.smt"
+summary = "File-aligned soundness + coverage validation for QF_LRA .ind files."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "sat-portfolio-driver"
+path    = "competition/ay_portfolio.sh"
+lang    = "sh"
+group   = "competition.sat"
+summary = "Competition portfolio driver (SAT parallel/cloud track): race full ay solve --competition configs."
+publish = "public"
+entrypoint = "convention"
+
+[[script]]
+name    = "maxsat-driver"
+path    = "competition/maxsat_run.sh"
+lang    = "sh"
+group   = "competition.maxsat"
+summary = "Competition driver for the weighted/unweighted MaxSAT track."
+publish = "public"
+status  = "deprecated"
+entrypoint = "convention"
+cli_note = "deprecated pending human review (zero refs)"
+
+[[script]]
+name    = "mc2026-build"
+path    = "competition/mc2026/build.sh"
+lang    = "bash"
+group   = "competition.mc"
+summary = "Model Counting Competition build script: AY exact counter plus the FlowCutter TD helper."
+publish = "public"
+entrypoint = "convention"
+cli_note = "SoSy-Lab fixed names; zero in-repo refs is expected"
+
+[[script]]
+name    = "mc2026-run"
+path    = "competition/mc2026/run.sh"
+lang    = "bash"
+group   = "competition.mc"
+summary = "Model Counting Competition run script: one instance path in, MC-2026 output format on stdout."
+publish = "public"
+entrypoint = "convention"
+cli_note = "SoSy-Lab fixed names; zero in-repo refs is expected"
+
+[[script]]
+name    = "pb26-build"
+path    = "competition/pb/build.sh"
+lang    = "sh"
+group   = "competition.pb"
+summary = "PB-COMP build script: build the ay-pb competition binary from the bundled source."
+publish = "public"
+entrypoint = "convention"
+
+[[script]]
+name    = "pb26-run"
+path    = "competition/pb/run.sh"
+lang    = "sh"
+group   = "competition.pb"
+summary = "PB-COMP run script for the AY PB solver (generated by package.sh from entries.toml)."
+publish = "public"
+entrypoint = "convention"
+
+[[script]]
+name    = "pb26-run-template"
+path    = "competition/pb/run.sh.in"
+lang    = "sh"
+group   = "competition.pb"
+summary = "Template for the PB-COMP run script; package.sh substitutes per-entry values."
+publish = "public"
+entrypoint = "template"
+
+[[script]]
+name    = "pb26-package"
+path    = "competition/pb/package.sh"
+lang    = "sh"
+group   = "competition.pb"
+summary = "Trident matrix packager: build, harden, and validate every entry in competition/pb/entries.toml."
+publish = "public"
+cli_note = "shipped caller cmd_submission.rs"
+
+[[script]]
+name    = "sat26-package"
+path    = "competition/prepare_sat26_submission.sh"
+lang    = "bash"
+group   = "competition.sat"
+summary = "Prepare the SAT-COMP 2026 submission package."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "fzn-exec"
+path    = "competition/minizinc/fzn-exec"
+lang    = "sh"
+group   = "competition.mzn"
+summary = "MiniZinc FlatZinc solver wrapper for AY; invoked by minizinc with the flags declared in ay.msc."
+publish = "public"
+entrypoint = "convention"
+cli_note = "declared in ay.msc"
+
+[[script]]
+name    = "chccomp-slurm-worker"
+path    = "deploy/cluster/chccomp_slurm_worker.sh"
+lang    = "bash"
+group   = "competition.chc"
+summary = "SLURM array worker driving CHC-COMP harness shards on the cluster."
+publish = "public"
+entrypoint = "convention"
+
+[[script]]
+name    = "mzn-gen-community"
+path    = "benchmarks/minizinc/gen_community.py"
+lang    = "python"
+group   = "corpus.gen"
+summary = "Generate a FlatZinc community-detection benchmark (mexican.s26.k4-like)."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "mzn-local-bench"
+path    = "benchmarks/minizinc/run_benchmarks.sh"
+lang    = "bash"
+group   = "bench.mzn"
+summary = "Run local FlatZinc benchmarks through the competition CLI surface."
+publish = "public"
+status  = "deprecated"
+cli_note = "deprecated (zero refs)"
+
+[[script]]
+name    = "smtlib-sample-fetch"
+path    = "benchmarks/smtlib-sample/fetch.sh"
+lang    = "bash"
+group   = "corpus.fetch"
+summary = "Re-fetch the SMT-LIB sample corpus used by ay-z3-parity bench (Zenodo 11061097)."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+docs    = "benchmarks/smtlib-sample/MANIFEST.md"
+
+[[script]]
+name    = "java-binding-smoke"
+path    = "bindings/java/run.sh"
+lang    = "bash"
+group   = "test"
+summary = "Build and run the AY Java (FFM) binding test against libay_ffi."
+publish = "public"
+cli_note = "README-documented"
+
+[[script]]
+name    = "ocaml-binding-smoke"
+path    = "bindings/ocaml/run.sh"
+lang    = "bash"
+group   = "test"
+summary = "Build and run the AY OCaml binding test against libay_ffi."
+publish = "public"
+cli_note = "README-documented"
+
+[[script]]
+name    = "ayz3-fuzz"
+path    = "bindings/python/ayz3_fuzz"
+lang    = "python"
+group   = "fuzz"
+summary = "Differential fuzzer for the ayz3 Python bindings."
+publish = "public"
+cli_note = "invoked as `python -m ayz3_fuzz`"
+
+[[script]]
+name    = "firewall-selfcert-check"
+path    = "scripts/firewall-selfcert-check.sh"
+lang    = "bash"
+group   = "audit.smt"
+summary = "End-to-end smoke check that --verify-firewall kernel-checks per-theory Lean firewall proofs and rejects corrupted ones."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "resource-harness-tests"
+path    = "scripts/tests/test_resource_harnesses.py"
+lang    = "python"
+group   = "test"
+summary = "Tests for benchmark drivers that consume the shared OOM guard."
+publish = "public"
+entrypoint = "test"
+
+[[script]]
+name    = "frontend-resource-harness-tests"
+path    = "scripts/tests/test_frontend_resource_harnesses.py"
+lang    = "python"
+group   = "test"
+summary = "Resource-envelope tests for the frontend benchmark harnesses."
+publish = "public"
+entrypoint = "test"
+
+[[script]]
+name    = "smtcomp-harness-tests"
+path    = "scripts/tests/test_smtcomp_harness.py"
+lang    = "python"
+group   = "test"
+summary = "Focused regression tests for SMT-COMP preparation, cache, and resource handling."
+publish = "public"
+entrypoint = "test"

@@ -1,0 +1,505 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Andrew Yates <andrewyates.name@gmail.com>",
+  "description": "SAT-COMP profile lane matrix for ay submission and runtime metadata.",
+  "type": "object",
+  "required": [
+    "version",
+    "control_plane",
+    "lineup_freeze",
+    "sat26_compliance",
+    "defaults",
+    "profiles"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "$comment": { "type": "string" },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "control_plane": {
+      "type": "object",
+      "required": [
+        "default_user_path",
+        "default_user_profile",
+        "authoritative_fallback",
+        "jit_mode_matrix"
+      ],
+      "properties": {
+        "default_user_path": { "type": "string" },
+        "default_user_profile": { "type": "string" },
+        "authoritative_fallback": { "type": "string" },
+        "jit_mode_matrix": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "lineup_freeze": { "$ref": "#/definitions/lineup_freeze" },
+    "sat26_compliance": { "$ref": "#/definitions/sat26_compliance" },
+    "defaults": {
+      "type": "object",
+      "required": [
+        "proof_format",
+        "proof_checker",
+        "sat_model_format",
+        "wrong_answer_budget",
+        "proof_failure_budget",
+        "witness_failure_budget",
+        "crash_budget"
+      ],
+      "properties": {
+        "proof_format": { "type": "string" },
+        "proof_checker": { "type": "string" },
+        "sat_model_format": { "type": "string" },
+        "wrong_answer_budget": { "type": "integer", "minimum": 0 },
+        "proof_failure_budget": { "type": "integer", "minimum": 0 },
+        "witness_failure_budget": { "type": "integer", "minimum": 0 },
+        "crash_budget": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "profiles": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/definitions/profile" }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "lineup_freeze": {
+      "type": "object",
+      "required": [
+        "issue",
+        "status",
+        "selection_profile_ids",
+        "excluded_profile_ids",
+        "matrix_source",
+        "required_evidence"
+      ],
+      "properties": {
+        "issue": { "type": "integer", "minimum": 1 },
+        "status": { "enum": ["blocked-until-final-evidence", "frozen"] },
+        "selection_profile_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          }
+        },
+        "excluded_profile_ids": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          }
+        },
+        "matrix_source": { "$ref": "#/definitions/freeze_matrix_source" },
+        "required_evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": [
+              "quiet_host_matrix",
+              "external_unsat_proof_csv",
+              "sat_model_validation",
+              "linux_x86_64_rehearsal",
+              "sat_main_final_evidence_manifest"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "sat26_compliance": {
+      "type": "object",
+      "required": [
+        "issue",
+        "status",
+        "official_sources_checked",
+        "official_sources",
+        "deadlines",
+        "nhr_submission_contract",
+        "main_track_contract",
+        "decision_state",
+        "required_evidence",
+        "archived_evidence",
+        "fail_closed_conditions"
+      ],
+      "properties": {
+        "issue": { "type": "integer", "minimum": 1 },
+        "status": {
+          "enum": [
+            "blocked-until-registration-and-final-evidence",
+            "ready-for-submission"
+          ]
+        },
+        "official_sources_checked": {
+          "type": "string",
+          "pattern": "^20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]$"
+        },
+        "official_sources_checked_at_utc": {
+          "type": "string",
+          "pattern": "^20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z$"
+        },
+        "official_sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "format": "uri" }
+        },
+        "official_source_citations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["label", "url", "retrieved_at_utc", "supports"],
+            "properties": {
+              "label": { "type": "string", "minLength": 1 },
+              "url": { "type": "string", "format": "uri" },
+              "retrieved_at_utc": {
+                "type": "string",
+                "pattern": "^20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z$"
+              },
+              "supports": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          }
+        },
+        "deadlines": { "$ref": "#/definitions/sat26_deadlines" },
+        "nhr_submission_contract": {
+          "$ref": "#/definitions/sat26_nhr_submission_contract"
+        },
+        "main_track_contract": { "$ref": "#/definitions/sat26_main_track_contract" },
+        "decision_state": { "$ref": "#/definitions/sat26_decision_state" },
+        "required_evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": [
+              "registration_status",
+              "benchmark_submission_status",
+              "solver_names",
+              "submitted_variant_count",
+              "ai_disclosure_class",
+              "proof_checker_selection",
+              "system_description_pdf",
+              "clean_nhr_generated_root_rehearsal",
+              "sat_model_validation",
+              "external_unsat_proof_csv",
+              "linux_x86_64_rehearsal",
+              "final_evidence_manifest"
+            ]
+          }
+        },
+        "archived_evidence": {
+          "type": "object",
+          "additionalProperties": { "type": "boolean" }
+        },
+        "fail_closed_conditions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "sat26_deadlines": {
+      "type": "object",
+      "required": [
+        "solver_registration",
+        "benchmark_submission",
+        "solver_submission",
+        "solver_documentation"
+      ],
+      "properties": {
+        "solver_registration": {
+          "type": "string",
+          "pattern": "^20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]$"
+        },
+        "benchmark_submission": {
+          "type": "string",
+          "pattern": "^20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]$"
+        },
+        "solver_submission": {
+          "type": "string",
+          "pattern": "^20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]$"
+        },
+        "solver_documentation": {
+          "type": "string",
+          "pattern": "^20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]$"
+        },
+        "parallel_cloud_solver_submission": {
+          "type": "string",
+          "pattern": "^20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]$"
+        }
+      },
+      "additionalProperties": false
+    },
+    "sat26_nhr_submission_contract": {
+      "type": "object",
+      "required": [
+        "package_shape",
+        "build_entrypoint",
+        "run_entrypoint",
+        "run_argv",
+        "unsat_proof_path",
+        "stdout_contract"
+      ],
+      "properties": {
+        "package_shape": { "enum": ["nhr-private-github-root"] },
+        "build_entrypoint": { "enum": ["build.sh"] },
+        "run_entrypoint": { "enum": ["run.sh"] },
+        "run_argv": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "type": "string" }
+        },
+        "unsat_proof_path": { "enum": ["proof.out"] },
+        "stdout_contract": { "enum": ["solution-and-model-only"] }
+      },
+      "additionalProperties": false
+    },
+    "sat26_main_track_contract": {
+      "type": "object",
+      "required": [
+        "profile_id",
+        "track",
+        "proof_format",
+        "proof_checker",
+        "sat_model_format",
+        "jobs",
+        "timeout_seconds",
+        "memory_limit_gb",
+        "wrong_answer_budget",
+        "proof_failure_budget",
+        "witness_failure_budget",
+        "crash_budget"
+      ],
+      "properties": {
+        "profile_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "track": { "enum": ["main"] },
+        "proof_format": { "enum": ["lrat"] },
+        "proof_checker": { "type": "string" },
+        "sat_model_format": { "enum": ["dimacs-v-lines"] },
+        "jobs": { "type": "integer", "minimum": 1 },
+        "timeout_seconds": { "type": "integer", "minimum": 1 },
+        "memory_limit_gb": { "type": "integer", "minimum": 1 },
+        "wrong_answer_budget": { "type": "integer", "minimum": 0, "maximum": 0 },
+        "proof_failure_budget": { "type": "integer", "minimum": 0, "maximum": 0 },
+        "witness_failure_budget": { "type": "integer", "minimum": 0, "maximum": 0 },
+        "crash_budget": { "type": "integer", "minimum": 0, "maximum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "sat26_decision_state": {
+      "type": "object",
+      "required": [
+        "registration_status",
+        "benchmark_submission_status",
+        "solver_names",
+        "submitted_variant_count",
+        "ai_disclosure_class",
+        "proof_checker",
+        "system_description_status"
+      ],
+      "properties": {
+        "registration_status": { "enum": ["unconfirmed", "confirmed"] },
+        "benchmark_submission_status": {
+          "enum": ["unconfirmed", "confirmed", "missed"]
+        },
+        "solver_names": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "submitted_variant_count": { "type": "integer", "minimum": 0 },
+        "ai_disclosure_class": {
+          "enum": ["unconfirmed", "regular", "ai-tuned", "ai-generated"]
+        },
+        "proof_checker": { "type": "string" },
+        "system_description_status": {
+          "enum": ["unconfirmed", "draft", "submitted"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "freeze_matrix_source": {
+      "type": "object",
+      "required": [
+        "suite",
+        "track",
+        "proof_format",
+        "jobs",
+        "wrong_answer_budget",
+        "proof_failure_budget",
+        "witness_failure_budget",
+        "crash_budget"
+      ],
+      "properties": {
+        "suite": { "enum": ["sat-main-2026-official-mirror"] },
+        "track": { "enum": ["main"] },
+        "proof_format": { "enum": ["lrat"] },
+        "jobs": { "type": "integer", "minimum": 1 },
+        "wrong_answer_budget": { "type": "integer", "minimum": 0, "maximum": 0 },
+        "proof_failure_budget": { "type": "integer", "minimum": 0, "maximum": 0 },
+        "witness_failure_budget": { "type": "integer", "minimum": 0, "maximum": 0 },
+        "crash_budget": { "type": "integer", "minimum": 0, "maximum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "profile": {
+      "type": "object",
+      "required": [
+        "id",
+        "lane",
+        "competition",
+        "track",
+        "profile_identity",
+        "description",
+        "run_script",
+        "package_name",
+        "solver_variant",
+        "runtime_env",
+        "runtime_comments",
+        "requirements",
+        "resource_policy",
+        "jit",
+        "fallback"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "lane": { "type": "string" },
+        "competition": { "type": "string" },
+        "track": { "type": "string" },
+        "profile_identity": { "type": "string" },
+        "description": { "type": "string" },
+        "run_script": { "type": "string" },
+        "package_name": { "type": "string" },
+        "solver_variant": { "type": "string" },
+        "runtime_env": {
+          "type": "object",
+          "required": [
+            "AY_SAT_COMPETITION_PROFILE",
+            "AY_SAT_PROFILE_ID",
+            "AY_SAT_VARIANT",
+            "AY_COMPETITION_JIT_MODE"
+          ],
+          "additionalProperties": { "type": "string" }
+        },
+        "runtime_comments": {
+          "type": "object",
+          "required": [
+            "ay.sat_competition_profile",
+            "ay.sat_profile_identity",
+            "ay.sat_competition_jit",
+            "ay.sat_competition_fallback"
+          ],
+          "additionalProperties": { "type": "string" }
+        },
+        "requirements": {
+          "type": "object",
+          "required": ["unsat_proof", "sat_model"],
+          "properties": {
+            "unsat_proof": { "$ref": "#/definitions/proof_requirement" },
+            "sat_model": { "$ref": "#/definitions/model_requirement" }
+          },
+          "additionalProperties": false
+        },
+        "resource_policy": {
+          "type": "object",
+          "required": ["execution", "default_threads", "cloud", "timeout_margin_seconds"],
+          "properties": {
+            "execution": { "enum": ["sequential", "portfolio"] },
+            "default_threads": { "type": "integer", "minimum": 1 },
+            "thread_env": { "type": "string" },
+            "cloud": { "type": "boolean" },
+            "timeout_margin_seconds": { "type": "integer", "minimum": 0 }
+          },
+          "additionalProperties": false
+        },
+        "jit": { "$ref": "#/definitions/jit_policy" },
+        "fallback": { "$ref": "#/definitions/fallback_policy" }
+      },
+      "additionalProperties": false
+    },
+    "proof_requirement": {
+      "type": "object",
+      "required": ["required", "format", "checker", "path_template"],
+      "properties": {
+        "required": { "type": "boolean" },
+        "format": { "type": "string" },
+        "checker": { "type": "string" },
+        "path_template": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "model_requirement": {
+      "type": "object",
+      "required": ["required", "format"],
+      "properties": {
+        "required": { "type": "boolean" },
+        "format": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "jit_policy": {
+      "type": "object",
+      "required": [
+        "default_mode",
+        "allowed_modes_after_gate",
+        "candidate_artifacts",
+        "fail_closed",
+        "requires_gate",
+        "async_compilation",
+        "required_counters"
+      ],
+      "properties": {
+        "default_mode": { "enum": ["off", "current", "solver-program", "profile-only"] },
+        "allowed_modes_after_gate": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "enum": ["off", "current", "solver-program", "profile-only"] }
+        },
+        "candidate_artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "fail_closed": { "type": "boolean" },
+        "requires_gate": { "type": "boolean" },
+        "async_compilation": { "$ref": "#/definitions/async_compilation" },
+        "required_counters": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "async_compilation": {
+      "type": "object",
+      "required": ["allowed", "max_queue", "max_compile_ms", "max_code_cache_mb"],
+      "properties": {
+        "allowed": { "type": "boolean" },
+        "max_queue": { "type": "integer", "minimum": 0 },
+        "max_compile_ms": { "type": "integer", "minimum": 0 },
+        "max_code_cache_mb": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "fallback_policy": {
+      "type": "object",
+      "required": ["authoritative_solver", "native_artifacts_may_change_verdict"],
+      "properties": {
+        "authoritative_solver": { "type": "string" },
+        "native_artifacts_may_change_verdict": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

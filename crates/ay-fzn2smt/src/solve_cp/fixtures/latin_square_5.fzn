@@ -1,0 +1,45 @@
+% Latin Square 5x5: every row and column contains each value 1..5 exactly once
+var 1..5: x11 :: output_var;
+var 1..5: x12 :: output_var;
+var 1..5: x13 :: output_var;
+var 1..5: x14 :: output_var;
+var 1..5: x15 :: output_var;
+var 1..5: x21 :: output_var;
+var 1..5: x22 :: output_var;
+var 1..5: x23 :: output_var;
+var 1..5: x24 :: output_var;
+var 1..5: x25 :: output_var;
+var 1..5: x31 :: output_var;
+var 1..5: x32 :: output_var;
+var 1..5: x33 :: output_var;
+var 1..5: x34 :: output_var;
+var 1..5: x35 :: output_var;
+var 1..5: x41 :: output_var;
+var 1..5: x42 :: output_var;
+var 1..5: x43 :: output_var;
+var 1..5: x44 :: output_var;
+var 1..5: x45 :: output_var;
+var 1..5: x51 :: output_var;
+var 1..5: x52 :: output_var;
+var 1..5: x53 :: output_var;
+var 1..5: x54 :: output_var;
+var 1..5: x55 :: output_var;
+% Row all-different
+constraint fzn_all_different_int([x11, x12, x13, x14, x15]);
+constraint fzn_all_different_int([x21, x22, x23, x24, x25]);
+constraint fzn_all_different_int([x31, x32, x33, x34, x35]);
+constraint fzn_all_different_int([x41, x42, x43, x44, x45]);
+constraint fzn_all_different_int([x51, x52, x53, x54, x55]);
+% Column all-different
+constraint fzn_all_different_int([x11, x21, x31, x41, x51]);
+constraint fzn_all_different_int([x12, x22, x32, x42, x52]);
+constraint fzn_all_different_int([x13, x23, x33, x43, x53]);
+constraint fzn_all_different_int([x14, x24, x34, x44, x54]);
+constraint fzn_all_different_int([x15, x25, x35, x45, x55]);
+% Fix first row to break symmetry
+constraint int_eq(x11, 1);
+constraint int_eq(x12, 2);
+constraint int_eq(x13, 3);
+constraint int_eq(x14, 4);
+constraint int_eq(x15, 5);
+solve :: int_search([x21, x22, x23, x24, x25, x31, x32, x33, x34, x35, x41, x42, x43, x44, x45, x51, x52, x53, x54, x55], first_fail, indomain_min, complete) satisfy;

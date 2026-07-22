@@ -1,0 +1,10 @@
+; QF_LIA benchmark: linear_18
+(set-logic QF_LIA)
+(declare-fun x () Int)
+(declare-fun y () Int)
+(assert (= (+ (* 4 x) (* 2 y)) 45))
+(assert (>= x 0))
+(assert (>= y 0))
+(assert (<= x 48))
+(check-sat)
+(exit)

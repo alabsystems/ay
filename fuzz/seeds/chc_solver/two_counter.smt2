@@ -1,0 +1,11 @@
+; BENCHMARK 1: Two-Variable Counter (Relational)
+; Z3: 0.01s | AY Target: <0.1s
+(set-logic HORN)
+(declare-fun Inv (Int Int) Bool)
+(assert (forall ((x Int) (y Int)) (=> (and (= x 0) (= y 0)) (Inv x y))))
+(assert (forall ((x Int) (y Int) (x_next Int) (y_next Int)) 
+  (=> (and (Inv x y) (= x_next (+ x 1)) (or (= y_next (+ y 1)) (= y_next y)))
+      (Inv x_next y_next))))
+(assert (forall ((x Int) (y Int)) (=> (and (Inv x y) (not (>= x y))) false)))
+(check-sat)
+(get-model)

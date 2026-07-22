@@ -1,0 +1,15 @@
+; Extensionality: if select(a, i) = select(b, i) for both i and j, and a != b,
+; there must be some other index where they differ (satisfiable)
+; Expected: sat
+(set-logic QF_AX)
+(declare-sort Index 0)
+(declare-sort Element 0)
+(declare-fun a () (Array Index Element))
+(declare-fun b () (Array Index Element))
+(declare-fun i () Index)
+(declare-fun j () Index)
+(assert (not (= a b)))
+(assert (= (select a i) (select b i)))
+(assert (= (select a j) (select b j)))
+(check-sat)
+(exit)

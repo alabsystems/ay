@@ -1,0 +1,5 @@
+name = "ay-soundness"
+defaultTargets = ["AySoundness"]
+
+[[lean_lib]]
+name = "AySoundness"

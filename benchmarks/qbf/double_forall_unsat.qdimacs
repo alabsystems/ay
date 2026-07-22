@@ -1,0 +1,10 @@
+c exists x forall y forall z. (x OR y) AND (x OR z) AND (NOT x OR NOT y) AND (NOT x OR NOT z)
+c UNSAT: If x=T, adversary sets y=T, last clause fails
+c        If x=F, adversary sets y=F, first clause fails
+p cnf 3 4
+e 1 0
+a 2 3 0
+1 2 0
+1 3 0
+-1 -2 0
+-1 -3 0

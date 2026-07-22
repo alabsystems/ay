@@ -1,0 +1,6 @@
+(set-logic QF_S)
+(declare-fun a () (Seq Bool))
+(declare-fun b () (Seq Bool))
+(declare-fun c () Bool)
+(assert (= (seq.len (ite c a b)) (- 0 2)))
+(check-sat)

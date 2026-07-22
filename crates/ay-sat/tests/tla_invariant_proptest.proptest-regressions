@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 07cd8051b1071040bbf49678595957451fc8c961cfa7b7a0c29cfc98bdf0f6be # shrinks to (num_vars, base_clauses) = (15, [[Literal(5), Literal(1)], [Literal(3), Literal(6)], [Literal(9), Literal(11)], [Literal(0)]]), (_, scope_clauses) = (3, [[Literal(4)]])
+cc d509013a2cb564ec8d75f2013d012930fb2cae79df7592243e3bd0dd8f2ac916 # shrinks to (num_vars, clauses) = (8, [[Literal(1), Literal(15)], [Literal(9), Literal(10)], [Literal(8)], [Literal(13), Literal(1)]]), extra_unit_var = 13, extra_unit_sign = false

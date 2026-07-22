@@ -1,0 +1,90 @@
+[package]
+name = "ay-sat"
+description = "CDCL SAT solver core for AY"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["raw-pointer-bcp", "jit"]
+serde = ["dep:serde"]
+# Experimental: Enable Phase 7 GPU compute infrastructure
+# STATUS (2026-07-14): soundness-audited + fail-closed (2026-07-13 audit);
+# reachable from the CLI via ay's `gpu` feature. Promotion to default is
+# blocked only on corpus benchmark evidence; see
+# the development design notes
+gpu = ["dep:wgpu", "dep:pollster"]
+# Raw-pointer implementation of the same watched-literal traversal.
+raw-pointer-bcp = []
+# Experimental: enable non-BCP SAT JIT support and shared ay-jit helpers.
+# SAT BCP/watch JIT was removed from the production path in #8517.
+jit = ["dep:ay-jit"]
+# CLI integration: derives clap::ValueEnum on SatTechnique for --disable flag
+cli = ["dep:clap"]
+# Lean4 integration tests (#8697): shell out to `lean` to kernel-verify
+# emitted proofs end-to-end. Requires `lean` on PATH.
+lean-integration = []
+# Approximate-BCP filter (#8789 Phase 2): opt-in pre-pass that compresses
+# each clause and the current trail into 64-bit signatures, runs the
+# `may_be_unit_or_falsified` filter, and compares the verdict against the
+# exact trail state. Bumps `approx_bcp_*` counters on SolverStats.
+# STATUS (2026-07-14): Phase-2 observer wired at the restart boundary
+# (solver/restart.rs) and measured on the vendored labeled corpus:
+# noop_matched=7493, conflict_matched=141, mismatch_detected=0 — filter
+# sound in vivo with a ~98% skippable-classification rate, a live
+# go-signal for Phase 3 (verdict-driven clause skipping); see
+# the development design notes
+approx-bcp-filter = ["dep:ay-approx-bcp"]
+# Route-b in-memory UNSAT certificate API (Program CK1 WS1-M1): solve a
+# caller-supplied CNF and return the solver's own refutation as a validated,
+# in-memory resolution DAG (clause DB + LRAT-style RUP steps with hint ids,
+# terminating at the empty clause; no file round-trip). Downstream certificate
+# bridges can use it to compare proofs from independently written bit-blasters.
+# Zero extra dependencies; off by default to keep the
+# certificate-export surface out of the core solver build.
+unsat-cert = []
+# Experimental: compile the len-6/8 BCP replacement-scan specialization.
+# Off by default after SAT Main profiling showed a regression.
+
+[dependencies]
+ay-core.workspace = true
+ay-sat-congruence-core.workspace = true
+ay-drat-check.workspace = true
+ay-sys.workspace = true
+ay-proof-common.workspace = true
+ay-prefetch.workspace = true
+hashbrown.workspace = true
+foldhash.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+bytemuck.workspace = true
+sha2.workspace = true
+smallvec.workspace = true
+fixedbitset.workspace = true
+serde = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
+ay-jit = { path = "../ay-jit", optional = true }
+ay-approx-bcp = { workspace = true, optional = true }
+parking_lot.workspace = true
+clap = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+ntest.workspace = true
+tempfile.workspace = true
+wait-timeout.workspace = true
+ay-lrat-check.workspace = true
+ay-tla-bridge.workspace = true
+ay-test-support.workspace = true
+
+[[bench]]
+name = "sat_bench"
+harness = false

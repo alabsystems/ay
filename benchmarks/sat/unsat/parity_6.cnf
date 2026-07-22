@@ -1,0 +1,41 @@
+c Parity constraint: XOR(x1,...,x6) = 1 AND XOR(x1,...,x6) = 0
+c Known UNSAT - contradictory parity requirements
+c Encoding: 6-variable XOR = 1 and 6-variable XOR = 0
+c Uses auxiliary variables for Tseitin encoding of XOR chains
+c
+c Direct encoding:
+c Chain: y1 = x1 XOR x2, y2 = y1 XOR x3, y3 = y2 XOR x4,
+c        y4 = y3 XOR x5, y5 = y4 XOR x6
+c Assert y5 = 1 AND y5 = 0
+c
+c Variables: x1..x6 = 1..6, y1..y5 = 7..11
+p cnf 11 24
+c y1 = x1 XOR x2 (var 7 = var 1 XOR var 2)
+-7 -1 -2 0
+-7 1 2 0
+7 -1 2 0
+7 1 -2 0
+c y2 = y1 XOR x3 (var 8 = var 7 XOR var 3)
+-8 -7 -3 0
+-8 7 3 0
+8 -7 3 0
+8 7 -3 0
+c y3 = y2 XOR x4 (var 9 = var 8 XOR var 4)
+-9 -8 -4 0
+-9 8 4 0
+9 -8 4 0
+9 8 -4 0
+c y4 = y3 XOR x5 (var 10 = var 9 XOR var 5)
+-10 -9 -5 0
+-10 9 5 0
+10 -9 5 0
+10 9 -5 0
+c y5 = y4 XOR x6 (var 11 = var 10 XOR var 6)
+-11 -10 -6 0
+-11 10 6 0
+11 -10 6 0
+11 10 -6 0
+c Assert y5 = 1 (XOR of all = 1)
+11 0
+c Assert y5 = 0 (XOR of all = 0) - CONTRADICTION
+-11 0

@@ -1,0 +1,31 @@
+[package]
+name = "ay-z3-parity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/ay-z3-parity"
+description = "Mechanistic compatibility auditor for Z3-ABI symbol coverage and live AY/Z3 differential testing"
+readme.workspace = true
+
+[[bin]]
+name = "ay-z3-parity"
+path = "src/main.rs"
+
+[dependencies]
+# dlopen both dylibs at RUNTIME — nothing is linked at build time. The whole
+# point is that an outsider can aim this tool at ANY two .dylib/.so files.
+libloading = "0.8"
+libc = { workspace = true }
+serde_json = { workspace = true }
+# The `classify` subcommand (the in-process differential oracle extracted from
+# deductive-checks at R1 of the two-language design) drives ay as a LIBRARY — the one
+# lane in this tool that deliberately links ay instead of dlopening it.
+ay-dpll = { workspace = true }
+ay-frontend = { workspace = true }
+serde = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "ay-lrat-check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+documentation = "https://docs.rs/ay-lrat-check"
+description = "LRAT proof-checking library for SAT solver certificates"
+readme.workspace = true
+
+[lib]
+name = "ay_lrat_check"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+ay-core.workspace = true
+ay-proof-common.workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

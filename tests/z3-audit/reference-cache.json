@@ -1,0 +1,116 @@
+{
+  "basic_smt_transcript": {
+    "id": "basic_qf_lia_model_transcript",
+    "input_sha256": "cf75205c45a85b68d10370fe61abab9befec6e1c17f2a21b78cf52a7dfa5241d",
+    "status_code": 0,
+    "stderr": "",
+    "stdout": "sat\n((x 1))\n"
+  },
+  "chc_certificate_obligations": {
+    "count": 3,
+    "obligations": [
+      {
+        "name": "000-initiation.smt2",
+        "sha256": "66f01f1d2c522f705627c6d9b2db01d6caf73981000ed2374d4d270e6cc6986b",
+        "status_code": 0,
+        "stderr": "",
+        "stdout": "unsat\n",
+        "stdout_first_line": "unsat"
+      },
+      {
+        "name": "001-consecution.smt2",
+        "sha256": "80c38854f73293c86e6a0887a11879d86c229f123a8457b0f97467c54a1e6b34",
+        "status_code": 0,
+        "stderr": "",
+        "stdout": "unsat\n",
+        "stdout_first_line": "unsat"
+      },
+      {
+        "name": "002-safety.smt2",
+        "sha256": "b3228bf6d69fddf7fc463b55f95bb52129945ea32c20e41d85d4963c663992ac",
+        "status_code": 0,
+        "stderr": "",
+        "stdout": "unsat\n",
+        "stdout_first_line": "unsat"
+      }
+    ],
+    "problem": "benchmarks/chc/counter_safe_chccomp.smt2",
+    "problem_sha256": "4c3d57c3b9fe565d373115186f0ff64cc3a74e32023d8422062cabbd8e71263c"
+  },
+  "generated_at_unix_seconds": 1780118253,
+  "generator": {
+    "ay": "target/debug/ay",
+    "ay_version": "unpublished-development-fixture",
+    "z3_command": "z3",
+    "z3_version": "Z3 version 4.15.4 - 64 bit"
+  },
+  "replacement_surface_evidence": {
+    "schema": "ay-z3-audit-replacement-surface-evidence/v1",
+    "surfaces": [
+      {
+        "command": "cargo build --release --locked && ./target/release/ay --version",
+        "current": "0/4 local release-build provenance files present; 0/0 current-code unauthenticated public-clone build packets pass; stale_passing_public_logs=0",
+        "goal": "1/1 fresh unauthenticated release build packet with command, environment, ay --version, and artifact provenance",
+        "id": "public_source_build",
+        "missing": "current-code unauthenticated public-clone build packet is missing from checked-in baseline evidence",
+        "source": "the development design notes",
+        "status": "fail"
+      },
+      {
+        "command": "cargo build --release --locked -p ay --features bench --bin ay && ./target/release/ay bench run smt-local-suite smt-smtcomp-qf-lia smt-smtcomp-qf-lra smt-smtcomp-qf-bv smt-smtcomp-qf-abv smt-smtcomp-qf-uf smt-smtcomp-qf-alia smt-smtcomp-qf-auflia --ay ./target/release/ay --timeout 30 --reference-solver z3",
+        "current": "0/8 current-code eval packets; 0/8 packets found; eval_statuses=pass:0,fail:8,fail_timeout:0,fail_unknown:0,fail_error:0; benchmarks=0; agree=0; disagree=0; ay_only=0; reference_solved_missing=0; reference_solved_missing_ay_results=none; both_solved=0; ay_errors=0; ref_errors=0; ay_results=none; ref_results=none; per_eval=[smt-local-suite{status=fail; packet=missing}; smt-smtcomp-qf-lia{status=fail; packet=missing}; smt-smtcomp-qf-lra{status=fail; packet=missing}; smt-smtcomp-qf-bv{status=fail; packet=missing}; smt-smtcomp-qf-abv{status=fail; packet=missing}; smt-smtcomp-qf-uf{status=fail; packet=missing}; smt-smtcomp-qf-alia{status=fail; packet=missing}; smt-smtcomp-qf-auflia{status=fail; packet=missing}]",
+        "goal": "1/1 current-code differential packet with per-logic solved/unknown/timeout/error/disagreement counts, 0 wrong answers, and reference_solved_missing=0",
+        "id": "smtlib_input",
+        "missing": "missing eval packets: smt-local-suite, smt-smtcomp-qf-lia, smt-smtcomp-qf-lra, smt-smtcomp-qf-bv, smt-smtcomp-qf-abv, smt-smtcomp-qf-uf, smt-smtcomp-qf-alia, smt-smtcomp-qf-auflia",
+        "source": "",
+        "status": "fail"
+      },
+      {
+        "command": "competition/prepare_sat26_submission.sh --variant default --track main --ai-class regular --proof-format lrat --stage-binary ./target/release/ay --allow-local-runsh-preflight-binary --output \"$PWD/target/sat26-submission\" && scripts/run_satcomp_matrix.sh --suite custom --instance benchmarks/sat/canary/tiny_sat.cnf --expected sat --family canary --category sanity --submission-root \"$PWD/target/sat26-submission\" --variants default --timeout-sec 30 --proof-checker auto --reference-solver cadical=reference/cadical/build/cadical --output the development design notes --soundness --fail-on-wrong",
+        "current": "0/1 current-code SAT-COMP-shaped scoreboard packets pass; 0 SAT-COMP-shaped scoreboard packets found; stale_scoreboards=0",
+        "goal": "1/1 current SAT-COMP-shaped packet with solved count, PAR-2, model/proof validity, 0 wrong answers, and 0 reference-only solves",
+        "id": "dimacs_cnf_input",
+        "missing": "current-code SAT-COMP-shaped scoreboard packet is missing",
+        "source": "",
+        "status": "fail"
+      },
+      {
+        "command": "for solver in z3 golem; do ./target/release/ay bench run chccomp-2025-extra-small-lia chccomp-2025-lia-lin --ay ./target/release/ay --timeout 30 --reference-solver \"$solver\"; done",
+        "current": "Golem verify: total=0; matches=0; sound_bugs=0; incomplete=0; reference_unknown=0; both_unknown=0; no_baseline=0; latest_ay_eval_total=0; latest_ay_eval_results=none; cached_chc_obligations=3; z3_spacer_packets=0/2; z3_spacer_benchmarks=0; z3_spacer_agree=0; z3_spacer_both_solved=0; z3_spacer_reference_solved_missing=0; z3_spacer_reference_solved_missing_ay_results=none; z3_spacer_ay_results=none; z3_spacer_ref_results=none; golem_packets=0/2; golem_benchmarks=0; golem_agree=0; golem_both_solved=0; golem_reference_solved_missing=0; golem_reference_solved_missing_ay_results=none; golem_ay_results=none; golem_ref_results=none; z3_spacer_disagree=0; golem_disagree=0; z3_spacer_reference_errors=0; golem_reference_errors=0; z3_spacer_ay_errors=0; golem_ay_errors=0",
+        "goal": "1/1 current CHC-COMP packet versus Z3 Spacer and Golem with certificate validation policy, 0 wrong answers, and 0 reference-only solves",
+        "id": "chc_spacer_style_use",
+        "missing": "missing Golem verification report; missing current Z3 Spacer comparison packets: 0/2 present; missing current Golem comparison packets: 0/2 present",
+        "source": "missing chc eval packet, 3 obligations in tests/z3-audit/reference-cache.json",
+        "status": "fail"
+      },
+      {
+        "command": "ay gate solver && bash scripts/soundness_gate.sh",
+        "current": "basic SMT model transcript=1/1 cached; SAT scoreboard invalid=0; SAT scoreboard wrong=0; SAT model checks passed=0/0; broad SMT theory model-validation packets=0/0",
+        "goal": "1/1 model-validation packet with invalid_model_count=0 for every claimed SAT/model surface",
+        "id": "models",
+        "missing": "full model-validation packet for every claimed SMT-LIB model surface is missing or failing",
+        "source": "the development design notes, the development design notes",
+        "status": "fail"
+      },
+      {
+        "command": "./target/release/ay consumer-smoke run --full --temp-worktree all --worktree-ref origin/main --fetch-worktree-ref --json /tmp/ay-consumer-smoke.json",
+        "current": "consumer inventory present=false; evidence schema present=true; current_downstream_smoke_artifacts=0; stale_artifacts=0; passing_artifacts=0; current_downstream_logs=0; stale_downstream_logs=0; current_model_checker_consumer_logs=0; stale_model_checker_consumer_logs=0; model_checker_consumer_failures=0; first_model_checker_consumer_failures=none; model_checker_consumer_stronger_unknown_to_proof=0; first_model_checker_consumer_stronger_unknown_to_proof=none",
+        "goal": "1/1 downstream Rust consumer smoke packet from a clean public checkout",
+        "id": "rust_embedding",
+        "missing": "checked-in downstream Rust consumer smoke result artifact is missing or not passing",
+        "source": "the development design notes, crates/ay/schemas/downstream-smoke-evidence.schema.json",
+        "status": "fail"
+      },
+      {
+        "command": "cargo test -p ay-ffi --release && cargo build -p ay-ffi --release --locked",
+        "current": "header sources present=2/2; consumer test sources present=2/2; checked-in FFI result packets=0/1",
+        "goal": "1/1 ABI/API smoke packet with examples, build instructions, consumer tests, and explicit libz3-compatibility decision",
+        "id": "c_api_ffi",
+        "missing": "checked-in ay-ffi result packet is missing; default z3-audit still runs cargo test -p ay-ffi --test group_ffi live",
+        "source": "crates/ay-ffi/include, crates/ay-ffi/tests",
+        "status": "fail"
+      }
+    ]
+  },
+  "schema": "ay-z3-audit-reference-cache/v1"
+}

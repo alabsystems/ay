@@ -1,0 +1,4 @@
+# TLC generated files
+*_TTrace_*.tla
+*_TTrace_*.bin
+states/

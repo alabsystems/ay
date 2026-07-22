@@ -1,0 +1,8 @@
+# Large binaries - install via Dockerfile
+loat
+UAutomizer-linux/
+UltimateAutomizer.zip
+*.zip
+# CHC-COMP competitor solvers (installed locally, large binaries)
+bin/
+eldarica/

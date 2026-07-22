@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 7dd3afc7b8995f6424e01efb9b820e625b3daa3db634c6a791f33692f7378f2d # shrinks to case = EufLraCase { num_consts: 3, euf_atoms: [EufAtomSpec { lhs: Const(0), rhs: F1(2) }, EufAtomSpec { lhs: Const(2), rhs: F2(0) }], lra_atoms: [LraAtomSpec { cmp: Ge, bound: 4 }], expr: Or([Atom(0), And([Atom(2), Atom(2)])]) }
+cc cf167be28962f46087ea47b42f4bcf1f443cc0fd18dbd4c312f0baf00719b634 # shrinks to case = EufCase { num_consts: 2, atom_specs: [EufAtomSpec { lhs: F2(0), rhs: F1(0) }, EufAtomSpec { lhs: F1(1), rhs: Const(1) }, EufAtomSpec { lhs: F1(1), rhs: Const(0) }, EufAtomSpec { lhs: Const(1), rhs: F1(1) }], expr: And([Not(Atom(1)), Atom(3)]) }
+cc 042d24e1f34e044b256add306d93d202eddf691837fffaeebc928b6accd09198 # shrinks to case = EufLraCase { num_consts: 2, euf_atoms: [EufAtomSpec { lhs: F2(0), rhs: F1(1) }, EufAtomSpec { lhs: F1(1), rhs: F1(0) }], lra_atoms: [LraAtomSpec { cmp: Ge, bound: 5 }, LraAtomSpec { cmp: Ge, bound: 5 }], expr: And([Not(Atom(3)), Atom(1), And([Atom(2), Atom(2)])]) }
+cc 6fdb4799c3efd8887d82746aa83f2a1cf25c162fa23096d64a33d6e3049f2ebb # shrinks to case = LraCase { atom_specs: [LraAtomSpec { cmp: Ge, bound: 1 }, LraAtomSpec { cmp: Ge, bound: -1 }, LraAtomSpec { cmp: Ge, bound: -4 }, LraAtomSpec { cmp: Ge, bound: 0 }, LraAtomSpec { cmp: Ge, bound: 1 }], expr: And([And([Atom(2), Atom(3)]), Atom(0), Not(Atom(4))]) }

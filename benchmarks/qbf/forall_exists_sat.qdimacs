@@ -1,0 +1,7 @@
+c forall x exists y. (x OR y) AND (NOT x OR NOT y)
+c SAT: for any x, set y = NOT x
+p cnf 2 2
+a 1 0
+e 2 0
+1 2 0
+-1 -2 0

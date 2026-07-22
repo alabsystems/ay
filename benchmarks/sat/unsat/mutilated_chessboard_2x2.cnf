@@ -1,0 +1,38 @@
+c Mutilated chessboard: 2x2 board with opposite corners removed
+c Known UNSAT - classic combinatorial UNSAT instance
+c Board (opposite corners removed):
+c  .  B
+c  W  .
+c Remaining squares: (0,1)=B, (1,0)=W
+c Cannot tile with dominoes: 1 white, 1 black but no adjacent pair
+c Variables: d_{i} = domino i placement
+c With only one black and one white square that are NOT adjacent,
+c no domino can cover both.
+c Encoding: Boolean variables for possible domino placements.
+c No valid domino placements exist, so any covering constraint is UNSAT.
+c
+c The formula encodes: "there exists a perfect domino tiling"
+c with the constraint that each remaining cell is covered exactly once.
+c Since (0,1) and (1,0) are diagonal, no single domino covers both.
+c
+c Variable 1: horizontal domino at row 0, cols 0-1 (but col 0 removed)
+c Variable 2: vertical domino at col 0, rows 0-1 (but row 0 removed)
+c Variable 3: horizontal domino at row 1, cols 0-1 (but col 1 removed)
+c Variable 4: vertical domino at col 1, rows 0-1 (but row 1 removed)
+c None of these are valid since each touches a removed corner.
+c Cell (0,1) must be covered: need at least one domino touching it
+c Cell (1,0) must be covered: need at least one domino touching it
+c But no single valid placement exists.
+p cnf 4 6
+c Cell (0,1) must be covered (by var 1 or var 4)
+1 4 0
+c Cell (1,0) must be covered (by var 2 or var 3)
+2 3 0
+c Var 1 invalid (touches removed corner (0,0))
+-1 0
+c Var 2 invalid (touches removed corner (0,0))
+-2 0
+c Var 3 invalid (touches removed corner (1,1))
+-3 0
+c Var 4 invalid (touches removed corner (1,1))
+-4 0

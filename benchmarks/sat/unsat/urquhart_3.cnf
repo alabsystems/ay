@@ -1,0 +1,23 @@
+c Urquhart formula of order 3
+c Known UNSAT - hard for resolution
+c Based on XOR chains that create unsatisfiable parity constraints
+c Variables: x1..x6, with XOR chains forcing contradiction
+c
+c Chain: x1 XOR x2 = 1, x2 XOR x3 = 1, x3 XOR x1 = 1
+c This requires x1 != x2, x2 != x3, x3 != x1
+c which is impossible for Boolean variables (by parity: 1+1+1 = 3, odd)
+p cnf 3 8
+c x1 XOR x2 = 1: (x1 OR x2) AND (-x1 OR -x2)
+1 2 0
+-1 -2 0
+c x2 XOR x3 = 1: (x2 OR x3) AND (-x2 OR -x3)
+2 3 0
+-2 -3 0
+c x3 XOR x1 = 1: (x3 OR x1) AND (-x3 OR -x1)
+3 1 0
+-3 -1 0
+c Additional blocking clauses for completeness
+c x1 XOR x2 XOR x3 = 0 (even parity from chain composition)
+c But individual parities sum to 1+1+1 = 3 (odd): contradiction
+1 2 3 0
+-1 -2 -3 0

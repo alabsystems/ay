@@ -1,0 +1,23 @@
+% Magic Square 3x3: all rows, cols, diags sum to 15, values 1..9 all different
+var 1..9: x11 :: output_var;
+var 1..9: x12 :: output_var;
+var 1..9: x13 :: output_var;
+var 1..9: x21 :: output_var;
+var 1..9: x22 :: output_var;
+var 1..9: x23 :: output_var;
+var 1..9: x31 :: output_var;
+var 1..9: x32 :: output_var;
+var 1..9: x33 :: output_var;
+constraint fzn_all_different_int([x11, x12, x13, x21, x22, x23, x31, x32, x33]);
+% Rows sum to 15
+constraint int_lin_eq([1, 1, 1], [x11, x12, x13], 15);
+constraint int_lin_eq([1, 1, 1], [x21, x22, x23], 15);
+constraint int_lin_eq([1, 1, 1], [x31, x32, x33], 15);
+% Columns sum to 15
+constraint int_lin_eq([1, 1, 1], [x11, x21, x31], 15);
+constraint int_lin_eq([1, 1, 1], [x12, x22, x32], 15);
+constraint int_lin_eq([1, 1, 1], [x13, x23, x33], 15);
+% Diagonals sum to 15
+constraint int_lin_eq([1, 1, 1], [x11, x22, x33], 15);
+constraint int_lin_eq([1, 1, 1], [x13, x22, x31], 15);
+solve :: int_search([x11, x12, x13, x21, x22, x23, x31, x32, x33], first_fail, indomain_min, complete) satisfy;

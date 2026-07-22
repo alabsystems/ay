@@ -1,0 +1,32 @@
+# Andrew Yates <andrewyates.name@gmail.com>
+# Eval spec for the locally provisioned SMT-LIB QF_LIA corpus
+id: smt-smtcomp-qf-lia
+version: 1
+description: >
+  Every QF_LIA benchmark provisioned under benchmarks/smtcomp/QF_LIA from the
+  SMT-LIB 2024 archive (Zenodo record 11061097). This is a potentially long
+  full-corpus AY-vs-Z3 run, not a preselected sample.
+owner: andrewyates.name@gmail.com
+inputs:
+  benchmarks_dir: benchmarks/smtcomp/QF_LIA
+  reference_solver: z3
+  timeout_sec: 30
+  runs: 1
+metrics:
+  - passed
+  - total
+  - wrong
+  - mismatch
+  - timeout
+  - ay_time_sec
+  - z3_time_sec
+  - ratio
+outputs:
+  results_dir: evals/results/smt-smtcomp-qf-lia/{run_id}
+setup:
+  download: scripts/download_smtcomp_benchmarks.sh --logic QF_LIA
+  note: >
+    Run scripts/download_smtcomp_benchmarks.sh --logic QF_LIA to populate
+    benchmarks/smtcomp/QF_LIA/ from the Zenodo SMT-LIB 2024 release. Record the
+    exact corpus inventory, binary provenance, timeout, and enforced resource
+    envelope with any results you cite.

@@ -1,0 +1,30 @@
+# Andrew Yates <andrewyates.name@gmail.com>
+# Eval spec for local SMT benchmark suite
+id: smt-local-suite
+version: 1
+description: Shipped local SMT benchmarks comparing AY vs Z3 (see suite_dirs)
+owner: andrewyates.name@gmail.com
+inputs:
+  benchmarks_dir: benchmarks/smt/
+  suite_dirs:
+    - QF_ALIA
+    - QF_BV
+    - QF_UF
+    - QF_LIA
+    - QF_LRA
+    - QF_UFLIA
+    - QF_UFLRA
+    - QF_NIA
+  reference_solver: z3
+  timeout_sec: 30
+  runs: 1
+metrics:
+  - passed
+  - total
+  - wrong
+  - timeout
+  - ay_time_sec
+  - z3_time_sec
+  - ratio
+outputs:
+  results_dir: evals/results/smt-local-suite/{run_id}

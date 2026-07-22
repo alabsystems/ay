@@ -1,0 +1,306 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# HiGHS reference-solver run log (scripts/refsolve.py)
+Highs.log
+/env/
+/venv/
+/.venv/
+
+# Rust
+target/
+target_*/
+target-*/
+# Cargo.lock is tracked: AY ships binaries (ay, ay-bench, ay-fzn2smt) so the
+# workspace follows the application-repo convention and commits the lock file
+# for reproducible builds (#8859).
+**/*.rs.bk
+.ruff_cache
+# Per-user cargo overrides (e.g., shared target-dir paths) — see
+# .cargo/config.toml comments. Cargo auto-merges config.toml + config.toml.local
+# style layering is not native, but users can copy their local config via
+# CARGO_HOME/config.toml or a symlink; we gitignore the path to prevent
+# accidental commits of absolute per-developer paths (#8860).
+.cargo/config.toml.local
+
+# C++
+*.o
+*.out
+*.exe
+build/
+
+# Transient local runtime files
+.*_status.json
+reports/*-dirty-worktree-snapshot.diff
+reports/*-test-status.json
+reports/*.json/
+
+# Transient worktrees (per-machine, not committed)
+.worktrees/
+
+# Metrics/runtime artifacts
+metrics/
+metrics
+.metrics/
+.flags/
+.flags
+logs/
+
+# Benchmark outputs
+benchmarks/**/results/
+
+# ay-bench persistent per-commit results store (see crates/ay-bench/src/db.rs)
+.ay-bench/
+benchmarks/**/logs/
+benchmarks/**/data/
+
+# Eval outputs
+evals/**/results/
+evals/**/logs/
+
+# Emacs
+*~
+\#*\#
+.#*
+
+# macOS
+.DS_Store
+
+# Vim
+*.swp
+*.swo
+
+# Test/lint output
+.coverage
+.coverage.*
+.vision_health_cache/
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.jscpd-report/
+
+# Credentials and secrets
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+secrets.json
+*_secret*
+*.secret
+.secrets/
+
+# === Project-specific ===
+.hypothesis/
+states/
+
+# Transient session artifacts
+.git_commit_msg_*.tmp
+
+# Test scheduler runtime state (per-machine, gitignored)
+.test_state.json
+.test_state.json.lock
+
+# Mutation testing artifacts
+mutants/
+.mutmut-cache/
+kani_status.json
+
+# Generated design index
+the development design notes
+the development design notes
+
+HINT_ACK.md
+benchmarks/chc-comp/
+# Large CHC-COMP corpora fetched on demand (see scripts/chccomp_harness.py BENCH_ROOT)
+benchmarks/chc/chc-comp26-benchmarks/
+benchmarks/chc/chc-comp25-benchmarks/
+# Competitor solver sources cloned for algorithm study (never vendored/committed)
+reference/competitors/
+benchmarks/smtcomp/
+!benchmarks/smtcomp/
+benchmarks/smtcomp/*
+!benchmarks/smtcomp/QF_LRA/
+benchmarks/smtcomp/QF_LRA/*
+!benchmarks/smtcomp/QF_LRA/simple_startup_10nodes.bug.induct.smt2
+!benchmarks/smtcomp/QF_LRA/simple_startup_14nodes.bug.induct.smt2
+benchmarks/ay-failing-tests/
+*.smt2.log
+
+# Alternative build directories
+target-main/
+
+# Report backup files
+*.md.bak
+
+# Reference solvers — cloned locally, never tracked (#5868)
+# Individual files (SOURCES.md, chc-solvers/) are tracked; dirs are not.
+reference/bitwuzla/
+reference/cadical/
+reference/carcara/
+reference/chc-comp25-scripts/
+reference/chc2c/
+reference/coar/
+reference/z3/
+reference/creusat/
+reference/cryptominisat/
+reference/cvc5/
+reference/drat-trim/
+reference/eldarica/
+reference/glucose/
+reference/golem/
+reference/golem-src/
+reference/chc-comp-official/
+reference/kissat/
+reference/ae-kissat-mab/
+reference/minisat/
+reference/loat/
+reference/loat-src/
+reference/isafol/
+reference/mata/
+reference/opensmt/
+reference/parafrost/
+reference/pcsat/
+reference/chuffed/
+reference/pumpkin/
+reference/smtinterpol/
+reference/smtrat/
+reference/theta-chc/
+reference/ultimateunihorn/
+reference/yices2/
+reference/z3/
+reference/z3-noodler/
+reference/z3.rs/
+reference/**/*-static
+# TLC is an optional local tool input; provide its path with TLA2TOOLS_JAR.
+# Never commit a developer-specific jar or symlink into the source snapshot.
+reference/tla2tools.jar
+benchmarks/sat/satcomp2024-sample/29ab150158d641568f888e8401d2ac13-bmc_QICE_snp_vld_30.cnf.xz
+
+# Competition submission archives
+competition/*.zip
+competition/bin/ay
+competition/dist/
+competition/pb26/benchmarks/
+competition/pb26/dist/
+competition/pb26/results/
+competition/pb26/*.tar.gz
+competition/maxsat26/dist/
+competition/maxsat26/*.tar.gz
+competition/qbf26/dist/
+competition/qbf26/*.tar.gz
+
+# SAT-COMP local caches and generated evidence payloads
+cache/
+the development design notes
+the development design notes
+the development design notes
+the development design notes
+the development design notes
+the development design notes
+
+# MCP server runtime artifacts
+reference/drat-trim~HEAD
+reference/lingeling
+# Exclude every benchmarks/security/ subdir except INDEX.md and the small
+# in-tree qif/ source set. The `qif/` files are authored in-repo and
+# republished as the security-qif release asset; the *.tar.zst cache stays
+# out of git.
+benchmarks/security/*
+!benchmarks/security/INDEX.md
+!benchmarks/security/qif/
+benchmarks/security/qif/*.tar.zst
+benchmarks/pb-comp/*
+!benchmarks/pb-comp/run-baseline.sh
+!benchmarks/pb-comp/test-instances/
+!benchmarks/pb-comp/results/
+benchmarks/pb-comp/results/*.json
+
+# dscan scan artifacts
+.dscan/
+
+# Large benchmark corpora — fetched via `ay corpus download <name>` from
+# the release assets configured in benchmarks/corpora.toml. The extracted
+# directories and the cached tarballs are reproducible artifacts, not
+# source code.
+benchmarks/sat/satcomp2024-sample/
+!benchmarks/sat/satcomp2024-sample/
+!benchmarks/sat/satcomp2024-sample/c5ae0ec49de0959cd14431ce851c14f8-Circuit_multiplier22.cnf.xz
+# Generated DRAT proof outputs — regenerable, and individual files can exceed
+# GitHub's 100MB hard limit, so they must never be committed.
+benchmarks/sat/satcomp2024-sample/*.drat
+benchmarks/sat/unsat/*.drat
+
+# Default proof-carrying certificates (proof-carrying is ON BY DEFAULT).
+# These are the auto-generated sidecars AY writes next to an input file on an
+# UNSAT/refutation verdict: `<input>.drat` (SAT), `<input>.alethe` (SMT),
+# `<input>.chccert` + `chc-obligations/` (CHC). They are regenerable and must
+# never pollute the tree when tests or users solve repo fixtures in place. The
+# `<input>.<ext>` shape means an explicit `--proof out.alethe` (a bare name the
+# user chose) is NOT matched and can still be committed with `git add -f`.
+*.cnf.drat
+*.dimacs.drat
+*.smt2.alethe
+*.smt.alethe
+*.smt2.chccert
+*.smt.chccert
+# Atomic proof writers create these beside the final artifact. A killed solver
+# can leave them behind, and large SMT proofs can exceed GitHub's file limit.
+*.drat.tmp-*
+*.lrat.tmp-*
+*.alethe.tmp-*
+*.lean4.tmp-*
+*.chccert.tmp-*
+*.pbp.tmp-*
+*.proof-artifact.json.tmp.*
+chc-obligations/
+# ...except the committed DRAT canary fixtures (checker regression inputs).
+!benchmarks/sat/canary/*.cnf.drat
+benchmarks/smt-lib-incremental/QF_LIA/
+benchmarks/sat/*.tar.zst
+benchmarks/smt-lib-incremental/*.tar.zst
+benchmarks/minizinc/*.tar.zst
+# Compiled FlatZinc output (produced by the minizinc compile step).
+benchmarks/minizinc/compiled-fzn/
+benchmarks/chc/chc-comp26-benchmarks/
+
+# PB-COMP build artifact (produced by competition/pb/build.sh)
+competition/pb/ay-pb
+
+# Lean (lake) build caches (proofs/ lakefile)
+.lake/
+proofs/.lake/
+
+third_party/cake_lpr/example.*
+
+# Local reference-solver binaries for differential sweeps (fetched manually;
+# see scripts/diff_sweep.py SOLVERS table).
+.competitors/
+
+# SMT-LIB sample corpora are fetched, not committed (~93 MB). Re-fetch the
+# byte-identical corpus with benchmarks/smtlib-sample/fetch.sh; per-file
+# SHA-256s are pinned in the committed MANIFEST.sha256.
+benchmarks/smtlib-sample/*/
+
+# MaxSAT benchmark corpora (fetched via `ay corpus`; reference CSVs are tracked)
+benchmarks/maxsat/downloads/
+benchmarks/maxsat/mse24-exact-unweighted/
+benchmarks/maxsat/mse24-exact-weighted/
+benchmarks/maxsat/mse24-exact-unweighted-oldfmt/
+benchmarks/maxsat/mse24-exact-weighted-oldfmt/
+reference/maxsat-competitors/
+
+# MiniZinc Challenge 2025 corpus (regenerable via scripts/mzn_challenge; ~3.6GB)
+benchmarks/minizinc/challenge-2025/
+
+# machine-specific symlink to the built ay binary (created by mzn_challenge/setup.sh)
+competition/minizinc/ay
+
+# SAT-COMP 2025 sample fetched by scripts/_fetch_sat2025_sample.sh (default DEST)
+benchmarks/sat/satcomp2025/

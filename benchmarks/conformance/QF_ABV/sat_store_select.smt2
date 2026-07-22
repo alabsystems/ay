@@ -1,0 +1,8 @@
+(set-info :status sat)
+(set-logic QF_ABV)
+(declare-const a (Array (_ BitVec 8) (_ BitVec 8)))
+(declare-const i (_ BitVec 8))
+(assert (= (select a i) #xFF))
+(assert (= i #x42))
+(check-sat)
+(exit)

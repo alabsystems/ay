@@ -1,0 +1,34 @@
+[package]
+name = "ay-bisect"
+description = "Feature-flag bisection harness for AY soundness debugging"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+
+[lib]
+name = "ay_bisect"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ay-bisect"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+rayon.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,5 @@
+(set-logic ALIA)
+(declare-const b (Array Int Int))
+(declare-const cc (Array Int Int))
+(assert (not (forall ((X0 Int)) (= (select b X0) (select cc X0)))))
+(check-sat)

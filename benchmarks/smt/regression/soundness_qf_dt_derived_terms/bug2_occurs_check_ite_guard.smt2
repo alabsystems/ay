@@ -1,0 +1,8 @@
+(set-logic QF_DT)
+(declare-datatypes ((Rec 0) (Tree 0)) (((mkRec)) ((leaf) (node (left Tree) (right Tree)))))
+(declare-const r Rec)
+(declare-const v11 Tree)
+(declare-const v12 Tree)
+(assert (= (ite ((_ is mkRec) r) v12 v11) (left v12)))
+(assert ((_ is node) v12))
+(check-sat)

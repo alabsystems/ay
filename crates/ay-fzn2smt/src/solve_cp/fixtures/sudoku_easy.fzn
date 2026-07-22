@@ -1,0 +1,39 @@
+% Sudoku 4x4 (2x2 blocks)
+% Given: row1=[1,_,_,_], row2=[_,_,1,_], row3=[_,3,_,_], row4=[_,_,_,2]
+var 1..4: x11 :: output_var;
+var 1..4: x12 :: output_var;
+var 1..4: x13 :: output_var;
+var 1..4: x14 :: output_var;
+var 1..4: x21 :: output_var;
+var 1..4: x22 :: output_var;
+var 1..4: x23 :: output_var;
+var 1..4: x24 :: output_var;
+var 1..4: x31 :: output_var;
+var 1..4: x32 :: output_var;
+var 1..4: x33 :: output_var;
+var 1..4: x34 :: output_var;
+var 1..4: x41 :: output_var;
+var 1..4: x42 :: output_var;
+var 1..4: x43 :: output_var;
+var 1..4: x44 :: output_var;
+% Givens
+constraint int_eq(x11, 1);
+constraint int_eq(x23, 1);
+constraint int_eq(x32, 3);
+constraint int_eq(x44, 2);
+% Row constraints
+constraint fzn_all_different_int([x11, x12, x13, x14]);
+constraint fzn_all_different_int([x21, x22, x23, x24]);
+constraint fzn_all_different_int([x31, x32, x33, x34]);
+constraint fzn_all_different_int([x41, x42, x43, x44]);
+% Column constraints
+constraint fzn_all_different_int([x11, x21, x31, x41]);
+constraint fzn_all_different_int([x12, x22, x32, x42]);
+constraint fzn_all_different_int([x13, x23, x33, x43]);
+constraint fzn_all_different_int([x14, x24, x34, x44]);
+% Block constraints (2x2)
+constraint fzn_all_different_int([x11, x12, x21, x22]);
+constraint fzn_all_different_int([x13, x14, x23, x24]);
+constraint fzn_all_different_int([x31, x32, x41, x42]);
+constraint fzn_all_different_int([x33, x34, x43, x44]);
+solve :: int_search([x11, x12, x13, x14, x21, x22, x23, x24, x31, x32, x33, x34, x41, x42, x43, x44], first_fail, indomain_min, complete) satisfy;

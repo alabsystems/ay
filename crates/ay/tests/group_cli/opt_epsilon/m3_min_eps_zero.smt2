@@ -1,0 +1,6 @@
+(declare-const x Real)
+(assert (> x 0.0))
+(minimize x)
+(check-sat)
+(get-objectives)
+(get-model)

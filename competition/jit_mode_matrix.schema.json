@@ -1,0 +1,241 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$comment": "Andrew Yates <andrewyates.name@gmail.com>",
+  "description": "Competition EXTERNAL_CODEGEN/tMIR JIT mode matrix and fail-closed A/B gate policy.",
+  "type": "object",
+  "required": ["version", "modes", "solve_control_plane", "gate_defaults", "tracks"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "modes": {
+      "type": "object",
+      "required": ["off", "current", "solver-program", "profile-only"],
+      "additionalProperties": false,
+      "properties": {
+        "off": { "$ref": "#/definitions/mode" },
+        "current": { "$ref": "#/definitions/mode" },
+        "solver-program": { "$ref": "#/definitions/mode" },
+        "profile-only": { "$ref": "#/definitions/mode" }
+      }
+    },
+    "solve_control_plane": { "$ref": "#/definitions/solve_control_plane" },
+    "gate_defaults": {
+      "type": "object",
+      "required": [
+        "wrong_answers_max",
+        "proof_failures_max",
+        "witness_failures_max",
+        "crashes_max",
+        "solved_count_loss_max",
+        "par2_loss_max_sec",
+        "min_useful_applications"
+      ],
+      "properties": {
+        "wrong_answers_max": { "type": "integer", "minimum": 0 },
+        "proof_failures_max": { "type": "integer", "minimum": 0 },
+        "witness_failures_max": { "type": "integer", "minimum": 0 },
+        "crashes_max": { "type": "integer", "minimum": 0 },
+        "solved_count_loss_max": { "type": "integer", "minimum": 0 },
+        "par2_loss_max_sec": { "type": "number", "minimum": 0 },
+        "min_useful_applications": { "type": "integer", "minimum": 0 },
+        "integrity_failure_mode": { "enum": ["off", "profile-only"] },
+        "performance_failure_mode": { "enum": ["off", "profile-only"] }
+      },
+      "additionalProperties": false
+    },
+    "tracks": {
+      "type": "object",
+      "required": ["sat", "smt", "pb", "chc"],
+      "additionalProperties": { "$ref": "#/definitions/track" }
+    }
+  },
+  "definitions": {
+    "mode": {
+      "type": "object",
+      "required": ["native_dispatch", "description"],
+      "properties": {
+        "native_dispatch": { "type": "boolean" },
+        "description": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "solve_control_plane": {
+      "type": "object",
+      "required": ["version", "vocabulary", "tracks"],
+      "properties": {
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "vocabulary": {
+          "type": "object",
+          "required": ["mode", "guidance", "guidance-out", "runtime-summary", "telemetry"],
+          "properties": {
+            "mode": { "$ref": "#/definitions/control_plane_vocabulary_entry" },
+            "guidance": { "$ref": "#/definitions/control_plane_vocabulary_entry" },
+            "guidance-out": { "$ref": "#/definitions/control_plane_vocabulary_entry" },
+            "runtime-summary": { "$ref": "#/definitions/control_plane_vocabulary_entry" },
+            "telemetry": { "$ref": "#/definitions/control_plane_vocabulary_entry" }
+          },
+          "additionalProperties": false
+        },
+        "tracks": {
+          "type": "object",
+          "required": ["sat", "smt", "pb", "chc"],
+          "additionalProperties": { "$ref": "#/definitions/control_plane_track" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "control_plane_vocabulary_entry": {
+      "type": "object",
+      "required": ["description", "decision_fields"],
+      "properties": {
+        "description": { "type": "string" },
+        "mode_values": {
+          "type": "array",
+          "items": { "enum": ["off", "current", "solver-program", "profile-only"] }
+        },
+        "decision_fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "control_plane_track": {
+      "type": "object",
+      "required": ["runtime_modes", "mode_source", "guidance_artifacts", "telemetry_counters"],
+      "properties": {
+        "runtime_modes": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "mode_source": { "type": "string" },
+        "guidance_artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+          }
+        },
+        "telemetry_counters": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9_.]*$"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "track": {
+      "type": "object",
+      "required": ["competition", "evals", "artifacts"],
+      "properties": {
+        "competition": { "type": "string" },
+        "evals": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/definitions/artifact" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "artifact": {
+      "type": "object",
+      "required": [
+        "id",
+        "description",
+        "default_mode",
+        "candidate_modes",
+        "evidence_kind",
+        "min_useful_applications",
+        "application_counter",
+        "gate"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "description": { "type": "string" },
+        "default_mode": { "enum": ["off", "current", "solver-program", "profile-only"] },
+        "candidate_modes": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "enum": ["off", "current", "solver-program", "profile-only"] }
+        },
+        "evidence_kind": {
+          "enum": ["profile-only", "integrated-native-helper", "solver-program-native"]
+        },
+        "min_useful_applications": { "type": "integer", "minimum": 0 },
+        "application_counter": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9_.]*$"
+        },
+        "native_dispatch_counters": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["install_counter", "apply_counter"],
+            "properties": {
+              "install_counter": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9_.]*$"
+              },
+              "apply_counter": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9_.]*$"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "gate": {
+          "type": "object",
+          "required": [
+            "wrong_answer",
+            "proof_failure",
+            "witness_failure",
+            "crash",
+            "solved_count_loss",
+            "par2_loss",
+            "application_count"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "wrong_answer": { "$ref": "#/definitions/rule" },
+            "proof_failure": { "$ref": "#/definitions/rule" },
+            "witness_failure": { "$ref": "#/definitions/rule" },
+            "crash": { "$ref": "#/definitions/rule" },
+            "solved_count_loss": { "$ref": "#/definitions/rule" },
+            "par2_loss": { "$ref": "#/definitions/rule" },
+            "application_count": { "$ref": "#/definitions/rule" }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "rule": {
+      "type": "object",
+      "required": ["enabled", "failure_mode"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "failure_mode": { "enum": ["off", "profile-only"] },
+        "description": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e30df4210cbd94ec0d78cf4d2b828f48ae6232d26c75005a486ee9be0db2fe44 # shrinks to case = UfLiaCaseV3 { num_int_vars: 3, atom_specs: [LiaBoundOnFunc { var_idx: 0, cmp: Ge, bound: 2 }, IntVarEq { lhs_idx: 2, rhs_idx: 0 }, LiaBound { var_idx: 0, cmp: Le, bound: 0 }, FuncVarEqConst { var_idx: 2, constant: 0 }], expr: And([Atom(3), And([Atom(0), Atom(1)])]) }
+cc 06c700c3be9aaf6f5989599524c1c3a977ac65aa087eab9d65f581fff8bd7202 # shrinks to case = UfLiaCaseV3 { num_int_vars: 2, atom_specs: [LiaBound { var_idx: 0, cmp: Le, bound: 0 }, LiaBound { var_idx: 0, cmp: Le, bound: 0 }, FuncVarEqConst { var_idx: 0, constant: 1 }], expr: Atom(2) }

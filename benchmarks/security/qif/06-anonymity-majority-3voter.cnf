@@ -1,0 +1,19 @@
+c QIF benchmark 6/7: anonymous tally — 3-voter majority observable.
+c
+c Vars: 1=v1, 2=v2, 3=v3 (per-voter binary votes), 4=l (majority).
+c Logic: l = majority(v1, v2, v3) = 1 iff at least 2 votes are YES.
+c Observable l reveals tally>=2 but not which voters voted YES,
+c preserving voter anonymity within each tally bucket.
+c Models: 8 (one l value forced per (v1,v2,v3)).
+c Channel: maps 8 vote profiles to 2 tally classes — leak of 1 bit
+c of total tally information; 2 bits of voter identity remain hidden.
+c
+c Reference: Chaum D., "The Dining Cryptographers Problem" (J. Crypt.
+c 1988) and follow-on anonymity-vote QIF analyses by Backes & Köpf.
+p cnf 4 6
+-1 -2 4 0
+-1 -3 4 0
+-2 -3 4 0
+-4 1 2 0
+-4 1 3 0
+-4 2 3 0

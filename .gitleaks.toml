@@ -1,0 +1,10 @@
+# Publication policy: only the standard Gitleaks rules, at full strength.
+# No allowlists — the publication guard refuses any (a repository cannot
+# suppress its own secret scan). Exported content must genuinely not look
+# like a secret; fix the content, not the scanner.
+#
+# Copyright 2026 Andrew Yates
+# Licensed under the Apache License, Version 2.0
+
+[extend]
+useDefault = true

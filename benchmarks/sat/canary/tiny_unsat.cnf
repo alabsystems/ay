@@ -1,0 +1,5 @@
+c Canary UNSAT benchmark: simplest possible unsatisfiable formula.
+c Variable 1 must be both true and false simultaneously.
+p cnf 1 2
+1 0
+-1 0

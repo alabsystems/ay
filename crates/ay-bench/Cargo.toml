@@ -1,0 +1,26 @@
+[package]
+name = "ay-bench"
+description = "Competition-standard benchmarking CLI for AY SMT solver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "ay_bench"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json.workspace = true
+serde.workspace = true
+rusqlite.workspace = true
+rayon.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+wait-timeout.workspace = true
+ay-proof-complexity.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,20 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "ay-multiset"
+description = "Multiset theory solver for AY (count over Array(T->Int) count carrier)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ay-core.workspace = true
+num-bigint.workspace = true
+
+[dev-dependencies]
+num-rational.workspace = true

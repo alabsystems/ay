@@ -1,0 +1,12 @@
+% x_i in [0..3], y=10: count(x_i == 10) should ALWAYS be 0
+% But due to the d sign bug, the b indicators might not properly capture equality
+var 0..3: x1 :: output_var;
+var 0..3: x2 :: output_var;
+var 0..3: x3 :: output_var;
+var 0..3: x4 :: output_var;
+var 0..3: x5 :: output_var;
+var 0..5: obj :: output_var;
+array [1..5] of var int: xs = [x1, x2, x3, x4, x5];
+constraint fzn_count_eq(xs, 10, obj);
+constraint int_eq(obj, 3);
+solve satisfy;

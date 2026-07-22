@@ -1,0 +1,5 @@
+dpr-trim
+lpr-check
+compress
+decompress
+*.o

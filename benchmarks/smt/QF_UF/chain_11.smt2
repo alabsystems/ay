@@ -1,0 +1,10 @@
+; QF_UF benchmark: chain_11
+(set-logic QF_UF)
+(declare-sort U 0)
+(declare-fun x0 () U)
+(declare-fun x1 () U)
+(declare-fun x2 () U)
+(assert (= x0 x1))
+(assert (= x1 x2))
+(check-sat)
+(exit)

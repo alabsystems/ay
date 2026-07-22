@@ -1,0 +1,12 @@
+* #variable= 6 #constraint= 5
+* Optimization: assign 3 tasks to 2 workers, minimize cost
+* Variables: x1=t1w1, x2=t1w2, x3=t2w1, x4=t2w2, x5=t3w1, x6=t3w2
+* Each task must be assigned to at least one worker:
+min: +1 x1 +2 x2 +2 x3 +1 x4 +3 x5 +1 x6 ;
++1 x1 +1 x2 >= 1 ;
++1 x3 +1 x4 >= 1 ;
++1 x5 +1 x6 >= 1 ;
+* Worker 1 has capacity 2: at most 2 tasks
++1 ~x1 +1 ~x3 +1 ~x5 >= 1 ;
+* Worker 2 has capacity 2: at most 2 tasks
++1 ~x2 +1 ~x4 +1 ~x6 >= 1 ;

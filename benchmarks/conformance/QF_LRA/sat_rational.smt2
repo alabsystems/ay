@@ -1,0 +1,6 @@
+(set-info :status sat)
+(set-logic QF_LRA)
+(declare-const x Real)
+(assert (= (* x 3.0) 1.0))
+(check-sat)
+(exit)

@@ -1,0 +1,21 @@
+[package]
+name = "ay-sys"
+description = "System interfaces for AY (memory measurement, resource limits)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Enable the first-allocation mimalloc `arena_reserve` peak-RSS trim (see
+# `ensure_arena_reserve_trimmed` in `lib.rs`). OFF by default: only the final `ay`
+# binary statically links mimalloc, so its symbols must not be referenced by
+# consumers that do not. The `ay` binary turns this on via its `cli` feature.
+mimalloc-arena-trim = []
+
+[dependencies]
+libc.workspace = true

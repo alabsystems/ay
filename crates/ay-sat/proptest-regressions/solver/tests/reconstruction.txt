@@ -1,0 +1,29 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ef2fc2f6be1c0779f8efe6273c7ae70a50b88d2fac573f12f7631d4d5169db94 # shrinks to num_vars = 6, seed = 1
+cc d86a755f79dea9d1083fac77539d5e443845f3d944386362b6461cab11b7418f # shrinks to num_vars = 23, seed = 397
+cc c95b8457193b5f13fb20cdbc05261de9964e6f7d02e812b98772fa582db896cb # shrinks to num_vars = 27, seed = 351
+cc 1ae6b135ace843db879a8a3153e460ce1a5aec5f0befcff64f7b2005523d0e9d # shrinks to num_vars = 27, seed = 34
+cc d37363142bc9cd7efee5b4e59950fb4343cdf3595713012d83ab2e0e37567565 # shrinks to num_vars = 27, seed = 230
+cc 62dc94e17bd6091161fdb8c131f2af32ad509a8266b256e8e07b0d25f3f0ef30 # shrinks to num_vars = 29, seed = 342
+cc 04c2d27983c57aa37258d043aa58b52a2376f46d7921be36cf545818b28bd877 # shrinks to num_vars = 29, seed = 459
+cc 6158a0902948d75906d45b9d3812cd238275d1e4310971da7bbc65d5b97cd4f8 # shrinks to num_vars = 25, seed = 19
+cc 87e4c1dfbf446d54b8a286a412a5cd8f1a1f9c953ef2567db2d8cf2dcf7f04ef # shrinks to num_vars = 27, seed = 194
+cc 26b1a585804a064e92fd696ee09496771ca27ffea204253c513277ed1043208e # shrinks to num_vars = 27, seed = 218
+cc c417c0be0c02bdfea37cce8542496330287580fb07d8eb526912271076d8fcc6 # shrinks to num_vars = 23, seed = 455
+cc 8fc17e651a5241c97f526bf3ddfaf556a774a55ead4f56581cd5fd3503ec679f # shrinks to num_vars = 21, seed = 127
+cc 4f3fa57ba618a374ca1349e81b8ed468bdcee8f71218ec0189bca96b9c1cf22f # shrinks to num_vars = 25, seed = 336
+cc 71dae1271c808dbdfbb180283f4aae84b7ef557acd391623463c51300b1c7567 # shrinks to num_vars = 21, seed = 390
+cc 3c2982ddec31c2b393d567c2760e2349ba25a156af85bf07a05f127531aa2091 # shrinks to num_vars = 25, seed = 57
+cc dad50cf1ce96ac13595d34d34c9ed3465426482bcf3b559cd3ab227f7284ee98 # shrinks to num_vars = 3, num_clauses = 5, seed = 6057
+cc 2baa9631db09bf19f3d63543a93058d2b98eba3c3e8745ebedcf02d5cf9f6b3e # shrinks to num_vars = 15, seed = 4
+cc 0d44278df22ff243c0c9eebe554e01aef7fc0ec3cfdcc37083da7df125385500 # shrinks to num_vars = 15, seed = 336
+cc 2a9f913bf8eb9bcacd297f8b2725933964dedd4c081fb0ebeaf92e9d2bb0def5 # shrinks to num_vars = 19, seed = 94
+cc 9aec83ae5f25430ab99613488ea5b898d225fcdd70cd71650b9b8a4a1f4e298b # shrinks to num_vars = 24, seed = 322
+cc cd1c7ce6bc90aac8bb5e367fb6dfe6c0c9089c7acdc3af0c0e79414c11b970e8 # shrinks to num_vars = 19, seed = 58
+cc dd3baad9b839a1bc07e36dd8babcf2cc6a2edb777334c3a74b9caba8b418138b # shrinks to seed = 326, n_gates = 3
+cc dd60a6dc5e83e127604780e1b3fa76b3d59f20900da62f54db7188eb87beabff # shrinks to num_vars = 20, seed = 405

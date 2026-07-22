@@ -1,0 +1,12 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 53bc76d7677124103a450676e4b0b0b1501e4ecc299f09975ebf448d67b8ae06 # shrinks to lp = RandomLp { cols: [(-inf, 2.0), (0.0, 4.0), (-inf, 2.0), (0.0, 1.0)], rows: [(-inf, 2.0, [(2, -2.0)]), (1.0, 1.0, [(0, -1.0), (3, 1.0), (1, 1.0), (3, -2.0)])], obj: [-1.0, 2.0, -1.0, -1.0], maximize: true }
+cc 4e33d0a5c6a5337408bc24741f74078366d4cbed7ead7aadeee7669f7ab71441 # shrinks to lp = RandomLp { cols: [(-inf, 2.0), (0.0, 1.0)], rows: [(0.0, 3.0, [(0, 2.0)]), (1.0, inf, [(1, 2.0)]), (1.0, inf, [(1, -1.0), (0, -2.0)])], obj: [-1.0, -1.0], maximize: false }
+cc d0501bf28e1b3456d0ff8e218b3d88332a8d7eb8d8c5bb1cd34d7932846b9b0b # shrinks to lp = RandomLp { cols: [(-inf, 2.0), (-inf, 2.0), (-3.0, inf), (0.0, 1.0), (-inf, 2.0)], rows: [(1.0, inf, [(4, -2.0), (0, 0.5)]), (1.0, inf, [(0, -2.0), (0, -2.0)]), (-inf, 2.0, [(4, -2.0), (2, 0.5), (0, -2.0), (1, 1.0)])], obj: [-1.0, -1.0, -1.0, -1.0, -1.0], maximize: false }
+cc 568a01c6cbbf9385a86aac119ec657a78a71375efb1986bcaa1cde3988d0acc7 # shrinks to lp = RandomLp { cols: [(-1.0, 1.0), (0.0, 1.0)], rows: [(0.0, 3.0, [(0, 2.0), (1, 0.5)])], obj: [-1.0, 2.0], maximize: true }
+cc b71ad4c01b5ab54ea5502b4e7e3a8ada3b89dec148b0097719ab53052ad72b1f # shrinks to lp = RandomLp { cols: [(0.0, 1.0), (0.0, 1.0)], rows: [(-inf, 2.0, [(0, -2.0)])], obj: [0.0, 0.0], maximize: false }
+cc eb03fc66f6b7250ad2e297f05d0ff2d6d9709e6526457a8ffa5fee1b0e83d1eb # shrinks to lp = RandomLp { cols: [(0.0, 1.0), (-1.0, 1.0), (-1.0, 1.0)], rows: [(-inf, 2.0, [(0, -2.0)])], obj: [-1.0, -1.0, -1.0], maximize: false }

@@ -1,0 +1,11 @@
+* #variable= 6 #constraint= 5
+* Pigeonhole principle: 3 pigeons in 2 holes (UNSAT)
+* Variables: x_ij = pigeon i goes to hole j
+* x11=x1, x12=x2, x21=x3, x22=x4, x31=x5, x32=x6
+* Each pigeon goes somewhere:
++1 x1 +1 x2 >= 1 ;
++1 x3 +1 x4 >= 1 ;
++1 x5 +1 x6 >= 1 ;
+* Each hole has at most one pigeon:
+-1 x1 -1 x3 -1 x5 >= -1 ;
+-1 x2 -1 x4 -1 x6 >= -1 ;

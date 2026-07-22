@@ -1,0 +1,32 @@
+[package]
+name = "ay-core"
+description = "Core types and traits for AY SMT solver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[features]
+default = []
+cli = ["dep:clap"]
+
+[dependencies]
+clap = { workspace = true, optional = true }
+hashbrown.workspace = true
+foldhash.workspace = true
+num-rational.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+num-integer.workspace = true
+stacker.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+ay-sys.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+serial_test.workspace = true
+
+[lints]
+workspace = true

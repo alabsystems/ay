@@ -1,0 +1,11 @@
+(set-info :status unsat)
+(set-logic QF_ABV)
+; Write value v1 at index i, then read back expecting different value v2
+(declare-const a (Array (_ BitVec 8) (_ BitVec 8)))
+(declare-const i (_ BitVec 8))
+(declare-const v1 (_ BitVec 8))
+(declare-const v2 (_ BitVec 8))
+(assert (distinct v1 v2))
+(assert (= (select (store a i v1) i) v2))
+(check-sat)
+(exit)

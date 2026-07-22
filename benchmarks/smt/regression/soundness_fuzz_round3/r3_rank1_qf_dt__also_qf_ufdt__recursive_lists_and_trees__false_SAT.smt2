@@ -1,0 +1,7 @@
+(set-logic QF_DT)
+(declare-sort E 0)
+(declare-datatypes ((Lst 0)) (((cons (hd E) (tl Lst)) (nil))))
+(declare-const x Lst)
+(declare-const h E)
+(assert (= x (cons h (cons h x))))
+(check-sat)

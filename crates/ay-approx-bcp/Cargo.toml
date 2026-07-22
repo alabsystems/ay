@@ -1,0 +1,30 @@
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# ay-approx-bcp: 64-bit clause signature filter for approximate BCP.
+#
+# Standalone kernel:
+#   - Per-clause 64-bit signature (OR of splitmix-hashed literal bits).
+#   - Running AssignmentMask that ORs in per-literal bit masks.
+#   - Sound "may_be_unit_or_falsified" filter used as a pre-pass before
+#     exact watch-literal BCP.  False positives are OK; false negatives
+#     would drop unit/conflict detection and are forbidden by property
+#     tests.
+#
+# This crate intentionally has no ay-sat dependency. ay-sat's optional
+# observer depends on this crate without creating a dependency inversion.
+
+[package]
+name = "ay-approx-bcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone approximate BCP filter using 64-bit clause signatures"
+readme = "README.md"
+repository.workspace = true
+authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]

@@ -1,0 +1,5 @@
+(set-logic QF_DT)
+(declare-datatypes ((Lst 0)) (((cons (tl Lst)) (nil))))
+(declare-const x Lst)
+(assert (= x (cons (cons (tl x)))))
+(check-sat)

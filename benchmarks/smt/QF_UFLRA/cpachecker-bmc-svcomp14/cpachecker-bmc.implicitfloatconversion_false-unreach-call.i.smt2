@@ -1,0 +1,35 @@
+(set-info :smt-lib-version 2.6)
+(set-logic QF_UFLRA)
+(set-info :source |CPAchecker with bounded model checking on SV-COMP14 program using MathSAT5, submitted by Philipp Wendler, http://cpachecker.sosy-lab.org|)
+(set-info :category "industrial")
+(set-info :status sat)
+
+
+(declare-fun __BASE_ADDRESS_OF__ (Real) Real)
+(declare-fun |__ADDRESS_OF_main::i| () Real)
+(declare-fun |main::i@2| () Real)
+(declare-fun |main::f@2| () Real)
+(declare-fun |__ADDRESS_OF_main::f| () Real)
+(define-fun _8 () Real |__ADDRESS_OF_main::f|)
+(define-fun _9 () Real (__BASE_ADDRESS_OF__ _8))
+(define-fun _10 () Bool (= _8 _9))
+(define-fun _11 () Real 1)
+(define-fun _12 () Real |main::f@2|)
+(define-fun _13 () Bool (= _12 _11))
+(define-fun _14 () Bool (and _10 _13))
+(define-fun _15 () Real |__ADDRESS_OF_main::i|)
+(define-fun _16 () Real (__BASE_ADDRESS_OF__ _15))
+(define-fun _17 () Bool (= _15 _16))
+(define-fun _18 () Real |main::i@2|)
+(define-fun _19 () Bool (= _12 _18))
+(define-fun _20 () Bool (and _17 _19))
+(define-fun _21 () Bool (and _14 _20))
+(define-fun _22 () Bool (= _18 _11))
+(define-fun _24 () Bool (and _21 _22))
+
+
+
+(assert _24)
+(check-sat)
+
+(exit)

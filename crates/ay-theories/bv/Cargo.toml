@@ -1,0 +1,27 @@
+[package]
+name = "ay-bv"
+description = "Bitvector theory solver for AY"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ay-core.workspace = true
+ay-sys.workspace = true
+num-bigint.workspace = true
+tracing.workspace = true
+stacker.workspace = true
+
+[dev-dependencies]
+ay-sat = { path = "../../ay-sat", default-features = false, features = ["raw-pointer-bcp", "jit"] }
+proptest.workspace = true
+criterion.workspace = true
+
+# [[bench]]
+# name = "bv_bench"
+# harness = false

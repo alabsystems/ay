@@ -1,0 +1,5 @@
+sat
+(objectives
+ (x  (interval 2 (+ 3.0 (* (- 1.0) epsilon))))
+ (y oo)
+)

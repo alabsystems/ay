@@ -1,0 +1,7 @@
+(set-logic QF_SLIA)
+(declare-fun v4 () (Seq Int))
+(declare-fun v6 () (Seq Bool))
+(declare-fun v9 () Int)
+(assert (= v6 (as seq.empty (Seq Bool))))
+(assert (= (seq.len (seq.++ (seq.unit 4) (seq.++ (seq.unit (- 0 1)) (seq.unit 0)))) (seq.nth (seq.++ (as seq.empty (Seq Int)) v4) (+ v9 v9))))
+(check-sat)

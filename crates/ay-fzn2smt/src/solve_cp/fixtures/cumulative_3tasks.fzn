@@ -1,0 +1,15 @@
+% Cumulative scheduling: 3 tasks, capacity 2
+% Task 1: duration 3, demand 1
+% Task 2: duration 2, demand 1
+% Task 3: duration 4, demand 1
+% Minimize makespan
+var 0..10: s1 :: output_var;
+var 0..10: s2 :: output_var;
+var 0..10: s3 :: output_var;
+var 0..20: makespan :: output_var;
+constraint fzn_cumulative([s1, s2, s3], [3, 2, 4], [1, 1, 1], 2);
+% Makespan >= end of each task
+constraint int_lin_le([1, -1], [s1, makespan], -3);
+constraint int_lin_le([1, -1], [s2, makespan], -2);
+constraint int_lin_le([1, -1], [s3, makespan], -4);
+solve minimize makespan;

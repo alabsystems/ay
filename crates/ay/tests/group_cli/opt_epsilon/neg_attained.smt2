@@ -1,0 +1,5 @@
+(declare-const x Real)
+(assert (<= x -2.0))
+(maximize x)
+(check-sat)
+(get-objectives)

@@ -1,0 +1,20 @@
+[package]
+name = "ay-cp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lazy Clause Generation CP-SAT solver built on ay-sat"
+readme.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ay-sat.workspace = true
+rustc-hash.workspace = true
+smallvec.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

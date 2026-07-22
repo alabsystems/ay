@@ -1,0 +1,12 @@
+(set-logic QF_ALIA)
+; Multiple stores at distinct positions, sum constraint: SAT
+(declare-const a (Array Int Int))
+(declare-const b (Array Int Int))
+(declare-const i Int)
+(declare-const j Int)
+(declare-const k Int)
+(assert (distinct i j k))
+(assert (= b (store (store (store a i 1) j 2) k 3)))
+(assert (= (+ (select b i) (select b j) (select b k)) 6))
+(check-sat)
+(exit)

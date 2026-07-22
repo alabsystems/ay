@@ -1,0 +1,7 @@
+# Proof-complexity hard-family corpus slice for issue #8890.
+# `ay-bench` consumes the first column; manifest.csv carries metadata.
+benchmarks/sat/unsat/php_4_3.cnf
+benchmarks/sat/unsat/tseitin_grid_3x3.cnf
+benchmarks/sat/unsat/parity_6.cnf
+benchmarks/sat/unsat/random_3sat_50_213_s12345.cnf
+benchmarks/sat/satcomp2024-sample/a5419a63d913bde0ba5bcd8a8571342f-asconhashv12_opt64_H11_M2-tBi5i1RIgRz_m0_1_U23.c.cnf.xz

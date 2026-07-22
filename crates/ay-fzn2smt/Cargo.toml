@@ -1,0 +1,38 @@
+# Author: Andrew Yates
+# ay-fzn2smt — library backing the unified `ay flatzinc` CLI
+#
+# Reads a .fzn file, translates constraints to SMT-LIB2 using flatzinc-smt,
+# and exposes the solve routines used by the top-level `ay` binary.
+#
+# CLI entry point:
+#   ay flatzinc translate model.fzn
+#   ay flatzinc solve model.fzn
+#   ay flatzinc info model.fzn
+
+[package]
+name = "ay-fzn2smt"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Library backing the unified ay flatzinc CLI and MiniZinc solving flow"
+readme.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/ay-fzn2smt"
+
+[lints]
+workspace = true
+
+[lib]
+name = "ay_fzn2smt"
+path = "src/lib.rs"
+
+[features]
+default = []
+
+[dependencies]
+ay-flatzinc-parser.workspace = true
+ay-flatzinc-smt.workspace = true
+ay-cp.workspace = true
+thiserror.workspace = true

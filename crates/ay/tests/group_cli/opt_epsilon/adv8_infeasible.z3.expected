@@ -1,0 +1,4 @@
+unsat
+(objectives
+ (x  (interval (* (- 1) oo) oo))
+)

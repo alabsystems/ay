@@ -1,0 +1,17 @@
+; If store(a, i, v) = store(b, i, w) and j != i, then select(a, j) = select(b, j)
+; By ROW2 on both sides and transitivity
+; Expected: unsat
+(set-logic QF_AX)
+(declare-sort Index 0)
+(declare-sort Element 0)
+(declare-fun a () (Array Index Element))
+(declare-fun b () (Array Index Element))
+(declare-fun i () Index)
+(declare-fun j () Index)
+(declare-fun v () Element)
+(declare-fun w () Element)
+(assert (= (store a i v) (store b i w)))
+(assert (not (= i j)))
+(assert (not (= (select a j) (select b j))))
+(check-sat)
+(exit)

@@ -1,0 +1,19 @@
+# Author: Andrew Yates
+# FlatZinc 2.8.5 parser — standalone crate for MiniZinc Challenge entry
+
+[package]
+name = "ay-flatzinc-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FlatZinc 2.8.5 parser for constraint programming models"
+readme.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]

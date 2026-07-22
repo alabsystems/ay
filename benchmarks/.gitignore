@@ -1,0 +1,32 @@
+# Downloaded benchmark files (too large to commit)
+*.tar.gz
+*.cnf
+# Exception: curated UNSAT corpus for DRAT verification (#2916)
+!sat/unsat/*.cnf
+# Exception: canary smoke-test benchmarks (tiny, committed for CI)
+!sat/canary/*.cnf
+# Exception: eq.atree.braun circuit equivalence UNSAT benchmarks
+!sat/eq_atree_braun/*.cnf
+# Exception: small in-tree QIF CNF set (security-qif corpus source).
+!security/qif/*.cnf
+
+# CHC-COMP benchmarks (clone from https://github.com/chc-comp/chc-comp25-benchmarks)
+chc/chc-comp25-benchmarks/
+
+# SMT-COMP benchmark downloads (download from smtlib.cs.uiowa.edu)
+# These are too large to commit (>1GB for full corpora)
+smtcomp/QF_*/
+!smtcomp/QF_LRA/
+smtcomp/QF_LRA/*
+!smtcomp/QF_LRA/simple_startup_10nodes.bug.induct.smt2
+!smtcomp/QF_LRA/simple_startup_14nodes.bug.induct.smt2
+smtcomp/non-incremental/
+smtcomp/incremental/
+smtcomp/**/*.smt2
+!smtcomp/QF_LRA/simple_startup_10nodes.bug.induct.smt2
+!smtcomp/QF_LRA/simple_startup_14nodes.bug.induct.smt2
+
+# model-checker-consumer harness check results (auto-generated, keep only latest baseline)
+model-checker-consumer/results/*.json
+!model-checker-consumer/results/.gitkeep
+*.cnf.xz

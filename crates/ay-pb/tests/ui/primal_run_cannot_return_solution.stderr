@@ -1,0 +1,10 @@
+error[E0271]: expected `{closure@primal_run_cannot_return_solution.rs:9:9}` to return `()`, but it returns `PbSolution`
+ --> tests/ui/primal_run_cannot_return_solution.rs:9:79
+  |
+9 |         |_instance, _objective, _timeout_dur, _start, _term_flag, _sender| -> ay_pb::PbSolution {
+  |         ----------------------------------------------------------------------^^^^^^^^^^^^^^^^^
+  |         |                                                                     |
+  |         |                                                                     expected `()`, found `PbSolution`
+  |         this closure
+  |
+  = note: required for the cast from `Box<{closure@$DIR/tests/ui/primal_run_cannot_return_solution.rs:9:9: 9:96}>` to `Box<(dyn for<'a, 'b, 'c, 'd> Fn(&'a PbInstance, &'b PbObjective, Option<Duration>, Instant, &'c Atomic<bool>, &'d PrimalSender) + Send + Sync + 'static)>`

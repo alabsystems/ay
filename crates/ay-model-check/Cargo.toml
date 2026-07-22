@@ -1,0 +1,26 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "ay-model-check"
+description = "Independent, fail-closed model-check gate for the AY SMT solver. A fresh, pure, total recursive SMT-LIB evaluator that re-checks every `sat` model against the assertions; depends only on ay-core."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+# INDEPENDENCE INVARIANT: this crate depends ONLY on ay-core (term/sort types)
+# and exact-arithmetic numeric crates. It must NOT depend on ay-dpll or any
+# solver/theory crate. The whole point is a second, simple, separately-auditable
+# evaluator that the (untrusted) search engine cannot influence.
+ay-core.workspace = true
+num-bigint.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+num-integer.workspace = true
+
+[lints]
+workspace = true

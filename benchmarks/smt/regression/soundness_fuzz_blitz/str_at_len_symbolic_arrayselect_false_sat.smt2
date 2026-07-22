@@ -1,0 +1,7 @@
+(set-logic ALL)
+(declare-const t String)
+(declare-const i Int)
+(declare-const a (Array Int Int))
+(assert (= (str.len (str.at t (select a i))) 3))
+(assert (= (select a 5) 3))
+(check-sat)

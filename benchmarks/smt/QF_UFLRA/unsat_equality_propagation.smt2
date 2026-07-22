@@ -1,0 +1,12 @@
+; Test UNSAT: x=5.0, y=5.0 => f(x)=f(y) but 10.0≠20.0
+(set-logic QF_UFLRA)
+(declare-const x Real)
+(declare-const y Real)
+(declare-fun f (Real) Real)
+(assert (>= x 5.0))
+(assert (<= x 5.0))
+(assert (= y 5.0))
+(assert (= (f x) 10.0))
+(assert (= (f y) 20.0))
+(check-sat)
+; Expected: unsat (x=5.0=y, so f(x)=f(y), but 10.0≠20.0)

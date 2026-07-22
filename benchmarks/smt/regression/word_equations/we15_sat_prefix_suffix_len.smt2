@@ -1,0 +1,6 @@
+(set-logic QF_SLIA)
+(declare-const x String)
+(assert (str.prefixof "ab" x))
+(assert (str.suffixof "ba" x))
+(assert (= (str.len x) 3))
+(check-sat)

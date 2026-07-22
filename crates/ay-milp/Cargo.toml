@@ -1,0 +1,35 @@
+# ay-milp: MILP/LP engine and the typed in-process API consumed by ny.
+#
+# Designed in the development design notes and
+# the development design notes At L0 (feature `smt`, default ON)
+# the engine is a shim over ay-dpll's typed Solver; Track E replaces the
+# internals with a native revised dual simplex + branch-and-cut underneath the
+# same API, at which point the `smt` default flips off.
+[package]
+name = "ay-milp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MILP/LP optimization engine with certified verdicts (Farkas / optimality certificates)"
+
+[features]
+default = ["smt"]
+# The L0 lowering lane through ay-dpll's typed Solver API. Carries the full
+# ay-dpll dependency; native Track E paths do not need it.
+smt = ["dep:ay-dpll"]
+
+[dependencies]
+ay-dpll = { workspace = true, optional = true }
+ay-lra.workspace = true
+num-rational.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+num-integer.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,7 @@
+(set-info :status unsat)
+(set-logic QF_AUFLIA)
+(declare-const a (Array Int Int))
+(declare-const i Int)
+(assert (= (select (store a i 5) i) 10))
+(check-sat)
+(exit)

@@ -1,0 +1,7 @@
+c exists x forall y. (x OR y) AND (NOT x OR NOT y)  
+c UNSAT: no value of x works for all y
+p cnf 2 2
+e 1 0
+a 2 0
+1 2 0
+-1 -2 0

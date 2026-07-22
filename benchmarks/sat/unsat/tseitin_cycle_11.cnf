@@ -1,0 +1,26 @@
+c Tseitin formula on cycle graph with 11 vertices
+c 11 edge variables, odd parity at each vertex
+c UNSAT: 11 odd-parity vertices (odd count) on graph where each edge in 2 vertices
+p cnf 11 22
+11 1 0
+-11 -1 0
+1 2 0
+-1 -2 0
+2 3 0
+-2 -3 0
+3 4 0
+-3 -4 0
+4 5 0
+-4 -5 0
+5 6 0
+-5 -6 0
+6 7 0
+-6 -7 0
+7 8 0
+-7 -8 0
+8 9 0
+-8 -9 0
+9 10 0
+-9 -10 0
+10 11 0
+-10 -11 0

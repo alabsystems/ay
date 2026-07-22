@@ -1,0 +1,8 @@
+(set-info :status sat)
+(set-logic QF_BV)
+(declare-const x (_ BitVec 8))
+(assert (= x #x01))
+(assert (= (bvshl x #x03) #x08))
+(assert (= (bvlshr #x80 #x03) #x10))
+(check-sat)
+(exit)

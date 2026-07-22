@@ -1,0 +1,8 @@
+(set-info :status sat)
+(set-logic QF_UFLIA)
+(declare-fun f (Int) Int)
+(declare-const x Int)
+(assert (= (f x) 42))
+(assert (> x 0))
+(check-sat)
+(exit)

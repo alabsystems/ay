@@ -1,0 +1,9 @@
+c exists x forall y. (y) - clause has only universal
+c SAT: universal reduction removes y, empty clause BUT
+c Actually this should be UNSAT because (y) forces y=true
+c but y is universal so adversary can set y=false
+c Let's make it: forall y. (y OR NOT y) - tautology
+p cnf 2 1
+e 1 0
+a 2 0
+2 -2 0

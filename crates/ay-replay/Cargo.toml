@@ -1,0 +1,23 @@
+[package]
+name = "ay-replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Deterministic LRAT and sequential RUP-only DRAT proof replay"
+readme = "README.md"
+
+[lib]
+name = "ay_replay"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+ay-drat-check = { workspace = true }
+ay-lrat-check = { workspace = true }
+ay-proof-common = { workspace = true }
+
+[lints]
+workspace = true

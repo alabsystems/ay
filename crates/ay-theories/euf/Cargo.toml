@@ -1,0 +1,26 @@
+[package]
+name = "ay-euf"
+description = "Equality and Uninterpreted Functions theory solver for AY"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ay-core.workspace = true
+hashbrown.workspace = true
+num-bigint.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+serial_test.workspace = true
+
+[[bench]]
+name = "euf_bench"
+harness = false

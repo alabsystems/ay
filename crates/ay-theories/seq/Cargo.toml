@@ -1,0 +1,18 @@
+[package]
+name = "ay-seq"
+description = "Sequence theory solver for AY"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ay-core.workspace = true
+num-bigint.workspace = true
+
+[dev-dependencies]
+num-rational.workspace = true

@@ -1,0 +1,12 @@
+; QF_LIA benchmark: system_02
+(set-logic QF_LIA)
+(declare-fun v0 () Int)
+(declare-fun v1 () Int)
+(declare-fun v2 () Int)
+(assert (= (+ (* 5 v0) (* 2 v1) (* -4 v2)) -49))
+(assert (<= (+ (* -1 v0) (* 2 v1) (* 2 v2)) 6))
+(assert (>= (+ (* -3 v0) (* -5 v1) (* -1 v2)) 11))
+(assert (= (+ (* -4 v0) (* 1 v1) (* 2 v2)) -41))
+(assert (>= (+ (* 5 v0) (* 5 v1) (* -5 v2)) -31))
+(check-sat)
+(exit)

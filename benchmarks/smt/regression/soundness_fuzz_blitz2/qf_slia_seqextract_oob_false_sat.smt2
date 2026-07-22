@@ -1,0 +1,6 @@
+(set-logic QF_SLIA)
+(declare-fun s0 () (Seq Int))
+(declare-fun n1 () Int)
+(assert (= (seq.replace s0 (seq.extract (seq.unit 2) 1 n1) (seq.unit (- 0 2)))
+           (seq.++ (seq.unit 0) (seq.unit 1))))
+(check-sat)

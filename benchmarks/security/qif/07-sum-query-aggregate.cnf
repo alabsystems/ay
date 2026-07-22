@@ -1,0 +1,21 @@
+c QIF benchmark 7/7: aggregate-sum side-channel.
+c
+c Vars: 1=h1, 2=h2 (1-bit secrets from two parties),
+c        3=l_lo, 4=l_hi (2-bit observable sum: l = h1 + h2).
+c Logic: l_lo = h1 XOR h2 (sum's LSB);
+c        l_hi = h1 AND h2 (sum's carry / MSB).
+c The aggregate sum exposes both secrets jointly even though no
+c individual secret is referenced by the observable. Models: 4.
+c Leakage: full 2 bits (h1 and h2 jointly recoverable from (l_hi,l_lo)).
+c
+c Reference: Smith G. & Volpano D., "Secure Information Flow in a
+c Multi-Threaded Imperative Language", POPL 1998 — aggregate-query
+c side-channel canonical example for statistical-database QIF.
+p cnf 4 7
+-1 -2 -3 0
+1 2 -3 0
+1 -2 3 0
+-1 2 3 0
+-4 1 0
+-4 2 0
+4 -1 -2 0

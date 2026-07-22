@@ -1,0 +1,18 @@
+; Double store with ROW2: select(store(store(a, i, v1), j, v2), k) = select(a, k)
+; when k != i and k != j
+; Expected: unsat
+(set-logic QF_AX)
+(declare-sort Index 0)
+(declare-sort Element 0)
+(declare-fun a () (Array Index Element))
+(declare-fun i () Index)
+(declare-fun j () Index)
+(declare-fun k () Index)
+(declare-fun v1 () Element)
+(declare-fun v2 () Element)
+(assert (not (= i j)))
+(assert (not (= i k)))
+(assert (not (= j k)))
+(assert (not (= (select (store (store a i v1) j v2) k) (select a k))))
+(check-sat)
+(exit)

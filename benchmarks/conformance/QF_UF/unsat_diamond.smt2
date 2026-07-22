@@ -1,0 +1,12 @@
+(set-info :status unsat)
+(set-logic QF_UF)
+; Diamond pattern: a=b, a=c, b!=c should be unsat
+(declare-sort U 0)
+(declare-const a U)
+(declare-const b U)
+(declare-const c U)
+(assert (= a b))
+(assert (= a c))
+(assert (not (= b c)))
+(check-sat)
+(exit)

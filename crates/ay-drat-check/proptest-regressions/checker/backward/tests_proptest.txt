@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 010193a069692040578379b2d6f7f529e06f445779b4a4b6b5522dc9952c84ae # shrinks to clauses = [[Literal(1)], [Literal(3), Literal(1)]], add_steps = [Add([Literal(1)])]
+cc 6dbc303a24ce45df8be2aa504704298414b382b778c8ad7a0788e376cf7ad734 # shrinks to num_vars = 2, clauses = [[Literal(3)], [Literal(6), Literal(6)], [Literal(7), Literal(7)]], add_steps = [Add([Literal(5), Literal(1)]), Add([Literal(7)])]
+cc 7235c26215a8f749e982bac865cccf11ee38015abf175cd56a734a9721f9357a # shrinks to (num_vars, clauses, steps) = (4, [[Literal(6), Literal(6)], [Literal(7), Literal(7)], [Literal(1)]], [Add([Literal(3), Literal(5)]), Add([Literal(7)])])

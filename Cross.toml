@@ -1,0 +1,43 @@
+# Cross.toml — configuration for `cross` (https://github.com/cross-rs/cross)
+#
+# Used by scripts/build_linux_static.sh to produce the static Linux x86_64
+# binary for PB-COMP and SAT-COMP submissions.
+#
+# The default image for x86_64-unknown-linux-musl already bundles musl-gcc
+# and a recent Rust toolchain, which is sufficient for ay's native
+# dependencies (libc only; jemalloc-sys is not enabled in release builds).
+
+[build]
+# Use pre-build hooks to skip rebuilding the Rust toolchain on every run.
+pre-build = []
+
+[build.env]
+volumes = [
+    "AY_STATIC_SSH_VOLUME",
+]
+# Forward RUSTFLAGS so the target-cpu tuning in build_linux_static.sh reaches
+# the container. Without this, the script's RUSTFLAGS is lost at the docker
+# boundary.
+passthrough = [
+    "RUSTFLAGS",
+    "RUSTC_WRAPPER",
+    "AY_SOURCE_GIT_COMMIT",
+    "AY_SOURCE_GIT_COMMIT_SHORT",
+    "AY_SOURCE_GIT_BRANCH",
+    "AY_SOURCE_GIT_DIRTY",
+    "CARGO_NET_GIT_FETCH_WITH_CLI",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
+    "GIT_SSH_COMMAND",
+    "CARGO_BUILD_JOBS",
+    "MAKEFLAGS",
+    "CARGO_INCREMENTAL",
+    "RUST_BACKTRACE",
+]
+
+[target.x86_64-unknown-linux-musl]
+# Default image from cross-rs has musl-gcc and all standard Rust target
+# components. If we later need libclang or other system deps for a new ay
+# crate, switch to a custom image here.
+# image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:main"

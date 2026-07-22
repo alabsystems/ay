@@ -1,0 +1,8 @@
+(set-info :status sat)
+(set-logic QF_UFLRA)
+(declare-fun f (Real) Real)
+(declare-const x Real)
+(assert (= (f x) 1.0))
+(assert (> x 0.0))
+(check-sat)
+(exit)

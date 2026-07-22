@@ -1,0 +1,15 @@
+; Write-after-write: store(store(a, i, v1), i, v2) should behave like store(a, i, v2)
+; at every index. Test: select at some other index j != i.
+; Expected: unsat
+(set-logic QF_AX)
+(declare-sort Index 0)
+(declare-sort Element 0)
+(declare-fun a () (Array Index Element))
+(declare-fun i () Index)
+(declare-fun j () Index)
+(declare-fun v1 () Element)
+(declare-fun v2 () Element)
+(assert (not (= i j)))
+(assert (not (= (select (store (store a i v1) i v2) j) (select (store a i v2) j))))
+(check-sat)
+(exit)

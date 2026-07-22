@@ -1,0 +1,15 @@
+[package]
+name = "ay-maxsat"
+description = "Maximum Satisfiability (MAX-SAT) solver for AY"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+ay-lp.workspace = true
+ay-sat.workspace = true
+
+[lints]
+workspace = true

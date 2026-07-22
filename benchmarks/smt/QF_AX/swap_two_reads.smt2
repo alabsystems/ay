@@ -1,0 +1,20 @@
+; Swap pattern with store-forwarding:
+; a1 = store(a, i, select(a, j))
+; a2 = store(a1, j, select(a, i))
+; Assert a2[i] != a[j] -- this is UNSAT because a2[i] = a1[i] = select(a, j)
+; (since j != i, the second store doesn't overwrite position i)
+; Expected: unsat
+(set-logic QF_AX)
+(set-info :status unsat)
+(declare-sort Index 0)
+(declare-sort Elem 0)
+(declare-fun a () (Array Index Elem))
+(declare-fun i () Index)
+(declare-fun j () Index)
+(assert (not (= i j)))
+(define-fun a1 () (Array Index Elem) (store a i (select a j)))
+(define-fun a2 () (Array Index Elem) (store a1 j (select a i)))
+; After swap: a2[i] should equal original a[j]
+(assert (not (= (select a2 i) (select a j))))
+(check-sat)
+(exit)

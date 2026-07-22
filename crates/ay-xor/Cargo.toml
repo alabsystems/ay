@@ -1,0 +1,26 @@
+[package]
+name = "ay-xor"
+description = "XOR Gauss-Jordan theory solver for AY"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ay-core.workspace = true
+ay-sat.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+ntest = "0.9"
+ay-drat-check.workspace = true
+
+[[bench]]
+name = "xor_bench"
+harness = false

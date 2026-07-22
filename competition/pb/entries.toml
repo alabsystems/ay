@@ -1,0 +1,76 @@
+# Trident entry manifest: the single source of truth for
+# every competition submission. `package.sh` builds ONE staged, vendored,
+# git-free source tree and stamps each entry below into its own validated
+# tarball with a GENERATED run.sh (env preset baked in from this file).
+#
+# The competition allows up to THREE solvers per contestant per track; entries
+# here are named configurations of the same codebase. v1 differentiates by
+# runtime preset; compile-time feature stripping per track is the planned v2
+# once per-track cargo features exist.
+#
+# Track -> portal category IDs (submit.php): DEC-LIN=112, OPT-LIN=113,
+# DEC-LIN-CERT=114, OPT-LIN-CERT=115, DEC-NLC=116, OPT-NLC=117, SOFT-LIN=118,
+# PARTIAL-LIN=119.
+
+[template]
+package = "ay-pb"
+binary = "ay-pb"
+
+# The generalist parallel entry: every NOCERT track. Presets mirror the
+# long-validated competition configuration (see run.sh.in comments).
+[[entry]]
+name = "AY"
+slug = "ay"
+tracks = ["DEC-LIN", "OPT-LIN", "DEC-NLC", "OPT-NLC", "SOFT-LIN", "PARTIAL-LIN"]
+commandline = "DIR/run.sh BENCHNAME"
+complete = "Y"
+
+[entry.env]
+AY_PB_BNN_FEAS = "1"
+AY_PB_BNN_SCHED = "1"
+AY_PB_SLS_NLC = "1"
+AY_PB_WBO_SLS = "1"
+AY_PB_PARALLEL = "auto"
+
+# The certified entry: CERT tracks, VeriPB proof to PROOFFILE. The proof
+# pipeline is sequential BY CONSTRUCTION (solve_opb returns into the certified
+# routes before any parallel dispatch), and the env now says so too:
+# AY_PB_PARALLEL=off keeps the entry's declared behavior identical to its
+# actual behavior on a CERT host (TIMELIMIT there is CPU time — every busy
+# helper thread would burn wall budget). The one remaining auxiliary thread is
+# the proof-tap serializer (rule-legal: PB-COMP §4.3 allows threads), which
+# streams the DEC-CERT proof off the search thread; its soft byte cap keeps
+# proofs under the competition's 100 GB certificate limit by voiding — never
+# truncating — oversized certificates.
+[[entry]]
+name = "AY-cert"
+slug = "ay-cert"
+tracks = ["DEC-LIN-CERT", "OPT-LIN-CERT"]
+commandline = "DIR/run.sh BENCHNAME PROOFFILE"
+complete = "Y"
+uncheckeddel = true
+
+[entry.env]
+AY_PB_BNN_FEAS = "1"
+AY_PB_BNN_SCHED = "1"
+AY_PB_SLS_NLC = "1"
+AY_PB_WBO_SLS = "1"
+AY_PB_PARALLEL = "off"
+AY_PB_PROOF_TAP_SOFT_CAP_MIB = "65536"
+
+# The sequential specialist: genuinely different search behavior (parallel
+# portfolio disabled), protecting the sequential-track incumbent-quality wins
+# and giving the three-entries slate a diversification axis today.
+[[entry]]
+name = "AY-seq"
+slug = "ay-seq"
+tracks = ["DEC-LIN", "OPT-LIN", "DEC-NLC", "OPT-NLC", "SOFT-LIN", "PARTIAL-LIN"]
+commandline = "DIR/run.sh BENCHNAME"
+complete = "Y"
+
+[entry.env]
+AY_PB_BNN_FEAS = "1"
+AY_PB_BNN_SCHED = "1"
+AY_PB_SLS_NLC = "1"
+AY_PB_WBO_SLS = "1"
+AY_PB_PARALLEL = "off"

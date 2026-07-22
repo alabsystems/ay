@@ -1,0 +1,25 @@
+[package]
+name = "ay-proof"
+description = "Proof production and export for AY"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+ay-core.workspace = true
+ay-sat.workspace = true
+num-bigint.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+proptest.workspace = true
+ay-lrat-check.workspace = true
+
+[lints]
+workspace = true

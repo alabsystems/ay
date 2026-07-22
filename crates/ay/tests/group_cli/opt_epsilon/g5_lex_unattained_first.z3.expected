@@ -1,0 +1,11 @@
+sat
+(objectives
+ (x  (interval 2 (+ 3.0 (* (- 1.0) epsilon))))
+ (y 5)
+)
+(
+  (define-fun x () Real
+    2.0)
+  (define-fun y () Real
+    5.0)
+)

@@ -1,0 +1,225 @@
+# AY benchmark corpora manifest, consumed by `ay corpus`.
+#
+# Each entry's `source` selects the fetch strategy:
+#   - release: tarball uploaded as a GitHub release asset on `repo`/`release_tag`.
+#               Requires `asset` and `sha256`. Supports `ay corpus upload`.
+#   - http:    archive fetched from a fixed URL. `archive` is "tar" (default),
+#              "zip", or "none". `sha256` is optional but recommended.
+#   - git:     `git clone --depth <depth>` from `url`. Optional `commit` pin.
+#   - gbd:     per-file fetch from the Global Benchmark Database. `manifest`
+#              names a CSV with `hash` and `local_path` columns; each row's
+#              content is downloaded from https://benchmark-database.de/file/<hash>
+#              and written to <local_path> (a `…cnf.xz`); when the payload is xz
+#              the decompressed `…cnf` sibling (what the tests read) is written
+#              too. Rows already present (either form) are skipped unless --force.
+#
+# `extract_to` is the destination directory (or, for archive="none", the
+# destination file path). `ay corpus check-urls` validates every entry.
+
+schema_version = 2
+repo = "alabsystems/ay"
+release_tag = "corpora-v1"
+
+[[corpus]]
+# SAT-COMP 2024 sample CNFs, keyed by content hash via the Global Benchmark
+# Database (https://benchmark-database.de/file/<hash>). Each manifest row is
+# downloaded and xz-decompressed into its `local_path`. This replaces the old
+# GitHub release asset below, which is currently "Not Found".
+#
+# Fallback (release source, asset no longer published):
+#   source = "release"
+#   asset = "satcomp2024-sample-v1.tar.zst"
+#   sha256 = "038a57918890e40e6f2a808b938bfbc51c2e120ef6d11d92cf46dd551b5ef7b8"
+#   size_bytes = 59867702
+name = "satcomp2024-sample"
+source = "gbd"
+extract_to = "benchmarks/sat/satcomp2024-sample"
+manifest = "benchmarks/sat/satcomp2024-sample/manifest.csv"
+
+[[corpus]]
+name = "security-qif"
+extract_to = "benchmarks/security/qif"
+asset = "qif-v1.tar.zst"
+sha256 = "80f53ef1a717b81f110d885aa85ffedebab245d53a6ca129955c2c99da301334"
+size_bytes = 2777
+
+[[corpus]]
+name = "smt-lib-incremental-qf-lia"
+extract_to = "benchmarks/smt-lib-incremental/QF_LIA"
+asset = "smt-lib-incremental-v1.tar.zst"
+sha256 = "a243dbe78292c1338221b3c804157fed668f6a62eeeb7d8b34fdbe2f6be16385"
+size_bytes = 180741
+
+[[corpus]]
+name = "pb-comp-selected-pb25"
+source = "http"
+extract_to = "benchmarks/pb-comp/selected-PB25"
+url = "https://www.cril.univ-artois.fr/PB25/benchs/selected-PB25.tar"
+
+[[corpus]]
+name = "pb-comp-normalized-pb25"
+source = "http"
+extract_to = "benchmarks/pb-comp/normalized-PB25"
+url = "https://www.cril.univ-artois.fr/PB25/benchs/normalized-PB25.tar"
+
+[[corpus]]
+name = "pb-comp-selected-pb24"
+source = "http"
+extract_to = "benchmarks/pb-comp/selected-PB24"
+url = "https://www.cril.univ-artois.fr/PB24/benchs/selected-PB24.tar"
+
+[[corpus]]
+name = "security-allsat-circuits"
+source = "git"
+extract_to = "benchmarks/security/allsat-circuits"
+url = "https://github.com/yogevshalmon/allsat-circuits"
+
+[[corpus]]
+name = "security-allsat-cnf"
+source = "git"
+extract_to = "benchmarks/security/allsat-cnf"
+url = "https://github.com/masinag/allsat-cnf"
+
+[[corpus]]
+name = "security-angr-binaries"
+source = "git"
+extract_to = "benchmarks/security/angr-binaries"
+url = "https://github.com/angr/binaries"
+
+[[corpus]]
+name = "security-darpa-cgc"
+source = "git"
+extract_to = "benchmarks/security/darpa-cgc"
+url = "https://github.com/trailofbits/cb-multios"
+
+[[corpus]]
+name = "security-exploitdb"
+source = "git"
+extract_to = "benchmarks/security/exploitdb"
+url = "https://gitlab.com/exploit-database/exploitdb"
+
+[[corpus]]
+name = "security-fuzzbench"
+source = "git"
+extract_to = "benchmarks/security/fuzzbench"
+url = "https://github.com/google/fuzzbench"
+
+[[corpus]]
+name = "security-how2heap"
+source = "git"
+extract_to = "benchmarks/security/how2heap"
+url = "https://github.com/shellphish/how2heap"
+
+[[corpus]]
+name = "security-juliet"
+source = "git"
+extract_to = "benchmarks/security/juliet"
+url = "https://github.com/sylvain-combe-sonarsource/Juliet-C-CPP-1.3"
+
+[[corpus]]
+name = "security-lava-m"
+source = "git"
+extract_to = "benchmarks/security/lava-m"
+url = "https://github.com/scu-804/LAVA-M"
+
+[[corpus]]
+name = "security-magma"
+source = "git"
+extract_to = "benchmarks/security/magma"
+url = "https://github.com/HexHive/magma"
+
+[[corpus]]
+name = "security-omt-benchmarks"
+source = "git"
+extract_to = "benchmarks/security/omt-benchmarks"
+url = "https://github.com/masinag/omt-benchmarks"
+
+[[corpus]]
+name = "security-pwncollege"
+source = "git"
+extract_to = "benchmarks/security/pwncollege"
+url = "https://github.com/pwncollege/ctf-archive"
+
+[[corpus]]
+name = "security-sv-comp"
+source = "git"
+extract_to = "benchmarks/security/sv-comp"
+url = "https://gitlab.com/sosy-lab/benchmarking/sv-benchmarks.git"
+
+[[corpus]]
+name = "security-sygus-benchmarks"
+source = "git"
+extract_to = "benchmarks/security/sygus-benchmarks"
+url = "https://github.com/SyGuS-Org/benchmarks"
+
+[[corpus]]
+name = "security-qbflib"
+source = "http"
+extract_to = "benchmarks/security/qdimacs.zip"
+url = "https://www.qbflib.org/DOWNLOADS/qdimacs.zip"
+archive = "none"
+
+[[corpus]]
+# CHC-COMP extra-small LIA suite (55 problems) backing the
+# chccomp-2025-extra-small-lia eval and the z3-audit CHC surface.
+name = "chc-comp-2025-extra-small-lia"
+source = "git"
+extract_to = "benchmarks/chc-comp/2025/extra-small-lia"
+url = "https://github.com/chc-comp/extra-small-lia"
+commit = "1a955e5d8cff5538f0dab7857aa0911ca419b1f5"
+
+[[corpus]]
+# CHC-COMP-normalised "_000" instances used as the ay-chc unit-test fixtures
+# (include_str! at compile time). Only the `extra-small-lia/*_000.smt2` subset
+# of this repo is the test corpus; those files are VENDORED (committed) under
+# benchmarks/chc-comp/2025/extra-small-lia/*_000.smt2. This entry exists to
+# refresh them from upstream; clone here, then copy the desired *_000.smt2 over.
+# (Two fixtures are AY-specific and NOT upstream: accumulator_unsafe_000 and
+# two_phase_unsafe_000.)
+name = "chc-comp-2025-extra-small-lia-fixtures"
+source = "git"
+extract_to = "benchmarks/chc/chc-comp25-benchmarks-fixtures"
+url = "https://github.com/chc-comp/chc-comp25-benchmarks"
+commit = "ddd279cab0717db6effe69baad451a8eb04ffd86"
+
+[[corpus]]
+# Full CHC-COMP 2025 benchmark set (~1.2 GB) with the LIA-Lin.set manifest
+# backing the chccomp-2025-lia-lin eval. Large; fetch only when running the
+# full CHC replacement-surface comparison.
+name = "chc-comp-2025-benchmarks"
+source = "git"
+extract_to = "benchmarks/chc/chc-comp25-benchmarks"
+url = "https://github.com/chc-comp/chc-comp25-benchmarks"
+commit = "ddd279cab0717db6effe69baad451a8eb04ffd86"
+
+[[corpus]]
+# CreuSAT's vendored SAT-2009-preprocessed (mfleury) benchmark set, the source of
+# the reference/creusat/tests/mfleury/** CNFs the ay-sat soundness / DRAT /
+# differential tests resolve (een-tip, hsat_vc, xinetd_vc, cmu-bmc, manol-pipe,
+# AProVE, ...). Cloned into the gitignored reference/ tree. `ay corpus` does a
+# full clone; for just the benchmarks a sparse checkout of tests/mfleury suffices.
+name = "creusat-mfleury"
+source = "git"
+extract_to = "reference/creusat"
+url = "https://github.com/sarsko/CreuSAT"
+
+[[corpus]]
+# MaxSAT Evaluation 2024 exact-track unweighted instances (553 .wcnf.xz;
+# ~2.0 GB archive). The per-instance reference results (all 2024 exact-track
+# solvers + known optima) live in benchmarks/maxsat/mse24/*.csv, which
+# `ay maxsat bench` uses for verification and retroactive leaderboards.
+# Decompress after fetch: find <dir> -name '*.xz' -exec xz -dk {} +
+name = "mse24-exact-unweighted"
+source = "http"
+extract_to = "benchmarks/maxsat/mse24-exact-unweighted"
+url = "https://www.cs.helsinki.fi/group/coreo/MSE2024-instances/mse24-exact-unweighted.zip"
+archive = "zip"
+
+[[corpus]]
+# MaxSAT Evaluation 2024 exact-track weighted instances (571 .wcnf.xz;
+# ~2.6 GB archive). See mse24-exact-unweighted above.
+name = "mse24-exact-weighted"
+source = "http"
+extract_to = "benchmarks/maxsat/mse24-exact-weighted"
+url = "https://www.cs.helsinki.fi/group/coreo/MSE2024-instances/mse24-exact-weighted.zip"
+archive = "zip"

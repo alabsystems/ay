@@ -1,0 +1,19 @@
+{
+  "id": "org.ay.ay",
+  "name": "AY",
+  "version": "0.1.0",
+  "executable": "competition/minizinc/fzn-exec",
+  "mznlib": "competition/minizinc/mznlib",
+  "supportsMzn": false,
+  "supportsFzn": true,
+  "supportsNL": false,
+  "needsSolns2Out": true,
+  "needsMznExecutable": false,
+  "needsStdlibDir": false,
+  "isGUIApplication": false,
+  "stdFlags": ["-a", "-f", "-p", "-t"],
+  "extraFlags": [
+    ["--output-mode", "Output mode", "string", "dzn"],
+    ["--output-objective", "Print objective", "bool", "false"]
+  ]
+}

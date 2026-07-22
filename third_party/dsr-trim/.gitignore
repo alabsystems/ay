@@ -1,0 +1,41 @@
+# Project-specific files
+/dsr-trim
+/lsr-check
+/compress
+/decompress
+bin/*
+
+# Pigeonhole executables and CNF/proof files
+php/php
+php/php-sr
+php/cnf/*
+php/sr/*
+php/lsr/*
+
+# CNF and proof files
+*.cnf
+*.drat
+*.lrat
+*.pr
+*.dpr
+*.lpr
+*.ppr
+*.sr
+*.dsr
+*.lsr
+
+# Mac and dev
+*.swp
+*.swo
+*.DS_Store
+.vscode/*
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Executables
+*.exe
+*.out

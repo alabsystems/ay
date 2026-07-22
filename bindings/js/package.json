@@ -1,0 +1,38 @@
+{
+  "name": "ayz3",
+  "version": "0.1.0",
+  "description": "JavaScript/Node binding for AY's Z3-shaped C ABI (koffi native FFI over libay_ffi).",
+  "type": "module",
+  "main": "ayz3.mjs",
+  "exports": {
+    ".": "./ayz3.mjs",
+    "./lib": "./_lib.mjs"
+  },
+  "files": [
+    "ayz3.mjs",
+    "_lib.mjs",
+    "README.md",
+    "test.mjs"
+  ],
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "keywords": [
+    "smt",
+    "solver",
+    "z3",
+    "ay",
+    "sat",
+    "ffi",
+    "koffi",
+    "wasm"
+  ],
+  "author": "Andrew Yates",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "koffi": "^3.1.0"
+  }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "ay-tla-bridge"
+description = "TLA+/TLC integration helpers for AY"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+ntest = "0.9"
+tempfile.workspace = true
+
+[lints]
+workspace = true

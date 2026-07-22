@@ -1,0 +1,20 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "ay-set"
+description = "Finite-set theory solver for AY (card + subset over Array(T->Bool) membership carrier)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ay-core.workspace = true
+num-bigint.workspace = true
+
+[dev-dependencies]
+num-rational.workspace = true

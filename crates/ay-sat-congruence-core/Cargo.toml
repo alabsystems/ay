@@ -1,0 +1,13 @@
+[package]
+name = "ay-sat-congruence-core"
+description = "Shared, trust-checkable XOR merge-polarity / parity core for ay-sat congruence closure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

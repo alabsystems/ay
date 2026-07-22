@@ -1,0 +1,52 @@
+# Fuzz testing targets for AY SMT solver
+# Author: Andrew Yates
+
+[package]
+name = "ay-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+# AY crates
+[dependencies.ay-frontend]
+path = "../crates/ay-frontend"
+
+[dependencies.ay-sat]
+path = "../crates/ay-sat"
+
+[dependencies.ay-dpll]
+path = "../crates/ay-dpll"
+
+[dependencies.ay-chc]
+path = "../crates/ay-chc"
+
+# SMT-LIB parser fuzz target
+[[bin]]
+name = "smtlib_parser"
+path = "fuzz_targets/smtlib_parser.rs"
+test = false
+doc = false
+bench = false
+
+# SAT solver fuzz target
+[[bin]]
+name = "sat_solver"
+path = "fuzz_targets/sat_solver.rs"
+test = false
+doc = false
+bench = false
+
+# CHC solver fuzz target
+[[bin]]
+name = "chc_solver"
+path = "fuzz_targets/chc_solver.rs"
+test = false
+doc = false
+bench = false

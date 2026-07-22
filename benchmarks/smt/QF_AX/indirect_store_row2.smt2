@@ -1,0 +1,16 @@
+; Indirect store via equality: b = store(a, i, v), select(b, j) where j != i
+; Without direct select-of-store, relies on theory solver to follow equalities
+; Expected: unsat
+(set-logic QF_AX)
+(declare-sort Index 0)
+(declare-sort Element 0)
+(declare-fun a () (Array Index Element))
+(declare-fun b () (Array Index Element))
+(declare-fun i () Index)
+(declare-fun j () Index)
+(declare-fun v () Element)
+(assert (= b (store a i v)))
+(assert (not (= i j)))
+(assert (not (= (select b j) (select a j))))
+(check-sat)
+(exit)

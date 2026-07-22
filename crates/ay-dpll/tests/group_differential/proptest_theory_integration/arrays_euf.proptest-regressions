@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 5d19718cb7058c2beafe78f7979a519960eff36345472d286b8f5d462daab6ac # shrinks to case = ArraysEufCase { num_indices: 2, atom_specs: [ArrayAtomSpec { lhs_idx: 0, rhs_idx: 1, lhs_has_store: None, rhs_has_store: Some((0, 0)) }, ArrayAtomSpec { lhs_idx: 1, rhs_idx: 0, lhs_has_store: None, rhs_has_store: None }], expr: Atom(0) }
+cc 7f36c94595676a1d1f4d3a48ef7623ef4dc8a200d02648fc30a355ab926efde9 # shrinks to case = ArraysEufCase { num_indices: 3, atom_specs: [ArrayAtomSpec { lhs_idx: 2, rhs_idx: 2, lhs_has_store: None, rhs_has_store: Some((2, 0)) }, ArrayAtomSpec { lhs_idx: 1, rhs_idx: 1, lhs_has_store: Some((0, 0)), rhs_has_store: None }], expr: Atom(0) }

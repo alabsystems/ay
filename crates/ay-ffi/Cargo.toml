@@ -1,0 +1,36 @@
+[package]
+name = "ay-ffi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "C FFI bindings for AY SMT solver"
+license = "Apache-2.0"
+readme.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/ay-ffi"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = []
+
+[dependencies]
+ay-chc.workspace = true
+ay-core.workspace = true
+ay-dpll.workspace = true
+ay-frontend.workspace = true
+ay-nra.workspace = true
+# Real cube-and-conquer lookahead cubes for `Z3_solver_cube` (the propositional
+# engine behind the Tseitin-skeleton bridge in `z3_compat/propagate.rs`).
+ay-sat.workspace = true
+num-bigint.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+
+[dev-dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

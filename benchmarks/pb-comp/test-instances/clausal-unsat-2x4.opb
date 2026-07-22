@@ -1,0 +1,8 @@
+* #variable= 2 #constraint= 4
+* Pure-clausal UNSAT: all four 2-variable clauses, excluding every assignment.
+* Each row is an at-least-1 (unit coeffs, rhs 1) => clause via the encoder
+* fast-path => aux-free => DEC-LIN-CERT DRAT-lift certifiable.
++1 x1 +1 x2 >= 1 ;
++1 ~x1 +1 x2 >= 1 ;
++1 x1 +1 ~x2 >= 1 ;
++1 ~x1 +1 ~x2 >= 1 ;

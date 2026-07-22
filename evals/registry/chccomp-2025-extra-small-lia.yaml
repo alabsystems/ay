@@ -1,0 +1,19 @@
+# Andrew Yates <andrewyates.name@gmail.com>
+# Eval spec for CHC-COMP 2025 extra-small LIA benchmark suite
+id: chccomp-2025-extra-small-lia
+version: 1
+description: CHC-COMP 2025 extra-small LIA benchmark suite (55 problems)
+owner: andrewyates.name@gmail.com
+inputs:
+  benchmarks_dir: benchmarks/chc-comp/2025/extra-small-lia
+  timeout_sec: 60
+  runs: 3
+metrics:
+  - passed
+  - total
+  - wrong
+  - timeout
+  - unknown
+  - error
+outputs:
+  results_dir: evals/results/chccomp-2025-extra-small-lia/{run_id}

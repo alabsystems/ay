@@ -1,0 +1,9 @@
+c forall x exists y. (x OR y) AND (NOT x OR NOT y)
+c SAT: y must depend on x. Set y = NOT x
+c x=T: (T OR F) AND (F OR T) = T
+c x=F: (F OR T) AND (T OR F) = T
+p cnf 2 2
+a 1 0
+e 2 0
+1 2 0
+-1 -2 0

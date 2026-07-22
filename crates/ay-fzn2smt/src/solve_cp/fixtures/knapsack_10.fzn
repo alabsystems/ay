@@ -1,0 +1,19 @@
+% 0-1 Knapsack: 10 items, capacity 50, maximize profit
+% weights: [10, 20, 30, 40, 50, 5, 15, 25, 35, 45]
+% profits: [60, 100, 120, 80, 200, 30, 50, 90, 150, 180]
+var bool: x1 :: output_var;
+var bool: x2 :: output_var;
+var bool: x3 :: output_var;
+var bool: x4 :: output_var;
+var bool: x5 :: output_var;
+var bool: x6 :: output_var;
+var bool: x7 :: output_var;
+var bool: x8 :: output_var;
+var bool: x9 :: output_var;
+var bool: x10 :: output_var;
+var 0..1060: profit :: output_var;
+% Weight constraint: sum(w_i * x_i) <= 50
+constraint int_lin_le([10, 20, 30, 40, 50, 5, 15, 25, 35, 45], [x1, x2, x3, x4, x5, x6, x7, x8, x9, x10], 50);
+% Profit definition: profit = sum(p_i * x_i)
+constraint int_lin_eq([60, 100, 120, 80, 200, 30, 50, 90, 150, 180, -1], [x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, profit], 0);
+solve maximize profit;

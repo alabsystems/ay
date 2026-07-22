@@ -1,0 +1,5 @@
+c Simple UNSAT: exists x. x AND NOT x
+p cnf 1 2
+e 1 0
+1 0
+-1 0

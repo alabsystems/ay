@@ -1,0 +1,20 @@
+[package]
+name = "ay-proptest"
+description = "Centralized property tests for AY workspace crates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true
+ay-sat.workspace = true

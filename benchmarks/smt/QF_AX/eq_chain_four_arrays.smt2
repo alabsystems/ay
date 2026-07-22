@@ -1,0 +1,18 @@
+; Equality chain with 4 arrays: a = b, b = store(c, i, v), c = d
+; select(a, i) should be v (through transitivity)
+; Expected: unsat
+(set-logic QF_AX)
+(declare-sort Index 0)
+(declare-sort Element 0)
+(declare-fun a () (Array Index Element))
+(declare-fun b () (Array Index Element))
+(declare-fun c () (Array Index Element))
+(declare-fun d () (Array Index Element))
+(declare-fun i () Index)
+(declare-fun v () Element)
+(assert (= a b))
+(assert (= b (store c i v)))
+(assert (= c d))
+(assert (not (= (select a i) v)))
+(check-sat)
+(exit)

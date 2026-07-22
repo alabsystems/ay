@@ -1,0 +1,1503 @@
+{
+  "assertions": [
+    {
+      "index": 0,
+      "name": null,
+      "scope_depth": 0,
+      "term": 47
+    },
+    {
+      "index": 1,
+      "name": null,
+      "scope_depth": 0,
+      "term": 67
+    },
+    {
+      "index": 2,
+      "name": null,
+      "scope_depth": 0,
+      "term": 227
+    }
+  ],
+  "checked_replay": null,
+  "created_unix_ms": 1777590316891,
+  "declarations": [
+    {
+      "name": "arg0",
+      "sort": "(Seq Int)",
+      "term": 13
+    },
+    {
+      "name": "_call_6",
+      "sort": "Int",
+      "term": 202
+    },
+    {
+      "name": "_call_8",
+      "sort": "Int",
+      "term": 208
+    }
+  ],
+  "events": [
+    {
+      "index": 0,
+      "kind": {
+        "event": "set_logic",
+        "logic": "ALL"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 4,
+      "kind": {
+        "domain": [
+          "List"
+        ],
+        "event": "declare_fun",
+        "name": "method_discriminant_1_d4c697374",
+        "range": "Int"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 7,
+      "kind": {
+        "event": "declare_const",
+        "name": "arg0",
+        "sort": "(Seq Int)",
+        "term": 13
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 11,
+      "kind": {
+        "domain": [
+          "List",
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "logic_get",
+        "range": "OptionInt"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 12,
+      "kind": {
+        "domain": [
+          "(Seq Int)"
+        ],
+        "event": "declare_fun",
+        "name": "logic_hash__log",
+        "range": "Int"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 13,
+      "kind": {
+        "domain": [
+          "MyHashMap",
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "logic_bucket",
+        "range": "List"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 14,
+      "kind": {
+        "domain": [
+          "MyHashMap",
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "logic_bucket__ix",
+        "range": "Int"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 15,
+      "kind": {
+        "domain": [
+          "MyHashMap"
+        ],
+        "event": "declare_fun",
+        "name": "logic_____quantifier_consumer__field__buckets__placeholder_u4d79486173684d6170__ret_x53657128496e7429",
+        "range": "(Seq Int)"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 16,
+      "kind": {
+        "domain": [
+          "(Seq Int)",
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "method_index_logic_2_s_i",
+        "range": "Int"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 19,
+      "kind": {
+        "domain": [
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "logic_K_P__P_hash__log__placeholder_i__ret_i",
+        "range": "Int"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 20,
+      "kind": {
+        "domain": [
+          "(Seq Int)"
+        ],
+        "event": "declare_fun",
+        "name": "seq_array",
+        "range": "(Array Int Int)"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 21,
+      "kind": {
+        "domain": [
+          "(Seq Int)"
+        ],
+        "event": "declare_fun",
+        "name": "seq_len",
+        "range": "Int"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 22,
+      "kind": {
+        "domain": [
+          "(Seq Int)"
+        ],
+        "event": "declare_fun",
+        "name": "seq_offset",
+        "range": "Int"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 23,
+      "kind": {
+        "domain": [
+          "(Seq Int)",
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "seq_index_logic",
+        "range": "Int"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 24,
+      "kind": {
+        "domain": [
+          "(Seq Int)",
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "seq_push_back",
+        "range": "(Seq Int)"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 25,
+      "kind": {
+        "domain": [
+          "(Seq Int)"
+        ],
+        "event": "declare_fun",
+        "name": "seq_sum",
+        "range": "Int"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 26,
+      "kind": {
+        "domain": [
+          "(Seq Int)",
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "seq_get",
+        "range": "Int"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 27,
+      "kind": {
+        "domain": [
+          "(Seq Int)",
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "seq_contains",
+        "range": "Bool"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 28,
+      "kind": {
+        "domain": [
+          "(Seq Int)",
+          "Int",
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "seq_subsequence",
+        "range": "(Seq Int)"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 29,
+      "kind": {
+        "domain": [
+          "(Seq Int)",
+          "(Seq Int)"
+        ],
+        "event": "declare_fun",
+        "name": "seq_concat",
+        "range": "(Seq Int)"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 30,
+      "kind": {
+        "domain": [
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "seq_singleton",
+        "range": "(Seq Int)"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 31,
+      "kind": {
+        "domain": [
+          "(Seq Int)",
+          "Int",
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "seq_set",
+        "range": "(Seq Int)"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 32,
+      "kind": {
+        "domain": [
+          "(Seq Int)"
+        ],
+        "event": "declare_fun",
+        "name": "seq_reverse",
+        "range": "(Seq Int)"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 33,
+      "kind": {
+        "domain": [
+          "(Seq Int)",
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "seq_push_front",
+        "range": "(Seq Int)"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 37,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 47
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 39,
+      "kind": {
+        "domain": [
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "logic_Some",
+        "range": "Int"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 40,
+      "kind": {
+        "domain": [],
+        "event": "declare_fun",
+        "name": "logic_None",
+        "range": "Int"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 41,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 67
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 55,
+      "kind": {
+        "domain": [
+          "MyHashMap"
+        ],
+        "event": "declare_fun",
+        "name": "method___quantifier_consumer_invariant_creusot__test_P__P_MyHashMap_1_d4d79486173684d6170",
+        "range": "Bool"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 56,
+      "kind": {
+        "domain": [
+          "MyHashMap"
+        ],
+        "event": "declare_fun",
+        "name": "logic_____quantifier_consumer__tuple__get__0__placeholder_u4d79486173684d6170__ret_x53657128496e7429",
+        "range": "(Seq Int)"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 58,
+      "kind": {
+        "domain": [
+          "MyHashMap",
+          "Int",
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "method_good_bucket_3_d4d79486173684d6170_i_i",
+        "range": "Bool"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 59,
+      "kind": {
+        "domain": [
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "method_no_double_binding_1_i",
+        "range": "Bool"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 61,
+      "kind": {
+        "event": "declare_const",
+        "name": "_call_6",
+        "sort": "Int",
+        "term": 202
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 63,
+      "kind": {
+        "domain": [
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "method_deep_model_1_i",
+        "range": "Int"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 66,
+      "kind": {
+        "event": "declare_const",
+        "name": "_call_8",
+        "sort": "Int",
+        "term": 208
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 67,
+      "kind": {
+        "domain": [
+          "(Seq Int)",
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "__seq_index_restore_List",
+        "range": "List"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 68,
+      "kind": {
+        "domain": [
+          "List"
+        ],
+        "event": "declare_fun",
+        "name": "__seq_elem_List",
+        "range": "Int"
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 70,
+      "kind": {
+        "event": "assert",
+        "name": null,
+        "term": 227
+      },
+      "scope_depth": 0
+    },
+    {
+      "index": 76,
+      "kind": {
+        "event": "push"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 77,
+      "kind": {
+        "domain": [
+          "List"
+        ],
+        "event": "declare_fun",
+        "name": "payload_cons__dom_4c697374__ret_496e74",
+        "range": "Int"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 78,
+      "kind": {
+        "domain": [
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "__quantifier_consumer_tuple_get_0",
+        "range": "Int"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 79,
+      "kind": {
+        "domain": [
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "__quantifier_consumer_tuple_get_1",
+        "range": "Int"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 80,
+      "kind": {
+        "domain": [
+          "OptionInt"
+        ],
+        "event": "declare_fun",
+        "name": "method_discriminant_1_d4f7074696f6e496e74",
+        "range": "Int"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 85,
+      "kind": {
+        "domain": [
+          "Tuple2"
+        ],
+        "event": "declare_fun",
+        "name": "logic_____quantifier_consumer__tuple__get__0__placeholder_u5475706c6532__ret_i",
+        "range": "Int"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 86,
+      "kind": {
+        "domain": [
+          "Tuple2"
+        ],
+        "event": "declare_fun",
+        "name": "logic_____quantifier_consumer__tuple__get__1__placeholder_u5475706c6532__ret_i",
+        "range": "Int"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 92,
+      "kind": {
+        "domain": [
+          "MyHashMap",
+          "Int",
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "method_good_bucket_3_u4d79486173684d6170_i_i",
+        "range": "Bool"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 94,
+      "kind": {
+        "domain": [
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "payload_cons",
+        "range": "Int"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 98,
+      "kind": {
+        "domain": [
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "is_nil",
+        "range": "Bool"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 100,
+      "kind": {
+        "domain": [
+          "List"
+        ],
+        "event": "declare_fun",
+        "name": "__quantifier_consumer_struct_bridge_List_to_List",
+        "range": "List"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 119,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 120,
+      "kind": {
+        "domain": [
+          "Int"
+        ],
+        "event": "declare_fun",
+        "name": "__quantifier_consumer_is_option",
+        "range": "Bool"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 140,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 1
+    },
+    {
+      "index": 141,
+      "kind": {
+        "event": "check_sat"
+      },
+      "scope_depth": 1
+    }
+  ],
+  "function_declarations": [
+    {
+      "domain": [
+        "List"
+      ],
+      "name": "method_discriminant_1_d4c697374",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "List",
+        "Int"
+      ],
+      "name": "logic_get",
+      "range": "OptionInt"
+    },
+    {
+      "domain": [
+        "(Seq Int)"
+      ],
+      "name": "logic_hash__log",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "MyHashMap",
+        "Int"
+      ],
+      "name": "logic_bucket",
+      "range": "List"
+    },
+    {
+      "domain": [
+        "MyHashMap",
+        "Int"
+      ],
+      "name": "logic_bucket__ix",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "MyHashMap"
+      ],
+      "name": "logic_____quantifier_consumer__field__buckets__placeholder_u4d79486173684d6170__ret_x53657128496e7429",
+      "range": "(Seq Int)"
+    },
+    {
+      "domain": [
+        "(Seq Int)",
+        "Int"
+      ],
+      "name": "method_index_logic_2_s_i",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "Int"
+      ],
+      "name": "logic_K_P__P_hash__log__placeholder_i__ret_i",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "(Seq Int)"
+      ],
+      "name": "seq_array",
+      "range": "(Array Int Int)"
+    },
+    {
+      "domain": [
+        "(Seq Int)"
+      ],
+      "name": "seq_len",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "(Seq Int)"
+      ],
+      "name": "seq_offset",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "(Seq Int)",
+        "Int"
+      ],
+      "name": "seq_index_logic",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "(Seq Int)",
+        "Int"
+      ],
+      "name": "seq_push_back",
+      "range": "(Seq Int)"
+    },
+    {
+      "domain": [
+        "(Seq Int)"
+      ],
+      "name": "seq_sum",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "(Seq Int)",
+        "Int"
+      ],
+      "name": "seq_get",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "(Seq Int)",
+        "Int"
+      ],
+      "name": "seq_contains",
+      "range": "Bool"
+    },
+    {
+      "domain": [
+        "(Seq Int)",
+        "Int",
+        "Int"
+      ],
+      "name": "seq_subsequence",
+      "range": "(Seq Int)"
+    },
+    {
+      "domain": [
+        "(Seq Int)",
+        "(Seq Int)"
+      ],
+      "name": "seq_concat",
+      "range": "(Seq Int)"
+    },
+    {
+      "domain": [
+        "Int"
+      ],
+      "name": "seq_singleton",
+      "range": "(Seq Int)"
+    },
+    {
+      "domain": [
+        "(Seq Int)",
+        "Int",
+        "Int"
+      ],
+      "name": "seq_set",
+      "range": "(Seq Int)"
+    },
+    {
+      "domain": [
+        "(Seq Int)"
+      ],
+      "name": "seq_reverse",
+      "range": "(Seq Int)"
+    },
+    {
+      "domain": [
+        "(Seq Int)",
+        "Int"
+      ],
+      "name": "seq_push_front",
+      "range": "(Seq Int)"
+    },
+    {
+      "domain": [
+        "Int"
+      ],
+      "name": "logic_Some",
+      "range": "Int"
+    },
+    {
+      "domain": [],
+      "name": "logic_None",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "MyHashMap"
+      ],
+      "name": "method___quantifier_consumer_invariant_creusot__test_P__P_MyHashMap_1_d4d79486173684d6170",
+      "range": "Bool"
+    },
+    {
+      "domain": [
+        "MyHashMap"
+      ],
+      "name": "logic_____quantifier_consumer__tuple__get__0__placeholder_u4d79486173684d6170__ret_x53657128496e7429",
+      "range": "(Seq Int)"
+    },
+    {
+      "domain": [
+        "MyHashMap",
+        "Int",
+        "Int"
+      ],
+      "name": "method_good_bucket_3_d4d79486173684d6170_i_i",
+      "range": "Bool"
+    },
+    {
+      "domain": [
+        "Int"
+      ],
+      "name": "method_no_double_binding_1_i",
+      "range": "Bool"
+    },
+    {
+      "domain": [
+        "Int"
+      ],
+      "name": "method_deep_model_1_i",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "(Seq Int)",
+        "Int"
+      ],
+      "name": "__seq_index_restore_List",
+      "range": "List"
+    },
+    {
+      "domain": [
+        "List"
+      ],
+      "name": "__seq_elem_List",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "List"
+      ],
+      "name": "payload_cons__dom_4c697374__ret_496e74",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "Int"
+      ],
+      "name": "__quantifier_consumer_tuple_get_0",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "Int"
+      ],
+      "name": "__quantifier_consumer_tuple_get_1",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "OptionInt"
+      ],
+      "name": "method_discriminant_1_d4f7074696f6e496e74",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "Tuple2"
+      ],
+      "name": "logic_____quantifier_consumer__tuple__get__0__placeholder_u5475706c6532__ret_i",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "Tuple2"
+      ],
+      "name": "logic_____quantifier_consumer__tuple__get__1__placeholder_u5475706c6532__ret_i",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "MyHashMap",
+        "Int",
+        "Int"
+      ],
+      "name": "method_good_bucket_3_u4d79486173684d6170_i_i",
+      "range": "Bool"
+    },
+    {
+      "domain": [
+        "Int"
+      ],
+      "name": "payload_cons",
+      "range": "Int"
+    },
+    {
+      "domain": [
+        "Int"
+      ],
+      "name": "is_nil",
+      "range": "Bool"
+    },
+    {
+      "domain": [
+        "List"
+      ],
+      "name": "__quantifier_consumer_struct_bridge_List_to_List",
+      "range": "List"
+    },
+    {
+      "domain": [
+        "Int"
+      ],
+      "name": "__quantifier_consumer_is_option",
+      "range": "Bool"
+    }
+  ],
+  "logic": "ALL",
+  "metadata": {
+    "consumer": null,
+    "consumer_revision": null,
+    "fixture_path": null,
+    "function_path": null,
+    "notes": null,
+    "obligation_kind": null,
+    "source_span": null
+  },
+  "panic_payload": null,
+  "replay_gaps": [
+    "quantifier_consumer-ay-native-replay shrink preserved status after 25 attempts; assertions 77->3, terms 574->34, term_pruned=true"
+  ],
+  "schema": "ay.native-replay.v1",
+  "scope_depth": 1,
+  "selected_route": "native-api:ALL",
+  "solve": {
+    "elapsed_ms": 13,
+    "executor_error": null,
+    "model": {
+      "delegated_checks": 0,
+      "incomplete_checks": 0,
+      "independent_checks": 0,
+      "validated": false,
+      "validation_failures": 0,
+      "validation_skips": 0
+    },
+    "proof": {
+      "available": false,
+      "checker_failures": 0,
+      "clause_count": 0,
+      "complete": false,
+      "trust_fallbacks": 0
+    },
+    "resources": {
+      "learned_clause_count": 0,
+      "limit_hit": null,
+      "rss_bytes": 26886144,
+      "term_bytes": 95357,
+      "term_count": 574
+    },
+    "result": "unknown",
+    "statistics": {
+      "conflicts": 0,
+      "decisions": 0,
+      "ematching_instances_created": 122,
+      "ematching_rounds_completed": 4,
+      "learned_clauses": 0,
+      "partial_clause_count": 0,
+      "propagations": 0,
+      "refinement_count": 0,
+      "restarts": 0,
+      "theory_conflicts": 0,
+      "theory_propagations": 0,
+      "theory_unknown_count": 0
+    },
+    "unknown_phase": "theory-combination",
+    "unknown_progress": {
+      "reason": "(unsupported mixed-collection)",
+      "responsible_phase": "theory-combination",
+      "wall_time_budget_ms": 10499,
+      "wall_time_elapsed_ms": 13
+    },
+    "unknown_reason": "(unsupported mixed-collection)",
+    "verification_level": "fully-verified"
+  },
+  "terms": [
+    {
+      "data": {
+        "kind": "const",
+        "value": {
+          "kind": "int",
+          "value": "0"
+        }
+      },
+      "id": 7,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "arg0",
+        "var_id": 7
+      },
+      "id": 13,
+      "sort": "(Seq Int)"
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "seq_ax_select_s_19",
+        "var_id": 19
+      },
+      "id": 39,
+      "sort": "(Seq Int)"
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "seq_ax_select_i_20",
+        "var_id": 20
+      },
+      "id": 40,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          39
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "seq_array"
+        }
+      },
+      "id": 41,
+      "sort": "(Array Int Int)"
+    },
+    {
+      "data": {
+        "args": [
+          39
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "seq_offset"
+        }
+      },
+      "id": 42,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          42,
+          40
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "+"
+        }
+      },
+      "id": 43,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          41,
+          43
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "select"
+        }
+      },
+      "id": 44,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          39,
+          40
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "seq_index_logic"
+        }
+      },
+      "id": 45,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          44,
+          45
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 46,
+      "sort": "Bool"
+    },
+    {
+      "data": {
+        "body": 46,
+        "kind": "forall",
+        "triggers": [
+          [
+            45
+          ]
+        ],
+        "vars": [
+          {
+            "name": "seq_ax_select_s_19",
+            "sort": "(Seq Int)"
+          },
+          {
+            "name": "seq_ax_select_i_20",
+            "sort": "Int"
+          }
+        ]
+      },
+      "id": 47,
+      "sort": "Bool"
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "seq_axiom_s8_23",
+        "var_id": 23
+      },
+      "id": 53,
+      "sort": "(Seq Int)"
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "seq_axiom_i8_24",
+        "var_id": 24
+      },
+      "id": 54,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          53,
+          54
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "seq_get"
+        }
+      },
+      "id": 55,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          53,
+          54
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "seq_index_logic"
+        }
+      },
+      "id": 56,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          53
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "seq_len"
+        }
+      },
+      "id": 57,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          7,
+          54
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<="
+        }
+      },
+      "id": 58,
+      "sort": "Bool"
+    },
+    {
+      "data": {
+        "args": [
+          54,
+          57
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "<"
+        }
+      },
+      "id": 59,
+      "sort": "Bool"
+    },
+    {
+      "data": {
+        "args": [
+          56
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "logic_Some"
+        }
+      },
+      "id": 61,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          55,
+          61
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 62,
+      "sort": "Bool"
+    },
+    {
+      "data": {
+        "inner": 58,
+        "kind": "not"
+      },
+      "id": 63,
+      "sort": "Bool"
+    },
+    {
+      "data": {
+        "inner": 59,
+        "kind": "not"
+      },
+      "id": 64,
+      "sort": "Bool"
+    },
+    {
+      "data": {
+        "args": [
+          62,
+          63,
+          64
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "or"
+        }
+      },
+      "id": 66,
+      "sort": "Bool"
+    },
+    {
+      "data": {
+        "body": 66,
+        "kind": "forall",
+        "triggers": [
+          [
+            55
+          ]
+        ],
+        "vars": [
+          {
+            "name": "seq_axiom_s8_23",
+            "sort": "(Seq Int)"
+          },
+          {
+            "name": "seq_axiom_i8_24",
+            "sort": "Int"
+          }
+        ]
+      },
+      "id": 67,
+      "sort": "Bool"
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "_call_6",
+        "var_id": 51
+      },
+      "id": 202,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "kind": "var",
+        "name": "_call_8",
+        "var_id": 54
+      },
+      "id": 208,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          202,
+          208
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "mod"
+        }
+      },
+      "id": 211,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          13
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "seq_array"
+        }
+      },
+      "id": 212,
+      "sort": "(Array Int Int)"
+    },
+    {
+      "data": {
+        "args": [
+          13
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "seq_offset"
+        }
+      },
+      "id": 213,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          213,
+          211
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "+"
+        }
+      },
+      "id": 214,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          212,
+          214
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "select"
+        }
+      },
+      "id": 215,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          13,
+          211
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "__seq_index_restore_List"
+        }
+      },
+      "id": 216,
+      "sort": "List"
+    },
+    {
+      "data": {
+        "args": [
+          216
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "__seq_elem_List"
+        }
+      },
+      "id": 226,
+      "sort": "Int"
+    },
+    {
+      "data": {
+        "args": [
+          215,
+          226
+        ],
+        "kind": "app",
+        "symbol": {
+          "kind": "named",
+          "name": "="
+        }
+      },
+      "id": 227,
+      "sort": "Bool"
+    }
+  ],
+  "timeout_ms": 10499,
+  "unsupported_atoms": [],
+  "ay_revision": "unpublished-development-fixture",
+  "ay_version": "0.10.0"
+}

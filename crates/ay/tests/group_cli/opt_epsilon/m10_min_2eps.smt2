@@ -1,0 +1,7 @@
+(declare-const x Real)
+(declare-const y Real)
+(assert (> y 1.5))
+(assert (> x y))
+(minimize x)
+(check-sat)
+(get-objectives)

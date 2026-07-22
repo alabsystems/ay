@@ -1,0 +1,68 @@
+# AY build configuration.
+#
+# Design: portable defaults, optional local acceleration.
+#
+# This file must let a fresh checkout run plain `cargo` without requiring
+# machine-local tools. Do not set `build.rustc-wrapper` here: if `sccache` is
+# useful on a given machine, opt into it with `RUSTC_WRAPPER=sccache` or a
+# user-local Cargo config.
+#
+# No `build.target-dir` lives here either. Shared target directories are
+# per-machine policy; use `CARGO_TARGET_DIR` or a user-local Cargo config.
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-unknown-linux-musl]
+linker = "./scripts/zig-cc-x86_64-linux-musl.sh"
+# Competition/Linux binaries were shipping at the x86-64-v1 baseline (SSE2 only:
+# no POPCNT/LZCNT/BMI1/2/FMA/AVX2) while Kissat/CaDiCaL ship `-O3 -march=native`.
+# x86-64-v3 (Haswell+, 2013) is a safe floor for the SAT-COMP cluster and lets
+# the SAT core's bit-manip + autovectorizable scans use the modern ISA. NOTE: a
+# plain RUSTFLAGS env (e.g. the PGO build in prepare_sat26_submission.sh)
+# OVERRIDES these target rustflags, so the submission script must append
+# target-cpu too (tracked: competition build-flags task).
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[net]
+# Fetch git dependencies with the installed git client; Cargo's built-in
+# libgit2 fetch can miss an available SSH agent.
+git-fetch-with-cli = true
+
+[profile.dev]
+# opt-level=1 keeps rlib sizes compact (ay-dpll: 73MB→~40MB) with tiny
+# compile-time cost vs opt-level=0.
+opt-level = 1
+# Minimal debuginfo: line tables only. Cuts linker RSS and artifact size
+# substantially; debugger still works via .o file references.
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+# Incremental on: keeps the just-edited crate responsive in normal development.
+# It also composes with optional local `RUSTC_WRAPPER=sccache` setups.
+incremental = true
+
+[profile.test]
+# Incremental is pathological on the giant lib-test units (ay-sat: 9,337s
+# warm-incremental vs 366s non-incremental, 2026-07-14; see workspace
+# Cargo.toml). Dev-profile lib rebuilds stay incremental.
+incremental = false
+
+[profile.release]
+lto = "thin"
+
+[profile.release-perf]
+# Max-performance profile for benchmarking. Fat LTO via codegen-units=1.
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+
+[env]
+SCCACHE_CACHE_SIZE = "50G"
+CC_x86_64_unknown_linux_musl = { value = "scripts/zig-cc-x86_64-linux-musl.sh", relative = true }
+CXX_x86_64_unknown_linux_musl = { value = "scripts/zig-cxx-x86_64-linux-musl.sh", relative = true }
+AR_x86_64_unknown_linux_musl = { value = "scripts/zig-ar.sh", relative = true }
+RANLIB_x86_64_unknown_linux_musl = { value = "scripts/zig-ranlib.sh", relative = true }

@@ -1,0 +1,113 @@
+; Ghost vector simulation: dense Seq push/pop/get/len operations
+; This models a sequence of push operations followed by length/nth checks,
+; similar to what Creusot generates for ghost_vec verification.
+(set-logic QF_UFLIA)
+
+; Sequence functions (uninterpreted, with LIA axioms for len/nth)
+(declare-fun seq_empty () Int)
+(declare-fun seq_push (Int Int) Int)
+(declare-fun seq_len (Int) Int)
+(declare-fun seq_get (Int Int) Int)
+
+; Build a sequence with 8 pushes
+(declare-fun s0 () Int)
+(declare-fun s1 () Int)
+(declare-fun s2 () Int)
+(declare-fun s3 () Int)
+(declare-fun s4 () Int)
+(declare-fun s5 () Int)
+(declare-fun s6 () Int)
+(declare-fun s7 () Int)
+(declare-fun s8 () Int)
+
+(declare-fun v0 () Int)
+(declare-fun v1 () Int)
+(declare-fun v2 () Int)
+(declare-fun v3 () Int)
+(declare-fun v4 () Int)
+(declare-fun v5 () Int)
+(declare-fun v6 () Int)
+(declare-fun v7 () Int)
+
+; s0 = empty
+(assert (= s0 seq_empty))
+
+; s_i+1 = push(s_i, v_i)
+(assert (= s1 (seq_push s0 v0)))
+(assert (= s2 (seq_push s1 v1)))
+(assert (= s3 (seq_push s2 v2)))
+(assert (= s4 (seq_push s3 v3)))
+(assert (= s5 (seq_push s4 v4)))
+(assert (= s6 (seq_push s5 v5)))
+(assert (= s7 (seq_push s6 v6)))
+(assert (= s8 (seq_push s7 v7)))
+
+; Length axioms: len(empty) = 0, len(push(s,v)) = len(s) + 1
+(assert (= (seq_len seq_empty) 0))
+(assert (= (seq_len s1) (+ (seq_len s0) 1)))
+(assert (= (seq_len s2) (+ (seq_len s1) 1)))
+(assert (= (seq_len s3) (+ (seq_len s2) 1)))
+(assert (= (seq_len s4) (+ (seq_len s3) 1)))
+(assert (= (seq_len s5) (+ (seq_len s4) 1)))
+(assert (= (seq_len s6) (+ (seq_len s5) 1)))
+(assert (= (seq_len s7) (+ (seq_len s6) 1)))
+(assert (= (seq_len s8) (+ (seq_len s7) 1)))
+
+; Get axioms: get(push(s,v), len(s)) = v
+(assert (= (seq_get s1 0) v0))
+(assert (= (seq_get s2 1) v1))
+(assert (= (seq_get s3 2) v2))
+(assert (= (seq_get s4 3) v3))
+(assert (= (seq_get s5 4) v4))
+(assert (= (seq_get s6 5) v5))
+(assert (= (seq_get s7 6) v6))
+(assert (= (seq_get s8 7) v7))
+
+; Frame axioms: get at old indices is preserved
+(assert (= (seq_get s2 0) (seq_get s1 0)))
+(assert (= (seq_get s3 0) (seq_get s2 0)))
+(assert (= (seq_get s3 1) (seq_get s2 1)))
+(assert (= (seq_get s4 0) (seq_get s3 0)))
+(assert (= (seq_get s4 1) (seq_get s3 1)))
+(assert (= (seq_get s4 2) (seq_get s3 2)))
+(assert (= (seq_get s5 0) (seq_get s4 0)))
+(assert (= (seq_get s5 1) (seq_get s4 1)))
+(assert (= (seq_get s5 2) (seq_get s4 2)))
+(assert (= (seq_get s5 3) (seq_get s4 3)))
+(assert (= (seq_get s6 0) (seq_get s5 0)))
+(assert (= (seq_get s6 1) (seq_get s5 1)))
+(assert (= (seq_get s6 2) (seq_get s5 2)))
+(assert (= (seq_get s6 3) (seq_get s5 3)))
+(assert (= (seq_get s6 4) (seq_get s5 4)))
+(assert (= (seq_get s7 0) (seq_get s6 0)))
+(assert (= (seq_get s7 1) (seq_get s6 1)))
+(assert (= (seq_get s7 2) (seq_get s6 2)))
+(assert (= (seq_get s7 3) (seq_get s6 3)))
+(assert (= (seq_get s7 4) (seq_get s6 4)))
+(assert (= (seq_get s7 5) (seq_get s6 5)))
+(assert (= (seq_get s8 0) (seq_get s7 0)))
+(assert (= (seq_get s8 1) (seq_get s7 1)))
+(assert (= (seq_get s8 2) (seq_get s7 2)))
+(assert (= (seq_get s8 3) (seq_get s7 3)))
+(assert (= (seq_get s8 4) (seq_get s7 4)))
+(assert (= (seq_get s8 5) (seq_get s7 5)))
+(assert (= (seq_get s8 6) (seq_get s7 6)))
+
+; Concrete values
+(assert (= v0 10))
+(assert (= v1 20))
+(assert (= v2 30))
+(assert (= v3 40))
+(assert (= v4 50))
+(assert (= v5 60))
+(assert (= v6 70))
+(assert (= v7 80))
+
+; Postcondition: final length is 8 and all elements match
+(assert (= (seq_len s8) 8))
+(assert (= (seq_get s8 0) 10))
+(assert (= (seq_get s8 3) 40))
+(assert (= (seq_get s8 7) 80))
+
+(check-sat)
+(exit)

@@ -1,0 +1,51 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+# Author: Andrew Yates
+
+[package]
+name = "ay-bindings"
+description = "SMT/CHC solver bindings - typed builder API for AY"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/ay-bindings"
+readme.workspace = true
+
+[lib]
+test = true
+
+[dependencies]
+num-bigint.workspace = true
+num-traits.workspace = true
+stacker.workspace = true
+thiserror.workspace = true
+
+# ay-core provides shared SMT-LIB utilities (quote_symbol, etc.)
+ay-core.workspace = true
+
+# ay-sys: process memory-limit setters, to arm the default ceiling for in-process
+# consumers (e.g. compiler_consumer) that never run ay's main(). See execute_direct/mod.rs.
+ay-sys.workspace = true
+
+# AY direct linking - native Rust SMT solver
+# Optional dependency for direct program execution without SMT-LIB parsing
+ay-dpll = { workspace = true, optional = true }
+ay-frontend = { workspace = true, optional = true }
+ay-translate = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enable direct AY execution - allows AYProgram to be executed without serialization
+direct = ["ay-dpll", "ay-frontend", "ay-translate"]
+
+[dev-dependencies]
+# For round-trip parser tests (#1840)
+ntest = "0.9"
+ay-frontend = { workspace = true }
+ay-chc = { workspace = true }
+
+[lints]
+workspace = true

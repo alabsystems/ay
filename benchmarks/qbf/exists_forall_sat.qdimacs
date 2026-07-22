@@ -1,0 +1,7 @@
+c exists x forall y. (x OR y) AND (x OR NOT y)
+c SAT: set x=true
+p cnf 2 2
+e 1 0
+a 2 0
+1 2 0
+1 -2 0

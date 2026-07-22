@@ -1,0 +1,6 @@
+(set-logic QF_S)
+(declare-const x String)
+(declare-const y String)
+(assert (= (str.++ x y) (str.++ y x)))
+(assert (not (= x y)))
+(check-sat)

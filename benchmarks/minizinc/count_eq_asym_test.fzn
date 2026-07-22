@@ -1,0 +1,8 @@
+% Test count_eq with asymmetric bounds: count(x_i == y) where x ∈ [0..3], y ∈ [0..10]
+var 0..3: x1 :: output_var;
+var 0..3: x2 :: output_var;
+var 0..10: y :: output_var;
+var 0..2: obj :: output_var;
+array [1..2] of var int: xs = [x1, x2];
+constraint fzn_count_eq(xs, y, obj);
+solve maximize obj;

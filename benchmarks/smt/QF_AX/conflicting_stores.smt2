@@ -1,0 +1,15 @@
+; Conflicting stores: a = store(b, i, e1) and a = store(b, i, e2) with e1 != e2
+; Expected: unsat
+(set-logic QF_AX)
+(declare-sort Index 0)
+(declare-sort Element 0)
+(declare-fun a () (Array Index Element))
+(declare-fun b () (Array Index Element))
+(declare-fun i () Index)
+(declare-fun e1 () Element)
+(declare-fun e2 () Element)
+(assert (not (= e1 e2)))
+(assert (= a (store b i e1)))
+(assert (= a (store b i e2)))
+(check-sat)
+(exit)

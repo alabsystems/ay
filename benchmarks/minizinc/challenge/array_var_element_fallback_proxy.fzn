@@ -1,0 +1,18 @@
+% Deterministic MiniZinc Challenge proxy for array_var_int_element over a
+% decision-variable array. This currently exercises the FlatZinc fallback path:
+% the CP probe cannot resolve the named array, while the SMT path solves it.
+
+array [1..6] of var 1..6: xs :: output_array([1..6]);
+var 1..6: idx :: output_var;
+var 1..6: val :: output_var;
+
+constraint int_eq(xs[1], 6);
+constraint int_eq(xs[2], 4);
+constraint int_eq(xs[3], 2);
+constraint int_eq(xs[4], 5);
+constraint int_eq(xs[5], 3);
+constraint int_eq(xs[6], 1);
+constraint array_var_int_element(idx, xs, val);
+constraint int_eq(val, 3);
+
+solve satisfy;

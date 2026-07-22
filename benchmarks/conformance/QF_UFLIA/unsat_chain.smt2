@@ -1,0 +1,13 @@
+(set-info :status unsat)
+(set-logic QF_UFLIA)
+; f(a)=b, f(b)=c, a=b, so f(a)=f(b), hence b=c. But b!=c.
+(declare-fun f (Int) Int)
+(declare-const a Int)
+(declare-const b Int)
+(declare-const c Int)
+(assert (= (f a) b))
+(assert (= (f b) c))
+(assert (= a b))
+(assert (distinct b c))
+(check-sat)
+(exit)

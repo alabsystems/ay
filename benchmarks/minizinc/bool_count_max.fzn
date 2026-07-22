@@ -1,0 +1,10 @@
+% Maximize count of true booleans: max sum(b) s.t. at most 3 true, 5 booleans
+var 0..1: b1 :: output_var;
+var 0..1: b2 :: output_var;
+var 0..1: b3 :: output_var;
+var 0..1: b4 :: output_var;
+var 0..1: b5 :: output_var;
+var 0..5: obj :: output_var;
+constraint bool_lin_eq([1, 1, 1, 1, 1], [b1, b2, b3, b4, b5], obj);
+constraint bool_lin_le([1, 1, 1, 1, 1], [b1, b2, b3, b4, b5], 3);
+solve maximize obj;

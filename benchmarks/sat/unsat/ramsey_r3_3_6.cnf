@@ -1,0 +1,89 @@
+c Ramsey number R(3,3) > 5: 2-color graph on 6 vertices with no monochromatic triangle
+c Known UNSAT since R(3,3) = 6
+c Variable x_{i,j} (i<j): edge (i,j) is red (true) or blue (false)
+c Edges of K6: (1,2)=1, (1,3)=2, (1,4)=3, (1,5)=4, (1,6)=5,
+c (2,3)=6, (2,4)=7, (2,5)=8, (2,6)=9, (3,4)=10, (3,5)=11,
+c (3,6)=12, (4,5)=13, (4,6)=14, (5,6)=15
+p cnf 15 40
+c No red triangle (all-true triangles forbidden)
+c Triangle (1,2,3): not all red
+-1 -6 -2 0
+c Triangle (1,2,4): not all red
+-1 -7 -3 0
+c Triangle (1,2,5): not all red
+-1 -8 -4 0
+c Triangle (1,2,6): not all red
+-1 -9 -5 0
+c Triangle (1,3,4): not all red
+-2 -10 -3 0
+c Triangle (1,3,5): not all red
+-2 -11 -4 0
+c Triangle (1,3,6): not all red
+-2 -12 -5 0
+c Triangle (1,4,5): not all red
+-3 -13 -4 0
+c Triangle (1,4,6): not all red
+-3 -14 -5 0
+c Triangle (1,5,6): not all red
+-4 -15 -5 0
+c Triangle (2,3,4): not all red
+-6 -10 -7 0
+c Triangle (2,3,5): not all red
+-6 -11 -8 0
+c Triangle (2,3,6): not all red
+-6 -12 -9 0
+c Triangle (2,4,5): not all red
+-7 -13 -8 0
+c Triangle (2,4,6): not all red
+-7 -14 -9 0
+c Triangle (2,5,6): not all red
+-8 -15 -9 0
+c Triangle (3,4,5): not all red
+-10 -13 -11 0
+c Triangle (3,4,6): not all red
+-10 -14 -12 0
+c Triangle (3,5,6): not all red
+-11 -15 -12 0
+c Triangle (4,5,6): not all red
+-13 -15 -14 0
+c No blue triangle (all-false triangles forbidden)
+c Triangle (1,2,3): not all blue
+1 6 2 0
+c Triangle (1,2,4): not all blue
+1 7 3 0
+c Triangle (1,2,5): not all blue
+1 8 4 0
+c Triangle (1,2,6): not all blue
+1 9 5 0
+c Triangle (1,3,4): not all blue
+2 10 3 0
+c Triangle (1,3,5): not all blue
+2 11 4 0
+c Triangle (1,3,6): not all blue
+2 12 5 0
+c Triangle (1,4,5): not all blue
+3 13 4 0
+c Triangle (1,4,6): not all blue
+3 14 5 0
+c Triangle (1,5,6): not all blue
+4 15 5 0
+c Triangle (2,3,4): not all blue
+6 10 7 0
+c Triangle (2,3,5): not all blue
+6 11 8 0
+c Triangle (2,3,6): not all blue
+6 12 9 0
+c Triangle (2,4,5): not all blue
+7 13 8 0
+c Triangle (2,4,6): not all blue
+7 14 9 0
+c Triangle (2,5,6): not all blue
+8 15 9 0
+c Triangle (3,4,5): not all blue
+10 13 11 0
+c Triangle (3,4,6): not all blue
+10 14 12 0
+c Triangle (3,5,6): not all blue
+11 15 12 0
+c Triangle (4,5,6): not all blue
+13 15 14 0

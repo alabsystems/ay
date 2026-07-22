@@ -1,0 +1,399 @@
+{
+  "$schema": "./jit_mode_matrix.schema.json",
+  "$comment": "Andrew Yates <andrewyates.name@gmail.com>",
+  "version": 1,
+  "modes": {
+    "off": {
+      "native_dispatch": false,
+      "description": "Do not collect or dispatch EXTERNAL_CODEGEN/tMIR JIT artifacts."
+    },
+    "current": {
+      "native_dispatch": true,
+      "description": "Allow already-integrated native-code helpers only after the profile gate passes."
+    },
+    "solver-program": {
+      "native_dispatch": true,
+      "description": "Allow solver-program artifacts emitted through EXTERNAL_CODEGEN/tMIR only after the profile gate passes."
+    },
+    "profile-only": {
+      "native_dispatch": false,
+      "description": "Collect profile and application evidence while keeping competition dispatch on the non-JIT path."
+    }
+  },
+  "solve_control_plane": {
+    "version": 1,
+    "vocabulary": {
+      "mode": {
+        "description": "The explicit competition/JIT profile mode requested for a solve artifact and the recommended mode after gate evaluation.",
+        "mode_values": ["off", "current", "solver-program", "profile-only"],
+        "decision_fields": ["candidate_mode", "recommended_mode", "native_dispatch"]
+      },
+      "guidance": {
+        "description": "Inline human-readable gate outcome and failure reasons derived from the selected artifact and metrics.",
+        "decision_fields": ["status", "failures"]
+      },
+      "guidance-out": {
+        "description": "Durable runner-side output for the same guidance, suitable for CI artifacts and issue evidence.",
+        "decision_fields": ["track", "artifact", "status", "failures"]
+      },
+      "runtime-summary": {
+        "description": "Compact per-run summary that reports the solve track, artifact, result, mode recommendation, dispatch state, and wall-clock outcome.",
+        "decision_fields": ["track", "artifact", "status", "candidate_mode", "recommended_mode", "native_dispatch"]
+      },
+      "telemetry": {
+        "description": "Numeric evidence used by the gate, including solved count, PAR-2, integrity failures, and artifact-specific useful applications.",
+        "decision_fields": ["baseline", "candidate"]
+      }
+    },
+    "tracks": {
+      "sat": {
+        "runtime_modes": ["dimacs-sat"],
+        "mode_source": "tracks.sat.artifacts[].candidate_modes",
+        "guidance_artifacts": [
+          "sat-learned-clause-candidates",
+          "sat-whole-loop-guard",
+          "sat-native-code-helpers"
+        ],
+        "telemetry_counters": [
+          "sat_learned_clause_candidate_applications",
+          "solver_program.sat_whole_loop.installs",
+          "solver_program.sat_whole_loop.applies",
+          "sat_native_code_helper_applications"
+        ]
+      },
+      "smt": {
+        "runtime_modes": ["smt"],
+        "mode_source": "tracks.smt.artifacts[].candidate_modes",
+        "guidance_artifacts": [
+          "smt-lra-basis-regions",
+          "smt-lra-sparse-substitute",
+          "smt-bv-batch-templates",
+          "smt-native-code-helpers"
+        ],
+        "telemetry_counters": [
+          "solver_program.lra_basis_region.boundary_checks",
+          "solver_program.lra_basis_region.requests_queued",
+          "solver_program.lra_basis_region.batch_native_applies",
+          "lra_external_codegen_backend_substitute_wrapper_applies",
+          "lra_external_codegen_backend_substitute_native_applies",
+          "lra_external_codegen_backend_substitute_native_empty_target_applies",
+          "lra_external_codegen_backend_substitute_native_non_empty_target_applies",
+          "lra_external_codegen_backend_substitute_runtime_applies",
+          "lra_external_codegen_backend_substitute_applies",
+          "smt_bv_batch_template_applications",
+          "smt_native_code_helper_applications"
+        ]
+      },
+      "pb": {
+        "runtime_modes": ["pb"],
+        "mode_source": "tracks.pb.artifacts[].candidate_modes",
+        "guidance_artifacts": ["pb-pbo-candidates", "pb-native-code-helpers"],
+        "telemetry_counters": [
+          "pb_pbo_candidate_applications",
+          "pb_native_code_helper_applications"
+        ]
+      },
+      "chc": {
+        "runtime_modes": ["chc", "portfolio"],
+        "mode_source": "tracks.chc.artifacts[].candidate_modes",
+        "guidance_artifacts": ["chc-tla-transition-clusters", "chc-native-code-helpers"],
+        "telemetry_counters": [
+          "chc_tla_transition_cluster_applications",
+          "solver_program.tla2_transition_cluster.installs",
+          "solver_program.tla2_transition_cluster.applies",
+          "chc_native_code_helper_applications",
+          "chc.native_code_helper_applications",
+          "chc.native_code_helper_compile_attempts",
+          "chc.native_code_helper_compile_successes",
+          "chc.native_code_helper_compile_failures",
+          "chc.native_code_helper_evaluations",
+          "chc.native_code_helper_deopts",
+          "chc.native_code_helper_fallbacks",
+          "chc.native_code_helper_missing_var_fallbacks",
+          "chc.native_code_helper_interpreter_confirmations",
+          "chc.native_code_helper_trusted_true_results"
+        ]
+      }
+    }
+  },
+  "gate_defaults": {
+    "wrong_answers_max": 0,
+    "proof_failures_max": 0,
+    "witness_failures_max": 0,
+    "crashes_max": 0,
+    "solved_count_loss_max": 0,
+    "par2_loss_max_sec": 0.0,
+    "min_useful_applications": 1,
+    "integrity_failure_mode": "off",
+    "performance_failure_mode": "profile-only"
+  },
+  "tracks": {
+    "sat": {
+      "competition": "SAT-COMP",
+      "evals": ["sat-par2-dev", "sat-par2-heldout"],
+      "artifacts": [
+        {
+          "id": "sat-learned-clause-candidates",
+          "description": "SAT learned-clause candidates profiled before any native dispatch.",
+          "default_mode": "profile-only",
+          "candidate_modes": ["off", "profile-only"],
+          "evidence_kind": "profile-only",
+          "min_useful_applications": 1,
+          "application_counter": "sat_learned_clause_candidate_applications",
+          "gate": {
+            "wrong_answer": {
+              "enabled": true,
+              "failure_mode": "off",
+              "description": "Any SAT/UNSAT disagreement disables the candidate mode."
+            },
+            "proof_failure": {
+              "enabled": true,
+              "failure_mode": "off",
+              "description": "Any UNSAT proof rejection disables the candidate mode."
+            },
+            "witness_failure": {
+              "enabled": true,
+              "failure_mode": "off",
+              "description": "Any reported SAT witness invalidity disables the candidate mode."
+            },
+            "crash": {
+              "enabled": true,
+              "failure_mode": "off",
+              "description": "Any crash disables the candidate mode."
+            },
+            "solved_count_loss": {
+              "enabled": true,
+              "failure_mode": "profile-only",
+              "description": "A solved-count loss keeps the artifact in profile-only mode."
+            },
+            "par2_loss": {
+              "enabled": true,
+              "failure_mode": "profile-only",
+              "description": "A PAR-2 regression keeps the artifact in profile-only mode."
+            },
+            "application_count": {
+              "enabled": true,
+              "failure_mode": "profile-only",
+              "description": "Zero useful applications keeps the artifact in profile-only mode."
+            }
+          }
+        },
+        {
+          "id": "sat-whole-loop-guard",
+          "description": "EXTERNAL_CODEGEN/tMIR SAT whole-loop guard artifact installed only at solver start and applied once after static formula profile guards pass.",
+          "default_mode": "profile-only",
+          "candidate_modes": ["off", "solver-program", "profile-only"],
+          "evidence_kind": "solver-program-native",
+          "min_useful_applications": 1,
+          "application_counter": "solver_program.sat_whole_loop.applies",
+          "native_dispatch_counters": {
+            "solver-program": {
+              "install_counter": "solver_program.sat_whole_loop.installs",
+              "apply_counter": "solver_program.sat_whole_loop.applies"
+            }
+          },
+          "gate": {
+            "wrong_answer": { "enabled": true, "failure_mode": "off" },
+            "proof_failure": { "enabled": true, "failure_mode": "off" },
+            "witness_failure": { "enabled": true, "failure_mode": "off" },
+            "crash": { "enabled": true, "failure_mode": "off" },
+            "solved_count_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "par2_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "application_count": { "enabled": true, "failure_mode": "profile-only" }
+          }
+        },
+        {
+          "id": "sat-native-code-helpers",
+          "description": "Existing SAT native-code helper paths evaluated as current-mode artifacts.",
+          "default_mode": "profile-only",
+          "candidate_modes": ["off", "current", "profile-only"],
+          "evidence_kind": "integrated-native-helper",
+          "min_useful_applications": 1,
+          "application_counter": "sat_native_code_helper_applications",
+          "gate": {
+            "wrong_answer": { "enabled": true, "failure_mode": "off" },
+            "proof_failure": { "enabled": true, "failure_mode": "off" },
+            "witness_failure": { "enabled": true, "failure_mode": "off" },
+            "crash": { "enabled": true, "failure_mode": "off" },
+            "solved_count_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "par2_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "application_count": { "enabled": true, "failure_mode": "profile-only" }
+          }
+        }
+      ]
+    },
+    "smt": {
+      "competition": "SMT-COMP",
+      "evals": [
+        "smt-smtcomp-qf-abv",
+        "smt-smtcomp-qf-bv",
+        "smt-smtcomp-qf-lia",
+        "smt-smtcomp-qf-lra"
+      ],
+      "artifacts": [
+        {
+          "id": "smt-lra-basis-regions",
+          "description": "LRA basis-region solver-program native batch applications gated on actual EXTERNAL_CODEGEN/tMIR batch substitute execution.",
+          "default_mode": "profile-only",
+          "candidate_modes": ["off", "solver-program", "profile-only"],
+          "evidence_kind": "solver-program-native",
+          "min_useful_applications": 1,
+          "application_counter": "solver_program.lra_basis_region.batch_native_applies",
+          "gate": {
+            "wrong_answer": { "enabled": true, "failure_mode": "off" },
+            "proof_failure": { "enabled": true, "failure_mode": "off" },
+            "witness_failure": { "enabled": true, "failure_mode": "off" },
+            "crash": { "enabled": true, "failure_mode": "off" },
+            "solved_count_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "par2_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "application_count": { "enabled": true, "failure_mode": "profile-only" }
+          }
+        },
+        {
+          "id": "smt-lra-sparse-substitute",
+          "description": "EXTERNAL_CODEGEN/tMIR LRA sparse-substitute native-function application stats profiled before native solver-program dispatch.",
+          "default_mode": "profile-only",
+          "candidate_modes": ["off", "solver-program", "profile-only"],
+          "evidence_kind": "profile-only",
+          "min_useful_applications": 1,
+          "application_counter": "lra_external_codegen_backend_substitute_native_applies",
+          "gate": {
+            "wrong_answer": { "enabled": true, "failure_mode": "off" },
+            "proof_failure": { "enabled": true, "failure_mode": "off" },
+            "witness_failure": { "enabled": true, "failure_mode": "off" },
+            "crash": { "enabled": true, "failure_mode": "off" },
+            "solved_count_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "par2_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "application_count": { "enabled": true, "failure_mode": "profile-only" }
+          }
+        },
+        {
+          "id": "smt-bv-batch-templates",
+          "description": "BV batch templates are a data-only CNF contract today; SMT runtime application stats fail closed at zero until a verified EXTERNAL_CODEGEN/tMIR install boundary exists.",
+          "default_mode": "profile-only",
+          "candidate_modes": ["off", "profile-only"],
+          "evidence_kind": "profile-only",
+          "min_useful_applications": 1,
+          "application_counter": "smt_bv_batch_template_applications",
+          "gate": {
+            "wrong_answer": { "enabled": true, "failure_mode": "off" },
+            "proof_failure": { "enabled": true, "failure_mode": "off" },
+            "witness_failure": { "enabled": true, "failure_mode": "off" },
+            "crash": { "enabled": true, "failure_mode": "off" },
+            "solved_count_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "par2_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "application_count": { "enabled": true, "failure_mode": "profile-only" }
+          }
+        },
+        {
+          "id": "smt-native-code-helpers",
+          "description": "SMT native-code helper application stats are an explicit fail-closed zero stub until integrated helpers expose validated EXTERNAL_CODEGEN/tMIR evidence.",
+          "default_mode": "profile-only",
+          "candidate_modes": ["off", "profile-only"],
+          "evidence_kind": "profile-only",
+          "min_useful_applications": 1,
+          "application_counter": "smt_native_code_helper_applications",
+          "gate": {
+            "wrong_answer": { "enabled": true, "failure_mode": "off" },
+            "proof_failure": { "enabled": true, "failure_mode": "off" },
+            "witness_failure": { "enabled": true, "failure_mode": "off" },
+            "crash": { "enabled": true, "failure_mode": "off" },
+            "solved_count_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "par2_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "application_count": { "enabled": true, "failure_mode": "profile-only" }
+          }
+        }
+      ]
+    },
+    "pb": {
+      "competition": "PB-COMP",
+      "evals": ["pb26-practice"],
+      "artifacts": [
+        {
+          "id": "pb-pbo-candidates",
+          "description": "PB/PBO candidates profiled before EXTERNAL_CODEGEN/tMIR solver-program dispatch.",
+          "default_mode": "profile-only",
+          "candidate_modes": ["off", "solver-program", "profile-only"],
+          "evidence_kind": "profile-only",
+          "min_useful_applications": 1,
+          "application_counter": "pb_pbo_candidate_applications",
+          "gate": {
+            "wrong_answer": { "enabled": true, "failure_mode": "off" },
+            "proof_failure": { "enabled": true, "failure_mode": "off" },
+            "witness_failure": { "enabled": true, "failure_mode": "off" },
+            "crash": { "enabled": true, "failure_mode": "off" },
+            "solved_count_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "par2_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "application_count": { "enabled": true, "failure_mode": "profile-only" }
+          }
+        },
+        {
+          "id": "pb-native-code-helpers",
+          "description": "Existing PB native-code helpers treated as profile-gated current mode.",
+          "default_mode": "profile-only",
+          "candidate_modes": ["off", "current", "profile-only"],
+          "evidence_kind": "integrated-native-helper",
+          "min_useful_applications": 1,
+          "application_counter": "pb_native_code_helper_applications",
+          "gate": {
+            "wrong_answer": { "enabled": true, "failure_mode": "off" },
+            "proof_failure": { "enabled": true, "failure_mode": "off" },
+            "witness_failure": { "enabled": true, "failure_mode": "off" },
+            "crash": { "enabled": true, "failure_mode": "off" },
+            "solved_count_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "par2_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "application_count": { "enabled": true, "failure_mode": "profile-only" }
+          }
+        }
+      ]
+    },
+    "chc": {
+      "competition": "CHC-COMP",
+      "evals": ["chccomp-2025-extra-small-lia", "chccomp-2025-lia-lin", "chccomp-2025-lia"],
+      "artifacts": [
+        {
+          "id": "chc-tla-transition-clusters",
+          "description": "CHC/TLA transition clusters profiled for EXTERNAL_CODEGEN/tMIR solver-program dispatch.",
+          "default_mode": "profile-only",
+          "candidate_modes": ["off", "solver-program", "profile-only"],
+          "evidence_kind": "profile-only",
+          "min_useful_applications": 1,
+          "application_counter": "chc_tla_transition_cluster_applications",
+          "native_dispatch_counters": {
+            "solver-program": {
+              "install_counter": "solver_program.tla2_transition_cluster.installs",
+              "apply_counter": "solver_program.tla2_transition_cluster.applies"
+            }
+          },
+          "gate": {
+            "wrong_answer": { "enabled": true, "failure_mode": "off" },
+            "proof_failure": { "enabled": true, "failure_mode": "off" },
+            "witness_failure": { "enabled": true, "failure_mode": "off" },
+            "crash": { "enabled": true, "failure_mode": "off" },
+            "solved_count_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "par2_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "application_count": { "enabled": true, "failure_mode": "profile-only" }
+          }
+        },
+        {
+          "id": "chc-native-code-helpers",
+          "description": "Existing CHC native-code helpers treated as profile-gated current mode.",
+          "default_mode": "profile-only",
+          "candidate_modes": ["off", "current", "profile-only"],
+          "evidence_kind": "integrated-native-helper",
+          "min_useful_applications": 1,
+          "application_counter": "chc_native_code_helper_applications",
+          "gate": {
+            "wrong_answer": { "enabled": true, "failure_mode": "off" },
+            "proof_failure": { "enabled": true, "failure_mode": "off" },
+            "witness_failure": { "enabled": true, "failure_mode": "off" },
+            "crash": { "enabled": true, "failure_mode": "off" },
+            "solved_count_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "par2_loss": { "enabled": true, "failure_mode": "profile-only" },
+            "application_count": { "enabled": true, "failure_mode": "profile-only" }
+          }
+        }
+      ]
+    }
+  }
+}

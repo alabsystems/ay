@@ -1,0 +1,457 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/alabsystems/ay/blob/main/crates/ay/schemas/downstream-smoke-evidence.schema.json",
+  "title": "AY downstream smoke evidence",
+  "description": "JSON summary emitted by ay consumer-smoke run --json PATH. The schema documents the artifact shape; release acceptance still depends on the evidence-packet checks in the release tooling.",
+  "x-ay-inventory-smoke-consumers": [
+    "model-checker-consumer",
+    "verification-consumer",
+    "deductive-checks",
+    "ty",
+    "clean"
+  ],
+  "x-ay-inventory-smoke-consumer-aliases": {
+    "verification-consumer": "quantifier_consumer",
+    "deductive-checks": "certificate_consumer",
+    "ty": "tla2",
+    "clean": "proof_replay"
+  },
+  "type": "object",
+  "required": [
+    "tool",
+    "timestamp_utc",
+    "mode",
+    "inventory",
+    "tools",
+    "evidence",
+    "ay",
+    "consumers",
+    "summary",
+    "overall"
+  ],
+  "properties": {
+    "tool": {
+      "const": "ay-consumer-smoke-check"
+    },
+    "timestamp_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "quick",
+        "full"
+      ]
+    },
+    "selected_consumers": {
+      "type": "array",
+      "description": "Names passed with --only. Empty or absent means the full smoke inventory was selected.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "unprocessed_consumers": {
+      "type": "array",
+      "description": "Selected smoke consumers that were not reached. Non-empty artifacts are partial blocker evidence, usually from --fail-fast, and are not launch candidates.",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "evidence": {
+      "type": "object",
+      "description": "Machine-readable classification of the smoke artifact. This lets consumers distinguish full clean downstream evidence from filtered or local smoke runs without re-deriving policy from every row.",
+      "required": [
+        "scope",
+        "checkout_mode",
+        "launch_candidate",
+        "all_consumers_clean",
+        "all_consumers_have_commit",
+        "summary_counts_match",
+        "all_executed_logs_verified",
+        "ay_head_stable",
+        "ay_worktree_clean",
+        "model_checker_consumer_first_failure_mode"
+      ],
+      "$comment": "model_checker_consumer_first_failure_mode is required (the legacy zani_first_failure_mode spelling is no longer accepted). verification_consumer_deductive_checks_clean_origin_main (ex-quantifier_consumer_certificate_consumer_clean_origin_main) is required via the anyOf below: at least one spelling (canonical or legacy alias) must be present, so both pre-rename and post-rename smoke artifacts validate.",
+      "allOf": [
+        {
+          "anyOf": [
+            {
+              "required": [
+                "verification_consumer_deductive_checks_clean_origin_main"
+              ]
+            },
+            {
+              "required": [
+                "quantifier_consumer_certificate_consumer_clean_origin_main"
+              ]
+            }
+          ]
+        }
+      ],
+      "properties": {
+        "scope": {
+          "type": "string",
+          "enum": [
+            "full_inventory",
+            "filtered"
+          ],
+          "description": "`full_inventory` means no --only filter was used; `filtered` means the artifact is partial lane evidence."
+        },
+        "checkout_mode": {
+          "type": "string",
+          "enum": [
+            "clean_temp_worktree",
+            "mixed",
+            "local"
+          ],
+          "description": "`clean_temp_worktree` means every selected consumer ran in a clean temporary worktree. `mixed` means some but not all selected consumers used temp worktrees. `local` means no selected consumer used a temp worktree."
+        },
+        "launch_candidate": {
+          "type": "boolean",
+          "x-ay-hn-launch-required-value": true,
+          "description": "True only for full-mode, full-inventory, passing, non-skipped evidence where all consumers have commits, all selected checkouts are clean, model-checker-consumer did not run in first-failure-only mode, and verification-consumer/deductive-checks (ex-quantifier_consumer/certificate_consumer) ran from clean origin/main temp worktrees."
+        },
+        "inventory_complete": {
+          "type": "boolean",
+          "description": "True only when every selected smoke consumer was processed and represented in consumers."
+        },
+        "partial": {
+          "type": "boolean",
+          "description": "True for intentionally incomplete artifacts, such as --fail-fast evidence after a first consumer failure. Partial artifacts are blocker evidence, not launch evidence."
+        },
+        "summary_counts_match": {
+          "type": "boolean",
+          "description": "True only when summary.passed/failed/skipped exactly match the statuses recorded in the consumer rows."
+        },
+        "fail_fast": {
+          "type": "boolean",
+          "description": "True when ay consumer-smoke run ran with --fail-fast."
+        },
+        "stopped_after_first_failure": {
+          "type": "boolean",
+          "description": "True when --fail-fast observed a consumer FAIL and stopped before the selected inventory was exhausted."
+        },
+        "all_consumers_clean": {
+          "type": "boolean"
+        },
+        "all_consumers_have_commit": {
+          "type": "boolean"
+        },
+        "all_executed_logs_verified": {
+          "type": "boolean",
+          "description": "True only when at least one consumer command ran and every executed consumer row has an existing log_path whose SHA-256 matches log_sha256 and whose first two lines match the row's consumer name and command."
+        },
+        "ay_head_stable": {
+          "type": "boolean",
+          "description": "True only when the ay checkout HEAD stayed at the same full commit for the whole smoke run and across every executed consumer command."
+        },
+        "ay_worktree_clean": {
+          "type": "boolean",
+          "description": "True only when the ay checkout worktree status stayed clean for the whole smoke run and across every executed consumer command."
+        },
+        "model_checker_consumer_first_failure_mode": {
+          "type": "boolean",
+          "description": "True when MODEL_CHECKER_CONSUMER_SMOKE_FIRST_FAILURE was set, meaning the model-checker-consumer consumer command ran a bounded first-failure repro instead of the full model-checker-consumer smoke surface."
+        },
+        "verification_consumer_deductive_checks_clean_origin_main": {
+          "type": "boolean",
+          "description": "Canonical (ex-quantifier_consumer_certificate_consumer_clean_origin_main). True when the verification-consumer and deductive-checks consumers both ran from clean origin/main temp worktrees."
+        },
+        "quantifier_consumer_certificate_consumer_clean_origin_main": {
+          "type": "boolean",
+          "description": "Back-compat alias for verification_consumer_deductive_checks_clean_origin_main. Accepted on pre-rename smoke artifacts; new artifacts should emit verification_consumer_deductive_checks_clean_origin_main."
+        }
+      },
+      "additionalProperties": true
+    },
+    "inventory": {
+      "type": "object",
+      "description": "Inventory file used to decide which downstream consumers must appear in the evidence.",
+      "required": [
+        "path",
+        "sha256",
+        "smoke_consumer_count",
+        "smoke_consumers"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "minLength": 1
+        },
+        "smoke_consumer_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of inventory rows with a smoke_script when the artifact was generated."
+        },
+        "smoke_consumers": {
+          "type": "array",
+          "description": "Inventory consumers with a smoke_script when the artifact was generated, in inventory order.",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "tools": {
+      "type": "object",
+      "description": "First-line tool versions captured when the smoke artifact was generated.",
+      "required": [
+        "git",
+        "cargo",
+        "rustc",
+        "z3"
+      ],
+      "properties": {
+        "git": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cargo": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rustc": {
+          "type": "string",
+          "minLength": 1
+        },
+        "z3": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": true
+    },
+    "ay": {
+      "type": "object",
+      "required": [
+        "root",
+        "commit",
+        "commit_full",
+        "commit_end",
+        "commit_full_end",
+        "git_status_short",
+        "git_status_short_end"
+      ],
+      "properties": {
+        "root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "commit": {
+          "type": "string",
+          "minLength": 1
+        },
+        "commit_full": {
+          "type": "string",
+          "minLength": 1
+        },
+        "commit_end": {
+          "type": "string",
+          "minLength": 1
+        },
+        "commit_full_end": {
+          "type": "string",
+          "minLength": 1
+        },
+        "git_status_short": {
+          "type": "string",
+          "description": "Raw `git status --short` output for the ay checkout when the smoke run started. Empty means clean."
+        },
+        "git_status_short_end": {
+          "type": "string",
+          "description": "Raw `git status --short` output for the ay checkout before JSON was written. Empty means clean."
+        }
+      },
+      "additionalProperties": true
+    },
+    "consumers": {
+      "type": "object",
+      "$comment": "Inventory smoke consumers at schema update (canonical names): \"model-checker-consumer\", \"verification-consumer\", \"deductive-checks\", \"ty\", \"clean\" (legacy aliases: quantifier_consumer, certificate_consumer, tla2, proof_replay — still accepted; the former zani alias is no longer accepted). Broad HN/Z3-successor evidence must include every smoke consumer; filtered --only artifacts include only selected consumers.",
+      "description": "Consumers come from the development design notes rows with a smoke_script. Full inventory runs include every smoke consumer; filtered --only runs include only selected consumers. Missing checkouts are represented as SKIP rows when selected.",
+      "additionalProperties": {
+        "$ref": "#/$defs/consumerEvidence"
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "passed",
+        "failed",
+        "skipped"
+      ],
+      "properties": {
+        "passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "overall": {
+      "type": "object",
+      "required": [
+        "status",
+        "exit_code"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "PASS",
+            "FAIL"
+          ]
+        },
+        "exit_code": {
+          "type": "integer",
+          "enum": [
+            0,
+            1
+          ]
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "consumerEvidence": {
+      "type": "object",
+      "required": [
+        "status",
+        "elapsed_sec",
+        "note",
+        "source_path",
+        "path",
+        "commit",
+        "git_status",
+        "temp_worktree",
+        "worktree_ref",
+        "command",
+        "log_path",
+        "log_sha256",
+        "ay_commit_full_before",
+        "ay_commit_full_after",
+        "ay_worktree_status_before",
+        "ay_worktree_status_after",
+        "ay_git_status_short_before",
+        "ay_git_status_short_after"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "PASS",
+            "FAIL",
+            "SKIP"
+          ]
+        },
+        "elapsed_sec": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "note": {
+          "type": "string"
+        },
+        "source_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "commit": {
+          "type": "string"
+        },
+        "git_status": {
+          "type": "string",
+          "enum": [
+            "",
+            "clean",
+            "dirty",
+            "not_git"
+          ]
+        },
+        "temp_worktree": {
+          "type": "boolean"
+        },
+        "worktree_ref": {
+          "type": "string"
+        },
+        "command": {
+          "type": "string",
+          "description": "Exact orchestrator command used for this consumer. Empty only when the consumer command did not run, such as a missing checkout SKIP."
+        },
+        "log_path": {
+          "type": "string",
+          "description": "Path to the per-consumer command log. Empty only when the consumer command did not run."
+        },
+        "log_sha256": {
+          "type": "string",
+          "description": "SHA-256 digest of log_path. Empty only when the consumer command did not run."
+        },
+        "ay_commit_full_before": {
+          "type": "string",
+          "description": "Full ay commit immediately before this consumer command. Empty only when the consumer command did not run."
+        },
+        "ay_commit_full_after": {
+          "type": "string",
+          "description": "Full ay commit immediately after this consumer command. Empty only when the consumer command did not run."
+        },
+        "ay_worktree_status_before": {
+          "type": "string",
+          "enum": [
+            "",
+            "clean",
+            "dirty",
+            "unavailable"
+          ],
+          "description": "ay checkout cleanliness immediately before this consumer command. Empty only when the consumer command did not run."
+        },
+        "ay_worktree_status_after": {
+          "type": "string",
+          "enum": [
+            "",
+            "clean",
+            "dirty",
+            "unavailable"
+          ],
+          "description": "ay checkout cleanliness immediately after this consumer command. Empty only when the consumer command did not run."
+        },
+        "ay_git_status_short_before": {
+          "type": "string",
+          "description": "Raw `git status --short` output for the ay checkout immediately before this consumer command. Empty means clean or command not run; use ay_worktree_status_before to distinguish."
+        },
+        "ay_git_status_short_after": {
+          "type": "string",
+          "description": "Raw `git status --short` output for the ay checkout immediately after this consumer command. Empty means clean or command not run; use ay_worktree_status_after to distinguish."
+        }
+      },
+      "additionalProperties": true
+    },
+    "hnLaunchAcceptanceNotes": {
+      "$comment": "Broad HN/Z3-successor downstream evidence must have evidence.launch_candidate=true. Equivalently: mode=full, evidence.scope=full_inventory, selected_consumers=[], unprocessed_consumers=[], evidence.inventory_complete=true, evidence.partial=false, overall.status=PASS, overall.exit_code=0, summary.failed=0, summary.skipped=0, evidence.summary_counts_match=true, evidence.all_executed_logs_verified=true, evidence.ay_head_stable=true, evidence.ay_worktree_clean=true, evidence.model_checker_consumer_first_failure_mode=false, every inventory smoke consumer at status=PASS with a non-empty commit, clean git_status, non-empty command, existing log_path with matching log_sha256 and matching log header, and verification-consumer/deductive-checks (ex-quantifier_consumer/certificate_consumer) from temp_worktree=true at worktree_ref=origin/main when those checkouts exist."
+    }
+  }
+}

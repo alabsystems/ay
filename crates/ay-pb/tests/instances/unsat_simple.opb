@@ -1,0 +1,5 @@
+* #variable= 2 #constraint= 3
+* Unsatisfiable: x1 must be true AND false
++1 x1 >= 1 ;
++1 ~x1 >= 1 ;
++1 x2 >= 0 ;

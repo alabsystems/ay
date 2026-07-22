@@ -1,0 +1,5 @@
+(set-logic QF_LIA)
+(declare-fun x () Int)
+(declare-fun y () Int)
+(assert (let ((sum (+ x y))) (= sum 5)))
+(check-sat)

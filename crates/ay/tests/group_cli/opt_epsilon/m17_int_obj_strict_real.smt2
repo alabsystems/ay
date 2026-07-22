@@ -1,0 +1,7 @@
+(declare-const x Int)
+(declare-const y Real)
+(assert (<= x 10))
+(assert (< y 100.0))
+(maximize x)
+(check-sat)
+(get-objectives)

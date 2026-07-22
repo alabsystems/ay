@@ -1,0 +1,10 @@
+c forall x exists y. (x OR y) AND (NOT x OR y) AND (x OR NOT y) AND (NOT x OR NOT y)
+c UNSAT: y cannot satisfy all clauses for all x
+c x=T: need y for first two, NOT y for third - contradiction
+p cnf 2 4
+a 1 0
+e 2 0
+1 2 0
+-1 2 0
+1 -2 0
+-1 -2 0

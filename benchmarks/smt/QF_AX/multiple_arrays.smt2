@@ -1,0 +1,20 @@
+; Multiple arrays with equalities
+; a = store(b, i, v), c = store(b, j, w), i != j
+; select(a, j) = select(b, j) = w (but via c)
+; Expected: sat
+(set-logic QF_AX)
+(declare-sort Index 0)
+(declare-sort Element 0)
+(declare-fun a () (Array Index Element))
+(declare-fun b () (Array Index Element))
+(declare-fun c () (Array Index Element))
+(declare-fun i () Index)
+(declare-fun j () Index)
+(declare-fun v () Element)
+(declare-fun w () Element)
+(assert (= a (store b i v)))
+(assert (= c (store b j w)))
+(assert (not (= i j)))
+(assert (= (select a j) w))
+(check-sat)
+(exit)

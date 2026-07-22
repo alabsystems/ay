@@ -1,0 +1,28 @@
+# Per-user cargo config overrides for AY (#8860).
+#
+# This file is an EXAMPLE. To use it:
+#   1. Copy to a location cargo reads (one of):
+#        a) Set CARGO_TARGET_DIR via shell env — simplest, preferred.
+#        b) Copy to $CARGO_HOME/config.toml (usually ~/.cargo/config.toml);
+#           cargo merges it with the repo's .cargo/config.toml.
+#        c) Use a symlink if you want a repo-local file: ln -s
+#           /abs/path/config.toml.local .cargo/config.toml.local — note
+#           cargo does NOT auto-load *.local; you must reference it via
+#           $CARGO_HOME or copy its contents into the repo config (which
+#           you should NOT commit if paths are absolute).
+#   2. Edit the paths below for your environment.
+#
+# The repo's .cargo/config.toml intentionally OMITS absolute paths so
+# fresh clones build on any machine without edits.
+
+[build]
+# Share a single target/ dir across all worktrees by pointing every
+# checkout at one absolute path.
+# target-dir = "/path/to/ay/target"
+
+# Optional: enable sccache if it is installed on this machine.
+# rustc-wrapper = "sccache"
+
+# Equivalent: set CARGO_TARGET_DIR in your shell rc, e.g.:
+#   export CARGO_TARGET_DIR="$HOME/ay/target"
+# Env var wins over config file, and works without editing any file.

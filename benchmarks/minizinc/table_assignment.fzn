@@ -1,0 +1,23 @@
+% Table constraint: assign 3 jobs to 3 workers with cost
+% Allowed (worker, job, cost) tuples (flat array, 3 columns):
+var 1..3: w1 :: output_var;
+var 1..3: j1 :: output_var;
+var 1..10: c1 :: output_var;
+var 1..3: w2 :: output_var;
+var 1..3: j2 :: output_var;
+var 1..10: c2 :: output_var;
+var 1..3: w3 :: output_var;
+var 1..3: j3 :: output_var;
+var 1..10: c3 :: output_var;
+var 3..30: total :: output_var;
+% Each assignment must come from the allowed table (flat 9x3 = 27 elements)
+array [1..27] of int: tbl = [1,1,5, 1,2,8, 1,3,3, 2,1,4, 2,2,7, 2,3,6, 3,1,9, 3,2,2, 3,3,1];
+constraint fzn_table_int([w1, j1, c1], tbl);
+constraint fzn_table_int([w2, j2, c2], tbl);
+constraint fzn_table_int([w3, j3, c3], tbl);
+% All different workers and jobs
+constraint fzn_all_different_int([w1, w2, w3]);
+constraint fzn_all_different_int([j1, j2, j3]);
+% Total cost
+constraint int_lin_eq([1, 1, 1, -1], [c1, c2, c3, total], 0);
+solve minimize total;

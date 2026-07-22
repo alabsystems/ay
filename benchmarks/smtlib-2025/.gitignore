@@ -1,0 +1,6 @@
+# SMT-LIB 2025 corpora extracted from Zenodo records 15493090 (non-incremental)
+# and 15493096 (incremental) — multi-GB benchmark trees, never tracked.
+# The selection manifests (selections/) and this file stay tracked.
+/non-incremental/
+/incremental/
+*.tar.zst

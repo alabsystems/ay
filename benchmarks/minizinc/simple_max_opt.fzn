@@ -1,0 +1,7 @@
+% Simple maximization: max x+y s.t. x in [1..10], y in [1..10], x+y <= 15
+var 1..10: x :: output_var;
+var 1..10: y :: output_var;
+var 0..20: obj :: output_var;
+constraint int_lin_eq([1, 1, -1], [x, y, obj], 0);
+constraint int_lin_le([1, 1], [x, y], 15);
+solve maximize obj;

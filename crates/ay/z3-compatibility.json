@@ -1,0 +1,55 @@
+{
+  "schema": "ay-z3-compatibility-inventory/v1",
+  "claims": {
+    "universal_drop_in_replacement": false,
+    "full_z3_cli_compatibility": false
+  },
+  "cli_subset": [
+    {
+      "surface": "Z3-style stdin SMT-LIB2 model transcript (`ay --z3-mode -in`, basic QF_LIA `get-value`)",
+      "status": "Ready"
+    },
+    {
+      "surface": "Z3-style parameter discovery subset (`ay -p` / `-pd` / `-pm` / `-pp`)",
+      "status": "Ready"
+    },
+    {
+      "surface": "Explicit rejection of unsupported Z3 options (e.g. `-tactics`)",
+      "status": "Ready"
+    }
+  ],
+  "full_replacement": [
+    {
+      "surface": "Public source build",
+      "status": "Pending evidence"
+    },
+    {
+      "surface": "SMT-LIB input",
+      "status": "In progress"
+    },
+    {
+      "surface": "DIMACS CNF input",
+      "status": "In progress"
+    },
+    {
+      "surface": "CHC / Spacer-style use",
+      "status": "In progress"
+    },
+    {
+      "surface": "Models",
+      "status": "Ready"
+    },
+    {
+      "surface": "UNSAT proofs",
+      "status": "In progress"
+    },
+    {
+      "surface": "Rust embedding",
+      "status": "Not started"
+    },
+    {
+      "surface": "C API / FFI",
+      "status": "Ready"
+    }
+  ]
+}

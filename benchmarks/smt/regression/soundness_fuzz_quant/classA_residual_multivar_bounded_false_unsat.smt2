@@ -1,0 +1,7 @@
+; AY=unsat z3=sat SOUNDNESS CONFLICT (minimized)
+(set-logic LIA)
+(declare-const a Int)
+(declare-const b Int)
+(declare-const c Int)
+(assert (not (exists ((X0 Int) (X1 Int)) (and (and (<= 0 X0) (<= X0 3) (<= 0 X1) (<= X1 3)) (and (distinct b X1) (= a c))))))
+(check-sat)

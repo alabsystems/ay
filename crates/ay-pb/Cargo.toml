@@ -1,0 +1,56 @@
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# OPB/WBO pseudo-Boolean format parser for PB26 competition
+
+[package]
+name = "ay-pb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OPB/WBO pseudo-Boolean format parser for PB competition instances"
+readme.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Large checked-in proof sidecars for exact benchmark certification routes.
+# Keep this opt-in so library consumers do not require benchmark proof data.
+certified-proof-artifacts = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+ay-sat.workspace = true
+ay-sys.workspace = true
+signal-hook.workspace = true
+rustc-hash.workspace = true
+ay-jit = { workspace = true, optional = true }
+num-rational.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+# The native MILP engine lane (OPT-LIN post-solve optimality upgrade).
+# `optimize::milp_lane` imports it unconditionally, so it must be a plain
+# (all-platform) dependency — it briefly sat in the cfg(unix) table below,
+# which broke every Windows build with E0432 on `use ay_milp`.
+ay-milp.workspace = true
+
+# Process-CPU accounting (getrusage) for the competition CPU-time budget
+# (AY_PB_CPU_BUDGET_MS): PB-COMP's TIMELIMIT is total CPU time across threads,
+# not wall time, so the solver must be able to stand down on its own CPU clock.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[[bin]]
+name = "ay-pb"
+path = "src/bin/ay.rs"
+
+[dev-dependencies]
+# Compile-fail lock for the primal worker-return split (tests/trybuild.rs):
+# a primal optimization worker must be STRUCTURALLY unable to produce a
+# Done/OptimumFound verdict.
+trybuild.workspace = true
+num-rational.workspace = true

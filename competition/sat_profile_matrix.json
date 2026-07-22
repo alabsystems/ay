@@ -1,0 +1,483 @@
+{
+  "$schema": "./sat_profile_matrix.schema.json",
+  "$comment": "Andrew Yates <andrewyates.name@gmail.com>",
+  "version": 1,
+  "control_plane": {
+    "default_user_path": "ay <input.cnf>",
+    "default_user_profile": "none",
+    "authoritative_fallback": "scalar-cdcl-2wl",
+    "jit_mode_matrix": "competition/jit_mode_matrix.json"
+  },
+  "lineup_freeze": {
+    "issue": 8899,
+    "status": "blocked-until-final-evidence",
+    "selection_profile_ids": ["regular", "ai-tuned", "experimental", "parallel"],
+    "excluded_profile_ids": ["cloud"],
+    "matrix_source": {
+      "suite": "sat-main-2026-official-mirror",
+      "track": "main",
+      "proof_format": "drat",
+      "jobs": 1,
+      "wrong_answer_budget": 0,
+      "proof_failure_budget": 0,
+      "witness_failure_budget": 0,
+      "crash_budget": 0
+    },
+    "required_evidence": [
+      "quiet_host_matrix",
+      "external_unsat_proof_csv",
+      "sat_model_validation",
+      "linux_x86_64_rehearsal",
+      "sat_main_final_evidence_manifest"
+    ]
+  },
+  "sat26_compliance": {
+    "issue": 8926,
+    "status": "blocked-until-registration-and-final-evidence",
+    "official_sources_checked": "2026-05-05",
+    "official_sources_checked_at_utc": "2026-05-05T19:34:52Z",
+    "official_sources": [
+      "https://satcompetition.github.io/2026/",
+      "https://satcompetition.github.io/2026/tracks.html",
+      "https://satcompetition.github.io/2026/nhr.html",
+      "https://satcompetition.github.io/2026/output.html",
+      "https://satcompetition.github.io/2026/rules.html"
+    ],
+    "official_source_citations": [
+      {
+        "label": "SAT-COMP 2026 important dates",
+        "url": "https://satcompetition.github.io/2026/",
+        "retrieved_at_utc": "2026-05-05T19:34:52Z",
+        "supports": "Solver registration and benchmark deadline of 2026-04-19, sequential solver deadline of 2026-05-10, parallel/cloud solver deadline of 2026-05-17, and solver documentation deadline of 2026-05-17."
+      },
+      {
+        "label": "SAT-COMP 2026 rules",
+        "url": "https://satcompetition.github.io/2026/rules.html",
+        "retrieved_at_utc": "2026-05-05T19:34:52Z",
+        "supports": "Competition rule constraints and proof-checker declaration requirements."
+      },
+      {
+        "label": "SAT-COMP 2026 NHR submission instructions",
+        "url": "https://satcompetition.github.io/2026/nhr.html",
+        "retrieved_at_utc": "2026-05-05T19:34:52Z",
+        "supports": "Private repository package shape with build/run hooks."
+      },
+      {
+        "label": "SAT-COMP 2026 output and certificate format",
+        "url": "https://satcompetition.github.io/2026/output.html",
+        "retrieved_at_utc": "2026-05-05T19:34:52Z",
+        "supports": "SAT model and UNSAT certificate output contract."
+      }
+    ],
+    "deadlines": {
+      "solver_registration": "2026-04-19",
+      "benchmark_submission": "2026-04-19",
+      "solver_submission": "2026-05-10",
+      "parallel_cloud_solver_submission": "2026-05-17",
+      "solver_documentation": "2026-05-17"
+    },
+    "nhr_submission_contract": {
+      "package_shape": "nhr-private-github-root",
+      "build_entrypoint": "build.sh",
+      "run_entrypoint": "run.sh",
+      "run_argv": ["instance", "output_dir"],
+      "unsat_proof_path": "proof.out",
+      "stdout_contract": "solution-and-model-only"
+    },
+    "main_track_contract": {
+      "profile_id": "regular",
+      "track": "main",
+      "proof_format": "drat",
+      "proof_checker": "drat-trim",
+      "sat_model_format": "dimacs-v-lines",
+      "jobs": 1,
+      "timeout_seconds": 5000,
+      "memory_limit_gb": 32,
+      "wrong_answer_budget": 0,
+      "proof_failure_budget": 0,
+      "witness_failure_budget": 0,
+      "crash_budget": 0
+    },
+    "decision_state": {
+      "registration_status": "confirmed",
+      "benchmark_submission_status": "unconfirmed",
+      "solver_names": [],
+      "submitted_variant_count": 0,
+      "ai_disclosure_class": "unconfirmed",
+      "proof_checker": "drat-trim",
+      "system_description_status": "draft"
+    },
+    "required_evidence": [
+      "registration_status",
+      "benchmark_submission_status",
+      "solver_names",
+      "submitted_variant_count",
+      "ai_disclosure_class",
+      "proof_checker_selection",
+      "system_description_pdf",
+      "clean_nhr_generated_root_rehearsal",
+      "sat_model_validation",
+      "external_unsat_proof_csv",
+      "linux_x86_64_rehearsal",
+      "final_evidence_manifest"
+    ],
+    "archived_evidence": {},
+    "fail_closed_conditions": [
+      "registration_status != confirmed",
+      "benchmark_submission_status != confirmed",
+      "solver_names is empty",
+      "submitted_variant_count == 0",
+      "ai_disclosure_class == unconfirmed",
+      "system_description_status != submitted",
+      "missing required_evidence artifact"
+    ]
+  },
+  "defaults": {
+    "proof_format": "drat",
+    "proof_checker": "drat-trim",
+    "sat_model_format": "dimacs-v-lines",
+    "wrong_answer_budget": 0,
+    "proof_failure_budget": 0,
+    "witness_failure_budget": 0,
+    "crash_budget": 0
+  },
+  "profiles": [
+    {
+      "id": "regular",
+      "lane": "regular-main",
+      "competition": "SAT-COMP",
+      "track": "Main Track",
+      "profile_identity": "ay-sat-regular-main",
+      "description": "Regular Main Track lane: proof-producing scalar CDCL with the default DIMACS SAT variant.",
+      "run_script": "competition/bin/starexec_run_regular",
+      "package_name": "ay-sat-regular",
+      "solver_variant": "default",
+      "runtime_env": {
+        "AY_SAT_COMPETITION_PROFILE": "regular",
+        "AY_SAT_PROFILE_ID": "ay-sat-regular-main",
+        "AY_SAT_VARIANT": "default",
+        "AY_COMPETITION_JIT_MODE": "off",
+        "AY_SAT_DENSE_CLIQUE_PHP_PROOF_ROUTE": "1"
+      },
+      "runtime_comments": {
+        "ay.sat_competition_profile": "regular",
+        "ay.sat_profile_identity": "ay-sat-regular-main",
+        "ay.sat_competition_jit": "off",
+        "ay.sat_competition_fallback": "scalar-cdcl-2wl",
+        "ay.sat_dense_clique_php_proof_route": "explicit-main-regular"
+      },
+      "requirements": {
+        "unsat_proof": {
+          "required": true,
+          "format": "drat",
+          "checker": "drat-trim",
+          "path_template": "$2/proof.out"
+        },
+        "sat_model": {
+          "required": true,
+          "format": "dimacs-v-lines"
+        }
+      },
+      "resource_policy": {
+        "execution": "sequential",
+        "default_threads": 1,
+        "cloud": false,
+        "timeout_margin_seconds": 5
+      },
+      "jit": {
+        "default_mode": "off",
+        "allowed_modes_after_gate": ["off", "profile-only", "current"],
+        "candidate_artifacts": ["sat-native-code-helpers"],
+        "fail_closed": true,
+        "requires_gate": true,
+        "async_compilation": {
+          "allowed": false,
+          "max_queue": 0,
+          "max_compile_ms": 0,
+          "max_code_cache_mb": 0
+        },
+        "required_counters": [
+          "sat.native_code_helpers_enabled",
+          "sat_native_code_helper_applications"
+        ]
+      },
+      "fallback": {
+        "authoritative_solver": "scalar-cdcl-2wl",
+        "native_artifacts_may_change_verdict": false
+      }
+    },
+    {
+      "id": "ai-tuned",
+      "lane": "ai-tuned-main",
+      "competition": "SAT-COMP",
+      "track": "AI-tuned Main Track",
+      "profile_identity": "ay-sat-ai-tuned-main",
+      "description": "AI-tuned Main Track lane: tuned sequential SAT variant, still proof-producing and JIT-off unless the SAT gate passes.",
+      "run_script": "competition/bin/starexec_run_ai_tuned",
+      "package_name": "ay-sat-ai-tuned",
+      "solver_variant": "aggressive",
+      "runtime_env": {
+        "AY_SAT_COMPETITION_PROFILE": "ai-tuned",
+        "AY_SAT_PROFILE_ID": "ay-sat-ai-tuned-main",
+        "AY_SAT_VARIANT": "aggressive",
+        "AY_COMPETITION_JIT_MODE": "off"
+      },
+      "runtime_comments": {
+        "ay.sat_competition_profile": "ai-tuned",
+        "ay.sat_profile_identity": "ay-sat-ai-tuned-main",
+        "ay.sat_competition_jit": "off",
+        "ay.sat_competition_fallback": "scalar-cdcl-2wl"
+      },
+      "requirements": {
+        "unsat_proof": {
+          "required": true,
+          "format": "drat",
+          "checker": "drat-trim",
+          "path_template": "$2/proof.out"
+        },
+        "sat_model": {
+          "required": true,
+          "format": "dimacs-v-lines"
+        }
+      },
+      "resource_policy": {
+        "execution": "sequential",
+        "default_threads": 1,
+        "cloud": false,
+        "timeout_margin_seconds": 5
+      },
+      "jit": {
+        "default_mode": "off",
+        "allowed_modes_after_gate": ["off", "profile-only", "current", "solver-program"],
+        "candidate_artifacts": ["sat-native-code-helpers", "sat-learned-clause-candidates", "sat-whole-loop-guard"],
+        "fail_closed": true,
+        "requires_gate": true,
+        "async_compilation": {
+          "allowed": false,
+          "max_queue": 0,
+          "max_compile_ms": 0,
+          "max_code_cache_mb": 0
+        },
+        "required_counters": [
+          "sat.native_code_helpers_enabled",
+          "sat.tier_controller_promotions",
+          "solver_program.sat_whole_loop.installs",
+          "solver_program.sat_whole_loop.applies",
+          "sat_native_code_helper_applications",
+          "sat_learned_clause_candidate_applications"
+        ]
+      },
+      "fallback": {
+        "authoritative_solver": "scalar-cdcl-2wl",
+        "native_artifacts_may_change_verdict": false
+      }
+    },
+    {
+      "id": "experimental",
+      "lane": "experimental",
+      "competition": "SAT-COMP",
+      "track": "Experimental Track",
+      "profile_identity": "ay-sat-experimental",
+      "description": "Experimental lane for #8873 SAT artifacts: profile-first, proof-producing, with counters and deopt logging required before dispatch.",
+      "run_script": "competition/bin/starexec_run_experimental",
+      "package_name": "ay-sat-experimental",
+      "solver_variant": "probe",
+      "runtime_env": {
+        "AY_SAT_COMPETITION_PROFILE": "experimental",
+        "AY_SAT_PROFILE_ID": "ay-sat-experimental",
+        "AY_SAT_VARIANT": "probe",
+        "AY_COMPETITION_JIT_MODE": "profile-only",
+        "AY_COMPETITION_JIT_COUNTERS": "required",
+        "AY_COMPETITION_JIT_DEOPT_LOG": "required"
+      },
+      "runtime_comments": {
+        "ay.sat_competition_profile": "experimental",
+        "ay.sat_profile_identity": "ay-sat-experimental",
+        "ay.sat_competition_jit": "profile-only",
+        "ay.sat_competition_fallback": "scalar-cdcl-2wl"
+      },
+      "requirements": {
+        "unsat_proof": {
+          "required": true,
+          "format": "drat",
+          "checker": "drat-trim",
+          "path_template": "$2/proof.out"
+        },
+        "sat_model": {
+          "required": true,
+          "format": "dimacs-v-lines"
+        }
+      },
+      "resource_policy": {
+        "execution": "sequential",
+        "default_threads": 1,
+        "cloud": false,
+        "timeout_margin_seconds": 5
+      },
+      "jit": {
+        "default_mode": "profile-only",
+        "allowed_modes_after_gate": ["off", "profile-only", "current", "solver-program"],
+        "candidate_artifacts": ["sat-native-code-helpers", "sat-learned-clause-candidates", "sat-whole-loop-guard"],
+        "fail_closed": true,
+        "requires_gate": true,
+        "async_compilation": {
+          "allowed": false,
+          "max_queue": 0,
+          "max_compile_ms": 0,
+          "max_code_cache_mb": 0
+        },
+        "required_counters": [
+          "sat.native_code_helpers_enabled",
+          "sat.tier_controller_promotions",
+          "sat.code_cache_evictions",
+          "solver_program.sat_whole_loop.installs",
+          "solver_program.sat_whole_loop.applies",
+          "sat_native_code_helper_applications",
+          "sat_learned_clause_candidate_applications"
+        ]
+      },
+      "fallback": {
+        "authoritative_solver": "scalar-cdcl-2wl",
+        "native_artifacts_may_change_verdict": false
+      }
+    },
+    {
+      "id": "parallel",
+      "lane": "parallel",
+      "competition": "SAT-COMP",
+      "track": "Parallel Track",
+      "profile_identity": "ay-sat-parallel",
+      "description": "Parallel lane: adaptive portfolio with explicit thread budget and profile-only JIT unless the SAT gate proves native dispatch.",
+      "run_script": "competition/bin/starexec_run_parallel",
+      "package_name": "ay-sat-parallel",
+      "solver_variant": "portfolio-adaptive",
+      "runtime_env": {
+        "AY_SAT_COMPETITION_PROFILE": "parallel",
+        "AY_SAT_PROFILE_ID": "ay-sat-parallel",
+        "AY_SAT_VARIANT": "default",
+        "AY_COMPETITION_JIT_MODE": "profile-only",
+        "AY_COMPETITION_ASYNC_COMPILE_BUDGET_MS": "1000"
+      },
+      "runtime_comments": {
+        "ay.sat_competition_profile": "parallel",
+        "ay.sat_profile_identity": "ay-sat-parallel",
+        "ay.sat_competition_jit": "profile-only",
+        "ay.sat_competition_fallback": "scalar-cdcl-2wl"
+      },
+      "requirements": {
+        "unsat_proof": {
+          "required": true,
+          "format": "drat",
+          "checker": "drat-trim",
+          "path_template": "$2/proof.out"
+        },
+        "sat_model": {
+          "required": true,
+          "format": "dimacs-v-lines"
+        }
+      },
+      "resource_policy": {
+        "execution": "portfolio",
+        "default_threads": 8,
+        "thread_env": "AY_SAT_PARALLEL_THREADS",
+        "cloud": false,
+        "timeout_margin_seconds": 5
+      },
+      "jit": {
+        "default_mode": "profile-only",
+        "allowed_modes_after_gate": ["off", "profile-only", "current", "solver-program"],
+        "candidate_artifacts": ["sat-native-code-helpers", "sat-learned-clause-candidates", "sat-whole-loop-guard"],
+        "fail_closed": true,
+        "requires_gate": true,
+        "async_compilation": {
+          "allowed": true,
+          "max_queue": 16,
+          "max_compile_ms": 1000,
+          "max_code_cache_mb": 64
+        },
+        "required_counters": [
+          "sat.parallel_threads",
+          "sat.native_code_helpers_enabled",
+          "sat.code_cache_evictions",
+          "solver_program.sat_whole_loop.installs",
+          "solver_program.sat_whole_loop.applies",
+          "sat_native_code_helper_applications",
+          "sat_learned_clause_candidate_applications"
+        ]
+      },
+      "fallback": {
+        "authoritative_solver": "scalar-cdcl-2wl",
+        "native_artifacts_may_change_verdict": false
+      }
+    },
+    {
+      "id": "cloud",
+      "lane": "cloud",
+      "competition": "SAT-COMP",
+      "track": "Cloud Track",
+      "profile_identity": "ay-sat-cloud",
+      "description": "Cloud lane: larger adaptive portfolio with bounded async compilation metadata and scalar CDCL fallback.",
+      "run_script": "competition/bin/starexec_run_cloud",
+      "package_name": "ay-sat-cloud",
+      "solver_variant": "portfolio-adaptive",
+      "runtime_env": {
+        "AY_SAT_COMPETITION_PROFILE": "cloud",
+        "AY_SAT_PROFILE_ID": "ay-sat-cloud",
+        "AY_SAT_VARIANT": "default",
+        "AY_COMPETITION_JIT_MODE": "profile-only",
+        "AY_COMPETITION_ASYNC_COMPILE_BUDGET_MS": "2500"
+      },
+      "runtime_comments": {
+        "ay.sat_competition_profile": "cloud",
+        "ay.sat_profile_identity": "ay-sat-cloud",
+        "ay.sat_competition_jit": "profile-only",
+        "ay.sat_competition_fallback": "scalar-cdcl-2wl"
+      },
+      "requirements": {
+        "unsat_proof": {
+          "required": true,
+          "format": "drat",
+          "checker": "drat-trim",
+          "path_template": "$2/proof.out"
+        },
+        "sat_model": {
+          "required": true,
+          "format": "dimacs-v-lines"
+        }
+      },
+      "resource_policy": {
+        "execution": "portfolio",
+        "default_threads": 32,
+        "thread_env": "AY_SAT_CLOUD_THREADS",
+        "cloud": true,
+        "timeout_margin_seconds": 5
+      },
+      "jit": {
+        "default_mode": "profile-only",
+        "allowed_modes_after_gate": ["off", "profile-only", "current", "solver-program"],
+        "candidate_artifacts": ["sat-native-code-helpers", "sat-learned-clause-candidates", "sat-whole-loop-guard"],
+        "fail_closed": true,
+        "requires_gate": true,
+        "async_compilation": {
+          "allowed": true,
+          "max_queue": 64,
+          "max_compile_ms": 2500,
+          "max_code_cache_mb": 256
+        },
+        "required_counters": [
+          "sat.parallel_threads",
+          "sat.native_code_helpers_enabled",
+          "sat.code_cache_evictions",
+          "solver_program.sat_whole_loop.installs",
+          "solver_program.sat_whole_loop.applies",
+          "sat_native_code_helper_applications",
+          "sat_learned_clause_candidate_applications"
+        ]
+      },
+      "fallback": {
+        "authoritative_solver": "scalar-cdcl-2wl",
+        "native_artifacts_may_change_verdict": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3c8bd7efff41504acf752e6ce5ae93c318b869e1f55251140059db9ffc71d3aa # shrinks to num_clauses = 1, seed = 0
+cc a0285a1fa0b5f8b4a250140852a30920df23f97ca47def4618ea719e155bd938 # shrinks to num_clauses = 4, seed = 0
+cc 75c23cd4d5f2385a39efc7c2ca60d0c125a04af3f517ca620b4dcf9cb67b77e9 # shrinks to num_vars = 3, seed = 337
+cc 3dccdf87fd3491f3887e006229d303b6d8ef81c676a740ddbedcf4e9e611da49 # shrinks to num_vars = 5, num_clauses = 5, seed = 1754
+cc e090e35c32de4801b703bacfe1542457f75f69383c0e116e0e37c20b4b157d42 # shrinks to n = 3, _seed = 0
+cc faf1e16d171286974a38ff64d81426243a15cfa9c714252b612ee51fe4caf667 # shrinks to num_vars = 17, seed = 194
+cc d806d9bd336d42f7268a6da997f07d8c9d24946ac857e1b985ca824cbd8d0754 # shrinks to num_vars = 5, seed = 1010
+cc 6beb017563fd3b4a7ebd22a1553d0ab6a1da3b9167c58a74484c3c59fe5e256f # shrinks to num_vars = 19, seed = 234

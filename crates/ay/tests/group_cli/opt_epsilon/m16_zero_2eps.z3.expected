@@ -1,0 +1,4 @@
+sat
+(objectives
+ ((* 2.0 x) (* 2.0 epsilon))
+)

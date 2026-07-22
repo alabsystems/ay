@@ -1,0 +1,23 @@
+[package]
+name = "ay-frontend"
+description = "SMT-LIB 2.6 parser and preprocessor for AY"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+ay-core.workspace = true
+logos.workspace = true
+thiserror.workspace = true
+num-bigint.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+stacker.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

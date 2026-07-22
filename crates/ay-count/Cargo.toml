@@ -1,0 +1,27 @@
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates
+# Licensed under the Apache License, Version 2.0
+
+[package]
+name = "ay-count"
+description = "Exact model counter for AY (Model Counting Competition tracks: mc, wmc, pmc, pwmc, amc-complex). Component-decomposition DPLL with component caching, exact arbitrary-precision arithmetic over pluggable semirings."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+ay-sat.workspace = true
+ay-sys.workspace = true
+num-bigint.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+num-integer.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

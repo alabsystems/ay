@@ -1,0 +1,15 @@
+c QIF benchmark 3/7: 2-bit XOR (parity) leak.
+c
+c Vars: 1=h1, 2=h2 (secret bits), 3=l (observable).
+c Logic: l <-> (h1 XOR h2). l reveals parity of (h1, h2) but not
+c the individual values — channel matrix has anonymity within rows.
+c Models: 4 total (one l value forced per h1,h2 pair).
+c Channel capacity: 1 bit; remaining uncertainty: 1 bit.
+c
+c Reference: Smith G., "Recent Developments in Quantitative
+c Information Flow", LICS 2015, parity-leak running example.
+p cnf 3 4
+-1 -2 -3 0
+1 2 -3 0
+1 -2 3 0
+-1 2 3 0

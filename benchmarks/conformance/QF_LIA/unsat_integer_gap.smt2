@@ -1,0 +1,8 @@
+(set-info :status unsat)
+(set-logic QF_LIA)
+; No integer between 0 (exclusive) and 1 (exclusive)
+(declare-const x Int)
+(assert (> x 0))
+(assert (< x 1))
+(check-sat)
+(exit)

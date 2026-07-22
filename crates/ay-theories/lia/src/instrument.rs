@@ -1,0 +1,256 @@
+// Copyright 2026 Andrew Yates
+// Author: Andrew Yates
+// Licensed under the Apache License, Version 2.0
+
+//! M1-PIVOT Part-A: per-solve LIA branch-count instrumentation.
+//!
+//! Falsifiable-fork diagnostic counters for the LIA search loop. These answer
+//! the branch-COUNT vs branch-COST fork: is the rusthorn/engine wall an
+//! unbounded integer branch-and-bound explosion (in-LIA cut-strength fixable),
+//! a re-solve-cost problem (incrementality), or a generator-fed unbounded term
+//! frontier (DT/quantifier lane)?
+//!
+//! ## Release-byte-identical / zero verdict dependence
+//!
+//! Every counter is incremented ONLY when `AY_LIA_INSTRUMENT` is set in the
+//! environment; the state read is a single cached relaxed atomic-u8 load. The
+//! verdict path NEVER reads any counter — they are write-only telemetry. When
+//! the env var is unset each `bump` returns after one relaxed load with no
+//! counter mutation and no I/O, so the solver's control flow (and therefore its
+//! verdict + reason set) is byte-for-byte the behaviour of the uninstrumented
+//! build. Toggling the env var can only change what is PRINTED, never what is
+//! DECIDED.
+//!
+//! ## Usage
+//!
+//! `AY_LIA_INSTRUMENT=1` enables counting. A background reporter thread dumps
+//! the counter snapshot to stderr every `AY_LIA_INSTRUMENT_SECS` seconds
+//! (default 3) so the counters are observable even when the solve diverges or
+//! is killed by an external timeout without ever returning from `check()`.
+
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering::Relaxed};
+
+macro_rules! define_counters {
+    ($($name:ident => $label:literal),* $(,)?) => {
+        $(pub(crate) static $name: AtomicU64 = AtomicU64::new(0);)*
+
+        /// Ordered (label, value) view of every counter for reporting.
+        pub(crate) fn snapshot() -> Vec<(&'static str, u64)> {
+            vec![$(($label, $name.load(Relaxed))),*]
+        }
+
+        /// Reset all counters to zero (test / per-solve boundary helper).
+        #[allow(dead_code)]
+        pub(crate) fn reset() {
+            $($name.store(0, Relaxed);)*
+        }
+    };
+}
+
+define_counters! {
+    // How many times the full LIA check ran (≈ distinct theory-check rounds /
+    // candidate models fed to the integer theory).
+    LIA_CHECK_CALLS         => "lia_check_calls",
+    // Inc0 (eager-theory-prop design §Inc0-0a): caller-class partition of
+    // LIA_CHECK_CALLS. The headline counter is bumped by EVERY check_inner
+    // entry — including conflict-probe solvers (~5.8 checks/probe, the
+    // AY_PROBE_STATS-documented dominant wisas cost) and verify-only solvers —
+    // so the 58k spin-cell headline is unattributed without this split.
+    // TOP = neither probe nor verify (the top-level solve path).
+    LIA_CHECK_TOP_CALLS     => "lia_check_top_calls",
+    LIA_CHECK_PROBE_CALLS   => "lia_check_probe_calls",
+    LIA_CHECK_VERIFY_CALLS  => "lia_check_verify_calls",
+    // Inc0: check_during_propagate_inner entries (the eager arm's BCP-time
+    // weak checks — a separate entry point that never reaches check_inner).
+    LIA_CHECK_BCP_CALLS     => "lia_check_bcp_calls",
+    // Inc0 (0c): Nelson-Oppen combiner check() invocations and fixpoint-loop
+    // iterations (bumped from ay-dpll's combiner_check — distinguishes
+    // "few combiner checks, many fixpoint iterations" from round-structured
+    // spin).
+    NO_CHECKS               => "no_checks",
+    NO_FIXPOINT_ITERS       => "no_fixpoint_iters",
+    // Inc0 (0c): lazy split-loop rounds started (bumped from the lazy macro).
+    SPLIT_ROUNDS            => "split_rounds",
+    // Inc0 (0d): theory propagations computed by the round's combiner and
+    // discarded at round end (the G1 discard — harvestable material for Inc1).
+    ROUND_PROPS_DISCARDED   => "round_props_discarded",
+    ROUND_PENDING_DISCARDED => "round_pending_discarded",
+    // extract_model() calls from the LIA branch/patch hot path — THE per-round
+    // model-rebuild metric the pivot tracks (memory: 140k+/28s divergence).
+    EXTRACT_MODEL_CALLS     => "extract_model_calls",
+    // check_integer_constraints() returned Some (a fractional integer var was
+    // selected — a branch candidate exists).
+    INT_CONSTRAINT_SELECT   => "int_constraint_selections",
+    // NeedSplit returned from the Sat-path branch-and-bound fallback (:1779).
+    SPLITS_ISSUED_BNB       => "splits_issued_bnb",
+    // NeedSplit returned from the Unknown-recovery midpoint path (:1520).
+    SPLITS_ISSUED_UNKNOWN   => "splits_issued_unknown",
+    // NeedSplit returned from the NeedModelEquality integrality guards.
+    SPLITS_ISSUED_MODELEQ   => "splits_issued_modeleq",
+    // NeedSplit forwarded straight from LRA (:1530).
+    SPLITS_FORWARDED_LRA    => "splits_forwarded_lra",
+    // Gomory cut generation rounds (calls to timed_generate_gomory_cuts).
+    GOMORY_GEN_CALLS        => "gomory_gen_calls",
+    // Total Gomory cuts produced across all rounds.
+    GOMORY_GENERATED        => "gomory_generated",
+    // Gomory cuts actually inserted into the tableau (accepted).
+    GOMORY_ACCEPTED         => "gomory_accepted",
+    // HNF cut attempts (calls to timed_try_hnf_cuts).
+    HNF_ATTEMPTS            => "hnf_attempts",
+    // HNF attempts that produced a cut (returned true).
+    HNF_ROUNDS_FIRED        => "hnf_rounds_fired",
+    // Iterations of the pre-loop iterative Diophantine tightening loop.
+    DIOPH_TIGHTEN_ROUNDS    => "dioph_tighten_rounds",
+    // Finite-domain CSP search entered (shared_equalities empty).
+    FINITE_DOMAIN_TRIGGERS  => "finite_domain_triggers",
+    // Finite-domain CSP search SKIPPED because shared equalities were present
+    // (the rusthorn UFLIA regime — the flagged gate at check.rs:1164).
+    FINITE_DOMAIN_SKIPS     => "finite_domain_skips",
+    // try_patching() calls (each does an extract_model).
+    PATCHING_CALLS          => "patching_calls",
+    // Cube-test attempts.
+    CUBE_TESTS              => "cube_tests",
+    // INTERFACE-DIET M0/C5: Farkas shared-equality reason-minimization probe.
+    // ATTEMPTS = conflict-augment reached with a non-empty reachable closure;
+    // PROVED = probe returned a proven-sufficient subset (Some); SUBSET_SUM =
+    // sum of |proven subset| (avg proven core size); CLOSURE_SUM = sum of the
+    // full reachable-closure size (the fallback size the probe shrinks from).
+    // "success rate" = PROVED/ATTEMPTS; when PROVED is high yet conflicts stay
+    // fat, minimization is NOT the wall (the campaign's key premise).
+    FARKAS_PROBE_ATTEMPTS   => "farkas_probe_attempts",
+    FARKAS_PROBE_PROVED     => "farkas_probe_proved",
+    FARKAS_PROBE_SUBSET_SUM => "farkas_probe_subset_sum",
+    FARKAS_PROBE_CLOSURE_SUM => "farkas_probe_closure_sum",
+}
+
+/// 0 = uninitialised, 1 = disabled, 2 = enabled.
+static ENABLED: AtomicU8 = AtomicU8::new(0);
+static REPORTER_STARTED: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+pub(crate) fn enabled() -> bool {
+    match ENABLED.load(Relaxed) {
+        2 => true,
+        1 => false,
+        _ => init_enabled(),
+    }
+}
+
+#[cold]
+fn init_enabled() -> bool {
+    let on = std::env::var_os("AY_LIA_INSTRUMENT").is_some();
+    ENABLED.store(if on { 2 } else { 1 }, Relaxed);
+    if on {
+        start_reporter();
+    }
+    on
+}
+
+/// Increment a counter iff instrumentation is enabled. Verdict-neutral.
+#[inline]
+pub(crate) fn bump(c: &AtomicU64) {
+    if enabled() {
+        c.fetch_add(1, Relaxed);
+    }
+}
+
+/// Add `n` to a counter iff instrumentation is enabled. Verdict-neutral.
+#[inline]
+pub(crate) fn bump_by(c: &AtomicU64, n: u64) {
+    if enabled() && n != 0 {
+        c.fetch_add(n, Relaxed);
+    }
+}
+
+fn start_reporter() {
+    if REPORTER_STARTED.swap(true, Relaxed) {
+        return;
+    }
+    let secs: u64 = std::env::var("AY_LIA_INSTRUMENT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+    let secs = secs.max(1);
+    std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            dump(start.elapsed().as_secs_f64());
+        }
+    });
+}
+
+/// Print the current counter snapshot to stderr as a single line.
+pub(crate) fn dump(elapsed_secs: f64) {
+    use std::fmt::Write as _;
+    let mut line = format!("[LIA-INSTRUMENT t={elapsed_secs:.1}s]");
+    for (label, value) in snapshot() {
+        let _ = write!(line, " {label}={value}");
+    }
+    eprintln!("{line}");
+}
+
+// ---------------------------------------------------------------------------
+// Inc0 public surface (eager-theory-prop design §Inc0): non-draining snapshot
+// + externally-bumpable counters for ay-dpll (combiner N-O loop, lazy split
+// rounds, round-end propagation discard). Same contract as the rest of the
+// module: every entry point is a no-op returning after one relaxed load when
+// `AY_LIA_INSTRUMENT` is unset — write-only telemetry, never read by any
+// verdict path.
+// ---------------------------------------------------------------------------
+
+/// Whether instrumentation is enabled (public, for gating caller-side probes).
+#[inline]
+pub fn enabled_pub() -> bool {
+    enabled()
+}
+
+/// Non-draining one-line snapshot of all counters, or `None` when disabled.
+/// Used by the `AY_UFLIA_PHASE` phase-edge timeline for per-arm attribution
+/// (synchronous, unlike the async reporter thread).
+pub fn snapshot_line() -> Option<String> {
+    if !enabled() {
+        return None;
+    }
+    use std::fmt::Write as _;
+    let mut line = String::from("lia:");
+    for (label, value) in snapshot() {
+        let _ = write!(line, " {label}={value}");
+    }
+    Some(line)
+}
+
+/// Current total of `lia_check_calls` (for per-round deltas). 0 when disabled.
+#[inline]
+pub fn check_calls_now() -> u64 {
+    if enabled() {
+        LIA_CHECK_CALLS.load(Relaxed)
+    } else {
+        0
+    }
+}
+
+/// Bump the Nelson-Oppen combiner-check counter (ay-dpll combiner_check).
+#[inline]
+pub fn bump_no_check() {
+    bump(&NO_CHECKS);
+}
+
+/// Bump the Nelson-Oppen fixpoint-iteration counter (ay-dpll combiner_check).
+#[inline]
+pub fn bump_no_fixpoint_iter() {
+    bump(&NO_FIXPOINT_ITERS);
+}
+
+/// Bump the lazy split-loop round counter (ay-dpll lazy macro).
+#[inline]
+pub fn bump_split_round() {
+    bump(&SPLIT_ROUNDS);
+}
+
+/// Record round-end discarded propagations (ay-dpll lazy macro, Inc0-0d).
+#[inline]
+pub fn add_round_props_discarded(props: u64, pending: u64) {
+    bump_by(&ROUND_PROPS_DISCARDED, props);
+    bump_by(&ROUND_PENDING_DISCARDED, pending);
+}

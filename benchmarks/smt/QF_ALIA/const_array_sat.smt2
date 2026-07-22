@@ -1,0 +1,11 @@
+(set-logic QF_ALIA)
+; Constant array + store: SAT
+(declare-const a (Array Int Int))
+(declare-const i Int)
+(assert (= a ((as const (Array Int Int)) 0)))
+(assert (= (select (store a 5 42) 5) 42))
+(assert (= (select (store a 5 42) 3) 0))
+(assert (> i 10))
+(assert (= (select a i) 0))
+(check-sat)
+(exit)

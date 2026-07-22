@@ -1,0 +1,170 @@
+[package]
+name = "ay"
+description = "Rust constraint-solving toolkit for SAT, SMT, CHC, and optimization"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://github.com/alabsystems/ay"
+readme = "README.md"
+
+[dependencies]
+mimalloc = { version = "0.1", optional = true, default-features = false }
+ay-core.workspace = true
+ay-sat = { workspace = true, optional = true }
+ay-dpll.workspace = true
+ay-milp.workspace = true
+ay-drat-check = { workspace = true, optional = true }
+ay-frontend.workspace = true
+ay-lrat-check = { workspace = true, optional = true }
+ay-proof.workspace = true
+ay-allsat.workspace = true
+ay-count.workspace = true
+ay-chc.workspace = true
+ay-sys = { workspace = true, optional = true }
+ay-translate.workspace = true
+ay-xor = { workspace = true, optional = true }
+ay-bench = { workspace = true, optional = true }
+ay-bisect = { workspace = true, optional = true }
+ay-pb = { workspace = true, optional = true }
+ay-lp = { workspace = true, optional = true }
+ay-fzn2smt = { workspace = true, optional = true }
+ay-flatzinc-parser = { workspace = true, optional = true }
+ay-flatzinc-smt = { workspace = true, optional = true }
+ay-maxsat = { workspace = true, optional = true }
+ay-qbf = { workspace = true, optional = true }
+# Optional: opt-in DRAT replay cross-check (Phase 2, AUDIT-2 Y6, #8789).
+# OFF by default. When enabled, `ay check drat` additionally asks
+# ay-replay's SequentialReplayer to re-verify the proof and logs
+# whether the two verdicts agree. Does not change the exit code.
+ay-replay = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+num-bigint.workspace = true
+num-traits.workspace = true
+num-rational.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+thiserror.workspace = true
+toml = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+ureq = { workspace = true, optional = true }
+wait-timeout = { workspace = true, optional = true }
+
+[features]
+default = ["raw-pointer-bcp", "jit"]
+bench = ["cli", "dep:ay-bench"]
+cli = [
+    "dep:mimalloc",
+    "dep:anyhow",
+    "dep:clap",
+    "dep:nix",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:sha2",
+    "dep:signal-hook",
+    "dep:toml",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:wait-timeout",
+    "dep:ay-bisect",
+    "dep:ay-drat-check",
+    "dep:ay-flatzinc-parser",
+    "dep:ay-flatzinc-smt",
+    "dep:ay-fzn2smt",
+    "dep:ay-lp",
+    "dep:ay-lrat-check",
+    "dep:ay-maxsat",
+    "dep:ay-pb",
+    "dep:ay-qbf",
+    "dep:ay-sat",
+    "dep:ay-sys",
+    "ay-sys/mimalloc-arena-trim",
+    "dep:ay-xor",
+]
+# Raw-pointer implementation of the same watched-literal BCP algorithm.
+raw-pointer-bcp = ["ay-sat?/raw-pointer-bcp"]
+# Enable live submission commands that publish artifacts to Zenodo.
+submission-live = ["cli", "dep:ureq"]
+# Enable active JIT support: SAT conflict processing plus SMT/CHC helper kernels.
+# SAT BCP/watch JIT was removed from the production path in #8517.
+jit = ["ay-dpll/jit", "ay-sat?/jit"]
+# GPU-accelerated inprocessing (wgpu compute: Vulkan/DX12/Metal — covers
+# NVIDIA, AMD, Intel, and Apple GPUs). Experimental; passes ay-sat's `gpu`
+# feature through so `ay --features cli,gpu` builds a GPU-capable binary and
+# `ay --features` reports `sat-gpu` truthfully. Off by default: the GPU BVE /
+# subsumption pre-passes engage only past their pair-count thresholds and
+# fall back to the CPU paths on machines without a GPU adapter.
+gpu = ["cli", "ay-sat/gpu"]
+# Opt-in Phase-2 DRAT replay cross-check against ay-replay's
+# SequentialReplayer. OFF by default. Observational only — it
+# does not change the verdict or exit code of `ay check drat`.
+replay-jit = ["cli", "dep:ay-replay"]
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, optional = true }
+signal-hook = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ntest = "0.9"
+nix.workspace = true
+tempfile.workspace = true
+wait-timeout.workspace = true
+ay-drat-check.workspace = true
+ay-lrat-check.workspace = true
+ay-replay.workspace = true
+ay-sat.workspace = true
+
+[[bin]]
+name = "ay"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "bv_idl_combination"
+path = "tests/bv_idl_combination.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "group_cli"
+path = "tests/group_cli.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "group_leetcode"
+path = "tests/group_leetcode.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "group_lra"
+path = "tests/group_lra.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "group_misc"
+path = "tests/group_misc.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "group_smt"
+path = "tests/group_smt.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "group_soundness"
+path = "tests/group_soundness.rs"
+required-features = ["cli"]
+
+[[bench]]
+name = "startup_bench"
+harness = false
+
+[lints]
+workspace = true

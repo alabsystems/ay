@@ -1,0 +1,56 @@
+sr_parser.c:
+    - When calculating min/max_clause_to_check, was previously setting the min and max to check for lit and neg_lit when subst_pair_incomplete was true, but it should be for when it is false, since we want to check clauses containing the literal that gets mapped under the substitution.
+    - Previously was adding the pivot to the witness array. Now omits it.
+    - When comparing hints[hint_index], I computed -(hints[hint_index] - 1) == i. Because the hint is negative, should have added one to map it from "printable" into 0-indexed.
+
+lsr-check:
+    (4/15/24): Not incrementing alpha_generation when a RAT clause is indicated but has no hints (see comment on line 249 of lsr-check.c).
+    (1/7/25): When implementing EAGER proof checking, the first/last updates were assuming the literals of interest are in the candidate clause. But now we must perform FLUs as we check the formula, and so an explicit clause_index is passed. Otherwise, we try to RAT check clauses beyond where we've checked so far.
+    (4/9/25): `max_line_id` was always set to `num_cnf_clauses`, even when doing EAGER parsing, which would cause lsr-check to think there are no LSR lines after all. Now `max_line_id` is only set during STREAMING parsing.
+
+dsr-trim:
+    - Some invariant regarding candidate_assumed_literals_index/candidate_unit_clauses_index and RAT_assumed_literals_index/RAT_unit_literals_index was off. Refactored into increment/decrement_state(). (Needs better name.)
+        - Currently increments candidate_unit_literals_index/RAT etc. when assume_unit_literal() is called, but can be computed more efficiently by setting it separately.
+            - The benefits for doing this are super small.
+    - Was clearing the lsr_line_size after assuming the candidate clause, leading to RAT derivations being printed when candidate UP was found. Cleared before.
+    - Substitutions were set using current_generation, but were then cleared after the first RAT clause. Created a new subst_generation value to run separately from current_generation.
+        - TODO: Refactor for sr-check
+        - TODO: Rename current_generation (to alpha_generation?)
+    - The ret val of get_lit_under_subst() can return SUBST_UNASSIGNED. Taking the up_reason of that variable gives 0 always, because I computed it before re-assigning back to the original lit.
+
+    - (3/27/24) When doing witness minimization, the write_index was not incremented twice when writing a literal mapping, leading to non-deleted witness mappings after minimization.
+    - (4/9/24) Was not adding the clause hash when adding a new clause.
+    - (4/14/24) Was not removing the added literals to lits_db when deleting a clause in the DSR format. As a result, the next addition clause included all the literals of the previous deletion clause.
+    - (4/15/24) When deleting a clause, the watch pointers must also be removed. But the call to delete_clause() came first, which caused a garbage collection/realloc() call to shift the underlying literals, and so the correct watch pointers weren't removed at all, leading to a spurious RAT check.
+    - (4/30/24) When adding a unit clause, it is possible that global UP has already set the unit literal to true. In that case, marking which clauses to include in global UP hints stops at the newly-added unit clause, but the reason is the prior clause, which may depend on other UP hints. The fix is to replace the unit literal's reason, and the unit_clause, with the newly-added unit clause. TODO is what to do if the previous clause is also unit (meaning there is a duplicate), and whether to delete the previous clause. Debugging method was to print when clauses became globally unit and detecting that the global unit matched the unit clause added in Schur.
+    - (1/30/25) minimize_witness() had an off-by-one error when setting the write_iter, leading to a malformed minimized witness.
+    - (2/12/25) During forwards/backwards checking, the order of literals in the clauses get rearranged, due to the reordering of watch pointers. Yet during backwards checking, we need to know what the pivot literal is. So we now store the pivot in the first slot of the witness, even if the witness is empty.
+    - (2/14/25) When printing a clause back into an LSR proof, we were fetching the wrong pivot (based off of the clause id, instead of the line num).
+    - (2/26/25) Calling `add_wp_for_lit()` can re-allocate both the watch pointers array `wps` or the watch pointer list for any literal `wps[lit]`, so after calling it, aliases used in unit propagation need to be refreshed.
+    - (9/9/25) Off-by-one error when calculating num_parsed_add_lines/indexes into `hints`. Mostly due to deriving the empty clause that isn't present in the SR proof, so we never increment num_parsed_add_lines appropriately.
+    - (9/18/25) When implementing implied-unit-clause deletion for forwards checking, I didn't un-set the truth value for the clause we are deleting, which led to a "satisfied" UP hint in the generated LRAT file.
+    - (10/27/25) Deletions in backwards checking weren't being generated correctly because a signed srid_t was being compared to an unsigned usrid_t. Solution was to revert everything to using srid_t.
+    - (10/28/25) Wasn't emitting an initial deletion line to handle duplicate CNF clauses. Then, when the line was generated, the line ID was off by one. Then, the deletions were being cleared before parsing the first addition line due to an extra `ra_clear()` call.
+    - (10/29/25) In `uncommit_clause_and_set_as_candidate()`, we weren't re-running unit propagation after removing the uncommitted candidate clause from the list of global units. In the fix, we were able to reuse `unassign_global_units_due_to_deletion()`. Also, in the unassign function, make sure that global_index was in bounds (MIN of 0).
+    - (10/29/25) dsr-trim had a bus error if we re-ran UP in `uncommit_clause_and_set_as_candidate()`, so we removed that line, but still preserved later-derived true units, a la `unassign_global_units_due_to_deletion()`. Off-by-one error fixed in `unassign()`.
+    - (11/29/25) Rarely (and only with SR witnesses), a clause can appear as both a global UP hint and as a reduced clause. Thus, when calling `minimize_RAT_hints()` to minimize the number of RAT hint groups, the dependencies among the global UP hints are needed to also calculate which reduced clauses are needed. Otherwise, the reduced clause was removed (since no other reduced clause UP refutation needed it), and since it wasn't used on the rest of the line, the clause was deleted in the line before, making the appearance of that clause in the global UP hint to fail. The fix was to call `mark_dependencies()` (with LUI modifications) before `minimize_RAT_hints()`.
+    - (11/30/25) When assuming the negation of the candidate clause, if a trivial UP refutation was found (i.e. a literal `l` was already satisfied in the global assignment), then the function returned immediately with the offending unit clause causing `l` to be true. However, this means that not all literals were assumed to be true, which caused more global UP hints to be added to the resulting line. The fix was to store the unit clause with the lowest index for a trivial refutation, while also looping through the rest of the clause.
+    - (11/30/25): On backwards checking, when a clause was un-committed from the formula, global unit clauses were reset in the following sense: if the un-committed clause is a global unit, then it and all non-true-unit clauses after it are unset from the global assignment and other structures. (True units are kept because they will always come up in UP, i.e., they don't depend on the un-committed clause.) However, global UP wasn't re-run, leading to missing global units. The fix was to re-run global UP after calling `uncommit_clause_and_set_as_candidate()`.
+    - (1/20/26): dsr-trim was always checking the 0th proof line, regardless of the clause's last-used index. One way to catch this in a CI pipeline is to have a normal DRAT proof, but have an obviously breaking clause be in the first line. A forwards check will fail, but a backwards check should skip over this clause. (Of course, can test this with a bad clause anywhere in the proof.) The overall effect of checking the 0th line was minimal (i.e. not deleting a clause that could be deleted, especially at the start of the proof), but it could lead to broken proof checking.
+    - (1/20/26): When deleting a clause during forwards checking, unit propagation was resetting when it shouldn't. The bug was that an implied unit was calculated too loosely: previously, an implied unit was one whose first literal was set to true via unit propagation, but this resulted in false positives wrt clauses subsumed by other (implied) units (e.g. [5 0] and [5 -10 0]). The calculation was updated to check if the unit clause for that literal matched the one that is to be deleted.
+    - (3/25/26): When checking the candidate clause for the SR property, throw an error if the substitution does not reduce the clause in some way. Otherwise, broken proofs that should be derivable via RUP get past. (This bug applies to lsr-check as well.)
+    - (4/29/26): Backwards checking didn't properly ignore the deletion of true unit clauses during parsing. This bug caused a second copy of a true unit to overwrite the first, and on backwards checking, when the second copy was uncommitted, the first copy was forgotten, leading to far fewer global units than expected.
+
+global_parsing.c:
+    - Not taking the absolute value of a token, meaning that negative tokens get "mapped twice."
+
+compress/decompress.c:
+    - Writing a zero and then a newline character adds an extra space, which won't interfere with parsing, but makes the diff command line tool complain.
+    - (4/9/24) Was expecting to read two zeros per addition line in DSR format. But these lines only have one zero per line.
+    - (4/9/24) Was expecting text lines to start with solely numbers (isdigit()). Instead, lines can start with '-' or 'd'.
+
+logger.c:
+    - (10/27/25) Variadic arguments weren't being passed on to the helper function correctly. Funnily enough, this was only detected by using an Ubuntu Docker container. Using a Mac and the PSC clusters didn't cause any problems.
+
+range_array.c:
+    - (2/24/26) ra_uncommit_range() was incorrect, where existing data wasn't getting erased. This made a DRAT clause appear to be an DPR clause (with an additional true/false literal), causing the proof to break. Swapping the order of the two operations in the function fixed the bug.

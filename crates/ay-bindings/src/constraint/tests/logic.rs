@@ -1,0 +1,121 @@
+// Copyright 2026 Andrew Yates
+// SPDX-License-Identifier: Apache-2.0
+// Author: Andrew Yates
+
+use crate::constraint::logic;
+
+/// All ay-dpll Logic::as_str() strings. Update when adding variants.
+const EXPECTED_LOGICS: &[&str] = &[
+    "QF_LIA",
+    "QF_LRA",
+    "QF_LIRA",
+    "QF_UF",
+    "QF_UFLIA",
+    "QF_UFLRA",
+    "QF_AUFLIA",
+    "QF_AUFLRA",
+    "QF_AUFLIRA",
+    "QF_NIA",
+    "QF_NRA",
+    "QF_NIRA",
+    "QF_BV",
+    "QF_UFBV",
+    "QF_ABV",
+    "QF_AUFBV",
+    "QF_UFNIA",
+    "QF_UFNRA",
+    "QF_UFNIRA",
+    "QF_FP",
+    "QF_BVFP",
+    "QF_S",
+    "QF_SLIA",
+    "QF_SEQ",
+    "QF_SEQLIA",
+    "QF_AX",
+    "QF_DT",
+    "QF_SNIA",
+    "LIA",
+    "LRA",
+    "NIA",
+    "NRA",
+    "NIRA",
+    "UF",
+    "UFLIA",
+    "UFLRA",
+    "UFNIA",
+    "UFNRA",
+    "UFNIRA",
+    "BV",
+    "UFBV",
+    "AUFLIA",
+    "AUFLRA",
+    "LIRA",
+    "AUFLIRA",
+    "ALL",
+];
+
+/// All ay-bindings logic:: constants.
+fn all_logic_constants() -> std::collections::BTreeSet<&'static str> {
+    [
+        logic::QF_UF,
+        logic::QF_LIA,
+        logic::QF_LRA,
+        logic::QF_LIRA,
+        logic::QF_NIA,
+        logic::QF_NRA,
+        logic::QF_NIRA,
+        logic::QF_UFLIA,
+        logic::QF_UFLRA,
+        logic::QF_AUFLIA,
+        logic::QF_AUFLRA,
+        logic::QF_AUFLIRA,
+        logic::QF_BV,
+        logic::QF_UFBV,
+        logic::QF_ABV,
+        logic::QF_AUFBV,
+        logic::QF_UFNIA,
+        logic::QF_UFNRA,
+        logic::QF_UFNIRA,
+        logic::QF_FP,
+        logic::QF_BVFP,
+        logic::QF_ABVFP,
+        logic::QF_S,
+        logic::QF_SLIA,
+        logic::QF_SEQ,
+        logic::QF_SEQLIA,
+        logic::QF_AX,
+        logic::QF_DT,
+        logic::QF_SNIA,
+        logic::UF,
+        logic::LIA,
+        logic::LRA,
+        logic::NIA,
+        logic::NRA,
+        logic::NIRA,
+        logic::UFLIA,
+        logic::UFLRA,
+        logic::UFNIA,
+        logic::UFNRA,
+        logic::UFNIRA,
+        logic::BV,
+        logic::UFBV,
+        logic::AUFBV,
+        logic::AUFLIA,
+        logic::AUFLRA,
+        logic::LIRA,
+        logic::AUFLIRA,
+        logic::HORN,
+        logic::ALL,
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Verify all ay-dpll Logic variants have ay-bindings constants (#6143).
+#[test]
+fn test_logic_constants_cover_all_dpll_variants() {
+    let available = all_logic_constants();
+    for &e in EXPECTED_LOGICS {
+        assert!(available.contains(e), "Missing logic constant: {e}");
+    }
+}

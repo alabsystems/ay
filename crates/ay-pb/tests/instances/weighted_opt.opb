@@ -1,0 +1,6 @@
+* #variable= 4 #constraint= 2
+* Weighted optimization: min cost subject to coverage constraints
+* Optimal: pick x1 (cost 2) + x2 (cost 3) = 5, satisfies exactly-2
+min: +2 x1 +3 x2 +5 x3 +7 x4 ;
++1 x1 +1 x2 +1 x3 +1 x4 >= 2 ;
++1 ~x1 +1 ~x2 +1 ~x3 +1 ~x4 >= 2 ;

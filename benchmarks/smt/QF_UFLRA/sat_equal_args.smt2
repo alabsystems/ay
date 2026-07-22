@@ -1,0 +1,10 @@
+; Test SAT: f(x) = f(y) when x = y (Real version)
+(set-logic QF_UFLRA)
+(declare-fun f (Real) Real)
+(declare-const x Real)
+(declare-const y Real)
+(assert (= x y))
+(assert (= (f x) 100.0))
+(assert (= (f y) 100.0))
+(check-sat)
+; Expected: sat

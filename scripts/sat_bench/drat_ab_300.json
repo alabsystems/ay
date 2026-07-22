@@ -1,0 +1,324 @@
+[
+ {
+  "cnf": "546f8e069aa4_intel047_Iter78.cnf",
+  "base": [
+   "SAT",
+   155.945769875,
+   0
+  ],
+  "cfgB": [
+   "SAT",
+   107.57754829199999,
+   0
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "9a839badecb2_anbul-dated-5-15-u.cnf",
+  "base": [
+   "UNSAT",
+   83.11537054200005,
+   139869193
+  ],
+  "cfgB": [
+   "UNSAT",
+   80.599617916,
+   153550893
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "9b5f767eb5c1_uniqinv40prop.cnf",
+  "base": [
+   "UNKNOWN",
+   300.084062167,
+   0
+  ],
+  "cfgB": [
+   "UNKNOWN",
+   300.11670033300004,
+   0
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "c21096fa2f55_case17.normalised.cnf",
+  "base": [
+   "SAT",
+   43.249825999999985,
+   0
+  ],
+  "cfgB": [
+   "SAT",
+   123.31284191700001,
+   0
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "0876c518e565_mp1-klieber2017s-0500-023-t12.cnf",
+  "base": [
+   "SAT",
+   189.49511262500005,
+   0
+  ],
+  "cfgB": [
+   "SAT",
+   31.588921250000112,
+   0
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "4761df10c93b_arles_thres10_p10_r8188.cnf",
+  "base": [
+   "UNSAT",
+   0.00869445800003632,
+   2
+  ],
+  "cfgB": [
+   "UNSAT",
+   0.008208666000200537,
+   2
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "5c24cfeff639_c7552.cnf",
+  "base": [
+   "UNSAT",
+   0.5371350840000559,
+   2046803
+  ],
+  "cfgB": [
+   "UNSAT",
+   0.38436379100016893,
+   4017034
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "663bb5659e42_SCPC-500-13.cnf",
+  "base": [
+   "UNSAT",
+   9.02204837499994,
+   33141417
+  ],
+  "cfgB": [
+   "UNSAT",
+   12.218297083999914,
+   46612267
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "6e139783cfbc_x9-06068.sat.sanitized.cnf",
+  "base": [
+   "SAT",
+   0.706882166000014,
+   0
+  ],
+  "cfgB": [
+   "SAT",
+   0.13063716600004227,
+   0
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "8e62c5d47920_SC25_Timetable_C_393_E_45_Cl_26_D_7_T_50.normalised.cnf",
+  "base": [
+   "SAT",
+   20.818446583999958,
+   0
+  ],
+  "cfgB": [
+   "SAT",
+   20.169634042000098,
+   0
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "ad9eb96bac59_AProVE07-21.cnf",
+  "base": [
+   "UNSAT",
+   29.414906875000042,
+   153765870
+  ],
+  "cfgB": [
+   "UNSAT",
+   15.48673404200008,
+   118048002
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "c86b261162ce_ITC2021_Middle_9.xml.cnf",
+  "base": [
+   "SAT",
+   33.390248000000156,
+   0
+  ],
+  "cfgB": [
+   "SAT",
+   59.984250500000144,
+   0
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "e4ac15cf2373_2013113162201nw.shuffled-as.sat03-1668.cnf",
+  "base": [
+   "SAT",
+   6.921079417000101,
+   0
+  ],
+  "cfgB": [
+   "SAT",
+   36.67965895900011,
+   0
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "ed6d842f96d1_battleship-16-31-sat.cnf",
+  "base": [
+   "SAT",
+   0.020590749999882973,
+   0
+  ],
+  "cfgB": [
+   "SAT",
+   0.02085129100009908,
+   0
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "efc1b7cc3861_oddball_19_4_ttf.normalised.cnf",
+  "base": [
+   "UNSAT",
+   6.117689208999991,
+   50192734
+  ],
+  "cfgB": [
+   "UNSAT",
+   1.8910572089998823,
+   16909434
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "0a4880c0e882_b19_1.cnf",
+  "base": [
+   "UNKNOWN",
+   300.028237666,
+   0
+  ],
+  "cfgB": [
+   "UNKNOWN",
+   300.11958525,
+   0
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "0ae917c2e0c1_dislog_a14_x14_n24.cnf",
+  "base": [
+   "UNKNOWN",
+   300.0914736670002,
+   0
+  ],
+  "cfgB": [
+   "UNKNOWN",
+   300.1124275000002,
+   0
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "0c9bcbc815cf_par32-2.shuffled-as.sat03-1534.cnf",
+  "base": [
+   "UNKNOWN",
+   300.0549583330003,
+   0
+  ],
+  "cfgB": [
+   "UNKNOWN",
+   300.0979431669998,
+   0
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "115fa7f61704_Circuit_multiplier24.cnf",
+  "base": [
+   "UNKNOWN",
+   300.1024281670002,
+   0
+  ],
+  "cfgB": [
+   "UNKNOWN",
+   300.1102559159999,
+   0
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "21415e807689_clqcl_50_6_5.normalised.cnf",
+  "base": [
+   "UNKNOWN",
+   264.8896908329998,
+   0
+  ],
+  "cfgB": [
+   "UNKNOWN",
+   238.4315101250004,
+   0
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "21b173943af5_shuffling-1-s1769330284-of-bench-sat04-422.used-as.sat04-561.cnf",
+  "base": [
+   "UNSAT",
+   65.46227945800001,
+   363546510
+  ],
+  "cfgB": [
+   "UNSAT",
+   56.77949987500051,
+   336495120
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "2bdfcf23ac18_1-ET-256-K-65.sanitized.cnf",
+  "base": [
+   "UNSAT",
+   73.26798916700045,
+   257102410
+  ],
+  "cfgB": [
+   "UNSAT",
+   73.22164537499975,
+   277842202
+  ],
+  "disagree": false
+ },
+ {
+  "cnf": "30f64b3b0870_lockchart-group1-L200-K289-p8d4j1.normalised.cnf",
+  "base": [
+   "UNKNOWN",
+   300.046603666,
+   0
+  ],
+  "cfgB": [
+   "UNKNOWN",
+   300.0576738330001,
+   0
+  ],
+  "disagree": false
+ }
+]

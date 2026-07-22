@@ -1,0 +1,11 @@
+(set-info :status sat)
+(set-logic QF_BV)
+; Test bitwise AND, OR
+(declare-const x (_ BitVec 8))
+(declare-const y (_ BitVec 8))
+(assert (= x #xF0))
+(assert (= y #x0F))
+(assert (= (bvand x y) #x00))
+(assert (= (bvor x y) #xFF))
+(check-sat)
+(exit)

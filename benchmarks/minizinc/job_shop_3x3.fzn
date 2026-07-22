@@ -1,0 +1,39 @@
+% Job Shop Scheduling: 3 jobs, 3 machines, minimize makespan
+% Job 1: M1(3), M2(2), M3(4) — durations on machines in order
+% Job 2: M2(2), M3(3), M1(3)
+% Job 3: M3(4), M1(2), M2(1)
+% Start times for each operation (job_machine)
+var 0..20: s11 :: output_var;
+var 0..20: s12 :: output_var;
+var 0..20: s13 :: output_var;
+var 0..20: s21 :: output_var;
+var 0..20: s22 :: output_var;
+var 0..20: s23 :: output_var;
+var 0..20: s31 :: output_var;
+var 0..20: s32 :: output_var;
+var 0..20: s33 :: output_var;
+var 0..30: makespan :: output_var;
+% Job 1 precedence: s11+3 <= s12, s12+2 <= s13
+constraint int_lin_le([1, -1], [s11, s12], -3);
+constraint int_lin_le([1, -1], [s12, s13], -2);
+% Job 2 precedence: s21+2 <= s22, s22+3 <= s23
+constraint int_lin_le([1, -1], [s21, s22], -2);
+constraint int_lin_le([1, -1], [s22, s23], -3);
+% Job 3 precedence: s31+4 <= s32, s32+2 <= s33
+constraint int_lin_le([1, -1], [s31, s32], -4);
+constraint int_lin_le([1, -1], [s32, s33], -2);
+% Machine 1 disjunctive: {s11(d=3), s23(d=3), s32(d=2)}
+% s11+3<=s23 OR s23+3<=s11
+var bool: d_m1_12 :: output_var;
+constraint int_le_reif(s11, s23, d_m1_12);
+constraint int_lin_le([1, -1], [s11, s23], -3);
+% Simplified: use Big-M disjunctive
+% For machine disjunctive, we need non-overlap:
+% s11+3<=s23 or s23+3<=s11 (Machine 1: job1op1 vs job2op3)
+% s11+3<=s32 or s32+2<=s11 (Machine 1: job1op1 vs job3op2)
+% s23+3<=s32 or s32+2<=s23 (Machine 1: job2op3 vs job3op2)
+% Makespan: all operations finish before makespan
+constraint int_lin_le([1, -1], [s13, makespan], -4);
+constraint int_lin_le([1, -1], [s23, makespan], -3);
+constraint int_lin_le([1, -1], [s33, makespan], -1);
+solve :: int_search([s11, s12, s13, s21, s22, s23, s31, s32, s33], first_fail, indomain_min, complete) minimize makespan;

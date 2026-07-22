@@ -1,0 +1,66 @@
+# AY external-tool registry, consumed by `ay tool` (and `ay bench compare` for
+# winner references; `ay corpus install-tool` is a deprecated alias reading this
+# same file). Installs are idempotent: probe-if-working, fetch pinned source,
+# build, install, re-verify, print resolved paths.
+#
+# Data chooses, code executes: `recipe` is a closed set implemented in Rust,
+# and build arguments are argv arrays, never shell strings — an unknown recipe
+# (or a string where an argv array belongs) is a load error, so this registry
+# cannot smuggle arbitrary code.
+
+schema_version = 1
+
+[[tool]]
+name        = "drat-trim"           # unique kebab-case; competition pins use a -<edition> suffix
+kind        = "checker"             # checker | reference-solver | utility
+groups      = ["audit", "sat"]      # for `ay tool install --group audit`
+source      = "git"                 # git | http-archive | pip | cargo | script
+url         = "https://github.com/marijnheule/drat-trim"
+commit      = ""                    # pin; "" = tip (install-time warning)
+recipe      = "cc-single-file"      # closed set: cc-single-file | configure-make | make | cmake | cargo-build
+recipe_args = ["drat-trim.c"]       # argv fragments, recipe-specific; NEVER shell-interpreted
+bin         = "drat-trim"           # produced artifact, relative to the build tree
+install_to  = "~/.local/bin/drat-trim"  # legacy target the tests already resolve — preserved verbatim
+verify      = ["{bin}"]             # argv; run after install and by `ay tool verify`
+verify_expect = "usage"             # substring expected in stdout/stderr
+requires    = ["cc", "git"]         # PATH preflight
+extra_paths = ["/usr/local/bin/drat-trim", "/tmp/drat-trim"]  # legacy resolver fallbacks, preserved
+
+[[tool]]
+name       = "cadical"
+kind       = "reference-solver"
+groups     = ["audit", "sat"]
+source     = "git"
+url        = "https://github.com/arminbiere/cadical"
+commit     = ""                     # transcribed as-is pre-0.1.0; pin post-0.1.0
+recipe     = "configure-make"
+in_place   = true                   # clone/build inside gitignored reference/cadical (existing convention)
+bin        = "build/cadical"
+install_to = "reference/cadical"    # exactly what the SAT cross-validation tests resolve
+verify     = ["{bin}", "--version"]
+requires   = ["git", "make", "c++"]
+
+# VeriPB 3 (the PB26+ proof-format checker) is Rust: the official GitLab README
+# installs it with `cargo install` from a checkout. It is not on PyPI — the pip
+# route belongs to the retired `version2` branch — so the recipe is a cargo
+# install pinned at the upstream 3.0.2 release tag, the version the PB CERT
+# evidence was audited with.
+[[tool]]
+name   = "veripb"
+kind   = "checker"
+groups = ["audit", "pb"]
+source = "cargo"                    # cargo install --git <url> --tag <tag>
+url    = "https://gitlab.com/MIAOresearch/software/VeriPB.git"
+tag    = "3.0.2"
+bin    = "veripb"                   # lands in ~/.cargo/bin
+verify = ["veripb", "--help"]
+
+[[tool]]
+name   = "carcara"
+kind   = "checker"
+groups = ["audit", "smt"]
+source = "cargo"                    # cargo install --git <url> [--rev <commit>]
+url    = "https://github.com/ufmg-smite/carcara"
+commit = "81f0df827297245f1370353924784325d8adab51"  # upstream main, 2026-07-20
+bin    = "carcara"                  # lands in ~/.cargo/bin
+verify = ["carcara", "--version"]

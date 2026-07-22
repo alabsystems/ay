@@ -1,0 +1,4 @@
+* #variable= 3 #constraint= 2
+* Simple satisfiable instance: x1 OR x2, x2 OR x3
++1 x1 +1 x2 >= 1 ;
++1 x2 +1 x3 >= 1 ;

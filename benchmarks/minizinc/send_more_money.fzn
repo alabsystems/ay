@@ -1,0 +1,20 @@
+% SEND + MORE = MONEY (classic cryptarithmetic)
+var 0..9: s :: output_var;
+var 0..9: e :: output_var;
+var 0..9: n :: output_var;
+var 0..9: d :: output_var;
+var 0..9: m :: output_var;
+var 0..9: o :: output_var;
+var 0..9: r :: output_var;
+var 0..9: y :: output_var;
+constraint fzn_all_different_int([s, e, n, d, m, o, r, y]);
+% s >= 1 (no leading zero)
+constraint int_lin_le([-1], [s], -1);
+% m >= 1
+constraint int_lin_le([-1], [m], -1);
+% 1000*s + 100*e + 10*n + d + 1000*m + 100*o + 10*r + e
+%   = 10000*m + 1000*o + 100*n + 10*e + y
+% => 1000*s + 100*e + 10*n + d + 1000*m + 100*o + 10*r + e - 10000*m - 1000*o - 100*n - 10*e - y = 0
+% => 1000*s + 91*e - 90*n + d - 9000*m - 900*o + 10*r - y = 0
+constraint int_lin_eq([1000, 91, -90, 1, -9000, -900, 10, -1], [s, e, n, d, m, o, r, y], 0);
+solve :: int_search([s, e, n, d, m, o, r, y], first_fail, indomain_min, complete) satisfy;

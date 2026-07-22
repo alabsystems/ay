@@ -1,0 +1,72 @@
+[package]
+name = "ay-dpll"
+description = "DPLL(T) integration framework for AY"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["proof-checker", "jit"]
+# Keep the checker feature enabled by default. The hardened proof path still
+# uses this cfg boundary, so removing the feature would silently compile the
+# permissive fallback instead of the production certification path.
+proof-checker = []
+jit = ["dep:ay-jit"]
+# Enables the incremental-E-matching differential canary (recomputes a full
+# TermIndex/EqualityClasses rebuild each round and asserts incremental == full).
+# OFF by default so production/dependent builds get the incremental perf win;
+# enable for verification: `cargo test -p ay-dpll --features ematching-differential`.
+ematching-differential = []
+
+[dependencies]
+ay-core.workspace = true
+ay-model-check.workspace = true
+ay-sat.workspace = true
+ay-euf.workspace = true
+ay-arrays.workspace = true
+ay-lra = { workspace = true, default-features = false }
+ay-lia.workspace = true
+ay-nia.workspace = true
+ay-nra.workspace = true
+ay-diff-logic.workspace = true
+ay-bv.workspace = true
+ay-fp.workspace = true
+ay-dt.workspace = true
+ay-seq.workspace = true
+ay-set.workspace = true
+ay-multiset.workspace = true
+ay-map.workspace = true
+ay-strings.workspace = true
+ay-frontend.workspace = true
+ay-proof.workspace = true
+num-rational.workspace = true
+num-bigint.workspace = true
+num-integer.workspace = true
+num-traits.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+stacker.workspace = true
+ay-sys.workspace = true
+ay-jit = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+ntest = "0.9"
+anyhow = "1.0"
+wait-timeout = "0.2.1"
+tempfile.workspace = true
+ay-lrat-check.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+
+[[bench]]
+name = "incremental_bench"
+harness = false

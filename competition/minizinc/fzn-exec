@@ -1,0 +1,29 @@
+#!/bin/sh
+# ay-script: fzn-exec
+# Copyright 2026 Andrew Yates
+# Author: Andrew Yates
+# Licensed under the Apache License, Version 2.0
+#
+# MiniZinc FlatZinc solver wrapper for AY (see ../../ay.msc).
+#
+# MiniZinc invokes this executable with the std flags declared in ay.msc
+# (`-a` all solutions, `-f` free search, `-p N` parallel workers, `-t MS`
+# timeout) followed by the path to the compiled `.fzn` model. We forward those
+# onto `ay flatzinc solve`, which auto-selects the CP or SMT backend.
+#
+# The descriptor sets needsSolns2Out=true, so MiniZinc pipes our raw FlatZinc
+# output through its own solns2out; we just emit the standard FlatZinc solution
+# stream (`x = ...;`, `----------`, `==========`, `=====UNSATISFIABLE=====`).
+set -eu
+
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+# Resolve the ay binary: prefer one sitting next to this wrapper (the layout a
+# packaged solver bundle uses), otherwise fall back to PATH.
+if [ -x "${DIR}/ay" ]; then
+    AY="${DIR}/ay"
+else
+    AY="ay"
+fi
+
+exec "${AY}" flatzinc solve "$@"

@@ -1,0 +1,7 @@
+(set-logic QF_UFDT)
+(declare-datatypes ((Enum 0)) (((c0) (c1) (c2))))
+(declare-fun f (Enum) Enum)
+(declare-const v1 Enum)(declare-const v2 Enum)(declare-const a Enum)(declare-const b Enum)
+(declare-const p Bool)
+(assert (distinct (ite p v1 v2) (f a) a b))
+(check-sat)

@@ -1,0 +1,7 @@
+(set-logic QF_SLIA)
+(declare-const x String)
+(declare-const y String)
+(assert (= (str.++ x "ab") (str.++ "a" y)))
+(assert (= (str.len x) 1))
+(assert (= (str.len y) 1))
+(check-sat)

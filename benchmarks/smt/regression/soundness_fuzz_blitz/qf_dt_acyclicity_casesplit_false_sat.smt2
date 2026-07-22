@@ -1,0 +1,6 @@
+(set-logic QF_DT)
+(declare-datatypes ((Tree 0)) (((lf) (nd (lc Tree)(rc Tree)))))
+(declare-const x Tree)(declare-const y Tree)
+(assert ((_ is nd) x))
+(assert (not (distinct (nd y x) lf x)))
+(check-sat)

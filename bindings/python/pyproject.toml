@@ -1,0 +1,58 @@
+# Copyright 2026 Andrew Yates
+# Licensed under the Apache License, Version 2.0
+#
+# Packaging for `ayz3`: a z3py-compatible Python API backed by the AY solver.
+#
+# The wheel BUNDLES the AY C ABI shared library (libay_ffi.{dylib,so}) inside
+# the `ayz3/` package directory. The bundling happens in setup.py's custom
+# build_py step, which runs `cargo build -p ay-ffi --release` and copies the
+# cdylib into the package before the wheel is assembled. See setup.py.
+#
+# Build a wheel for the current platform with:   python -m build --wheel
+# (or `pip install .`). The resulting wheel is self-contained: an installed
+# ayz3 locates its library next to ayz3/_lib.py without the AY source tree.
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ayz3"
+version = "0.1.0"
+description = "z3py-shaped core subset backed by the AY solver"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.8"
+authors = [{ name = "Andrew Yates" }]
+keywords = ["smt", "solver", "z3", "z3py", "satisfiability", "ay"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+# Pure-ctypes binding: no third-party Python runtime dependencies.
+dependencies = []
+
+[project.optional-dependencies]
+# Match the recorded reference version named in this repository's differential
+# tests. The ordinary ayz3 wheel remains dependency-free.
+dev = ["pytest>=8", "z3-solver==4.15.4.0"]
+
+[project.urls]
+Homepage = "https://github.com/alabsystems/ay"
+Repository = "https://github.com/alabsystems/ay"
+
+[tool.setuptools]
+# Only the ayz3 package ships; tests/conftest are dev-only.
+packages = ["ayz3"]
+
+[tool.setuptools.package-data]
+# Include the bundled cdylib (staged into ayz3/ by setup.py's build step).
+# Listed for every platform basename so the manifest is platform-agnostic; the
+# build step only ever produces the one for the current platform.
+ayz3 = ["libay_ffi.dylib", "libay_ffi.so", "ay_ffi.dll"]

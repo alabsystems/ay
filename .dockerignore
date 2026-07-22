@@ -1,0 +1,16 @@
+target/
+target-main/
+target-*/
+fuzz/target/
+benchmarks/
+worker_logs/
+reports/
+states/
+reference/
+papers/
+designs/
+ideas/
+postmortems/
+metrics/
+.git/
+*.log

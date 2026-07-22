@@ -1,0 +1,11 @@
+(set-logic QF_ALIA)
+; Array sorted property preserved through identity swap: UNSAT
+(declare-const a (Array Int Int))
+(declare-const b (Array Int Int))
+(assert (<= (select a 0) (select a 1)))
+(assert (= b a))
+(assert (= (select b 0) (select a 0)))
+(assert (= (select b 1) (select a 1)))
+(assert (> (select b 0) (select b 1)))
+(check-sat)
+(exit)

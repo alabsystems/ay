@@ -1,0 +1,8 @@
+(set-info :status unsat)
+(set-logic QF_AUFLIA)
+(declare-const a (Array Int Int))
+(declare-const b (Array Int Int))
+(assert (= a b))
+(assert (not (= (select a 0) (select b 0))))
+(check-sat)
+(exit)

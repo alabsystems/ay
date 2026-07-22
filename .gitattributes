@@ -1,0 +1,8 @@
+# One line-ending policy for every machine (macOS/Linux/Windows dev boxes):
+# text files are LF in the repo AND in every working tree, so checkouts,
+# diffs, and hashes are byte-identical across machines regardless of each
+# clone's core.autocrlf. Windows toolchains (rustc, cargo, PowerShell 7,
+# Git Bash) all handle LF sources; no .bat/.cmd files exist in this repo.
+* text=auto eol=lf
+*.sh text eol=lf
+crates/ay-pb/tests/instances/koops_mat12_11_identity_complement_red_capacity.pbp -filter -diff -merge text eol=lf

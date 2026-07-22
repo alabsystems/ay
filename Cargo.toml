@@ -1,0 +1,415 @@
+[workspace]
+resolver = "2"
+exclude = ["fuzz"]
+members = [
+    "crates/ay",
+    "crates/ay-core",
+    "crates/ay-sat",
+    "crates/ay-sat-congruence-core",
+    "crates/ay-qbf",
+    "crates/ay-maxsat",
+    "crates/ay-allsat",
+    "crates/ay-count",
+    "crates/ay-proof-complexity",
+    "crates/ay-dpll",
+    "crates/ay-frontend",
+    "crates/ay-proof",
+    "crates/ay-tla-bridge",
+    "crates/ay-lean-bridge",
+    "crates/ay-chc",
+    "crates/ay-dispatch",
+    "crates/ay-ffi",
+    "crates/ay-theories/euf",
+    "crates/ay-theories/lra",
+    "crates/ay-theories/lia",
+    "crates/ay-theories/bv",
+    "crates/ay-theories/arrays",
+    "crates/ay-theories/strings",
+    "crates/ay-theories/seq",
+    "crates/ay-theories/set",
+    "crates/ay-theories/multiset",
+    "crates/ay-theories/map",
+    "crates/ay-theories/fp",
+    "crates/ay-theories/dt",
+    "crates/ay-theories/nia",
+    "crates/ay-theories/nra",
+    "crates/ay-theories/nonlinear-common",
+    "crates/ay-theories/intsat",
+    "crates/ay-theories/diff-logic",
+    "crates/ay-xor",
+    "crates/ay-translate",
+    "crates/ay-bindings",
+    "crates/ay-drat-check",
+    "crates/ay-lrat-check",
+    "crates/ay-proof-common",
+    "crates/ay-flatzinc-parser",
+    "crates/ay-flatzinc-smt",
+    "crates/ay-fzn2smt",
+    "crates/ay-cp",
+    "crates/ay-sys",
+    "crates/ay-prefetch",
+    "crates/ay-jit",
+    "crates/ay-replay",
+    "crates/ay-bench",
+    "crates/ay-bisect",
+    "crates/ay-pb",
+    "crates/ay-lp",
+    "crates/ay-milp",
+    "crates/ay-approx-bcp",
+    "crates/ay-proptest",
+    "crates/ay-test-support",
+    "crates/ay-model-check",
+    "crates/ay-z3-parity",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/alabsystems/ay"
+homepage = "https://github.com/alabsystems/ay"
+authors = ["Andrew Yates"]
+
+readme = "README.md"
+[workspace.lints.rust]
+# Kani model checker sets the `kani` cfg flag; `ay_logging` is an internal
+# instrumentation cfg used by selected development builds.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(ay_logging)', 'cfg(feature, values("optional-chc25-repo-corpus-tests", "optional-chc-comp25-corpus-tests"))'] }
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_qualifications = "warn"
+elided_lifetimes_in_paths = "warn"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+unused_import_braces = "warn"
+unused_macro_rules = "warn"
+non_ascii_idents = "forbid"
+keyword_idents_2024 = "forbid"
+
+[workspace.lints.clippy]
+# === Group enables (low priority so individual overrides win) ===
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -2 }
+nursery = { level = "warn", priority = -3 }
+
+# === Pedantic allows — too noisy or inapplicable for solver code ===
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+fn_params_excessive_bools = "allow"
+too_many_arguments = "allow"
+implicit_hasher = "allow"
+doc_markdown = "allow"
+items_after_statements = "allow"
+single_match_else = "allow"
+wildcard_imports = "allow"
+collapsible_else_if = "allow"
+collapsible_if = "allow"
+needless_continue = "allow"
+if_not_else = "allow"
+needless_raw_string_hashes = "allow"
+used_underscore_binding = "allow"
+return_self_not_must_use = "allow"
+# Numeric kernels routinely cross solver-index, bit-width, and floating domains.
+# These diagnostics mostly flag deliberate representation boundaries; keep them
+# silent workspace-wide and require local rationale only in crates that opt in.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+unreadable_literal = "allow"
+# Fused multiply-add (`mul_add`) changes IEEE rounding: it rounds once instead of
+# twice. AY deliberately does NOT fuse in its numeric kernels. In the
+# directed-rounding soundness bounds (ay-pb safe_lp_bound, ay-theories/lra
+# float_simplex roundoff tracking) fusing would UNDER-count accumulated error and
+# could make a conservative bound non-conservative — i.e. an unsound OPTIMUM/UNSAT.
+# In the search heuristics (VSIDS/PB activity, MAB/bandit EMA) it would perturb the
+# exact float trajectory and reproducibility. Keep two-step `a*b + c` everywhere.
+suboptimal_flops = "allow"
+imprecise_flops = "allow"
+# Stylistic nursery/pedantic lints that fire on deliberate solver idioms and are
+# pure churn here: Self-less type names in math code, index loops over parallel
+# arrays, match-with-guard vs if-let, doc-bullet continuation style, explicit
+# `.into()`/conversions used to pin numeric width in i128 cutting-plane
+# arithmetic, drain/append micro-forms, etc. Allowed workspace-wide, matching the
+# curation policy above. (Correctness lints like absurd_extreme_comparisons stay
+# active; the few intentional sites carry local #[allow] + rationale instead.)
+use_self = "allow"
+doc_lazy_continuation = "allow"
+collapsible_match = "allow"
+needless_range_loop = "allow"
+redundant_closure_for_method_calls = "allow"
+implicit_clone = "allow"
+wrong_self_convention = "allow"
+equatable_if_let = "allow"
+op_ref = "allow"
+too_long_first_doc_paragraph = "allow"
+option_option = "allow"
+should_implement_trait = "allow"
+useless_conversion = "allow"
+redundant_clone = "allow"
+redundant_guards = "allow"
+iter_with_drain = "allow"
+extend_with_drain = "allow"
+manual_contains = "allow"
+tuple_array_conversions = "allow"
+cast_lossless = "allow"
+unnecessary_fallible_conversions = "allow"
+match_bool = "allow"
+inline_always = "allow"
+redundant_else = "allow"
+manual_let_else = "allow"              # match-based patterns are equally clear in solver code
+match_same_arms = "allow"              # Often intentional for readability across enum variants
+unused_self = "allow"                  # Methods may need &self for trait conformance or future use
+single_char_pattern = "allow"          # .split(",") vs .split(',') is trivial
+many_single_char_names = "allow"       # Math/solver code legitimately uses x, y, z, a, b, c
+trivially_copy_pass_by_ref = "allow"   # Rarely matters for perf
+needless_pass_by_value = "allow"       # Would require API changes that ripple across crate boundaries
+match_wildcard_for_single_variants = "allow" # _ as default is fine for future-proofing
+semicolon_if_nothing_returned = "allow" # Pure style preference
+struct_field_names = "allow"           # Common in domain-specific code
+unnested_or_patterns = "allow"         # Style preference
+only_used_in_recursion = "allow"       # Valid recursive design pattern
+if_then_some_else_none = "allow"       # .then(||) is less clear than explicit if/else
+comparison_chain = "allow"             # Explicit if/else chains are clearer for solver conditions
+unnecessary_wraps = "allow"            # Functions may return Result/Option for consistency
+ref_option = "allow"                   # &Option<T> is common in internal APIs
+no_effect_underscore_binding = "allow" # Used for side-effectful expressions
+verbose_bit_mask = "allow"             # Bit operations are common in solver code
+range_minus_one = "allow"              # ..=(n-1) is equivalent to ..n, both are clear
+assigning_clones = "allow"             # x = y.clone() vs x.clone_from(y) is micro-optimization
+format_push_string = "allow"           # write! vs push_str(format!()) is style preference
+float_cmp = "allow"                    # Exact float comparison is intentional in solver arithmetic
+needless_pass_by_ref_mut = "allow"     # Nursery lint, false positives on complex control flow
+debug_assert_with_mut_call = "allow"   # debug_assert with side effects is intentional
+type_complexity = "allow"              # Complex types are common in solver internals
+bool_to_int_with_if = "allow"          # Explicit if/else is clearer than u32::from(bool)
+map_unwrap_or = "allow"               # .map().unwrap_or() sometimes needed for type inference
+needless_collect = "allow"             # Sometimes needed for borrow checker
+same_functions_in_if_condition = "allow" # Intentional in solver logic
+from_iter_instead_of_collect = "allow" # Style preference
+cloned_ref_to_slice_refs = "allow"     # Nursery lint, false positives
+needless_borrows_for_generic_args = "allow" # Style preference
+default_trait_access = "allow"         # Type::default() vs Default::default() is preference
+unnecessary_map_or = "allow"           # Style preference
+iter_on_single_items = "allow"         # Sometimes clearer with iter pattern
+explicit_iter_loop = "allow"           # for x in &v vs for x in v.iter() is style
+collection_is_never_read = "warn"      # Dead code: fix individual instances, not blanket allow
+
+# === Nursery allows — unstable or too noisy ===
+missing_const_for_fn = "allow"
+option_if_let_else = "allow"
+cognitive_complexity = "allow"
+significant_drop_tightening = "allow"
+branches_sharing_code = "allow"
+fallible_impl_from = "allow"
+useless_let_if_seq = "allow"
+or_fun_call = "allow"
+redundant_pub_crate = "allow"          # Conflicts with unreachable_pub
+
+# === Restriction lints — cherry-picked for real bugs ===
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+print_stdout = "allow"                 # Too noisy: println! used in tests and CLI output
+print_stderr = "allow"                 # Too noisy: eprintln! used in tests and diagnostics
+# Workspace default stays permissive for unwrap-style lints: tests, fixture
+# builders, and solver-internal invariant checks still use many unwraps. Parser
+# and FFI trust boundaries opt into deny locally; further tightening is per-crate.
+unwrap_used = "allow"
+get_unwrap = "allow"
+clone_on_ref_ptr = "allow"             # Too noisy: Arc::clone() vs .clone() is style preference
+rc_buffer = "warn"
+rc_mutex = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+empty_drop = "warn"
+empty_structs_with_brackets = "warn"
+# undocumented_unsafe_blocks: deferred until unsafe audit complete
+# missing_assert_message: too noisy for test code (no per-target override)
+# allow_attributes_without_reason: conflicts with targeted allows in test modules
+
+[workspace.dependencies]
+# Core dependencies
+hashbrown = "0.15"
+foldhash = "0.1"
+parking_lot = "0.12"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
+tempfile = "3.14"
+rusqlite = { version = "0.32", features = ["bundled"] }
+ureq = { version = "2.12", features = ["json"] }
+
+# Numeric
+num-rational = { version = "0.4", features = ["serde"] }
+num-bigint = { version = "0.4", features = ["serde"] }
+num-traits = "0.2"
+num-integer = "0.1"
+
+# Parsing
+logos = "0.15"
+
+# Hash / collections
+rustc-hash = "2.1"
+sha2 = "0.10"
+smallvec = "1.13"
+fixedbitset = "0.5"
+
+# Utilities
+stacker = "0.1.22"
+bytemuck = { version = "1", features = ["derive"] }
+rayon = "1.10"
+rand = "0.8"
+rand_chacha = "0.3"
+
+# Testing/Benchmarking
+criterion = "0.5"
+proptest = "1.5"
+serial_test = "3.2"
+trybuild = "1.0"
+ntest = "0.9"
+wait-timeout = "0.2.1"
+pollster = "0.3"
+# default-features = false drops the wasm-only `webgpu` backend from the
+# build. Note the GLES fallback (OPENGL32.dll import) and DX12 FXC
+# (d3dcompiler_47.dll) are wired by wgpu's Windows target deps regardless of
+# features; crates/ay/build.rs delay-loads both to keep process startup free
+# of GPU driver DLLs (measured +66ms per launch otherwise, 2026-07-14).
+wgpu = { version = "0.19", default-features = false, features = ["wgsl", "dx12", "metal"] }
+
+# Internal crates
+ay = { version = "0.1.0", path = "crates/ay" }
+ay-core = { version = "0.1.0", path = "crates/ay-core" }
+ay-count = { version = "0.1.0", path = "crates/ay-count" }
+ay-model-check = { version = "0.1.0", path = "crates/ay-model-check" }
+ay-sat = { version = "0.1.0", path = "crates/ay-sat", default-features = false }
+ay-test-support = { version = "0.1.0", path = "crates/ay-test-support" }
+ay-sat-congruence-core = { version = "0.1.0", path = "crates/ay-sat-congruence-core" }
+ay-dpll = { version = "0.1.0", path = "crates/ay-dpll", default-features = false, features = ["proof-checker", "jit"] }
+ay-frontend = { version = "0.1.0", path = "crates/ay-frontend" }
+ay-proof = { version = "0.1.0", path = "crates/ay-proof" }
+ay-tla-bridge = { version = "0.1.0", path = "crates/ay-tla-bridge" }
+ay-euf = { version = "0.1.0", path = "crates/ay-theories/euf" }
+ay-lra = { version = "0.1.0", path = "crates/ay-theories/lra", default-features = false }
+ay-lia = { version = "0.1.0", path = "crates/ay-theories/lia" }
+ay-bv = { version = "0.1.0", path = "crates/ay-theories/bv" }
+ay-arrays = { version = "0.1.0", path = "crates/ay-theories/arrays" }
+ay-seq = { version = "0.1.0", path = "crates/ay-theories/seq" }
+ay-set = { version = "0.1.0", path = "crates/ay-theories/set" }
+ay-multiset = { version = "0.1.0", path = "crates/ay-theories/multiset" }
+ay-map = { version = "0.1.0", path = "crates/ay-theories/map" }
+ay-strings = { version = "0.1.0", path = "crates/ay-theories/strings" }
+ay-fp = { version = "0.1.0", path = "crates/ay-theories/fp" }
+ay-dt = { version = "0.1.0", path = "crates/ay-theories/dt" }
+ay-nia = { version = "0.1.0", path = "crates/ay-theories/nia" }
+ay-nra = { version = "0.1.0", path = "crates/ay-theories/nra" }
+ay-nonlinear-common = { version = "0.1.0", path = "crates/ay-theories/nonlinear-common" }
+ay-intsat = { version = "0.1.0", path = "crates/ay-theories/intsat" }
+ay-diff-logic = { version = "0.1.0", path = "crates/ay-theories/diff-logic" }
+ay-chc = { version = "0.1.0", path = "crates/ay-chc" }
+ay-dispatch = { version = "0.1.0", path = "crates/ay-dispatch" }
+ay-qbf = { version = "0.1.0", path = "crates/ay-qbf" }
+ay-maxsat = { version = "0.1.0", path = "crates/ay-maxsat" }
+ay-pb = { version = "0.1.0", path = "crates/ay-pb" }
+ay-lp = { version = "0.1.0", path = "crates/ay-lp" }
+ay-milp = { version = "0.1.0", path = "crates/ay-milp" }
+ay-allsat = { version = "0.1.0", path = "crates/ay-allsat" }
+ay-proof-complexity = { version = "0.1.0", path = "crates/ay-proof-complexity" }
+ay-lean-bridge = { version = "0.1.0", path = "crates/ay-lean-bridge" }
+ay-xor = { version = "0.1.0", path = "crates/ay-xor" }
+ay-translate = { version = "0.1.0", path = "crates/ay-translate" }
+ay-bindings = { version = "0.1.0", path = "crates/ay-bindings" }
+ay-drat-check = { version = "0.1.0", path = "crates/ay-drat-check" }
+ay-lrat-check = { version = "0.1.0", path = "crates/ay-lrat-check" }
+ay-proof-common = { version = "0.1.0", path = "crates/ay-proof-common" }
+ay-flatzinc-parser = { version = "0.1.0", path = "crates/ay-flatzinc-parser" }
+ay-flatzinc-smt = { version = "0.1.0", path = "crates/ay-flatzinc-smt" }
+ay-fzn2smt = { version = "0.1.0", path = "crates/ay-fzn2smt" }
+ay-cp = { version = "0.1.0", path = "crates/ay-cp" }
+ay-sys = { version = "0.1.0", path = "crates/ay-sys" }
+ay-bench = { version = "0.1.0", path = "crates/ay-bench" }
+ay-bisect = { version = "0.1.0", path = "crates/ay-bisect" }
+ay-prefetch = { version = "0.1.0", path = "crates/ay-prefetch" }
+ay-jit = { version = "0.1.0", path = "crates/ay-jit" }
+ay-replay = { version = "0.1.0", path = "crates/ay-replay" }
+ay-approx-bcp = { version = "0.1.0", path = "crates/ay-approx-bcp" }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# External deps for flatzinc crates
+anyhow = "1"
+libc = "0.2"
+nix = { version = "0.29", default-features = false, features = ["process", "signal", "term"] }
+signal-hook = "0.3"
+
+[profile.release]
+lto = "thin"
+# codegen-units set in .cargo/config.toml (16 for build memory; 1 here is dead config)
+# `unwind` (not `abort`): the portfolio wraps every engine in `catch_unwind`
+# (portfolio/schedule.rs) so one engine's panic is CONTAINED (that engine is
+# discarded, the rest keep solving) rather than aborting the whole process and
+# losing the instance. `panic = "abort"` silently defeated that containment —
+# observed as SIGABRT crashes via e.g. ay_dpll::executor::theories::lra::solve_lra
+# during competition-load runs (#18). Soundness is unaffected: a caught panic
+# yields no verdict for that engine (treated as Unknown), never a wrong answer.
+panic = "unwind"
+# Overflow checks stay ON in release: AY must never SILENTLY wrap integer
+# arithmetic — a silently-wrapped bound/objective is a soundness hazard. Where
+# wrapping or saturation is genuinely intended, the code says so explicitly with
+# `wrapping_*` / `saturating_*` / `checked_*`. (Re-enabled per owner directive;
+# the prior `= false` was masking real i128 overflow bugs in the PB engine.)
+overflow-checks = true
+
+[profile.dev]
+# Keep public debug/test builds fast enough for solver-heavy gates even when
+# .cargo/config.toml is absent from sanitized publication staging.
+opt-level = 1
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+incremental = true
+
+# Incremental compilation is pathological on the giant lib-test units: on
+# Windows (rustc 1.96.1, AMD 8700G/31GB), a warm incremental rebuild of
+# ay-sat's lib-test after a one-line edit took 9,337s wall / 21.7GB rustc RSS
+# — almost entirely a single-threaded phase — while the same rebuild with
+# incremental off took 366s / 6.7GB (25x). The plain lib unit rebuilds
+# incrementally in ~65s, so the blowup is specific to the *-test units
+# (lib + inline test modules + ~3k #[test] registrations). Scoping the
+# opt-out to profile.test keeps dev-profile lib rebuilds incremental.
+# Measured 2026-07-14.
+[profile.test]
+incremental = false
+
+# Compile third-party deps at opt-level=2 even in debug builds.
+# Deps rarely change so they're compiled once and cached. Cuts debug binary sizes
+# and improves test performance for hot-loop-heavy crates (hashbrown, num-bigint).
+[profile.dev.package."*"]
+opt-level = 2
+# Disable debug info for third-party deps to cut rlib sizes ~50%.
+# ay-chc's 149 MB rlib and ay-dpll's 127 MB rlib are worst offenders.
+# Reduces disk I/O and linker RSS during test binary linking.
+debug = false
+
+[profile.release-perf]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+# Overflow checks ON even in the max-perf profile (see [profile.release]).
+overflow-checks = true
+
+[profile.bench]
+lto = "thin"
+
+[workspace.metadata.atpkg]
+# The user-facing commands for `ay`. The flagship `ay` bin is gated behind the `cli` feature,
+# so build-args enables it; a plain release build would otherwise omit it.
+expose = ["ay", "ay-maxsat", "ay-pb", "ay-qbf", "ay-lrat-check"]
+build-args = ["--workspace", "--features", "ay/cli"]

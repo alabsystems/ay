@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# ay-script: pre-push-hook
+# In-tree pre-push hook: run the SMT soundness-differential gate before every
+# push. This opt-in local coverage supplements the repository's GitHub Actions
+# checks.
+#
+# INSTALL (the owner installs it; it is never forced):
+#     git config core.hooksPath scripts/git-hooks
+# UNINSTALL:
+#     git config --unset core.hooksPath
+# BYPASS a single push (use sparingly, e.g. docs-only work):
+#     git push --no-verify
+#
+# It preserves the repo's existing Git-LFS pre-push behavior by chaining to it
+# first, then runs scripts/ci/smt_soundness_gate.sh (hermetic declared-status
+# oracle + 2-solver diff vs libz3 when present). A wrong verdict fails the push.
+set -u
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+
+# --- 1. Preserve Git-LFS pre-push (this repo LFS-tracks *.pbp) ---------------
+# git-lfs consumes the ref updates on stdin; run it first so it sees them.
+if command -v git-lfs >/dev/null 2>&1; then
+    git lfs pre-push "$@" || exit $?
+fi
+
+# --- 2. Soundness-differential gate -----------------------------------------
+echo ""
+echo "pre-push: running SMT soundness-differential gate ..."
+if ! bash "$REPO_ROOT/scripts/ci/smt_soundness_gate.sh"; then
+    echo ""
+    echo "pre-push: BLOCKED — SMT soundness gate failed."
+    echo "          Fix the regression, or bypass a docs-only push with: git push --no-verify"
+    exit 1
+fi
+echo "pre-push: SMT soundness gate PASSED."
+exit 0

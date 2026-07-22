@@ -1,0 +1,35 @@
+c Pigeonhole principle: 4 pigeons, 3 holes
+c Known UNSAT - classic hard instance for resolution
+c Variables: x_{i,j} = pigeon i goes to hole j (1-indexed)
+c x_{1,1}=1 x_{1,2}=2 x_{1,3}=3
+c x_{2,1}=4 x_{2,2}=5 x_{2,3}=6
+c x_{3,1}=7 x_{3,2}=8 x_{3,3}=9
+c x_{4,1}=10 x_{4,2}=11 x_{4,3}=12
+p cnf 12 22
+c Each pigeon must go to at least one hole
+1 2 3 0
+4 5 6 0
+7 8 9 0
+10 11 12 0
+c No two pigeons in the same hole
+c Hole 1: at most one of {1,4,7,10}
+-1 -4 0
+-1 -7 0
+-1 -10 0
+-4 -7 0
+-4 -10 0
+-7 -10 0
+c Hole 2: at most one of {2,5,8,11}
+-2 -5 0
+-2 -8 0
+-2 -11 0
+-5 -8 0
+-5 -11 0
+-8 -11 0
+c Hole 3: at most one of {3,6,9,12}
+-3 -6 0
+-3 -9 0
+-3 -12 0
+-6 -9 0
+-6 -12 0
+-9 -12 0
