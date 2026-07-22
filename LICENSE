@@ -1,0 +1,101 @@
+ALab Academic Use License
+Version 1.0, 2026-11-22
+
+Copyright 2026 Andrew Yates. All rights reserved except as granted below.
+
+1. Definitions
+
+"Licensor" means Andrew Yates, the copyright holder of the ALab software.
+
+"Software" means the ALab program, library or data this license accompanies,
+in source or binary form, together with its documentation, and any part of it.
+
+"Academic Use" means use solely for non-commercial teaching, academic research
+or personal study, by an individual, or by an accredited educational
+institution or a non-profit research organization, where no person or
+organization receives, directly or indirectly, any commercial advantage or
+monetary compensation from the use or from its results.
+
+"Commercial Use" means any use that is not Academic Use, including use by or
+on behalf of a for-profit entity, use in or for a product or service, use in
+the internal operations of a business, consulting, and research that a
+commercial party sponsors and from which it obtains rights or results.
+
+2. License grant
+
+Subject to the terms of this license, the Licensor grants you a worldwide,
+royalty-free, non-exclusive, non-transferable, non-sublicensable license to
+use, copy and modify the Software, solely for Academic Use.
+
+You may share unmodified copies of the Software with others solely for their
+Academic Use, provided each copy carries this license and every copyright and
+attribution notice that came with the Software. You may not distribute
+modified versions of the Software, or works that include any part of it,
+without the Licensor's prior written permission.
+
+3. Patents
+
+The Licensor grants you a license, under any patent claims the Licensor can
+license that the Software necessarily infringes, solely to exercise the rights
+in section 2. This patent license ends immediately if you assert that the
+Software infringes a patent.
+
+4. Restrictions
+
+You may not:
+
+  (a) use the Software, or any modification or output of it that embodies a
+      substantial part of it, for Commercial Use;
+  (b) sell, rent, lease, sublicense or host the Software as a service for
+      others;
+  (c) remove or alter any copyright, license or attribution notice in the
+      Software; or
+  (d) reverse engineer, decompile or disassemble any part of the Software
+      provided only in binary form, except to the extent applicable law
+      expressly permits it despite this restriction.
+
+Publishing the results of Academic Use, including measurements and
+comparisons, is permitted, provided the publication identifies the Software
+and its version.
+
+5. Third-party components
+
+The Software may include components that others hold copyright in. Each such
+component remains under its own license, which the NOTICE file or the
+third-party notices that come with the Software identify. Nothing in this
+license limits any right you have under such a component's own license, and
+where a third-party license requires terms different from this license for
+that component, those terms govern that component. In particular, where such
+a license (for example the GNU Lesser General Public License) requires that
+you may modify its component, relink the Software with a modified version of
+it, or reverse engineer the Software to debug such modifications, section 4
+does not restrict you from doing so.
+
+6. Commercial licenses
+
+Commercial Use requires a separate written license from the Licensor. See
+https://alab.systems for contact details.
+
+7. Termination
+
+Your rights under this license end automatically if you breach any of its
+terms. On termination you must stop all use of the Software and destroy every
+copy you hold. Sections 4, 8 and 9 survive termination.
+
+8. No warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT.
+
+9. Limitation of liability
+
+IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OF OR OTHER DEALINGS IN
+THE SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+10. Entire license
+
+This license is the entire grant of rights in the Software from the Licensor.
+Any right not expressly granted is reserved.

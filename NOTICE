@@ -1,0 +1,69 @@
+ay
+Copyright 2026 Andrew Yates
+
+ay is licensed under the ALab Academic Use License 1.0; the terms are in LICENSE.
+
+ay's binaries include third-party components. Each remains under its own
+license, and nothing in the ALab Academic Use License limits the rights that license
+gives you.
+
+ay's binaries include code derived from the following projects. Each part
+keeps its upstream license; the license texts named are in licenses/.
+
+- VeriPB, by Andy Oertel and contributors (https://gitlab.com/MIAOresearch/software/VeriPB),
+  MIT OR Apache-2.0: the integrated VeriPB checking libraries, with ALab's fixes.
+  VeriPB's checker statically links the malachite-base, malachite-nz and
+  malachite-bigint crates 0.10.0 (https://crates.io/crates/malachite), which
+  are licensed under the GNU Lesser General Public License 3.0
+  (licenses/LGPL-3.0.txt, which incorporates licenses/GPL-3.0.txt); section 5
+  of the ALab Academic Use License keeps every right that license gives you.
+- Choco-solver, BSD-4-Clause: the union-find structure of the alldifferent
+  bounds-consistency propagators is derived from its AlgoAllDiffBC. Its notice:
+
+    Copyright (c) 1999-2026, IMT Atlantique (the choco-solver project)
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are met:
+      1. Redistributions of source code must retain the above copyright notice,
+         this list of conditions and the following disclaimer.
+      2. Redistributions in binary form must reproduce the above copyright
+         notice, this list of conditions and the following disclaimer in the
+         documentation and/or other materials provided with the distribution.
+      3. All advertising materials mentioning features or use of this software
+         must display the following acknowledgement: This product includes
+         software developed by IMT Atlantique and the choco-solver project.
+      4. Neither the name of the copyright holder nor the names of its
+         contributors may be used to endorse or promote products derived from
+         this software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+    AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+    IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+    ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+    LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+    CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+    SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+    INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+    CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+    ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
+- Kissat, by Armin Biere (https://github.com/arminbiere/kissat), MIT: the term
+  store's mark-compact collector and dense occurrence-list propagation are
+  ported from its compact.c and propdense.c.
+- CryptoMiniSat (https://github.com/msoos/cryptominisat), MIT: intree probing
+  is ported from its intree.cpp.
+- Pumpkin (https://github.com/ConSol-Lab/Pumpkin), MIT: the disjunctive
+  edge-finding propagator and its Theta-Lambda tree are ported from it.
+- OpenSMT (https://github.com/usi-verification-and-security/opensmt), MIT:
+  decomposed Farkas interpolation is ported from its FarkasInterpolator.cc.
+- Eldarica, BSD-3-Clause: forward and backward interval propagation over
+  integer CHC systems follows its IntervalPropagator.
+
+- colored (https://crates.io/crates/colored), MPL-2.0, and smartstring
+  (https://crates.io/crates/smartstring), MPL-2.0 or later, unmodified
+  (licenses/MPL-2.0.txt); their source is at those addresses.
+
+ay also follows algorithms and interfaces of Z3, Golem, CaDiCaL and Bitwuzla
+(MIT) and CVC5 (BSD-3-Clause) without copying their code; its Z3-compatible
+interface is for compatibility only.
