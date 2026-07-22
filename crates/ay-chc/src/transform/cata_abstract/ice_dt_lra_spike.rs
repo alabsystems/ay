@@ -23,6 +23,7 @@
 use std::time::Duration;
 
 use ay_core::time::Instant;
+// The one workspace env choke point: serialized, restore-on-exit env mutation.
 use ay_test_support::env::{lock_env, ScopedEnvVar};
 
 use crate::{
@@ -544,9 +545,8 @@ fn lra_ice_dt_s3_srvr_4_bodyatoms() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(64);
     // The raw-LRA guard harvest legitimately exceeds the cata default (40); let
-    // the core admit up to the u64 ceiling for this diagnostic run. Serialized
-    // + restore-on-exit via the workspace env choke point; the guard holds for
-    // the rest of this diagnostic body.
+    // the core admit up to the u64 ceiling for this diagnostic run. Held for the
+    // rest of the test; serialized + restored on scope exit.
     let _env_lock = lock_env();
     let _max_atoms = ScopedEnvVar::set("AY_ICE_DT_MAX_ATOMS", &atom_cap.min(64).to_string());
     let smt = std::fs::read_to_string(&path).expect("read TS benchmark");

@@ -29,8 +29,8 @@ num-integer.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-proptest.workspace = true
 ay-test-support.workspace = true
+proptest.workspace = true
 
 [lints]
 workspace = true

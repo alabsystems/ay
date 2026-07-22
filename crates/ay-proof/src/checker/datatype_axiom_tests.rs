@@ -70,6 +70,7 @@ fn validate(
         dt_decls,
         None,
         None,
+        None,
     )
 }
 
@@ -234,6 +235,7 @@ fn validate_project(
         true,
         None,
         ctor_selectors,
+        None,
         None,
     )
 }

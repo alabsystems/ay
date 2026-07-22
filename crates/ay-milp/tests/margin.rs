@@ -18,6 +18,7 @@
 //!    fall back to the plain feasibility solve with an identical verdict.
 
 use ay_milp::{BabSession, Model, Outcome, SolveOpts};
+use ay_test_support::env::with_serialized_env_vars;
 
 fn opts() -> SolveOpts {
     SolveOpts::new().with_time_limit(std::time::Duration::from_secs(30))
@@ -248,11 +249,9 @@ fn multiple_inequality_rows_fold_one_soundly() {
 #[test]
 fn kill_switch_falls_back_to_plain() {
     let (mark, plain) = build(false, 1.5, 2.0, true, 1.0);
-    // Safe: this crate's tests are single-process; set/solve/reset in sequence.
-    std::env::set_var("AY_MILP_NO_MARGIN_REFRAME", "1");
-    let reframed = solve(&mark);
-    let feas = solve(&plain);
-    std::env::remove_var("AY_MILP_NO_MARGIN_REFRAME");
+    let (reframed, feas) = with_serialized_env_vars(&[("AY_MILP_NO_MARGIN_REFRAME", "1")], || {
+        (solve(&mark), solve(&plain))
+    });
     assert_eq!(
         is_sat(&reframed),
         is_sat(&feas),

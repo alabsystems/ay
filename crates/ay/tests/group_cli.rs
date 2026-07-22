@@ -10,6 +10,9 @@ pub mod spawn;
 #[path = "group_cli/spawn_timeout_selftest.rs"]
 mod spawn_timeout_selftest;
 
+#[path = "group_cli/strings_kill_switches.rs"]
+mod strings_kill_switches;
+
 #[path = "group_cli/allsat_phase1_8777.rs"]
 mod allsat_phase1_8777;
 

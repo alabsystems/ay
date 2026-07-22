@@ -3161,6 +3161,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+
     fn tree_contains_file(root: &Path, expected: &[u8]) -> bool {
         let Ok(entries) = std::fs::read_dir(root) else {
             return false;
@@ -3176,6 +3178,8 @@ mod tests {
             }
         })
     }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
 
     fn artifact_test_item(time_sec: f64, result: &str) -> NativeResultItem {
         NativeResultItem {
@@ -3249,7 +3253,13 @@ mod tests {
         let (_, sorted) =
             preflight_native_benchmarks(&make_args(vec![second.clone(), first.clone()]))
                 .expect("preflight");
-        assert_eq!(sorted, vec![first.clone(), second]);
+        assert_eq!(
+            sorted,
+            vec![
+                first.canonicalize().expect("canonical first benchmark"),
+                second.canonicalize().expect("canonical second benchmark"),
+            ]
+        );
         let error = preflight_native_benchmarks(&make_args(vec![first.clone(), first]))
             .expect_err("duplicate IDs must fail");
         assert!(error.to_string().contains("duplicate native benchmark ID"));
@@ -3322,6 +3332,12 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn write_environment_isolation_solver_script(dir: &TempDir) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -3338,37 +3354,23 @@ mod tests {
     }
 
     #[cfg(unix)]
-    struct EnvironmentRestore {
-        name: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    #[cfg(unix)]
-    impl EnvironmentRestore {
-        fn set(name: &'static str, value: &str) -> Self {
-            let previous = std::env::var_os(name);
-            std::env::set_var(name, value);
-            Self { name, previous }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for EnvironmentRestore {
-        fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
-                std::env::set_var(self.name, previous);
-            } else {
-                std::env::remove_var(self.name);
-            }
-        }
-    }
-
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn shell_quote(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
 
     #[cfg(unix)]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn write_artifact_probe_solver_script(
         dir: &TempDir,
         argv_file: &Path,
@@ -3425,6 +3427,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn write_oversized_artifact_solver_script(dir: &TempDir) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -3450,6 +3453,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn write_planted_destination_solver_script(dir: &TempDir, destination: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -3479,6 +3483,12 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn write_arg_capture_solver_script(dir: &TempDir, name: &str, argv_file: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3545,6 +3555,12 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn write_forking_timeout_solver_script(dir: &TempDir, pid_file: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3572,6 +3588,12 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn write_exiting_pipe_leak_solver_script(dir: &TempDir, pid_file: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3599,6 +3621,12 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn read_pid_file(path: &Path) -> i32 {
         std::fs::read_to_string(path)
             .expect("read child pid file")
@@ -3608,6 +3636,12 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn pid_is_alive(pid: i32) -> bool {
         use nix::errno::Errno;
         use nix::unistd::Pid;
@@ -3620,6 +3654,12 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn wait_until_pid_exits(pid: i32, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -3631,10 +3671,20 @@ mod tests {
         !pid_is_alive(pid)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc")),
+    ))]
     struct PidCleanup(Option<i32>);
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc")),
+    ))]
     impl Drop for PidCleanup {
         fn drop(&mut self) {
             use nix::sys::signal::Signal;
@@ -3762,12 +3812,20 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn native_solver_does_not_inherit_unrecorded_parent_environment() {
         let temp = tempfile::tempdir().expect("tempdir");
         let solver = write_environment_isolation_solver_script(&temp);
         let benchmark = temp.path().join("case.smt2");
         std::fs::write(&benchmark, "(check-sat)\n").expect("benchmark");
-        let _restore = EnvironmentRestore::set("AY_BENCH_UNRECORDED_SENTINEL", "present");
+        let _env_lock = ay_test_support::env::lock_env();
+        let _sentinel =
+            ay_test_support::env::ScopedEnvVar::set("AY_BENCH_UNRECORDED_SENTINEL", "present");
 
         let results = run_native(&NativeRunArgs {
             ay: &solver,
@@ -3859,6 +3917,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn decompression_rejects_output_past_fixed_file_cap() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("bomb.smt2");
@@ -3884,6 +3948,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn decompression_accepts_mixed_case_compression_suffix() {
         let dir = tempfile::tempdir().expect("tempdir");
         let source = dir.path().join("case.CNF");
@@ -3909,6 +3979,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn requested_features_are_bound_to_private_decompressed_solver_input() {
         let dir = tempfile::tempdir().expect("tempdir");
         let solver = write_solver_script(&dir, "feature-solver.sh", "feature solver", "sat");
@@ -4124,6 +4200,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn test_run_native_timeout_reaps_process_group_descendants() {
         let _guard = process_group_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4166,6 +4248,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn test_run_external_solver_timeout_reaps_process_group_descendants() {
         let _guard = process_group_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4207,6 +4295,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn test_run_native_reaps_pipe_leak_descendant_after_wrapper_exit() {
         let _guard = process_group_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4249,6 +4343,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn test_run_external_solver_reaps_pipe_leak_descendant_after_wrapper_exit() {
         let _guard = process_group_test_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4271,6 +4371,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn pre_pinned_ay_snapshot_is_probed_once_and_reused_without_source_rehash() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -4337,6 +4443,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn test_run_native_preserves_solver_provenance_in_reports() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ay_version = "\
@@ -4398,6 +4510,12 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn test_run_native_records_sat_profile_argv_and_metadata() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ay = write_solver_script(&tmp, "fake-ay.sh", "ay test", "sat");
@@ -4487,6 +4605,12 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn test_run_native_separates_benchmark_paths_from_solver_options() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ref_argv_file = tmp.path().join("ref-argv.txt");
@@ -4547,6 +4671,12 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn test_run_native_captures_sat_artifacts_env_and_run_metadata() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let argv_file = tmp.path().join("argv.txt");
@@ -4752,6 +4882,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
 
     #[cfg(unix)]
     #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn test_run_native_rejects_missing_sat_proof_file() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ay = write_solver_script(&tmp, "fake-ay-no-proof.sh", "ay no proof", "unsat");
@@ -4865,6 +4996,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
 
     #[cfg(unix)]
     #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn artifact_plan_uses_absent_path_in_private_staging_directory() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -4903,6 +5035,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
     }
 
     #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn staging_cleanup_never_follows_a_post_quarantine_replacement() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut plan =
@@ -4925,6 +5058,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
     }
 
     #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn staging_cleanup_preserves_a_pre_quarantine_directory_replacement() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut plan =
@@ -4953,6 +5087,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
     }
 
     #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn repeated_runs_publish_only_the_selected_private_proof() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut runs = Vec::new();
@@ -5014,6 +5149,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
     }
 
     #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn proof_publication_never_clobbers_concurrently_created_destination() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut plan =
@@ -5038,6 +5174,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
 
     #[cfg(unix)]
     #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn failed_cleanup_preserves_replaced_solver_work_path() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut plan =
@@ -5076,6 +5213,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
 
     #[cfg(unix)]
     #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn failed_cleanup_preserves_replaced_published_proof_path() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut plan =
@@ -5107,6 +5245,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
     }
 
     #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn failed_cleanup_preserves_authenticated_published_proof() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut plan =
@@ -5130,6 +5269,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
 
     #[cfg(unix)]
     #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn run_native_cleanup_preserves_planted_public_proof_destination() {
         let temp = tempfile::tempdir().expect("tempdir");
         let benchmark = temp.path().join("planted.cnf");
@@ -5175,6 +5315,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
 
     #[cfg(unix)]
     #[test]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn run_native_enforces_hard_proof_size_limit() {
         let temp = tempfile::tempdir().expect("tempdir");
         let ay = write_oversized_artifact_solver_script(&temp);
@@ -5232,6 +5373,12 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn test_run_native_multiple_references_populate_references_and_legacy_fields() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ay = write_solver_script(&tmp, "fake-ay.sh", "ay test", "sat");
@@ -5311,6 +5458,12 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn test_run_native_stamps_run_class_unverified_with_host_fingerprint() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ay = write_solver_script(&tmp, "fake-ay.sh", "ay test", "sat");
@@ -5410,6 +5563,12 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn test_results_json_omits_new_fields_when_not_requested() {
         // Backwards compatibility: an invocation without --reference-solver
         // and without --run-class must serialize the same top-level keys as
@@ -5451,6 +5610,12 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn test_results_json_shape_with_references_and_run_class() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ay = write_solver_script(&tmp, "fake-ay.sh", "ay test", "sat");

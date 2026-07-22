@@ -194,3 +194,61 @@ theorem ex_charAt_cat_via_principle : charAt (cat sAB sC) 1 = charAt sAB 1 :=
 theorem ex_charAt_value : charAt (cat sAB sC) 1 = some 66 := by decide
 
 end AySoundness.StringThy
+
+/-! ## `str.at` — the single-character positional substring.
+
+The SMT `str.at s i` returns a STRING of length 0 or 1 (the 1-char substring at
+position `i`, or the empty string if `i` is out of range). It is *not* the
+codepoint read `charAt` — it re-wraps the read into a length-≤1 string. We model
+it as `(s[i]?).toList` over `StringThy.Str = List Nat`. The `str.len (str.at s i)
+≤ 1` fact ay emits (which superficially looked like a fabricated bare premise)
+is exactly this verified tautology, and the conflict corollaries below are the
+`¬(…)`-shaped literals the emitter grounds in. -/
+namespace AySoundness.StrAt
+open StringThy
+
+/-- `str.at` at position `i`: the 1-char (or empty) substring, modelled as the
+    length-≤1 string `(s[i]?).toList`. -/
+def strAt (s : Str) (i : Nat) : Str := (s[i]?).toList
+
+/-- **`str.at` length bound.** `str.len (str.at s i) ≤ 1` — always: the read is
+    `none` (empty, length 0) out of range or `some c` (length 1) in range. -/
+theorem len_strAt_le_one (s : Str) (i : Nat) : len (strAt s i) ≤ 1 := by
+  unfold strAt len
+  cases s[i]? <;> simp
+
+/-- Conflict form: asserting `str.len (str.at s i) ≥ 2` (i.e. `> 1`) is unsat. -/
+theorem strAt_len_ge_two_conflict (s : Str) (i : Nat) : ¬ (len (strAt s i) ≥ 2) := by
+  have h := len_strAt_le_one s i
+  omega
+
+/-- **`str.at` length-equality conflict.** For any `n ≥ 2`, the literal
+    `str.len (str.at s i) = n` is unsatisfiable — the exact shape ay grounds in
+    for `str.len (str.at t (select a i)) = 3` (the `soundness_fuzz_blitz` /
+    `soundness_fuzz_xtheory` false-`sat` regressions). -/
+theorem strAt_len_eq_conflict (s : Str) (i n : Nat) (hn : n ≥ 2) :
+    ¬ (len (strAt s i) = n) := by
+  have h := len_strAt_le_one s i
+  omega
+
+/-! ### Concrete, kernel-checked, NON-vacuous `str.at` witnesses. -/
+
+/-- Concrete in-range read: `str.at "AB" 1 = "B" = [66]` — length exactly `1`,
+    so the read genuinely wraps a real character, and `len_strAt_le_one` is not
+    vacuous. -/
+theorem ex_strAt_value : strAt sAB 1 = [66] := by decide
+
+/-- Concrete out-of-range read: `str.at "AB" 5 = ε` — length `0`. -/
+theorem ex_strAt_oob : strAt sAB 5 = empty := by decide
+
+/-- Concrete `len = 3` conflict on a ground string: `str.len (str.at "AB" 1) = 3`
+    is false (the true length is `1 ≤ 1 < 3`), the ground instance of the
+    `soundness_fuzz` false-`sat` conflict. -/
+theorem ex_strAt_len_three_conflict : ¬ (len (strAt sAB 1) = 3) := by decide
+
+/-- The same via the general principle (not just `decide`), with `3 ≥ 2`
+    discharged by `decide`. -/
+theorem ex_strAt_len_three_via_principle : ¬ (len (strAt sAB 1) = 3) :=
+  strAt_len_eq_conflict sAB 1 3 (by decide)
+
+end AySoundness.StrAt

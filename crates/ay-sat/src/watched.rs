@@ -1460,6 +1460,7 @@ impl WatchListView<'_> {
 
     /// Get the raw clause value at watcher index (includes BINARY_FLAG).
     #[inline]
+    #[allow(dead_code)] // immutable raw access is used only by diagnostic/test lanes
     pub(crate) fn clause_raw(&self, i: usize) -> u64 {
         self.lists.clause_raw(self.lit, i)
     }

@@ -12,7 +12,7 @@ use ay_core::{AletheRule, Proof, ProofId, ProofStep, TermId, TermStore, TheoryLe
 
 use crate::checker::{
     ensure_terminal_empty_clause, quantifier, validate_step, validate_step_with_datatypes,
-    ProofCheckError,
+    ExtDiffRegistry, ProofCheckError,
 };
 use crate::partial::PartialProofCheck;
 
@@ -323,9 +323,53 @@ pub fn check_proof_strict_with_datatypes_and_selectors(
     dt_decls: Option<&[(String, Vec<String>)]>,
     ctor_selectors: Option<&[(String, Vec<String>)]>,
 ) -> Result<ProofQuality, ProofCheckError> {
+    check_proof_strict_with_context(proof, terms, dt_decls, ctor_selectors, None)
+}
+
+/// As [`check_proof_strict_with_datatypes_and_selectors`], but additionally
+/// given the PROBLEM's assertion terms so strict mode can certify
+/// `TheoryLemmaKind::ArrayExtensionality` lemmas.
+///
+/// The Skolemized extensionality clause
+/// `(cl (= a b) (not (= (select a k) (select b k))))` is not a tautology — it
+/// is sound only because `k` is a fresh witness minted for exactly `(a, b)`.
+/// Deciding that needs two things the proof alone does not carry: the
+/// `array_ext_diff_intro` steps that record which pair each witness was minted
+/// for, and the problem's own symbols, against which the checker VERIFIES
+/// freshness rather than taking it on faith. `problem_assertions` supplies the
+/// second; passing `None` is equivalent to
+/// [`check_proof_strict_with_datatypes_and_selectors`] and keeps extensionality
+/// fail-closed.
+///
+/// `problem_assertions` must be the AUTHORED assertions, not the solver-time
+/// assertion stack (which also holds the injected extensionality axioms and
+/// would make every witness look non-fresh). A superset is always safe: extra
+/// terms can only make the freshness test stricter.
+///
+/// # Errors
+///
+/// Returns the first [`ProofCheckError`] any step fails on, or a registry
+/// construction failure (a malformed, duplicated, non-fresh, or
+/// self-referential diff-witness introduction).
+pub fn check_proof_strict_with_context(
+    proof: &Proof,
+    terms: &TermStore,
+    dt_decls: Option<&[(String, Vec<String>)]>,
+    ctor_selectors: Option<&[(String, Vec<String>)]>,
+    problem_assertions: Option<&[TermId]>,
+) -> Result<ProofQuality, ProofCheckError> {
     if proof.steps.is_empty() {
         return Err(ProofCheckError::EmptyProof);
     }
+
+    // Built ONCE, before any step is validated: construction is where the
+    // whole-proof conditions (bound once, fresh against the problem, not
+    // self-referential) are enforced, so a bad introduction fails the check
+    // even when no lemma ever cites it.
+    let ext_diff = match problem_assertions {
+        Some(assertions) => Some(ExtDiffRegistry::collect(proof, terms, assertions)?),
+        None => None,
+    };
 
     let mut quality = ProofQuality::default();
     let mut derived_clauses: Vec<Option<Vec<TermId>>> = Vec::with_capacity(proof.steps.len());
@@ -340,6 +384,7 @@ pub fn check_proof_strict_with_datatypes_and_selectors(
             true,
             dt_decls,
             ctor_selectors,
+            ext_diff.as_ref(),
             None,
         )?;
     }
@@ -347,6 +392,51 @@ pub fn check_proof_strict_with_datatypes_and_selectors(
     quality.total_steps = proof.steps.len() as u32;
     ensure_terminal_empty_clause(&derived_clauses)?;
     Ok(quality)
+}
+
+/// Fail-closed re-validation of every `TheoryLemmaKind::ArrayExtensionality`
+/// step in `proof` against the problem's assertions.
+///
+/// The `--self-check` gate consults the PARTIAL (non-strict) checker, which
+/// admits theory lemmas as axioms on the strength of their recorded kind. That
+/// is fine for kinds whose clause is a tautology, but extensionality is not one
+/// — relabelling a clause `ArrayExtensionality` would otherwise be enough to
+/// ship it. This runs the provenance half of the check independently:
+///
+///  * every diff-witness introduction is well formed, bound ONCE, and names a
+///    symbol that occurs in NO problem assertion and NO `assume` of the proof;
+///  * every extensionality lemma matches the exact schema and cites the pair
+///    its own witness was introduced for.
+///
+/// Returns `Ok(())` for a proof with no extensionality content at all.
+///
+/// # Errors
+///
+/// Returns the first [`ProofCheckError`] describing why the extensionality
+/// content cannot be certified; the caller must degrade the verdict.
+pub fn validate_array_extensionality_provenance(
+    proof: &Proof,
+    terms: &TermStore,
+    problem_assertions: &[TermId],
+) -> Result<(), ProofCheckError> {
+    let registry = ExtDiffRegistry::collect(proof, terms, problem_assertions)?;
+    for (idx, step) in proof.steps.iter().enumerate() {
+        let ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::ArrayExtensionality,
+            clause,
+            ..
+        } = step
+        else {
+            continue;
+        };
+        crate::checker::validate_array_extensionality_for_provenance(
+            terms,
+            ProofId(idx as u32),
+            clause,
+            Some(&registry),
+        )?;
+    }
+    Ok(())
 }
 
 fn classify_step(step: &ProofStep, quality: &mut ProofQuality) {

@@ -830,6 +830,75 @@ fn test_closed_identity_classes_emit_firewall_lean() {
 }
 
 #[test]
+fn test_qf_dt_tester_exclusion_emits_firewall_lean() {
+    // bench `soundness_qf_dt_derived_terms/bug1_tester_excl_uf_app.smt2`:
+    // two DISTINCT constructor testers on the SAME opaque term `(f x)` — no value
+    // is headed by two constructors. End-to-end through the QF_UFDT pipeline.
+    let input = r#"(set-option :produce-proofs true)(set-logic QF_UFDT)
+        (declare-datatype Enum ((c0) (c1) (c2)))
+        (declare-fun f (Enum) Enum)(declare-const x Enum)
+        (assert ((_ is c0) (f x)))(assert ((_ is c1) (f x)))(check-sat)"#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
+    let fw = emit_firewall_lean(&exec, exec.last_proof.as_ref().unwrap());
+    let f = fw
+        .iter()
+        .find(|f| f.contains("DtTesterExcl_"))
+        .expect("expected a DtTesterExcl firewall file");
+    assert!(f.contains("firewall_combined_unsat"));
+    assert!(f.contains("| k0 | k1 | k2"));
+}
+
+#[test]
+fn test_qf_dt_exhaustiveness_emits_firewall_lean() {
+    // bench `qf_dt/v2l60078.cvc.smt2` core conflict: over `list` (cons|null),
+    // `(not ((_ is cons) (cdr x4)))` AND `(cdr x4) != null` — a value that is
+    // neither constructor of a 2-constructor datatype. End-to-end through QF_DT.
+    let input = r#"(set-option :produce-proofs true)(set-logic QF_DT)
+        (declare-datatypes ((nat 0)(list 0)(tree 0)) (((succ (pred nat)) (zero))
+        ((cons (car tree) (cdr list)) (null))
+        ((node (children list)) (leaf (data nat)))))
+        (declare-fun x2 () nat)(declare-fun x3 () list)(declare-fun x4 () list)
+        (declare-fun x5 () tree)(declare-fun x6 () tree)
+        (assert (and (and (and (and (and (= (node x3) x5) (not ((_ is cons) (cdr x4)))) ((_ is node) x6)) ((_ is cons) (cons (leaf (pred x2)) x4))) (not (= null (cdr x4)))) (not ((_ is succ) zero))))
+        (check-sat)"#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
+    let fw = emit_firewall_lean(&exec, exec.last_proof.as_ref().unwrap());
+    let f = fw
+        .iter()
+        .find(|f| f.contains("DtExhaust_"))
+        .expect("expected a DtExhaust firewall file");
+    assert!(f.contains("firewall_combined_unsat"));
+    assert!(f.contains("| k0 | k1"));
+}
+
+#[test]
+fn test_qf_dt_selector_over_matching_ctor_emits_firewall_lean() {
+    // bench `datatype_simple.smt2`: `x = Some(0x2a)` with `value(x) ≠ 0x2a` is the
+    // selector-over-matching-constructor collapse. The proof-step `DtSel`
+    // projection emitter does NOT fire here (the residual routes through a
+    // BV-constant compare), so the from-parsed `DtSelCtor` emitter reconstructs it.
+    let input = r#"(set-option :produce-proofs true)(set-logic QF_DT)
+        (declare-datatype Option_bv64 ((None_Option_bv64) (Some_Option_bv64 (value (_ BitVec 64)))))
+        (declare-fun x () Option_bv64)
+        (assert (= x (Some_Option_bv64 #x000000000000002a)))
+        (assert (not (= (value x) #x000000000000002a)))(check-sat)"#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
+    let fw = emit_firewall_lean(&exec, exec.last_proof.as_ref().unwrap());
+    let f = fw
+        .iter()
+        .find(|f| f.contains("DtSelCtor_"))
+        .expect("expected a DtSelCtor selector-over-constructor firewall file");
+    assert!(f.contains("firewall_combined_unsat"));
+    assert!(f.contains("def sel : D -> Int"));
+}
+
+#[test]
 fn test_qf_ite_same_collapse_is_strict_checkable() {
     // `(not (= (ite p a a) a))` — an if-then-else with identical branches folds to
     // `false` during elaboration (the builder reduces `(ite p a a) → a`),
@@ -2546,5 +2615,340 @@ fn qf_s_symbolic_regex_intersection_that_is_non_empty_stays_sat() {
         exec.execute_all(&commands).unwrap(),
         vec!["sat"],
         "an intersection with a member must stay SAT"
+    );
+}
+
+#[test]
+fn qf_ax_store_flat_refutation_self_certifies_from_authored_assertions() {
+    // The QF_AX `storecomm_*_sf_*` family, verbatim in shape: two store chains
+    // build the same array by permuted writes at pairwise-distinct indices, and
+    // the problem asserts the two endpoints differ.
+    //
+    // `substitute_store_flat_equalities` expands every defined array name into
+    // its store chain and then DROPS the defining equalities (they have become
+    // `true`), so the exported refutation assumed the fully expanded
+    // `(not (= (store (store a1 i1 e1) i2 e2) (store (store a1 i2 e2) i1 e1)))`
+    // — a preprocessing artifact, not a problem premise. The #8821 authority
+    // gate refused to publish that proof and `--self-check` degraded the UNSAT
+    // to `unknown`. The substitution bridge now walks back down the chain with
+    // `trans` through each authored defining equality plus congruence on the
+    // store's array argument, so every leaf is an authored assertion again.
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_AX)
+        (declare-sort Index 0)
+        (declare-sort Element 0)
+        (declare-fun a1 () (Array Index Element))
+        (declare-fun b1 () (Array Index Element))
+        (declare-fun b2 () (Array Index Element))
+        (declare-fun c1 () (Array Index Element))
+        (declare-fun c2 () (Array Index Element))
+        (declare-fun i1 () Index)
+        (declare-fun i2 () Index)
+        (declare-fun e1 () Element)
+        (declare-fun e2 () Element)
+        (assert (= b1 (store a1 i1 e1)))
+        (assert (= b2 (store b1 i2 e2)))
+        (assert (= c1 (store a1 i2 e2)))
+        (assert (= c2 (store c1 i1 e1)))
+        (assert (not (= i1 i2)))
+        (assert (not (= b2 c2)))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
+
+    let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
+
+    // Every `assume` must be an AUTHORED assertion — this is exactly what the
+    // #8821 gate checks, asserted here directly so a regression fails loudly
+    // rather than silently degrading to `unknown`.
+    let authored = exec.proof_original_problem_assertions();
+    for step in &proof.steps {
+        if let ProofStep::Assume(term) = step {
+            assert!(
+                authored.contains(term),
+                "proof assumes a non-authored term {term:?}"
+            );
+        }
+    }
+    assert!(
+        ay_proof::validate_reachable_assumes_in_problem_scope(proof, &authored).is_ok(),
+        "the rebuilt proof must clear the #8821 authority gate"
+    );
+
+    let text = exec.get_proof();
+    assert!(
+        !text.contains(":rule trust"),
+        "the store-flat refutation must not fall back to trust; got:\n{text}"
+    );
+    assert!(
+        text.contains(":rule trans"),
+        "expected the chain-walking `trans` bridge; got:\n{text}"
+    );
+    assert!(
+        exec.unsat_proof_self_certified(),
+        "the store-flat refutation must now self-certify"
+    );
+}
+
+// ===========================================================================
+// Array extensionality diff-witness certification (#ext-diff-cert).
+//
+// The injected axiom `(= a b) ∨ ¬(= (select a k) (select b k))` is NOT a
+// tautology, so promotion is only sound when the proof also records what `k`
+// is. Each acceptance test below has a twin that breaks exactly one provenance
+// condition and asserts the gate REJECTS.
+// ===========================================================================
+
+/// A stand-in parsed AST: only the assertion COUNT matters for the
+/// parsed-prefix boundary these tests exercise.
+fn parsed_placeholder() -> ay_frontend::command::Term {
+    ay_frontend::command::Term::Symbol("problem".to_string())
+}
+
+/// `(not (= a b))` over two array constants, plus the extensionality axiom the
+/// eager array lane injects for that pair, in the `Generic`/trust shape
+/// `push_array_axiom_assertion_site` records.
+fn ext_axiom_fixture() -> (Executor, Proof, TermId, TermId, TermId) {
+    let mut exec = Executor::new();
+    let array_sort = Sort::array(Sort::Int, Sort::Int);
+    let a = exec.ctx.terms.mk_var("ext_a", array_sort.clone());
+    let b = exec.ctx.terms.mk_var("ext_b", array_sort);
+    let k = exec.ctx.terms.mk_var("__ext_diff_1_2", Sort::Int);
+    let eq_ab = exec.ctx.terms.mk_eq(a, b);
+    let not_eq_ab = exec.ctx.terms.mk_not(eq_ab);
+    let sel_a = exec.ctx.terms.mk_select(a, k);
+    let sel_b = exec.ctx.terms.mk_select(b, k);
+    let sel_eq = exec.ctx.terms.mk_eq(sel_a, sel_b);
+    let not_sel_eq = exec.ctx.terms.mk_not(sel_eq);
+    let ext_axiom = exec.ctx.terms.mk_or(vec![eq_ab, not_sel_eq]);
+
+    // The problem asserted the disequality; the extensionality axiom is the
+    // SOLVER's own injection, appended AFTER the problem's parsed prefix (the
+    // boundary `proof_original_problem_assertions` reads).
+    exec.ctx
+        .add_assertion_with_parsed(not_eq_ab, parsed_placeholder());
+    exec.ctx.assertions.push(ext_axiom);
+
+    let mut proof = Proof::new();
+    proof.add_assume(not_eq_ab, None);
+    proof.add_theory_lemma("array", vec![ext_axiom]);
+    (exec, proof, a, b, k)
+}
+
+#[test]
+fn injected_extensionality_axiom_is_promoted_with_a_witness_introduction() {
+    let (mut exec, mut proof, a, b, k) = ext_axiom_fixture();
+    exec.promote_array_extensionality_axioms(&mut proof);
+
+    assert!(
+        proof
+            .steps
+            .iter()
+            .all(|step| !matches!(step, ProofStep::TheoryLemma { kind, .. } if kind.is_trust())),
+        "the injected extensionality axiom must stop being a trust lemma"
+    );
+    assert_eq!(
+        proof
+            .steps
+            .iter()
+            .filter(|step| matches!(
+                step,
+                ProofStep::TheoryLemma {
+                    kind: TheoryLemmaKind::ArrayExtensionality,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    let intro = proof
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            ProofStep::Step {
+                rule: AletheRule::ArrayExtDiffIntro,
+                clause,
+                premises,
+                args,
+            } => Some((clause.clone(), premises.clone(), args.clone())),
+            _ => None,
+        })
+        .expect("promotion must append a witness introduction");
+    assert!(
+        intro.0.is_empty() && intro.1.is_empty(),
+        "the introduction is a definition: no clause, no premises"
+    );
+    assert_eq!(intro.2, vec![k, a, b]);
+
+    exec.unsat_proof_extensionality_certified(&proof)
+        .then_some(())
+        .expect("a freshly introduced, once-bound witness must certify");
+}
+
+#[test]
+fn promoted_extensionality_is_rejected_when_the_witness_is_not_fresh() {
+    // SOUNDNESS CRUX. The problem itself constrains `__ext_diff_1_2`, so the
+    // clause is no longer a conservative extension and the gate must refuse it
+    // even though the promotion produced a perfectly-shaped introduction.
+    let (mut exec, mut proof, _a, _b, k) = ext_axiom_fixture();
+    let zero = exec.ctx.terms.mk_int(BigInt::from(0));
+    let pinned = exec.ctx.terms.mk_eq(k, zero);
+    // The pinning constraint is a PROBLEM assertion, so it extends the parsed
+    // prefix; the injected axiom stays after it.
+    let injected = exec.ctx.assertions.pop().expect("injected axiom");
+    exec.ctx
+        .add_assertion_with_parsed(pinned, parsed_placeholder());
+    exec.ctx.assertions.push(injected);
+
+    exec.promote_array_extensionality_axioms(&mut proof);
+    assert!(
+        !exec.unsat_proof_extensionality_certified(&proof),
+        "a witness the problem also constrains must not certify"
+    );
+}
+
+#[test]
+fn promoted_extensionality_is_rejected_when_the_introduction_names_another_pair() {
+    let (mut exec, mut proof, a, _b, k) = ext_axiom_fixture();
+    let c = exec
+        .ctx
+        .terms
+        .mk_var("ext_c", Sort::array(Sort::Int, Sort::Int));
+    exec.promote_array_extensionality_axioms(&mut proof);
+
+    // Tamper: rebind the witness to a different array pair.
+    for step in &mut proof.steps {
+        if let ProofStep::Step {
+            rule: AletheRule::ArrayExtDiffIntro,
+            args,
+            ..
+        } = step
+        {
+            *args = vec![k, a, c];
+        }
+    }
+    assert!(
+        !exec.unsat_proof_extensionality_certified(&proof),
+        "an introduction for a different pair must not certify the clause"
+    );
+}
+
+#[test]
+fn qf_ax_store_flat_permutation_that_is_consistent_stays_sat() {
+    // The soundness twin: the SAME store chains, but WITHOUT the
+    // `(not (= i1 i2))` premise the permutation argument needs. The two
+    // endpoints may legitimately differ (take `i1 = i2`, `e1 != e2`), so the
+    // bridge must not help manufacture a refutation.
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_AX)
+        (declare-sort Index 0)
+        (declare-sort Element 0)
+        (declare-fun a1 () (Array Index Element))
+        (declare-fun b1 () (Array Index Element))
+        (declare-fun b2 () (Array Index Element))
+        (declare-fun c1 () (Array Index Element))
+        (declare-fun c2 () (Array Index Element))
+        (declare-fun i1 () Index)
+        (declare-fun i2 () Index)
+        (declare-fun e1 () Element)
+        (declare-fun e2 () Element)
+        (assert (= b1 (store a1 i1 e1)))
+        (assert (= b2 (store b1 i2 e2)))
+        (assert (= c1 (store a1 i2 e2)))
+        (assert (= c2 (store c1 i1 e1)))
+        (assert (not (= b2 c2)))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    assert_ne!(
+        exec.execute_all(&commands).unwrap(),
+        vec!["unsat"],
+        "a satisfiable store-flat permutation must never be refuted"
+    );
+}
+
+#[test]
+fn promoted_extensionality_is_rejected_when_the_introduction_is_removed() {
+    let (mut exec, mut proof, _a, _b, _k) = ext_axiom_fixture();
+    exec.promote_array_extensionality_axioms(&mut proof);
+    proof.steps.retain(|step| {
+        !matches!(
+            step,
+            ProofStep::Step {
+                rule: AletheRule::ArrayExtDiffIntro,
+                ..
+            }
+        )
+    });
+    assert!(
+        !exec.unsat_proof_extensionality_certified(&proof),
+        "an extensionality lemma with no introduction must not certify"
+    );
+}
+
+#[test]
+fn one_witness_shared_by_two_array_pairs_is_never_promoted() {
+    // The solver should never mint one witness for two pairs; if it somehow
+    // did, no single introduction could be true, so NEITHER axiom is promoted
+    // and both stay trust.
+    let (mut exec, mut proof, a, _b, k) = ext_axiom_fixture();
+    let c = exec
+        .ctx
+        .terms
+        .mk_var("ext_c", Sort::array(Sort::Int, Sort::Int));
+    let eq_ac = exec.ctx.terms.mk_eq(a, c);
+    let sel_a = exec.ctx.terms.mk_select(a, k);
+    let sel_c = exec.ctx.terms.mk_select(c, k);
+    let sel_eq = exec.ctx.terms.mk_eq(sel_a, sel_c);
+    let not_sel_eq = exec.ctx.terms.mk_not(sel_eq);
+    let second_axiom = exec.ctx.terms.mk_or(vec![eq_ac, not_sel_eq]);
+    exec.ctx.assertions.push(second_axiom);
+    proof.add_theory_lemma("array", vec![second_axiom]);
+
+    exec.promote_array_extensionality_axioms(&mut proof);
+    assert!(
+        proof.steps.iter().all(|step| !matches!(
+            step,
+            ProofStep::Step {
+                rule: AletheRule::ArrayExtDiffIntro,
+                ..
+            }
+        )),
+        "a witness shared across pairs must produce no introduction at all"
+    );
+    assert_eq!(
+        proof
+            .steps
+            .iter()
+            .filter(|step| matches!(step, ProofStep::TheoryLemma { kind, .. } if kind.is_trust()))
+            .count(),
+        2,
+        "both axioms must stay uncertified trust lemmas"
+    );
+}
+
+#[test]
+fn a_problem_asserted_extensionality_shaped_clause_is_never_promoted() {
+    // Promotion is limited to assertions the SOLVER injected. A clause of the
+    // same shape written by the USER is a problem premise, not a Skolem
+    // definition, and must keep its `assume` provenance.
+    let (mut exec, _proof, _a, _b, _k) = ext_axiom_fixture();
+    let ext_axiom = exec.ctx.assertions[1];
+    exec.ctx.assertions.clear();
+    exec.ctx
+        .add_assertion_with_parsed(ext_axiom, parsed_placeholder());
+    let mut proof = Proof::new();
+    proof.add_assume(ext_axiom, None);
+
+    exec.promote_array_extensionality_axioms(&mut proof);
+    assert!(
+        matches!(proof.steps.as_slice(), [ProofStep::Assume(_)]),
+        "a problem-asserted clause must stay an assume, got {:?}",
+        proof.steps
     );
 }

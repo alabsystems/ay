@@ -2079,7 +2079,7 @@ fn rational_ceil_to_i64(value: &BigRational) -> Option<i128> {
 mod tests {
     use super::*;
     use crate::types::{PbConstraint, PbLit, PbObjective, PbRel, PbTerm};
-    use ay_test_support::env::{lock_env, ScopedEnvVar};
+    use ay_test_support::env::with_serialized_env_vars;
 
     fn lit(var: u32) -> PbLit {
         PbLit {
@@ -3691,16 +3691,16 @@ mod tests {
 
         // Drive ay's GATED PRODUCTION path: with AY_PB_FARKAS_CERT set, this is the
         // exact wiring `native_oll` uses — build the cert from the dual point in hand,
-        // then `check_slack` it. Serialized + restore-on-exit via the workspace
-        // env choke point (env is process-global).
-        let _env_lock = lock_env();
-        let _farkas_cert = ScopedEnvVar::set("AY_PB_FARKAS_CERT", "1");
-        let result = lp_lower_bound_with_cert(
-            &objective,
-            &instance.constraints,
-            instance.num_vars,
-            &never_stop,
-        );
+        // then `check_slack` it. (Env is process-global; serialized + restored via
+        // the one workspace env choke point.)
+        let result = with_serialized_env_vars(&[("AY_PB_FARKAS_CERT", "1")], || {
+            lp_lower_bound_with_cert(
+                &objective,
+                &instance.constraints,
+                instance.num_vars,
+                &never_stop,
+            )
+        });
 
         let (bound, valid, outcome) = result.expect("certified bound");
         assert_eq!(
@@ -3814,8 +3814,8 @@ mod tests {
         // End-to-end on a REAL OPT-LIN .opb instance through the gated emit path:
         // enable AY_PB_FARKAS_CERT, parse the instance, run lp_lower_bound_with_cert,
         // and confirm the checker VERIFIED the certificate for the real LP bound.
-        // (Env vars are process-global; serialized + restore-on-exit via the
-        // workspace env choke point.)
+        // (Env vars are process-global; this is the only test that sets this flag,
+        // and it restores the prior value.)
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/instances/weighted_opt.opb"
@@ -3824,15 +3824,15 @@ mod tests {
         let instance = crate::parser::parse_opb(&text).expect("parse OPB");
         let objective = instance.objective.clone().expect("instance has objective");
 
-        let _env_lock = lock_env();
-        let _farkas_cert = ScopedEnvVar::set("AY_PB_FARKAS_CERT", "1");
-
-        let result = lp_lower_bound_with_cert(
-            &objective,
-            &instance.constraints,
-            instance.num_vars,
-            &never_stop,
-        );
+        // Serialized + restored via the one workspace env choke point.
+        let result = with_serialized_env_vars(&[("AY_PB_FARKAS_CERT", "1")], || {
+            lp_lower_bound_with_cert(
+                &objective,
+                &instance.constraints,
+                instance.num_vars,
+                &never_stop,
+            )
+        });
 
         let (bound, cert, outcome) = result.expect("certified bound");
         assert_eq!(

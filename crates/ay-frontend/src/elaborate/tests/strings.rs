@@ -178,8 +178,20 @@ fn test_elaborate_regex_builtins() {
 
 #[test]
 fn indexed_regex_repetition_rejects_invalid_bounds_and_operand_sort() {
+    // SMT-LIB 2.6: `((_ re.loop i n) e)` denotes `⋃_{k=i}^{n} L(e)^k`, so
+    // `i > n` is an EMPTY index set — a well-formed term denoting the empty
+    // language, NOT an invalid constant. It must ELABORATE (and fold to
+    // `re.none`); rejecting it refused a conformant input
+    // (#regex-loop-degenerate-bounds).
+    {
+        let input = "(assert (str.in_re \"x\" ((_ re.loop 3 2) (str.to_re \"a\"))))";
+        let commands = parse(input).expect("degenerate re.loop parses");
+        let mut ctx = Context::new();
+        ctx.process_command(&commands[0])
+            .expect("a degenerate re.loop bound is the EMPTY LANGUAGE, not an error");
+    }
+    // Operand-sort violations are still genuine elaboration errors.
     for input in [
-        "(assert (str.in_re \"x\" ((_ re.loop 3 2) (str.to_re \"a\"))))",
         "(assert (str.in_re \"x\" ((_ re.loop 1 2) 7)))",
         "(assert (str.in_re \"x\" ((_ re.^ 2) 7)))",
     ] {

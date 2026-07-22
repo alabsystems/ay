@@ -477,7 +477,7 @@ pub(crate) fn prepare_private_store_path(path: &Path, label: &str) -> Result<Pre
         }
     }
     let identity = StoreFileIdentity::from_metadata(&descriptor_metadata);
-    let mut prepared = PreparedStorePath {
+    let prepared = PreparedStorePath {
         resolved,
         label: label.to_string(),
         reservation,
@@ -489,9 +489,11 @@ pub(crate) fn prepare_private_store_path(path: &Path, label: &str) -> Result<Pre
     };
     prepared.verify_visible_reservation()?;
     #[cfg(target_os = "linux")]
-    {
+    let prepared = {
+        let mut prepared = prepared;
         prepared.descriptors_before_sqlite_open = prepared.matching_linux_descriptors()?;
-    }
+        prepared
+    };
     Ok(prepared)
 }
 
@@ -1159,7 +1161,15 @@ impl SharedWatchdogServer {
         responsive
     }
 
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        any(
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "haiku",
+            all(target_os = "linux", not(target_env = "uclibc")),
+        ),
+    ))]
     fn process_id(&self) -> Option<u32> {
         self.process
             .lock()
@@ -2038,7 +2048,15 @@ impl PlannedResources {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        any(
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "haiku",
+            all(target_os = "linux", not(target_env = "uclibc")),
+        ),
+    ))]
     fn watchdog_server_pid(&self) -> Option<u32> {
         self.watchdog_server.process_id()
     }
@@ -2080,6 +2098,21 @@ enum UnreapedChildState {
     Stopped(nix::sys::signal::Signal),
     Exited,
 }
+
+// On platforms without `waitid(..., WNOWAIT)`, observation fails closed before
+// producing a state. Keep an exhaustive compile-time witness so all variants
+// remain type-checked on those targets as well as on the supported targets.
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "haiku",
+    all(target_os = "linux", not(target_env = "uclibc")),
+)))]
+const UNREAPED_CHILD_STATE_TYPE_WITNESS: [UnreapedChildState; 3] = [
+    UnreapedChildState::Running,
+    UnreapedChildState::Stopped(nix::sys::signal::Signal::SIGSTOP),
+    UnreapedChildState::Exited,
+];
 
 #[cfg(any(
     target_os = "android",
@@ -2127,9 +2160,33 @@ fn observe_child_unreaped(
     _include_stopped: bool,
     label: &str,
 ) -> Result<UnreapedChildState> {
+    let _ = UNREAPED_CHILD_STATE_TYPE_WITNESS;
     Err(BenchError::msg(format!(
         "{label}: safe unreaped child observation is unavailable on this platform"
     )))
+}
+
+#[cfg(all(
+    test,
+    unix,
+    not(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc")),
+    )),
+))]
+#[test]
+fn unsupported_target_rejects_unreaped_child_observation() {
+    let mut child = std::process::Command::new("/usr/bin/true")
+        .spawn()
+        .expect("spawn policy probe");
+    let error = observe_child_unreaped(&child, false, "target-policy regression")
+        .expect_err("unsupported targets must fail closed");
+    assert!(error
+        .to_string()
+        .contains("safe unreaped child observation is unavailable"));
+    child.wait().expect("reap policy probe");
 }
 
 fn wait_for_child_exit_unreaped(child: &Child, timeout: Duration, label: &str) -> Result<bool> {
@@ -2755,6 +2812,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn aggregate_lease_death_before_spawn_fails_closed() {
         let temp = tempfile::tempdir().expect("tempdir");
         let script = temp.path().join("short-lived-lease.py");
@@ -2784,6 +2847,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn aggregate_lease_death_during_run_kills_guarded_child() {
         let temp = tempfile::tempdir().expect("tempdir");
         let script = temp.path().join("persistent-lease.py");
@@ -2890,6 +2959,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn guarded_capture_arms_before_target_and_captures_bounded_output() {
         let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 10_000);
         let output = resources
@@ -2907,6 +2982,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn concurrent_children_share_one_campaign_watchdog_server() {
         let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 10_000);
         let mut first_command = resources.external_command("/bin/sh");
@@ -2993,6 +3074,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn missing_campaign_watchdog_heartbeat_kills_target() {
         let temp = tempfile::tempdir().expect("tempdir");
         let fake_server = temp.path().join("watch-server.py");
@@ -3092,6 +3179,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn campaign_watchdog_preserves_zero_grace_memout_enforcement() {
         let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 16);
         let mut command = resources.external_command("python3");

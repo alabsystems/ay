@@ -215,7 +215,7 @@ fn prepare_sorted_abstraction(smt: &str) -> Option<CataAbstraction> {
     // Generous obligation budget (the spike is offline, not competition-timed).
     if !abstraction.discharge_obligations(
         Duration::from_secs(5),
-        Some(Instant::now() + Duration::from_secs(120)),
+        Some(Instant::now() + Duration::from_mins(2)),
     ) {
         return None;
     }
@@ -664,7 +664,7 @@ fn nat_peano_spike() {
         };
         let discharged = abstraction.discharge_obligations(
             Duration::from_secs(5),
-            Some(Instant::now() + Duration::from_secs(60)),
+            Some(Instant::now() + Duration::from_mins(1)),
         );
         if !discharged {
             eprintln!("{level:<3} {pool_str:<28} OBLIGATIONS-UNDISCHARGED (fail-closed)");

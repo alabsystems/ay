@@ -2,6 +2,12 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
+// The production resource-admission guard deliberately fails closed without
+// Linux procfs. These success-path end-to-end tests therefore run only where
+// their required process-table capability exists; Python policy tests retain
+// explicit coverage of the unsupported-target refusal.
+#![cfg(target_os = "linux")]
+
 //! End-to-end integration tests for `ay-bisect`.
 //!
 //! We do NOT require the real `ay` binary to be present. Instead we build a

@@ -520,13 +520,24 @@ impl Context {
                         "re.loop requires 2 indices and 1 argument".to_string(),
                     ));
                 }
-                if indices[0] > indices[1] {
-                    return Err(ElaborateError::InvalidConstant(format!(
-                        "re.loop lower bound {} exceeds upper bound {}",
-                        indices[0], indices[1]
-                    )));
-                }
                 self.expect_arg_sort(arg_ids[0], &Sort::RegLan)?;
+                if indices[0] > indices[1] {
+                    // SMT-LIB 2.6: `((_ re.loop i n) e)` denotes
+                    // `⋃_{k=i}^{n} L(e)^k`. When `i > n` the index set is
+                    // EMPTY, so the term denotes the empty language — it is a
+                    // perfectly well-formed term, NOT an invalid constant.
+                    // Rejecting it made AY refuse a conformant input (it is
+                    // fail-closed, so never a wrong answer, but it is a
+                    // capability gap: the formula is decidable and AY declined
+                    // to decide it). Fold to `re.none`, which every downstream
+                    // consumer already handles — and which is exactly what
+                    // `WeRegex::loop_bounded` / `evaluate` / `accepted_lengths`
+                    // already computed for this shape
+                    // (#regex-loop-degenerate-bounds).
+                    return Ok(self
+                        .terms
+                        .mk_app(Symbol::named("re.none"), vec![], Sort::RegLan));
+                }
                 Ok(self.terms.mk_app(
                     Symbol::indexed("re.loop", indices),
                     vec![arg_ids[0]],

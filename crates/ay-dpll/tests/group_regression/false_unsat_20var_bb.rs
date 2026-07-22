@@ -56,7 +56,8 @@ fn with_global_timeout_unset<T>(f: impl FnOnce() -> T) -> T {
 }
 
 fn with_global_timeout_override<T>(timeout_ms: Option<u64>, f: impl FnOnce() -> T) -> T {
-    // Serialized + restore-on-exit via the workspace env choke point.
+    // Serialized + restore-on-exit via the one workspace env choke point
+    // (unifies the former per-file EnvVarRestoreGuard/ENV_LOCK onto it).
     with_env_edits(|env| {
         match timeout_ms {
             Some(ms) => env.set("AY_GLOBAL_TIMEOUT_MS", &ms.to_string()),

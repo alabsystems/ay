@@ -584,6 +584,31 @@ def _named_build_processes(proc_root="/proc", max_entries=1_000_000):
     wanted = {"cargo", "targo", "rustc", "compiler_consumer"}
     rows = []
     seen = 0
+    if not os.path.isdir(proc_root):
+        # No procfs (macOS): fall back to `ps` for the same bounded pid/comm
+        # rows. Failure here must not abort the caller's resource planning —
+        # an empty row set means "no concurrent build detected", the safe
+        # default for a warn-only check.
+        import subprocess
+        try:
+            out = subprocess.run(
+                ["ps", "-axo", "pid=,comm="],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True,
+            ).stdout
+        except Exception:
+            return rows
+        for line in out.splitlines()[:max_entries]:
+            parts = line.split(None, 1)
+            if len(parts) != 2:
+                continue
+            pid_s, comm = parts
+            base = os.path.basename(comm.strip())
+            if pid_s.isdigit() and base in wanted:
+                rows.append((int(pid_s), base))
+        return rows
     try:
         entries = os.scandir(proc_root)
     except OSError as error:
@@ -621,7 +646,13 @@ def count_active_rustc(proc_root="/proc", ancestor_pids=None):
     excluded. A cargo or targo process supervising this executable is an
     ancestor, not a concurrent build, and is excluded once its compiler
     children have finished.
+
+    Hosts without a procfs (macOS) use an equivalent bounded ``ps`` scan so
+    the concurrent-build refusal keeps protecting sweeps on every supported
+    platform instead of crashing.
     """
+    if proc_root == "/proc" and not os.path.isdir(proc_root):
+        return _count_active_rustc_ps(ancestor_pids)
     processes = _named_build_processes(proc_root)
     inactive_states = {"Z", "T", "t", "X", "x"}
     count = sum(
@@ -655,6 +686,87 @@ def count_active_rustc(proc_root="/proc", ancestor_pids=None):
         if any(token in build_commands for token in tokens[1:]):
             count += 1
     return count
+
+
+def _count_active_rustc_ps(ancestor_pids=None):
+    """`count_active_rustc` for procfs-less hosts (macOS) via bounded ``ps``.
+
+    Same contract: count live rustc/compiler_consumer compilers plus non-ancestor
+    cargo/targo drivers running a build-like subcommand. Any inspection
+    failure raises so callers keep their fail-closed refusal behavior.
+    """
+    wanted = {"cargo", "targo", "rustc", "compiler_consumer"}
+    try:
+        listing = subprocess.run(
+            ["ps", "-axo", "pid=,state=,comm="],
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"cannot inspect build processes via ps: {error}")
+    lines = listing.stdout.decode("utf-8", errors="replace").splitlines()
+    if len(lines) > 1_000_000:
+        raise RuntimeError("process table exceeds fixed 1000000-entry inspection cap")
+    inactive_states = {"Z", "T", "t", "X", "x"}
+    rows = []
+    for line in lines:
+        parts = line.split(None, 2)
+        if len(parts) != 3 or not parts[0].isdigit():
+            continue
+        pid, state, command_name = int(parts[0]), parts[1][:1], parts[2].strip()
+        name = os.path.basename(command_name)
+        if name in wanted and state not in inactive_states:
+            rows.append((pid, name))
+    count = sum(1 for _, name in rows if name in ("rustc", "compiler_consumer"))
+    build_commands = {
+        "build", "check", "test", "run", "clippy", "rustc", "bench",
+        "doc", "install", "fix",
+    }
+    ancestors = _ancestor_pids_ps() if ancestor_pids is None else set(ancestor_pids)
+    for pid, name in rows:
+        if name not in ("cargo", "targo") or pid in ancestors:
+            continue
+        try:
+            detail = subprocess.run(
+                ["ps", "-o", "command=", "-p", str(pid)],
+                capture_output=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise RuntimeError(f"cannot inspect {name} process {pid}: {error}")
+        if detail.returncode != 0:
+            continue  # exited between the scan and the detail lookup
+        command = detail.stdout.decode("utf-8", errors="replace")
+        if len(command) > 64 * 1024:
+            raise RuntimeError(f"{name} process {pid} has an oversized command line")
+        tokens = command.split()
+        if any(token in build_commands for token in tokens[1:]):
+            count += 1
+    return count
+
+
+def _ancestor_pids_ps(pid=None):
+    """Ancestor PID set via ``ps`` for procfs-less hosts (macOS)."""
+    current = os.getpid() if pid is None else int(pid)
+    ancestors = set()
+    visited = set()
+    while current > 1 and current not in visited:
+        visited.add(current)
+        try:
+            detail = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(current)],
+                capture_output=True,
+                timeout=30,
+            )
+            parent = int(detail.stdout.decode("utf-8", errors="replace").strip())
+        except (OSError, subprocess.SubprocessError, ValueError):
+            break
+        if parent <= 0 or parent == current:
+            break
+        ancestors.add(parent)
+        current = parent
+    return ancestors
 
 
 def _ancestor_pids(pid=None):

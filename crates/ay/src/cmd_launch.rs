@@ -1041,7 +1041,7 @@ fn default_repo_root() -> Result<PathBuf> {
 
 fn find_launch_gate_repo_root(start: &Path) -> Option<PathBuf> {
     // Identify the AY workspace root by its permanent markers. The historical
-    // marker `scripts/hn_launch_gate.sh` was the original shell gate, now
+    // marker `scripts/release_gate.sh` was the original shell gate, now
     // superseded by this native `ay launch-gate` command and removed from the
     // tree, so it can no longer be relied on. The workspace manifest plus the
     // `crates/ay` package directory uniquely identify the repo root.
@@ -5116,9 +5116,9 @@ fn check_launch_gate_summaries(manifest: &Value, reasons: &mut Vec<String>) {
         if summary.get("exists").and_then(Value::as_bool) != Some(true) {
             reasons.push(format!("launch gate summary path is missing: {label}"));
         }
-        if summary.get("schema").and_then(Value::as_str) != Some("ay-hn-launch-gate-summary/v1") {
+        if summary.get("schema").and_then(Value::as_str) != Some("ay-release-gate-summary/v1") {
             reasons.push(format!(
-                "launch gate summary {label} schema={:?}, expected 'ay-hn-launch-gate-summary/v1'",
+                "launch gate summary {label} schema={:?}, expected 'ay-release-gate-summary/v1'",
                 summary.get("schema")
             ));
         }
@@ -5579,7 +5579,7 @@ fn write_summary_json(args: &ResolvedArgs, state: &GateState, path: &Path) -> Re
         .map(|check| (check.id.clone(), targeted_smoke_check_json(check)))
         .collect::<serde_json::Map<_, _>>();
     let summary = json!({
-        "schema": "ay-hn-launch-gate-summary/v1",
+        "schema": "ay-release-gate-summary/v1",
         "status": if state.evidence_gate_failures == 0 && state.blockers.is_empty() { "pass" } else { "fail" },
         "generated_at_utc": now_utc_rfc3339(),
         "repo_root": args.repo_root,

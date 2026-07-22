@@ -2003,6 +2003,7 @@ impl Executor {
     /// Build the assumption literal asserting the current solution STRICTLY
     /// DOMINATES the point `value` — at-least-as-good on EVERY objective AND
     /// strictly better on >= 1. Used to push a seed up to Pareto-optimality.
+    #[cfg(debug_assertions)]
     fn mk_strictly_dominates_value(
         &mut self,
         objectives: &[ay_frontend::Objective],
@@ -2023,6 +2024,7 @@ impl Executor {
     /// Atom: objective `obj` is at-least-as-good as `value` (weak improvement in
     /// `obj`'s optimize direction). Maximize → `obj >= value`; minimize →
     /// `obj <= value`. Dispatches on the objective's sort.
+    #[cfg(debug_assertions)]
     fn mk_at_least_as_good_atom(
         &mut self,
         obj: &ay_frontend::Objective,

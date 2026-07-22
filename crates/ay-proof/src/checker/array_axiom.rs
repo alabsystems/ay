@@ -25,17 +25,23 @@
 //! - `ArrayRowChain` — read-over-write evaluated through a `store` CHAIN,
 //!   optionally under an array-equality premise (see
 //!   [`validate_array_row_chain`]).
-//! - `ArrayExtensionality` is fail-closed in strict mode unless a future
-//!   checker can verify that the select index is a real extensionality/diff
-//!   witness for the array pair. A syntactic `select` witness is not enough.
+//! - `ArrayExtensionality` — the Skolemized extensionality axiom
+//!   `(= a b) ∨ ¬(= (select a k) (select b k))`. This is NOT a tautology: it
+//!   holds only because `k` is a FRESH witness minted for exactly `(a, b)`.
+//!   It is therefore accepted only against an [`ExtDiffRegistry`] built from
+//!   the proof's own `array_ext_diff_intro` steps and the problem's assertion
+//!   set (see [`validate_array_extensionality`]); with no registry it stays
+//!   fail-closed exactly as before.
 //!
-//! Full semantic validation (#8073) is still future work. Strict mode accepts
-//! the exact read-over-write schemas and rejects unverified extensionality
-//! witnesses instead of accepting them by shape alone.
+//! Full semantic validation (#8073) is still future work for the remaining
+//! kinds. Strict mode accepts the exact read-over-write schemas and rejects
+//! anything it cannot re-derive from the proof plus the problem.
 
 // #8529: deterministic hash containers in all builds.
-use ay_core::kani_compat::{det_hash_set_new, DetHashSet};
-use ay_core::{ProofId, Sort, TermData, TermId, TermStore, TheoryLemmaKind};
+use ay_core::kani_compat::{det_hash_set_new, DetHashMap, DetHashSet};
+use ay_core::{
+    AletheRule, Proof, ProofId, ProofStep, Sort, TermData, TermId, TermStore, TheoryLemmaKind,
+};
 
 use super::ProofCheckError;
 
@@ -81,10 +87,12 @@ pub(crate) fn validate_array_select_store(
 /// This is the EXACT inverse of [`validate_array_select_store`]: the proof
 /// classifier (`ay-dpll` `theory_inference`) calls it so the kind it assigns is
 /// precisely the one strict mode will accept — no classifier/checker drift.
-/// Extensionality is intentionally NOT recognized here: strict mode cannot yet
-/// validate it (#8073), so those lemmas must stay `Generic` rather than be
-/// labelled a checkable kind they would fail. Schema logic lives ONLY in this
-/// module.
+/// Extensionality is intentionally NOT recognized here: it is not a tautology,
+/// so shape alone can never license it. Its recognizer is the separate
+/// [`recognize_array_extensionality`], which the PROOF EMITTER pairs with an
+/// `array_ext_diff_intro` step; the live conflict classifier (which has no
+/// proof to attach an introduction to) must leave such clauses `Generic`.
+/// Schema logic lives ONLY in this module.
 #[must_use]
 pub fn recognize_array_select_store(terms: &TermStore, clause: &[TermId]) -> Option<bool> {
     if clause.is_empty() {
@@ -117,8 +125,8 @@ pub fn recognize_array_select_store(terms: &TermStore, clause: &[TermId]) -> Opt
 /// (and its Lean firewall) is unchanged; the n-ary schemas only ever claim
 /// clauses that were previously `Generic`.
 ///
-/// Extensionality is intentionally NOT recognized: strict mode cannot yet
-/// validate the diff witness (#8073).
+/// Extensionality is intentionally NOT recognized here — see
+/// [`recognize_array_select_store`] for why it needs its own emitter-side path.
 #[must_use]
 pub fn recognize_array_theory_lemma(
     terms: &TermStore,
@@ -258,10 +266,60 @@ pub(crate) fn validate_array_row_chain(
 }
 
 /// Validate an `ArrayExtensionality` lemma in strict mode.
+///
+/// SCHEMA. The clause must be EXACTLY the two-literal Skolemized
+/// extensionality axiom for an array pair `(a, b)` at a witness index `k`:
+///
+/// ```text
+/// (cl (= a b) (not (= (select a k) (select b k))))
+/// ```
+///
+/// with `sort(a) == sort(b) == Array(as)`, both `select`s well-sorted against
+/// `as`, and `sort(k) == as.index_sort`. The polarities are fixed: the array
+/// equality is POSITIVE and the select equality is NEGATED. The mirror image
+/// `(cl (not (= a b)) (= (select a k) (select b k)))` is a DIFFERENT (and
+/// false) claim and is rejected.
+///
+/// WHY A REGISTRY IS REQUIRED. Unlike every other schema in this module, this
+/// clause is **not** a theory tautology: `(select a k) = (select b k)` is
+/// perfectly consistent with `a != b` for an arbitrary index term `k`. The
+/// clause is sound only as the Skolemization of the array theory's `diff`
+/// function — i.e. only when `k` is a symbol the SOLVER minted for this pair
+/// and that appears nowhere in the problem. That is provenance, not shape, so
+/// `registry` is mandatory: with `None` the lemma fails closed (the historical
+/// behaviour of this entry point).
+///
+/// CHECKS (all necessary; any failure REJECTS):
+///  1. the clause matches the schema above and yields `(a, b, k)`;
+///  2. `k` is an atomic symbol (`TermData::Var`) — not a compound term;
+///  3. some `array_ext_diff_intro` step in the SAME proof binds `k`'s symbol
+///     (looked up by NAME, so a same-named symbol at another sort cannot
+///     smuggle a binding in);
+///  4. that introduction resolves to the very `TermId` used here, and binds
+///     the UNORDERED pair `{a, b}` used here — an introduction for a different
+///     array pair is rejected.
+///
+/// Conditions the [`ExtDiffRegistry`] itself already enforced when it was
+/// built (see [`ExtDiffRegistry::collect`]): the symbol is FRESH (occurs in no
+/// problem assertion and in no `assume` of the proof), does not occur inside
+/// `a` or `b`, and is bound exactly ONCE.
+///
+/// SOUNDNESS. Let `P` be the problem and let the checks above hold. Take any
+/// model `M ⊨ P`. `k` occurs nowhere in `P`, so `M` says nothing about it; `k`
+/// occurs in neither `a` nor `b`, so the denotations of `a` and `b` do not
+/// depend on it. Extend `M` to `k`: if `M ⊨ a = b`, interpret `k` arbitrarily
+/// (the first literal holds); otherwise the array theory's extensionality
+/// axiom gives an index `d` with `M(select a d) != M(select b d)`, so
+/// interpret `k := d` (the second literal holds). Because `k` is bound ONCE,
+/// no other step imposes a competing requirement on that same symbol, so the
+/// extension is well defined. Hence `P ∪ {clause}` is satisfiable whenever `P`
+/// is, and a refutation of `P ∪ {clause}` refutes `P` — the clause is a sound
+/// conservative extension, which is all a refutation needs.
 pub(crate) fn validate_array_extensionality(
     terms: &TermStore,
     step_id: ProofId,
     clause: &[TermId],
+    registry: Option<&ExtDiffRegistry>,
 ) -> Result<(), ProofCheckError> {
     if clause.is_empty() {
         return Err(ProofCheckError::InvalidTheoryLemma {
@@ -272,17 +330,376 @@ pub(crate) fn validate_array_extensionality(
     reject_non_bool_literals(terms, step_id, clause, "array extensionality")?;
 
     let literals = flatten_clause_literals(terms, clause);
-    let reason = if matches_extensionality(terms, &literals) {
-        "array extensionality schema has no checked diff witness; strict mode \
-         rejects it until semantic witness validation is available"
-    } else {
-        "array extensionality clause does not match the exact \
-         `(= a b) ∨ ¬(= (select a k) (select b k))` schema"
+    let Some((array_a, array_b, witness)) = extensionality_parts(terms, &literals) else {
+        return Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "array extensionality clause does not match the exact \
+                     `(= a b) ∨ ¬(= (select a k) (select b k))` schema"
+                .to_string(),
+        });
     };
-    Err(ProofCheckError::InvalidTheoryLemma {
+
+    let Some(registry) = registry else {
+        return Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "array extensionality clause carries a diff witness with no \
+                     checked provenance: this checker was given no problem \
+                     assertion set, so it cannot verify the witness is fresh and \
+                     fails closed"
+                .to_string(),
+        });
+    };
+
+    let TermData::Var(witness_name, _) = terms.get(witness) else {
+        return Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "array extensionality diff witness must be an atomic symbol \
+                     introduced by an `array_ext_diff_intro` step"
+                .to_string(),
+        });
+    };
+
+    let Some(binding) = registry.get(witness_name) else {
+        return Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: format!(
+                "array extensionality diff witness `{witness_name}` has no \
+                 `array_ext_diff_intro` step binding it to an array pair"
+            ),
+        });
+    };
+
+    if binding.witness != witness {
+        return Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: format!(
+                "array extensionality diff witness `{witness_name}` resolves to a \
+                 different term than the one its `array_ext_diff_intro` bound"
+            ),
+        });
+    }
+
+    if unordered(binding.array_a, binding.array_b) != unordered(array_a, array_b) {
+        return Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: format!(
+                "array extensionality diff witness `{witness_name}` was introduced \
+                 for a DIFFERENT array pair (step {}) than the one this clause uses",
+                binding.step
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+/// Recognize `clause` as the exact Skolemized extensionality schema, returning
+/// `(array_a, array_b, witness_index)`.
+///
+/// This is the EXACT shape half of [`validate_array_extensionality`] and is the
+/// matcher the proof emitter must use when it decides to label a clause
+/// `TheoryLemmaKind::ArrayExtensionality`, so emitter and checker cannot drift.
+/// Recognition alone is NOT a licence to accept the clause — the provenance
+/// half (freshness, single binding, matching pair) lives in [`ExtDiffRegistry`]
+/// and is checked separately.
+#[must_use]
+pub fn recognize_array_extensionality(
+    terms: &TermStore,
+    clause: &[TermId],
+) -> Option<(TermId, TermId, TermId)> {
+    if clause.is_empty()
+        || clause
+            .iter()
+            .any(|&lit| !matches!(terms.sort(lit), Sort::Bool))
+    {
+        return None;
+    }
+    let literals = flatten_clause_literals(terms, clause);
+    extensionality_parts(terms, &literals)
+}
+
+// ---------- extensionality diff-witness provenance ----------
+
+/// One `array_ext_diff_intro` binding: the fresh witness symbol and the
+/// UNORDERED array pair it was minted for.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExtDiffBinding {
+    /// The witness term (an atomic `TermData::Var`).
+    pub(crate) witness: TermId,
+    /// First array of the pair.
+    pub(crate) array_a: TermId,
+    /// Second array of the pair.
+    pub(crate) array_b: TermId,
+    /// The introducing step, for diagnostics.
+    pub(crate) step: ProofId,
+}
+
+/// Whole-proof registry of extensionality diff-witness introductions.
+///
+/// Built ONCE per strict check from the proof's `array_ext_diff_intro` steps
+/// and the problem's assertion terms. Construction is where the three
+/// whole-proof soundness conditions are enforced (see
+/// [`ExtDiffRegistry::collect`]); per-step validation then only has to confirm
+/// that the clause in hand matches its symbol's single recorded binding.
+#[derive(Debug, Default)]
+pub struct ExtDiffRegistry {
+    bindings: DetHashMap<String, ExtDiffBinding>,
+}
+
+impl ExtDiffRegistry {
+    fn get(&self, name: &str) -> Option<&ExtDiffBinding> {
+        self.bindings.get(name)
+    }
+
+    /// Whether the registry recorded no introductions at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+
+    /// Build the registry for `proof`, given the problem's assertion terms.
+    ///
+    /// `problem_assertions` must be the terms the PROBLEM asserted — the
+    /// authored assertion window, NOT the solver-time assertion stack (which
+    /// also carries the injected extensionality axioms themselves, and would
+    /// make every witness look non-fresh). Passing a SUPERSET is always safe:
+    /// every extra term can only make the freshness test stricter.
+    ///
+    /// Enforced here, once, for every introduction:
+    ///
+    ///  1. SHAPE — no premises, no conclusion clause, exactly three `:args`
+    ///     `(k a b)` with `a`, `b` two DISTINCT terms of the same array sort
+    ///     and `k` an atomic symbol at that sort's index sort
+    ///     ([`validate_ext_diff_intro`]).
+    ///  2. BOUND ONCE — two introductions naming the same symbol are rejected
+    ///     outright, so a symbol can never acquire two array-pair definitions
+    ///     (which would be unsound: one index cannot in general witness two
+    ///     independent array disequalities).
+    ///  3. FRESH — the symbol's NAME must occur in no `problem_assertions`
+    ///     term and in no `assume` step of the proof. This is the soundness
+    ///     crux and is verified against the problem, never assumed from a name
+    ///     prefix or a solver-side "this is a Skolem" flag: a witness that the
+    ///     problem also constrains is not a witness at all.
+    ///  4. NOT SELF-REFERENTIAL — the symbol must not occur inside the arrays
+    ///     `a` or `b` it is the difference witness FOR, which would make the
+    ///     Skolem definition circular.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofCheckError::InvalidTheoryLemma`] for the offending
+    /// introduction step whenever any condition fails. There is deliberately no
+    /// lenient mode: an introduction that cannot be verified makes the whole
+    /// check fail rather than silently dropping the binding (which would only
+    /// re-surface as an unbound witness later, with a worse diagnostic).
+    pub fn collect(
+        proof: &Proof,
+        terms: &TermStore,
+        problem_assertions: &[TermId],
+    ) -> Result<Self, ProofCheckError> {
+        let mut bindings: DetHashMap<String, ExtDiffBinding> = DetHashMap::default();
+
+        for (index, step) in proof.steps.iter().enumerate() {
+            let ProofStep::Step {
+                rule: AletheRule::ArrayExtDiffIntro,
+                clause,
+                premises,
+                args,
+            } = step
+            else {
+                continue;
+            };
+            let step_id = ProofId(index as u32);
+            let (witness, array_a, array_b, name) =
+                validate_ext_diff_intro(terms, step_id, clause, premises, args)?;
+
+            // (4) the witness must not occur inside the very arrays it
+            // differentiates — `k = diff(store(c, k, v), b)` is circular.
+            if symbol_occurs(terms, array_a, &name) || symbol_occurs(terms, array_b, &name) {
+                return Err(ProofCheckError::InvalidTheoryLemma {
+                    step: step_id,
+                    reason: format!(
+                        "array ext-diff witness `{name}` occurs inside the array pair \
+                         it is introduced for; the Skolem definition would be circular"
+                    ),
+                });
+            }
+
+            // (2) bound once.
+            if let Some(prior) = bindings.insert(
+                name.clone(),
+                ExtDiffBinding {
+                    witness,
+                    array_a,
+                    array_b,
+                    step: step_id,
+                },
+            ) {
+                return Err(ProofCheckError::InvalidTheoryLemma {
+                    step: step_id,
+                    reason: format!(
+                        "array ext-diff witness `{name}` is introduced more than once \
+                         (already bound at step {}); a difference witness may bind to \
+                         exactly one array pair",
+                        prior.step
+                    ),
+                });
+            }
+        }
+
+        if bindings.is_empty() {
+            return Ok(Self { bindings });
+        }
+
+        // (3) freshness, checked against the problem itself. One traversal of
+        // the problem terms and the proof's `assume` leaves collects every
+        // symbol name they mention; any introduced witness in that set is not
+        // fresh and the proof is rejected.
+        let mut problem_symbols: DetHashSet<String> = det_hash_set_new();
+        let mut visited: DetHashSet<TermId> = det_hash_set_new();
+        for &assertion in problem_assertions {
+            collect_symbol_names(terms, assertion, &mut problem_symbols, &mut visited);
+        }
+        for step in &proof.steps {
+            if let ProofStep::Assume(term) = step {
+                collect_symbol_names(terms, *term, &mut problem_symbols, &mut visited);
+            }
+        }
+        for (name, binding) in &bindings {
+            if problem_symbols.contains(name) {
+                return Err(ProofCheckError::InvalidTheoryLemma {
+                    step: binding.step,
+                    reason: format!(
+                        "array ext-diff witness `{name}` is NOT fresh: the symbol also \
+                         occurs in the problem, so the extensionality clause over it is \
+                         not a conservative extension"
+                    ),
+                });
+            }
+        }
+
+        Ok(Self { bindings })
+    }
+}
+
+/// Structural validation of one `array_ext_diff_intro` step, returning
+/// `(witness, array_a, array_b, witness_name)`.
+///
+/// The step is a DEFINITION, so it must be inert as an inference: no premises
+/// and no conclusion clause (the checker records it as clause-free, exactly
+/// like an `anchor`, so it can never be resolved against or seed a RUP check).
+pub(crate) fn validate_ext_diff_intro(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    premises: &[ProofId],
+    args: &[TermId],
+) -> Result<(TermId, TermId, TermId, String), ProofCheckError> {
+    let invalid = |reason: String| ProofCheckError::InvalidTheoryLemma {
         step: step_id,
-        reason: reason.to_string(),
-    })
+        reason,
+    };
+    if !clause.is_empty() {
+        return Err(invalid(
+            "array ext-diff introduction is a definition and must conclude no clause".to_string(),
+        ));
+    }
+    if !premises.is_empty() {
+        return Err(invalid(
+            "array ext-diff introduction must not have premises".to_string(),
+        ));
+    }
+    let [witness, array_a, array_b] = args else {
+        return Err(invalid(
+            "array ext-diff introduction must carry exactly three arguments \
+             (witness, array, array)"
+                .to_string(),
+        ));
+    };
+    let TermData::Var(name, _) = terms.get(*witness) else {
+        return Err(invalid(
+            "array ext-diff introduction witness must be an atomic symbol".to_string(),
+        ));
+    };
+    let Sort::Array(array_sort) = terms.sort(*array_a) else {
+        return Err(invalid(
+            "array ext-diff introduction must be for two array-sorted terms".to_string(),
+        ));
+    };
+    if terms.sort(*array_a) != terms.sort(*array_b) {
+        return Err(invalid(
+            "array ext-diff introduction pair has mismatched array sorts".to_string(),
+        ));
+    }
+    if array_a == array_b {
+        return Err(invalid(
+            "array ext-diff introduction pair must be two distinct array terms".to_string(),
+        ));
+    }
+    if terms.sort(*witness) != &array_sort.index_sort {
+        return Err(invalid(
+            "array ext-diff introduction witness is not at the array's index sort".to_string(),
+        ));
+    }
+    Ok((*witness, *array_a, *array_b, name.clone()))
+}
+
+/// Whether the symbol `name` occurs anywhere in `root`.
+fn symbol_occurs(terms: &TermStore, root: TermId, name: &str) -> bool {
+    let mut names: DetHashSet<String> = det_hash_set_new();
+    let mut visited: DetHashSet<TermId> = det_hash_set_new();
+    collect_symbol_names(terms, root, &mut names, &mut visited);
+    names.contains(name)
+}
+
+/// Collect every symbol name mentioned by `root` — variables, application
+/// heads, and binder names alike.
+///
+/// Deliberately over-approximates: a binder-bound name is collected too, so a
+/// witness that merely SHARES a name with some quantified variable is treated
+/// as non-fresh. Over-approximating can only reject more proofs, never accept
+/// one, which is the correct direction for a freshness test.
+fn collect_symbol_names(
+    terms: &TermStore,
+    root: TermId,
+    names: &mut DetHashSet<String>,
+    visited: &mut DetHashSet<TermId>,
+) {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        match terms.get(id) {
+            TermData::Var(name, _) => {
+                names.insert(name.clone());
+            }
+            TermData::App(sym, args) => {
+                names.insert(sym.name().to_string());
+                stack.extend(args.iter().copied());
+            }
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(c, t, e) => {
+                stack.push(*c);
+                stack.push(*t);
+                stack.push(*e);
+            }
+            TermData::Let(bindings, body) => {
+                for (name, value) in bindings {
+                    names.insert(name.clone());
+                    stack.push(*value);
+                }
+                stack.push(*body);
+            }
+            TermData::Forall(vars, body, triggers) | TermData::Exists(vars, body, triggers) => {
+                for (name, _) in vars {
+                    names.insert(name.clone());
+                }
+                stack.push(*body);
+                stack.extend(triggers.iter().flatten().copied());
+            }
+            _ => {}
+        }
+    }
 }
 
 // ---------- helpers ----------
@@ -376,30 +793,50 @@ fn matches_row2_conditional(terms: &TermStore, literals: &[TermId]) -> bool {
     false
 }
 
-fn matches_extensionality(terms: &TermStore, literals: &[TermId]) -> bool {
+/// Match the exact two-literal Skolemized extensionality schema and return
+/// `(array_a, array_b, witness_index)`.
+///
+/// The polarity assignment is FIXED — positive array equality, negated select
+/// equality — and both `select`s must be well-sorted against the pair's array
+/// sort with the SAME index term. Any other arrangement (in particular the
+/// mirror image `¬(= a b) ∨ (= (select a k) (select b k))`, which is a
+/// different and unsound claim) fails to match.
+fn extensionality_parts(
+    terms: &TermStore,
+    literals: &[TermId],
+) -> Option<(TermId, TermId, TermId)> {
     if literals.len() != 2 {
-        return false;
+        return None;
     }
-    for &array_eq_lit in literals {
+    for (array_eq_lit, witness_lit) in [(literals[0], literals[1]), (literals[1], literals[0])] {
         let Some((array_a, array_b)) = equality_sides(terms, array_eq_lit) else {
             continue;
         };
-        if !matches!(terms.sort(array_a), Sort::Array(_))
-            || !matches!(terms.sort(array_b), Sort::Array(_))
-        {
-            continue;
-        }
-        let Some(&witness_lit) = literals.iter().find(|&&lit| lit != array_eq_lit) else {
+        let Sort::Array(array_sort) = terms.sort(array_a) else {
             continue;
         };
+        if terms.sort(array_a) != terms.sort(array_b) || array_a == array_b {
+            continue;
+        }
         let Some((sel_a, sel_b)) = negated_equality_sides(terms, witness_lit) else {
             continue;
         };
-        if selects_match_pair_at_same_index(terms, sel_a, sel_b, array_a, array_b) {
-            return true;
+        let (Some((lhs_array, lhs_index)), Some((rhs_array, rhs_index))) = (
+            well_sorted_select_parts(terms, sel_a),
+            well_sorted_select_parts(terms, sel_b),
+        ) else {
+            continue;
+        };
+        if lhs_index != rhs_index || terms.sort(lhs_index) != &array_sort.index_sort {
+            continue;
+        }
+        if (lhs_array == array_a && rhs_array == array_b)
+            || (lhs_array == array_b && rhs_array == array_a)
+        {
+            return Some((array_a, array_b, lhs_index));
         }
     }
-    false
+    None
 }
 
 fn row1_eq_parts(
@@ -484,24 +921,6 @@ fn is_select_of(terms: &TermStore, term: TermId, array: TermId, index: TermId) -
             && terms.sort(index) == &array_sort.index_sort
             && terms.sort(term) == &array_sort.element_sort
     )
-}
-
-fn selects_match_pair_at_same_index(
-    terms: &TermStore,
-    lhs: TermId,
-    rhs: TermId,
-    array_a: TermId,
-    array_b: TermId,
-) -> bool {
-    let Some((lhs_array, lhs_index)) = select_parts(terms, lhs) else {
-        return false;
-    };
-    let Some((rhs_array, rhs_index)) = select_parts(terms, rhs) else {
-        return false;
-    };
-    lhs_index == rhs_index
-        && ((lhs_array == array_a && rhs_array == array_b)
-            || (lhs_array == array_b && rhs_array == array_a))
 }
 
 fn select_parts(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {

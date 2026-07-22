@@ -46,7 +46,7 @@ fn solve_cli_parity(smt: &str) -> String {
     let mut exec = ay_dpll::Executor::new();
     exec.set_produce_proofs(true);
     exec.set_deadline(Some(
-        std::time::Instant::now() + std::time::Duration::from_millis(60_000),
+        std::time::Instant::now() + std::time::Duration::from_mins(1),
     ));
     exec.execute_all(&commands)
         .unwrap_or_else(|err| panic!("execution failed: {err}\nSMT2:\n{smt}"))
@@ -297,7 +297,7 @@ fn qf_abv_pinned_concat_index_select_unsat_proof_guard_wishlist1_cli_parity() {
     let mut exec = ay_dpll::Executor::new();
     exec.set_produce_proofs(true);
     exec.set_deadline(Some(
-        std::time::Instant::now() + std::time::Duration::from_millis(60_000),
+        std::time::Instant::now() + std::time::Duration::from_mins(1),
     ));
     let output = exec.execute_all(&commands).expect("execute").join("\n");
     let lines = results(&output);

@@ -13,7 +13,7 @@ use ay_core::term::{Symbol, TermId, TermStore};
 use ay_core::Sort;
 use ay_core::TheorySolver;
 use ay_euf::EufSolver;
-use ay_test_support::env::with_env_edits;
+use ay_test_support::env::{lock_env, ScopedEnvVar};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 struct EufBenchProblem {
@@ -55,31 +55,33 @@ fn run_check(problem: &EufBenchProblem) {
 
 fn bench_congruence_closure(c: &mut Criterion) {
     let mut group = c.benchmark_group("euf_congruence_closure");
+    // Serialized + restore-on-exit via the one workspace env choke point.
+    let _env_lock = lock_env();
 
-    // Serialized + restore-on-exit via the workspace env choke point; the
-    // AY_LEGACY_EUF knob is walked set->unset across the paired benches.
-    with_env_edits(|env| {
-        for num_vars in [100_usize, 1_000, 10_000, 100_000] {
-            let problem = build_chain_problem(num_vars);
-            let label = format!("{num_vars}_vars");
+    for num_vars in [100_usize, 1_000, 10_000, 100_000] {
+        let problem = build_chain_problem(num_vars);
+        let label = format!("{num_vars}_vars");
 
-            // Legacy rebuild path (AY_LEGACY_EUF=1).
-            env.set("AY_LEGACY_EUF", "1");
+        // Legacy rebuild path (AY_LEGACY_EUF=1).
+        {
+            let _legacy = ScopedEnvVar::set("AY_LEGACY_EUF", "1");
             group.bench_with_input(
                 BenchmarkId::new("legacy_check", &label),
                 &problem,
                 |b, p| b.iter(|| run_check(black_box(p))),
             );
+        }
 
-            // Incremental rebuild path (default).
-            env.remove("AY_LEGACY_EUF");
+        // Incremental rebuild path (default).
+        {
+            let _incremental = ScopedEnvVar::unset("AY_LEGACY_EUF");
             group.bench_with_input(
                 BenchmarkId::new("incremental_check", &label),
                 &problem,
                 |b, p| b.iter(|| run_check(black_box(p))),
             );
         }
-    });
+    }
 
     group.finish();
 }

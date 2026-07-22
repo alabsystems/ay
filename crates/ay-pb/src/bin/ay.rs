@@ -4533,6 +4533,8 @@ fn pb_exit_code(status: PbStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The one workspace env choke point: serialized, restore-on-exit env
+    // mutation (unifies the former CERT_ENV_LOCK onto it).
     use ay_test_support::env::{lock_env, ScopedEnvVar};
     use std::fs;
 
@@ -5640,12 +5642,10 @@ mod tests {
     #[test]
     fn test_dec_cert_pipeline_certifies_sat_via_solution_proof() {
         let _serial = lock_env();
-        // Reset both cert knobs for the test body; restored on scope exit.
-        let _cert_portfolio = ScopedEnvVar::unset("AY_PB_OPT_CERT_PORTFOLIO");
-        let _cert_native_cap = ScopedEnvVar::unset("AY_PB_CERT_NATIVE_CAP_MS");
+        let _cert = clear_cert_env();
         // Kill N1: the plain-speed phase must produce the model and the
         // solution-only proof must be committed.
-        let _cert_native_cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
+        let _cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
         let instance = parse_instance_interruptible(
             PbInputFormat::Opb,
             "* #variable= 2 #constraint= 1\n+1 x1 +1 x2 >= 1 ;\n",
@@ -5684,10 +5684,8 @@ mod tests {
     #[test]
     fn test_dec_cert_pipeline_unsat_via_native_tail() {
         let _serial = lock_env();
-        // Reset both cert knobs for the test body; restored on scope exit.
-        let _cert_portfolio = ScopedEnvVar::unset("AY_PB_OPT_CERT_PORTFOLIO");
-        let _cert_native_cap = ScopedEnvVar::unset("AY_PB_CERT_NATIVE_CAP_MS");
-        let _cert_native_cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
+        let _cert = clear_cert_env();
+        let _cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
         let instance = parse_instance_interruptible(
             PbInputFormat::Opb,
             "* #variable= 1 #constraint= 2\n+1 x1 >= 1 ;\n-1 x1 >= 0 ;\n",
@@ -5884,6 +5882,19 @@ mod tests {
         assert_eq!(solution.objective, Some(2));
     }
 
+    /// Clears the AY_PB_OPT_CERT_PORTFOLIO / AY_PB_CERT_NATIVE_CAP_MS
+    /// process-global env vars for the lifetime of the returned guards
+    /// (restored on scope exit, also on panic). Bind at the start of each cert
+    /// test — held under the `lock_env()` serialization guard. Tests serialize
+    /// on the one workspace env lock (`lock_env`).
+    #[must_use]
+    fn clear_cert_env() -> [ScopedEnvVar; 2] {
+        [
+            ScopedEnvVar::unset("AY_PB_OPT_CERT_PORTFOLIO"),
+            ScopedEnvVar::unset("AY_PB_CERT_NATIVE_CAP_MS"),
+        ]
+    }
+
     fn solve_opb_text_with_proof(input: &str, proof_path: &Path) -> (PbSolution, String) {
         let instance = parse_instance_interruptible(PbInputFormat::Opb, input, || false)
             .expect("OPB text should parse");
@@ -5913,9 +5924,7 @@ mod tests {
     #[test]
     fn test_cert_opt_budget_split_tiers_and_gates() {
         let _serial = lock_env();
-        // Reset both cert knobs for the test body; restored on scope exit.
-        let _cert_portfolio = ScopedEnvVar::unset("AY_PB_OPT_CERT_PORTFOLIO");
-        let _cert_native_cap = ScopedEnvVar::unset("AY_PB_CERT_NATIVE_CAP_MS");
+        let _cert = clear_cert_env();
 
         let small = ay_pb::parse_opb(
             "* #variable= 2 #constraint= 1\nmin: +1 x1 +1 x2 ;\n+1 x1 +1 x2 >= 1 ;\n",
@@ -5927,7 +5936,7 @@ mod tests {
         let split = compute_cert_opt_budget_split(
             &small,
             &objective,
-            Some(Duration::from_secs(600)),
+            Some(Duration::from_mins(10)),
             Instant::now(),
         );
         assert!(split.eligible());
@@ -5969,7 +5978,7 @@ mod tests {
         let nonlinear = compute_cert_opt_budget_split(
             &small,
             &product_objective,
-            Some(Duration::from_secs(600)),
+            Some(Duration::from_mins(10)),
             Instant::now(),
         );
         assert!(!nonlinear.eligible());
@@ -5988,7 +5997,7 @@ mod tests {
         );
         assert_eq!(
             certify_reserve(Duration::from_mins(50)),
-            Duration::from_secs(300)
+            Duration::from_mins(5)
         );
     }
 
@@ -5998,7 +6007,7 @@ mod tests {
         let split = CertOptBudgetSplit {
             native_deadline: Some(now + Duration::from_secs(10)),
             native_hard_limit: Some(now + Duration::from_secs(20)),
-            improve_grace: Duration::from_secs(60),
+            improve_grace: Duration::from_mins(1),
         };
         let cell = Cell::new(split.native_deadline);
         extend_native_deadline(&cell, &split);
@@ -6012,7 +6021,7 @@ mod tests {
         let uncapped = CertOptBudgetSplit {
             native_deadline: None,
             native_hard_limit: None,
-            improve_grace: Duration::from_secs(60),
+            improve_grace: Duration::from_mins(1),
         };
         let free = Cell::new(None);
         extend_native_deadline(&free, &uncapped);
@@ -6022,12 +6031,10 @@ mod tests {
     #[test]
     fn test_cert_fallback_certifies_portfolio_optimum() {
         let _serial = lock_env();
-        // Reset both cert knobs for the test body; restored on scope exit.
-        let _cert_portfolio = ScopedEnvVar::unset("AY_PB_OPT_CERT_PORTFOLIO");
-        let _cert_native_cap = ScopedEnvVar::unset("AY_PB_CERT_NATIVE_CAP_MS");
+        let _cert = clear_cert_env();
         // Kill N1 outright: the portfolio must prove the optimum and the
         // out-of-band helpers must certify it.
-        let _cert_native_cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
+        let _cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
         let proof_dir =
             std::env::temp_dir().join(format!("ay-cert-fallback-test-{}", std::process::id()));
         std::fs::create_dir_all(&proof_dir).expect("proof dir should create");
@@ -6058,13 +6065,11 @@ mod tests {
     #[test]
     fn test_cert_kill_switch_restores_native_only() {
         let _serial = lock_env();
-        // Reset both cert knobs for the test body; restored on scope exit.
-        let _cert_portfolio = ScopedEnvVar::unset("AY_PB_OPT_CERT_PORTFOLIO");
-        let _cert_native_cap = ScopedEnvVar::unset("AY_PB_CERT_NATIVE_CAP_MS");
+        let _cert = clear_cert_env();
         // Kill switch off => the CAP override must be ignored and the native
         // full-budget path must still prove + commit.
-        let _cert_portfolio = ScopedEnvVar::set("AY_PB_OPT_CERT_PORTFOLIO", "0");
-        let _cert_native_cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
+        let _portfolio = ScopedEnvVar::set("AY_PB_OPT_CERT_PORTFOLIO", "0");
+        let _cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
         let proof_dir =
             std::env::temp_dir().join(format!("ay-cert-killswitch-test-{}", std::process::id()));
         std::fs::create_dir_all(&proof_dir).expect("proof dir should create");
@@ -6083,12 +6088,10 @@ mod tests {
     #[test]
     fn test_cert_opt_unsat_proved_by_native_tail() {
         let _serial = lock_env();
-        // Reset both cert knobs for the test body; restored on scope exit.
-        let _cert_portfolio = ScopedEnvVar::unset("AY_PB_OPT_CERT_PORTFOLIO");
-        let _cert_native_cap = ScopedEnvVar::unset("AY_PB_CERT_NATIVE_CAP_MS");
+        let _cert = clear_cert_env();
         // N1 disabled; the portfolio's UNSAT is uncertified and must NOT be
         // emitted — the native tail is the only compliant INF INF source.
-        let _cert_native_cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
+        let _cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
         let proof_dir =
             std::env::temp_dir().join(format!("ay-cert-tail-test-{}", std::process::id()));
         std::fs::create_dir_all(&proof_dir).expect("proof dir should create");
@@ -6614,7 +6617,7 @@ mod tests {
             solve_pb(
                 &ParsedPbInstance::Opb(Arc::new(sat)),
                 None,
-                Some(Duration::from_millis(2_000)),
+                Some(Duration::from_secs(2)),
                 Instant::now(),
                 /* native = */ true,
                 false,

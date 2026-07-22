@@ -191,6 +191,15 @@ where
 
 fn derives_empty_clause(step: &ProofStep) -> bool {
     match step {
+        // An `array_ext_diff_intro` is a DEFINITION and carries no clause at
+        // all. Its empty `clause` field must NOT be read as "derives (cl)" —
+        // doing so would seed the terminal-trust walk from a step that proves
+        // nothing (and, worse, make a trust-free report out of a proof whose
+        // real empty clause is trust-tainted).
+        ProofStep::Step {
+            rule: AletheRule::ArrayExtDiffIntro,
+            ..
+        } => false,
         ProofStep::Step { clause, .. } | ProofStep::Resolution { clause, .. } => clause.is_empty(),
         // TheoryLemma cannot derive the empty clause in a well-formed proof
         // (a theory never asserts `false` directly), but we accept any step

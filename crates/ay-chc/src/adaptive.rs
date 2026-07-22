@@ -3641,6 +3641,20 @@ impl AdaptivePortfolio {
             return result;
         }
 
+        // Cheap validated Safe guess for the IsaPlanner `last`/singleton
+        // ADT+LIA shape (#9700), AFTER the datatype BMC unsafe refutation
+        // (unsafe instances keep their fast refutation path) and BEFORE the
+        // CATA abstraction lane, whose refinement rounds burn the whole
+        // budget on exactly this shape. The guess is strictly validated
+        // per-rule against the ORIGINAL clauses and fails closed, so it can
+        // never manufacture a Safe verdict; class-gated to SimpleLoop, the
+        // only class that could previously reach it.
+        if matches!(features.class, ProblemClass::SimpleLoop) {
+            if let Some(result) = self.try_adt_lia_constructor_case_synthesis(&features) {
+                return (result, ValidationEvidence::FullVerification);
+            }
+        }
+
         if let Some(result) = self.try_argument_constant_invariant_route(deadline) {
             return (result, ValidationEvidence::FullVerification);
         }

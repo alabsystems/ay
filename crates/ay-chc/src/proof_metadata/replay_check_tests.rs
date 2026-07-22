@@ -16,7 +16,7 @@ use crate::{
 };
 use std::time::Duration;
 
-const REPLAY_TEST_BUDGET: Duration = Duration::from_secs(60);
+const REPLAY_TEST_BUDGET: Duration = Duration::from_mins(1);
 
 fn parse_problem(input: &str) -> ChcProblem {
     ChcParser::parse(input).expect("CHC fixture should parse")

@@ -282,11 +282,17 @@ pub(super) fn add_discovered_invariant_impl(
         }
     }
 
+    // #4751 L4 (cand4 hardening): lemmas whose self-inductiveness is only
+    // established CONDITIONED on the optimistic entry-domain over-approximation
+    // are tagged, so candidate repair can identify them as the likely poison
+    // when a direct-safety global claim later fails strict validation.
+    let mut optimistic_entry = false;
     if !algebraically_verified {
         let blocking_formula = ChcExpr::not(formula.clone());
         let passes_self_inductive = if solver.predicate_has_facts(pred) {
             solver.is_self_inductive_blocking(&blocking_formula, pred)
         } else if let Some(entry_domain) = solver.entry_domain_constraint(pred, target_level) {
+            optimistic_entry = true;
             solver.is_self_inductive_blocking_with_entry_domain(
                 &blocking_formula,
                 pred,
@@ -364,7 +370,9 @@ pub(super) fn add_discovered_invariant_impl(
     }
 
     solver.add_lemma_to_frame(
-        Lemma::new(pred, formula, target_level).with_algebraically_verified(algebraically_verified),
+        Lemma::new(pred, formula, target_level)
+            .with_algebraically_verified(algebraically_verified)
+            .with_optimistic_entry(optimistic_entry),
         target_level,
     );
     finish_lia_farkas_template_admission(solver, lia_farkas_template, true, false);

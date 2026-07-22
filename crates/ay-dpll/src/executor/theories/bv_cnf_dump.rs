@@ -1807,13 +1807,20 @@ mod tests {
         );
         assert!(!second_parent.join("formula.cnf").exists());
         assert!(!second_parent.join("proof.drat").exists());
+        // The production path canonicalizes the export parent (the hardening
+        // under test), so the expected side must be canonicalized too: on
+        // macOS the default TMPDIR sits behind the /var -> /private/var
+        // symlink and the lexical `first_parent` differs from the physical
+        // path the lock is actually derived from.
+        let canonical_first_parent =
+            std::fs::canonicalize(&first_parent).expect("canonicalize retained export parent");
         assert_eq!(
             retained_cnf_lock,
-            first_parent.join(".formula.cnf.ay-bv-cnf.lock")
+            canonical_first_parent.join(".formula.cnf.ay-bv-cnf.lock")
         );
         assert_eq!(
             retained_drat_lock,
-            first_parent.join(".proof.drat.ay-bv-cnf.lock")
+            canonical_first_parent.join(".proof.drat.ay-bv-cnf.lock")
         );
         clear_test_transaction();
     }

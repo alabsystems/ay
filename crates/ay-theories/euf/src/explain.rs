@@ -348,6 +348,7 @@ impl EufSolver<'_> {
         // skip-set, we APPEND (the current buffer may not already hold it).
         if self.explain_memo_enabled {
             if let Some(cached) = memo.get(a.0, b.0) {
+                #[cfg(debug_assertions)]
                 let start = reasons.len();
                 reasons.extend_from_slice(cached);
                 // Debug oracle (#i6-euf-explain-batch-memo): recompute the

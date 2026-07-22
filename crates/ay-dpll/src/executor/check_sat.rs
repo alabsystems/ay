@@ -4077,7 +4077,7 @@ mod quantifier_determinism_tests {
     #[test]
     fn quantifier_deadline_backstop_caps_extension() {
         let mut exec = Executor::new();
-        let nominal = Instant::now() + Duration::from_secs(300);
+        let nominal = Instant::now() + Duration::from_mins(5);
         exec.set_deadline(Some(nominal));
         exec.install_quantifier_deadline_backstop();
         let extra = exec
@@ -4086,7 +4086,7 @@ mod quantifier_determinism_tests {
             .expect("deadline must stay installed")
             .duration_since(nominal);
         assert!(
-            extra <= Duration::from_secs(180),
+            extra <= Duration::from_mins(3),
             "extension must be capped: {extra:?}"
         );
         assert!(
@@ -4146,7 +4146,7 @@ mod quantifier_determinism_tests {
         // back. This pins the non-compounding design: the tight window stays
         // tight even after the backstop extension.
         let mut exec = Executor::new();
-        let outer = Instant::now() + Duration::from_secs(60);
+        let outer = Instant::now() + Duration::from_mins(1);
         exec.set_deadline(Some(outer));
         exec.install_quantifier_deadline_backstop();
         let stop = exec.make_should_stop();
@@ -4211,7 +4211,7 @@ mod quantifier_determinism_tests {
         let mut exec = Executor::new();
         exec.last_result = Some(SolveResult::Unknown);
         exec.last_unknown_reason = Some(UnknownReason::QuantifierUnhandled);
-        exec.set_deadline(Some(Instant::now() + Duration::from_secs(60)));
+        exec.set_deadline(Some(Instant::now() + Duration::from_mins(1)));
         exec.finalize_unknown_diagnostics();
         assert_eq!(
             exec.last_unknown_reason,
@@ -4381,7 +4381,7 @@ mod quantifier_determinism_tests {
         exec.execute_all(&commands)
             .expect("setup commands must run");
         exec.last_unknown_reason = Some(UnknownReason::Incomplete);
-        exec.set_deadline(Some(Instant::now() + Duration::from_secs(60)));
+        exec.set_deadline(Some(Instant::now() + Duration::from_mins(1)));
         exec.refine_unsupported_fragment_unknown_reason(&div_mod_features());
         assert_eq!(
             exec.last_unknown_reason,
@@ -4403,7 +4403,7 @@ mod quantifier_determinism_tests {
         exec.execute_all(&commands)
             .expect("setup commands must run");
         exec.last_unknown_reason = Some(UnknownReason::Incomplete);
-        exec.set_deadline(Some(Instant::now() + Duration::from_secs(60)));
+        exec.set_deadline(Some(Instant::now() + Duration::from_mins(1)));
         exec.refine_unsupported_fragment_unknown_reason(&div_mod_features());
         assert_eq!(exec.last_unknown_reason, Some(UnknownReason::Incomplete));
     }

@@ -522,7 +522,7 @@ impl Executor {
             if let Some(result) = self.try_word_equation_nielsen()? {
                 return Ok(result);
             }
-            // W4 (`AY_STR_W4=1`, default off): length-indexed per-position
+            // W4 (default ON, `AY_STR_W4=0` kill switch): length-indexed per-position
             // character witness synthesizer (see `strings_w4.rs`). Same
             // validated-candidate contract as the passes above — a failed
             // synthesis falls through and never concludes UNSAT.
@@ -531,7 +531,7 @@ impl Executor {
                     return Ok(result);
                 }
             }
-            // W6 (`AY_STR_W6=1`, default off): regex-driven joint word
+            // W6 (default ON, `AY_STR_W6=0` kill switch): regex-driven joint word
             // construction (see `strings_w6.rs`). Same validated-candidate
             // contract — a failed construction never concludes UNSAT.
             if super::strings_w6::str_w6_enabled() {
@@ -539,7 +539,7 @@ impl Executor {
                     return Ok(result);
                 }
             }
-            // W7 (`AY_STR_W7=1`, default off): chain-definition, multi-atom
+            // W7 (default ON, `AY_STR_W7=0` kill switch): chain-definition, multi-atom
             // placement and distinct-witness moves (see `strings_w7.rs`).
             // LAST in the cascade, deliberately: W6 measured that moving a
             // later witness pass earlier costs the earlier passes' own

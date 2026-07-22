@@ -21,8 +21,10 @@ const BLAND_THRESHOLD: u32 = 1000;
 // Cached `--debug lra` channel (checked once per process). #8858
 cached_debug_channel!(debug_lra, DebugChannel::Lra);
 
+pub(crate) mod basis_solve;
 mod debug;
 mod feasibility;
+pub(crate) mod float_layer;
 pub(crate) mod float_simplex;
 mod pivot;
 mod solve;

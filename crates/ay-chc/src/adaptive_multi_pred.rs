@@ -1301,15 +1301,20 @@ impl AdaptivePortfolio {
 
     pub(crate) fn multi_pred_portfolio_timeout(remaining: Duration) -> Duration {
         const MIN_PORTFOLIO_BUDGET: Duration = Duration::from_secs(3);
+        // `PortfolioSolver` permits a two-second cooperative grace period after
+        // its parallel timeout. Reserve that time here so the nested stage does
+        // not overrun the adaptive solver's absolute deadline.
+        const COOPERATIVE_GRACE_RESERVE: Duration = Duration::from_secs(2);
 
-        if remaining <= MIN_PORTFOLIO_BUDGET {
-            return remaining;
-        }
-
-        remaining
-            .mul_f64(0.7)
-            .max(MIN_PORTFOLIO_BUDGET)
-            .min(remaining)
+        let desired = if remaining <= MIN_PORTFOLIO_BUDGET {
+            remaining
+        } else {
+            remaining
+                .mul_f64(0.7)
+                .max(MIN_PORTFOLIO_BUDGET)
+                .min(remaining)
+        };
+        desired.min(remaining.saturating_sub(COOPERATIVE_GRACE_RESERVE))
     }
 
     pub(crate) fn multi_pred_probe_timeout(&self, deadline: Option<Instant>) -> Duration {
@@ -1423,6 +1428,10 @@ impl AdaptivePortfolio {
         if self.config.verbose {
             safe_eprintln!("Adaptive: Trying case-split preprocessing (Stage 0)");
         }
+        let case_split_budget = self
+            .remaining_budget(deadline)
+            .unwrap_or(Duration::from_secs(8))
+            .min(Duration::from_secs(8));
         let mut case_split_config = Self::multi_pred_pdr_config(PdrConfig {
             max_iterations: 1000,
             max_obligations: 500_000,
@@ -1438,7 +1447,7 @@ impl AdaptivePortfolio {
             // (E!=1); the remaining time covers merged-model verification which
             // needs SMT checks on complex guarded formulas (e.g., dillig12_m's
             // quadratic invariant).
-            solve_timeout: Some(Duration::from_secs(8)),
+            solve_timeout: Some(case_split_budget),
             ..PdrConfig::default()
         })
         .with_tla_trace_from_env();
@@ -1452,7 +1461,7 @@ impl AdaptivePortfolio {
                     stage: "multi_pred_linear_case_split",
                     gate_result: true,
                     gate_reason: "case-split solved".to_string(),
-                    budget_secs: 5.0,
+                    budget_secs: case_split_budget.as_secs_f64(),
                     elapsed_secs: case_split_start.elapsed().as_secs_f64(),
                     result: Self::result_to_str(&validated),
                     lemmas_learned: 0,
@@ -1465,7 +1474,7 @@ impl AdaptivePortfolio {
             stage: "multi_pred_linear_case_split",
             gate_result: true,
             gate_reason: "case-split returned none/unknown".to_string(),
-            budget_secs: 5.0,
+            budget_secs: case_split_budget.as_secs_f64(),
             elapsed_secs: case_split_start.elapsed().as_secs_f64(),
             result: "unknown",
             lemmas_learned: 0,
@@ -1718,8 +1727,22 @@ impl AdaptivePortfolio {
         if let Some(ref mut timeout) = config.parallel_timeout {
             if let Some(remaining) = self.remaining_budget(deadline) {
                 *timeout = Self::multi_pred_portfolio_timeout(remaining);
+                if timeout.is_zero() {
+                    if self.config.verbose {
+                        safe_eprintln!(
+                            "Adaptive: Skipping mixed portfolio because only its cooperative grace window remains"
+                        );
+                    }
+                    return (
+                        PortfolioResult::Unknown,
+                        ValidationEvidence::FullVerification,
+                    );
+                }
             }
         }
+        let portfolio_budget_secs = config
+            .parallel_timeout
+            .map_or(0.0, |timeout| timeout.as_secs_f64());
 
         let portfolio_start = Instant::now();
         let portfolio_result = if self.is_large_acyclic_bv_array_graph(features) {
@@ -1745,9 +1768,7 @@ impl AdaptivePortfolio {
             stage: "multi_pred_linear_portfolio",
             gate_result: true,
             gate_reason: "mixed portfolio".to_string(),
-            budget_secs: self
-                .remaining_budget(deadline)
-                .map_or(0.0, |d| d.as_secs_f64()),
+            budget_secs: portfolio_budget_secs,
             elapsed_secs: portfolio_start.elapsed().as_secs_f64(),
             result: Self::result_to_str(&portfolio_result),
             lemmas_learned: 0,
@@ -1829,12 +1850,35 @@ impl AdaptivePortfolio {
             return (portfolio_result, ValidationEvidence::FullVerification);
         }
 
-        // Stage 3: Failure-guided retry (with transferred lemma pool)
-        (
-            self.failure_guided_retry(deadline, transferred_pool.as_ref())
-                .unwrap_or(portfolio_result),
-            ValidationEvidence::FullVerification,
-        )
+        // Stage 3: Failure-guided retry (with transferred lemma pool).
+        let retry_budget = self
+            .remaining_budget(deadline)
+            .map_or(0.0, |duration| duration.as_secs_f64());
+        let retry_start = Instant::now();
+        let retry_result = self.failure_guided_retry(deadline, transferred_pool.as_ref());
+        let retry_solved = retry_result.as_ref().is_some_and(|candidate| {
+            !matches!(
+                candidate,
+                PortfolioResult::Unknown | PortfolioResult::NotApplicable
+            )
+        });
+        let result = retry_result.unwrap_or(portfolio_result);
+        self.decision_log.log_decision(DecisionEntry {
+            stage: "multi_pred_linear_retry",
+            gate_result: retry_solved,
+            gate_reason: if retry_solved {
+                "failure-guided retry produced a result"
+            } else {
+                "failure-guided retry exhausted or remained unknown"
+            }
+            .to_string(),
+            budget_secs: retry_budget,
+            elapsed_secs: retry_start.elapsed().as_secs_f64(),
+            result: Self::result_to_str(&result),
+            lemmas_learned: 0,
+            max_frame: 0,
+        });
+        (result, ValidationEvidence::FullVerification)
     }
 
     /// Failure-guided retry: probe PDR, analyze the failure, and retry with

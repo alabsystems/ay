@@ -933,21 +933,32 @@ fn test_proof_streaming_parse_error_after_header_removes_sidecar() {
         .output()
         .expect("spawn ay proof streaming parse-error run");
 
+    // The streaming route reserves its requested proof output before solving,
+    // and the hardened transactional boundary refuses to overwrite (or
+    // unlink) a pre-existing foreign path: the run fails closed before any
+    // verdict and leaves the sidecar untouched.
     assert_eq!(
         output.status.code(),
         Some(1),
-        "expected parse-error UNKNOWN exit 1: stdout={}, stderr={}",
+        "expected pre-existing-sidecar refusal exit 1: stdout={}, stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("s UNKNOWN"),
-        "parse-error proof-mode run should print UNKNOWN: {}",
-        String::from_utf8_lossy(&output.stdout)
+        String::from_utf8_lossy(&output.stderr)
+            .contains("refusing to overwrite pre-existing DIMACS proof output"),
+        "parse-error proof-mode run must refuse the pre-existing sidecar: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        !proof_path.exists(),
-        "proof-streaming parse-error UNKNOWN must remove non-UNSAT sidecar {}",
+        !String::from_utf8_lossy(&output.stdout).contains("s UNSATISFIABLE"),
+        "refused run must not emit a verdict: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        std::fs::read(&proof_path).expect("pre-existing sidecar must be preserved"),
+        b"stale proof",
+        "proof-streaming refusal must preserve the foreign pre-existing sidecar {}",
         proof_path.display()
     );
 }
@@ -984,9 +995,13 @@ fn test_parallel_portfolio_sat_with_requested_proof_removes_stale_sidecar() {
         "parallel proof-mode SAT run should print SAT: {}",
         String::from_utf8_lossy(&output.stdout)
     );
-    assert!(
-        !proof_path.exists(),
-        "parallel proof-mode SAT must remove stale non-UNSAT sidecar {}",
+    // A pre-existing sidecar is not owned by this solve; the hardened
+    // publication boundary never unlinks a foreign path. Non-UNSAT routes
+    // must leave it untouched.
+    assert_eq!(
+        std::fs::read(&proof_path).expect("pre-existing sidecar must be preserved"),
+        b"stale proof",
+        "parallel proof-mode SAT must preserve the foreign pre-existing sidecar {}",
         proof_path.display()
     );
 }
@@ -1023,9 +1038,13 @@ fn test_parallel_portfolio_parse_error_with_requested_proof_removes_stale_sideca
         "parallel parse-error proof-mode run should print UNKNOWN: {}",
         String::from_utf8_lossy(&output.stdout)
     );
-    assert!(
-        !proof_path.exists(),
-        "parallel parse-error UNKNOWN must remove stale non-UNSAT sidecar {}",
+    // A pre-existing sidecar is not owned by this solve; the hardened
+    // publication boundary never unlinks a foreign path. The parse-error run
+    // must fail without touching it.
+    assert_eq!(
+        std::fs::read(&proof_path).expect("pre-existing sidecar must be preserved"),
+        b"stale proof",
+        "parallel parse-error UNKNOWN must preserve the foreign pre-existing sidecar {}",
         proof_path.display()
     );
 }

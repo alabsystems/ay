@@ -61,6 +61,7 @@ ay-jit = { workspace = true, optional = true }
 libc.workspace = true
 
 [dev-dependencies]
+ay-test-support.workspace = true
 proptest.workspace = true
 criterion.workspace = true
 ntest = "0.9"
@@ -70,7 +71,6 @@ tempfile.workspace = true
 ay-lrat-check.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
-ay-test-support.workspace = true
 
 [[bench]]
 name = "incremental_bench"

@@ -488,3 +488,170 @@ fn safety_proof_routes_bv_inductive_subset_candidates_through_cascade_issue_7964
         "BV single-predicate inductive-subset candidates must route through the verification cascade"
     );
 }
+
+// ===========================================================================
+// Counterexample-guided candidate repair (#4751 L4)
+// ===========================================================================
+
+/// Bouncy-style two-predicate program: itp1 counts up in lockstep (a1 stays 0,
+/// a0 = a2), itp2 is entered by a copy edge and conserves a1 + a2 while a0 is
+/// untouched. Query: itp2 with a0 = a1 and a2 != 0 must be unreachable.
+const BOUNCY_STYLE_PROGRAM: &str = r#"
+(set-logic HORN)
+(declare-fun itp2 (Int Int Int) Bool)
+(declare-fun itp1 (Int Int Int) Bool)
+(assert (forall ((A Int) (B Int) (C Int))
+  (=> (and (= B 0) (= A 0) (= C 0)) (itp1 A B C))))
+(assert (forall ((A Int) (B Int) (C Int) (D Int) (E Int) (F Int))
+  (=> (and (itp1 A C B) (= E C) (= D (+ 1 A)) (= F (+ 1 B))) (itp1 D E F))))
+(assert (forall ((A Int) (B Int) (C Int))
+  (=> (and (itp1 A B C) true) (itp2 A B C))))
+(assert (forall ((A Int) (B Int) (C Int) (D Int) (E Int) (F Int))
+  (=> (and (itp2 C A B) (= E (+ 1 A)) (= D C) (= F (+ (- 1) B))) (itp2 D E F))))
+(assert (forall ((A Int) (B Int) (C Int))
+  (=> (and (itp2 A B C) (= A B) (not (= C 0))) false)))
+(check-sat)
+"#;
+
+fn bouncy_style_solver() -> PdrSolver {
+    let problem = ChcParser::parse(BOUNCY_STYLE_PROGRAM).expect("bouncy-style program parses");
+    PdrSolver::new(problem, PdrConfig::default())
+}
+
+fn pred_id_by_name(solver: &PdrSolver, name: &str) -> crate::PredicateId {
+    solver
+        .problem
+        .predicates()
+        .iter()
+        .find(|p| p.name == name)
+        .unwrap_or_else(|| panic!("predicate {name} exists"))
+        .id
+}
+
+#[test]
+fn assignment_from_state_conjunction_extracts_constant_equalities() {
+    let cube = ChcExpr::and_all([
+        ChcExpr::eq(var("a"), ChcExpr::int(1)),
+        ChcExpr::eq(ChcExpr::int(-3), var("b")),
+        // Non-constant equality is skipped, not misread.
+        ChcExpr::eq(var("c"), var("d")),
+        // Non-equality conjuncts are skipped.
+        ChcExpr::le(var("e"), ChcExpr::int(7)),
+    ]);
+    let assignment = PdrSolver::assignment_from_state_conjunction(&cube);
+    assert_eq!(
+        assignment.get("a"),
+        Some(&crate::smt::SmtValue::Int(1)),
+        "direct var = const equality must be extracted"
+    );
+    assert_eq!(
+        assignment.get("b"),
+        Some(&crate::smt::SmtValue::Int(-3)),
+        "reversed const = var equality must be extracted"
+    );
+    assert!(!assignment.contains_key("c") && !assignment.contains_key("d"));
+    assert!(!assignment.contains_key("e"));
+}
+
+#[test]
+fn drop_falsified_candidate_conjuncts_drops_exactly_the_poison() {
+    let solver = bouncy_style_solver();
+    let itp2 = pred_id_by_name(&solver, "itp2");
+    let vars: Vec<ChcVar> = solver
+        .canonical_vars(itp2)
+        .expect("canonical vars")
+        .to_vec();
+    let (a0, a1, a2) = (vars[0].clone(), vars[1].clone(), vars[2].clone());
+
+    // Candidate: (a0 = a1 + a2) [true invariant] AND (a0 <= 0) [poison].
+    let good = ChcExpr::eq(
+        ChcExpr::var(a0.clone()),
+        ChcExpr::add(ChcExpr::var(a1.clone()), ChcExpr::var(a2.clone())),
+    );
+    let poison = ChcExpr::le(ChcExpr::var(a0.clone()), ChcExpr::int(0));
+    let mut model = InvariantModel::new();
+    model.set(
+        itp2,
+        PredicateInterpretation::new(vars.clone(), ChcExpr::and(good.clone(), poison.clone())),
+    );
+
+    // Counterexample post-state a0=1, a1=0, a2=1 falsifies ONLY the poison.
+    let cex = ChcExpr::and_all([
+        ChcExpr::eq(ChcExpr::var(a0), ChcExpr::int(1)),
+        ChcExpr::eq(ChcExpr::var(a1), ChcExpr::int(0)),
+        ChcExpr::eq(ChcExpr::var(a2), ChcExpr::int(1)),
+    ]);
+
+    let dropped = solver.drop_falsified_candidate_conjuncts(&mut model, itp2, &cex);
+    assert_eq!(dropped, 1, "exactly the falsified conjunct is dropped");
+    let repaired = model.get(&itp2).expect("interpretation survives");
+    let conjuncts = repaired.formula.collect_conjuncts();
+    assert!(
+        conjuncts.contains(&good),
+        "the true-invariant conjunct must be kept"
+    );
+    assert!(
+        !conjuncts.contains(&poison),
+        "the falsified poison conjunct must be gone"
+    );
+}
+
+#[test]
+fn repair_demoted_candidate_recovers_a_verifiable_model_from_poison() {
+    let problem = ChcParser::parse(BOUNCY_STYLE_PROGRAM).expect("bouncy-style program parses");
+    let mut solver = PdrSolver::new(problem, PdrConfig::default().with_verbose(true));
+    let itp1 = pred_id_by_name(&solver, "itp1");
+    let itp2 = pred_id_by_name(&solver, "itp2");
+    let vars1: Vec<ChcVar> = solver.canonical_vars(itp1).expect("vars").to_vec();
+    let vars2: Vec<ChcVar> = solver.canonical_vars(itp2).expect("vars").to_vec();
+
+    // itp1 := (a1 = 0) AND (a0 = a2) — the true invariant.
+    let itp1_formula = ChcExpr::and(
+        ChcExpr::eq(ChcExpr::var(vars1[1].clone()), ChcExpr::int(0)),
+        ChcExpr::eq(
+            ChcExpr::var(vars1[0].clone()),
+            ChcExpr::var(vars1[2].clone()),
+        ),
+    );
+    // itp2 := (a0 = a1 + a2) AND (a0 <= 0) — true invariant plus the exact
+    // optimistically-admitted poison shape observed on bouncy (#4751 L4).
+    let itp2_good = ChcExpr::eq(
+        ChcExpr::var(vars2[0].clone()),
+        ChcExpr::add(
+            ChcExpr::var(vars2[1].clone()),
+            ChcExpr::var(vars2[2].clone()),
+        ),
+    );
+    let itp2_poison = ChcExpr::le(ChcExpr::var(vars2[0].clone()), ChcExpr::int(0));
+
+    let mut model = InvariantModel::new();
+    model.set(itp1, PredicateInterpretation::new(vars1, itp1_formula));
+    model.set(
+        itp2,
+        PredicateInterpretation::new(vars2, ChcExpr::and(itp2_good, itp2_poison.clone())),
+    );
+
+    // Pre-repair the poisoned candidate must FAIL strict validation...
+    assert!(
+        !solver.verify_model_fresh(&model),
+        "poisoned candidate must be rejected by strict validation"
+    );
+
+    // ...and counterexample-guided repair must recover a verified candidate.
+    let repaired = solver
+        .repair_demoted_candidate(model)
+        .expect("repair should converge on the bouncy-style poison");
+    assert!(
+        !repaired
+            .get(&itp2)
+            .expect("itp2 interpretation")
+            .formula
+            .collect_conjuncts()
+            .contains(&itp2_poison),
+        "repair must drop the poison conjunct"
+    );
+    assert!(
+        solver.verify_model_fresh(&repaired),
+        "repaired candidate must pass the unmodified strict gate"
+    );
+}

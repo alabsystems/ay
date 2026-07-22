@@ -504,7 +504,7 @@ fn threaded_memory_safe_end_to_end() {
     // unconstrained vars, so translated interpretations keep the original
     // arity (required for original-clause validation).
     let pdr_config = PdrConfig {
-        solve_timeout: Some(std::time::Duration::from_secs(60)),
+        solve_timeout: Some(std::time::Duration::from_mins(1)),
         ..PdrConfig::default()
     };
     let mut solver = PdrSolver::new(result.problem.clone(), pdr_config);

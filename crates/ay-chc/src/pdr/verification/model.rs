@@ -197,6 +197,26 @@ impl PdrSolver {
         result
     }
 
+    /// Fresh-context per-rule verification that reports the failing clause.
+    ///
+    /// Same semantics as [`verify_model_fresh`](Self::verify_model_fresh)
+    /// (fresh `SmtContext`, independent 2s per-rule budgets), but returns the
+    /// failure tuple `(body_pred, pre_state, head_pred, post_state)` instead
+    /// of a bare bool. For a transition-clause SAT failure the `post_state`
+    /// is a conjunction of `canonical_var = value` equalities extracted from
+    /// the SMT counterexample model — the hook point for counterexample-guided
+    /// candidate repair (#4751 L4 follow-up). `None` means the model verified.
+    pub(in crate::pdr) fn verify_model_fresh_with_failure(
+        &mut self,
+        model: &InvariantModel,
+    ) -> Option<(PredicateId, ChcExpr, PredicateId, ChcExpr)> {
+        let warm_smt = std::mem::take(&mut self.smt);
+        let per_rule_budget = std::time::Duration::from_secs(2);
+        let result = self.verify_model_impl(model, Some(per_rule_budget), false, true);
+        self.smt = warm_smt;
+        result
+    }
+
     /// Fresh-context verification checking only query clauses.
     ///
     /// Used as a fallback when full fresh verification fails on transition

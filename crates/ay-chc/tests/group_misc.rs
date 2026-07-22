@@ -24,8 +24,6 @@ mod cegar_multi_predicate_6047;
 mod chc_regression_1615;
 #[path = "group_misc/cyclic_array_bmc_unsafe_swaparray.rs"]
 mod cyclic_array_bmc_unsafe_swaparray;
-#[path = "group_misc/dillig12_m_regression_4751.rs"]
-mod dillig12_m_regression_4751;
 #[path = "group_misc/dt_bv_theory_combination_8419.rs"]
 mod dt_bv_theory_combination_8419;
 #[path = "group_misc/entry_value_inference_prover.rs"]

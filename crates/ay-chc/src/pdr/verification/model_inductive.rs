@@ -108,9 +108,13 @@ impl PdrSolver {
             .is_some_and(|(body_pred, _)| *body_pred != *head_pred);
 
         // Validate: body => head  (i.e., body /\ !head is UNSAT)
-        let query = Self::simplify_transition_query(
-            self.bound_int_vars(ChcExpr::and(body.clone(), ChcExpr::not(head.clone()))),
-        );
+        // Keep the pre-simplification query: `simplify_transition_query`
+        // substitutes top-level variable equalities away, so a SAT model over
+        // the simplified query omits the substituted variables. State
+        // extraction (and #4751 L4 candidate repair) re-derives them by
+        // propagating the ORIGINAL query's equalities through the model.
+        let raw_query = self.bound_int_vars(ChcExpr::and(body.clone(), ChcExpr::not(head.clone())));
+        let query = Self::simplify_transition_query(raw_query.clone());
 
         // Fast-path: a syntactic contradiction implies UNSAT (safe to skip SMT).
         if cube::is_trivial_contradiction(&query) {
@@ -383,9 +387,13 @@ impl PdrSolver {
             SmtResult::Sat(m) => {
                 let mut m = m;
                 if m.is_empty() {
-                    Self::extract_equalities_from_formula(&query, &mut m);
+                    Self::extract_equalities_from_formula(&raw_query, &mut m);
                 }
-                cube::augment_model_from_equalities(&query, &mut m);
+                // Augment from the PRE-simplification query (#4751 L4):
+                // simplify_transition_query substituted variable equalities
+                // away, so only the raw query still carries the equalities
+                // needed to reconstruct the substituted variables' values.
+                cube::augment_model_from_equalities(&raw_query, &mut m);
                 if self.config.verbose {
                     safe_eprintln!(
                         "PDR: verify_model: clause {} implication failed",

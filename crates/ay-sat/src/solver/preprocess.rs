@@ -1045,19 +1045,10 @@ mod tests {
     #[test]
     fn lucky_probe_budget_scales_and_clamps() {
         use std::time::Duration;
-        assert_eq!(lucky_probe_budget_for(0), Duration::from_millis(1_000));
-        assert_eq!(
-            lucky_probe_budget_for(500_000),
-            Duration::from_millis(1_000)
-        );
-        assert_eq!(
-            lucky_probe_budget_for(5_000_000),
-            Duration::from_millis(5_000)
-        );
-        assert_eq!(
-            lucky_probe_budget_for(63_000_000),
-            Duration::from_millis(60_000)
-        );
+        assert_eq!(lucky_probe_budget_for(0), Duration::from_secs(1));
+        assert_eq!(lucky_probe_budget_for(500_000), Duration::from_secs(1));
+        assert_eq!(lucky_probe_budget_for(5_000_000), Duration::from_secs(5));
+        assert_eq!(lucky_probe_budget_for(63_000_000), Duration::from_mins(1));
     }
 
     #[test]

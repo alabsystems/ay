@@ -50,12 +50,15 @@ impl PdrSolver {
     /// (`houdini_pruned_frame1_len`), so repeated demotions do not repeat the
     /// per-lemma SMT sweep.
     ///
-    /// Scope: budget-capped solves only (portfolio cancellation token /
-    /// solve_timeout / solve_deadline). Unbounded direct-PDR solves cannot be
-    /// starved by the post-demotion tail — they reach the existing
-    /// end-of-startup prune and the main loop with their full budget — so
-    /// eagerly pruning them would change the main-loop trajectory for no
-    /// benefit; they keep the pre-existing flow.
+    /// Scope: ALL solves (#4751 L4). This was previously gated to
+    /// budget-capped solves on the theory that unbounded solves "cannot be
+    /// starved by the post-demotion tail". That rationale was falsified by
+    /// pdr_bouncy_two_counters_equality_safe: an UNBOUNDED solve carried a
+    /// poisoned 40+-lemma frame[1] into the main loop after a demotion, where
+    /// single blocking queries took tens of seconds and the test harness'
+    /// wall clock starved the solve anyway. Unbounded solves are starved by
+    /// the OUTER wall clock even when no internal budget exists, so the
+    /// demotion-point prune runs unconditionally.
     ///
     /// SOUNDNESS: the prune only REMOVES lemmas (weakening an
     /// over-approximating frame, always sound), the convergence snapshot is
@@ -66,12 +69,6 @@ impl PdrSolver {
         &mut self,
         stage: &'static str,
     ) -> Option<PdrResult> {
-        let budget_capped = self.config.cancellation_token.is_some()
-            || self.config.solve_timeout.is_some()
-            || self.solve_deadline.is_some();
-        if !budget_capped {
-            return None;
-        }
         let frame1_len = self.frames.get(1).map_or(0, |f| f.lemmas.len());
         if frame1_len == 0
             || self.houdini_pruned_frame1_len == Some(frame1_len)
@@ -136,8 +133,20 @@ impl PdrSolver {
                             &formula,
                             &canonical_vars,
                         );
+                    // #4751 L4 (cand4 hardening): check entry-inductiveness at
+                    // level 2, i.e. against the SURVIVING frame[1] conjuncts of
+                    // the predecessor predicates (global relative induction),
+                    // NOT the level-1 check whose prev_level==0 context is the
+                    // init-only must-summary. The init-only context is the
+                    // strongest possible hypothesis, so poison like `a0 <= 0`
+                    // (true at depth <= 1 only) survives it — observed on
+                    // bouncy. Because source predicates are pruned first and
+                    // the sweep iterates to a fixpoint, the surviving set is
+                    // mutually relatively inductive (standard Houdini
+                    // argument). Using the weaker frame[1] hypothesis can only
+                    // remove MORE lemmas — removal is always sound.
                     let entry_ok =
-                        self_ok && (!is_multi || self.is_entry_inductive(&formula, pred.id, 1));
+                        self_ok && (!is_multi || self.is_entry_inductive(&formula, pred.id, 2));
                     if !(init_ok && self_ok && entry_ok) {
                         if self.config.verbose {
                             safe_eprintln!(

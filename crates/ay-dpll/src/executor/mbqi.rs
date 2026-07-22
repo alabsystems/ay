@@ -7552,19 +7552,49 @@ impl Executor {
                         sym_names.len()
                     ),
                 );
-                // W1 bridge route is SHADOW-ONLY in this increment: a grant
-                // that depends on ANY bridge-route claim is logged and then
-                // WITHHELD (verdict byte-identical to the route being absent).
-                // Authoritative grant is gated on the W3 vehicle-gate
-                // reconcile + the EUF-extraction faithfulness guarantee
-                // (SAT-side campaign blocking pin #5) — deliberately not
-                // implemented here.
-                if bridge_route_used {
+                // EUF-EXTRACTION FAITHFULNESS GUARANTEE (blocking pin #5): before
+                // ANY grant (shadow would-grant OR authoritative), cross-check
+                // the certified tables against the solver's committed
+                // per-application values. A would-grant that fails faithfulness
+                // logs a would-DECLINE instead and withholds (fail-closed). This
+                // is what stands between the cert's grant and a wrong-SAT via a
+                // dropped/misassigned extraction row.
+                if let Err(reason) = self.dt_cert_extraction_faithful(
+                    &model,
+                    snapshot,
+                    &table_syms,
+                    &tables,
+                    &defaults,
+                    &bridge_rewrite,
+                ) {
                     dt_cert_note(
                         mode,
-                        "[BRIDGE-ROUTE] would-grant base (shadow-only: grant withheld, verdict unchanged)",
+                        &format!("[FAITHFULNESS] would-decline (extraction infidelity): {reason}"),
                     );
                     return None;
+                }
+                dt_cert_note(
+                    mode,
+                    "[FAITHFULNESS] verified (committed values match certified cells)",
+                );
+                // W1 bridge route: SHADOW when `AY_DT_CERT_BRIDGE_ROUTE`=shadow/log
+                // (log would-grant, withhold — verdict byte-identical to the
+                // route being absent); AUTHORITATIVE (armed) when =1/on — the
+                // grant now flows through, faithfulness-verified. Byte-identical
+                // when the route flag is unset (`bridge_route_used` is false).
+                if bridge_route_used {
+                    if dt_cert_bridge_route_authoritative() {
+                        dt_cert_note(
+                            mode,
+                            "[BRIDGE-ROUTE] grant (authoritative, faithfulness-verified)",
+                        );
+                    } else {
+                        dt_cert_note(
+                            mode,
+                            "[BRIDGE-ROUTE] would-grant base (bridge route in shadow: grant withheld, verdict unchanged)",
+                        );
+                        return None;
+                    }
                 }
                 // SHADOW: log only, never flip the verdict. ON: grant.
                 return match mode {
@@ -8892,6 +8922,185 @@ impl Executor {
         result
     }
 
+    /// Render a certified table value in the atom spelling the EUF extraction
+    /// uses for committed function/class values (`eval_value_to_model_atom`), so
+    /// a cert cell can be compared for equality against a committed atom read.
+    fn dt_cert_table_val_atom(v: &TableCertVal) -> String {
+        match v {
+            TableCertVal::Int(i) => i.to_string(),
+            TableCertVal::Bool(b) => b.to_string(),
+            TableCertVal::Rat(r) => {
+                if r.is_integer() {
+                    r.numer().to_string()
+                } else {
+                    format!("(/ {} {})", r.numer(), r.denom())
+                }
+            }
+        }
+    }
+
+    /// EUF-EXTRACTION FAITHFULNESS GUARANTEE (SAT-side base-recheck campaign,
+    /// blocking pin #5) — the last soundness prerequisite before an authoritative
+    /// DT-cert grant. Runs at cert-grant time, BEFORE any grant (shadow or
+    /// authoritative). Read-only (`&self`): a cheap pass over already-committed
+    /// state (~71-100 ground asserts), no minting.
+    ///
+    /// THE HOLE it closes (the [[regression-mutref-euf-lia-model]] class): the F4
+    /// tables are built with `evaluate_term`, which resolves an Int UF
+    /// application through the arg-keyed function-table synthesis. A
+    /// ground-pinned value that reaches the solver only IMPLICITLY (via EUF
+    /// equality/congruence chains not materialized as a directly-evaluable
+    /// ground assertion) could be DROPPED or MISASSIGNED there — the table cell
+    /// then disagrees with the solver's committed e-graph value, no single
+    /// ground assertion evaluates false, and F4 certifies a universal the true
+    /// model violates → wrong-SAT → a vacuous proof reports Verified (the
+    /// cardinal sin).
+    ///
+    /// THE GUARANTEE: for every symbol the certificate RELIES ON (the F4 finite-
+    /// table symbols + the W1/W2 bridge UFs), cross-check the cert's decision
+    /// against the solver's COMMITTED per-application value read through
+    /// [`Executor::committed_app_atom`] — the NON-RECURSIVE `func_app_const_terms`
+    /// / `int_values` / `term_values` anchors, INDEPENDENT of the arg-keyed
+    /// table synthesis that produced the cert cell. An extraction that
+    /// dropped/misassigned a row can no longer produce a certified grant,
+    /// because the certification now requires and cross-checks a committed
+    /// source of truth rather than trusting the extracted table alone.
+    ///
+    /// Fail-closed. DECLINE (`Err`) on: (1) any relied-upon symbol the EUF
+    /// extraction flagged as a cross-theory function-table conflict
+    /// (`function_table_conflicts` — its own contract says consumers MUST fail
+    /// closed); (2) any ground-core application whose committed value disagrees
+    /// with the certified cell at its argument e-class; (3) congruent
+    /// applications (same argument e-class) that commit two different values (the
+    /// dropped-congruence signature); (4) an argument whose e-class cannot be
+    /// resolved; (5) a ground application with no independent committed anchor;
+    /// (6) a ground application with no certified row or default. The final two
+    /// cases MUST decline: accepting either would reduce this purportedly
+    /// independent check to trusting the same evaluator/table extraction whose
+    /// omission or misassignment it exists to catch.
+    fn dt_cert_extraction_faithful(
+        &self,
+        model: &Model,
+        snapshot: &[TermId],
+        table_syms: &HashMap<String, TableCertSort>,
+        tables: &HashMap<String, HashMap<String, TableCertVal>>,
+        defaults: &HashMap<String, TableCertVal>,
+        bridge_rewrite: &HashMap<String, (String, Sort)>,
+    ) -> std::result::Result<(), String> {
+        // The cert's F4 tables and bridge completion are over UF applications
+        // whose committed values live in the EUF model. With no EUF model there
+        // is no committed surface to certify against — fail closed if the cert
+        // relied on any table or bridge symbol.
+        let Some(euf) = model.euf_model.as_ref() else {
+            if table_syms.is_empty() && bridge_rewrite.is_empty() {
+                return Ok(());
+            }
+            return Err("no EUF model to cross-check tabled/bridge symbols".to_string());
+        };
+
+        // (1) Cross-theory function-table conflicts. The extraction flags a
+        // symbol whose rows became semantically inconsistent after model
+        // combination and could not be repaired exactly; certifying a universal
+        // over such a symbol is the wrong-SAT vector its contract warns of.
+        for uf in table_syms.keys().chain(bridge_rewrite.keys()) {
+            if euf.function_table_conflicts.contains(uf) {
+                return Err(format!(
+                    "committed function table for `{uf}` is flagged inconsistent \
+                     (cross-theory merge conflict)"
+                ));
+            }
+        }
+
+        // (2)+(3) Committed-vs-certified agreement + congruence consistency over
+        // every ground-core application of a relied-upon table symbol.
+        let mut committed_by_key: HashMap<(String, String), String> = HashMap::default();
+        let mut visited: HashSet<TermId> = HashSet::default();
+        let mut stack: Vec<TermId> = snapshot.to_vec();
+        while let Some(t) = stack.pop() {
+            if !visited.insert(t) {
+                continue;
+            }
+            match self.ctx.terms.get(t) {
+                TermData::Forall(_, b, _) | TermData::Exists(_, b, _) => stack.push(*b),
+                TermData::Not(i) => stack.push(*i),
+                TermData::Ite(c, a, b) => {
+                    stack.push(*c);
+                    stack.push(*a);
+                    stack.push(*b);
+                }
+                TermData::Let(bindings, b) => {
+                    for (_, v) in bindings {
+                        stack.push(*v);
+                    }
+                    stack.push(*b);
+                }
+                TermData::App(sym, args) => {
+                    let name = sym.name().to_string();
+                    let args = args.clone();
+                    stack.extend(args.iter().copied());
+                    if !table_syms.contains_key(&name) || args.len() != 1 {
+                        continue;
+                    }
+                    // Skip the certified BINDER application `uf(x)` (and any
+                    // binder-DEPENDENT `uf(g(x))`): its argument is a bound
+                    // variable with no committed e-class, so it is the universal
+                    // itself, not a ground observation — step 4 (`dt_cert_value_
+                    // key`) skips it too. Every GROUND table argument DID resolve
+                    // (else step 4 would already have declined "unresolvable
+                    // e-class key for a table arg" before we reached the grant),
+                    // so a `None` here is exactly a non-ground application.
+                    let Some(key) = self.dt_cert_value_key(model, args[0]) else {
+                        continue;
+                    };
+                    // Committed per-application value (the independent anchor
+                    // read). A ground application with no anchor is not
+                    // certifiable: falling back to the evaluator here would be
+                    // circular, because that evaluator produced the F4 cell.
+                    let Some(atom) = self.committed_app_atom(model, euf, t) else {
+                        return Err(format!(
+                            "`{name}` has no independent committed value at argument e-class `{key}`"
+                        ));
+                    };
+                    // The certified decision at this cell (what an F4 body would
+                    // have substituted for `uf(x)` at this e-class).
+                    let Some(cell) = tables
+                        .get(&name)
+                        .and_then(|tab| tab.get(&key))
+                        .cloned()
+                        .or_else(|| defaults.get(&name).cloned())
+                    else {
+                        return Err(format!(
+                            "`{name}` has no certified row or default at argument e-class `{key}`"
+                        ));
+                    };
+                    let cell_atom = Self::dt_cert_table_val_atom(&cell);
+                    if cell_atom != atom {
+                        return Err(format!(
+                            "`{name}` committed value `{atom}` disagrees with certified \
+                             cell `{cell_atom}` at argument e-class `{key}`"
+                        ));
+                    }
+                    // Congruence: two applications whose arguments share an
+                    // e-class must commit ONE value (a disagreement is the
+                    // dropped-congruence extraction signature).
+                    match committed_by_key.get(&(name.clone(), key.clone())) {
+                        Some(prev) if *prev != atom => {
+                            return Err(format!(
+                                "`{name}` congruent applications commit two values \
+                                 (`{prev}` vs `{atom}`) at argument e-class `{key}`"
+                            ));
+                        }
+                        _ => {
+                            committed_by_key.insert((name.clone(), key), atom);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// After a re-sequencing GRANT, drop the printed function-table
     /// interpretation of every FREE completable UF that heads a top-level
     /// `forall` in `snapshot` (`logic_sum`, the bridge UFs, …). This makes those
@@ -9464,6 +9673,19 @@ pub(crate) fn dt_cert_bridge_route_enabled() -> bool {
     matches!(
         std::env::var("AY_DT_CERT_BRIDGE_ROUTE").ok().as_deref(),
         Some("1") | Some("on") | Some("shadow") | Some("log")
+    )
+}
+
+/// AUTHORITATIVE arming of the W1 bridge route: `AY_DT_CERT_BRIDGE_ROUTE`=`1`/`on`
+/// (NOT `shadow`/`log`). Only when this holds does a faithfulness-verified
+/// bridge-route claim flow through to a real grant (under `AY_DT_CERT`=on); with
+/// `shadow`/`log` the bridge route classifies + logs a would-grant but WITHHOLDS
+/// the verdict exactly as before. The EUF-extraction faithfulness guarantee is a
+/// hard precondition of BOTH paths — the withhold happens strictly after it.
+pub(crate) fn dt_cert_bridge_route_authoritative() -> bool {
+    matches!(
+        std::env::var("AY_DT_CERT_BRIDGE_ROUTE").ok().as_deref(),
+        Some("1") | Some("on")
     )
 }
 

@@ -16,8 +16,9 @@ fn ay_binary() -> &'static str {
 
 #[test]
 fn incomplete_check_retires_stale_queries_explanation_and_decision_trace() {
-    let temp = TempDir::new().expect("temporary directory");
-    let trace = temp.path().join("decision.trace");
+    // NOTE: `--decision-trace` now requires a FILE input (complete
+    // single-query preflight before any verdict), so this stdin transcript
+    // covers the query/explanation retirement surface without a trace.
     let input = r#"
 (set-logic QF_UF)
 (set-option :produce-proofs true)
@@ -38,8 +39,7 @@ fn incomplete_check_retires_stale_queries_explanation_and_decision_trace() {
 "#;
 
     let mut child = Command::new(ay_binary())
-        .args(["solve", "--stdin", "--explain", "--decision-trace"])
-        .arg(&trace)
+        .args(["solve", "--stdin", "--explain"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -85,17 +85,6 @@ fn incomplete_check_retires_stale_queries_explanation_and_decision_trace() {
         stdout.contains("a problem-contributing command was discarded"),
         "public reason-unknown was not preserved: {stdout}; stderr={stderr}"
     );
-    assert!(
-        trace.exists(),
-        "same-run trace reservation should remain visible"
-    );
-    assert_eq!(
-        std::fs::metadata(&trace)
-            .expect("invalidated trace metadata")
-            .len(),
-        0,
-        "a raw trace with a mismatched public result must be non-replayable"
-    );
 }
 
 #[test]
@@ -136,25 +125,21 @@ fn unrepresentable_definition_overloads_fail_closed() {
 
 #[test]
 fn piped_execution_failure_exits_nonzero_without_a_verdict() {
+    // NOTE: `--decision-trace` now requires a FILE input, so the unusable
+    // trace target is exercised through a file transcript; its reservation
+    // fails in preflight, before any verdict can be emitted.
     let temp = TempDir::new().expect("temporary directory");
     let invalid_trace_target = temp.path().join("trace-is-a-directory");
     std::fs::create_dir(&invalid_trace_target).expect("create invalid trace target");
+    let input = temp.path().join("input.smt2");
+    std::fs::write(&input, b"(assert missing-symbol)\n(check-sat)\n").expect("write input");
 
-    let mut child = Command::new(ay_binary())
-        .args(["solve", "--stdin", "--decision-trace"])
+    let output = Command::new(ay_binary())
+        .args(["solve", "--decision-trace"])
         .arg(&invalid_trace_target)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .arg(&input)
+        .output()
         .expect("spawn ay");
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(b"(assert missing-symbol)\n(check-sat)\n")
-        .expect("write transcript");
-    let output = child.wait_with_output().expect("wait for ay");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -163,39 +148,36 @@ fn piped_execution_failure_exits_nonzero_without_a_verdict() {
         !stdout
             .lines()
             .any(|line| matches!(line.trim(), "sat" | "unsat" | "unknown")),
-        "failed artifact invalidation must not be followed by a verdict: {stdout}"
+        "failed trace reservation must not be followed by a verdict: {stdout}"
     );
     assert!(
-        stderr.contains("could not be invalidated"),
+        stderr.contains("cannot reserve --decision-trace output"),
         "missing failure diagnostic: {stderr}"
     );
 }
 
 #[test]
 fn required_smt_proof_failure_precedes_verdict_stats_and_trace() {
+    // NOTE: `--decision-trace` now requires a FILE input, and the unusable
+    // requested proof path (missing parent directory) is rejected by the
+    // artifact-path preflight — still strictly before any verdict, statistic,
+    // or authoritative trace can be published.
     let temp = TempDir::new().expect("temporary directory");
     let proof = temp.path().join("missing-parent").join("proof.alethe");
     let trace = temp.path().join("decision.trace");
-    let mut child = Command::new(ay_binary())
+    let input = temp.path().join("input.smt2");
+    std::fs::write(&input, b"(set-logic QF_UF)\n(assert false)\n(check-sat)\n")
+        .expect("write input");
+    let output = Command::new(ay_binary())
         .arg("--proof")
         .arg(&proof)
         .arg("--no-verify-proof")
         .arg("--stats-json")
         .arg("--decision-trace")
         .arg(&trace)
-        .arg("--stdin")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .arg(&input)
+        .output()
         .expect("spawn ay");
-    child
-        .stdin
-        .take()
-        .expect("piped stdin")
-        .write_all(b"(set-logic QF_UF)\n(assert false)\n(check-sat)\n")
-        .expect("write transcript");
-    let output = child.wait_with_output().expect("wait for ay");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -215,15 +197,13 @@ fn required_smt_proof_failure_precedes_verdict_stats_and_trace() {
         "same-run trace reservation should remain visible"
     );
     assert_eq!(
-        std::fs::metadata(&trace)
-            .expect("invalidated trace metadata")
-            .len(),
-        0,
-        "required proof failure left an authoritative decision trace"
+        std::fs::read(&trace).expect("reserved trace content"),
+        b"AYDTRC1\x00\x01",
+        "required proof failure must leave only the non-authoritative trace reservation header"
     );
     assert!(
-        stderr.contains("required UNSAT publication failed"),
-        "missing publication diagnostic: {stderr}"
+        stderr.contains("cannot protect SMT-LIB input/artifact paths"),
+        "missing preflight diagnostic: {stderr}"
     );
 }
 

@@ -286,7 +286,7 @@ fn make_clauses_mixed(
 #[test]
 fn test_variant_input_for_dimacs_records_dense_mutex_restart_env_request() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENV);
+    let _g = ScopedEnvVar::unset(SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENV);
 
     let default_input =
         variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
@@ -295,7 +295,7 @@ fn test_variant_input_for_dimacs_records_dense_mutex_restart_env_request() {
         "dense-mutex focused restart route must be default-off"
     );
 
-    let _guard = ScopedEnvVar::set(SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENV, "1");
     let requested_input =
         variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
     assert!(
@@ -307,7 +307,7 @@ fn test_variant_input_for_dimacs_records_dense_mutex_restart_env_request() {
 #[test]
 fn test_variant_input_for_dimacs_records_dense_clique_mab_branch_env_request() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_DENSE_CLIQUE_MAB_BRANCH_ENV);
+    let _g = ScopedEnvVar::unset(SAT_DENSE_CLIQUE_MAB_BRANCH_ENV);
 
     let default_input =
         variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
@@ -316,7 +316,7 @@ fn test_variant_input_for_dimacs_records_dense_clique_mab_branch_env_request() {
         "dense-clique MAB branch route must be default-off"
     );
 
-    let _guard = ScopedEnvVar::set(SAT_DENSE_CLIQUE_MAB_BRANCH_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_DENSE_CLIQUE_MAB_BRANCH_ENV, "1");
     let requested_input =
         variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
     assert!(
@@ -328,8 +328,8 @@ fn test_variant_input_for_dimacs_records_dense_clique_mab_branch_env_request() {
 #[test]
 fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_default_off() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_BVE_LRAT_SCOUT_ROUTE_ENV);
-    let _guard = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
+    let _g = ScopedEnvVar::unset(SAT_BVE_LRAT_SCOUT_ROUTE_ENV);
+    let _g = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
 
     let input = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
 
@@ -346,8 +346,8 @@ fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_default_off() {
 #[test]
 fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_official_only() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::set(SAT_BVE_LRAT_SCOUT_ROUTE_ENV, "1");
-    let _guard = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
+    let _g = ScopedEnvVar::set(SAT_BVE_LRAT_SCOUT_ROUTE_ENV, "1");
+    let _g = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
 
     let official = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
     assert_eq!(
@@ -398,8 +398,8 @@ fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_official_only() {
 #[test]
 fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_default_off() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV);
-    let _guard = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
+    let _g = ScopedEnvVar::unset(SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV);
+    let _g = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
 
     let input = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
 
@@ -416,8 +416,8 @@ fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_default_off()
 #[test]
 fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_official_only() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::set(SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV, "1");
-    let _guard = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
+    let _g = ScopedEnvVar::set(SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV, "1");
+    let _g = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
 
     let official = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
     assert_eq!(
@@ -468,7 +468,7 @@ fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_official_only
 #[test]
 fn test_configure_dimacs_solver_search_inplace_watch_scan_default_on() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV);
+    let _g = ScopedEnvVar::unset(SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -498,7 +498,7 @@ fn test_configure_dimacs_solver_search_inplace_watch_scan_default_on() {
 #[test]
 fn test_configure_dimacs_solver_search_inplace_watch_scan_env_kill_switch() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::set(SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV, "0");
+    let _g = ScopedEnvVar::set(SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV, "0");
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -521,7 +521,7 @@ fn test_configure_dimacs_solver_search_inplace_watch_scan_env_kill_switch() {
 #[test]
 fn test_configure_dimacs_solver_search_inplace_watch_scan_env_gate_truthy() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::set(SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV, "1");
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -546,7 +546,7 @@ fn test_configure_dimacs_solver_search_inplace_watch_scan_env_gate_truthy() {
 #[test]
 fn test_configure_dimacs_solver_scan_pressure_env_gate_default_off() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENV);
+    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -566,7 +566,7 @@ fn test_configure_dimacs_solver_scan_pressure_env_gate_default_off() {
 #[test]
 fn test_configure_dimacs_solver_scan_pressure_env_gate_truthy() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENV, "1");
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -586,7 +586,7 @@ fn test_configure_dimacs_solver_scan_pressure_env_gate_truthy() {
 #[test]
 fn test_configure_dimacs_solver_learned_1963_identity_env_gate() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_IDENTITY_ENV);
+    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_IDENTITY_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -601,7 +601,7 @@ fn test_configure_dimacs_solver_learned_1963_identity_env_gate() {
         "learned 19-63 identity profiling must stay default-off"
     );
 
-    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_IDENTITY_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_IDENTITY_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -619,8 +619,8 @@ fn test_configure_dimacs_solver_learned_1963_identity_env_gate() {
 #[test]
 fn test_configure_dimacs_solver_learned_1963_pressure_reduction_env_gate() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENV);
-    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_IDENTITY_ENV);
+    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENV);
+    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_IDENTITY_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -639,7 +639,7 @@ fn test_configure_dimacs_solver_learned_1963_pressure_reduction_env_gate() {
         "pressure reduction default-off must not enable identity profiling"
     );
 
-    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -661,8 +661,8 @@ fn test_configure_dimacs_solver_learned_1963_pressure_reduction_env_gate() {
 #[test]
 fn test_configure_dimacs_solver_learned_1963_pressure_retention_env_gate() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_PRESSURE_RETENTION_ENV);
-    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_IDENTITY_ENV);
+    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_PRESSURE_RETENTION_ENV);
+    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_IDENTITY_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -681,7 +681,7 @@ fn test_configure_dimacs_solver_learned_1963_pressure_retention_env_gate() {
         "pressure retention default-off must not enable identity profiling"
     );
 
-    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_PRESSURE_RETENTION_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_PRESSURE_RETENTION_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -703,7 +703,7 @@ fn test_configure_dimacs_solver_learned_1963_pressure_retention_env_gate() {
 #[test]
 fn test_configure_dimacs_solver_used5_fsw_reset_env_gate() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ENV);
+    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -718,7 +718,7 @@ fn test_configure_dimacs_solver_used5_fsw_reset_env_gate() {
         "learned 19-63 used5 FSW reset must stay default-off"
     );
 
-    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -736,7 +736,7 @@ fn test_configure_dimacs_solver_used5_fsw_reset_env_gate() {
 #[test]
 fn test_configure_dimacs_solver_fsw_conflict_saved_pos_reset_env_gate() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ENV);
+    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -751,7 +751,7 @@ fn test_configure_dimacs_solver_fsw_conflict_saved_pos_reset_env_gate() {
         "learned 19-63 FSW conflict-only reset must stay default-off"
     );
 
-    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -769,7 +769,7 @@ fn test_configure_dimacs_solver_fsw_conflict_saved_pos_reset_env_gate() {
 #[test]
 fn test_configure_dimacs_solver_fsw_gent_skip_env_gate() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENV);
+    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -784,7 +784,7 @@ fn test_configure_dimacs_solver_fsw_gent_skip_env_gate() {
         "learned 19-63 FSW Gent-order skip must stay default-off"
     );
 
-    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -818,7 +818,7 @@ fn test_configure_dimacs_solver_disable_1963_unit_blocker_refresh_env_gate() {
         "learned 19-63 no-replacement unit blocker-refresh guard must stay default-off"
     );
 
-    let _guard = ScopedEnvVar::set(
+    let _g = ScopedEnvVar::set(
         SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH_ENV,
         "1",
     );
@@ -839,7 +839,7 @@ fn test_configure_dimacs_solver_disable_1963_unit_blocker_refresh_env_gate() {
 #[test]
 fn test_configure_dimacs_solver_1963_tail_reorder_swap_budget_env_gate() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_ENV);
+    let _g = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -855,7 +855,7 @@ fn test_configure_dimacs_solver_1963_tail_reorder_swap_budget_env_gate() {
         "learned 19-63 budgeted tail reorder must stay default-off"
     );
 
-    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_ENV, "256");
+    let _g = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_ENV, "256");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -874,7 +874,7 @@ fn test_configure_dimacs_solver_1963_tail_reorder_swap_budget_env_gate() {
 #[test]
 fn test_configure_dimacs_solver_inprocessing_yield_productivity_rescue_env_gate() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE_ENV);
+    let _g = ScopedEnvVar::unset(SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -889,7 +889,7 @@ fn test_configure_dimacs_solver_inprocessing_yield_productivity_rescue_env_gate(
         "the #9084 yield-productivity rescue must stay default-off"
     );
 
-    let _guard = ScopedEnvVar::set(SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -907,7 +907,7 @@ fn test_configure_dimacs_solver_inprocessing_yield_productivity_rescue_env_gate(
 #[test]
 fn test_configure_dimacs_solver_lrat_proof_clamp_probe_rescue_env_gate() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENV);
+    let _g = ScopedEnvVar::unset(SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -922,7 +922,7 @@ fn test_configure_dimacs_solver_lrat_proof_clamp_probe_rescue_env_gate() {
         "LRAT proof-clamp probe rescue must stay default-off"
     );
 
-    let _guard = ScopedEnvVar::set(SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -940,7 +940,7 @@ fn test_configure_dimacs_solver_lrat_proof_clamp_probe_rescue_env_gate() {
 #[test]
 fn test_configure_dimacs_solver_yield_rescue_backbone_cooldown_env_gate() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_INPROCESSING_YIELD_RESCUE_BACKBONE_COOLDOWN_ENV);
+    let _g = ScopedEnvVar::unset(SAT_INPROCESSING_YIELD_RESCUE_BACKBONE_COOLDOWN_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -955,7 +955,7 @@ fn test_configure_dimacs_solver_yield_rescue_backbone_cooldown_env_gate() {
         "the #9084 yield-rescue backbone cooldown must stay default-off"
     );
 
-    let _guard = ScopedEnvVar::set(SAT_INPROCESSING_YIELD_RESCUE_BACKBONE_COOLDOWN_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_INPROCESSING_YIELD_RESCUE_BACKBONE_COOLDOWN_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -973,7 +973,7 @@ fn test_configure_dimacs_solver_yield_rescue_backbone_cooldown_env_gate() {
 #[test]
 fn test_configure_dimacs_solver_bounded_backbone_zero_decompose_backoff_env_gate() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_ENV);
+    let _g = ScopedEnvVar::unset(SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -988,7 +988,7 @@ fn test_configure_dimacs_solver_bounded_backbone_zero_decompose_backoff_env_gate
         "the #9084 bounded-backbone zero-decompose backoff must stay default-off"
     );
 
-    let _guard = ScopedEnvVar::set(SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -1006,7 +1006,7 @@ fn test_configure_dimacs_solver_bounded_backbone_zero_decompose_backoff_env_gate
 #[test]
 fn test_configure_dimacs_solver_backbone_post_vivify_binary_admission_env_gate() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV);
+    let _g = ScopedEnvVar::unset(SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -1021,7 +1021,7 @@ fn test_configure_dimacs_solver_backbone_post_vivify_binary_admission_env_gate()
         "post-vivify binary admission must stay default-on without env override"
     );
 
-    let _guard = ScopedEnvVar::set(SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV, "0");
+    let _g = ScopedEnvVar::set(SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV, "0");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -1035,7 +1035,7 @@ fn test_configure_dimacs_solver_backbone_post_vivify_binary_admission_env_gate()
         "env 0 should restore the legacy post-vivify backbone gate"
     );
 
-    let _guard = ScopedEnvVar::set(SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -1072,7 +1072,7 @@ fn test_dimacs_stats_json_exports_backbone_post_vivify_binary_admission_gate() {
 #[test]
 fn test_dimacs_stats_json_exports_hard_tail_row_id() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::set(SAT_HARD_TAIL_ROW_ID_ENV, "Circuit_multiplier22");
+    let _g = ScopedEnvVar::set(SAT_HARD_TAIL_ROW_ID_ENV, "Circuit_multiplier22");
 
     let run_stats = stats_output::RunStatistics::new(
         stats_output::SolveMode::DimacsSat,
@@ -1938,7 +1938,7 @@ fn test_dense_clique_php_route_checker_audit_counts_fail_closed() {
 #[test]
 fn test_dense_clique_scout_stats_are_default_off() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_DENSE_CLIQUE_SCOUT_ENV);
+    let _g = ScopedEnvVar::unset(SAT_DENSE_CLIQUE_SCOUT_ENV);
     let mut run_stats = stats_output::RunStatistics::new(
         stats_output::SolveMode::DimacsSat,
         "unknown",
@@ -1971,7 +1971,7 @@ fn test_dense_clique_scout_stats_are_default_off() {
 #[test]
 fn test_dense_clique_scout_stats_recover_strict_mutex_surface() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::set(SAT_DENSE_CLIQUE_SCOUT_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_DENSE_CLIQUE_SCOUT_ENV, "1");
     let content = "\
 p cnf 6 17
 1 2 3 0
@@ -2092,7 +2092,7 @@ p cnf 6 17
 #[test]
 fn test_dense_clique_scout_requested_mixed_formula_fails_closed() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::set(SAT_DENSE_CLIQUE_SCOUT_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_DENSE_CLIQUE_SCOUT_ENV, "1");
     let content = "\
 p cnf 4 3
 1 2 0
@@ -2131,7 +2131,7 @@ p cnf 4 3
 #[test]
 fn test_multiplier_equiv_conservation_scout_stats_are_default_off() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset(SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENV);
+    let _g = ScopedEnvVar::unset(SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENV);
     let mut run_stats = stats_output::RunStatistics::new(
         stats_output::SolveMode::DimacsSat,
         "unknown",
@@ -2164,7 +2164,7 @@ fn test_multiplier_equiv_conservation_scout_stats_are_default_off() {
 #[test]
 fn test_multiplier_equiv_conservation_scout_requested_fails_closed_without_proof() {
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::set(SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENV, "1");
+    let _g = ScopedEnvVar::set(SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENV, "1");
     let content = "\
 p cnf 3 3
 -3 1 0
@@ -3131,9 +3131,9 @@ fn test_dimacs_timeout_exit_retains_fmla_learned_lrat_fail_closed_diagnostic() {
     }
     let _cleanup = Cleanup(artifact_path.clone());
 
-    let _guard = ScopedEnvVar::set(
+    let _g = ScopedEnvVar::set(
         ay_sat::fmla_runtime_ledger::FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV,
-        artifact_path.to_str().expect("artifact path utf8"),
+        &artifact_path,
     );
     let proof_output = ProofOutput::lrat_text(Vec::new(), 1);
     let mut solver = SatSolver::with_proof_output(1, proof_output);
@@ -3446,7 +3446,7 @@ fn test_large_formula_disables_xor_extension() {
     // distribution keeps the binary/gate-structure guards from firing first,
     // isolating the absolute-size guard.
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset("AY_XOR_ALLOW_LARGE");
+    let _g = ScopedEnvVar::unset("AY_XOR_ALLOW_LARGE");
 
     let n = XOR_EXTENSION_MAX_CLAUSES + 1;
     let bin = n / 10; // 10% binary
@@ -3460,7 +3460,7 @@ fn test_large_formula_disables_xor_extension() {
         "large formulas must skip the XOR extension regardless of density"
     );
     // The escape hatch restores GE for experimentation.
-    let _guard = ScopedEnvVar::set("AY_XOR_ALLOW_LARGE", "1");
+    let _g = ScopedEnvVar::set("AY_XOR_ALLOW_LARGE", "1");
     assert!(
         should_enable_xor_extension(&clauses, clauses.len() / 2, clauses.len() / 2, 5_000),
         "AY_XOR_ALLOW_LARGE must re-enable the XOR extension on large formulas"
@@ -3472,7 +3472,7 @@ fn test_small_dense_xor_still_enabled_under_size_cap() {
     // inc6: a small, dense, mixed-size XOR-heavy formula (well under the cap)
     // must still route to the XOR extension -- this is the case GE helps.
     let _lock = lock_env();
-    let _guard = ScopedEnvVar::unset("AY_XOR_ALLOW_LARGE");
+    let _g = ScopedEnvVar::unset("AY_XOR_ALLOW_LARGE");
 
     let clauses = make_clauses_mixed(0, 80, 20); // 100 clauses, 80% ternary
     assert!(clauses.len() <= XOR_EXTENSION_MAX_CLAUSES);

@@ -2770,6 +2770,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn chc_gate_executes_one_pinned_snapshot_with_exact_recorded_environment() {
         use sha2::Digest as _;
         use std::os::unix::fs::PermissionsExt as _;

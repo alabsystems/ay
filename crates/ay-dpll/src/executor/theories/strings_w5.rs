@@ -2,7 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! W5 — position-aware witness search (`AY_STR_W5=1`, default OFF).
+//! W5 — position-aware witness search (default ON, `AY_STR_W5=0` kill switch).
 //!
 //! ## The measured gap W5 closes
 //!
@@ -88,7 +88,7 @@ use super::super::model::{EvalValue, Model};
 use super::super::Executor;
 use super::strings_w4::{w4_memo_reset, w4_pick_char, w4_set_char, MAX_W4_LEN};
 
-/// Master switch (`AY_STR_W5=1`, default OFF → byte-identical to W4-only).
+/// Master switch (default ON, `AY_STR_W5=0` kill switch → byte-identical to W4-only).
 pub(in crate::executor) fn str_w5_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // DEFAULT-ON: 31/58 remaining sat-side conversions, ALL 31 z3-PIN-verified

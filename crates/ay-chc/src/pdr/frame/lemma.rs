@@ -50,6 +50,18 @@ pub(crate) struct Lemma {
     /// anti-vacuous guard, and this tag additionally short-circuits those
     /// paths explicitly so the exclusion survives future refactors.
     pub(crate) relative_induction_only: bool,
+    /// Origin tag: this lemma's self-inductiveness was only established
+    /// CONDITIONED on the optimistic entry-domain over-approximation
+    /// (`is_self_inductive_blocking_with_entry_domain`, #4751 L4 / cand4).
+    ///
+    /// At target level 1 the entry context degenerates to the init-only
+    /// must-summary, so such a lemma can be true for the sampled prefix while
+    /// being globally non-inductive (bouncy's `(<= a0 0)`). The lemma is still
+    /// a VALID frame lemma (frames over-approximate per-level reachability),
+    /// but candidate-repair uses this tag to identify the likely poison when a
+    /// direct-safety GLOBAL claim built from frame[1] fails strict validation
+    /// without a usable concrete counterexample.
+    pub(crate) optimistic_entry: bool,
 }
 
 impl Lemma {
@@ -65,6 +77,7 @@ impl Lemma {
             action_id: None,
             usage_count: 0,
             relative_induction_only: false,
+            optimistic_entry: false,
         };
 
         // Postcondition: cached hash is consistent with formula (#4757).
@@ -87,6 +100,15 @@ impl Lemma {
     /// verification-skip paths (`individually_inductive`, #5877).
     pub(crate) fn with_relative_induction_only(mut self, value: bool) -> Self {
         self.relative_induction_only = value;
+        self
+    }
+
+    /// Tag this lemma as admitted through the OPTIMISTIC entry-domain
+    /// conditioned self-inductiveness oracle (#4751 L4 / cand4 hardening).
+    /// Candidate repair drops tagged conjuncts first when a direct-safety
+    /// global claim fails strict validation without a concrete counterexample.
+    pub(crate) fn with_optimistic_entry(mut self, value: bool) -> Self {
+        self.optimistic_entry = value;
         self
     }
 

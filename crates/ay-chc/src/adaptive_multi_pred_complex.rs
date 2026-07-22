@@ -2549,9 +2549,9 @@ mod tests {
             let problem = ChcParser::parse(&smt).expect("reve CHC should parse");
             let adaptive = AdaptivePortfolio::new(
                 problem,
-                AdaptiveConfig::test_default().with_time_budget(std::time::Duration::from_secs(60)),
+                AdaptiveConfig::test_default().with_time_budget(std::time::Duration::from_mins(1)),
             );
-            let deadline = Some(ay_core::time::Instant::now() + std::time::Duration::from_secs(60));
+            let deadline = Some(ay_core::time::Instant::now() + std::time::Duration::from_mins(1));
             adaptive.try_bv_shallow_bmc_refutation(deadline)
         };
 

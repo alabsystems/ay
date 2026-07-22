@@ -302,12 +302,13 @@ impl PdrSolver {
         }
 
         // Check logical equivalence for each predicate
-        for pred in self.problem.predicates() {
+        let pred_ids: Vec<_> = self.problem.predicates().iter().map(|p| p.id).collect();
+        for pred_id in pred_ids {
             if self.config.verbose {
-                safe_eprintln!("PDR: frames_equivalent: checking pred {}", pred.id.index());
+                safe_eprintln!("PDR: frames_equivalent: checking pred {}", pred_id.index());
             }
-            let constraint_i = self.cumulative_frame_constraint(i, pred.id);
-            let constraint_j = self.cumulative_frame_constraint(j, pred.id);
+            let constraint_i = self.cumulative_frame_constraint(i, pred_id);
+            let constraint_j = self.cumulative_frame_constraint(j, pred_id);
 
             match (constraint_i, constraint_j) {
                 (None, None) => {
@@ -324,7 +325,7 @@ impl PdrSolver {
                         if self.config.verbose {
                             safe_eprintln!(
                                 "PDR: frames_equivalent: pred {} syntactically equal",
-                                pred.id.index()
+                                pred_id.index()
                             );
                         }
                         continue;
@@ -333,32 +334,43 @@ impl PdrSolver {
                     if self.config.verbose {
                         safe_eprintln!(
                             "PDR: frames_equivalent: pred {} checking logical equivalence",
-                            pred.id.index()
+                            pred_id.index()
                         );
                     }
 
                     // Check logical equivalence via SMT: ci <=> cj
                     // This means: (ci => cj) AND (cj => ci)
+                    //
+                    // #4751 L4: decompose each implication PER CONJUNCT and
+                    // bound each query. The previous monolithic
+                    // `check_implies(ci, cj)` negates the whole 20+-lemma
+                    // conjunction cj into a 20+-way disjunction; on redundant
+                    // bound-flooded frames (s_multipl_12) that single
+                    // UNBOUNDED LIA query ran for minutes and starved the
+                    // whole solve. `ci => (c1 /\ ... /\ cn)` holds iff
+                    // `ci => ck` for every k, so the decomposition is exact
+                    // (not an approximation); each small query is easy. A
+                    // timeout/Unknown fails CLOSED (frames treated as not
+                    // equivalent — PDR just keeps searching; any convergence
+                    // model still passes full validation downstream).
 
-                    // First check ci => cj: (ci AND NOT cj) should be UNSAT
-                    self.smt.reset();
-                    if !self.smt.check_implies(&ci, &cj) {
+                    // First check ci => cj: (ci AND NOT ck) UNSAT for each ck.
+                    if !self.frame_constraint_implies(&ci, &cj) {
                         if self.config.verbose {
                             safe_eprintln!(
                                 "PDR: frames_equivalent: pred {} ci => cj FAILED",
-                                pred.id.index()
+                                pred_id.index()
                             );
                         }
                         return false;
                     }
 
-                    // Then check cj => ci: (cj AND NOT ci) should be UNSAT
-                    self.smt.reset();
-                    if !self.smt.check_implies(&cj, &ci) {
+                    // Then check cj => ci: (cj AND NOT ck) UNSAT for each ck.
+                    if !self.frame_constraint_implies(&cj, &ci) {
                         if self.config.verbose {
                             safe_eprintln!(
                                 "PDR: frames_equivalent: pred {} cj => ci FAILED",
-                                pred.id.index()
+                                pred_id.index()
                             );
                         }
                         return false;
@@ -367,13 +379,45 @@ impl PdrSolver {
                     if self.config.verbose {
                         safe_eprintln!(
                             "PDR: frames_equivalent: pred {} logically equivalent",
-                            pred.id.index()
+                            pred_id.index()
                         );
                     }
                 }
             }
         }
 
+        true
+    }
+
+    /// Bounded per-conjunct implication check for frame equivalence
+    /// (#4751 L4). Returns true iff `lhs => rhs` was PROVEN: for every
+    /// conjunct `ck` of `rhs`, the query `lhs /\ NOT ck` is UNSAT within the
+    /// per-conjunct timeout. Timeout/Unknown/SAT all return false (fail
+    /// closed: the frames are treated as not equivalent and PDR continues).
+    ///
+    /// The decomposition is exact — `lhs => (c1 /\ ... /\ cn)` iff
+    /// `lhs => ck` for all k — while avoiding the negated-conjunction
+    /// disjunctive blowup of a monolithic `check_implies` call.
+    fn frame_constraint_implies(&mut self, lhs: &ChcExpr, rhs: &ChcExpr) -> bool {
+        const PER_CONJUNCT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+        for conjunct in rhs.collect_conjuncts() {
+            // Cap at the remaining solve deadline (mirrors verification's
+            // cap_timeout, which is not visible from this module).
+            let timeout = match self.solve_deadline {
+                Some(deadline) => PER_CONJUNCT_TIMEOUT
+                    .min(deadline.saturating_duration_since(ay_core::time::Instant::now())),
+                None => PER_CONJUNCT_TIMEOUT,
+            };
+            if timeout.is_zero() || self.is_cancelled() {
+                return false;
+            }
+            let query = ChcExpr::and(lhs.clone(), ChcExpr::not(conjunct));
+            self.smt.reset();
+            match self.smt.check_sat_with_timeout(&query, timeout) {
+                SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {}
+                _ => return false,
+            }
+        }
         true
     }
 }

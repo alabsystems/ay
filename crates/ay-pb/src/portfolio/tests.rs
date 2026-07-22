@@ -3310,7 +3310,7 @@ fn test_backfill_admissible_fail_closed_on_every_input() {
 fn test_backfill_respects_memory_pressure_deadline_and_budget() {
     let instance = worker_split_instance();
     let outer_term = AtomicBool::new(false);
-    let far_deadline = Some(Instant::now() + Duration::from_secs(60));
+    let far_deadline = Some(Instant::now() + Duration::from_mins(1));
     let (tx, _rx) = mpsc::channel();
 
     // MEMORY PRESSURE (mocked high): refused but NOT disabled.
@@ -5392,8 +5392,8 @@ fn nonlinear_objective_optimum_downgraded_to_satisfiable() {
 
 // ---- AY_PB_LNS2 (stronger LNS) soundness gate --------------------------
 //
-// Process-global env-var toggling is serialized on the one workspace-wide env
-// lock (`lock_env`) so concurrent tests do not race on `AY_PB_LNS2`.
+// Process-global env-var toggling must be serialized so concurrent tests do
+// not race on `AY_PB_LNS2` (the one workspace env lock, `lock_env`).
 
 /// Exhaustive 0/1 optimum of a tiny linear instance.
 fn brute_force_optimum_small(instance: &PbInstance, objective: &PbObjective) -> Option<i128> {
@@ -5499,6 +5499,7 @@ fn lns2_portfolio_matches_bruteforce_optimum_and_reports_only_sound_incumbents()
             );
         }
     }
+    // `_lns2` restores AY_PB_LNS2 at end of scope, still under `_guard`.
 }
 
 /// Control: the SAME instances must declare the SAME OPTIMUM value with LNS2
@@ -5529,8 +5530,7 @@ fn lns2_does_not_change_declared_optimum_vs_off() {
         };
 
         // LNS2 now defaults ON; model the old default-off path explicitly
-        // with `AY_PB_LNS2=0` so this control still compares OFF vs ON. Each
-        // solve is scoped + restore-on-exit via the workspace env choke point.
+        // with `AY_PB_LNS2=0` so this control still compares OFF vs ON.
         let off = {
             let _lns2 = ScopedEnvVar::set("AY_PB_LNS2", "0");
             solve_once()
@@ -5565,43 +5565,44 @@ fn lns2_does_not_change_declared_optimum_vs_off() {
     }
 }
 
-// Process-global env-var toggling is serialized on the one workspace-wide env
-// lock (`lock_env`) so concurrent tests do not observe a mid-test
-// AY_PB_WBO_SLS value.
+// Process-global env-var toggling must be serialized so concurrent tests do
+// not observe a mid-test AY_PB_WBO_SLS value (the one workspace env lock,
+// `lock_env`).
 
 #[test]
 fn wbo_sls_enabled_reads_env_flag() {
     let _guard = lock_env();
-    // Baseline unset for the whole body; each per-iteration guard below
-    // restores to this state. Restore-on-exit via the workspace env choke point.
-    let _wbo_baseline = ScopedEnvVar::unset("AY_PB_WBO_SLS");
+    // Baseline unset for the whole test; restored on scope exit.
+    let _wbo = ScopedEnvVar::unset("AY_PB_WBO_SLS");
     // Sequential tail fallback: opt-IN (default OFF). Parallel WBO-route
     // worker: batteries-included (default ON) — the SAME env var only serves
     // as an explicit override in either direction.
     assert!(!wbo_sls_enabled());
     assert!(wbo_sls_worker_enabled());
     for v in ["1", "true", "yes", "on", "ON", " On "] {
-        let _wbo = ScopedEnvVar::set("AY_PB_WBO_SLS", v);
+        let _w = ScopedEnvVar::set("AY_PB_WBO_SLS", v);
         assert!(wbo_sls_enabled(), "expected enabled for {v:?}");
         assert!(wbo_sls_worker_enabled(), "worker must stay on for {v:?}");
     }
     for v in ["0", "false", "no", "off", ""] {
-        let _wbo = ScopedEnvVar::set("AY_PB_WBO_SLS", v);
+        let _w = ScopedEnvVar::set("AY_PB_WBO_SLS", v);
         assert!(!wbo_sls_enabled(), "expected disabled for {v:?}");
     }
     for v in ["0", "false", "no", "off", " OFF ", ""] {
-        let _wbo = ScopedEnvVar::set("AY_PB_WBO_SLS", v);
+        let _w = ScopedEnvVar::set("AY_PB_WBO_SLS", v);
         assert!(
             !wbo_sls_worker_enabled(),
             "explicit off must disable the worker for {v:?}"
         );
     }
-    // ... and the WBO-route spec set follows the worker gate. (The baseline
-    // guard has restored the var to unset after the loops above.)
+    // (baseline `_wbo` keeps AY_PB_WBO_SLS unset between the probes above)
+    // ... and the WBO-route spec set follows the worker gate.
     let instance = worker_split_instance();
     let profile = InstanceProfile::from_instance(&instance);
-    let _wbo = ScopedEnvVar::set("AY_PB_WBO_SLS", "0");
-    let disabled = optimization_worker_specs(&profile, OptimizationPortfolioRoute::WboReduced);
+    let disabled = {
+        let _w = ScopedEnvVar::set("AY_PB_WBO_SLS", "0");
+        optimization_worker_specs(&profile, OptimizationPortfolioRoute::WboReduced)
+    };
     assert!(
         disabled.iter().all(|spec| spec.label != "wbo-sls-opt"),
         "AY_PB_WBO_SLS=0 must remove the WBO-route worker"

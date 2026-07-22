@@ -21,7 +21,7 @@ fn split(problem: ChcProblem) -> TransformationResult {
 /// hanging the suite.
 fn bounded_pdr_config() -> PdrConfig {
     PdrConfig {
-        solve_timeout: Some(std::time::Duration::from_secs(60)),
+        solve_timeout: Some(std::time::Duration::from_mins(1)),
         ..PdrConfig::default()
     }
 }
@@ -333,7 +333,7 @@ fn deriv_expansion_split_inline_bmc_replays_on_original() {
 
     let cfg = BmcConfig::default()
         .with_max_depth(4)
-        .with_time_budget(std::time::Duration::from_secs(60));
+        .with_time_budget(std::time::Duration::from_mins(1));
     let ChcEngineResult::Unsafe(cex) = BmcSolver::new(pipeline_result.problem.clone(), cfg).solve()
     else {
         panic!("inlined split tower must refute at a shallow depth");
@@ -432,7 +432,7 @@ fn deriv_expansion_expanded_witness_rejected_on_safe_query() {
 
     let cfg = BmcConfig::default()
         .with_max_depth(4)
-        .with_time_budget(std::time::Duration::from_secs(60));
+        .with_time_budget(std::time::Duration::from_mins(1));
     let ChcEngineResult::Unsafe(cex) = BmcSolver::new(pipeline_result.problem.clone(), cfg).solve()
     else {
         panic!("inlined unsafe tower must refute");

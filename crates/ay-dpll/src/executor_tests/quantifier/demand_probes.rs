@@ -294,7 +294,7 @@ const RED_TIMEOUT: Duration = Duration::from_secs(3);
 /// ground DT+LIA final-solve over its frontier-gated batch (~20s in a debug
 /// build), so the cap is generous. The flip test is `#[ignore]`d so this budget
 /// never lands in the default `--lib` run.
-const PRODUCTION_FLIP_TIMEOUT: Duration = Duration::from_secs(120);
+const PRODUCTION_FLIP_TIMEOUT: Duration = Duration::from_mins(2);
 
 /// Solve `input` under a nominal `timeout`, bounded by a HARD wall cap of
 /// `timeout + 3s`. The solve runs on a worker thread; if it does not finish

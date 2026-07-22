@@ -151,6 +151,15 @@ enum DiseqBoundPlan {
     Conjunct,
 }
 
+/// Total `plan_eq` nodes one predicate bridge may explore.
+///
+/// The search is a fail-closed planner: exhausting the budget abandons the
+/// rebuild and keeps the original proof, so this only trades recoverable
+/// proofs for bounded planning time — never correctness. Sized to clear the
+/// longest store-flat chains in the QF_AX division (60 links, each costing a
+/// `trans` node plus a 3-argument congruence node) with a wide margin.
+const EQ_PLAN_BUDGET: u32 = 200_000;
+
 fn atom_of(terms: &TermStore, lit: TermId) -> TermId {
     match terms.get(lit) {
         TermData::Not(inner) => *inner,
@@ -2423,14 +2432,36 @@ impl Executor {
         let original_terms: Vec<TermId> = originals.iter().map(|(c, _)| *c).collect();
 
         // (1) Which assume leaves are defective?
+        //
+        // Only leaves REACHABLE from an empty-clause step matter: the #8821
+        // authority gate (`validate_reachable_assumes_in_problem_scope`) walks
+        // the dependency cone of the empty clause and ignores everything
+        // outside it, and dead steps are never printed. A defective leaf on a
+        // dead branch (e.g. an abandoned extensionality split whose
+        // `__ext_diff_*` witness assumes survive in the step list) therefore
+        // carries NO authority claim, and must not veto repairing the leaves
+        // that do. Those leaves are copied through verbatim — this pass never
+        // invents a derivation for them.
+        let reachable = Self::reachable_step_mask(proof);
         let mut defective: Vec<TermId> = Vec::new();
-        for step in &proof.steps {
+        let mut dead_defective: Vec<TermId> = Vec::new();
+        for (idx, step) in proof.steps.iter().enumerate() {
             if let ProofStep::Assume(term) = step {
-                if !original_terms.contains(term) && !defective.contains(term) {
-                    defective.push(*term);
+                if original_terms.contains(term) {
+                    continue;
+                }
+                if reachable[idx] {
+                    if !defective.contains(term) {
+                        defective.push(*term);
+                    }
+                } else if !dead_defective.contains(term) {
+                    dead_defective.push(*term);
                 }
             }
         }
+        // A term assumed on BOTH a live and a dead branch is repaired once and
+        // remapped everywhere; it is not a pass-through.
+        dead_defective.retain(|t| !defective.contains(t));
         if defective.is_empty() {
             return false;
         }
@@ -2480,6 +2511,16 @@ impl Executor {
             let id = new_proof.add_assume(term, None);
             assume_ids.insert(term, id);
         }
+        // Dead-branch defective leaves are re-emitted UNCHANGED, exactly as
+        // the proof already had them. They stay outside the empty clause's
+        // cone, so they are neither printed nor claimed as authority; keeping
+        // them merely preserves the skeleton this pass promised not to
+        // restructure.
+        let mut passthrough_ids: HashMap<TermId, ProofId> = HashMap::default();
+        for &term in &dead_defective {
+            let id = new_proof.add_assume(term, None);
+            passthrough_ids.insert(term, id);
+        }
 
         let mut bridge_unit: HashMap<TermId, ProofId> = HashMap::default();
         for plan in &plans {
@@ -2499,7 +2540,7 @@ impl Executor {
             let new_id = match step {
                 ProofStep::Assume(term) => match assume_ids.get(term) {
                     Some(&id) => id,
-                    None => match bridge_unit.get(term) {
+                    None => match bridge_unit.get(term).or_else(|| passthrough_ids.get(term)) {
                         Some(&id) => id,
                         None => return false,
                     },
@@ -2619,6 +2660,53 @@ impl Executor {
         true
     }
 
+    /// Mark every step in the dependency cone of an empty-clause step.
+    ///
+    /// This mirrors `ay_proof::validate_reachable_assumes_in_problem_scope`
+    /// exactly — it is the same cone the #8821 authority gate inspects — so a
+    /// leaf this mask reports as unreachable provably cannot be the leaf that
+    /// gate rejects.
+    fn reachable_step_mask(proof: &Proof) -> Vec<bool> {
+        let mut reachable = vec![false; proof.steps.len()];
+        let mut stack: Vec<usize> = Vec::new();
+        for (index, step) in proof.steps.iter().enumerate() {
+            let derives_empty = match step {
+                ProofStep::Step { clause, .. }
+                | ProofStep::Resolution { clause, .. }
+                | ProofStep::TheoryLemma { clause, .. } => clause.is_empty(),
+                _ => false,
+            };
+            if derives_empty {
+                reachable[index] = true;
+                stack.push(index);
+            }
+        }
+        while let Some(index) = stack.pop() {
+            let push = |premise: ProofId, reachable: &mut Vec<bool>, stack: &mut Vec<usize>| {
+                let premise = premise.0 as usize;
+                if premise < reachable.len() && !reachable[premise] {
+                    reachable[premise] = true;
+                    stack.push(premise);
+                }
+            };
+            match &proof.steps[index] {
+                ProofStep::Step { premises, .. } => {
+                    for &premise in premises {
+                        push(premise, &mut reachable, &mut stack);
+                    }
+                }
+                ProofStep::Resolution {
+                    clause1, clause2, ..
+                } => {
+                    push(*clause1, &mut reachable, &mut stack);
+                    push(*clause2, &mut reachable, &mut stack);
+                }
+                _ => {}
+            }
+        }
+        reachable
+    }
+
     /// Plan the congruence bridge deriving the substituted leaf `goal` from an
     /// authored predicate assertion plus authored defining equalities, or
     /// `None` when no such derivation exists.
@@ -2650,8 +2738,13 @@ impl Executor {
             let src_args = src_args.clone();
             let mut kids: Vec<EqPlan> = Vec::with_capacity(src_args.len());
             let mut ok = true;
+            // One shared budget across the whole predicate: a pathological
+            // original set can offer many defining equalities per variable,
+            // and search is bounded so planning stays linear-ish in practice
+            // and always terminates.
+            let mut budget = EQ_PLAN_BUDGET;
             for (&a, &b) in src_args.iter().zip(goal_args.iter()) {
-                match self.plan_eq(a, b, original_terms, 0) {
+                match self.plan_eq(a, b, original_terms, 0, &mut budget) {
                     Some(plan) => kids.push(plan),
                     None => {
                         ok = false;
@@ -2690,18 +2783,44 @@ impl Executor {
 
     /// Plan a derivation of `(= a b)` from the original assertions:
     /// reflexivity, an authored equality (either orientation, bridged by
-    /// `symm`), or congruence over a shared function symbol.
+    /// `symm`), congruence over a shared function symbol, or transitivity
+    /// through an authored DEFINING equality for `a`.
+    ///
+    /// The transitivity leg is what covers eliminated definitions. A
+    /// definition-substituting preprocessing pass (the QF_AX store-flat
+    /// pass `substitute_store_flat_equalities` is the canonical case) replaces
+    /// a defined symbol by its definition EVERYWHERE and then drops the now
+    /// tautological defining equality from the assertion stack, so the leaf
+    /// the proof assumes mentions the fully expanded term while the authored
+    /// assertion mentions the name. The defining equalities are not lost —
+    /// they are still authored assertions, recovered here from the
+    /// re-elaborated parse — but the expansion is a FIXPOINT: authored
+    /// `(= a3 (store a2 i e))` relates `a3` to a one-level store, while the
+    /// leaf holds the fully nested chain. Congruence alone cannot cross that
+    /// gap (`a3` is a variable, not an application); `trans` through the
+    /// authored definition followed by congruence on the store's array
+    /// argument walks the chain one link at a time, bottoming out at whichever
+    /// link the substitution left alone.
     fn plan_eq(
         &mut self,
         a: TermId,
         b: TermId,
         original_terms: &[TermId],
         depth: u32,
+        budget: &mut u32,
     ) -> Option<EqPlan> {
-        const MAX_DEPTH: u32 = 8;
+        // Chains are walked one definition per level, so the depth bound must
+        // admit `2 * chain_length` (a `trans` level plus a `cong` level per
+        // link). `EQ_PLAN_BUDGET` is the real terminator; `MAX_DEPTH` only
+        // caps native stack use.
+        const MAX_DEPTH: u32 = 512;
         if depth > MAX_DEPTH {
             return None;
         }
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
         let eq = self
             .ctx
             .terms
@@ -2742,29 +2861,128 @@ impl Executor {
         }
         // Congruence: `a` and `b` are the same function applied to pairwise
         // derivably-equal arguments.
-        let TermData::App(a_sym, a_args) = self.ctx.terms.get(a) else {
-            return None;
-        };
-        let (a_sym, a_args) = (a_sym.clone(), a_args.clone());
-        let TermData::App(b_sym, b_args) = self.ctx.terms.get(b) else {
-            return None;
-        };
-        if *b_sym != a_sym || b_args.len() != a_args.len() || a_args.is_empty() {
-            return None;
+        let congruence = (|| {
+            let TermData::App(a_sym, a_args) = self.ctx.terms.get(a) else {
+                return None;
+            };
+            let (a_sym, a_args) = (a_sym.clone(), a_args.clone());
+            let TermData::App(b_sym, b_args) = self.ctx.terms.get(b) else {
+                return None;
+            };
+            if *b_sym != a_sym || b_args.len() != a_args.len() || a_args.is_empty() {
+                return None;
+            }
+            let b_args = b_args.clone();
+            let mut kids = Vec::with_capacity(a_args.len());
+            for (&x, &y) in a_args.iter().zip(b_args.iter()) {
+                kids.push(self.plan_eq(x, y, original_terms, depth + 1, budget)?);
+            }
+            // `eq_congruent ⊢ (cl ¬(= a1 b1) .. ¬(= an bn) (= f(a..) f(b..)))`.
+            let mut lemma: Vec<TermId> = kids.iter().map(|k| k.neg_eq).collect();
+            lemma.push(eq);
+            Some(EqPlanKind::Cong { lemma, kids })
+        })();
+        if let Some(kind) = congruence {
+            return Some(EqPlan { eq, neg_eq, kind });
         }
-        let b_args = b_args.clone();
-        let mut kids = Vec::with_capacity(a_args.len());
-        for (&x, &y) in a_args.iter().zip(b_args.iter()) {
-            kids.push(self.plan_eq(x, y, original_terms, depth + 1)?);
+
+        // Transitivity through an authored DEFINING equality for `a`: some
+        // original asserts `(= a mid)` (either orientation), and `(= mid b)`
+        // is itself derivable. `trans` chains the two unit equalities into
+        // `(= a b)`.
+        //
+        // Only `a` — the side that comes from the AUTHORED assertion — is
+        // expanded. `b` is the preprocessing-substituted side; walking it
+        // would be searching for a way to make the substituted form match
+        // something, which is exactly the direction that could launder a
+        // formula the problem never asserted.
+        self.plan_eq_via_definition(a, b, eq, neg_eq, original_terms, depth, budget)
+    }
+
+    /// The `trans`-through-a-definition leg of [`Self::plan_eq`].
+    ///
+    /// Every `mid` considered comes from an assertion the problem AUTHORED, and
+    /// the emitted `trans` step is validated by the unchanged strict checker
+    /// (which re-derives the `a — mid — b` chain itself and rejects redundant
+    /// premises), so a definition the problem does not contain cannot be
+    /// fabricated here: there is simply no original to read it from.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_eq_via_definition(
+        &mut self,
+        a: TermId,
+        b: TermId,
+        eq: TermId,
+        neg_eq: TermId,
+        original_terms: &[TermId],
+        depth: u32,
+        budget: &mut u32,
+    ) -> Option<EqPlan> {
+        for &original in original_terms {
+            let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(original) else {
+                continue;
+            };
+            if name != "=" || args.len() != 2 {
+                continue;
+            }
+            let (lhs, rhs) = (args[0], args[1]);
+            // `mid` is the OTHER side of an authored equality one of whose
+            // sides is syntactically `a`.
+            let (mid, flipped) = if lhs == a {
+                (rhs, false)
+            } else if rhs == a {
+                (lhs, true)
+            } else {
+                continue;
+            };
+            // `mid == b` is already covered by the Assumed/Symm cases above,
+            // and `mid == a` is a degenerate self-definition: neither yields a
+            // well-formed two-edge `trans` chain.
+            if mid == b || mid == a {
+                continue;
+            }
+            let Some(right) = self.plan_eq(mid, b, original_terms, depth + 1, budget) else {
+                continue;
+            };
+            // The left leg proves `(= a mid)`. When the problem spelled the
+            // definition the other way round (`(= mid a)`), `symm` reorients
+            // it, and the leg's conclusion is the separately interned
+            // `(= a mid)` — NOT the authored term — so emission resolves
+            // against the right id.
+            let left = if flipped {
+                let oriented = self
+                    .ctx
+                    .terms
+                    .mk_app(Symbol::named("="), [a, mid], Sort::Bool);
+                // `mk_app` raw-interns, but a constant-folding surprise would
+                // break the rigid `symm` / `trans` clause shapes.
+                if !matches!(
+                    self.ctx.terms.get(oriented),
+                    TermData::App(Symbol::Named(n), ar) if n == "=" && ar.len() == 2
+                ) {
+                    continue;
+                }
+                EqPlan {
+                    eq: oriented,
+                    neg_eq: self.ctx.terms.mk_not_raw(oriented),
+                    kind: EqPlanKind::Symm { assumed: original },
+                }
+            } else {
+                EqPlan {
+                    eq: original,
+                    neg_eq: self.ctx.terms.mk_not_raw(original),
+                    kind: EqPlanKind::Assumed,
+                }
+            };
+            return Some(EqPlan {
+                eq,
+                neg_eq,
+                kind: EqPlanKind::Trans {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+            });
         }
-        // `eq_congruent ⊢ (cl ¬(= a1 b1) .. ¬(= an bn) (= f(a..) f(b..)))`.
-        let mut lemma: Vec<TermId> = kids.iter().map(|k| k.neg_eq).collect();
-        lemma.push(eq);
-        Some(EqPlan {
-            eq,
-            neg_eq,
-            kind: EqPlanKind::Cong { lemma, kids },
-        })
+        None
     }
 
     /// Emit a planned bridge, returning the id of the unit `(cl goal)` step.
@@ -2862,6 +3080,19 @@ impl Executor {
                 }
                 Some(current)
             }
+            EqPlanKind::Trans { left, right } => {
+                let left_id = Self::emit_eq_plan(proof, left, assume_ids)?;
+                let right_id = Self::emit_eq_plan(proof, right, assume_ids)?;
+                // `trans` takes the two unit equalities as PREMISES; the
+                // strict checker re-derives the `a — mid — b` chain from them
+                // and rejects any premise it cannot place on that path.
+                Some(proof.add_rule_step(
+                    AletheRule::Trans,
+                    vec![plan.eq],
+                    vec![left_id, right_id],
+                    Vec::new(),
+                ))
+            }
         }
     }
 }
@@ -2900,6 +3131,12 @@ enum EqPlanKind {
         lemma: Vec<TermId>,
         kids: Vec<EqPlan>,
     },
+    /// `trans` over an authored defining equality `(= a mid)` (`left`) and a
+    /// derivation of `(= mid b)` (`right`).
+    Trans {
+        left: Box<EqPlan>,
+        right: Box<EqPlan>,
+    },
 }
 
 impl EqPlan {
@@ -2921,6 +3158,10 @@ impl EqPlan {
                     kid.collect_assumed(out);
                 }
             }
+            EqPlanKind::Trans { left, right } => {
+                left.collect_assumed(out);
+                right.collect_assumed(out);
+            }
         }
     }
 }
@@ -2941,3 +3182,7 @@ struct BridgePlan {
     /// Per-argument equality derivations, aligned with the predicate's args.
     kids: Vec<EqPlan>,
 }
+
+#[cfg(test)]
+#[path = "proof_original_rebuild_tests.rs"]
+mod proof_original_rebuild_tests;

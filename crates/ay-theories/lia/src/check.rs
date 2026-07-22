@@ -186,19 +186,9 @@ impl LiaSolver<'_> {
         literals: &[TheoryLit],
         candidates: &[usize],
     ) -> Option<Vec<usize>> {
-        fn is_unsat(r: &TheoryResult) -> bool {
-            matches!(r, TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_))
-        }
-        // A DEFINITE feasible verdict: a concrete model of the asserted set
-        // exists. Only `Sat` qualifies — `Unknown`/`NeedSplit`/budget outcomes
-        // decide nothing (see `probe_prefix_check`). This is the exactness
-        // hinge of the #probe-batch-prescreen fail-fast: a model of
-        // `literals + ALL candidates` also models `literals + ANY subset`, so
-        // a definite-Sat batch PROVES no subset can refute — the scan is
-        // provably unproductive and skipping it drops nothing.
-        fn is_sat(r: &TheoryResult) -> bool {
-            matches!(r, TheoryResult::Sat)
-        }
+        // Verdict readers: `probe_verdict_is_unsat` / `probe_verdict_is_sat`
+        // (module level — the #probe-qx minimizer reads verdicts by exactly the
+        // same rules).
         // A probe never probes again (it has no shared equalities of its own).
         if self.conflict_probe || candidates.is_empty() {
             return None;
@@ -314,11 +304,51 @@ impl LiaSolver<'_> {
                 used.push(i);
             }
             probe_checks += 1;
-            if is_unsat(&probe.check()) {
+            if probe_verdict_is_unsat(&probe.check()) {
                 probe_stats_record(probe_checks, true, used.len());
                 record_hint(&used);
                 PROBE_SCAN_FAIL_STREAK.with(|streak| streak.set(0));
                 return Some(used);
+            }
+        }
+
+        // #probe-qx (Junker 2004): the DIVIDE-AND-CONQUER half of
+        // #probe-prefix-bisect, replacing the O(|order|) forward scan below
+        // with an O(k·log(n/k)) recursion plus two set-level checks. Opt-in
+        // (`AY_LIA_PROBE_QX=1`) and only over orders big enough for those two
+        // checks to pay for themselves — the trajectory-sensitive Hash SAT
+        // greens run candidate orders of ~1-3 and keep the scan bit-for-bit.
+        // See `quickxplain_shared_equalities` for the argument; the acceptance
+        // rule is identical to the scan's, so both exits here are exactly the
+        // scan's own exits (proven subset, or `None` and the caller keeps the
+        // sound full-closure over-approximation).
+        if matches!(probe_qx_mode(), ProbeQxMode::Quickxplain) && order.len() >= QX_MIN_ORDER {
+            match self.quickxplain_shared_equalities(literals, &order, &mut probe_checks) {
+                QxOutcome::Proved(subset) => {
+                    probe_stats_record(probe_checks, true, subset.len());
+                    record_hint(&subset);
+                    PROBE_SCAN_FAIL_STREAK.with(|streak| streak.set(0));
+                    return Some(subset);
+                }
+                QxOutcome::Refuted => {
+                    // The failed-scan exit at ONE check: a definite-Sat full
+                    // candidate set proves no subset can refute `literals`.
+                    probe_stats_record(probe_checks, false, 0);
+                    if self.probe_subset_cache_active() {
+                        PROBE_SUBSET_HINT.with(|hint| hint.borrow_mut().clear());
+                    }
+                    if order.len() >= PROBE_SCAN_SWITCH_MIN_ORDER {
+                        PROBE_SCAN_FAIL_STREAK
+                            .with(|streak| streak.set(streak.get().saturating_add(1)));
+                        PROBE_SCAN_BIG_FAIL_TOTAL
+                            .with(|total| total.set(total.get().saturating_add(1)));
+                        probe_scan_big_fail_record(order.len());
+                    }
+                    return None;
+                }
+                // Nothing decided (Unknown batch, budget or deadline abort):
+                // fall through to the untouched forward scan.
+                QxOutcome::Undecided => {}
             }
         }
 
@@ -367,11 +397,17 @@ impl LiaSolver<'_> {
         // three exits the fail-fast takes. `rescue_cap` caps the forward scan
         // below when the verdict is UNKNOWN (see the match).
         let mut rescue_cap: Option<usize> = None;
-        if self.probe_batch_prescreen_active() && !self.should_timeout() {
+        // #probe-qx subsumes the batch check (it runs one as its precondition
+        // and only reaches here when that batch was UNDECIDED), so running the
+        // pre-screen again would just re-pay an identical check.
+        if self.probe_batch_prescreen_active()
+            && matches!(probe_qx_mode(), ProbeQxMode::Scan)
+            && !self.should_timeout()
+        {
             probe_checks += 1;
             let batch = self.probe_prefix_check(literals, &order);
             prescreen_batch_verdict_record(&batch);
-            if is_sat(&batch) {
+            if probe_verdict_is_sat(&batch) {
                 // DEFINITE-Sat: a model of `literals + ALL candidates` exists,
                 // so it models `literals + ANY subset`; no subset is refutable
                 // and the scan is PROVABLY unproductive. Exact fast-fail — this
@@ -393,7 +429,7 @@ impl LiaSolver<'_> {
                 }
                 return None;
             }
-            if !is_unsat(&batch) {
+            if !probe_verdict_is_unsat(&batch) {
                 // UNKNOWN: the monster full-set system exhausted a branching /
                 // coefficient budget its small incremental subsystems never
                 // hit, so the verdict is UNDECIDED — a blind fast-fail here may
@@ -424,6 +460,18 @@ impl LiaSolver<'_> {
         // bounded UNKNOWN-batch rescue can cap the scan at `rescue_cap` NEW
         // checks and then take the exhausted-scan exit below.
         let mut scanned = 0usize;
+        // #probe-gallop: when armed, the scan checks at EXPONENTIALLY spaced
+        // prefixes (1, 2, 4, 8, ... candidates added since the last check)
+        // instead of after every single add — see `probe_qx_mode`. `step` is
+        // the current batch size and `pending` the adds since the last check.
+        let gallop = matches!(probe_qx_mode(), ProbeQxMode::Gallop) && order_len >= QX_MIN_ORDER;
+        let mut step = 1usize;
+        let mut pending = 0usize;
+        let mut reproduced = false;
+        // #probe-gallop-bisect: `used.len()` at the last check that did NOT
+        // reproduce the infeasibility — the low end of the window a successful
+        // batch check has to be narrowed back down to (see below).
+        let mut last_feasible = used.len();
         for i in order {
             if used.contains(&i) {
                 continue;
@@ -444,13 +492,30 @@ impl LiaSolver<'_> {
             // which equalities the infeasibility needs, not why they hold.
             probe.assert_shared_equality(lhs, rhs, &[]);
             used.push(i);
-            probe_checks += 1;
             scanned += 1;
-            if is_unsat(&probe.check()) {
-                probe_stats_record(probe_checks, true, used.len());
-                record_hint(&used);
-                PROBE_SCAN_FAIL_STREAK.with(|streak| streak.set(0));
-                return Some(used);
+            pending += 1;
+            // #probe-gallop: inside a batch — defer the check to its boundary.
+            if gallop && pending < step {
+                if let Some(cap) = rescue_cap {
+                    if scanned >= cap {
+                        break;
+                    }
+                }
+                continue;
+            }
+            pending = 0;
+            probe_checks += 1;
+            if probe_verdict_is_unsat(&probe.check()) {
+                reproduced = true;
+                break;
+            }
+            // #probe-gallop: this prefix is not (provably) infeasible, so
+            // double the next batch. The probe is ADD-ONLY, so every deferred
+            // check is a prefix check the scan would also have run — just
+            // fewer of them.
+            if gallop {
+                step = step.saturating_mul(2);
+                last_feasible = used.len();
             }
             // Bounded rescue budget hit without reproducing infeasibility: stop
             // and take the exhausted-scan exit (the UNKNOWN batch could not
@@ -461,6 +526,44 @@ impl LiaSolver<'_> {
                     break;
                 }
             }
+        }
+        // #probe-gallop: the trailing partial batch never reached a boundary,
+        // so its prefix — the WHOLE candidate order — is still unchecked. The
+        // one-at-a-time scan always ends on a check; without this flush a
+        // gallop could report "exhausted" for an order it never asked about.
+        if gallop && !reproduced && pending > 0 && !self.should_timeout() {
+            probe_checks += 1;
+            reproduced = probe_verdict_is_unsat(&probe.check());
+        }
+        if reproduced {
+            // #probe-gallop-bisect: a batch check reproduces the infeasibility
+            // somewhere in `(last_feasible, used.len()]`, and everything past
+            // the true boundary is DEAD WEIGHT — its reasons are appended to
+            // the emitted clause, weakening it (measured: the un-bisected
+            // gallop grew the mean proven subset 15.2 -> 17.8 and cost 9
+            // QF_UFLIA SAT greens). Binary-search the window back down. Each
+            // probe is a from-scratch check of `literals` plus exactly a
+            // prefix, so every accepted narrowing is PROVEN, and a window
+            // whose narrowings all come back undecided simply keeps the batch
+            // boundary the incremental probe already refuted — the acceptance
+            // rule holds on either exit.
+            if gallop && used.len() - last_feasible > 1 {
+                let (mut lo, mut hi) = (last_feasible, used.len());
+                while hi - lo > 1 && !self.should_timeout() {
+                    let mid = lo + (hi - lo) / 2;
+                    probe_checks += 1;
+                    if probe_verdict_is_unsat(&self.probe_prefix_check(literals, &used[..mid])) {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                used.truncate(hi);
+            }
+            probe_stats_record(probe_checks, true, used.len());
+            record_hint(&used);
+            PROBE_SCAN_FAIL_STREAK.with(|streak| streak.set(0));
+            return Some(used);
         }
         probe_stats_record(probe_checks, false, 0);
         // A failed scan invalidates the hint: the conflict landscape has
@@ -581,6 +684,178 @@ impl LiaSolver<'_> {
     fn probe_prefix_check(&self, literals: &[TheoryLit], prefix: &[usize]) -> TheoryResult {
         let mut probe = self.build_conflict_probe(literals, prefix);
         probe.check()
+    }
+
+    /// #probe-qx: minimize the shared-equality reason set with QUICKXPLAIN
+    /// (Junker 2004) instead of the linear forward scan — the
+    /// divide-and-conquer half of #probe-prefix-bisect that the pre-screen
+    /// scaffold above was built for.
+    ///
+    /// The forward scan asserts candidates one at a time and re-runs a FULL
+    /// LIA check after each add, so it pays O(n) checks whenever it fails and
+    /// O(prefix) when it succeeds. Measured (T:20 census, 55 QF_UFLIA files
+    /// that never reach a candidate model): ~97% of ALL full LIA invocations
+    /// are these probe checks, at 8-507 checks per attempt over candidate
+    /// orders of 21-509, with only ~40% of attempts proving a subset — i.e.
+    /// the bulk of the budget is spent on scans that assert EVERY candidate
+    /// and prove nothing.
+    ///
+    /// QUICKXPLAIN isolates a MINIMAL conflicting subset in O(k·log(n/k))
+    /// checks, wrapped in two set-level checks that bound the whole attempt:
+    ///
+    ///   * PRECONDITION (`literals + ALL candidates`): the recursion is only
+    ///     defined when the full candidate set actually refutes `literals`.
+    ///     That one check also decides the dominant failure case EXACTLY — a
+    ///     definite `Sat` means a model of the full set exists, hence a model
+    ///     of every subset, hence NO subset can refute (`Refuted` at one check
+    ///     where the scan pays n). An `Unknown` batch decides nothing (the
+    ///     monster full-set system can exhaust a branching budget the scan's
+    ///     small incremental subsystems never hit), so it yields `Undecided`
+    ///     and the caller runs the untouched forward scan.
+    ///   * ACCEPTANCE (`literals + exactly the returned subset`): the same
+    ///     rule as the scan's — a subset is returned ONLY after a probe check
+    ///     actually re-derives UNSAT from it, never by inference from the
+    ///     recursion's invariants. Those invariants are only as strong as the
+    ///     oracle, and this oracle is partial: an `Unknown` inside the
+    ///     recursion is read as "not proven", so the recursion CAN return a
+    ///     set that does not in fact refute. The acceptance check catches
+    ///     exactly that and falls back.
+    ///
+    /// SOUNDNESS is therefore the scan's argument unchanged, including both
+    /// load-bearing contracts: the result is drawn only from `order` (⊆ the
+    /// caller's usable candidates — contract 1) and is never empty (contract
+    /// 2 — the recursion bottoms out at a singleton, never at ∅, because the
+    /// root call carries no Δ and so never takes the "background already
+    /// suffices" exit). TRAJECTORY is deliberately NOT preserved: this returns
+    /// a minimal subset where the scan returns a prefix, so the emitted clause
+    /// differs — usually smaller, which is the point.
+    ///
+    /// MEASURED — AND FALSIFIED on this workload (T:20, 17 QF_UFLIA spin
+    /// cells, interleaved off/on, `AY_PROBE_STATS`): the precondition batch is
+    /// UNDECIDED on 78% of attempts (16152 of 20738) and definite-Sat on
+    /// **zero**, so the exact fast-fail this design leans on never fires and
+    /// the scan runs anyway, one check poorer. On the 22% the batch DOES
+    /// refute, the recursion returns a SINGLETON every single time (4586
+    /// proofs, subset_len_sum 4586) — a core the one-at-a-time scan already
+    /// finds in its FIRST check, where the recursion pays ~log2(n)+2. Net:
+    /// median checks per attempt 17.4 -> 14.5 (1.2x) with the proved/attempt
+    /// rate FALLING 0.38 -> 0.25. The lever is kept, measured and gated, so
+    /// the next reader does not re-derive it: the obstacle is not the
+    /// algorithm but the ORACLE — a full LIA check over a large candidate set
+    /// answers `Unknown`, and QUICKXPLAIN's first questions are its largest.
+    /// The strategy that fits this oracle is `ProbeQxMode::Gallop`, which asks
+    /// only small monotone prefix questions.
+    ///
+    /// `checks` accumulates the full LIA checks this attempt paid, for the
+    /// caller's `probe_stats_record`.
+    pub(super) fn quickxplain_shared_equalities(
+        &self,
+        literals: &[TheoryLit],
+        order: &[usize],
+        checks: &mut u64,
+    ) -> QxOutcome {
+        if self.should_timeout() {
+            return QxOutcome::Undecided;
+        }
+        *checks += 1;
+        let batch = self.probe_prefix_check(literals, order);
+        prescreen_batch_verdict_record(&batch);
+        if probe_verdict_is_sat(&batch) {
+            qx_stats_record(QxStat::Refuted, *checks, 0);
+            return QxOutcome::Refuted;
+        }
+        if !probe_verdict_is_unsat(&batch) {
+            qx_stats_record(QxStat::BatchUnknown, *checks, 0);
+            return QxOutcome::Undecided;
+        }
+
+        // The recursion may never cost materially more than the scan it
+        // replaces: `Unknown` answers inside it break the halving argument, so
+        // without a cap a pathological attempt could out-spend the O(n) scan.
+        // Exhausting the budget is `Undecided` — the caller's scan then still
+        // finds a (prefix) subset, so the cap costs clause QUALITY at worst,
+        // never soundness.
+        let budget = (order.len() + QX_CHECK_SLACK) as u64;
+        let Some(core) = self.qx_recurse(literals, &[], false, order, checks, budget) else {
+            qx_stats_record(QxStat::Aborted, *checks, 0);
+            return QxOutcome::Undecided;
+        };
+        // Canonicalize to candidate-order position: the recursion returns the
+        // two halves' cores concatenated, and a stable order keeps the emitted
+        // clause (and the #probe-subset-cache hint) reproducible.
+        let core: HashSet<usize> = core.into_iter().collect();
+        let subset: Vec<usize> = order.iter().copied().filter(|i| core.contains(i)).collect();
+        if subset.is_empty() {
+            // Unreachable by construction (contract 2), but an empty "core"
+            // must never reach the caller as a proven subset.
+            qx_stats_record(QxStat::Aborted, *checks, 0);
+            return QxOutcome::Undecided;
+        }
+        // ACCEPTANCE: re-derive the infeasibility from `literals` plus exactly
+        // this subset. Skipped only when the subset IS the whole candidate
+        // set, which the precondition check above already refuted.
+        if subset.len() < order.len() {
+            if self.should_timeout() {
+                qx_stats_record(QxStat::Aborted, *checks, 0);
+                return QxOutcome::Undecided;
+            }
+            *checks += 1;
+            if !probe_verdict_is_unsat(&self.probe_prefix_check(literals, &subset)) {
+                qx_stats_record(QxStat::VerifyFail, *checks, subset.len());
+                return QxOutcome::Undecided;
+            }
+        }
+        qx_stats_record(QxStat::Proved, *checks, subset.len());
+        QxOutcome::Proved(subset)
+    }
+
+    /// QUICKXPLAIN' (Junker 2004): the subset of `c` that, together with
+    /// `literals` and `base`, still refutes.
+    ///
+    /// `delta_nonempty` records whether the CALLER extended `base` on the way
+    /// in (Junker's Δ). When it did, one check of `literals + base` decides
+    /// whether the caller's own addition already suffices — the split that
+    /// makes the recursion O(k·log(n/k)) instead of O(n). The FIRST half of
+    /// `c` is always the half pushed into the background, so the returned core
+    /// inherits the caller's ordering bias (conflict-touching equalities lead
+    /// `order`, and a core drawn from them keeps the clause relevant).
+    ///
+    /// `None` = ABORT (deadline or check budget): the caller must not read an
+    /// aborted recursion as a proof of anything.
+    fn qx_recurse(
+        &self,
+        literals: &[TheoryLit],
+        base: &[usize],
+        delta_nonempty: bool,
+        c: &[usize],
+        checks: &mut u64,
+        budget: u64,
+    ) -> Option<Vec<usize>> {
+        if delta_nonempty {
+            // #lia-deadline-forward: every probe check is a full BigRational
+            // LIA solve, so poll the parent's deadline before each one.
+            if self.should_timeout() || *checks >= budget {
+                return None;
+            }
+            *checks += 1;
+            if probe_verdict_is_unsat(&self.probe_prefix_check(literals, base)) {
+                return Some(Vec::new());
+            }
+        }
+        if c.len() <= 1 {
+            return Some(c.to_vec());
+        }
+        let (c1, c2) = c.split_at(c.len() / 2);
+        let mut background = Vec::with_capacity(base.len() + c1.len());
+        background.extend_from_slice(base);
+        background.extend_from_slice(c1);
+        let d1 = self.qx_recurse(literals, &background, true, c2, checks, budget)?;
+        background.truncate(base.len());
+        background.extend_from_slice(&d1);
+        let d2 = self.qx_recurse(literals, &background, !d1.is_empty(), c1, checks, budget)?;
+        let mut core = d1;
+        core.extend(d2);
+        Some(core)
     }
 
     /// Whether the #probe-subset-cache batch guess is active for this
@@ -838,11 +1113,19 @@ thread_local! {
     /// so per-solver state would reset before it could ever trip. Once the
     /// streak reaches `PROBE_SCAN_FAIL_STREAK_SWITCH` AND the attempt total
     /// reaches `PROBE_SCAN_FAIL_TOTAL_SWITCH`, the thread's probes switch
-    /// from the incremental scan to the set-level pre-screen +
-    /// prefix-bisection strategy (see `probe_needed_shared_equalities`);
-    /// scan successes reset the streak (never the total). Purely a
-    /// performance trajectory heuristic: both strategies accept a subset
-    /// only after an actual probe check refutes literals+subset.
+    /// from the incremental scan to the set-level pre-screen (see
+    /// `probe_needed_shared_equalities`); scan successes reset the streak
+    /// (never the total). Purely a performance trajectory heuristic: every
+    /// strategy accepts a subset only after an actual probe check refutes
+    /// literals+subset.
+    ///
+    /// The other half of the strategy — divide-and-conquer instead of a
+    /// forward scan — landed as #probe-qx (`quickxplain_shared_equalities`),
+    /// which does NOT arm off this streak: the census showed the fail-streak
+    /// arming never trips inside a T:20 budget on the spin cells it was meant
+    /// for (287 big fails accumulated vs the 384 bar on wisas xs_40_60), and
+    /// those cells burn the scan on SUCCESSFUL large-subset attempts the
+    /// streak never counts. #probe-qx arms on candidate-order size instead.
     static PROBE_SCAN_FAIL_STREAK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 
     /// #probe-prefix-bisect: monotone per-attempt count of big exhausted
@@ -884,6 +1167,103 @@ const PROBE_SCAN_SWITCH_MIN_ORDER: usize = 16;
 /// failing augment probes IS the refutation-grind signature the fail-fast
 /// exists for.
 const PROBE_SCAN_FAIL_TOTAL_SWITCH: u64 = 384;
+
+/// #probe-qx: outcome of one QUICKXPLAIN minimization attempt (see
+/// `quickxplain_shared_equalities`).
+pub(crate) enum QxOutcome {
+    /// A subset an actual probe check re-derived UNSAT from, together with the
+    /// conflict literals. Drawn only from the candidate order; never empty.
+    Proved(Vec<usize>),
+    /// The full candidate set has a MODEL together with the conflict literals,
+    /// so NO subset can refute them: minimization is provably unproductive.
+    Refuted,
+    /// Nothing decided — the caller must fall back to the forward scan.
+    Undecided,
+}
+
+/// Candidate orders below this keep the linear forward scan under BOTH
+/// alternative strategies (#probe-qx and #probe-gallop). Neither pays for
+/// itself on a short order — QUICKXPLAIN adds two set-level checks around its
+/// recursion, and a gallop over an order the scan finishes in a handful of
+/// checks saves nothing while still coarsening the proven subset. Same cost
+/// model — and the same measured order profile — as
+/// `PROBE_SCAN_SWITCH_MIN_ORDER`: the trajectory-sensitive Hash SAT greens run
+/// orders of ~1-3, the wisas / Certora spin cells these levers target run
+/// 21-509.
+const QX_MIN_ORDER: usize = 16;
+
+/// #probe-qx: check budget slack over `|order|`. The recursion is
+/// O(k·log(n/k)) only while the oracle is exact; an `Unknown` answer inside it
+/// breaks the halving argument, so an attempt is capped at what the scan it
+/// replaces would have cost, plus the two set-level checks and a small margin.
+const QX_CHECK_SLACK: usize = 8;
+
+/// Which shared-equality minimization strategy the probe uses in place of the
+/// one-at-a-time forward scan. Both alternatives are default OFF: each returns
+/// a different subset than the scan's prefix, so the emitted clause — and with
+/// it the search trajectory — differs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeQxMode {
+    /// `AY_LIA_PROBE_QX` unset or `0`: the linear forward scan, unchanged.
+    Scan,
+    /// `AY_LIA_PROBE_QX=1`: QUICKXPLAIN divide-and-conquer (#probe-qx).
+    Quickxplain,
+    /// `AY_LIA_PROBE_QX=gallop`: exponential-batch prefix scan (#probe-gallop)
+    /// on the SAME add-only incremental probe the scan uses — one check per
+    /// 1, 2, 4, 8, ... adds instead of one per add.
+    ///
+    /// Why a second strategy: measured (T:20, 17 QF_UFLIA spin cells), the
+    /// full-candidate-set batch check QUICKXPLAIN needs as its precondition is
+    /// UNDECIDED on 78% of attempts and definite-Sat on 0% — the oracle simply
+    /// cannot answer set-level questions here, and every core it CAN prove
+    /// turns out to be a singleton the one-at-a-time scan already finds in its
+    /// first check. The gallop asks only the questions this oracle answers —
+    /// the scan's own monotone prefix questions, on the scan's own incremental
+    /// probe — and just asks O(log n) of them instead of O(n).
+    ///
+    /// MEASURED, same 17 cells, interleaved off/on: median checks per probe
+    /// attempt 18.9 -> 3.8 (5.0x; per-file 2.3x-68x, every cell improves) at an
+    /// UNCHANGED proved/attempt rate (0.366 -> 0.367). QUICKXPLAIN on the same
+    /// cells: 17.4 -> 14.5 (1.2x) with the rate FALLING 0.38 -> 0.25.
+    ///
+    /// WHY IT IS STILL OFF BY DEFAULT: the cheaper probe frees budget but the
+    /// proven prefix is not always the scan's, so clauses — and trajectories —
+    /// move in both directions. Full QF_UFLIA division (300 files, T:20,
+    /// interleaved): 8 conversions, 8 regressions, 0 sat/unsat disagreements.
+    /// Verdict-neutral in the aggregate, but not regression-free, and the
+    /// losses are SAT-fast files (0.7-8s) whose closures (41-45) overlap the
+    /// winners' (26-30), so no order-size arming separates them. Default-on
+    /// needs an arming signal that fires only where the budget is already lost.
+    Gallop,
+}
+
+/// Probe minimization strategy for this process (`AY_LIA_PROBE_QX`, one
+/// cached env read). See [`ProbeQxMode`].
+fn probe_qx_mode() -> ProbeQxMode {
+    static MODE: std::sync::OnceLock<ProbeQxMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("AY_LIA_PROBE_QX").ok().as_deref() {
+        Some("1") => ProbeQxMode::Quickxplain,
+        Some("gallop") => ProbeQxMode::Gallop,
+        _ => ProbeQxMode::Scan,
+    })
+}
+
+/// A DEFINITE infeasibility verdict from a probe check. `Unknown`/`NeedSplit`
+/// and budget outcomes decide NOTHING — they mean "not proven", never "proven
+/// feasible" (see `probe_prefix_check`).
+fn probe_verdict_is_unsat(r: &TheoryResult) -> bool {
+    matches!(r, TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_))
+}
+
+/// A DEFINITE feasible verdict: a concrete model of the asserted set exists.
+/// Only `Sat` qualifies. This is the exactness hinge of both the
+/// #probe-batch-prescreen fail-fast and the #probe-qx precondition: a model of
+/// `literals + ALL candidates` also models `literals + ANY subset`, so a
+/// definite-Sat batch PROVES no subset can refute — the minimization is
+/// provably unproductive and skipping it drops nothing.
+fn probe_verdict_is_sat(r: &TheoryResult) -> bool {
+    matches!(r, TheoryResult::Sat)
+}
 
 /// #probe-batch-prescreen-exact: default leading-candidate budget for the
 /// bounded rescue scan taken when the full-set batch verdict is UNKNOWN.
@@ -1029,6 +1409,62 @@ fn probe_stats_record(checks: u64, success: bool, subset_len: usize) {
             SUBSET_LEN.load(Ordering::Relaxed)
         );
     }
+}
+
+/// #probe-qx observability: per-process outcome histogram of QUICKXPLAIN
+/// minimization attempts, printed every 256 attempts when `AY_PROBE_STATS` is
+/// set. Zero overhead when unset (one cached env read).
+fn qx_stats_record(outcome: QxStat, checks: u64, subset_len: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("AY_PROBE_STATS").is_some()) {
+        return;
+    }
+    static PROVED: AtomicU64 = AtomicU64::new(0);
+    static REFUTED: AtomicU64 = AtomicU64::new(0);
+    static BATCH_UNKNOWN: AtomicU64 = AtomicU64::new(0);
+    static ABORTED: AtomicU64 = AtomicU64::new(0);
+    static VERIFY_FAIL: AtomicU64 = AtomicU64::new(0);
+    static CHECKS: AtomicU64 = AtomicU64::new(0);
+    static SUBSET_LEN: AtomicU64 = AtomicU64::new(0);
+    let counter = match outcome {
+        QxStat::Proved => &PROVED,
+        QxStat::Refuted => &REFUTED,
+        QxStat::BatchUnknown => &BATCH_UNKNOWN,
+        QxStat::Aborted => &ABORTED,
+        QxStat::VerifyFail => &VERIFY_FAIL,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    CHECKS.fetch_add(checks, Ordering::Relaxed);
+    SUBSET_LEN.fetch_add(subset_len as u64, Ordering::Relaxed);
+    let total = PROVED.load(Ordering::Relaxed)
+        + REFUTED.load(Ordering::Relaxed)
+        + BATCH_UNKNOWN.load(Ordering::Relaxed)
+        + ABORTED.load(Ordering::Relaxed)
+        + VERIFY_FAIL.load(Ordering::Relaxed);
+    if total.is_multiple_of(256) || total == 1 {
+        safe_eprintln!(
+            "[QX-STATS] attempts={} proved={} refuted={} batch_unknown={} aborted={} \
+             verify_fail={} checks={} subset_len_sum={}",
+            total,
+            PROVED.load(Ordering::Relaxed),
+            REFUTED.load(Ordering::Relaxed),
+            BATCH_UNKNOWN.load(Ordering::Relaxed),
+            ABORTED.load(Ordering::Relaxed),
+            VERIFY_FAIL.load(Ordering::Relaxed),
+            CHECKS.load(Ordering::Relaxed),
+            SUBSET_LEN.load(Ordering::Relaxed)
+        );
+    }
+}
+
+/// #probe-qx outcome classes counted by [`qx_stats_record`].
+enum QxStat {
+    Proved,
+    Refuted,
+    BatchUnknown,
+    Aborted,
+    VerifyFail,
 }
 
 /// #probe-prefix-bisect observability: per-process count of big exhausted

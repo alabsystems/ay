@@ -414,15 +414,15 @@ fn launch_packet_index_summarizes_packet_artifacts() {
     fs::create_dir_all(packet.join("raw")).expect("mkdir packet");
     fs::write(packet.join("raw/smt-local-suite.json"), "{}\n").expect("write raw result");
     fs::write(
-        packet.join("hn-launch-gate.log"),
-        "hn-launch-gate: FAIL broad HN/Z3-successor launch is blocked\n",
+        packet.join("release-gate.log"),
+        "release-gate: FAIL broad broad public-launch launch is blocked\n",
     )
     .expect("write gate log");
     let commit = "94b1811a4ecf9ddf7ed04c5eb78d3c4cb50c2f89";
     write_json(
-        &packet.join("hn-launch-gate-summary.json"),
+        &packet.join("release-gate-summary.json"),
         &json!({
-            "schema": "ay-hn-launch-gate-summary/v1",
+            "schema": "ay-release-gate-summary/v1",
             "status": "fail",
             "evidence_gate_failures": 0,
             "advisory_failures": 0,

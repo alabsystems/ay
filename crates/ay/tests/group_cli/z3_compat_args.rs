@@ -1649,13 +1649,17 @@ fn smt_undefined_symbol_errors_are_recoverable_stdout_results() {
         Some(1),
         "undefined check-sat-assuming literal should make final CLI status non-zero; stdout={assuming_stdout}, stderr={assuming_stderr}"
     );
-    assert!(
-        assuming_stderr.is_empty(),
-        "undefined check-sat-assuming literal should not emit stderr: {assuming_stderr}"
+    // AY answers the failed decision query with a synthesized fail-closed
+    // `unknown` (every check-sat emits a verdict) and explains it with a
+    // single reason diagnostic on stderr; the error text itself matches z3.
+    assert_eq!(
+        assuming_stderr,
+        "(:reason-unknown (incomplete decision-execution-error))\n",
+        "undefined check-sat-assuming literal should emit exactly the reason diagnostic: {assuming_stderr}"
     );
     assert_eq!(
         assuming_stdout,
-        "success\nsuccess\n(error \"line 3 column 21: unknown constant p\")\n(:status unknown)\nsuccess\n"
+        "success\nsuccess\n(error \"line 3 column 21: unknown constant p\")\nunknown\n(:status unknown)\nsuccess\n"
     );
 
     if let Some(z3) = run_installed_z3(assuming_script) {
@@ -1666,14 +1670,30 @@ fn smt_undefined_symbol_errors_are_recoverable_stdout_results() {
             Some(1),
             "installed z3 should reject the undefined assumption but continue; stdout={z3_stdout}, stderr={z3_stderr}"
         );
-        assert_eq!(
-            assuming_stderr, z3_stderr,
-            "ay stderr should match installed z3"
+        // DELIBERATE DIVERGENCE FROM Z3 (same #match-soundness rationale as
+        // the reset script above): AY answers the failed decision query with
+        // a synthesized fail-closed `unknown` and explains it with a single
+        // reason diagnostic on stderr; z3 emits neither. Every other line is
+        // byte-identical to z3.
+        assert!(
+            z3_stderr.is_empty(),
+            "installed z3 emits nothing on stderr here; ay adds only the reason diagnostic: {z3_stderr}"
         );
+        let ay_lines: Vec<&str> = assuming_stdout.lines().collect();
+        let z3_stdout_lines: Vec<&str> = z3_stdout.lines().collect();
         assert_eq!(
-            assuming_stdout, z3_stdout,
-            "ay check-sat-assuming undefined-symbol transcript should match installed z3"
+            ay_lines.len(),
+            z3_stdout_lines.len() + 1,
+            "ay adds exactly the synthesized unknown; ay={assuming_stdout}, z3={z3_stdout}"
         );
+        assert_eq!(ay_lines[3], "unknown", "ay={assuming_stdout}");
+        for (i, z3_line) in z3_stdout_lines.iter().enumerate() {
+            let ay_index = if i < 3 { i } else { i + 1 };
+            assert_eq!(
+                &ay_lines[ay_index], z3_line,
+                "line {i} must match installed z3 outside the synthesized unknown; ay={assuming_stdout}, z3={z3_stdout}"
+            );
+        }
         let z3_lines: Vec<&str> = z3_stdout.lines().collect();
         assert_eq!(
             z3_lines.len(),

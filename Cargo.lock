@@ -214,6 +214,7 @@ name = "ay-bench"
 version = "0.2.0"
 dependencies = [
  "ay-proof-complexity",
+ "ay-test-support",
  "nix",
  "rayon",
  "rusqlite",

@@ -89,7 +89,7 @@ mod tests {
         cell.set(Some(past));
         assert_eq!(handle.get(), Some(past));
         assert!(handle.expired());
-        let future = Instant::now() + Duration::from_secs(60);
+        let future = Instant::now() + Duration::from_mins(1);
         cell.set(Some(future));
         assert!(!handle.expired());
         cell.set(None);

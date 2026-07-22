@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! W7 — chain-definition, multi-atom and witness-enumerating witness moves
-//! (`AY_STR_W7=1`, default OFF).
+//! (default ON, `AY_STR_W7=0` kill switch).
 //!
 //! ## The measured gap W7 closes
 //!
@@ -166,7 +166,7 @@ use crate::executor_types::{Result, SolveResult};
 use super::super::Executor;
 use super::strings_w4::{w4_memo_reset, MAX_W4_LEN};
 
-/// Master switch (`AY_STR_W7=1`, default OFF → byte-identical to W6-only).
+/// Master switch (default ON, `AY_STR_W7=0` kill switch → byte-identical to W6-only).
 pub(in crate::executor) fn str_w7_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // DEFAULT-ON: 6 further conversions (3 ip_int_from_string, Leetcode

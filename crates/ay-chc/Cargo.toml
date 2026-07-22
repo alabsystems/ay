@@ -36,13 +36,13 @@ num-rational.workspace = true
 num-traits.workspace = true
 
 [dev-dependencies]
+ay-test-support.workspace = true
 proptest.workspace = true
 ntest.workspace = true
 serial_test.workspace = true
 tempfile.workspace = true
 wait-timeout.workspace = true
 ay-tla-bridge.workspace = true
-ay-test-support.workspace = true
 
 [lints]
 workspace = true

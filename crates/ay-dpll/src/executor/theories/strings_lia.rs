@@ -1337,7 +1337,7 @@ impl Executor {
             }
         }
 
-        // W4 (`AY_STR_W4=1`, default off): length-indexed PER-POSITION
+        // W4 (default ON, `AY_STR_W4=0` kill switch): length-indexed PER-POSITION
         // character witness synthesizer — the measured RANK-1 sat-side lever
         // (70 of the 92 sat misses are the per-position family, and 58 of them
         // never build a model at all, so every model-construction path is
@@ -1402,7 +1402,7 @@ impl Executor {
             }
         }
 
-        // W6 (`AY_STR_W6=1`, default off): regex-driven joint word
+        // W6 (default ON, `AY_STR_W6=0` kill switch): regex-driven joint word
         // construction — the LAST witness pre-pass, deliberately.
         //
         // The per-position synthesizer's targeting gate declines
@@ -1424,7 +1424,7 @@ impl Executor {
             }
         }
 
-        // W7 (`AY_STR_W7=1`, default off): chain-definition search, multi-atom
+        // W7 (default ON, `AY_STR_W7=0` kill switch): chain-definition search, multi-atom
         // placement search, and the distinct-witness enumerator — the LAST
         // witness pre-pass, with its own budget.
         //
@@ -1870,7 +1870,7 @@ impl Executor {
             }
         }
 
-        // P2 escalation (`AY_STR_P2=1`, default off): symbolic-bounds
+        // P2 escalation (default ON, `AY_STR_P2=0` kill switch): symbolic-bounds
         // `str.substr` + `str.indexof` first-occurrence reductions, only
         // AFTER the unchanged effort passes return Unknown — so anything the
         // default pipeline solves is decided identically first, and the P2
@@ -1926,7 +1926,7 @@ impl Executor {
             }
         }
 
-        // P3 escalation (`AY_STR_P3=1`, default off): `str.to_int` /
+        // P3 escalation (default ON, `AY_STR_P3=0` kill switch): `str.to_int` /
         // `str.from_int` digit-string ↔ LIA coupling for NON-GROUND
         // arguments, again only after every earlier pass returned Unknown.
         // The axioms are universally valid SMT-LIB theorems (see
@@ -2200,7 +2200,7 @@ impl Executor {
             eager_extension: true,
             disable_preprocess: true,
             pre_iter_check: |_s| self.should_abort_theory_loop(),
-            // Strings increment P3 (`AY_STR_P3=1`, default off — the default
+            // Strings increment P3 (default ON, `AY_STR_P3=0` kill switch — the killed
             // lane keeps the conservative escalate-to-Unknown): opt into the
             // #6812 verify-before-accept relaxation for post-split UNSAT.
             // The full_str_int family refutes propositionally+LIA after

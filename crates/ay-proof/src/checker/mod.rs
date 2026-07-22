@@ -4,7 +4,10 @@
 
 //! Proof structure validation for premise linkage, resolution, DRUP, and terminal empty-clause derivation.
 mod array_axiom;
-pub use array_axiom::{recognize_array_select_store, recognize_array_theory_lemma};
+pub use array_axiom::{
+    recognize_array_extensionality, recognize_array_select_store, recognize_array_theory_lemma,
+    ExtDiffRegistry,
+};
 mod boolean;
 mod boolean_derived;
 mod boolean_negation;
@@ -246,6 +249,31 @@ pub fn check_proof_collecting_trust(
     Ok(collected)
 }
 
+/// Crate-internal re-export of the extensionality validator so the whole-proof
+/// provenance pass in `quality.rs` re-uses the EXACT per-step check strict mode
+/// applies — one implementation, no drift between the two acceptance paths.
+/// Crate-internal re-export of the diff-witness introduction shape check for
+/// the Alethe printer, so a malformed introduction is a typed print error
+/// rather than a silently-rendered comment.
+pub(crate) fn validate_ext_diff_intro_for_printer(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    premises: &[ProofId],
+    args: &[TermId],
+) -> Result<(), ProofCheckError> {
+    array_axiom::validate_ext_diff_intro(terms, step_id, clause, premises, args).map(|_| ())
+}
+
+pub(crate) fn validate_array_extensionality_for_provenance(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    registry: Option<&ExtDiffRegistry>,
+) -> Result<(), ProofCheckError> {
+    array_axiom::validate_array_extensionality(terms, step_id, clause, registry)
+}
+
 pub(crate) fn validate_step(
     terms: &TermStore,
     derived_clauses: &mut Vec<Option<Vec<TermId>>>,
@@ -264,6 +292,7 @@ pub(crate) fn validate_step(
         step_id,
         step,
         strict,
+        None,
         None,
         None,
         trust_collector,
@@ -286,6 +315,11 @@ pub(crate) fn validate_step_with_datatypes(
     strict: bool,
     dt_decls: Option<datatype_axiom::DatatypeDecls<'_>>,
     ctor_selectors: Option<datatype_axiom::SelectorDecls<'_>>,
+    // Whole-proof extensionality diff-witness provenance, built once by the
+    // caller from the proof's `array_ext_diff_intro` steps and the PROBLEM's
+    // assertions. `None` (no problem assertion set available) keeps
+    // `TheoryLemmaKind::ArrayExtensionality` fail-closed.
+    ext_diff: Option<&ExtDiffRegistry>,
     // Deferred-trust recovery (see [`validate_step`]): when `Some`, a strict
     // `Trust` step is collected for independent discharge instead of rejected.
     mut trust_collector: Option<&mut Vec<(ProofId, Vec<TermId>)>>,
@@ -316,8 +350,27 @@ pub(crate) fn validate_step_with_datatypes(
             strict,
             dt_decls,
             ctor_selectors,
+            ext_diff,
             trust_collector.as_deref_mut(),
         )?,
+        // An `array_ext_diff_intro` is a DEFINITION, not an inference: it
+        // records that a fresh symbol is the extensionality difference witness
+        // for one array pair. It is validated for shape here and recorded as
+        // producing NO clause (like an `anchor`), so it can never be resolved
+        // against, never seed a RUP check, and never be mistaken for a derived
+        // empty clause. The provenance conditions that make it MEAN anything
+        // (freshness, bound-once) are whole-proof and live in
+        // `ExtDiffRegistry::collect`.
+        ProofStep::Step {
+            rule: AletheRule::ArrayExtDiffIntro,
+            clause,
+            premises,
+            args,
+        } => {
+            let _binding =
+                array_axiom::validate_ext_diff_intro(terms, step_id, clause, premises, args)?;
+            derived_clauses.push(None);
+        }
         ProofStep::Resolution {
             clause,
             pivot,
@@ -381,6 +434,7 @@ fn validate_theory_lemma(
     strict: bool,
     dt_decls: Option<datatype_axiom::DatatypeDecls<'_>>,
     ctor_selectors: Option<datatype_axiom::SelectorDecls<'_>>,
+    ext_diff: Option<&ExtDiffRegistry>,
     // When `Some` AND a strict trust-kind (`Generic`) theory lemma is encountered,
     // the lemma is DEFERRED (its clause collected for independent re-discharge)
     // instead of rejected — the theory-lemma analogue of the `Step{rule:Trust}`
@@ -445,10 +499,9 @@ fn validate_theory_lemma(
             //
             // Enforces that read-over-write clauses mention
             // `(select (store ...) ...)` and that the negative case carries a
-            // disequality between the indices. Extensionality clauses must
-            // contain an equality between two array-sorted terms plus a
-            // `select` witness. Unchecked extensionality witnesses are
-            // rejected until full semantic validation is available (#8073).
+            // disequality between the indices. Extensionality clauses are
+            // handled separately below: their soundness is provenance, not
+            // shape, so they need the `ext_diff` registry.
             TheoryLemmaKind::ArraySelectStore { index_eq } => {
                 array_axiom::validate_array_select_store(terms, step_id, clause, index_eq)?;
             }
@@ -460,8 +513,13 @@ fn validate_theory_lemma(
             TheoryLemmaKind::ArrayRowChain => {
                 array_axiom::validate_array_row_chain(terms, step_id, clause)?;
             }
+            // Skolemized extensionality: NOT a tautology, so shape alone can
+            // never license it. Accepted only against the whole-proof
+            // `array_ext_diff_intro` provenance registry; `None` (the caller
+            // had no problem assertion set to check freshness against) fails
+            // closed exactly as this kind always did.
             TheoryLemmaKind::ArrayExtensionality => {
-                array_axiom::validate_array_extensionality(terms, step_id, clause)?;
+                array_axiom::validate_array_extensionality(terms, step_id, clause, ext_diff)?;
             }
             // FP→BV lemmas: fail-closed until semantic lowering exists (#8820).
             //

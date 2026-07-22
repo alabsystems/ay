@@ -16,6 +16,15 @@ fn shortest_poly_pivot_enabled() -> bool {
     *V.get_or_init(|| std::env::var("AY_LRA_SHORTEST_POLY").map_or(true, |v| v != "0"))
 }
 
+#[inline]
+const fn use_shortest_poly_pivot(integer_mode: bool, enabled: bool) -> bool {
+    // The heuristic was benchmarked for rational QF_LRA. LIA embeds this
+    // simplex as a relaxation and relies on the historical greatest-error path
+    // for stable invariant discovery; applying the LRA pivot there regresses
+    // certified CHC discharge (dillig12_m #4751).
+    !integer_mode && enabled
+}
+
 impl LraSolver {
     /// Check if a variable's current value violates its bounds.
     ///
@@ -80,8 +89,13 @@ impl LraSolver {
     }
 
     /// #group-l-shortpoly (`AY_LRA_SHORTEST_POLY`): the pivot leaving-variable
-    /// selection key. Default (OFF) = Z3/Dantzig most-violated rule (violation
-    /// magnitude, cuts iteration COUNT). ON = OpenSMT's shortest-polynomial rule:
+    /// selection key. Default for rational LRA (ON) = OpenSMT's
+    /// shortest-polynomial rule; integer-mode LIA always retains the historical
+    /// Z3/Dantzig most-violated rule because this QF_LRA heuristic can perturb
+    /// integer invariant discovery. `AY_LRA_SHORTEST_POLY=0` opts rational LRA
+    /// out as well.
+    ///
+    /// The shortest-polynomial rule:
     /// among infeasible basic vars prefer the one whose tableau ROW has the fewest
     /// terms, because pivoting on a short row substitutes into fewer/smaller rows,
     /// so each pivot is O(small). OpenSMT (the 2025 Inc QF_LRA winner) uses this as
@@ -95,7 +109,7 @@ impl LraSolver {
             // Anti-cycling: smallest var index first (negated for the max-heap).
             return -f64::from(var);
         }
-        if shortest_poly_pivot_enabled() {
+        if use_shortest_poly_pivot(self.integer_mode, shortest_poly_pivot_enabled()) {
             if let Some(VarStatus::Basic(row_idx)) = self.vars[var as usize].status {
                 if let Some(row) = self.rows.get(row_idx) {
                     // fewest-terms-first; tiebreak toward smaller var index for determinism
@@ -205,5 +219,18 @@ impl LraSolver {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::use_shortest_poly_pivot;
+
+    #[test]
+    fn shortest_poly_is_lra_only_even_when_enabled_by_default() {
+        assert!(use_shortest_poly_pivot(false, true));
+        assert!(!use_shortest_poly_pivot(true, true));
+        assert!(!use_shortest_poly_pivot(false, false));
+        assert!(!use_shortest_poly_pivot(true, false));
     }
 }

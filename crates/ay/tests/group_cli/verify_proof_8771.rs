@@ -259,9 +259,9 @@ fn test_checker_rejects_nonderiving_proof() {
 
 /// An explicitly required checker is an authority gate, so a proof format the
 /// internal DIMACS checker cannot verify must fail before any public UNSAT
-/// surface is emitted. The proof file itself is diagnostic output and may
-/// remain, but neither result statistics nor a proof-artifact envelope may
-/// claim that the run was authorized.
+/// surface is emitted. The rejected same-run proof publication is retired
+/// (descriptor-invalidated), and neither result statistics nor a
+/// proof-artifact envelope may claim that the run was authorized.
 #[test]
 fn test_required_verification_precedes_unsat_stats_and_artifact() {
     let (cnf, drat, mut guard) = temp_paths("authority_order");
@@ -288,9 +288,12 @@ fn test_required_verification_precedes_unsat_stats_and_artifact() {
         Some(1),
         "unsupported mandatory verification must fail; stdout={stdout}; stderr={stderr}"
     );
+    // The failed authority gate retires the rejected same-run publication
+    // (descriptor-invalidated and quarantined), so no proof file may remain
+    // at the public path to be mistaken for an authorized artifact.
     assert!(
-        proof.exists(),
-        "the test must reach post-solve verification after emitting a proof"
+        !proof.exists(),
+        "failed authority gate must retire the rejected proof publication"
     );
     assert!(
         !stdout.contains("s UNSATISFIABLE"),

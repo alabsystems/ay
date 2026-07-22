@@ -23,17 +23,11 @@ use crate::proof_manager::{
 };
 use crate::ClauseTrace;
 use crate::ProofOutput;
-use ay_test_support::env::ScopedEnvVar;
+use ay_test_support::env::{lock_env, ScopedEnvVar};
 use sha2::{Digest, Sha256};
 
-/// Serialize FMLA-learned-LRAT env tests on the production module's own env
-/// lock — the SAME lock `fmla_runtime_ledger` holds while it reads these vars,
-/// so test mutation cannot race a production read. Individual mutations compose
-/// [`ScopedEnvVar`] (capture + restore-on-drop) under this held lock.
 fn lock_fmla_learned_lrat_env_test() -> std::sync::MutexGuard<'static, ()> {
-    crate::fmla_runtime_ledger::FMLA_LEARNED_LRAT_ENV_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock_env()
 }
 
 /// Add `n` original clauses to satisfy ProofManager's embedded ForwardChecker
@@ -1782,9 +1776,9 @@ fn test_fmla_learned_lrat_dry_run_artifact_export_runs_before_take_proof_writer(
     let artifact_path = dir
         .path()
         .join("fmla-learned-lrat-dry-run-proof-artifact.json");
-    let _dry_run_env = ScopedEnvVar::set(
+    let _dry_run = ScopedEnvVar::set(
         FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV,
-        artifact_path.to_str().expect("artifact path utf8"),
+        artifact_path.to_str().expect("temp path is UTF-8"),
     );
 
     let writer = solver
@@ -1828,9 +1822,9 @@ fn test_fmla_learned_lrat_dry_run_artifact_take_proof_writer_replaces_stale_arti
         .path()
         .join("fmla-learned-lrat-dry-run-proof-artifact.json");
     std::fs::write(&artifact_path, b"stale artifact").expect("seed stale artifact");
-    let _dry_run_env = ScopedEnvVar::set(
+    let _dry_run = ScopedEnvVar::set(
         FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV,
-        artifact_path.to_str().expect("artifact path utf8"),
+        artifact_path.to_str().expect("temp path is UTF-8"),
     );
 
     let writer = solver
@@ -2301,7 +2295,7 @@ fn test_fmla_fail_closed_learned_lrat_chain_final_solve_returns_unknown() {
 #[test]
 fn test_lrat_authority_fail_closed_replay_diagnostic_still_downgrades_unsat() {
     let _lock = lock_fmla_learned_lrat_env_test();
-    let _dry_run_env = ScopedEnvVar::unset(FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV);
+    let _dry_run = ScopedEnvVar::unset(FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV);
     let dir = tempfile::tempdir().expect("tempdir");
     let seed_proof = dir.path().join("seed-proof.out");
 
@@ -2323,13 +2317,13 @@ fn test_lrat_authority_fail_closed_replay_diagnostic_still_downgrades_unsat() {
         &sha256_hex(&seed_proof_bytes),
         false,
     );
-    let _replay_env = ScopedEnvVar::set(
+    let _replay = ScopedEnvVar::set(
         FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV,
-        replay.to_str().expect("replay path utf8"),
+        replay.to_str().expect("temp path is UTF-8"),
     );
-    let _proof_out_env = ScopedEnvVar::set(
+    let _proof_out = ScopedEnvVar::set(
         FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV,
-        proof_out.to_str().expect("proof out path utf8"),
+        proof_out.to_str().expect("temp path is UTF-8"),
     );
 
     let result = solve_latched_lrat_unit_contradiction_to_file(&proof_out);
@@ -2342,7 +2336,7 @@ fn test_lrat_authority_fail_closed_replay_diagnostic_still_downgrades_unsat() {
 #[test]
 fn test_lrat_authority_fail_closed_complete_verified_replay_admits_unsat() {
     let _lock = lock_fmla_learned_lrat_env_test();
-    let _dry_run_env = ScopedEnvVar::unset(FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV);
+    let _dry_run = ScopedEnvVar::unset(FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV);
     let dir = tempfile::tempdir().expect("tempdir");
     let seed_proof = dir.path().join("seed-proof.out");
 
@@ -2364,13 +2358,13 @@ fn test_lrat_authority_fail_closed_complete_verified_replay_admits_unsat() {
         &sha256_hex(&seed_proof_bytes),
         true,
     );
-    let _replay_env = ScopedEnvVar::set(
+    let _replay = ScopedEnvVar::set(
         FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV,
-        replay.to_str().expect("replay path utf8"),
+        replay.to_str().expect("temp path is UTF-8"),
     );
-    let _proof_out_env = ScopedEnvVar::set(
+    let _proof_out = ScopedEnvVar::set(
         FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV,
-        proof_out.to_str().expect("proof out path utf8"),
+        proof_out.to_str().expect("temp path is UTF-8"),
     );
 
     let result = solve_latched_lrat_unit_contradiction_to_file(&proof_out);

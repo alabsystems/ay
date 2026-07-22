@@ -2730,6 +2730,201 @@ fn dt_occurs_check_declines_non_occurrence_and_selectors() {
 }
 
 #[test]
+fn emits_dt_tester_exclusion_from_parsed() {
+    // bench `soundness_qf_dt_derived_terms/bug1_tester_excl_uf_app.smt2`:
+    //   (declare-datatype Enum ((c0) (c1) (c2)))
+    //   (assert ((_ is c0) (f x)))  (assert ((_ is c1) (f x)))
+    // Two DISTINCT testers on the SAME opaque term `(f x)` — mutual exclusion.
+    use ay_frontend::command::{Index as PIndex, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let tester = |c: &str, on: PTerm| {
+        PTerm::IndexedApp(
+            "is".to_string(),
+            vec![PIndex::Symbol(c.to_string())],
+            vec![on],
+        )
+    };
+    let decls: Vec<(String, Vec<String>)> = vec![(
+        "Enum".to_string(),
+        vec!["c0".to_string(), "c1".to_string(), "c2".to_string()],
+    )];
+    let fx = app("f", vec![sym("x")]);
+    let parsed = vec![tester("c0", fx.clone()), tester("c1", fx.clone())];
+    let lean = emit_dt_tester_exclusion_firewall_lean_from_parsed(&parsed, &decls)
+        .expect("two distinct testers on one term should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("firewall_combined_unsat"));
+    assert!(lean.contains("DtTesterExcl_"));
+    assert!(lean.contains("| k0 | k1 | k2"));
+    assert!(lean.contains(".k0 => true")); // isC_i selects c0
+    assert!(lean.contains(".k1 => true")); // isC_j selects c1
+
+    // SAME constructor on the same term is NOT a conflict — decline.
+    let same = vec![tester("c0", fx.clone()), tester("c0", fx.clone())];
+    assert!(emit_dt_tester_exclusion_firewall_lean_from_parsed(&same, &decls).is_none());
+
+    // Distinct testers on DIFFERENT terms are not jointly a conflict — decline.
+    let diff = vec![
+        tester("c0", app("f", vec![sym("x")])),
+        tester("c1", app("f", vec![sym("y")])),
+    ];
+    assert!(emit_dt_tester_exclusion_firewall_lean_from_parsed(&diff, &decls).is_none());
+
+    // Constructors from DIFFERENT datatypes never mutually exclude on one term —
+    // decline (fail-closed; also ill-typed, but the emitter must not rely on that).
+    let two_dt: Vec<(String, Vec<String>)> = vec![
+        ("A".to_string(), vec!["c0".to_string()]),
+        ("B".to_string(), vec!["c1".to_string()]),
+    ];
+    assert!(emit_dt_tester_exclusion_firewall_lean_from_parsed(&parsed, &two_dt).is_none());
+}
+
+#[test]
+fn emits_dt_exhaustiveness_from_parsed() {
+    // bench `qf_dt/v2l60078.cvc.smt2` core conflict: over `list` (2 ctors
+    // cons|null), `(not ((_ is cons) (cdr x4)))` AND `(not (= null (cdr x4)))` —
+    // a list value that is neither constructor. Buried in a nested `and` of noise.
+    use ay_frontend::command::Constant as PConst;
+    use ay_frontend::command::{Index as PIndex, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let not = |t: PTerm| app("not", vec![t]);
+    let tester = |c: &str, on: PTerm| {
+        PTerm::IndexedApp(
+            "is".to_string(),
+            vec![PIndex::Symbol(c.to_string())],
+            vec![on],
+        )
+    };
+    let decls: Vec<(String, Vec<String>)> = vec![
+        (
+            "nat".to_string(),
+            vec!["succ".to_string(), "zero".to_string()],
+        ),
+        (
+            "list".to_string(),
+            vec!["cons".to_string(), "null".to_string()],
+        ),
+        (
+            "tree".to_string(),
+            vec!["node".to_string(), "leaf".to_string()],
+        ),
+    ];
+    let cdr = app("cdr", vec![sym("x4")]);
+    // Nested `(and (and NOISE (not is-cons(cdr x4))) (not (= null (cdr x4))))`.
+    let noise = app("=", vec![app("node", vec![sym("x3")]), sym("x5")]);
+    let succ_noise = not(tester("succ", sym("zero")));
+    let parsed = vec![app(
+        "and",
+        vec![
+            app(
+                "and",
+                vec![
+                    app("and", vec![noise, succ_noise]),
+                    not(tester("cons", cdr.clone())),
+                ],
+            ),
+            not(app("=", vec![sym("null"), cdr.clone()])),
+        ],
+    )];
+    let lean = emit_dt_exhaustiveness_firewall_lean_from_parsed(&parsed, &decls)
+        .expect("2-ctor exhaustiveness conflict should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("firewall_combined_unsat"));
+    assert!(lean.contains("DtExhaust_"));
+    assert!(lean.contains("| k0 | k1"));
+    assert!(lean.contains("isC(T) ∨ T = D") || lean.contains("[1, 2]"));
+
+    // Reversed equality order `(not (= (cdr x4) null))` also matches.
+    let rev = vec![app(
+        "and",
+        vec![
+            not(tester("cons", cdr.clone())),
+            not(app("=", vec![cdr.clone(), sym("null")])),
+        ],
+    )];
+    assert!(emit_dt_exhaustiveness_firewall_lean_from_parsed(&rev, &decls).is_some());
+
+    // Datatype with >2 constructors is NOT exhausted by one neg-tester + one
+    // diseq — decline (fail-closed).
+    let three: Vec<(String, Vec<String>)> = vec![(
+        "list".to_string(),
+        vec!["cons".to_string(), "null".to_string(), "snoc".to_string()],
+    )];
+    assert!(emit_dt_exhaustiveness_firewall_lean_from_parsed(&parsed, &three).is_none());
+
+    // Missing the disequality conjunct — `¬is-cons(t)` alone is SAT — decline.
+    let only_tester = vec![not(tester("cons", cdr.clone()))];
+    assert!(emit_dt_exhaustiveness_firewall_lean_from_parsed(&only_tester, &decls).is_none());
+
+    // Disequality against a NON-nullary partner would be unsound; here `succ` is
+    // in `nat`, term mismatched — no valid pairing — decline. (Also silences the
+    // unused `PConst` import for numeral-free builds.)
+    let _ = PConst::Numeral("0".to_string());
+    let mismatch = vec![app(
+        "and",
+        vec![
+            not(tester("cons", cdr.clone())),
+            not(app("=", vec![sym("zero"), sym("other")])),
+        ],
+    )];
+    assert!(emit_dt_exhaustiveness_firewall_lean_from_parsed(&mismatch, &decls).is_none());
+}
+
+#[test]
+fn emits_dt_selector_over_ctor_from_parsed() {
+    // bench `datatype_simple.smt2`: `(= x (Some 0x2a))` + `(not (= (value x) 0x2a))`
+    // — the selector `value` over the matching constructor `Some` projects `0x2a`.
+    use ay_frontend::command::Constant as PConst;
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let k = PTerm::Const(PConst::Hexadecimal("000000000000002a".to_string()));
+    // ctor->selectors: Some has one field selector `value`; None is nullary.
+    let sels: Vec<(String, Vec<String>)> = vec![
+        ("None_Option_bv64".to_string(), vec![]),
+        ("Some_Option_bv64".to_string(), vec!["value".to_string()]),
+    ];
+    let bind = app(
+        "=",
+        vec![sym("x"), app("Some_Option_bv64", vec![k.clone()])],
+    );
+    let diseq = app(
+        "not",
+        vec![app("=", vec![app("value", vec![sym("x")]), k.clone()])],
+    );
+    let parsed = vec![bind.clone(), diseq.clone()];
+    let lean = emit_dt_selector_over_ctor_firewall_lean_from_parsed(&parsed, &sels)
+        .expect("selector-over-constructor conflict should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("firewall_combined_unsat"));
+    assert!(lean.contains("DtSelCtor_"));
+    assert!(lean.contains("def sel : D -> Int"));
+
+    // If the selector's projected value does NOT match the constructor argument
+    // (`(not (= (value x) 0x2b))` while `x = Some 0x2a`), it is not this identity
+    // conflict — decline (fail-closed; that would be a genuine BV disequality).
+    let other = PTerm::Const(PConst::Hexadecimal("000000000000002b".to_string()));
+    let diseq2 = app(
+        "not",
+        vec![app("=", vec![app("value", vec![sym("x")]), other])],
+    );
+    assert!(
+        emit_dt_selector_over_ctor_firewall_lean_from_parsed(&[bind.clone(), diseq2], &sels)
+            .is_none()
+    );
+
+    // A selector name that is NOT a field of the bound constructor — decline.
+    let wrong_sels: Vec<(String, Vec<String>)> =
+        vec![("Some_Option_bv64".to_string(), vec!["notvalue".to_string()])];
+    assert!(emit_dt_selector_over_ctor_firewall_lean_from_parsed(&parsed, &wrong_sels).is_none());
+
+    // Missing the constructor binding — `(value x) ≠ 0x2a` alone is SAT — decline.
+    assert!(emit_dt_selector_over_ctor_firewall_lean_from_parsed(&[diseq], &sels).is_none());
+}
+
+#[test]
 fn emits_dt_case_split_ite_from_parsed() {
     // boolean-ite-guard, bench `qf_dt_occurs_ite_ctor_eq_false_sat.smt2`:
     //   (= (cons F) (ite b F nil))  over  Lst = cons(tl:Lst) | nil.
@@ -2922,4 +3117,616 @@ fn dt_case_split_declines_unsound_shapes() {
         emit_dt_case_split_firewall_lean_from_parsed(&no_tester, &tree_ctors, &tree_decls)
             .is_none()
     );
+}
+
+#[test]
+fn emits_dt_enum_cardinality_from_parsed() {
+    // bench `soundness_qf_dt_derived_terms/bug3_enum_card_ite_distinct.smt2`:
+    //   (declare-datatypes ((Enum 0)) (((c0) (c1) (c2))))
+    //   (declare-fun f (Enum) Enum)
+    //   (assert (distinct (ite p v1 v2) (f a) a b))
+    // 4 distinct Enum terms over a 3-element enum — pigeonhole (4 > 3).
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    // symbol -> result sort: every distinct arg resolves to `Enum`.
+    let sym_sorts: Vec<(String, String)> = ["v1", "v2", "a", "b", "f"]
+        .iter()
+        .map(|n| (n.to_string(), "Enum".to_string()))
+        .collect();
+    let enum_datatypes: Vec<(String, usize)> = vec![("Enum".to_string(), 3)];
+    let parsed = vec![app(
+        "distinct",
+        vec![
+            app("ite", vec![sym("p"), sym("v1"), sym("v2")]),
+            app("f", vec![sym("a")]),
+            sym("a"),
+            sym("b"),
+        ],
+    )];
+    let lean =
+        emit_dt_enum_cardinality_firewall_lean_from_parsed(&parsed, &enum_datatypes, &sym_sorts)
+            .expect("4-distinct over a 3-enum should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("firewall_combined_unsat"));
+    assert!(lean.contains("DtEnumCard_"));
+    assert!(lean.contains("| k0 | k1 | k2"));
+    assert!(lean.contains("cases x0 <;> cases x1 <;> cases x2 <;> cases x3 <;> decide"));
+    // 4 opaque enum vars, 6 pairwise-equality atoms.
+    assert!(lean.contains("x3 : EnumK"));
+    assert!(lean.contains("[1, 2, 3, 4, 5, 6]"));
+
+    // Enough constructors (4 ≥ 4 args) is NOT a pigeonhole — decline.
+    let four_ctor: Vec<(String, usize)> = vec![("Enum".to_string(), 4)];
+    assert!(
+        emit_dt_enum_cardinality_firewall_lean_from_parsed(&parsed, &four_ctor, &sym_sorts)
+            .is_none()
+    );
+
+    // An argument whose sort does NOT resolve (unknown symbol) — decline
+    // (fail-closed; the common sort could not be pinned).
+    let missing_sorts: Vec<(String, String)> = vec![("a".to_string(), "Enum".to_string())];
+    assert!(emit_dt_enum_cardinality_firewall_lean_from_parsed(
+        &parsed,
+        &enum_datatypes,
+        &missing_sorts
+    )
+    .is_none());
+
+    // A non-enum sort (not in the finite-enum table) — decline.
+    let mixed_sorts: Vec<(String, String)> = ["v1", "v2", "a", "b", "f"]
+        .iter()
+        .map(|n| (n.to_string(), "Other".to_string()))
+        .collect();
+    assert!(emit_dt_enum_cardinality_firewall_lean_from_parsed(
+        &parsed,
+        &enum_datatypes,
+        &mixed_sorts
+    )
+    .is_none());
+}
+
+#[test]
+fn emits_dt_tester_casesplit_occurs_from_parsed() {
+    // bench `soundness_qf_dt_derived_terms/fuzz_dt_falsesat_800.smt2`:
+    //   (assert (= v7 (cons v11 (ite ((_ is none) v6)
+    //                                (ite v13 v8 (cons v11 v7))
+    //                                (ite v13 v8 v7)))))
+    //   (assert (not (and v13 true)))
+    // Assert-2 forces v13 = false, collapsing the inner ites to `(cons v11 v7)`
+    // and `v7`. Residual `v7 = cons v11 (ite (is-none v6) (cons v11 v7) v7)`:
+    // both branches occurs-check v7 (depth 2 then-branch, depth 1 else-branch).
+    use ay_frontend::command::{Constant as PConst, Index as PIndex, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let tester = |c: &str, on: PTerm| {
+        PTerm::IndexedApp(
+            "is".to_string(),
+            vec![PIndex::Symbol(c.to_string())],
+            vec![on],
+        )
+    };
+    let tru = PTerm::Const(PConst::True);
+    let ctors = vec![
+        "c0".to_string(),
+        "c1".to_string(),
+        "none".to_string(),
+        "some".to_string(),
+        "cons".to_string(),
+        "nil".to_string(),
+        "leaf".to_string(),
+        "node".to_string(),
+        "mkRec".to_string(),
+    ];
+    let inner_then = app(
+        "ite",
+        vec![
+            sym("v13"),
+            sym("v8"),
+            app("cons", vec![sym("v11"), sym("v7")]),
+        ],
+    );
+    let inner_else = app("ite", vec![sym("v13"), sym("v8"), sym("v7")]);
+    let rhs = app(
+        "cons",
+        vec![
+            sym("v11"),
+            app(
+                "ite",
+                vec![tester("none", sym("v6")), inner_then, inner_else],
+            ),
+        ],
+    );
+    let parsed = vec![
+        app("=", vec![sym("v7"), rhs]),
+        app("not", vec![app("and", vec![sym("v13"), tru])]),
+    ];
+    let lean = emit_dt_tester_casesplit_occurs_firewall_lean_from_parsed(&parsed, &ctors)
+        .expect("forced-unit + tester-guard both-occurs case split should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("import AySoundness.Datatype"));
+    assert!(lean.contains("firewall_combined_unsat"));
+    assert!(lean.contains("DtTesterCaseSplit_"));
+    assert!(lean.contains("cases hg : m.g"));
+    assert!(lean.contains("acyclic_conflict_generic"));
+    // then-branch depth 2, else-branch depth 1.
+    assert!(lean.contains("def ctxT (z : DtT) : DtT := DtT.wrap (DtT.wrap (z))"));
+    assert!(lean.contains("def ctxF (z : DtT) : DtT := DtT.wrap (z)"));
+
+    // WITHOUT the forcing unit assertion the inner ites do not collapse (a stray
+    // `ite v13 …` remains inside a branch), so the residual is NOT both-occurs —
+    // decline (fail-closed).
+    let no_force = vec![parsed[0].clone()];
+    assert!(emit_dt_tester_casesplit_occurs_firewall_lean_from_parsed(&no_force, &ctors).is_none());
+}
+
+#[test]
+fn emits_dt_tester_casesplit_mixed_from_parsed() {
+    // bench `soundness_fuzz_blitz/dt_residual/dt_residual_falsesat_2.smt2`:
+    //   (assert (= (ite ((_ is none) v6)
+    //                   (node (node v12 v3 (leaf v1)) (mkRec v14 v16) (ite false (leaf v2) v11))
+    //                   (ite (and false true) (ite v16 v12 v12) v11))
+    //              (node v11 (nv (ite false (leaf v1) v12)) (leaf v2))))
+    // All guards fold: `(ite false (leaf v2) v11) → v11`, `(and false true) → false`
+    // so the ELSE `(ite false … v11) → v11`, and `(nv (ite false … v12)) → nv v12`.
+    // Residual `(ite (is-none v6) THEN v11) = node(v11, nv v12, leaf v2)`, with
+    //   THEN = node(node(v12,·,leaf v1), mkRec.., v11):
+    //   * g = false (else): `v11 = node(v11, …)` → ACYCLICITY occurs-check (depth 1);
+    //   * g = true  (then): `THEN = node(v11, …)`; node_inj → node(v12,·,leaf v1)=v11
+    //     and v11=leaf v2 → node = leaf DISTINCTNESS. MIXED (a lemma per branch).
+    use ay_frontend::command::{Constant as PConst, Index as PIndex, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let tester = |c: &str, on: PTerm| {
+        PTerm::IndexedApp(
+            "is".to_string(),
+            vec![PIndex::Symbol(c.to_string())],
+            vec![on],
+        )
+    };
+    let fls = PTerm::Const(PConst::False);
+    let tru = PTerm::Const(PConst::True);
+    let ctors = vec![
+        "c0".to_string(),
+        "c1".to_string(),
+        "mkRec".to_string(),
+        "none".to_string(),
+        "some".to_string(),
+        "cons".to_string(),
+        "nil".to_string(),
+        "leaf".to_string(),
+        "node".to_string(),
+    ];
+    // Per-constructor recursive-field masks (`true` at a field of the datatype's
+    // own sort). `Tree`: leaf(lv Enum) → [false]; node(left Tree)(nv Rec)(right
+    // Tree) → [true,false,true].
+    let ctor_rec: Vec<(String, Vec<bool>)> = vec![
+        ("c0".to_string(), vec![]),
+        ("c1".to_string(), vec![]),
+        ("mkRec".to_string(), vec![false, false]),
+        ("none".to_string(), vec![]),
+        ("some".to_string(), vec![false]),
+        ("cons".to_string(), vec![false, true]),
+        ("nil".to_string(), vec![]),
+        ("leaf".to_string(), vec![false]),
+        ("node".to_string(), vec![true, false, true]),
+    ];
+    let then_branch = app(
+        "node",
+        vec![
+            app(
+                "node",
+                vec![sym("v12"), sym("v3"), app("leaf", vec![sym("v1")])],
+            ),
+            app("mkRec", vec![sym("v14"), sym("v16")]),
+            app(
+                "ite",
+                vec![fls.clone(), app("leaf", vec![sym("v2")]), sym("v11")],
+            ),
+        ],
+    );
+    let else_branch = app(
+        "ite",
+        vec![
+            app("and", vec![fls.clone(), tru.clone()]),
+            app("ite", vec![sym("v16"), sym("v12"), sym("v12")]),
+            sym("v11"),
+        ],
+    );
+    let lhs = app(
+        "ite",
+        vec![tester("none", sym("v6")), then_branch, else_branch],
+    );
+    let rhs = app(
+        "node",
+        vec![
+            sym("v11"),
+            app(
+                "nv",
+                vec![app(
+                    "ite",
+                    vec![fls.clone(), app("leaf", vec![sym("v1")]), sym("v12")],
+                )],
+            ),
+            app("leaf", vec![sym("v2")]),
+        ],
+    );
+    let parsed = vec![app("=", vec![lhs, rhs])];
+    let lean = emit_dt_tester_casesplit_mixed_firewall_lean_from_parsed(&parsed, &ctors, &ctor_rec)
+        .expect("mixed occurs+distinctness tester-guard case split should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("import AySoundness.Datatype"));
+    assert!(lean.contains("firewall_combined_unsat"));
+    assert!(lean.contains("DtTesterCaseSplitMixed_"));
+    assert!(lean.contains("cases hg : m.g"));
+    // else-branch: acyclicity occurs-check via the generic conflict.
+    assert!(lean.contains("acyclic_conflict_generic"));
+    assert!(lean
+        .contains("fun z => AySoundness.Datatype.Tree.node (z) (AySoundness.Datatype.Tree.leaf)"));
+    // then-branch: constructor distinctness via node_inj (+ node ≠ leaf).
+    assert!(lean.contains("AySoundness.Datatype.Tree.node_inj heq"));
+    // two datatype variables (v12 → t0, v11 → t1) plus the opaque guard.
+    assert!(lean.contains("t0 : AySoundness.Datatype.Tree"));
+    assert!(lean.contains("t1 : AySoundness.Datatype.Tree"));
+    assert!(!lean.contains("t2 : AySoundness.Datatype.Tree"));
+
+    // Reversed equality orientation still emits (the ite may be on either side).
+    let PTerm::App(_, eqa) = &parsed[0] else {
+        unreachable!()
+    };
+    let rev = vec![app("=", vec![eqa[1].clone(), eqa[0].clone()])];
+    assert!(
+        emit_dt_tester_casesplit_mixed_firewall_lean_from_parsed(&rev, &ctors, &ctor_rec).is_some()
+    );
+}
+
+#[test]
+fn declines_dt_tester_casesplit_mixed_selector_guarded() {
+    // bench `soundness_qf_dt_derived_terms/fuzz_ufdt_falsesat_881.smt2` (assert1):
+    //   (= v12 (node (right (ite v17 v12 (node v13 (mkRec v18 (gE v15)) v12)))
+    //                v5 (left (node v13 v5 v13))))
+    // The `ite` sits UNDER a `right(…)` selector (not at the top of a side), and
+    // the top-level shape is `v12 = node(…)` (a bare variable, not a tester-guarded
+    // `ite`). The selector blocks the binary-`Tree` abstraction → DECLINE (None),
+    // fail-closed (this residual needs a nested by_cases + distinct-with-duplicate
+    // reflexivity not covered by the occurs+distinct mixed render).
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let ctors = vec![
+        "mkRec".to_string(),
+        "leaf".to_string(),
+        "node".to_string(),
+        "none".to_string(),
+        "some".to_string(),
+    ];
+    let ctor_rec: Vec<(String, Vec<bool>)> = vec![
+        ("mkRec".to_string(), vec![false, false]),
+        ("leaf".to_string(), vec![false]),
+        ("node".to_string(), vec![true, false, true]),
+        ("none".to_string(), vec![]),
+        ("some".to_string(), vec![false]),
+    ];
+    let inner_node = app(
+        "node",
+        vec![
+            sym("v13"),
+            app("mkRec", vec![sym("v18"), app("gE", vec![sym("v15")])]),
+            sym("v12"),
+        ],
+    );
+    let rhs = app(
+        "node",
+        vec![
+            app(
+                "right",
+                vec![app("ite", vec![sym("v17"), sym("v12"), inner_node])],
+            ),
+            sym("v5"),
+            app(
+                "left",
+                vec![app("node", vec![sym("v13"), sym("v5"), sym("v13")])],
+            ),
+        ],
+    );
+    let _ = PConst::True;
+    let parsed = vec![app("=", vec![sym("v12"), rhs])];
+    assert!(
+        emit_dt_tester_casesplit_mixed_firewall_lean_from_parsed(&parsed, &ctors, &ctor_rec)
+            .is_none()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `str.at` / `seq.at` / `seq.nth` positional-read firewall emitters.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn emits_str_at_len_from_parsed_assertions() {
+    // str_at_len_symbolic_arrayselect_false_sat.smt2 /
+    // xt_strat_len_false_sat.smt2: (= (str.len (str.at t (select a i))) 3).
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+
+    let strat = app(
+        "str.at",
+        vec![sym("t"), app("select", vec![sym("a"), sym("i")])],
+    );
+    let parsed = vec![
+        app("=", vec![app("str.len", vec![strat]), num("3")]),
+        // red herring (irrelevant array assert)
+        app("=", vec![app("select", vec![sym("a"), num("5")]), num("3")]),
+    ];
+    let lean = emit_str_at_len_firewall_lean_from_parsed(&parsed)
+        .expect("str.at length conflict should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    for needle in [
+        "import AySoundness.StringThy",
+        "namespace AySoundness.Emitted.StrAtLen_",
+        "StrAt.strAt m.1 m.2",
+        "StrAt.strAt_len_eq_conflict m.1 m.2 3 (by decide)",
+        "firewall_combined_unsat",
+    ] {
+        assert!(lean.contains(needle), "emitted Lean missing: {needle}");
+    }
+
+    // N = 1 is within the (verified) bound — no conflict, decline.
+    let sat = vec![app(
+        "=",
+        vec![
+            app("str.len", vec![app("str.at", vec![sym("t"), num("0")])]),
+            num("1"),
+        ],
+    )];
+    assert!(emit_str_at_len_firewall_lean_from_parsed(&sat).is_none());
+}
+
+#[test]
+fn emits_seq_at_pinned_from_parsed_assertions() {
+    // qf_slia_seqat_symbolic_pinned_false_sat.smt2: s1=[3,-2,3], n0=1,
+    // (= (seq.unit 1) (seq.at s1 n0)) — read is -2, so 1 ≠ -2.
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let unit = |v: PTerm| app("seq.unit", vec![v]);
+
+    let parsed = vec![
+        app(
+            "=",
+            vec![
+                sym("s1"),
+                app(
+                    "seq.++",
+                    vec![unit(num("3")), unit(sym("-2")), unit(num("3"))],
+                ),
+            ],
+        ),
+        app("=", vec![sym("n0"), num("1")]),
+        app(
+            "=",
+            vec![unit(num("1")), app("seq.at", vec![sym("s1"), sym("n0")])],
+        ),
+        app("=", vec![sym("s0"), sym("s1")]),
+    ];
+    let lean = emit_seq_at_pinned_firewall_lean_from_parsed(&parsed)
+        .expect("ground seq.at value mismatch should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    for needle in [
+        "import AySoundness.SeqThy",
+        "namespace AySoundness.Emitted.SeqAtPinned_",
+        "SeqThy.unit (1 : Int)",
+        "SeqThy.seqAt (([3, -2, 3]) : SeqThy.Seq Int) 1",
+        "cases m <;> decide",
+        "firewall_combined_unsat",
+    ] {
+        assert!(lean.contains(needle), "emitted Lean missing: {needle}");
+    }
+
+    // Matching value (read == unit) is NOT a conflict — decline.
+    let sat = vec![
+        app(
+            "=",
+            vec![
+                sym("s1"),
+                app("seq.++", vec![unit(num("3")), unit(num("9"))]),
+            ],
+        ),
+        app("=", vec![sym("n0"), num("1")]),
+        app(
+            "=",
+            vec![unit(num("9")), app("seq.at", vec![sym("s1"), sym("n0")])],
+        ),
+    ];
+    assert!(emit_seq_at_pinned_firewall_lean_from_parsed(&sat).is_none());
+}
+
+#[test]
+fn emits_seq_suffixof_from_parsed_assertions() {
+    // seq_falsesat_suffixof_elem_mismatch.smt2: v1=[1], v2=[-1,-1],
+    // (seq.suffixof v2 (seq.++ v3 v1)) — [-1,-1] ends in -1, v3++[1] ends in 1.
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let unit = |v: &str| app("seq.unit", vec![sym(v)]);
+
+    let parsed = vec![
+        app("=", vec![sym("v1"), unit("1")]),
+        app(
+            "=",
+            vec![sym("v2"), app("seq.++", vec![unit("-1"), unit("-1")])],
+        ),
+        app(
+            "seq.suffixof",
+            vec![sym("v2"), app("seq.++", vec![sym("v3"), sym("v1")])],
+        ),
+    ];
+    let lean = emit_seq_suffixof_firewall_lean_from_parsed(&parsed)
+        .expect("seq.suffixof last-element mismatch should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    for needle in [
+        "import AySoundness.SeqThy",
+        "namespace AySoundness.Emitted.SeqSuffixof_",
+        "SeqThy.suffix_append_last_conflict",
+        "SeqThy.suffixOf (([-1, -1]) : List Int) (p ++ (([1]) : List Int))",
+        "theorem no_model (p : List Int)",
+        "(-1) (1) h",
+    ] {
+        assert!(lean.contains(needle), "emitted Lean missing: {needle}");
+    }
+
+    // Matching last element (a == b) is NOT a conflict — decline.
+    let sat = vec![
+        app("=", vec![sym("v1"), unit("1")]),
+        app(
+            "=",
+            vec![sym("v2"), app("seq.++", vec![unit("-1"), unit("1")])],
+        ),
+        app(
+            "seq.suffixof",
+            vec![sym("v2"), app("seq.++", vec![sym("v3"), sym("v1")])],
+        ),
+    ];
+    assert!(emit_seq_suffixof_firewall_lean_from_parsed(&sat).is_none());
+}
+
+#[test]
+fn emits_seq_nth_ground_lia_from_parsed_assertions() {
+    // seq_falsesat_nth_ground_eval.smt2: v2=[0], v10=0,
+    // (and (>= (- -3 4) (seq.nth v2 v10)) (not (<= v7 3))) — -7 >= 0 is false.
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+
+    let parsed = vec![
+        app("=", vec![sym("v2"), app("seq.unit", vec![num("0")])]),
+        app("=", vec![sym("v10"), num("0")]),
+        app(
+            "and",
+            vec![
+                app(
+                    ">=",
+                    vec![
+                        app("-", vec![sym("-3"), num("4")]),
+                        app("seq.nth", vec![sym("v2"), sym("v10")]),
+                    ],
+                ),
+                app("not", vec![app("<=", vec![sym("v7"), num("3")])]),
+            ],
+        ),
+    ];
+    let lean = emit_seq_nth_ground_lia_firewall_lean_from_parsed(&parsed)
+        .expect("ground seq.nth + LIA conflict should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    for needle in [
+        "import AySoundness.SeqThy",
+        "namespace AySoundness.Emitted.SeqNthLia_",
+        "SeqThy.nthD (([0]) : SeqThy.Seq Int) 0 (0 : Int)",
+        "(-7 : Int) ≥",
+        "firewall_combined_unsat",
+    ] {
+        assert!(lean.contains(needle), "emitted Lean missing: {needle}");
+    }
+
+    // A TRUE comparison (0 >= -7) is no conflict — decline.
+    let sat = vec![
+        app("=", vec![sym("v2"), app("seq.unit", vec![num("0")])]),
+        app("=", vec![sym("v10"), num("0")]),
+        app(
+            ">=",
+            vec![
+                app("seq.nth", vec![sym("v2"), sym("v10")]),
+                app("-", vec![sym("-3"), num("4")]),
+            ],
+        ),
+    ];
+    assert!(emit_seq_nth_ground_lia_firewall_lean_from_parsed(&sat).is_none());
+}
+
+#[test]
+fn emits_seq_at_ite_from_parsed_assertions() {
+    // seq_falsesat_iteofseq_eq_operand.smt2: v1=[false,false], v3=empty,
+    // (= (seq.at v1 0) (ite C (seq.unit true) (seq.++ v3 empty empty))).
+    use ay_frontend::command::{
+        Constant as PConst, QualifiedIdentifier, Sort as FSort, Term as PTerm,
+    };
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let fls = || PTerm::Const(PConst::False);
+    let tru = || PTerm::Const(PConst::True);
+    let unit = |v: PTerm| app("seq.unit", vec![v]);
+    let seq_bool = FSort::Parameterized("Seq".to_string(), vec![FSort::Simple("Bool".to_string())]);
+    let empty = || {
+        PTerm::QualifiedApp(
+            QualifiedIdentifier::Symbol("seq.empty".to_string()),
+            seq_bool.clone(),
+            vec![],
+        )
+    };
+
+    // Abstract OOB condition (never evaluated).
+    let cond = app("seq.nth", vec![unit(sym("v5")), sym("-3")]);
+    let parsed = vec![
+        app(
+            "=",
+            vec![sym("v1"), app("seq.++", vec![unit(fls()), unit(fls())])],
+        ),
+        app("=", vec![sym("v3"), empty()]),
+        app(
+            "=",
+            vec![
+                app("seq.at", vec![sym("v1"), num("0")]),
+                app(
+                    "ite",
+                    vec![
+                        cond,
+                        unit(tru()),
+                        app("seq.++", vec![sym("v3"), empty(), empty()]),
+                    ],
+                ),
+            ],
+        ),
+    ];
+    let lean = emit_seq_at_ite_firewall_lean_from_parsed(&parsed)
+        .expect("bounded seq.at-vs-ite conflict should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    for needle in [
+        "import AySoundness.SeqThy",
+        "namespace AySoundness.Emitted.SeqAtIte_",
+        "SeqThy.seqAt (([false, false]) : SeqThy.Seq Bool) 0",
+        "bif m then (([true]) : SeqThy.Seq Bool) else (([]) : SeqThy.Seq Bool)",
+        "cases m <;> decide",
+        "firewall_combined_unsat",
+    ] {
+        assert!(lean.contains(needle), "emitted Lean missing: {needle}");
+    }
+
+    // If the true branch MATCHES the read ([false]), a c=true model satisfies it
+    // — decline.
+    let sat = vec![
+        app(
+            "=",
+            vec![sym("v1"), app("seq.++", vec![unit(fls()), unit(fls())])],
+        ),
+        app("=", vec![sym("v3"), empty()]),
+        app(
+            "=",
+            vec![
+                app("seq.at", vec![sym("v1"), num("0")]),
+                app(
+                    "ite",
+                    vec![
+                        sym("c"),
+                        unit(fls()),
+                        app("seq.++", vec![sym("v3"), empty()]),
+                    ],
+                ),
+            ],
+        ),
+    ];
+    assert!(emit_seq_at_ite_firewall_lean_from_parsed(&sat).is_none());
 }

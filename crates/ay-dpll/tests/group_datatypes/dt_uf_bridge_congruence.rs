@@ -76,7 +76,7 @@ fn solve_capped(smt: &str, timeout: Duration) -> String {
 /// depth 3 and diverged at depth 4.
 #[test]
 fn inc_some_list_dual_vocab_obligation_is_unsat() {
-    let verdict = solve_capped(INC_SOME_LIST, Duration::from_secs(60));
+    let verdict = solve_capped(INC_SOME_LIST, Duration::from_mins(1));
     assert_eq!(
         verdict, "unsat",
         "the inc_some_list dual-vocabulary catamorphism obligation must refute \

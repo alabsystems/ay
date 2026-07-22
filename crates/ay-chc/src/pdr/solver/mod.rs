@@ -931,6 +931,12 @@ pub struct PdrSolver {
     /// same per-lemma SMT checks.
     pub(super) houdini_pruned_frame1_len: Option<usize>,
 
+    /// Total counterexample-guided candidate-repair rounds spent this solve
+    /// (#4751 L4). Each round is one strict per-rule verification; the
+    /// per-solve cap keeps repeated demotions in a long main loop from
+    /// turning into unbounded re-verification work.
+    pub(super) candidate_repair_rounds_used: usize,
+
     /// Invariants that failed entry-inductiveness but may pass after frame
     /// strengthening (#5970 deferred retry). Each entry:
     /// (predicate, formula, target_level, retry_count).

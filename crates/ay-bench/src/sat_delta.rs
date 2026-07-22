@@ -2733,6 +2733,12 @@ fn round3(value: f64) -> f64 {
 mod tests {
     use super::*;
 
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn test_resources() -> crate::resource::PlannedResources {
         crate::resource::PlannedResources::for_test(&crate::runner::repo_root_public(), 4096)
     }
@@ -3015,6 +3021,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn unsat_proof_validation_accepts_verified_stdout_with_comment_stderr() {
         let tmp = tempfile::tempdir().unwrap();
         let cnf = tmp.path().join("case.cnf");
@@ -3314,6 +3326,12 @@ c after
     }
 
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn ay_unsat_validation_invokes_external_checker() {
         let tmp = tempfile::tempdir().unwrap();
         let cnf = tmp.path().join("case.cnf");
@@ -3411,6 +3429,12 @@ c after
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn sat_delta_report_records_ay_model_and_proof_statuses() {
         let tmp = tempfile::tempdir().unwrap();
         let sat = tmp.path().join("sat.cnf");
@@ -3570,6 +3594,12 @@ esac
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn sat_delta_gives_ay_cleanup_grace_but_scores_after_budget_as_timeout() {
         let tmp = tempfile::tempdir().unwrap();
         let cnf = tmp.path().join("slow.cnf");
@@ -3657,6 +3687,12 @@ printf '{"mode":"dimacs-sat","result":"unknown","wall_time_ms":1100}\n' >&2
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn sat_delta_keeps_ay_env_and_stats_flag_off_reference_solvers() {
         let tmp = tempfile::tempdir().unwrap();
         let cnf = tmp.path().join("sat.cnf");
@@ -3863,6 +3899,12 @@ printf 's SATISFIABLE\n'
     }
 
     #[cfg(unix)]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn make_executable(path: &Path) {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3872,5 +3914,11 @@ printf 's SATISFIABLE\n'
     }
 
     #[cfg(not(unix))]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn make_executable(_path: &Path) {}
 }

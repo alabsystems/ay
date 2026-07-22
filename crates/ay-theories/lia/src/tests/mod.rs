@@ -16,5 +16,6 @@ mod core_solver;
 mod int_bounds_dirty;
 mod modular;
 mod perf_hot_loop;
+mod probe_quickxplain;
 mod rational;
 mod verification;

@@ -485,7 +485,7 @@ fn test_preprocess_preserves_launch_gate_subcommand() {
         "--launch-mode",
         "metadata-only",
         "--summary-json",
-        "/tmp/ay-hn-launch-gate-summary.json",
+        "/tmp/ay-release-gate-summary.json",
     ]);
 
     let processed = preprocess_args(raw.clone());

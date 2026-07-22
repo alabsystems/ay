@@ -1098,6 +1098,10 @@ fn submission_preflight_chc_baseline_compare_fast_proxy_requires_timeout() {
 #[test]
 #[cfg(unix)]
 fn submission_preflight_chc_baseline_compare_runs_same_timeout_evidence() {
+    // The compare harness takes a host-wide non-blocking oom-guard lease;
+    // serialize the two baseline-compare runs so they refuse concurrent
+    // sweeps (the guard's job) without refusing each other.
+    let _serial = chc_solver_smoke_guard();
     let temp = tempdir().expect("temp dir");
     let benchmark_root = temp.path().join("chc-bench");
     let baseline_path = temp.path().join("baseline.json");
@@ -1141,6 +1145,56 @@ fn submission_preflight_chc_baseline_compare_runs_same_timeout_evidence() {
     fs::set_permissions(&ay_stub, fs::Permissions::from_mode(0o755))
         .expect("chmod ay compare stub");
 
+    // The same-timeout gate also requires the baseline's recorded resource
+    // plan to match the current host's plan; that plan is host-specific, so
+    // harvest it from a first (non-comparable, expected-fail) compare run and
+    // embed it into the baseline before the gating run.
+    let probe = Command::new(env!("CARGO_BIN_EXE_ay"))
+        .args(["submission", "preflight", "chc-baseline-compare"])
+        .args(["--baseline"])
+        .arg(&baseline_path)
+        .args(["--bench-dir"])
+        .arg(&benchmark_root)
+        .args(["--ay"])
+        .arg(&ay_stub)
+        .args(["--output-dir"])
+        .arg(&output_dir)
+        .output()
+        .expect("run CHC baseline compare resource-plan probe");
+    assert!(
+        !probe.status.success(),
+        "compare without a recorded resource plan must be non-comparable and fail; stdout={} stderr={}",
+        String::from_utf8_lossy(&probe.stdout),
+        String::from_utf8_lossy(&probe.stderr)
+    );
+    let probe_payload: Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("chc-baseline-compare.json"))
+            .expect("probe evidence JSON"),
+    )
+    .expect("probe evidence JSON parses");
+    assert_eq!(
+        probe_payload["summary"]["non_comparable_baseline"], 1,
+        "probe run must fail solely on baseline comparability: {probe_payload}"
+    );
+    let resource_plan = probe_payload["resource_plan"].clone();
+    assert!(
+        resource_plan.is_object(),
+        "probe evidence must record the host resource plan: {probe_payload}"
+    );
+    let mut baseline: Value = serde_json::from_str(
+        &fs::read_to_string(&baseline_path).expect("read baseline for plan embedding"),
+    )
+    .expect("baseline JSON parses");
+    baseline["resource_plan"] = resource_plan;
+    fs::write(
+        &baseline_path,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&baseline).expect("serialize comparable baseline")
+        ),
+    )
+    .expect("rewrite baseline with host resource plan");
+
     let output = Command::new(env!("CARGO_BIN_EXE_ay"))
         .args(["submission", "preflight", "chc-baseline-compare"])
         .args(["--baseline"])
@@ -1175,6 +1229,9 @@ fn submission_preflight_chc_baseline_compare_runs_same_timeout_evidence() {
 #[test]
 #[cfg(unix)]
 fn submission_preflight_chc_baseline_compare_direct_regression_reports_fail() {
+    // See submission_preflight_chc_baseline_compare_runs_same_timeout_evidence:
+    // serialized against the shared host-wide oom-guard lease.
+    let _serial = chc_solver_smoke_guard();
     let temp = tempdir().expect("temp dir");
     let benchmark_root = temp.path().join("chc-bench");
     let baseline_path = temp.path().join("baseline.json");

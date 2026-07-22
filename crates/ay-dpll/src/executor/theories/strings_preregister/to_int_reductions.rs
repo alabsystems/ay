@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! Strings increment P3: `str.to_int` / `str.from_int` digit-string ↔ LIA
-//! coupling for NON-GROUND arguments (`AY_STR_P3=1`, default OFF).
+//! coupling for NON-GROUND arguments (default ON, `AY_STR_P3=0` kill switch).
 //!
 //! SMT-LIB semantics being encoded (the ONLY source of truth for every axiom
 //! below): `(str.to_int s)` returns the non-negative decimal value of `s`
@@ -43,13 +43,13 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-/// Strings increment P3 master switch (`AY_STR_P3=1`, default OFF).
+/// Strings increment P3 master switch (default ON, `AY_STR_P3=0` kill switch).
 ///
 /// Gates the eager NON-GROUND `str.to_int` / `str.from_int` digit-string
 /// reasoning package (range, all-digits ↔ non-negative, decimal magnitude ↔
 /// length coupling, `-1` propagation from non-digit witnesses, `from_int`
 /// canonical-form + roundtrip axioms), wired as one more escalation pass in
-/// `solve_strings_lia` after the P2 pass. Default OFF keeps the solve
+/// `solve_strings_lia` after the P2 pass. `AY_STR_P3=0` keeps the solve
 /// pipeline byte-identical to pre-P3 behavior. P3 is gated independently of
 /// `AY_STR_P2` (its escalation pass collects the P2 reduction package itself
 /// when the P2 gate is off — the substr length windows are what let LIA see

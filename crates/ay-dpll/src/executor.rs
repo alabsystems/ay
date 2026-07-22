@@ -88,6 +88,7 @@ mod model;
 pub(crate) mod optimization;
 mod partition_rescue;
 mod proof;
+mod proof_array_ext;
 mod proof_euf_lemma;
 mod proof_farkas;
 mod proof_original_rebuild;

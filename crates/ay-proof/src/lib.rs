@@ -70,14 +70,18 @@ pub use checker::recognize_ite_same;
 pub use checker::recognize_regex_intersect_empty;
 pub use checker::recognize_string_ground_eval;
 pub use checker::{check_proof, check_proof_collecting_trust, ProofCheckError};
-pub use checker::{recognize_array_select_store, recognize_array_theory_lemma};
+pub use checker::{
+    recognize_array_extensionality, recognize_array_select_store, recognize_array_theory_lemma,
+    ExtDiffRegistry,
+};
 pub use checker::{recognize_bool_tautology, recognize_bv_bitblast};
 pub use checker::{recognize_datatype_distinct, recognize_datatype_selector_project};
 pub use checker::{recognize_fp_classification, recognize_fp_classification_op};
 pub use partial::{check_proof_partial, PartialProofCheck};
 pub use quality::{
-    check_proof_partial_with_quality, check_proof_strict, check_proof_strict_with_datatypes,
-    check_proof_strict_with_datatypes_and_selectors, check_proof_with_quality, ProofQuality,
+    check_proof_partial_with_quality, check_proof_strict, check_proof_strict_with_context,
+    check_proof_strict_with_datatypes, check_proof_strict_with_datatypes_and_selectors,
+    check_proof_with_quality, validate_array_extensionality_provenance, ProofQuality,
 };
 pub use terminal_trust::{
     terminal_trust_report, terminal_trust_report_with_provenance, TerminalTrustReport,

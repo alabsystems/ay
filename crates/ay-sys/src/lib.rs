@@ -15,7 +15,7 @@
 //! system interfaces are isolated here behind safe public APIs.
 
 use std::alloc::{GlobalAlloc, Layout};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod fs;
 #[cfg(unix)]
 pub mod supervisor;

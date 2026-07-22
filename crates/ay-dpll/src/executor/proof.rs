@@ -360,6 +360,23 @@ impl Executor {
         // already discharge.
         self.split_shadowed_store_equality_lemmas(&mut proof);
 
+        // Array extensionality certification (#ext-diff-cert). The eager array
+        // lane INJECTS the Skolemized extensionality axiom
+        // `(= a b) ∨ ¬(= (select a k) (select b k))` as an assertion; being no
+        // problem premise, it ended up either demoted to `trust` or rejected at
+        // export as a non-problem `assume`, and the `--self-check` gate degraded
+        // the whole (correct) UNSAT to `unknown`.
+        //
+        // The clause is NOT a tautology, so it cannot simply be relabelled a
+        // theory lemma. This pass instead records the WITNESS PROVENANCE as
+        // proof content — an `array_ext_diff_intro` step binding `k` to the
+        // pair it was minted for — which `ay-proof` then independently checks
+        // (bound once, not self-referential, and FRESH against the problem's
+        // own symbols). MUST run last: it appends steps that must survive every
+        // prune, and matches the axiom in whichever shape the passes above left
+        // it. Fail-closed; see `proof_array_ext`.
+        self.promote_array_extensionality_axioms(&mut proof);
+
         // Proof validation (#4393): validates all non-Hole steps via partial
         // checker. Replaces the old check_proof + Hole-skip pattern that skipped
         // entire proofs when ANY Hole step was present.

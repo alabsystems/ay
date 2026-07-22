@@ -2811,7 +2811,7 @@ impl Executor {
         }
     }
 
-    /// W3 (`AY_STR_WITNESS=1`, default OFF): PER-VARIABLE retracting
+    /// W3 (default ON, `AY_STR_WITNESS=0` kill switch): PER-VARIABLE retracting
     /// completion, run only after BOTH all-or-nothing strategies were refuted.
     ///
     /// The pre-existing pass fills every gap variable, gate-checks ONCE, and on
@@ -2936,7 +2936,7 @@ impl Executor {
         if let Some(s) = self.derive_string_from_sat_true_equalities(model, var) {
             return Some(EvalValue::String(s));
         }
-        // (a2) W1 (`AY_STR_WITNESS=1`, default OFF): CONTENT-POSITIVE
+        // (a2) W1 (default ON, `AY_STR_WITNESS=0` kill switch): CONTENT-POSITIVE
         //      construction from the variable's `str.in_re` memberships as the
         //      SAT model assigns them. The uniform pad in (b) can only emit the
         //      pad letter, so a length-pinned + language-constrained variable is
@@ -3006,7 +3006,7 @@ impl Executor {
         None
     }
 
-    /// W1 (`AY_STR_WITNESS=1`, default OFF): construct `var`'s witness from the
+    /// W1 (default ON, `AY_STR_WITNESS=0` kill switch): construct `var`'s witness from the
     /// `str.in_re` memberships the SAT model assigns it, via the exact
     /// derivative search [`ay_strings::we_regex::find_witness`].
     ///

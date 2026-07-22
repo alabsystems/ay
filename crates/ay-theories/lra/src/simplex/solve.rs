@@ -75,6 +75,24 @@ impl LraSolver {
         let scale_iters = (self.rows.len() + self.vars.len()) * 200;
         let max_iters = std::cmp::min(base_iters + scale_iters, 10_000_000);
 
+        // Float-pivot layer (AY_LRA_FLOAT_LAYER, default OFF). A pure heuristic
+        // f64 basis oracle proposes a candidate basis that we certify EXACTLY in
+        // O(one basis solve); on any imprecision it returns None and we fall
+        // through to the unchanged exact simplex below. Only reached on the
+        // full-check path (never dual_simplex_propagate). Soundness is
+        // structural — see simplex::float_layer.
+        // SOUNDNESS (wrong-SAT fix): a pending trivial_conflict (a contradictory
+        // bound found before the loop) is consumed ONLY by
+        // dual_simplex_with_max_iters below. The float certified-SAT path must NOT
+        // short-circuit past it, or a genuine UNSAT would be reported SAT. Skip the
+        // float path when a trivial conflict is pending → fall through to the exact
+        // loop, which returns the correct Unsat.
+        if float_layer::float_layer_enabled() && self.trivial_conflict.is_none() {
+            if let Some(result) = self.try_float_certified_sat() {
+                return result;
+            }
+        }
+
         self.dual_simplex_with_max_iters(max_iters)
     }
 

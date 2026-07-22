@@ -3347,10 +3347,7 @@ fn emit_dt_distinct_disjunction(
                     continue;
                 }
                 // occurs: `x` must occur in `node(y,x)` (depth ≥ 1).
-                if occurs_ctor_depth(node_app, x, is_ctor)
-                    .filter(|d| *d >= 1)
-                    .is_none()
-                {
+                if occurs_ctor_depth(node_app, x, is_ctor).is_none_or(|depth| depth < 1) {
                     continue;
                 }
                 // tester: `((_ is nd) x)` asserted (x is node-headed) — the
@@ -3627,6 +3624,1469 @@ theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
     atomVal (by decide) (by decide) lemmas_valid (by decide)
 
 end AySoundness.Emitted.DtInjective_{hash}
+"#,
+    )
+}
+
+/// Flatten a (possibly nested) `(and a b …)` parsed term into its leaf
+/// conjuncts. A non-`and` term is its own single conjunct.
+fn flatten_dt_and<'a>(t: &'a PTerm, out: &mut Vec<&'a PTerm>) {
+    if let PTerm::App(op, args) = t {
+        if op == "and" {
+            for a in args {
+                flatten_dt_and(a, out);
+            }
+            return;
+        }
+    }
+    out.push(t);
+}
+
+/// Recognize a POSITIVE constructor tester `((_ is C) T)` and return `(C, T)`.
+fn parsed_positive_tester(t: &PTerm) -> Option<(&str, &PTerm)> {
+    let PTerm::IndexedApp(name, idx, args) = t else {
+        return None;
+    };
+    if name != "is" || idx.len() != 1 || args.len() != 1 {
+        return None;
+    }
+    let ctor = idx[0].as_symbol()?;
+    Some((ctor, &args[0]))
+}
+
+/// Recognize a NEGATIVE constructor tester `(not ((_ is C) T))` → `(C, T)`.
+fn parsed_neg_tester(t: &PTerm) -> Option<(&str, &PTerm)> {
+    let PTerm::App(op, args) = t else {
+        return None;
+    };
+    if op != "not" || args.len() != 1 {
+        return None;
+    }
+    parsed_positive_tester(&args[0])
+}
+
+/// Recognize a disequality against a bare constructor symbol,
+/// `(not (= D T))` / `(not (= T D))` with `is_ctor(D)`, and return `(D, T)`.
+fn parsed_neg_eq_ctor<'a>(
+    t: &'a PTerm,
+    is_ctor: &impl Fn(&str) -> bool,
+) -> Option<(&'a str, &'a PTerm)> {
+    let PTerm::App(op, args) = t else {
+        return None;
+    };
+    if op != "not" || args.len() != 1 {
+        return None;
+    }
+    let PTerm::App(eqop, ea) = &args[0] else {
+        return None;
+    };
+    if eqop != "=" || ea.len() != 2 {
+        return None;
+    }
+    for (ci, ti) in [(0usize, 1usize), (1, 0)] {
+        if let PTerm::Symbol(d) = &ea[ci] {
+            if is_ctor(d) {
+                return Some((d, &ea[ti]));
+            }
+        }
+    }
+    None
+}
+
+/// Emit a verified-firewall Lean proof for a DATATYPE TESTER MUTUAL-EXCLUSION
+/// refutation over the PARSED (frontend) assertions: two DISTINCT constructor
+/// testers `((_ is Cᵢ) T)` and `((_ is Cⱼ) T)` (`Cᵢ ≠ Cⱼ`) asserted POSITIVELY
+/// on the SAME syntactic term `T`. No value of a datatype is headed by two
+/// different constructors, so the pair is unsatisfiable — the generalization of
+/// `AySoundness.Datatype.tester_node_leaf_excl` from the concrete node/leaf pair
+/// to any two distinct constructors of one datatype, at any arity (`T` need not
+/// be a variable — `(f x)` is a single opaque datatype-sorted term; no UF
+/// congruence is involved).
+///
+/// `Cᵢ`, `Cⱼ` must be constructors of the SAME datatype in `decls` (the two
+/// testers are only well-typed on that datatype, so `T` is that datatype-sorted;
+/// the abstraction is faithful without any sort inference). The datatype is
+/// modeled as a genuine `N`-nullary-constructor inductive (fields collapsed —
+/// sound for tester head-tag reasoning, as nullary abstraction is to
+/// distinctness), the testers as `Bool`-valued matches, and the mutual exclusion
+/// discharged by `cases`/`decide` inside the theory-lemma validity obligation.
+/// EMISSION-ONLY; grounded through `AySoundness.firewall_combined_unsat`;
+/// axioms ⊆ {propext, Quot.sound}. Fail-closed (`None`) on any other shape.
+pub(crate) fn emit_dt_tester_exclusion_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    decls: &[(String, Vec<String>)],
+) -> Option<String> {
+    // Collect POSITIVE testers asserted at the top level.
+    let testers: Vec<(&str, &PTerm)> = parsed.iter().filter_map(parsed_positive_tester).collect();
+    // Datatype (name, ctors) owning a constructor.
+    let datatype_of = |ctor: &str| -> Option<&(String, Vec<String>)> {
+        decls.iter().find(|(_, cs)| cs.iter().any(|c| c == ctor))
+    };
+    for a in 0..testers.len() {
+        for b in (a + 1)..testers.len() {
+            let (ci, ti) = testers[a];
+            let (cj, tj) = testers[b];
+            if ci == cj || ti != tj {
+                continue;
+            }
+            // Both constructors must belong to the SAME datatype.
+            let Some((dti, ctors)) = datatype_of(ci) else {
+                continue;
+            };
+            let Some((dtj, _)) = datatype_of(cj) else {
+                continue;
+            };
+            if dti != dtj {
+                continue;
+            }
+            let (Some(i), Some(j)) = (
+                ctors.iter().position(|c| c == ci),
+                ctors.iter().position(|c| c == cj),
+            ) else {
+                continue;
+            };
+            let n = ctors.len();
+            if n < 2 || i == j {
+                continue;
+            }
+            return Some(render_dt_tester_exclusion_lean(
+                n,
+                i,
+                j,
+                fnv_hex(&format!("dttesterexcl:{dti}:{ci}:{cj}:{ti:?}")),
+            ));
+        }
+    }
+    None
+}
+
+/// Render the datatype tester mutual-exclusion refutation, grounded in the
+/// verified `firewall_combined_unsat`. The datatype is modeled as `n` nullary
+/// constructors `k0 … k{n-1}`; the two testers select `ki` / `kj`; the single
+/// lemma clause `[-1,-2]` (¬isCᵢ(T) ∨ ¬isCⱼ(T)) is validated by `cases` on the
+/// value.
+fn render_dt_tester_exclusion_lean(n: usize, i: usize, j: usize, hash: String) -> String {
+    let ctors = (0..n)
+        .map(|k| format!("k{k}"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — DATATYPE TESTER MUTUAL-EXCLUSION
+  conflict grounded in the verified `firewall_combined_unsat`. The assertions
+  `((_ is Cᵢ) T)` and `((_ is Cⱼ) T)` (Cᵢ ≠ Cⱼ, same datatype, same term T) are
+  unsatisfiable: every datatype value is headed by exactly ONE constructor, so no
+  `T` is simultaneously `Cᵢ`-headed and `Cⱼ`-headed. This is the generalization of
+  `AySoundness.Datatype.tester_node_leaf_excl` from the concrete node/leaf pair to
+  ANY two distinct constructors of one datatype; `T` is a single opaque
+  datatype-sorted term (`(f x)`, a variable, …) — no UF congruence is involved,
+  as both testers apply to the SAME syntactic term. Reconstructed from the
+  frontend parsed ASSERTIONS. Faithful abstraction: the datatype is modeled by an
+  `{n}`-nullary-constructor inductive (fields collapsed — sound for tester
+  head-tag reasoning, as nullary abstraction is to distinctness), the testers as
+  `Bool`-valued matches. Pure Lean 4 core; axioms ⊆ {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.DtTesterExcl_{hash}
+open AySoundness
+
+/-- The datatype abstracted to its `{n}` constructor head-tags (fields dropped). -/
+inductive DtE where
+  | {ctors}
+  deriving DecidableEq
+
+abbrev Val := DtE
+
+/-- Tester `((_ is Cᵢ) ·)` as ay lowers it: `true` on the i-th head, else `false`. -/
+def isC_i (x : DtE) : Bool := match x with | .k{i} => true | _ => false
+/-- Tester `((_ is Cⱼ) ·)`: `true` on the j-th head, else `false`. -/
+def isC_j (x : DtE) : Bool := match x with | .k{j} => true | _ => false
+
+/-- Atoms: `1 ↦ isCᵢ(T)`, `2 ↦ isCⱼ(T)`. -/
+def atomVal (m : Val) : Nat → Bool
+  | 1 => isC_i m
+  | 2 => isC_j m
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1]), (2, [2])]
+def lemmas   : List (Cid × Clause) := [(3, [-1, -2])]
+def proof    : List (Cid × Clause × List Int) := [(4, [], [1, 2, 3])]
+
+/-- **Tester mutual-exclusion validity** — the firewall's premise (b): no value
+    is headed by both `Cᵢ` and `Cⱼ`, so `¬isCᵢ(T) ∨ ¬isCⱼ(T)` holds in every
+    model. `cases` on the head-tag closes each leaf by `decide`. -/
+theorem lemma_valid :
+    ∀ c ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) c = true := by
+  intro c hc m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hc
+  subst hc
+  cases m <;> decide
+
+/-- `isCᵢ(T) ∧ isCⱼ(T)` (Cᵢ ≠ Cⱼ) is unsatisfiable — via the verified firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemma_valid (by decide)
+
+end AySoundness.Emitted.DtTesterExcl_{hash}
+"#,
+    )
+}
+
+/// Emit a verified-firewall Lean proof for a DATATYPE EXHAUSTIVENESS (2-ctor
+/// case-completeness) refutation over the PARSED (frontend) assertions: a
+/// NEGATIVE tester `(not ((_ is C) T))` together with a disequality
+/// `(not (= D T))` / `(not (= T D))`, where `C` and `D` are the ONLY TWO
+/// constructors of one datatype and `D` is nullary. A value that is neither
+/// `C`-headed nor equal to `D` cannot exist (the datatype has exactly those two
+/// constructors) — the exhaustiveness dual of the enum-cardinality pigeonhole.
+/// The relevant conjuncts are extracted from a flattened top-level `(and …)`
+/// (the rest of the conjunction is sat/tautological noise).
+///
+/// `C`, `D` come from `decls` (the tester and the nullary-constructor equality
+/// are only well-typed on that datatype, so `T` is that datatype-sorted; the
+/// abstraction is faithful without any sort inference). The datatype is modeled
+/// as a genuine 2-nullary-constructor inductive; exhaustiveness (`isC(T) ∨
+/// T = D`) is discharged by `cases` inside the theory-lemma validity obligation.
+/// EMISSION-ONLY; grounded through `AySoundness.firewall_combined_unsat`;
+/// axioms ⊆ {propext, Quot.sound}. Fail-closed (`None`) on any other shape.
+pub(crate) fn emit_dt_exhaustiveness_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    decls: &[(String, Vec<String>)],
+) -> Option<String> {
+    let is_ctor = |name: &str| decls.iter().any(|(_, cs)| cs.iter().any(|c| c == name));
+    let datatype_of = |ctor: &str| -> Option<&(String, Vec<String>)> {
+        decls.iter().find(|(_, cs)| cs.iter().any(|c| c == ctor))
+    };
+    // Flatten every top-level assertion's `and` structure into one conjunct pool.
+    let mut conjs: Vec<&PTerm> = Vec::new();
+    for a in parsed {
+        flatten_dt_and(a, &mut conjs);
+    }
+    for tc in &conjs {
+        let Some((c, tt)) = parsed_neg_tester(tc) else {
+            continue;
+        };
+        for dc in &conjs {
+            let Some((d, td)) = parsed_neg_eq_ctor(dc, &is_ctor) else {
+                continue;
+            };
+            // Same term, distinct constructors of a datatype with EXACTLY {C, D}.
+            if c == d || tt != td {
+                continue;
+            }
+            let Some((dtc, ctors)) = datatype_of(c) else {
+                continue;
+            };
+            if ctors.len() != 2 || !ctors.iter().any(|x| x == d) {
+                continue;
+            }
+            return Some(render_dt_exhaustiveness_lean(fnv_hex(&format!(
+                "dtexhaust:{dtc}:{c}:{d}:{tt:?}"
+            ))));
+        }
+    }
+    None
+}
+
+/// Render the 2-constructor exhaustiveness refutation, grounded in the verified
+/// `firewall_combined_unsat`. The datatype is modeled as `k0` (the tested
+/// constructor `C`) and `k1` (the nullary partner `D`); the single lemma clause
+/// `[1,2]` (isC(T) ∨ T = D) is validated by `cases` on the value.
+fn render_dt_exhaustiveness_lean(hash: String) -> String {
+    format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — DATATYPE EXHAUSTIVENESS (2-constructor
+  case-completeness) conflict grounded in the verified `firewall_combined_unsat`.
+  The assertions `(not ((_ is C) T))` and `(not (= D T))` are unsatisfiable when
+  `C` and `D` are the ONLY two constructors of `T`'s datatype: a value that is
+  neither `C`-headed nor `D` cannot exist. This is the exhaustiveness dual of the
+  enum-cardinality pigeonhole (`cases <;> …` over a finite constructor set), the
+  case-completeness rather than the too-many-distinct direction. Reconstructed
+  from the frontend parsed ASSERTIONS (the relevant two conjuncts extracted from a
+  flattened top-level `and`; the rest is sat/tautological noise). Faithful
+  abstraction: the datatype is modeled by a 2-nullary-constructor inductive
+  (`k0 = C`, `k1 = D`; `C`'s fields dropped — sound for head-tag reasoning), the
+  tester as a `Bool`-valued match. Pure Lean 4 core; axioms ⊆ {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.DtExhaust_{hash}
+open AySoundness
+
+/-- The datatype abstracted to its two constructor head-tags (`k0 = C`, `k1 = D`,
+    fields dropped). -/
+inductive DtL where
+  | k0 | k1
+  deriving DecidableEq
+
+abbrev Val := DtL
+
+/-- Tester `((_ is C) ·)` as ay lowers it: `true` on `k0` (= `C`), else `false`. -/
+def isC (x : DtL) : Bool := match x with | .k0 => true | _ => false
+
+/-- Atoms: `1 ↦ isC(T)`, `2 ↦ (T = D)` (`D = k1`). -/
+def atomVal (m : Val) : Nat → Bool
+  | 1 => isC m
+  | 2 => decide (m = DtL.k1)
+  | _ => false
+
+-- `¬isC(T)` → clause `[-1]`;  `T ≠ D` → clause `[-2]`.
+def original : List (Cid × Clause) := [(1, [-1]), (2, [-2])]
+-- exhaustiveness: `isC(T) ∨ T = D`.
+def lemmas   : List (Cid × Clause) := [(3, [1, 2])]
+def proof    : List (Cid × Clause × List Int) := [(4, [], [1, 2, 3])]
+
+/-- **Exhaustiveness validity** — the firewall's premise (b): every value of a
+    two-constructor datatype is `C`-headed or equals `D`, so `isC(T) ∨ T = D`
+    holds in every model. `cases` on the value closes each leaf by `decide`. -/
+theorem lemma_valid :
+    ∀ c ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) c = true := by
+  intro c hc m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hc
+  subst hc
+  cases m <;> decide
+
+/-- `¬isC(T) ∧ T ≠ D` (with `{{C, D}}` the whole datatype) is unsatisfiable — via
+    the verified firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemma_valid (by decide)
+
+end AySoundness.Emitted.DtExhaust_{hash}
+"#,
+    )
+}
+
+/// Emit a verified-firewall Lean proof for a DATATYPE SELECTOR-OVER-OWN-
+/// CONSTRUCTOR refutation over the PARSED (frontend) assertions: an equality
+/// `(= X (C a₀ … a_{n-1}))` binding a variable to a constructor application,
+/// together with a disequality `(not (= (sᵢ X) v))` where `sᵢ` is `C`'s i-th
+/// field selector and `aᵢ` (the constructor's i-th argument) is syntactically
+/// `v`. The selector-over-matching-constructor axiom gives `sᵢ X = sᵢ (C …) = aᵢ
+/// = v`, contradicting `sᵢ X ≠ v`.
+///
+/// This is the shape of `benchmarks/smt/datatype_simple.smt2`
+/// (`x = Some(0x2a)`, `value(x) ≠ 0x2a`). The proof-step-driven `DtSel`
+/// projection emitter does not fire (the executor routes the residual through a
+/// BV-constant compare, not a `DtSelector` theory lemma), so reconstruct from the
+/// frontend assertions like the selector-congruence / injectivity emitters.
+///
+/// `C` and its selectors come from `ctor_selectors`; the field is abstracted to
+/// `Int` (the projection identity `sel (mk a) = a` is field-sort-independent, as
+/// in the injectivity emitter). EMISSION-ONLY; grounded through
+/// `AySoundness.firewall_combined_unsat`; axioms ⊆ {propext, Quot.sound}.
+/// Fail-closed (`None`) on any other shape.
+pub(crate) fn emit_dt_selector_over_ctor_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    ctor_selectors: &[(String, Vec<String>)],
+) -> Option<String> {
+    let selectors_of = |ctor: &str| -> Option<&Vec<String>> {
+        ctor_selectors
+            .iter()
+            .find(|(c, _)| c == ctor)
+            .map(|(_, s)| s)
+    };
+    for a in parsed {
+        // A: `(= X (C args))` with `X` a variable and `C` a known constructor.
+        let PTerm::App(eqop, ea) = a else {
+            continue;
+        };
+        if eqop != "=" || ea.len() != 2 {
+            continue;
+        }
+        for (xi, ci) in [(0usize, 1usize), (1, 0)] {
+            let PTerm::Symbol(x) = &ea[xi] else {
+                continue;
+            };
+            let PTerm::App(c, cargs) = &ea[ci] else {
+                continue;
+            };
+            let Some(sels) = selectors_of(c) else {
+                continue;
+            };
+            if sels.is_empty() || sels.len() != cargs.len() {
+                continue;
+            }
+            // B: `(not (= (sᵢ X) v))` with `sᵢ` = C's field-i selector, `aᵢ` = v.
+            for b in parsed {
+                let PTerm::App(nop, nargs) = b else {
+                    continue;
+                };
+                if nop != "not" || nargs.len() != 1 {
+                    continue;
+                }
+                let PTerm::App(beq, ba) = &nargs[0] else {
+                    continue;
+                };
+                if beq != "=" || ba.len() != 2 {
+                    continue;
+                }
+                for (si, vi) in [(0usize, 1usize), (1, 0)] {
+                    let PTerm::App(s, sargs) = &ba[si] else {
+                        continue;
+                    };
+                    if sargs.len() != 1 {
+                        continue;
+                    }
+                    let PTerm::Symbol(sx) = &sargs[0] else {
+                        continue;
+                    };
+                    if sx != x {
+                        continue;
+                    }
+                    let Some(idx) = sels.iter().position(|se| se == s) else {
+                        continue;
+                    };
+                    if cargs[idx] != ba[vi] {
+                        continue;
+                    }
+                    return Some(render_dt_selector_over_ctor_lean(fnv_hex(&format!(
+                        "dtselctor:{c}:{s}:{x}:{:?}",
+                        cargs[idx]
+                    ))));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Render the datatype selector-over-own-constructor refutation, grounded in the
+/// verified `firewall_combined_unsat`. The datatype is modeled as a single-field
+/// constructor `mk : Int → D` with projection `sel`; the lemma `[-1,2]`
+/// (`X = mk a → sel X = a`) discharges the selector-over-matching-constructor
+/// axiom, closed by `by_cases` on the constructor equality.
+fn render_dt_selector_over_ctor_lean(hash: String) -> String {
+    format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — DATATYPE SELECTOR-OVER-OWN-CONSTRUCTOR
+  conflict grounded in the verified `firewall_combined_unsat`. The assertions
+  `X = C(… aᵢ …)` and `sᵢ X ≠ aᵢ` are unsatisfiable: the selector of a
+  constructor over that same constructor projects its own argument, so
+  `sᵢ X = sᵢ (C …) = aᵢ`. Reconstructed from the frontend parsed ASSERTIONS
+  (ay routes the residual through a BV/constant compare, so the proof-step `DtSel`
+  projection emitter does not fire). Faithful abstraction: the datatype is modeled
+  by a single-field constructor `mk : Int → D` with projection `sel` (the
+  projected field abstracted to `Int` and the sibling fields dropped — sound for
+  single-field projection, as in the injectivity emitter). Pure Lean 4 core;
+  axioms ⊆ {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.DtSelCtor_{hash}
+open AySoundness
+
+/-- The datatype abstracted to the projected field: one single-field constructor
+    `mk` carrying the field value (`Int`), sibling fields dropped. -/
+inductive D where
+  | mk : Int -> D
+  deriving DecidableEq
+
+/-- The field-`i` selector as ay lowers it: it projects `mk`'s argument. -/
+def sel : D -> Int | .mk a => a
+
+/-- Theory model: the datatype value `X` and the field value `a` (= `aᵢ` = `v`). -/
+structure Val where
+  x : D
+  a : Int
+
+/-- Atoms: `1 ↦ (X = mk a)` (the ctor binding), `2 ↦ (sel X = a)`. -/
+def atomVal (m : Val) : Nat -> Bool
+  | 1 => decide (m.x = D.mk m.a)
+  | 2 => decide (sel m.x = m.a)
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1]), (2, [-2])]
+def lemmas   : List (Cid × Clause) := [(3, [-1, 2])]
+def proof    : List (Cid × Clause × List Int) := [(4, [], [1, 2, 3])]
+
+/-- **Selector-over-constructor validity** — the firewall's premise (b):
+    `X = mk a → sel X = a`. `by_cases` on the constructor equality; the positive
+    branch reduces `sel (mk a) = a` by the selector definition. -/
+theorem sel_lemma_valid (m : Val) : clauseSat (atomVal m) [-1, 2] = true := by
+  by_cases h : m.x = D.mk m.a
+  · simp [clauseSat, litSat, atomVal, sel, h]
+  · simp [clauseSat, litSat, atomVal, h]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact sel_lemma_valid m
+
+/-- `X = C(… aᵢ …) ∧ sᵢ X ≠ aᵢ` is unsatisfiable — via the verified firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.DtSelCtor_{hash}
+"#,
+    )
+}
+
+/// Resolve the (result) sort simple-name of a `distinct` argument, using the
+/// declared symbol→sort table. `ite` inherits its branch sort; a function /
+/// constructor application takes the head's result sort; a bare symbol is a
+/// declared constant/nullary-constructor. `None` (fail-closed) when unresolved.
+fn enum_arg_sort(t: &PTerm, sym_sorts: &[(String, String)]) -> Option<String> {
+    let lookup = |name: &str| -> Option<String> {
+        sym_sorts
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, s)| s.clone())
+    };
+    match t {
+        PTerm::Symbol(s) => lookup(s),
+        PTerm::App(op, args) if op == "ite" && args.len() == 3 => {
+            enum_arg_sort(&args[1], sym_sorts).or_else(|| enum_arg_sort(&args[2], sym_sorts))
+        }
+        PTerm::App(head, _) => lookup(head),
+        _ => None,
+    }
+}
+
+/// Emit a verified-firewall Lean proof for a DATATYPE ENUM-CARDINALITY
+/// (pigeonhole) refutation over the PARSED (frontend) assertions: a
+/// `(distinct T₀ … T_{n-1})` whose `n` arguments all inhabit a FINITE ENUM
+/// datatype `D` (every constructor nullary) with only `k < n` constructors. By
+/// pigeonhole, `n` values of a `k`-element type cannot be pairwise distinct, so
+/// the assertion is unsatisfiable. The `n` derived Enum terms are abstracted to
+/// `n` OPAQUE enum variables — any UF application `(f a)`, `ite`, or variable is
+/// just an unknown element of `D` — and the pigeonhole is discharged by finite
+/// case analysis (`cases … <;> decide`) inside the theory-lemma validity
+/// obligation.
+///
+/// `sym_sorts` maps each declared symbol to its result-sort name (so the common
+/// sort of the `distinct` arguments is resolved without a full sort checker;
+/// `distinct` is well-typed, so all arguments share one sort — every argument is
+/// required to resolve to the SAME `D`, fail-closed otherwise). `enum_datatypes`
+/// lists exactly the finite-enum datatypes (all-nullary constructors) with their
+/// constructor count `k`, computed by the caller from the datatype registry.
+/// EMISSION-ONLY; grounded through `AySoundness.firewall_combined_unsat`; axioms
+/// ⊆ {propext, Quot.sound}. Fail-closed (`None`) on any other shape.
+pub(crate) fn emit_dt_enum_cardinality_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    enum_datatypes: &[(String, usize)],
+    sym_sorts: &[(String, String)],
+) -> Option<String> {
+    // Flatten top-level `and` structure so a `distinct` buried in a conjunction
+    // (sat/tautological noise around it) is still found.
+    let mut conjs: Vec<&PTerm> = Vec::new();
+    for a in parsed {
+        flatten_dt_and(a, &mut conjs);
+    }
+    for c in &conjs {
+        let PTerm::App(op, args) = c else {
+            continue;
+        };
+        if op != "distinct" || args.len() < 2 {
+            continue;
+        }
+        let n = args.len();
+        // Bound the enumeration (k^n leaves in the pigeonhole `cases`): keep the
+        // certificate small and fast to kernel-check. These are diagnostics.
+        if n > 6 {
+            continue;
+        }
+        // Every argument must resolve to the SAME datatype sort `D`.
+        let mut common: Option<String> = None;
+        let mut resolved = true;
+        for arg in args {
+            match enum_arg_sort(arg, sym_sorts) {
+                Some(s) => match &common {
+                    Some(prev) if prev != &s => {
+                        resolved = false;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => common = Some(s),
+                },
+                None => {
+                    resolved = false;
+                    break;
+                }
+            }
+        }
+        if !resolved {
+            continue;
+        }
+        let Some(d) = common else {
+            continue;
+        };
+        // `D` must be a finite enum (all-nullary constructors) with `k < n`.
+        let Some((_, k)) = enum_datatypes.iter().find(|(name, _)| name == &d) else {
+            continue;
+        };
+        let k = *k;
+        if k == 0 || n <= k {
+            continue;
+        }
+        return Some(render_enum_cardinality_lean(
+            n,
+            k,
+            fnv_hex(&format!("dtenumcard:{c:?}:{d}:{n}:{k}")),
+        ));
+    }
+    None
+}
+
+/// Render the enum-cardinality pigeonhole refutation, grounded in the verified
+/// `firewall_combined_unsat`. `n` opaque enum variables over a `k`-nullary-
+/// constructor inductive (`k < n`); each of the `P = n·(n-1)/2` atoms is a
+/// pairwise equality `xᵢ = xⱼ`; the `distinct` asserts every atom FALSE
+/// (`original` = `P` unit clauses `[-a]`), and the single pigeonhole lemma
+/// clause `[1 … P]` (some pair is equal) is validated by exhaustive `cases`.
+fn render_enum_cardinality_lean(n: usize, k: usize, hash: String) -> String {
+    // Constructor list `k0 | k1 | … | k{k-1}`.
+    let ctors = (0..k)
+        .map(|i| format!("k{i}"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    // Structure fields `x0 … x{n-1}`.
+    let fields = (0..n)
+        .map(|i| format!("  x{i} : EnumK"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Pair list in atom order (i < j), 1-based atom index.
+    let pairs: Vec<(usize, usize)> = (0..n)
+        .flat_map(|i| ((i + 1)..n).map(move |j| (i, j)))
+        .collect();
+    let p = pairs.len();
+    // atomVal match arms.
+    let arms = pairs
+        .iter()
+        .enumerate()
+        .map(|(a, (i, j))| format!("  | {} => decide (m.x{i} = m.x{j})", a + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // original: P unit clauses [-a].
+    let original = (1..=p)
+        .map(|a| format!("({a}, [-{a}])"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // lemma clause [1 … P].
+    let lemma_lits = (1..=p)
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // proof hints: all P original cids + the lemma cid.
+    let proof_hints = (1..=(p + 1))
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    // rcases binder `⟨x0, …, x{n-1}⟩` and the `cases … <;>` chain.
+    let binder = (0..n)
+        .map(|i| format!("x{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cases_chain = (0..n)
+        .map(|i| format!("cases x{i}"))
+        .collect::<Vec<_>>()
+        .join(" <;> ");
+    format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — DATATYPE ENUM-CARDINALITY (pigeonhole)
+  conflict grounded in the verified `firewall_combined_unsat`. The assertion
+  `(distinct T₀ … T_{{{nm1}}})` over {n} terms of a FINITE ENUM datatype with only
+  {k} (< {n}) constructors is unsatisfiable: by pigeonhole, {n} values of a
+  {k}-element type cannot be pairwise distinct. The {n} derived Enum terms — any
+  mix of variables, `ite`s and UF applications like `(f a)` — are abstracted to
+  {n} OPAQUE enum variables (each is simply an unknown element of the enum; UF is
+  projected away, no congruence involved). Faithful abstraction: the datatype is
+  modeled by a genuine `{k}`-nullary-constructor inductive (fields collapsed —
+  sound for cardinality reasoning, as nullary abstraction is to distinctness), and
+  the pigeonhole is discharged by exhaustive finite `cases` (`{kn}` leaves).
+  Reconstructed from the frontend parsed ASSERTIONS. Pure Lean 4 core; axioms ⊆
+  {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.DtEnumCard_{hash}
+open AySoundness
+
+/-- The finite enum abstracted to its {k} constructor head-tags (fields dropped). -/
+inductive EnumK where
+  | {ctors}
+  deriving DecidableEq
+
+/-- Theory model: the {n} opaque enum values the `distinct` compares. -/
+structure Val where
+{fields}
+
+/-- Atoms `1 … {p}` — the pairwise equalities `xᵢ = xⱼ` (`i < j`). -/
+def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+{arms}
+  | _ => false
+
+/-- `distinct` asserts every pairwise equality FALSE: {p} unit clauses `[-a]`. -/
+def original : List (Cid × Clause) := [{original}]
+/-- Pigeonhole lemma: at least one pair is equal — `[1 … {p}]`. -/
+def lemmas   : List (Cid × Clause) := [({lemma_cid}, [{lemma_lits}])]
+def proof    : List (Cid × Clause × List Int) := [({proof_cid}, [], [{proof_hints}])]
+
+/-- **Pigeonhole validity** — the firewall's premise (b): among {n} values of a
+    {k}-element enum, some two are equal, so `⋁ᵢ<ⱼ (xᵢ = xⱼ)` holds in every
+    model. Exhaustive `cases` over the {n} enum fields; each of the {kn} leaves is
+    closed by `decide` (some pair collides). -/
+theorem card_lemma_valid (m : Val) : clauseSat (atomVal m) [{lemma_lits}] = true := by
+  rcases m with ⟨{binder}⟩
+  {cases_chain} <;> decide
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact card_lemma_valid m
+
+/-- `(distinct …)` over {n} values of a {k}-element enum is unsatisfiable — via
+    the verified firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.DtEnumCard_{hash}
+"#,
+        nm1 = n - 1,
+        kn = format!("{k}^{n}"),
+        lemma_cid = p + 1,
+        proof_cid = p + 2,
+    )
+}
+
+/// A sound, UNCONDITIONAL boolean+datatype constant-fold that ALSO substitutes a
+/// map of FORCED Boolean units (`env`, derived only from sibling unit
+/// assertions) into `ite`/`and`/`or`/`not` guards. Substituting an entailed unit
+/// preserves satisfiability of the whole assertion conjunction, so the folded
+/// residual is unsat iff the conjunction is. Extends [`fold_dt_term`] with:
+///   * a known Boolean variable `v` (in `env`) → its constant;
+///   * `(and …)`/`(or …)`/`(not …)` over Boolean constants → the constant;
+/// everything else as in `fold_dt_term` (reflexive `ite`, `ite` on constant
+/// guard, tester on a constructor application). Applied bottom-up.
+fn fold_bool_dt_term(
+    term: &PTerm,
+    is_ctor: &impl Fn(&str) -> bool,
+    env: &std::collections::HashMap<String, bool>,
+) -> PTerm {
+    match term {
+        PTerm::Symbol(s) => {
+            if let Some(b) = env.get(s) {
+                return PTerm::Const(if *b { PConst::True } else { PConst::False });
+            }
+            term.clone()
+        }
+        PTerm::App(op, args) => {
+            let fargs: Vec<PTerm> = args
+                .iter()
+                .map(|a| fold_bool_dt_term(a, is_ctor, env))
+                .collect();
+            match op.as_str() {
+                "not" if fargs.len() == 1 => match &fargs[0] {
+                    PTerm::Const(PConst::True) => return PTerm::Const(PConst::False),
+                    PTerm::Const(PConst::False) => return PTerm::Const(PConst::True),
+                    _ => {}
+                },
+                "and" => {
+                    let mut kept: Vec<PTerm> = Vec::new();
+                    for a in &fargs {
+                        match a {
+                            PTerm::Const(PConst::False) => return PTerm::Const(PConst::False),
+                            PTerm::Const(PConst::True) => {}
+                            _ => kept.push(a.clone()),
+                        }
+                    }
+                    return match kept.len() {
+                        0 => PTerm::Const(PConst::True),
+                        1 => kept.pop().unwrap(),
+                        _ => PTerm::App("and".to_string(), kept),
+                    };
+                }
+                "or" => {
+                    let mut kept: Vec<PTerm> = Vec::new();
+                    for a in &fargs {
+                        match a {
+                            PTerm::Const(PConst::True) => return PTerm::Const(PConst::True),
+                            PTerm::Const(PConst::False) => {}
+                            _ => kept.push(a.clone()),
+                        }
+                    }
+                    return match kept.len() {
+                        0 => PTerm::Const(PConst::False),
+                        1 => kept.pop().unwrap(),
+                        _ => PTerm::App("or".to_string(), kept),
+                    };
+                }
+                "ite" if fargs.len() == 3 => {
+                    match &fargs[0] {
+                        PTerm::Const(PConst::True) => return fargs[1].clone(),
+                        PTerm::Const(PConst::False) => return fargs[2].clone(),
+                        _ => {}
+                    }
+                    if fargs[1] == fargs[2] {
+                        return fargs[1].clone();
+                    }
+                }
+                _ => {}
+            }
+            PTerm::App(op.clone(), fargs)
+        }
+        PTerm::IndexedApp(name, idx, args) => {
+            let fargs: Vec<PTerm> = args
+                .iter()
+                .map(|a| fold_bool_dt_term(a, is_ctor, env))
+                .collect();
+            if name == "is" && idx.len() == 1 && fargs.len() == 1 {
+                if let Some(d) = idx[0].as_symbol() {
+                    match &fargs[0] {
+                        PTerm::App(head, _) if is_ctor(head) && is_ctor(d) => {
+                            return PTerm::Const(if head == d {
+                                PConst::True
+                            } else {
+                                PConst::False
+                            });
+                        }
+                        PTerm::Symbol(head) if is_ctor(head) && is_ctor(d) => {
+                            return PTerm::Const(if head == d {
+                                PConst::True
+                            } else {
+                                PConst::False
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            PTerm::IndexedApp(name.clone(), idx.clone(), fargs)
+        }
+        _ => term.clone(),
+    }
+}
+
+/// Collect FORCED Boolean units from the top-level assertions: an assertion that
+/// (after boolean folding) reduces to a bare Boolean variable `v` forces `v =
+/// true`; `(not v)` forces `v = false`. Only genuine unit assertions contribute
+/// (a `(not (and v true))` folds to `(not v)`, a unit). Two fixpoint passes let
+/// one forced unit unlock another.
+fn collect_dt_bool_env(
+    parsed: &[PTerm],
+    is_ctor: &impl Fn(&str) -> bool,
+) -> std::collections::HashMap<String, bool> {
+    let mut env: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for _ in 0..2 {
+        let snapshot = env.clone();
+        for a in parsed {
+            match &fold_bool_dt_term(a, is_ctor, &snapshot) {
+                PTerm::Symbol(s) => {
+                    env.insert(s.clone(), true);
+                }
+                PTerm::App(op, args) if op == "not" && args.len() == 1 => {
+                    if let PTerm::Symbol(s) = &args[0] {
+                        env.insert(s.clone(), false);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    env
+}
+
+/// Collect every `ite` subterm of `term` (in pre-order).
+fn collect_ite_subterms<'a>(term: &'a PTerm, out: &mut Vec<&'a PTerm>) {
+    match term {
+        PTerm::App(op, args) => {
+            if op == "ite" && args.len() == 3 {
+                out.push(term);
+            }
+            for a in args {
+                collect_ite_subterms(a, out);
+            }
+        }
+        PTerm::IndexedApp(_, _, args) => {
+            for a in args {
+                collect_ite_subterms(a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `g` is a constructor tester `((_ is C) v)`.
+fn is_tester_term(g: &PTerm) -> bool {
+    matches!(g, PTerm::IndexedApp(name, idx, args)
+        if name == "is" && idx.len() == 1 && args.len() == 1)
+}
+
+/// Structurally replace every occurrence of `target` in `term` with `repl`.
+fn replace_dt_subterm(term: &PTerm, target: &PTerm, repl: &PTerm) -> PTerm {
+    if term == target {
+        return repl.clone();
+    }
+    match term {
+        PTerm::App(op, args) => PTerm::App(
+            op.clone(),
+            args.iter()
+                .map(|a| replace_dt_subterm(a, target, repl))
+                .collect(),
+        ),
+        PTerm::IndexedApp(name, idx, args) => PTerm::IndexedApp(
+            name.clone(),
+            idx.clone(),
+            args.iter()
+                .map(|a| replace_dt_subterm(a, target, repl))
+                .collect(),
+        ),
+        _ => term.clone(),
+    }
+}
+
+/// Emit a verified-firewall Lean proof for a DATATYPE TESTER-GUARDED CASE-SPLIT
+/// refutation whose BOTH branches are ACYCLICITY occurs-checks, over the PARSED
+/// (frontend) assertions. After (a) substituting any FORCED Boolean unit from a
+/// sibling unit-assertion and (b) sound constant-folding, a residual equality
+/// `t = C(… ite g A B …)` remains, where `g` is a constructor tester, `t` a bare
+/// variable, and BOTH branch-substitutions `C(… A …)` and `C(… B …)` contain `t`
+/// as a proper subterm under ≥1 constructor layer. Whatever value the tester
+/// takes, `t` equals a strictly-larger context of itself — unsatisfiable by
+/// acyclicity in either branch. The split is carried as a `by_cases` on the
+/// (opaque) guard inside the theory-lemma validity obligation, each branch
+/// discharged by `AySoundness.Datatype.acyclic_conflict_generic` at that branch's
+/// occurrence depth.
+///
+/// This is the tester-guarded, nested-under-a-constructor analog of the boolean-
+/// ite-guard case split: there the `ite` is the WHOLE non-constructor side; here
+/// it sits under a constructor layer with a bare-variable other side, and the two
+/// branches may occur at DIFFERENT depths. EMISSION-ONLY; grounded through
+/// `AySoundness.firewall_combined_unsat`; axioms ⊆ {propext, Quot.sound}.
+/// Fail-closed (`None`) on any other shape.
+pub(crate) fn emit_dt_tester_casesplit_occurs_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    constructors: &[String],
+) -> Option<String> {
+    let is_ctor = |name: &str| constructors.iter().any(|c| c == name);
+    let env = collect_dt_bool_env(parsed, &is_ctor);
+    for asrt in parsed {
+        let folded = fold_bool_dt_term(asrt, &is_ctor, &env);
+        let PTerm::App(eqop, eqa) = &folded else {
+            continue;
+        };
+        if eqop != "=" || eqa.len() != 2 {
+            continue;
+        }
+        for (lhs, rhs) in [(&eqa[0], &eqa[1]), (&eqa[1], &eqa[0])] {
+            let PTerm::Symbol(t) = lhs else {
+                continue;
+            };
+            if is_ctor(t) {
+                continue;
+            }
+            // `rhs` must be a constructor application …
+            let PTerm::App(rhead, _) = rhs else {
+                continue;
+            };
+            if !is_ctor(rhead) {
+                continue;
+            }
+            // … containing EXACTLY one `ite`, tester-guarded with ite-free
+            // branches.
+            let mut ites: Vec<&PTerm> = Vec::new();
+            collect_ite_subterms(rhs, &mut ites);
+            if ites.len() != 1 {
+                continue;
+            }
+            let PTerm::App(_, ia) = ites[0] else {
+                continue;
+            };
+            if !is_tester_term(&ia[0]) {
+                continue;
+            }
+            let (a_branch, b_branch) = (&ia[1], &ia[2]);
+            // branches must be free of further `ite`s (fully case-split).
+            let mut nested: Vec<&PTerm> = Vec::new();
+            collect_ite_subterms(a_branch, &mut nested);
+            collect_ite_subterms(b_branch, &mut nested);
+            if !nested.is_empty() {
+                continue;
+            }
+            let ite_term = ites[0].clone();
+            let bt = replace_dt_subterm(rhs, &ite_term, a_branch);
+            let bf = replace_dt_subterm(rhs, &ite_term, b_branch);
+            let (Some(dt), Some(df)) = (
+                occurs_ctor_depth(&bt, t, &is_ctor).filter(|d| *d >= 1),
+                occurs_ctor_depth(&bf, t, &is_ctor).filter(|d| *d >= 1),
+            ) else {
+                continue;
+            };
+            return Some(render_dt_var_casesplit_occurs_lean(
+                dt,
+                df,
+                fnv_hex(&format!("dttestercs:{asrt:?}:{t}:{dt}:{df}")),
+            ));
+        }
+    }
+    None
+}
+
+/// Render the tester-guarded both-branches-occurs case split, grounded in the
+/// verified `firewall_combined_unsat`. `true_depth`/`false_depth` are the
+/// occurrence depths of `t` under the then/else branches; the single lemma clause
+/// `[-1]` is validated by `by_cases` on the opaque guard, each branch discharged
+/// by `AySoundness.Datatype.acyclic_conflict_generic` at its depth.
+fn render_dt_var_casesplit_occurs_lean(
+    true_depth: usize,
+    false_depth: usize,
+    hash: String,
+) -> String {
+    let wrap_layers = |d: usize| -> String {
+        let mut body = String::from("z");
+        for _ in 0..d {
+            body = format!("DtT.wrap ({body})");
+        }
+        body
+    };
+    let ctx_t = wrap_layers(true_depth);
+    let ctx_f = wrap_layers(false_depth);
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.Datatype
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — DATATYPE TESTER-GUARDED CASE-SPLIT
+  (both branches ACYCLICITY occurs-checks) grounded in the verified
+  `firewall_combined_unsat`. The residual assertion `t = C(… ite g A B …)` (a
+  bare variable `t` equal to a constructor context wrapping a tester-guarded
+  `ite`) is unsatisfiable: `by_cases` on the (opaque) tester guard reduces the
+  `ite` to one branch, and in EITHER branch `t` occurs as a PROPER subterm under
+  ≥1 constructor layer ({true_depth} layer(s) in the then-branch, {false_depth} in
+  the else-branch), so `sizeOf t < sizeOf (context t)` and no `t` can equal it.
+  Reconstructed from the frontend parsed ASSERTIONS after (a) substituting a
+  FORCED Boolean unit from a sibling unit-assertion (entailed by the query, so
+  satisfiability-preserving) and (b) sound constant-folding of reflexive `ite`s /
+  tautological testers. Faithful abstraction: each constructor layer is modeled by
+  the self-recursive `wrap : DtT → DtT` (strictly `sizeOf`-increasing as any real
+  constructor), sibling fields dropped (irrelevant to acyclicity), and the tester
+  guard abstracted to an arbitrary `Bool` (the conflict holds for BOTH values).
+  Pure Lean 4 core; axioms ⊆ {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.DtTesterCaseSplit_{hash}
+open AySoundness
+
+/-- The datatype abstracted to its recursive spine: one self-recursive
+    constructor (`wrap`, one per occurrence layer) plus a base point. -/
+inductive DtT where
+  | wrap : DtT → DtT
+  | base
+deriving DecidableEq
+
+/-- Theory model: the opaque tester guard `g` and the datatype value `t`. -/
+structure Val where
+  g : Bool
+  t : DtT
+
+/-- Then-branch occurrence context `ctxT z := C(… z …)` — {true_depth} `wrap`
+    layer(s). -/
+def ctxT (z : DtT) : DtT := {ctx_t}
+/-- Else-branch occurrence context `ctxF z := C(… z …)` — {false_depth} `wrap`
+    layer(s). -/
+def ctxF (z : DtT) : DtT := {ctx_f}
+
+/-- Atom `1 ↦ (t = C(… ite g A B …))` — the residual tester-guarded equality,
+    with the constructor spine of each branch abstracted to its `wrap` depth and
+    the guard to the opaque Boolean `g`. -/
+def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide (m.t = (cond m.g (ctxT m.t) (ctxF m.t)))
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1])]
+def lemmas   : List (Cid × Clause) := [(2, [-1])]
+def proof    : List (Cid × Clause × List Int) := [(3, [], [1, 2])]
+
+/-- **Case-split lemma validity** — the firewall's premise (b): the residual
+    equality is false in every model. `by_cases` on the guard reduces the `cond`;
+    each branch is an acyclicity conflict at its occurrence depth. -/
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1] = true := by
+  have h : m.t ≠ (cond m.g (ctxT m.t) (ctxF m.t)) := by
+    cases hg : m.g
+    · show m.t ≠ ctxF m.t
+      exact AySoundness.Datatype.acyclic_conflict_generic (t := m.t) (ctx := ctxF)
+        (by simp only [ctxF, DtT.wrap.sizeOf_spec]; omega)
+    · show m.t ≠ ctxT m.t
+      exact AySoundness.Datatype.acyclic_conflict_generic (t := m.t) (ctx := ctxT)
+        (by simp only [ctxT, DtT.wrap.sizeOf_spec]; omega)
+  simp [clauseSat, atomVal, litSat, List.any_cons, List.any_nil, h]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- No datatype model satisfies the tester-guarded case-split equality — via the
+    verified firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.DtTesterCaseSplit_{hash}
+"#,
+    )
+}
+
+/// Abstract a datatype term into a Lean expression over the concrete `Tree`
+/// datatype of `AySoundness.Datatype` (`leaf | node Tree Tree`), the faithful
+/// binary-tree spine every real algebraic datatype maps onto: a constructor with
+/// EXACTLY 2 recursive (same-datatype) fields becomes `Tree.node` (its two
+/// recursive children mapped, sibling non-recursive fields dropped), a
+/// constructor with 0 recursive fields becomes `Tree.leaf` (all fields dropped).
+/// A bare datatype VARIABLE becomes a fresh `Val` field `m.t{i}` (registered in
+/// `tree_vars`, de-duplicated by name) — unless it is the occurs variable named
+/// by `occ_repl`, which is emitted as the literal `z` (for building the
+/// acyclicity context `fun z => …`). `None` (fail-closed) on any non-abstractable
+/// head — a selector, a UF application, an `ite`, a constructor whose recursive
+/// arity is not 0 or 2, or a missing recursive-field record.
+fn abstract_tree_term(
+    term: &PTerm,
+    is_ctor: &impl Fn(&str) -> bool,
+    rec_of: &impl Fn(&str) -> Option<Vec<bool>>,
+    occ_repl: Option<&str>,
+    tree_vars: &mut Vec<String>,
+) -> Option<String> {
+    const LEAF: &str = "AySoundness.Datatype.Tree.leaf";
+    match term {
+        PTerm::Symbol(s) => {
+            if is_ctor(s) {
+                // A nullary constructor abstracts to the recursive base point.
+                let rec = rec_of(s)?;
+                if rec.iter().filter(|b| **b).count() == 0 {
+                    Some(LEAF.to_string())
+                } else {
+                    None
+                }
+            } else if occ_repl == Some(s.as_str()) {
+                Some("z".to_string())
+            } else {
+                let idx = match tree_vars.iter().position(|v| v == s) {
+                    Some(i) => i,
+                    None => {
+                        tree_vars.push(s.clone());
+                        tree_vars.len() - 1
+                    }
+                };
+                Some(format!("m.t{idx}"))
+            }
+        }
+        PTerm::App(head, args) => {
+            if !is_ctor(head) {
+                return None;
+            }
+            let rec = rec_of(head)?;
+            if rec.len() != args.len() {
+                return None;
+            }
+            let rec_pos: Vec<usize> = (0..rec.len()).filter(|&i| rec[i]).collect();
+            match rec_pos.len() {
+                0 => Some(LEAF.to_string()),
+                2 => {
+                    let c0 = abstract_tree_term(
+                        &args[rec_pos[0]],
+                        is_ctor,
+                        rec_of,
+                        occ_repl,
+                        tree_vars,
+                    )?;
+                    let c1 = abstract_tree_term(
+                        &args[rec_pos[1]],
+                        is_ctor,
+                        rec_of,
+                        occ_repl,
+                        tree_vars,
+                    )?;
+                    Some(format!("AySoundness.Datatype.Tree.node ({c0}) ({c1})"))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The abstract head-class of a datatype term under the binary-`Tree` spine:
+/// `Some("node")` for a constructor application / symbol with exactly 2 recursive
+/// fields, `Some("leaf")` for one with 0. `None` for anything else (a variable,
+/// a selector, a UF app). Two DISTINCT classes on the same linking variable
+/// witness a constructor-DISTINCTNESS conflict (`node ≠ leaf`).
+fn tree_head_class(
+    term: &PTerm,
+    is_ctor: &impl Fn(&str) -> bool,
+    rec_of: &impl Fn(&str) -> Option<Vec<bool>>,
+) -> Option<&'static str> {
+    let head = match term {
+        PTerm::Symbol(s) if is_ctor(s) => s,
+        PTerm::App(h, _) if is_ctor(h) => h,
+        _ => return None,
+    };
+    match rec_of(head)?.iter().filter(|b| **b).count() {
+        0 => Some("leaf"),
+        2 => Some("node"),
+        _ => None,
+    }
+}
+
+/// Emit a verified-firewall Lean proof for a DATATYPE TESTER-GUARDED CASE-SPLIT
+/// whose two branches are discharged by DIFFERENT verified datatype lemmas — a
+/// MIXED conflict — over the PARSED (frontend) assertions. After boolean folding,
+/// a residual `(ite g A B) = R` remains, where `g` is a constructor tester, `R` a
+/// constructor application, and the two `by_cases` branches on the (opaque) guard
+/// discharge as:
+///   * else-branch (`g = false`): `B = R` is an ACYCLICITY occurs-check — `B` is
+///     a bare variable occurring as a proper subterm of `R`
+///     (`AySoundness.Datatype.acyclic_conflict_generic`);
+///   * then-branch (`g = true`): `A = R` is a constructor DISTINCTNESS conflict —
+///     `A` and `R` are the SAME constructor, and projecting their children (via
+///     `AySoundness.Datatype.Tree.node_inj`) forces some variable to equal both a
+///     `node`-headed and a `leaf`-headed term, which no value satisfies
+///     (`AySoundness.Datatype.Tree.node_ne_leaf`).
+///
+/// This GENERALIZES the both-branches-occurs
+/// [`emit_dt_tester_casesplit_occurs_firewall_lean_from_parsed`]: each `by_cases`
+/// branch is discharged by its OWN lemma. The datatype is faithfully abstracted
+/// onto the concrete binary `Tree` of `AySoundness.Datatype` (a constructor with
+/// 2 recursive fields ↦ `Tree.node`, 0 ↦ `Tree.leaf`, sibling non-recursive
+/// fields dropped, the tester guard abstracted to an opaque `Bool`). A real model
+/// maps homomorphically onto this abstraction, so no-abstract-model ⟹
+/// no-real-model. EMISSION-ONLY; grounded through
+/// `AySoundness.firewall_combined_unsat`; axioms ⊆ {propext, Quot.sound}.
+/// Fail-closed (`None`) on any other shape. `ctor_rec` is the per-constructor
+/// recursive-field mask (`true` at a field of the constructor's OWN datatype).
+pub(crate) fn emit_dt_tester_casesplit_mixed_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    constructors: &[String],
+    ctor_rec: &[(String, Vec<bool>)],
+) -> Option<String> {
+    let is_ctor = |name: &str| constructors.iter().any(|c| c == name);
+    let rec_of = |ctor: &str| -> Option<Vec<bool>> {
+        ctor_rec
+            .iter()
+            .find(|(c, _)| c == ctor)
+            .map(|(_, v)| v.clone())
+    };
+    let env = collect_dt_bool_env(parsed, &is_ctor);
+    for asrt in parsed {
+        let folded = fold_bool_dt_term(asrt, &is_ctor, &env);
+        let PTerm::App(eqop, eqa) = &folded else {
+            continue;
+        };
+        if eqop != "=" || eqa.len() != 2 {
+            continue;
+        }
+        for (lhs, rhs) in [(&eqa[0], &eqa[1]), (&eqa[1], &eqa[0])] {
+            // `lhs` must be a top-level tester-guarded `ite` with fully-folded
+            // (ite-free) branches; `rhs` a constructor application.
+            let PTerm::App(iop, ia) = lhs else {
+                continue;
+            };
+            if iop != "ite" || ia.len() != 3 || !is_tester_term(&ia[0]) {
+                continue;
+            }
+            let (a_branch, b_branch) = (&ia[1], &ia[2]);
+            let mut nested: Vec<&PTerm> = Vec::new();
+            collect_ite_subterms(a_branch, &mut nested);
+            collect_ite_subterms(b_branch, &mut nested);
+            collect_ite_subterms(rhs, &mut nested);
+            if !nested.is_empty() {
+                continue;
+            }
+            let PTerm::App(rhead, _) = rhs else {
+                continue;
+            };
+            if !is_ctor(rhead) {
+                continue;
+            }
+            // ---- else-branch (g = false): OCCURS-check. `b_branch` a bare
+            // variable occurring as a proper subterm of `rhs`.
+            let PTerm::Symbol(occ_var) = b_branch else {
+                continue;
+            };
+            if is_ctor(occ_var)
+                || occurs_ctor_depth(rhs, occ_var, &is_ctor).is_none_or(|depth| depth < 1)
+            {
+                continue;
+            }
+            // ---- then-branch (g = true): DISTINCTNESS. `a_branch` and `rhs`
+            // must be the SAME constructor (a 2-recursive-field `node`-like head),
+            // and projecting their recursive children pairwise must force some
+            // variable to two DISTINCT abstract head-classes (`node` vs `leaf`).
+            let (PTerm::App(ahead, aargs), PTerm::App(_, rargs)) = (a_branch, rhs) else {
+                continue;
+            };
+            if ahead != rhead {
+                continue;
+            }
+            let Some(rec) = rec_of(ahead) else { continue };
+            if rec.len() != aargs.len() || rec.len() != rargs.len() {
+                continue;
+            }
+            let rec_pos: Vec<usize> = (0..rec.len()).filter(|&i| rec[i]).collect();
+            if rec_pos.len() != 2 {
+                continue;
+            }
+            // Accumulate, per linking variable, the abstract head-classes it is
+            // directly equated with across the two recursive-child pairs.
+            let mut classes: std::collections::HashMap<&str, std::collections::BTreeSet<&str>> =
+                std::collections::HashMap::new();
+            for &p in &rec_pos {
+                for (v_side, c_side) in [(&aargs[p], &rargs[p]), (&rargs[p], &aargs[p])] {
+                    if let PTerm::Symbol(w) = v_side {
+                        if !is_ctor(w) {
+                            if let Some(cls) = tree_head_class(c_side, &is_ctor, &rec_of) {
+                                classes.entry(w).or_default().insert(cls);
+                            }
+                        }
+                    }
+                }
+            }
+            if !classes.values().any(|s| s.len() >= 2) {
+                continue;
+            }
+            // Build the abstract `Tree` terms. Field indices are assigned in a
+            // deterministic first-seen order across then / else / rhs.
+            let mut tree_vars: Vec<String> = Vec::new();
+            let (Some(then_abs), Some(else_abs), Some(rhs_abs)) = (
+                abstract_tree_term(a_branch, &is_ctor, &rec_of, None, &mut tree_vars),
+                abstract_tree_term(b_branch, &is_ctor, &rec_of, None, &mut tree_vars),
+                abstract_tree_term(rhs, &is_ctor, &rec_of, None, &mut tree_vars),
+            ) else {
+                continue;
+            };
+            // The occurs context `fun z => rhs[occ_var := z]`; `z` must actually
+            // appear (occ_var reached through a recursive path) so the acyclicity
+            // `sizeOf` hypothesis is discharge-able.
+            let Some(rhs_ctx) =
+                abstract_tree_term(rhs, &is_ctor, &rec_of, Some(occ_var), &mut tree_vars)
+            else {
+                continue;
+            };
+            if !rhs_ctx.contains('z') {
+                continue;
+            }
+            return Some(render_dt_casesplit_mixed_lean(
+                tree_vars.len(),
+                &then_abs,
+                &else_abs,
+                &rhs_abs,
+                &rhs_ctx,
+                fnv_hex(&format!("dtmixed:{asrt:?}:{ahead}:{occ_var}")),
+            ));
+        }
+    }
+    None
+}
+
+/// Render the MIXED tester-guarded case-split Lean: a `by_cases` on the opaque
+/// tester guard whose else-branch is an ACYCLICITY occurs-check
+/// (`acyclic_conflict_generic`) and whose then-branch is a constructor
+/// DISTINCTNESS conflict (`node_inj` + `node_ne_leaf`, closed by `simp_all`),
+/// grounded in the verified `firewall_combined_unsat`. `n_vars` `Tree` fields plus
+/// the `Bool` guard model the theory; each `t{i}` is a datatype variable, the
+/// abstract terms are the binary-`Tree` images of the residual equality's sides.
+fn render_dt_casesplit_mixed_lean(
+    n_vars: usize,
+    then_abs: &str,
+    else_abs: &str,
+    rhs_abs: &str,
+    rhs_ctx: &str,
+    hash: String,
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut val_fields = String::new();
+    for i in 0..n_vars {
+        writeln!(&mut val_fields, "  t{i} : AySoundness.Datatype.Tree")
+            .expect("writing to a String cannot fail");
+    }
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.Datatype
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — DATATYPE TESTER-GUARDED CASE-SPLIT with
+  a MIXED conflict (a DIFFERENT verified lemma per branch), grounded in the
+  verified `firewall_combined_unsat`. The residual assertion `(ite g A B) = R` (a
+  tester-guarded `ite` equal to a constructor application `R`) is unsatisfiable:
+  `by_cases` on the (opaque) tester guard `g` reduces the `ite` to one branch, and
+    * the ELSE branch (`g = false`) gives `B = R` with the bare variable `B`
+      occurring as a PROPER subterm of `R` — an ACYCLICITY occurs-check, refuted
+      by `AySoundness.Datatype.acyclic_conflict_generic` (`sizeOf B < sizeOf R`);
+    * the THEN branch (`g = true`) gives `A = R` with `A` and `R` the SAME
+      constructor; projecting their children (`Tree.node_inj`) forces a variable
+      to equal both a `node`-headed and a `leaf`-headed term — a constructor
+      DISTINCTNESS conflict, refuted by `AySoundness.Datatype.Tree.node_ne_leaf`.
+  Reconstructed from the frontend parsed ASSERTIONS after (a) substituting any
+  FORCED Boolean unit from a sibling unit-assertion (entailed by the query, so
+  satisfiability-preserving) and (b) sound constant-folding of reflexive `ite`s /
+  tautological testers. Faithful abstraction: the datatype maps homomorphically
+  onto the concrete binary `Tree` of `AySoundness.Datatype` (a constructor with 2
+  recursive fields ↦ `Tree.node`, 0 ↦ `Tree.leaf`, sibling non-recursive fields
+  dropped, the tester guard abstracted to an arbitrary `Bool`), so no abstract
+  model ⟹ no real model. Pure Lean 4 core; axioms ⊆ {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.DtTesterCaseSplitMixed_{hash}
+open AySoundness
+
+/-- Theory model: the opaque tester guard `g` and the datatype variables. -/
+structure Val where
+  g : Bool
+{val_fields}
+/-- Atom `1 ↦ ((ite g A B) = R)` — the residual tester-guarded equality, each
+    side mapped onto the binary-`Tree` spine with the guard abstracted to `g`. -/
+def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide (cond m.g ({then_abs}) ({else_abs}) = {rhs_abs})
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1])]
+def lemmas   : List (Cid × Clause) := [(2, [-1])]
+def proof    : List (Cid × Clause × List Int) := [(3, [], [1, 2])]
+
+/-- **Case-split lemma validity** — the firewall's premise (b): the residual
+    equality is false in every model. `by_cases` on the guard reduces the `cond`;
+    the else-branch is an acyclicity occurs-check, the then-branch a constructor
+    distinctness conflict (MIXED — a different lemma per branch). -/
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1] = true := by
+  have h : ¬ (cond m.g ({then_abs}) ({else_abs}) = {rhs_abs}) := by
+    cases hg : m.g
+    · -- else-branch (g = false): ACYCLICITY occurs-check.
+      show ({else_abs}) ≠ {rhs_abs}
+      exact AySoundness.Datatype.acyclic_conflict_generic
+        (t := {else_abs})
+        (ctx := fun z => {rhs_ctx})
+        (by simp only [AySoundness.Datatype.Tree.node.sizeOf_spec]; omega)
+    · -- then-branch (g = true): constructor DISTINCTNESS (node ≠ leaf).
+      show ({then_abs}) ≠ {rhs_abs}
+      intro heq
+      obtain ⟨hl, hr⟩ := AySoundness.Datatype.Tree.node_inj heq
+      simp_all
+  simp [clauseSat, atomVal, litSat, List.any_cons, List.any_nil, h]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- No datatype model satisfies the mixed tester-guarded case-split equality — via
+    the verified firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.DtTesterCaseSplitMixed_{hash}
 "#,
     )
 }
@@ -4121,6 +5581,836 @@ theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
     atomVal (by decide) (by decide) lemmas_valid (by decide)
 
 end AySoundness.Emitted.StrLenZero_{hash}
+"#,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// `str.at` / `seq.at` / `seq.nth` firewall emitters (grounded in the verified
+// `AySoundness.StrAt` / `AySoundness.SeqThy` positional-read lemmas).
+// ---------------------------------------------------------------------------
+
+/// A GROUND sequence element: an `Int` or a `Bool` literal. Used to reconstruct
+/// concrete `seq.unit` / `seq.++` content for the `seq.at` / `seq.nth` firewall
+/// emitters so the emitted Lean can close by `decide` over the exact values.
+#[derive(Clone, Copy, PartialEq)]
+enum SeqElt {
+    Int(i64),
+    Bool(bool),
+}
+
+impl SeqElt {
+    /// The Lean element-type name (`Int` / `Bool`).
+    fn lean_ty(self) -> &'static str {
+        match self {
+            SeqElt::Int(_) => "Int",
+            SeqElt::Bool(_) => "Bool",
+        }
+    }
+
+    /// The bare Lean literal (`-2`, `true`) — the surrounding list / `seq.unit`
+    /// carries the `: SeqThy.Seq _` / `: _` ascription.
+    fn lean_bare(self) -> String {
+        match self {
+            SeqElt::Int(n) => n.to_string(),
+            SeqElt::Bool(b) => {
+                if b {
+                    "true".to_string()
+                } else {
+                    "false".to_string()
+                }
+            }
+        }
+    }
+}
+
+/// Parse an `Int`-or-`Bool` value literal (a `seq.unit` operand). Negative
+/// integers LEX AS SYMBOLS (`-2`), so a symbol that parses as `i64` is accepted;
+/// `(- x)` unary negation is folded too.
+fn parse_seq_elt(t: &PTerm) -> Option<SeqElt> {
+    match t {
+        PTerm::Const(PConst::Numeral(n)) => n.parse::<i64>().ok().map(SeqElt::Int),
+        PTerm::Const(PConst::True) => Some(SeqElt::Bool(true)),
+        PTerm::Const(PConst::False) => Some(SeqElt::Bool(false)),
+        PTerm::Symbol(s) => s.parse::<i64>().ok().map(SeqElt::Int),
+        PTerm::App(op, args) if op == "-" && args.len() == 1 => match parse_seq_elt(&args[0]) {
+            Some(SeqElt::Int(n)) => Some(SeqElt::Int(-n)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Reconstruct a fully-GROUND sequence value from a parsed term, resolving symbol
+/// references through `binds` (symbol → its bound ground seq). Handles
+/// `(seq.unit V)`, n-ary `(seq.++ …)`, `(as seq.empty …)`, and bound symbols.
+/// `None` if any part is not ground.
+fn parse_ground_seq(t: &PTerm, binds: &[(String, Vec<SeqElt>)]) -> Option<Vec<SeqElt>> {
+    match t {
+        PTerm::Symbol(s) => binds.iter().find(|(n, _)| n == s).map(|(_, v)| v.clone()),
+        // (as seq.empty (Seq _)) — the empty sequence.
+        PTerm::QualifiedApp(id, _, args) if args.is_empty() => {
+            (id.as_symbol() == Some("seq.empty")).then(Vec::new)
+        }
+        PTerm::App(op, args) if op == "seq.unit" && args.len() == 1 => {
+            parse_seq_elt(&args[0]).map(|e| vec![e])
+        }
+        PTerm::App(op, args) if op == "seq.++" => {
+            let mut out = Vec::new();
+            for a in args {
+                out.extend(parse_ground_seq(a, binds)?);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// The element type shared by a ground seq's elements (`None` if empty / mixed).
+fn seq_elt_ty(elts: &[SeqElt]) -> Option<&'static str> {
+    let first = elts.first()?.lean_ty();
+    elts.iter().all(|e| e.lean_ty() == first).then_some(first)
+}
+
+/// Render a ground seq as a bare Lean list literal (`[3, -2, 3]`, `[]`).
+fn seq_list_lean(elts: &[SeqElt]) -> String {
+    format!(
+        "[{}]",
+        elts.iter()
+            .map(|e| e.lean_bare())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// Collect `(= sym numeral)` integer pins from the parsed assertions.
+fn collect_int_binds(parsed: &[PTerm]) -> Vec<(String, i64)> {
+    let mut v = Vec::new();
+    for a in parsed {
+        let PTerm::App(op, args) = a else { continue };
+        if op != "=" || args.len() != 2 {
+            continue;
+        }
+        for (p, q) in [(&args[0], &args[1]), (&args[1], &args[0])] {
+            if let (PTerm::Symbol(s), Some(n)) = (p, parsed_numeral(q)) {
+                v.push((s.clone(), n));
+            }
+        }
+    }
+    v
+}
+
+/// Collect `(= sym ground-seq)` bindings, iterated to a fixpoint so a binding
+/// whose RHS references an earlier-bound symbol still resolves.
+fn collect_seq_binds(parsed: &[PTerm]) -> Vec<(String, Vec<SeqElt>)> {
+    let mut binds: Vec<(String, Vec<SeqElt>)> = Vec::new();
+    loop {
+        let mut changed = false;
+        for a in parsed {
+            let PTerm::App(op, args) = a else { continue };
+            if op != "=" || args.len() != 2 {
+                continue;
+            }
+            for (p, q) in [(&args[0], &args[1]), (&args[1], &args[0])] {
+                if let PTerm::Symbol(s) = p {
+                    if binds.iter().any(|(n, _)| n == s) {
+                        continue;
+                    }
+                    if let Some(g) = parse_ground_seq(q, &binds) {
+                        binds.push((s.clone(), g));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    binds
+}
+
+/// Resolve an index term to a concrete `i64` (a numeral, a negative-symbol
+/// numeral, or an integer-pinned symbol).
+fn resolve_index(t: &PTerm, int_binds: &[(String, i64)]) -> Option<i64> {
+    match t {
+        PTerm::Const(PConst::Numeral(n)) => n.parse::<i64>().ok(),
+        PTerm::Symbol(s) => {
+            if let Ok(n) = s.parse::<i64>() {
+                return Some(n);
+            }
+            int_binds.iter().find(|(k, _)| k == s).map(|(_, v)| *v)
+        }
+        _ => None,
+    }
+}
+
+/// The in-range element read `list[idx]` (`None` when out of range / negative).
+fn eval_read(list: &[SeqElt], idx: i64) -> Option<SeqElt> {
+    if idx < 0 {
+        return None;
+    }
+    list.get(idx as usize).copied()
+}
+
+/// Constant-fold a ground integer arithmetic term (`Numeral`, negative symbol,
+/// unary/binary `-`, n-ary `+`/`*`), resolving pinned symbols through `binds`.
+fn fold_int(t: &PTerm, binds: &[(String, i64)]) -> Option<i64> {
+    match t {
+        PTerm::Const(PConst::Numeral(n)) => n.parse::<i64>().ok(),
+        PTerm::Symbol(s) => {
+            if let Ok(n) = s.parse::<i64>() {
+                return Some(n);
+            }
+            binds.iter().find(|(k, _)| k == s).map(|(_, v)| *v)
+        }
+        PTerm::App(op, a) if op == "-" && a.len() == 1 => Some(-fold_int(&a[0], binds)?),
+        PTerm::App(op, a) if op == "-" && a.len() == 2 => {
+            Some(fold_int(&a[0], binds)? - fold_int(&a[1], binds)?)
+        }
+        PTerm::App(op, a) if op == "+" && !a.is_empty() => {
+            let mut s = 0i64;
+            for x in a {
+                s = s.checked_add(fold_int(x, binds)?)?;
+            }
+            Some(s)
+        }
+        PTerm::App(op, a) if op == "*" && !a.is_empty() => {
+            let mut s = 1i64;
+            for x in a {
+                s = s.checked_mul(fold_int(x, binds)?)?;
+            }
+            Some(s)
+        }
+        _ => None,
+    }
+}
+
+/// Flatten nested `(and …)` into a flat list of conjuncts.
+fn flatten_and<'a>(t: &'a PTerm, out: &mut Vec<&'a PTerm>) {
+    if let PTerm::App(op, args) = t {
+        if op == "and" {
+            for a in args {
+                flatten_and(a, out);
+            }
+            return;
+        }
+    }
+    out.push(t);
+}
+
+/// Emit a verified-firewall Lean proof for a `str.at` LENGTH conflict found among
+/// the PARSED assertions: `(= (str.len (str.at T IDX)) N)` (either operand order)
+/// with a constant `N ≥ 2`. This is unsatisfiable for ANY string `T` and ANY
+/// index: the verified `AySoundness.StrAt.strAt_len_eq_conflict` shows
+/// `str.len (str.at s i) ≤ 1`, so it can never equal `N ≥ 2`.
+///
+/// The bound is index-UNIVERSAL (no case split): the certificate quantifies over
+/// all `Str × Nat`, so the concrete symbolic index (`(select a i)` etc.) and any
+/// red-herring assertions are irrelevant. Grounded through the verified
+/// `firewall_combined_unsat` over `Val = StringThy.Str × Nat`. `None` if no such
+/// conflict. Single-conflict, fail-closed.
+pub(crate) fn emit_str_at_len_firewall_lean_from_parsed(parsed: &[PTerm]) -> Option<String> {
+    for asrt in parsed {
+        let PTerm::App(op, args) = asrt else { continue };
+        if op != "=" || args.len() != 2 {
+            continue;
+        }
+        for (p, q) in [(&args[0], &args[1]), (&args[1], &args[0])] {
+            // p = (str.len (str.at _ _))
+            let PTerm::App(lop, largs) = p else { continue };
+            if lop != "str.len" || largs.len() != 1 {
+                continue;
+            }
+            let PTerm::App(aop, aargs) = &largs[0] else {
+                continue;
+            };
+            if aop != "str.at" || aargs.len() != 2 {
+                continue;
+            }
+            // q = numeral N ≥ 2
+            if let Some(n) = parsed_numeral(q) {
+                if n >= 2 {
+                    return Some(render_str_at_len_lean(n));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Render the `str.at` length-conflict firewall Lean for the asserted length `n`
+/// (`n ≥ 2`). Grounds `AySoundness.StrAt.strAt_len_eq_conflict` through the
+/// verified `firewall_combined_unsat` over `Val = StringThy.Str × Nat` (the
+/// abstract string and its abstract read index).
+fn render_str_at_len_lean(n: i64) -> String {
+    let hash = fnv_hex(&format!("stratlen:{n}"));
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.StringThy
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — `str.at` LENGTH conflict grounded in the
+  verified `firewall_combined_unsat`. The assertion `str.len (str.at t i) = {n}`
+  (with `{n} ≥ 2`) is unsatisfiable: the verified axiom
+  `AySoundness.StrAt.strAt_len_eq_conflict` gives `str.len (str.at s i) ≤ 1` for
+  ANY string and ANY index, so it can never equal `{n}`. The bound is
+  index-UNIVERSAL — no case split, and the concrete symbolic index (and any
+  red-herring assertions) are irrelevant. Reconstructed from the frontend parsed
+  ASSERTIONS (ay reduces str.at eagerly, so the conflict is surface-rewrite-
+  trivialized before emit). Model: `Val = StringThy.Str × Nat` (abstract string ×
+  abstract index). Pure Lean 4 core; axioms ⊆ {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.StrAtLen_{hash}
+open AySoundness
+
+abbrev Val := StringThy.Str × Nat
+
+/-- Atom `1 ↦ str.len (str.at t i) = {n}`. -/
+def atomVal (m : Val) (k : Nat) : Bool :=
+  match k with
+  | 1 => decide (StringThy.len (StrAt.strAt m.1 m.2) = {n})
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1])]
+def lemmas   : List (Cid × Clause) := [(2, [-1])]
+def proof    : List (Cid × Clause × List Int) := [(3, [], [1, 2])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1] = true := by
+  have ha : atomVal m 1 = false := by
+    simp only [atomVal, decide_eq_false_iff_not]
+    exact StrAt.strAt_len_eq_conflict m.1 m.2 {n} (by decide)
+  simp [clauseSat, litSat, List.any_cons, List.any_nil, ha]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- No string's `str.at` read has length {n} — via the firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.StrAtLen_{hash}
+"#,
+    )
+}
+
+/// Emit a verified-firewall Lean proof for a fully-GROUND `seq.at` value-mismatch
+/// conflict found among the PARSED assertions: `(= (seq.unit V) (seq.at S I))`
+/// (either operand order) where `S` resolves to a ground sequence, `I` to a
+/// pinned in-range index, and the read element differs from `V`.
+///
+/// Fully ground — no case split. The read `seq.at S I = seq.unit (S[I])` has
+/// length 1, so both sides are length-1 singletons and the conflict is the ELEMENT
+/// mismatch `V ≠ S[I]`, closed by `decide` over the verified `SeqThy.seqAt` /
+/// `SeqThy.unit` model. Grounded through `firewall_combined_unsat` over the
+/// trivial `Val = Unit`. `None` unless the read is in range and the values differ.
+pub(crate) fn emit_seq_at_pinned_firewall_lean_from_parsed(parsed: &[PTerm]) -> Option<String> {
+    let int_binds = collect_int_binds(parsed);
+    let seq_binds = collect_seq_binds(parsed);
+    for asrt in parsed {
+        let PTerm::App(op, args) = asrt else { continue };
+        if op != "=" || args.len() != 2 {
+            continue;
+        }
+        for (p, q) in [(&args[0], &args[1]), (&args[1], &args[0])] {
+            // p = (seq.unit V)
+            let PTerm::App(uop, uargs) = p else { continue };
+            if uop != "seq.unit" || uargs.len() != 1 {
+                continue;
+            }
+            let Some(vu) = parse_seq_elt(&uargs[0]) else {
+                continue;
+            };
+            // q = (seq.at S I)
+            let PTerm::App(aop, aargs) = q else { continue };
+            if aop != "seq.at" || aargs.len() != 2 {
+                continue;
+            }
+            let Some(list) = parse_ground_seq(&aargs[0], &seq_binds) else {
+                continue;
+            };
+            let Some(idx) = resolve_index(&aargs[1], &int_binds) else {
+                continue;
+            };
+            let Some(read) = eval_read(&list, idx) else {
+                continue;
+            };
+            // Genuine value mismatch (same element kind, distinct value).
+            if read.lean_ty() != vu.lean_ty() || read == vu {
+                continue;
+            }
+            if let Some(ty) = seq_elt_ty(&list) {
+                return Some(render_seq_at_pinned_lean(vu, &list, idx, ty));
+            }
+        }
+    }
+    None
+}
+
+/// Render the ground `seq.at` value-mismatch firewall Lean. Grounds the verified
+/// `SeqThy.seqAt` / `SeqThy.unit` model by `decide` over `Val = Unit`.
+fn render_seq_at_pinned_lean(vu: SeqElt, list: &[SeqElt], idx: i64, ty: &str) -> String {
+    let hash = fnv_hex(&format!(
+        "seqatpinned:{}:{}:{idx}",
+        vu.lean_bare(),
+        seq_list_lean(list)
+    ));
+    let list_lean = seq_list_lean(list);
+    let vu_bare = vu.lean_bare();
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.SeqThy
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — GROUND `seq.at` value-mismatch conflict
+  grounded in the verified `firewall_combined_unsat`. The literal
+  `seq.unit V = seq.at s i` is unsatisfiable: the read `seq.at s i` wraps the
+  in-range element `s[i]` into a length-1 sequence, so the equation forces
+  `V = s[i]` — false for the concrete ground values. Discharged by `decide` over
+  the verified `SeqThy.seqAt` / `SeqThy.unit` model (mirrors
+  `SeqThy.ex_seqat_pinned_conflict`). Reconstructed from the frontend parsed
+  ASSERTIONS (ay reduces seq.at eagerly). Model: `Val = Unit` (fully ground). Pure
+  Lean 4 core; axioms ⊆ {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.SeqAtPinned_{hash}
+open AySoundness
+
+abbrev Val := Unit
+
+/-- Atom `1 ↦ seq.unit V = seq.at s i` (the asserted, ground-false equation). -/
+def atomVal (_m : Val) (k : Nat) : Bool :=
+  match k with
+  | 1 => decide (SeqThy.unit ({vu_bare} : {ty}) = SeqThy.seqAt (({list_lean}) : SeqThy.Seq {ty}) {idx})
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1])]
+def lemmas   : List (Cid × Clause) := [(2, [-1])]
+def proof    : List (Cid × Clause × List Int) := [(3, [], [1, 2])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1] = true := by
+  have ha : atomVal m 1 = false := by cases m <;> decide
+  simp [clauseSat, litSat, List.any_cons, List.any_nil, ha]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- The pinned `seq.unit` value does not match the `seq.at` read — via the firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.SeqAtPinned_{hash}
+"#,
+    )
+}
+
+/// Emit a verified-firewall Lean proof for a `seq.suffixof` LAST-ELEMENT-mismatch
+/// conflict found among the PARSED assertions: `(seq.suffixof X Y)` where `X`
+/// resolves to a ground NON-EMPTY sequence ending in `a`, `Y` is `(seq.++ … T)`
+/// whose LAST operand `T` resolves to a ground NON-EMPTY sequence ending in
+/// `b ≠ a` (the prefix operands are arbitrary). A non-empty suffix shares the
+/// whole's last element, so `X` (ending in `a`) can be a suffix of `p ++ T`
+/// (ending in `b`) for NO prefix `p` — unsatisfiable for the WHOLE assertion.
+///
+/// Grounded through the verified `SeqThy.suffix_append_last_conflict` (built from
+/// the kernel-verified `suffixOf` / `getLast?_of_suffix` / `suffix_last_conflict`):
+/// the emitted `no_model` quantifies the prefix `p` universally, so it refutes the
+/// suffix relation for every value of the concrete prefix (`v3` etc.). The tail
+/// `T` and the alleged suffix `X` are ground concrete lists, so every side
+/// condition (`X ≠ []`, `T ≠ []`, the two `getLast?`s, `a ≠ b`) closes by `decide`.
+/// `None` (fail-closed) unless the read is a genuine non-empty-suffix last-element
+/// mismatch over a shared element type.
+pub(crate) fn emit_seq_suffixof_firewall_lean_from_parsed(parsed: &[PTerm]) -> Option<String> {
+    let seq_binds = collect_seq_binds(parsed);
+    for asrt in parsed {
+        let PTerm::App(op, args) = asrt else { continue };
+        if op != "seq.suffixof" || args.len() != 2 {
+            continue;
+        }
+        // X = the alleged suffix: ground, non-empty, last element `a`.
+        let Some(xlist) = parse_ground_seq(&args[0], &seq_binds) else {
+            continue;
+        };
+        let Some(a) = xlist.last().copied() else {
+            continue;
+        };
+        // Y = the whole. Its LAST `seq.++` operand (or Y itself) is the ground,
+        // non-empty tail `T`, last element `b`; the prefix operands are arbitrary.
+        let tail_term = match &args[1] {
+            PTerm::App(yop, yargs) if yop == "seq.++" && !yargs.is_empty() => yargs.last().unwrap(),
+            other => other,
+        };
+        let Some(tlist) = parse_ground_seq(tail_term, &seq_binds) else {
+            continue;
+        };
+        let Some(b) = tlist.last().copied() else {
+            continue;
+        };
+        // Genuine element mismatch over a shared element type.
+        if a.lean_ty() != b.lean_ty() || a == b {
+            continue;
+        }
+        let (Some(tyx), Some(tyt)) = (seq_elt_ty(&xlist), seq_elt_ty(&tlist)) else {
+            continue;
+        };
+        if tyx != tyt {
+            continue;
+        }
+        return Some(render_seq_suffixof_lean(&xlist, &tlist, a, b, tyx));
+    }
+    None
+}
+
+/// Render the `seq.suffixof` last-element-mismatch firewall Lean. Grounds the
+/// verified `SeqThy.suffix_append_last_conflict` over a universally-quantified
+/// prefix `p : List ty`; the suffix `x` and tail `t` are ground concrete lists so
+/// all side conditions close by `decide`.
+fn render_seq_suffixof_lean(
+    xlist: &[SeqElt],
+    tlist: &[SeqElt],
+    a: SeqElt,
+    b: SeqElt,
+    ty: &str,
+) -> String {
+    let x_lean = seq_list_lean(xlist);
+    let t_lean = seq_list_lean(tlist);
+    let a_bare = a.lean_bare();
+    let b_bare = b.lean_bare();
+    let hash = fnv_hex(&format!(
+        "seqsuffixof:{x_lean}:{t_lean}:{a_bare}:{b_bare}:{ty}"
+    ));
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.SeqThy
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — `seq.suffixof` LAST-ELEMENT-mismatch
+  conflict grounded in the verified `SeqThy.suffix_append_last_conflict` (itself
+  built from the kernel-verified `suffixOf` / `getLast?_of_suffix` /
+  `suffix_last_conflict`). The assertion `seq.suffixof x (seq.++ … t)` is
+  unsatisfiable: a NON-EMPTY suffix shares the whole's LAST element, but the
+  alleged suffix `x = {x_lean}` ends in `{a_bare}` while the whole ends in
+  `{b_bare}` (the last `seq.++` operand `t = {t_lean}` is ground and non-empty, so
+  `last (p ++ t) = last t = {b_bare}` for EVERY prefix `p`), and `{a_bare} ≠
+  {b_bare}`. Reconstructed from the frontend parsed ASSERTIONS (ay reduces
+  seq.suffixof / seq.++ eagerly). The prefix `p` is quantified UNIVERSALLY, so the
+  certificate refutes the suffix relation for every value of the concrete prefix;
+  `x` and `t` are ground concrete lists, so every side condition closes by
+  `decide`. Pure Lean 4 core; axioms ⊆ {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.SeqSuffixof_{hash}
+open AySoundness
+
+/-- No prefix `p` makes `x = {x_lean}` a suffix of `p ++ {t_lean}`: the whole ends
+    in `{b_bare}`, the suffix in `{a_bare}`, and `{a_bare} ≠ {b_bare}`. -/
+theorem no_model (p : List {ty}) :
+    ¬ SeqThy.suffixOf (({x_lean}) : List {ty}) (p ++ (({t_lean}) : List {ty})) :=
+  fun h => SeqThy.suffix_append_last_conflict (({x_lean}) : List {ty}) p
+    (({t_lean}) : List {ty}) ({a_bare}) ({b_bare}) h
+    (by decide) (by decide) (by decide) (by decide) (by decide)
+
+end AySoundness.Emitted.SeqSuffixof_{hash}
+"#,
+    )
+}
+
+/// The `(S, I)` operands of a `(seq.nth S I)` read, else `None`.
+fn match_seq_nth(t: &PTerm) -> Option<(&PTerm, &PTerm)> {
+    match t {
+        PTerm::App(op, a) if op == "seq.nth" && a.len() == 2 => Some((&a[0], &a[1])),
+        _ => None,
+    }
+}
+
+/// Emit a verified-firewall Lean proof for a GROUND `seq.nth` + LIA conflict found
+/// among the PARSED assertions (possibly inside an `and`): a numeric comparison
+/// `(OP … (seq.nth S I) …)` where `S` resolves to a ground sequence, `I` to a
+/// pinned in-range index, the other operand constant-folds, and the comparison is
+/// FALSE once the read is bound to `S[I]`.
+///
+/// The total `seq.nth` is modelled by the verified `SeqThy.nthD` bridge; for an
+/// in-range read it equals the element, handing a concrete integer to LIA. The
+/// whole comparison is ground-false, so it is closed by `decide` over `Val =
+/// Unit`. `None` unless a genuinely-false ground comparison over an in-range read
+/// is found.
+pub(crate) fn emit_seq_nth_ground_lia_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+) -> Option<String> {
+    let int_binds = collect_int_binds(parsed);
+    let seq_binds = collect_seq_binds(parsed);
+    let mut conjuncts: Vec<&PTerm> = Vec::new();
+    for a in parsed {
+        flatten_and(a, &mut conjuncts);
+    }
+    for c in conjuncts {
+        let PTerm::App(op, args) = c else { continue };
+        let lean_op = match op.as_str() {
+            ">=" => "≥",
+            "<=" => "≤",
+            ">" => ">",
+            "<" => "<",
+            "=" => "=",
+            _ => continue,
+        };
+        if args.len() != 2 {
+            continue;
+        }
+        // `read_left`: the `seq.nth` read is the FIRST operand.
+        for read_left in [true, false] {
+            let (read_t, const_t) = if read_left {
+                (&args[0], &args[1])
+            } else {
+                (&args[1], &args[0])
+            };
+            let Some((s, i)) = match_seq_nth(read_t) else {
+                continue;
+            };
+            let Some(list) = parse_ground_seq(s, &seq_binds) else {
+                continue;
+            };
+            let Some(idx) = resolve_index(i, &int_binds) else {
+                continue;
+            };
+            let Some(SeqElt::Int(rv)) = eval_read(&list, idx) else {
+                continue;
+            };
+            let Some(cv) = fold_int(const_t, &int_binds) else {
+                continue;
+            };
+            let (lv, rhv) = if read_left { (rv, cv) } else { (cv, rv) };
+            let holds = match op.as_str() {
+                ">=" => lv >= rhv,
+                "<=" => lv <= rhv,
+                ">" => lv > rhv,
+                "<" => lv < rhv,
+                "=" => lv == rhv,
+                _ => continue,
+            };
+            // Only a genuine conflict (a FALSE ground comparison) qualifies.
+            if holds {
+                continue;
+            }
+            return Some(render_seq_nth_lia_lean(cv, lean_op, read_left, &list, idx));
+        }
+    }
+    None
+}
+
+/// Render the ground `seq.nth` + LIA firewall Lean. The total read is
+/// `SeqThy.nthD` (verified bridge); the ground-false comparison closes by
+/// `decide` over `Val = Unit`.
+fn render_seq_nth_lia_lean(
+    c: i64,
+    lean_op: &str,
+    read_left: bool,
+    list: &[SeqElt],
+    idx: i64,
+) -> String {
+    let hash = fnv_hex(&format!(
+        "seqnthlia:{c}:{lean_op}:{read_left}:{}:{idx}",
+        seq_list_lean(list)
+    ));
+    let list_lean = seq_list_lean(list);
+    let nthd = format!("SeqThy.nthD (({list_lean}) : SeqThy.Seq Int) {idx} (0 : Int)");
+    let cexpr = format!("({c} : Int)");
+    let (lhs, rhs) = if read_left {
+        (nthd, cexpr)
+    } else {
+        (cexpr, nthd)
+    };
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.SeqThy
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — GROUND `seq.nth` + LIA conflict grounded
+  in the verified `firewall_combined_unsat`. A numeric comparison over the total
+  read `seq.nth s i` is unsatisfiable once the in-range read is bound to `s[i]`:
+  the verified `SeqThy.nthD` bridge evaluates the total read to the concrete
+  element, and the resulting all-constant comparison is FALSE in LIA (mirrors
+  `SeqThy.ex_seq_nth_ground_lia_conflict`). Reconstructed from the frontend parsed
+  ASSERTIONS (ay refutes eagerly; the irrelevant conjuncts are red herrings).
+  Model: `Val = Unit` (fully ground). Pure Lean 4 core; axioms ⊆ {{propext,
+  Quot.sound}}.
+-/
+namespace AySoundness.Emitted.SeqNthLia_{hash}
+open AySoundness
+
+abbrev Val := Unit
+
+/-- Atom `1 ↦` the asserted (ground-false) `seq.nth` comparison. -/
+def atomVal (_m : Val) (k : Nat) : Bool :=
+  match k with
+  | 1 => decide ({lhs} {lean_op} {rhs})
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1])]
+def lemmas   : List (Cid × Clause) := [(2, [-1])]
+def proof    : List (Cid × Clause × List Int) := [(3, [], [1, 2])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1] = true := by
+  have ha : atomVal m 1 = false := by cases m <;> decide
+  simp [clauseSat, litSat, List.any_cons, List.any_nil, ha]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- The ground `seq.nth` comparison is false — via the firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.SeqNthLia_{hash}
+"#,
+    )
+}
+
+/// Emit a verified-firewall Lean proof for a BOUNDED 2-way `seq.at`-vs-`ite`
+/// conflict found among the PARSED assertions: `(= (seq.at S I) (ite C TB FB))`
+/// (either operand order) where `S` resolves to a ground sequence with an in-range
+/// read, and BOTH ground `ite` branches `TB`/`FB` differ from the read.
+///
+/// The abstract `ite` condition `C` is modelled as a free `Bool` — it is never
+/// evaluated (so a red-herring OOB `seq.nth` inside `C` is absorbed). The
+/// certificate case-splits on that `Bool`: both branches are ground-false against
+/// the verified `SeqThy.seqAt` read (true-branch element/length mismatch,
+/// false-branch length mismatch), closed by `cases m <;> decide`. Grounded through
+/// `firewall_combined_unsat` over `Val = Bool`. `None` unless both branches are
+/// genuine conflicts.
+pub(crate) fn emit_seq_at_ite_firewall_lean_from_parsed(parsed: &[PTerm]) -> Option<String> {
+    let int_binds = collect_int_binds(parsed);
+    let seq_binds = collect_seq_binds(parsed);
+    for asrt in parsed {
+        let PTerm::App(op, args) = asrt else { continue };
+        if op != "=" || args.len() != 2 {
+            continue;
+        }
+        for (p, q) in [(&args[0], &args[1]), (&args[1], &args[0])] {
+            // p = (seq.at S I)
+            let PTerm::App(aop, aargs) = p else { continue };
+            if aop != "seq.at" || aargs.len() != 2 {
+                continue;
+            }
+            // q = (ite C TB FB)
+            let PTerm::App(iop, iargs) = q else { continue };
+            if iop != "ite" || iargs.len() != 3 {
+                continue;
+            }
+            let Some(list) = parse_ground_seq(&aargs[0], &seq_binds) else {
+                continue;
+            };
+            let Some(idx) = resolve_index(&aargs[1], &int_binds) else {
+                continue;
+            };
+            let Some(read) = eval_read(&list, idx) else {
+                continue;
+            };
+            let Some(tb) = parse_ground_seq(&iargs[1], &seq_binds) else {
+                continue;
+            };
+            let Some(fb) = parse_ground_seq(&iargs[2], &seq_binds) else {
+                continue;
+            };
+            // The read is the length-1 singleton `[read]`.
+            let read_seq = vec![read];
+            // Both branches must genuinely conflict with the read.
+            if read_seq == tb || read_seq == fb {
+                continue;
+            }
+            let Some(ty) = seq_elt_ty(&list) else {
+                continue;
+            };
+            // Branch element types (where present) must match the read's.
+            if !tb.iter().chain(fb.iter()).all(|e| e.lean_ty() == ty) {
+                continue;
+            }
+            return Some(render_seq_at_ite_lean(&list, idx, &tb, &fb, ty));
+        }
+    }
+    None
+}
+
+/// Render the bounded 2-way `seq.at`-vs-`ite` firewall Lean. The abstract
+/// condition is a free `Bool m`; both branches close by `cases m <;> decide` over
+/// the verified `SeqThy.seqAt` read model.
+fn render_seq_at_ite_lean(
+    list: &[SeqElt],
+    idx: i64,
+    tb: &[SeqElt],
+    fb: &[SeqElt],
+    ty: &str,
+) -> String {
+    let hash = fnv_hex(&format!(
+        "seqatite:{}:{idx}:{}:{}",
+        seq_list_lean(list),
+        seq_list_lean(tb),
+        seq_list_lean(fb)
+    ));
+    let read_lean = seq_list_lean(list);
+    let tb_lean = seq_list_lean(tb);
+    let fb_lean = seq_list_lean(fb);
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.SeqThy
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — BOUNDED 2-way `seq.at`-vs-`ite` conflict
+  grounded in the verified `firewall_combined_unsat`. The literal
+  `seq.at s i = ite c TB FB` is unsatisfiable REGARDLESS of the condition `c`: the
+  read `seq.at s i` is the fixed length-1 singleton `s[i]`, and BOTH ground
+  branches differ from it (true-branch element/length mismatch, false-branch
+  length mismatch — cf. `SeqThy.ex_seqat_ite_true_conflict` /
+  `ex_seqat_ite_false_conflict`). The abstract condition (a red-herring OOB
+  `seq.nth`) is modelled as a free `Bool` and NEVER evaluated; the proof
+  case-splits on it (`cases m <;> decide`). Reconstructed from the frontend parsed
+  ASSERTIONS (ay reduces seq.at eagerly). Model: `Val = Bool` (the condition).
+  Pure Lean 4 core; axioms ⊆ {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.SeqAtIte_{hash}
+open AySoundness
+
+abbrev Val := Bool
+
+/-- Atom `1 ↦ seq.at s i = (if c then TB else FB)` with `c := m`. -/
+def atomVal (m : Val) (k : Nat) : Bool :=
+  match k with
+  | 1 => decide (SeqThy.seqAt (({read_lean}) : SeqThy.Seq {ty}) {idx} = (bif m then (({tb_lean}) : SeqThy.Seq {ty}) else (({fb_lean}) : SeqThy.Seq {ty})))
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1])]
+def lemmas   : List (Cid × Clause) := [(2, [-1])]
+def proof    : List (Cid × Clause × List Int) := [(3, [], [1, 2])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1] = true := by
+  have ha : atomVal m 1 = false := by cases m <;> decide
+  simp [clauseSat, litSat, List.any_cons, List.any_nil, ha]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- Neither `ite` branch matches the `seq.at` read, for any condition — via the
+    firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.SeqAtIte_{hash}
 "#,
     )
 }

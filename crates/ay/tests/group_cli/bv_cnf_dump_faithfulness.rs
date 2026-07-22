@@ -526,10 +526,13 @@ fn unsupported_later_check_clears_the_preceding_artifact() {
         .filter(|line| matches!(line.trim(), "sat" | "unsat" | "unknown"))
         .map(str::trim)
         .collect();
+    // The rejected second check answers with the synthesized fail-closed
+    // `unknown` (every decision query emits a verdict); only the certified
+    // first decision may emit a definitive sat/unsat.
     assert_eq!(
         verdicts,
-        ["sat"],
-        "only the first supported check may emit a verdict; stdout={stdout}; stderr={stderr}"
+        ["sat", "unknown"],
+        "only the first supported check may emit a definitive verdict; stdout={stdout}; stderr={stderr}"
     );
     assert!(
         stdout.contains("supports pure QF_BV") || stderr.contains("supports pure QF_BV"),
@@ -586,11 +589,14 @@ fn optimization_and_maxsmt_checks_fail_before_verdict_and_clear_stale_dump() {
         let output = run_smt_dump(&input, &dump);
         let (stdout, stderr) = output_text(&output);
         assert!(!output.status.success(), "stdout={stdout}; stderr={stderr}");
+        // The rejected check answers the synthesized fail-closed `unknown`
+        // (every decision query emits a verdict); a definitive sat/unsat must
+        // never escape.
         assert!(
             !stdout
                 .lines()
-                .any(|line| matches!(line.trim(), "sat" | "unsat" | "unknown")),
-            "optimization must be rejected before a verdict; stdout={stdout}; stderr={stderr}"
+                .any(|line| matches!(line.trim(), "sat" | "unsat")),
+            "optimization must be rejected without a definitive verdict; stdout={stdout}; stderr={stderr}"
         );
         assert!(
             stdout.contains("does not support optimization or MaxSMT")
@@ -604,16 +610,26 @@ fn optimization_and_maxsmt_checks_fail_before_verdict_and_clear_stale_dump() {
 #[test]
 #[timeout(60_000)]
 fn failed_assumption_elaboration_and_internal_probes_retire_prior_artifact() {
-    for (name, smt) in [
+    // A failed decision query (the elaboration-failed `check-sat-assuming`)
+    // answers the synthesized fail-closed `unknown`; failed non-decision
+    // probes emit no verdict of their own. Either way no definitive second
+    // sat/unsat may escape and the artifact must be retired.
+    for (name, smt, expected_verdicts) in [
         (
             "failed-assumption-elaboration",
             FAILED_ASSUMING_COMMAND_AFTER_VALID_EXPORT,
+            vec!["sat", "unknown"],
         ),
         (
             "get-consequences-probe",
             GET_CONSEQUENCES_AFTER_VALID_EXPORT,
+            vec!["sat"],
         ),
-        ("solver-apply-probe", SOLVER_APPLY_AFTER_VALID_EXPORT),
+        (
+            "solver-apply-probe",
+            SOLVER_APPLY_AFTER_VALID_EXPORT,
+            vec!["sat"],
+        ),
     ] {
         let temp = TempDir::new(name);
         let input = temp.write("input.smt2", smt);
@@ -628,9 +644,8 @@ fn failed_assumption_elaboration_and_internal_probes_retire_prior_artifact() {
             .map(str::trim)
             .collect();
         assert_eq!(
-            verdicts,
-            ["sat"],
-            "only the certified first decision may escape; stdout={stdout}; stderr={stderr}"
+            verdicts, expected_verdicts,
+            "only the certified first decision may emit a definitive verdict; stdout={stdout}; stderr={stderr}"
         );
         assert!(!dump.exists(), "rejected follow-up must retire artifact");
     }
@@ -639,8 +654,11 @@ fn failed_assumption_elaboration_and_internal_probes_retire_prior_artifact() {
 #[test]
 #[timeout(60_000)]
 fn named_core_redirect_and_malformed_decision_retire_artifacts_before_verdict() {
+    // The rejected named-core check answers the synthesized fail-closed
+    // `unknown` (every decision query emits a verdict); a definitive
+    // sat/unsat never escapes an unexported decision.
     for (name, smt, expected_verdicts) in [
-        ("named-core", NAMED_CORE_REDIRECT, Vec::<&str>::new()),
+        ("named-core", NAMED_CORE_REDIRECT, vec!["unknown"]),
         (
             "malformed-decision",
             MALFORMED_DECISION_AFTER_VALID_EXPORT,
@@ -707,11 +725,14 @@ fn mismatched_declared_logic_cannot_bypass_pure_qf_bv_gate() {
         let output = run_smt_dump(&input, &dump);
         let (stdout, stderr) = output_text(&output);
         assert!(!output.status.success(), "stdout={stdout}; stderr={stderr}");
+        // The rejected check answers the synthesized fail-closed `unknown`
+        // (every decision query emits a verdict); a definitive sat/unsat must
+        // never escape the unexportable formula.
         assert!(
             !stdout
                 .lines()
-                .any(|line| matches!(line.trim(), "sat" | "unsat" | "unknown")),
-            "unsupported array formula must be rejected before a verdict; stdout={stdout}; stderr={stderr}"
+                .any(|line| matches!(line.trim(), "sat" | "unsat")),
+            "unsupported array formula must be rejected without a definitive verdict; stdout={stdout}; stderr={stderr}"
         );
         assert!(
             stdout.contains("supports pure QF_BV") || stderr.contains("supports pure QF_BV"),

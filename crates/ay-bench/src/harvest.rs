@@ -2469,6 +2469,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
     fn test_run_solver_drains_large_output_without_pipe_deadlock() {
         use std::os::unix::fs::PermissionsExt as _;
 

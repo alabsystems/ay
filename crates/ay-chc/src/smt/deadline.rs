@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn install_and_drop_restores() {
         {
-            let _guard = ScopedSmtDeadline::install(Duration::from_secs(60));
+            let _guard = ScopedSmtDeadline::install(Duration::from_mins(1));
             assert!(smt_deadline_remaining().is_some());
             assert!(!smt_deadline_expired());
         }
@@ -170,7 +170,7 @@ mod tests {
         let _outer = ScopedSmtDeadline::install(Duration::from_millis(50));
         let outer_remaining = smt_deadline_remaining().unwrap();
         {
-            let _inner = ScopedSmtDeadline::install(Duration::from_secs(60));
+            let _inner = ScopedSmtDeadline::install(Duration::from_mins(1));
             // Inner scope must keep the tighter outer deadline.
             assert!(smt_deadline_remaining().unwrap() <= Duration::from_millis(50));
         }

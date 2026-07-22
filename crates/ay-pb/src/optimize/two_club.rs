@@ -718,6 +718,76 @@ fn indep_2dom_cuts(
     out
 }
 
+/// VIOLATED-CLIQUE separation at the fractional point `x*`: cliques `Q` in
+/// the violating-pair graph with `Σ_{v∈Q} x*_v > 1 + 0.03`. The blind family
+/// (viol_clique_rows) grows by degree and misses exactly the x*-heavy
+/// cliques; violated cliques of size ≥ 4 are also outside the exact-triple
+/// 2-domination scan. Greedy growth by descending x* from each x*-heavy
+/// violating edge; emitted in the 2-domination cut format with empty hub
+/// lists (a clique is the all-pairs-violating, zero-hub special case).
+fn violated_cliques_at_x(
+    tc: &TwoClub,
+    state: &SearchState,
+    x: &[f64],
+    cap: usize,
+) -> Vec<(Vec<u32>, Vec<(u32, u8)>)> {
+    use std::collections::{HashMap, HashSet};
+    let mut adj: HashMap<u32, HashSet<u32>> = HashMap::new();
+    let mut edges: Vec<(u32, u32)> = Vec::new();
+    for (pi, (a, b, _)) in tc.pairs.iter().enumerate() {
+        if state.both_in[pi] && state.cn_alive[pi] == 0 {
+            adj.entry(*a).or_default().insert(*b);
+            adj.entry(*b).or_default().insert(*a);
+            edges.push((*a, *b));
+        }
+    }
+    if edges.is_empty() {
+        return Vec::new();
+    }
+    // Heaviest edges first; only x*-support endpoints are worth seeding.
+    edges.retain(|&(a, b)| x[a as usize] + x[b as usize] > 0.4);
+    edges.sort_unstable_by(|&(a1, b1), &(a2, b2)| {
+        (x[a2 as usize] + x[b2 as usize])
+            .partial_cmp(&(x[a1 as usize] + x[b1 as usize]))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    edges.truncate(400);
+    let mut seen: HashSet<Vec<u32>> = HashSet::new();
+    let mut out = Vec::new();
+    for &(a, b) in &edges {
+        if out.len() >= cap {
+            break;
+        }
+        let mut clique = vec![a, b];
+        let mut weight = x[a as usize] + x[b as usize];
+        let ba = &adj[&b];
+        let mut cands: Vec<u32> = adj[&a]
+            .iter()
+            .copied()
+            .filter(|u| ba.contains(u) && x[*u as usize] > 1e-6)
+            .collect();
+        cands.sort_unstable_by(|&u, &v| {
+            x[v as usize]
+                .partial_cmp(&x[u as usize])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for u in cands {
+            let ua = &adj[&u];
+            if clique.iter().all(|&q| ua.contains(&q)) {
+                weight += x[u as usize];
+                clique.push(u);
+            }
+        }
+        if weight > 1.03 && clique.len() >= 3 {
+            clique.sort_unstable();
+            if seen.insert(clique.clone()) {
+                out.push((clique, Vec::new()));
+            }
+        }
+    }
+    out
+}
+
 /// Builds the Solve-mode model rows: pair rows (CN restricted to `C`, sorted
 /// merge of endpoints into the CN stream) followed by clique-cut rows.
 /// Returns `(rows_raw, pair_of_row, cliques)`; `None` if over `cfg.max_rows`.
@@ -1236,98 +1306,124 @@ fn refresh_dual_snapshot(
     // separation finds violations 0.05-0.33 at ~2/3 of near-misses, exactly at
     // the binding points (the development design notes*).
     if !prune && base + sum >= -(best_floor + 4) * DUAL_SCALE {
-        let cuts = indep_2dom_cuts(tc, state, &xstar, 50);
-        if !cuts.is_empty() {
-            if let Some((mut rows2, pair_of_row2, cliques2)) = build_solve_rows(tc, state, cfg) {
-                let n_pc = rows2.len();
-                for (members, hubs) in &cuts {
-                    let mut coeffs: Vec<(usize, f64)> = members
-                        .iter()
-                        .map(|&i| (i as usize, -1.0))
-                        .chain(hubs.iter().map(|&(v, c)| (v as usize, c as f64)))
-                        .collect();
-                    coeffs.sort_unstable_by_key(|e| e.0);
-                    rows2.push((coeffs, -1.0));
-                }
-                let c2: Vec<f64> = (0..n)
-                    .map(|v| if state.in_c[v] { -1.0 } else { 0.0 })
+        // BOUNDED SEPARATION: both families — 2-domination triples
+        // (hub-charging) and x*-violated cliques — are re-separated at each
+        // round's new fractional point; cuts accumulate. Measurements showed
+        // no prune conversions beyond the first round, so production keeps the
+        // generic engine capped at one round to avoid the observed tailing-off.
+        const CUT_SEPARATION_ROUNDS: usize = 1;
+        let mut all_cuts: Vec<(Vec<u32>, Vec<(u32, u8)>)> = Vec::new();
+        let mut x_cur = xstar.clone();
+        for round in 0..CUT_SEPARATION_ROUNDS {
+            if prune {
+                break;
+            }
+            let mut fresh = indep_2dom_cuts(tc, state, &x_cur, 40);
+            fresh.extend(violated_cliques_at_x(tc, state, &x_cur, 40));
+            // Dedup against accumulated cuts by member list.
+            fresh.retain(|(m, _)| !all_cuts.iter().any(|(m2, _)| m2 == m));
+            if fresh.is_empty() {
+                break;
+            }
+            all_cuts.extend(fresh);
+            let Some((mut rows2, pair_of_row2, cliques2)) = build_solve_rows(tc, state, cfg) else {
+                break;
+            };
+            let n_pc = rows2.len();
+            for (members, hubs) in &all_cuts {
+                let mut coeffs: Vec<(usize, f64)> = members
+                    .iter()
+                    .map(|&i| (i as usize, -1.0))
+                    .chain(hubs.iter().map(|&(v, c)| (v as usize, c as f64)))
                     .collect();
-                if let Some((duals2, _x2)) =
-                    crate::optimize::safe_lp_bound::safe_lp_duals_and_primal_from_raw(
-                        n,
-                        c2,
-                        rows2,
-                        Some(-(best_floor as f64) + 0.5),
-                        should_stop,
-                    )
-                {
-                    if duals2.len() == n_pc + cuts.len() {
-                        let mut base2: i128 = 0;
-                        let mut ay2 = vec![0i128; n];
-                        for (row_i, &pi) in pair_of_row2.iter().enumerate() {
-                            let m = ((duals2[row_i] * DUAL_SCALE as f64).floor() as i128)
-                                .clamp(0, DUAL_M_MAX);
-                            if m == 0 {
-                                continue;
-                            }
-                            base2 -= m;
-                            let (a, b, cn) = &tc.pairs[pi as usize];
-                            ay2[*a as usize] -= m;
-                            ay2[*b as usize] -= m;
-                            for &kk in cn {
-                                if state.in_c[kk as usize] {
-                                    ay2[kk as usize] += m;
-                                }
-                            }
-                        }
-                        for (qi, q) in cliques2.iter().enumerate() {
-                            let m = ((duals2[pair_of_row2.len() + qi] * DUAL_SCALE as f64).floor()
-                                as i128)
-                                .clamp(0, DUAL_M_MAX);
-                            if m == 0 {
-                                continue;
-                            }
-                            base2 -= m;
-                            for &v in q {
-                                ay2[v as usize] -= m;
-                            }
-                        }
-                        for (ci, (members, hubs)) in cuts.iter().enumerate() {
-                            let m = ((duals2[n_pc + ci] * DUAL_SCALE as f64).floor() as i128)
-                                .clamp(0, DUAL_M_MAX);
-                            if m == 0 {
-                                continue;
-                            }
-                            base2 -= m;
-                            for &i in members {
-                                ay2[i as usize] -= m;
-                            }
-                            for &(v, cc) in hubs {
-                                ay2[v as usize] += (cc as i128) * m;
-                            }
-                        }
-                        let d2: Vec<i128> = ay2.iter().map(|&a| -DUAL_SCALE - a).collect();
-                        let sum2: i128 = (0..n)
-                            .filter(|&v| state.in_c[v])
-                            .map(|v| d2[v].min(0))
-                            .sum();
-                        if std::env::var_os("TWO_CLUB_TRACE").is_some() {
-                            eprintln!(
-                                "  [2cut] c={} ub_before={:.2} ub_after={:.2} ncuts={}",
-                                state.c_size,
-                                -((base + sum) as f64) / DUAL_SCALE as f64,
-                                -((base2 + sum2) as f64) / DUAL_SCALE as f64,
-                                cuts.len(),
-                            );
-                        }
-                        if base2 + sum2 > base + sum {
-                            base = base2;
-                            d = d2;
-                            sum = sum2;
-                            prune = base + sum >= -best_floor * DUAL_SCALE;
-                        }
+                coeffs.sort_unstable_by_key(|e| e.0);
+                rows2.push((coeffs, -1.0));
+            }
+            let c2: Vec<f64> = (0..n)
+                .map(|v| if state.in_c[v] { -1.0 } else { 0.0 })
+                .collect();
+            let Some((duals2, x2)) =
+                crate::optimize::safe_lp_bound::safe_lp_duals_and_primal_from_raw(
+                    n,
+                    c2,
+                    rows2,
+                    Some(-(best_floor as f64) + 0.5),
+                    should_stop,
+                )
+            else {
+                break;
+            };
+            if duals2.len() != n_pc + all_cuts.len() {
+                break;
+            }
+            let mut base2: i128 = 0;
+            let mut ay2 = vec![0i128; n];
+            for (row_i, &pi) in pair_of_row2.iter().enumerate() {
+                let m = ((duals2[row_i] * DUAL_SCALE as f64).floor() as i128).clamp(0, DUAL_M_MAX);
+                if m == 0 {
+                    continue;
+                }
+                base2 -= m;
+                let (a, b, cn) = &tc.pairs[pi as usize];
+                ay2[*a as usize] -= m;
+                ay2[*b as usize] -= m;
+                for &kk in cn {
+                    if state.in_c[kk as usize] {
+                        ay2[kk as usize] += m;
                     }
                 }
+            }
+            for (qi, q) in cliques2.iter().enumerate() {
+                let m = ((duals2[pair_of_row2.len() + qi] * DUAL_SCALE as f64).floor() as i128)
+                    .clamp(0, DUAL_M_MAX);
+                if m == 0 {
+                    continue;
+                }
+                base2 -= m;
+                for &v in q {
+                    ay2[v as usize] -= m;
+                }
+            }
+            for (ci, (members, hubs)) in all_cuts.iter().enumerate() {
+                let m =
+                    ((duals2[n_pc + ci] * DUAL_SCALE as f64).floor() as i128).clamp(0, DUAL_M_MAX);
+                if m == 0 {
+                    continue;
+                }
+                base2 -= m;
+                for &i in members {
+                    ay2[i as usize] -= m;
+                }
+                for &(v, cc) in hubs {
+                    ay2[v as usize] += (cc as i128) * m;
+                }
+            }
+            let d2: Vec<i128> = ay2.iter().map(|&a| -DUAL_SCALE - a).collect();
+            let sum2: i128 = (0..n)
+                .filter(|&v| state.in_c[v])
+                .map(|v| d2[v].min(0))
+                .sum();
+            let improved = base2 + sum2 > base + sum;
+            if std::env::var_os("TWO_CLUB_TRACE").is_some() {
+                eprintln!(
+                    "  [2cut] c={} round={} ub={:.2}->{:.2} ncuts={} improved={}",
+                    state.c_size,
+                    round + 1,
+                    -((base + sum) as f64) / DUAL_SCALE as f64,
+                    -((base2 + sum2) as f64) / DUAL_SCALE as f64,
+                    all_cuts.len(),
+                    improved,
+                );
+            }
+            if improved {
+                base = base2;
+                d = d2;
+                sum = sum2;
+                prune = base + sum >= -best_floor * DUAL_SCALE;
+            }
+            x_cur = x2;
+            if !improved {
+                break;
             }
         }
     }

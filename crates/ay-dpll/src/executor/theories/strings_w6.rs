@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! W6 — digit/arithmetic-aware and regex-word witness moves
-//! (`AY_STR_W6=1`, default OFF).
+//! (default ON, `AY_STR_W6=0` kill switch).
 //!
 //! ## The measured gap W6 closes
 //!
@@ -103,7 +103,7 @@ use super::super::model::{EvalValue, Model};
 use super::super::Executor;
 use super::strings_w4::{w4_memo_reset, w4_trial_model, MAX_W4_LEN};
 
-/// Master switch (`AY_STR_W6=1`, default OFF → byte-identical to W5-only).
+/// Master switch (default ON, `AY_STR_W6=0` kill switch → byte-identical to W5-only).
 pub(in crate::executor) fn str_w6_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // DEFAULT-ON: 16 of the last 27 sat-side misses convert, ALL 16 confirmed

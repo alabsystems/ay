@@ -49,9 +49,9 @@ name = "ay-pb"
 path = "src/bin/ay.rs"
 
 [dev-dependencies]
+ay-test-support.workspace = true
 # Compile-fail lock for the primal worker-return split (tests/trybuild.rs):
 # a primal optimization worker must be STRUCTURALLY unable to produce a
 # Done/OptimumFound verdict.
 trybuild.workspace = true
 num-rational.workspace = true
-ay-test-support.workspace = true

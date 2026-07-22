@@ -529,6 +529,7 @@ impl Environment {
 /// Extract a deterministic Linux CPU identity without inventing a marketing
 /// name. x86 usually supplies `model name`; ARM commonly exposes only numeric
 /// implementer/part pairs, possibly with multiple distinct core types.
+#[cfg(any(not(target_os = "macos"), test))]
 fn linux_cpu_model(cpuinfo: &str, arch: &str) -> String {
     if let Some(model) = cpuinfo.lines().find_map(|line| {
         let (key, value) = line.split_once(':')?;
@@ -662,7 +663,12 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc")),
+    ))]
     fn write_solver_script(dir: &tempfile::TempDir, name: &str, version_output: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
@@ -724,7 +730,12 @@ CPU part : 0xd4f\n";
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc")),
+    ))]
     #[test]
     fn test_capture_parses_structured_solver_provenance() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -738,7 +749,14 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
 
         let env = Environment::capture(&solver);
 
-        assert_eq!(env.ay_path, solver.display().to_string());
+        assert_eq!(
+            env.ay_path,
+            solver
+                .canonicalize()
+                .expect("canonical solver path")
+                .display()
+                .to_string()
+        );
         assert_eq!(env.ay_version, version_output);
         assert_eq!(env.ay_build_version, "0.9.0");
         assert_eq!(env.ay_build_commit, "abc123");

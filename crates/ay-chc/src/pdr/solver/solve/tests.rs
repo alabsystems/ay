@@ -428,7 +428,7 @@ fn solve_init_keeps_default_when_no_ambient_deadline() {
         .solve_deadline
         .expect("solve_init installs a deadline");
     assert!(
-        installed >= before + std::time::Duration::from_secs(60),
+        installed >= before + std::time::Duration::from_mins(1),
         "with no ambient deadline and no solve_timeout, the generous safety default must remain"
     );
 }

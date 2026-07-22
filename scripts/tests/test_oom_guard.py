@@ -249,8 +249,21 @@ class PlanSolverResourcesTest(unittest.TestCase):
                         stream.close()
 
     def test_count_active_rustc_returns_count(self):
+        if not Path("/proc").is_dir():
+            with self.assertRaisesRegex(RuntimeError, "cannot inspect build processes"):
+                og.count_active_rustc()
+            return
         self.assertIsInstance(og.count_active_rustc(), int)
         self.assertGreaterEqual(og.count_active_rustc(), 0)
+
+    def test_warn_concurrent_build_preserves_process_scan_failure(self):
+        with mock.patch.object(
+            og,
+            "count_active_rustc",
+            side_effect=RuntimeError("process scan unavailable"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "process scan unavailable"):
+                og.warn_concurrent_build()
 
     def test_build_detection_includes_targo_and_trustc_and_excludes_ancestor(self):
         with tempfile.TemporaryDirectory() as td:

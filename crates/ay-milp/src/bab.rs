@@ -14698,6 +14698,49 @@ pub fn diag_float_lp(model: &Model, secs: f64) -> String {
     let cand = lp.solve_bounded(&lp.lower, &lp.upper, None, Some(deadline));
     let wall = t.elapsed().as_secs_f64();
     let obj: f64 = (0..lp.n).map(|j| lp.cost[j] * cand.values[j]).sum();
+    // MEASUREMENT KNOB (diag only): dump the fractional LP vertex + row
+    // tightness to derive cuts on hard covering instances. Disabled unless the
+    // documented exact value `AY_DUMP_VERTEX=1` is present.
+    if std::env::var("AY_DUMP_VERTEX").as_deref() == Ok("1") {
+        let n = model.num_cols();
+        let mut buckets = [0usize; 11];
+        let mut nfrac = 0usize;
+        let (mut sb, mut sc) = (0.0f64, 0.0f64);
+        for j in 0..n {
+            let v = cand.values[j];
+            let b = ((v.clamp(0.0, 1.0)) * 10.0).round() as usize;
+            buckets[b.min(10)] += 1;
+            if v.fract().abs() > 1e-6 && (1.0 - v.fract()).abs() > 1e-6 {
+                nfrac += 1;
+            }
+            match model.col_kind(Col(j as u32)) {
+                ColKind::Continuous => sc += v,
+                _ => sb += v,
+            }
+        }
+        eprintln!("VERTEX obj={obj:.6} cols={n} frac={nfrac} sum_bin={sb:.4} sum_cont={sc:.4} hist={buckets:?}");
+        let mut tight = 0usize;
+        let mut loose = 0usize;
+        for r in 0..model.num_rows() {
+            let row = model.row_at(r).expect("row");
+            let (coeffs, lb, _ub) = model.row(row);
+            let act: f64 = coeffs
+                .iter()
+                .map(|&(c, a)| a * cand.values[c as usize])
+                .sum();
+            if lb.is_finite() {
+                if (act - lb).abs() < 1e-4 {
+                    tight += 1;
+                } else {
+                    loose += 1;
+                }
+            }
+        }
+        eprintln!(
+            "VERTEX tight_ge_rows={tight} loose_ge_rows={loose} total_rows={}",
+            model.num_rows()
+        );
+    }
     use std::sync::atomic::Ordering::Relaxed;
     format!(
         "diag_float_lp: status={:?} obj(min-form)={obj:.6} wall={wall:.3}s primal={} (degen={} flips={} moved={}) dual={} (degen={}) refac={} ({:.2}s, {} repairs)",
@@ -23879,6 +23922,9 @@ mod prop_tests {
 mod tests {
     use super::*;
     use crate::model::Sense;
+    // The one workspace env choke point: serialized, restore-on-exit (also on
+    // panic) process-environment mutation for these tests.
+    use ay_test_support::env::{lock_env, with_env_edits, ScopedEnvVar};
 
     /// The top-level MILP call site must pass an already-expired caller
     /// deadline into the parity device unchanged.  This rank-2/nullity-1
@@ -24447,14 +24493,16 @@ mod tests {
     #[test]
     fn prop_conflict_learning_preserves_the_optimum() {
         use std::sync::atomic::Ordering::Relaxed;
-        let _env = env_guard_lock();
+        let _env_lock = lock_env();
         let stored_before = PC_STORED_TOTAL.load(Relaxed);
-        std::env::set_var("AY_MILP_PROP_CONFLICT", "2");
-        std::env::set_var("AY_MILP_IMPL", "force");
-        std::env::set_var("AY_MILP_IMPL_ARM", "0");
-        std::env::set_var("AY_MILP_NG_UP", "2");
-        std::env::set_var("AY_MILP_HEUR_SHARE", "0");
-        std::env::set_var("AY_MILP_NO_CUTS", "1");
+        let _guards = [
+            ScopedEnvVar::set("AY_MILP_PROP_CONFLICT", "2"),
+            ScopedEnvVar::set("AY_MILP_IMPL", "force"),
+            ScopedEnvVar::set("AY_MILP_IMPL_ARM", "0"),
+            ScopedEnvVar::set("AY_MILP_NG_UP", "2"),
+            ScopedEnvVar::set("AY_MILP_HEUR_SHARE", "0"),
+            ScopedEnvVar::set("AY_MILP_NO_CUTS", "1"),
+        ];
         let mut seed = 0xC0DE_2026_u64;
         let mut rnd = move || {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
@@ -24555,12 +24603,7 @@ mod tests {
                 (want, got) => panic!("brute force {want:?} vs solver {got:?}"),
             }
         }
-        std::env::remove_var("AY_MILP_PROP_CONFLICT");
-        std::env::remove_var("AY_MILP_IMPL");
-        std::env::remove_var("AY_MILP_IMPL_ARM");
-        std::env::remove_var("AY_MILP_NG_UP");
-        std::env::remove_var("AY_MILP_HEUR_SHARE");
-        std::env::remove_var("AY_MILP_NO_CUTS");
+        // `_guards` restore (drop) at end of scope, still under `_env_lock`.
         assert!(
             PC_STORED_TOTAL.load(Relaxed) > stored_before,
             "guard is vacuous: no solve ever stored a propagation-conflict box"
@@ -24741,14 +24784,16 @@ mod tests {
     #[test]
     fn lb_conflict_learning_preserves_the_optimum() {
         use std::sync::atomic::Ordering::Relaxed;
-        let _env = env_guard_lock();
+        let _env_lock = lock_env();
         let stored_before = LB_STORED_TOTAL.load(Relaxed);
-        std::env::set_var("AY_MILP_LB_CONFLICT", "2");
-        std::env::set_var("AY_MILP_LB_ARM", "0");
-        std::env::set_var("AY_MILP_LB_STRICT", "0");
-        std::env::set_var("AY_MILP_NG_UP", "2");
-        std::env::set_var("AY_MILP_HEUR_SHARE", "0");
-        std::env::set_var("AY_MILP_NO_CUTS", "1");
+        let _guards = [
+            ScopedEnvVar::set("AY_MILP_LB_CONFLICT", "2"),
+            ScopedEnvVar::set("AY_MILP_LB_ARM", "0"),
+            ScopedEnvVar::set("AY_MILP_LB_STRICT", "0"),
+            ScopedEnvVar::set("AY_MILP_NG_UP", "2"),
+            ScopedEnvVar::set("AY_MILP_HEUR_SHARE", "0"),
+            ScopedEnvVar::set("AY_MILP_NO_CUTS", "1"),
+        ];
         let mut seed = 0x1B0D_2026_u64;
         let mut rnd = move || {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
@@ -24844,12 +24889,7 @@ mod tests {
                 (want, got) => panic!("brute force {want:?} vs solver {got:?}"),
             }
         }
-        std::env::remove_var("AY_MILP_LB_CONFLICT");
-        std::env::remove_var("AY_MILP_LB_ARM");
-        std::env::remove_var("AY_MILP_LB_STRICT");
-        std::env::remove_var("AY_MILP_NG_UP");
-        std::env::remove_var("AY_MILP_HEUR_SHARE");
-        std::env::remove_var("AY_MILP_NO_CUTS");
+        // `_guards` restore (drop) at end of scope, still under `_env_lock`.
         assert!(
             LB_STORED_TOTAL.load(Relaxed) > stored_before,
             "guard is vacuous: no solve ever stored an LP-bound conflict box"
@@ -24863,15 +24903,17 @@ mod tests {
     /// test in this binary touches this env var, so set/remove here cannot race a reader.
     #[test]
     fn rins_every_env_override() {
-        std::env::remove_var("AY_MILP_RINS_EVERY");
-        assert_eq!(rins_every(), RINS_EVERY);
-        std::env::set_var("AY_MILP_RINS_EVERY", "5000");
-        assert_eq!(rins_every(), 5000);
-        std::env::set_var("AY_MILP_RINS_EVERY", "junk");
-        assert_eq!(rins_every(), RINS_EVERY);
-        std::env::set_var("AY_MILP_RINS_EVERY", "0");
-        assert_eq!(rins_every(), RINS_EVERY);
-        std::env::remove_var("AY_MILP_RINS_EVERY");
+        with_env_edits(|env| {
+            env.remove("AY_MILP_RINS_EVERY");
+            assert_eq!(rins_every(), RINS_EVERY);
+            env.set("AY_MILP_RINS_EVERY", "5000");
+            assert_eq!(rins_every(), 5000);
+            env.set("AY_MILP_RINS_EVERY", "junk");
+            assert_eq!(rins_every(), RINS_EVERY);
+            env.set("AY_MILP_RINS_EVERY", "0");
+            assert_eq!(rins_every(), RINS_EVERY);
+            env.remove("AY_MILP_RINS_EVERY");
+        });
     }
 
     /// THE FEASIBILITY-OBJECTIVE CLOSURE (`zero_objective` in `solve_milp_in`): a
@@ -25075,12 +25117,14 @@ mod tests {
         // `AY_MILP_NG_UP=2` is process-global: hold the same lock the symmetry
         // guard holds so its non-vacuity counters cannot be starved by trees
         // reshaped under forced unit propagation (and vice versa).
-        let _env = env_guard_lock();
+        let _env_lock = lock_env();
         let stored_before = NG_STORED_TOTAL.load(Relaxed);
-        std::env::set_var("AY_MILP_NG_UP", "2");
         // The tree must be the finder for no-goods to accumulate at all.
-        std::env::set_var("AY_MILP_HEUR_SHARE", "0");
-        std::env::set_var("AY_MILP_NO_CUTS", "1");
+        let _guards = [
+            ScopedEnvVar::set("AY_MILP_NG_UP", "2"),
+            ScopedEnvVar::set("AY_MILP_HEUR_SHARE", "0"),
+            ScopedEnvVar::set("AY_MILP_NO_CUTS", "1"),
+        ];
         let mut seed = 0x0A17_2026_u64;
         let mut rnd = move || {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
@@ -25163,9 +25207,7 @@ mod tests {
                 (want, got) => panic!("brute force {want:?} vs solver {got:?}"),
             }
         }
-        std::env::remove_var("AY_MILP_NG_UP");
-        std::env::remove_var("AY_MILP_HEUR_SHARE");
-        std::env::remove_var("AY_MILP_NO_CUTS");
+        // `_guards` restore (drop) at end of scope, still under `_env_lock`.
         assert!(
             NG_STORED_TOTAL.load(Relaxed) > stored_before,
             "guard is vacuous: no solve ever learned a no-good"
@@ -25206,7 +25248,7 @@ mod tests {
     fn scaled_noenter_shortcut_matches_phase1_verdict() {
         use crate::simplex::{SimplexStatus, DUAL_NOENTER_SHORTCUT};
         use std::sync::atomic::Ordering::Relaxed;
-        let _g = env_guard_lock();
+        let _g = lock_env();
         let fires_before = DUAL_NOENTER_SHORTCUT[1].load(Relaxed);
         let mut seed = 0xF00D_2026_u64;
         let mut rnd = move || {
@@ -25265,7 +25307,9 @@ mod tests {
             // HARD: shrink so `Σ a_j x_j` cannot reach T (infeasible). MILD: leave
             // room (feasible). Randomize for a mix that exercises both the
             // fail-closed and the proof directions.
-            std::env::remove_var("AY_MILP_SCALE");
+            // Held unset for the whole iteration (baseline frame); the scaled
+            // solve below overrides it in a nested guard, then restores unset.
+            let _scale = ScopedEnvVar::unset("AY_MILP_SCALE");
             let obj0: Vec<(u32, f64)> = Vec::new();
             let ref_lp = FloatLp::from_model(&m, &obj0, m.sense()).expect("ref lp");
             let clo = ref_lp.lower.clone();
@@ -25277,11 +25321,10 @@ mod tests {
                 cup[j] = ub[j] * factor;
             }
 
-            std::env::remove_var("AY_MILP_SCALE");
             let (u_status, _, _) = solve_child(&m, &clo, &cup);
-            std::env::set_var("AY_MILP_SCALE", "1");
+            let s_scale = ScopedEnvVar::set("AY_MILP_SCALE", "1");
             let (s_status, s_farkas, s_verified) = solve_child(&m, &clo, &cup);
-            std::env::remove_var("AY_MILP_SCALE");
+            drop(s_scale);
 
             let u_inf = u_status == SimplexStatus::PrimalInfeasible;
             let s_inf = s_status == SimplexStatus::PrimalInfeasible;
@@ -25340,22 +25383,19 @@ mod tests {
     /// Serializes the guards whose process-global env levers (or non-vacuity
     /// counters) would race each other when the harness runs tests in
     /// parallel: forced unit propagation reshapes trees enough to starve the
-    /// symmetry counters, and vice versa.
-    fn env_guard_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
+    /// symmetry counters, and vice versa (they serialize behind the one
+    /// workspace env lock, `lock_env`).
     #[test]
     fn symmetry_handling_preserves_the_optimum() {
         use std::sync::atomic::Ordering::Relaxed;
-        let _env = env_guard_lock();
+        let _env_lock = lock_env();
         let fixes_before = SYM_FIXES_TOTAL.load(Relaxed);
         let rows_before = SYM_ROWS_TOTAL.load(Relaxed);
         // The tree must be the finder, or the fixing under guard never runs:
         // at this size the root suite + cuts settle most cases at node 1.
-        std::env::set_var("AY_MILP_HEUR_SHARE", "0");
-        std::env::set_var("AY_MILP_NO_CUTS", "1");
+        // Held for the whole test; restored on scope exit under `_env_lock`.
+        let _heur_share = ScopedEnvVar::set("AY_MILP_HEUR_SHARE", "0");
+        let _no_cuts = ScopedEnvVar::set("AY_MILP_NO_CUTS", "1");
         let mut seed = 0x5E11_2026_u64;
         let mut rnd = move || {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
@@ -25363,7 +25403,7 @@ mod tests {
         };
         let big = |v: i64| BigRational::from_integer(v.into());
         for mode in ["orbital", "rows"] {
-            std::env::set_var("AY_MILP_SYM", mode);
+            let sym = ScopedEnvVar::set("AY_MILP_SYM", mode);
             let mut solved = 0usize;
             for case in 0..24 {
                 // Columns: 4 identical pairs (y), one interchangeable block
@@ -25504,7 +25544,7 @@ mod tests {
                     ),
                 }
             }
-            std::env::remove_var("AY_MILP_SYM");
+            drop(sym);
             assert!(
                 solved >= 12,
                 "mode {mode}: too few Optimal cases ({solved}) — corpus degenerate"
@@ -25517,7 +25557,7 @@ mod tests {
         // component to the static lex lane (the measured default), so this
         // phase is the end-to-end guard that lane preserves the optimum.
         let orbitope_before = SYM_ORBITOPE_TOTAL.load(Relaxed);
-        std::env::set_var("AY_MILP_SYM", "orbital");
+        let sym = ScopedEnvVar::set("AY_MILP_SYM", "orbital");
         let mut solved = 0usize;
         for case in 0..16 {
             let mut m = Model::new();
@@ -25626,7 +25666,7 @@ mod tests {
                 ),
             }
         }
-        std::env::remove_var("AY_MILP_SYM");
+        drop(sym);
         assert!(
             solved >= 8,
             "too few Optimal cases ({solved}) — corpus degenerate"
@@ -25639,8 +25679,8 @@ mod tests {
         // integer point of the box is enumerated for the ground-truth
         // optimum; the handled solver must return exactly that value under
         // BRANCHING-ORDER-relative fixing, whatever order the search took.
-        std::env::set_var("AY_MILP_SYM", "orbital");
-        std::env::set_var("AY_MILP_ORBITOPE_DYN", "1");
+        let sym = ScopedEnvVar::set("AY_MILP_SYM", "orbital");
+        let orbitope_dyn = ScopedEnvVar::set("AY_MILP_ORBITOPE_DYN", "1");
         let mut solved = 0usize;
         for case in 0..16 {
             let mut m = Model::new();
@@ -25752,14 +25792,14 @@ mod tests {
                 ),
             }
         }
-        std::env::remove_var("AY_MILP_ORBITOPE_DYN");
-        std::env::remove_var("AY_MILP_SYM");
+        drop(orbitope_dyn);
+        drop(sym);
         assert!(
             solved >= 8,
             "too few Optimal cases ({solved}) — dynamic corpus degenerate"
         );
-        std::env::remove_var("AY_MILP_HEUR_SHARE");
-        std::env::remove_var("AY_MILP_NO_CUTS");
+        // `_heur_share` / `_no_cuts` restore at end of scope, still under
+        // `_env_lock`.
         assert!(
             SYM_FIXES_TOTAL.load(Relaxed) > fixes_before,
             "non-vacuity: orbital fixing never fired on the symmetric corpus"
@@ -26187,24 +26227,27 @@ mod tests {
     #[test]
     fn node_cut_slots_preserve_the_optimum() {
         use std::sync::atomic::Ordering::Relaxed;
+        // Serialize the process-global cut levers behind the one env choke
+        // point; the guards below restore on scope exit (also on panic).
+        let _env_lock = lock_env();
         // Cadence floor 1 and EAGER separation (no incumbent gate): correctness-neutral for any
         // concurrent test, and the eager mode is what makes the guard SENSITIVE — behind the
         // production incumbent gate a deliberately-poisoned cut cannot lose a verdict on models
         // this small (the heuristics hold the true optimum before any cut lands), and a guard the
         // bug cannot fail is vacuous. Verified: with each landed cut strengthened by 0.6, this
         // test fails (wrong optima / false infeasibility); unpoisoned it passes.
-        std::env::set_var("AY_MILP_NODE_CUT_EVERY", "1");
-        std::env::set_var("AY_MILP_NODE_CUT_EAGER", "1");
+        let _cut_every = ScopedEnvVar::set("AY_MILP_NODE_CUT_EVERY", "1");
+        let _cut_eager = ScopedEnvVar::set("AY_MILP_NODE_CUT_EAGER", "1");
         // The guard's models are deliberately tiny (brute-forceable), which the production
         // row floor in `cut_slot_count` would silence — force the slot count so the ENGINE
         // is what gets exercised, exactly as the cadence/eager overrides above force theirs.
-        std::env::set_var("AY_MILP_NODE_CUT_SLOTS", "16");
+        let _cut_slots = ScopedEnvVar::set("AY_MILP_NODE_CUT_SLOTS", "16");
         // No root-heuristic incumbents: models this small are cracked optimally by the pump/dive/
         // RINS chain before the tree runs one node, and a search already holding the optimum
         // cannot return a wrong OPTIMAL however poisoned its pruning is — the tree itself must be
         // the finder for cut soundness to be observable end-to-end. (Correctness-neutral: the
         // share only budgets a heuristic; verdicts never depend on it.)
-        std::env::set_var("AY_MILP_HEUR_SHARE", "0");
+        let _heur_share = ScopedEnvVar::set("AY_MILP_HEUR_SHARE", "0");
         let writes_before = NODE_CUT_WRITES_TOTAL.load(Relaxed);
         let mut seed = 0x5107_2026_u64;
         let mut rnd = || {
@@ -26308,10 +26351,7 @@ mod tests {
                 }
             }
         }
-        std::env::remove_var("AY_MILP_NODE_CUT_EVERY");
-        std::env::remove_var("AY_MILP_NODE_CUT_EAGER");
-        std::env::remove_var("AY_MILP_HEUR_SHARE");
-        std::env::remove_var("AY_MILP_NODE_CUT_SLOTS");
+        // The `_cut_*` / `_heur_share` guards restore on scope exit.
         assert!(
             solved >= 20,
             "corpus degenerate: only {solved} feasible cases"
@@ -26339,15 +26379,20 @@ mod tests {
     #[test]
     fn node_gmi_cuts_preserve_the_optimum() {
         use std::sync::atomic::Ordering::Relaxed;
-        std::env::set_var("AY_MILP_NODE_CUT_EVERY", "1");
-        std::env::set_var("AY_MILP_NODE_CUT_EAGER", "1");
-        std::env::set_var("AY_MILP_NODE_CUT_SLOTS", "16");
-        std::env::set_var("AY_MILP_HEUR_SHARE", "0");
-        std::env::set_var("AY_MILP_NODE_GMI", "1");
-        std::env::set_var("AY_MILP_NODE_GMI_EVERY", "1");
-        // Every node owns its bound on models this small — disarm the owner gate so the
-        // derivation runs at each visit.
-        std::env::set_var("AY_MILP_NODE_GMI_MARGIN", "1e18");
+        // Serialize the process-global cut levers behind the one env choke
+        // point; the guards below restore on scope exit (also on panic).
+        let _env_lock = lock_env();
+        let _guards = [
+            ScopedEnvVar::set("AY_MILP_NODE_CUT_EVERY", "1"),
+            ScopedEnvVar::set("AY_MILP_NODE_CUT_EAGER", "1"),
+            ScopedEnvVar::set("AY_MILP_NODE_CUT_SLOTS", "16"),
+            ScopedEnvVar::set("AY_MILP_HEUR_SHARE", "0"),
+            ScopedEnvVar::set("AY_MILP_NODE_GMI", "1"),
+            ScopedEnvVar::set("AY_MILP_NODE_GMI_EVERY", "1"),
+            // Every node owns its bound on models this small — disarm the owner
+            // gate so the derivation runs at each visit.
+            ScopedEnvVar::set("AY_MILP_NODE_GMI_MARGIN", "1e18"),
+        ];
         let writes_before = NODE_CUT_WRITES_TOTAL.load(Relaxed);
         let gmi_before = NODE_GMI_CUTS_TOTAL.load(Relaxed);
         let mut seed = 0x51A7_2026_u64;
@@ -26443,13 +26488,7 @@ mod tests {
                 }
             }
         }
-        std::env::remove_var("AY_MILP_NODE_CUT_EVERY");
-        std::env::remove_var("AY_MILP_NODE_CUT_EAGER");
-        std::env::remove_var("AY_MILP_HEUR_SHARE");
-        std::env::remove_var("AY_MILP_NODE_CUT_SLOTS");
-        std::env::remove_var("AY_MILP_NODE_GMI");
-        std::env::remove_var("AY_MILP_NODE_GMI_EVERY");
-        std::env::remove_var("AY_MILP_NODE_GMI_MARGIN");
+        // The `_guards` array restores every lever on scope exit.
         assert!(
             solved >= 20,
             "corpus degenerate: only {solved} feasible cases"
@@ -26486,11 +26525,14 @@ mod tests {
     #[test]
     fn bound_branching_inherited_bounds_preserve_the_optimum() {
         use std::sync::atomic::Ordering::Relaxed;
-        std::env::set_var("AY_MILP_BB", "1");
+        // Serialize the process-global levers behind the one env choke point;
+        // the guards below restore on scope exit (also on panic).
+        let _env_lock = lock_env();
+        let _bb = ScopedEnvVar::set("AY_MILP_BB", "1");
         // The tree must be the finder: models this small are cracked by the root
         // heuristics before a node runs, and a search that already holds the optimum
         // cannot lose a verdict to a wrong inherited bound.
-        std::env::set_var("AY_MILP_HEUR_SHARE", "0");
+        let _heur_share = ScopedEnvVar::set("AY_MILP_HEUR_SHARE", "0");
         let pairs_before = BB_PAIRS_TOTAL.load(Relaxed);
         let mut seed = 0xB0B0_2026_u64;
         let mut rnd = || {
@@ -26622,8 +26664,7 @@ mod tests {
                 }
             }
         }
-        std::env::remove_var("AY_MILP_BB");
-        std::env::remove_var("AY_MILP_HEUR_SHARE");
+        // The `_bb` / `_heur_share` guards restore on scope exit.
         assert!(
             solved >= 15,
             "corpus degenerate: only {solved} feasible cases"
@@ -26652,8 +26693,11 @@ mod tests {
     #[test]
     fn node_rc_fixing_never_deletes_the_optimum() {
         use std::sync::atomic::Ordering::Relaxed;
-        std::env::set_var("AY_MILP_NODE_RC", "1");
-        std::env::set_var("AY_MILP_HEUR_SHARE", "0");
+        // Serialize the process-global levers behind the one env choke point;
+        // the guards below restore on scope exit (also on panic).
+        let _env_lock = lock_env();
+        let _node_rc = ScopedEnvVar::set("AY_MILP_NODE_RC", "1");
+        let _heur_share = ScopedEnvVar::set("AY_MILP_HEUR_SHARE", "0");
         let fixes_before = NODE_RC_FIXES_TOTAL.load(Relaxed);
         let mut seed = 0x0DE5_C0DE_u64;
         let mut rnd = || {
@@ -26783,8 +26827,7 @@ mod tests {
                 }
             }
         }
-        std::env::remove_var("AY_MILP_NODE_RC");
-        std::env::remove_var("AY_MILP_HEUR_SHARE");
+        // The `_node_rc` / `_heur_share` guards restore on scope exit.
         assert!(
             solved >= 15,
             "corpus degenerate: only {solved} feasible cases"
@@ -27229,9 +27272,10 @@ mod tests {
         let best = BigRational::from_integer((best as i64).into());
 
         for rule in ["pc", "maxc", "wpc", "crit", "crits"] {
-            std::env::set_var("AY_MILP_MS_BRANCH", rule);
-            let out = solve_milp(&m, &SolveOpts::new());
-            std::env::remove_var("AY_MILP_MS_BRANCH");
+            let out = with_env_edits(|env| {
+                env.set("AY_MILP_MS_BRANCH", rule);
+                solve_milp(&m, &SolveOpts::new())
+            });
             match out {
                 Outcome::Optimal { value, .. } => {
                     assert_eq!(value, best, "rule {rule} must land the brute optimum")
@@ -27526,16 +27570,16 @@ mod tests {
                 best = best.min(minimax_value(&a, &b, nb, mask));
             }
             let best = BigRational::from_integer((best as i64).into());
-            std::env::set_var("AY_MILP_MS_DIVE", "1");
-            // Half the cases run STARVED (a 64-sweep budget): nearly every firing
-            // then comes back `Spent`, so any wiring that treats an abstention as
-            // a prune license destroys the optimum here.
-            if case >= 2 {
-                std::env::set_var("AY_MILP_MS_DIVE_STEPS", "64");
-            }
-            let out = solve_milp(&m, &SolveOpts::new());
-            std::env::remove_var("AY_MILP_MS_DIVE");
-            std::env::remove_var("AY_MILP_MS_DIVE_STEPS");
+            let out = with_env_edits(|env| {
+                env.set("AY_MILP_MS_DIVE", "1");
+                // Half the cases run STARVED (a 64-sweep budget): nearly every firing
+                // then comes back `Spent`, so any wiring that treats an abstention as
+                // a prune license destroys the optimum here.
+                if case >= 2 {
+                    env.set("AY_MILP_MS_DIVE_STEPS", "64");
+                }
+                solve_milp(&m, &SolveOpts::new())
+            });
             match out {
                 Outcome::Optimal { value, .. } => {
                     assert_eq!(
@@ -29127,12 +29171,14 @@ mod tests {
     #[test]
     fn implication_layer_preserves_the_optimum() {
         use std::sync::atomic::Ordering::Relaxed;
-        let _env = env_guard_lock();
+        let _env_lock = lock_env();
         let events_before = IMPL_EVENTS_TOTAL.load(Relaxed);
-        std::env::set_var("AY_MILP_IMPL", "1");
-        std::env::set_var("AY_MILP_IMPL_ARM", "1");
-        std::env::set_var("AY_MILP_HEUR_SHARE", "0");
-        std::env::set_var("AY_MILP_NO_CUTS", "1");
+        let _guards = [
+            ScopedEnvVar::set("AY_MILP_IMPL", "1"),
+            ScopedEnvVar::set("AY_MILP_IMPL_ARM", "1"),
+            ScopedEnvVar::set("AY_MILP_HEUR_SHARE", "0"),
+            ScopedEnvVar::set("AY_MILP_NO_CUTS", "1"),
+        ];
         let mut seed = 0x1DEA_2026_u64;
         let mut rnd = move || {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
@@ -29215,10 +29261,7 @@ mod tests {
                 got => panic!("case {case}: expected Optimal({want}), got {got:?}"),
             }
         }
-        std::env::remove_var("AY_MILP_IMPL");
-        std::env::remove_var("AY_MILP_IMPL_ARM");
-        std::env::remove_var("AY_MILP_HEUR_SHARE");
-        std::env::remove_var("AY_MILP_NO_CUTS");
+        // `_guards` restore (drop) at end of scope, still under `_env_lock`.
         assert!(
             IMPL_EVENTS_TOTAL.load(Relaxed) > events_before,
             "guard is vacuous: the implication layer never fired"

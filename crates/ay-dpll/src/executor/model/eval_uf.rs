@@ -232,7 +232,12 @@ impl Executor {
     /// value — so nothing is lost by reading it directly.
     ///
     /// The pinned constant is a leaf, so evaluating it cannot re-enter a table.
-    fn committed_app_atom(
+    ///
+    /// Exposed to `crate::executor::mbqi` so the DT-MBQI-Sat certificate's
+    /// EUF-extraction faithfulness pass can read the SAME committed anchors —
+    /// independently of the arg-keyed function-table synthesis `evaluate_term`
+    /// uses to build the F4 tables — and cross-check the two for agreement.
+    pub(in crate::executor) fn committed_app_atom(
         &self,
         model: &Model,
         euf_model: &EufModel,

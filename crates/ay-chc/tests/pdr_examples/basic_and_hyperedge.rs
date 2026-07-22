@@ -175,10 +175,18 @@ fn pdr_even_odd_safe() {
 /// The entry-inductiveness check (#1423) ensures discovered invariants are valid
 /// across inter-predicate transitions.
 ///
-/// Status: AY correctly solves this as Safe with entry-inductive invariants.
+/// Status: Safe via #4751 L4 counterexample-guided candidate repair. Startup
+/// discovery admits optimistic entry-domain lemmas (e.g. `a0 <= 0` for itp2 —
+/// true at depth <= 1 only); strict validation (#9227) correctly rejects the
+/// poisoned global candidate with a concrete counterexample, and repair drops
+/// exactly the falsified conjunct, leaving the true invariant
+/// (itp1: y=0 ∧ x=z; itp2: x=y+z) which passes the unmodified strict gate.
+/// Before the repair landed this solve never returned Safe (it demoted to
+/// Unknown at publish, and churned past the 60s harness clock after #4751 F3).
 ///
 /// Related issues:
 /// - #1423: Entry-inductiveness check for discovered invariants (soundness fix)
+/// - #4751 L4: candidate repair at the strict-validation demotion boundary
 #[test]
 #[timeout(60_000)]
 fn pdr_bouncy_two_counters_equality_safe() {
@@ -248,9 +256,13 @@ fn pdr_bouncy_two_counters_equality_safe() {
 
     let config = test_config(true);
     let result = pdr_solve_from_str(input, config).unwrap();
+    // Tightened from Safe|Unknown after #4751 L4 candidate repair landed:
+    // the solve now concludes Safe in well under a second (verified via the
+    // strict #9227 gate). A regression back to Unknown (or a wall-clock
+    // starvation) must fail this test again.
     assert!(
-        matches!(result, PdrResult::Safe(_) | PdrResult::Unknown),
-        "direct PDR should prove Safe or fail closed to Unknown, got {result:?}"
+        matches!(result, PdrResult::Safe(_)),
+        "direct PDR should prove Safe (via #4751 L4 candidate repair), got {result:?}"
     );
 }
 

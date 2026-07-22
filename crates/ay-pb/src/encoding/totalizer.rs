@@ -678,7 +678,7 @@ mod aux_ceiling_tests {
         let rhs: i128 = 1_i128 << 41;
         let mut clauses = Vec::new();
         let mut next_var = 41_u32;
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_mins(1);
         let mut should_stop = || Instant::now() >= deadline;
 
         let start = Instant::now();

@@ -2736,15 +2736,16 @@ mod tests {
     /// returning a stale Satisfiable(6) before the post-fix re-solve was added).
     #[test]
     fn native_oll_reduced_cost_fixing_solves_hardening_collapse_regression() {
-        // Serialized + restore-on-exit via the workspace env choke point.
         let _g = lock_env();
         let input = "* #variable= 5 #constraint= 1\n\
             min: +4 x1 +92 ~x2 +6 x3 +3 x4 +10 x5 ;\n\
             +1 x1 +1 x2 +1 x3 >= 2 ;\n";
         let instance = parse_opb(input).expect("parse");
         let objective = instance.objective.clone().expect("obj");
-        let _reduced_cost = ScopedEnvVar::set(REDUCED_COST_ENV, "on");
-        let with = solve(&instance, &objective, || false, None, None);
+        let with = {
+            let _rc = ScopedEnvVar::set(REDUCED_COST_ENV, "on");
+            solve(&instance, &objective, || false, None, None)
+        };
         assert!(
             matches!(with, Some(OptResult::Optimal(_, 4))),
             "expected proven Optimal(4) WITH reduced-cost fixing, got {with:?}"
@@ -2756,7 +2757,6 @@ mod tests {
     /// aggressive fix that removed the optimum would make the WITH run disagree.
     #[test]
     fn native_oll_reduced_cost_fixing_preserves_optimum_vs_disabled_and_brute_force() {
-        // Serialized + restore-on-exit via the workspace env choke point.
         let _guard = lock_env();
 
         let mut seed: u64 = 0xD1CE_F00D_2024_BEEF;

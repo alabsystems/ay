@@ -242,4 +242,228 @@ theorem ex_nth_concat_via_principle : nth (concat s3 [40]) 1 = nth s3 1 :=
     in-bounds guard on read-your-write is genuinely necessary. -/
 theorem ex_update_out_of_range_noop : update s3 5 99 = s3 := by decide
 
+/-! ## `seq.at` — the single-element positional subsequence.
+
+The SMT `seq.at s i` returns a SEQUENCE of length 0 or 1 (the 1-element
+subsequence at position `i`, or the empty sequence if `i` is out of range) — the
+generic-element mirror of `str.at`. It is *not* the element read `nth`; it
+re-wraps the read into a length-≤1 sequence. We model it as `(s[i]?).toList`
+over `Seq α`, and `seq.unit v` (the singleton constructor) as `[v]`. The conflict
+corollaries below are the `¬(…)`-shaped literals the emitter grounds in for the
+`seqat` false-`sat` regressions. -/
+
+/-- `seq.unit v`: the one-element sequence `[v]` (the SMT singleton constructor). -/
+def unit {α : Type} (v : α) : Seq α := [v]
+
+/-- `seq.at` at position `i`: the 1-element (or empty) subsequence, modelled as
+    the length-≤1 sequence `(s[i]?).toList`. -/
+def seqAt {α : Type} (s : Seq α) (i : Nat) : Seq α := (s[i]?).toList
+
+/-- **`seq.at` length bound.** `len (seq.at s i) ≤ 1` — always: the read is `none`
+    (empty, length 0) out of range or `some x` (length 1) in range. -/
+theorem len_seqAt_le_one {α : Type} (s : Seq α) (i : Nat) :
+    len (seqAt s i) ≤ 1 := by
+  unfold seqAt len
+  cases s[i]? <;> simp
+
+/-- **`seq.at` in-range length.** For an in-range index `i < len s`,
+    `len (seq.at s i) = 1` — it wraps exactly one element. This is the length-1
+    fact that clashes with `len (as seq.empty) = 0` in the `iteofseq` false-`sat`
+    conflict (the `ite`-false branch). -/
+theorem len_seqAt_of_lt {α : Type} (s : Seq α) (i : Nat) (h : i < len s) :
+    len (seqAt s i) = 1 := by
+  unfold seqAt len
+  rw [List.getElem?_eq_getElem (by simpa [len] using h)]
+  simp
+
+/-- **`seq.unit` value.** `len (seq.unit v) = 1`, and the ground content is `[v]`;
+    a `seq.unit` is never empty. -/
+theorem len_unit {α : Type} (v : α) : len (unit v) = 1 := by
+  simp [len, unit]
+
+/-- **`seq.unit` injectivity.** `seq.unit a = seq.unit b → a = b`: distinct values
+    build distinct singletons. This is the value-propagation step that turns a
+    sequence equation `seq.unit a = seq.unit b` into the element equation the
+    LIA / Bool core refutes. -/
+theorem unit_injective {α : Type} {a b : α} (h : unit a = unit b) : a = b := by
+  simpa [unit] using h
+
+/-! ### `seq.at` conflict corollaries. -/
+
+/-- **`seq.at` length conflict.** Asserting `len (seq.at s i) ≥ 2` is unsat. -/
+theorem seqAt_len_ge_two_conflict {α : Type} (s : Seq α) (i : Nat) :
+    ¬ (len (seqAt s i) ≥ 2) := by
+  have h := len_seqAt_le_one s i
+  omega
+
+/-- **`seq.unit` distinctness conflict.** With `a ≠ b`, the literal
+    `seq.unit a = seq.unit b` is unsatisfiable — ay's singleton value-conflict is
+    sound. -/
+theorem unit_ne_conflict {α : Type} {a b : α} (hab : a ≠ b) :
+    ¬ (unit a = unit b) :=
+  fun h => hab (unit_injective h)
+
+/-- **`seq.at`-vs-empty length conflict.** For an in-range index, the literal set
+    `{ seq.at s i = t, t = as seq.empty }` is unsatisfiable: the LHS has length
+    `1`, the empty sequence length `0`. Stated directly on lengths — the shape the
+    `iteofseq` `ite`-false branch grounds in. -/
+theorem seqAt_ne_empty_conflict {α : Type} (s : Seq α) (i : Nat) (h : i < len s) :
+    ¬ (len (seqAt s i) = len ([] : Seq α)) := by
+  have h1 := len_seqAt_of_lt s i h
+  have h2 : len ([] : Seq α) = 0 := rfl
+  omega
+
+/-! ### Ground-eval bridge for the TOTAL `seq.nth`.
+
+SMT `seq.nth s i` is a *total* function (it returns an element directly; the
+out-of-range value is unconstrained). For an in-range concrete read it agrees
+with the partial `nth` (`s[i]?`) via `some`, which is all the emitter needs: it
+binds `seq.nth v2 v10 = x` from the ground read and hands the resulting numeric
+literal to the LIA core. `nthD s i d` models the total read with an (irrelevant,
+in-range) default `d`. -/
+
+/-- Total positional read with default `d` (SMT `seq.nth`). In range it is the
+    element; out of range it is `d`. -/
+def nthD {α : Type} (s : Seq α) (i : Nat) (d : α) : α := (s[i]?).getD d
+
+/-- **`seq.nth` ↔ `nth` bridge.** If the partial read `nth s i = some v` (i.e. `i`
+    is in range with value `v`), then the total read `seq.nth s i = v`,
+    regardless of the default. This is the value-binding the emitter uses. -/
+theorem nthD_eq_of_nth {α : Type} (s : Seq α) (i : Nat) (d v : α)
+    (h : nth s i = some v) : nthD s i d = v := by
+  simp only [nth] at h
+  simp [nthD, h]
+
+/-! ### Concrete, kernel-checked `seq.at` / `seq.nth` conflict witnesses. -/
+
+/-- The ground sequence `seq.++ (seq.unit 3) (seq.unit -2) (seq.unit 3) = [3,-2,3]`
+    over `Int`, from the `qf_slia_seqat_symbolic_pinned` regression. -/
+def sat3 : Seq Int := [3, -2, 3]
+
+/-- Concrete `seq.at` read: `seq.at [3,-2,3] 1 = [-2] = seq.unit (-2)`. Length
+    exactly `1`, so the read wraps a real element and is non-vacuous. -/
+theorem ex_seqAt_value : seqAt sat3 1 = unit (-2) := by decide
+
+/-- **`qf_slia_seqat_symbolic_pinned` conflict.** The literal
+    `seq.unit 1 = seq.at [3,-2,3] 1` is unsatisfiable: the read is `seq.unit (-2)`,
+    and `seq.unit 1 = seq.unit (-2)` forces `1 = -2` (by `unit_injective`), which
+    is false. Kernel-checked. -/
+theorem ex_seqat_pinned_conflict : ¬ (unit (1 : Int) = seqAt sat3 1) := by decide
+
+/-- The same via the general principle: rewrite the read to `seq.unit (-2)` and
+    close with `seq.unit` injectivity + `(1 : Int) ≠ -2`. -/
+theorem ex_seqat_pinned_via_principle : ¬ (unit (1 : Int) = seqAt sat3 1) := by
+  rw [ex_seqAt_value]
+  exact unit_ne_conflict (by decide)
+
+/-- The length-2 sequence `v1 = seq.++ (seq.unit false) (seq.unit false)` over
+    `Bool`, from the `iteofseq` regression. -/
+def vff : Seq Bool := [false, false]
+
+/-- Concrete `seq.at` read over `Bool`: `seq.at [false,false] 0 = [false] =
+    seq.unit false`. -/
+theorem ex_seqAt_bool_value : seqAt vff 0 = unit false := by decide
+
+/-- **`iteofseq` `ite`-true branch conflict.** `seq.at [false,false] 0 =
+    seq.unit true` is unsatisfiable: the read is `seq.unit false`, and
+    `seq.unit false = seq.unit true` forces `false = true`. -/
+theorem ex_seqat_ite_true_conflict : ¬ (seqAt vff 0 = unit true) := by decide
+
+/-- **`iteofseq` `ite`-false branch conflict.** `seq.at [false,false] 0 =
+    as seq.empty` is unsatisfiable: the read has length `1` (`0 < len [false,false]`),
+    the empty sequence length `0`. Kernel-checked, and also derivable from
+    `seqAt_ne_empty_conflict` (length-1 vs length-0). -/
+theorem ex_seqat_ite_false_conflict : ¬ (seqAt vff 0 = ([] : Seq Bool)) := by decide
+
+/-- The `ite`-false branch via the general principle (length argument). -/
+theorem ex_seqat_ite_false_via_principle :
+    ¬ (len (seqAt vff 0) = len ([] : Seq Bool)) :=
+  seqAt_ne_empty_conflict vff 0 (by decide)
+
+/-- The length-1 sequence `v2 = seq.unit 0` over `Int`, from the
+    `seq_falsesat_nth_ground_eval` regression. -/
+def v2nth : Seq Int := [0]
+
+/-- Concrete in-range partial read: `nth (seq.unit 0) 0 = some 0`, the ground-eval
+    bridge input. -/
+theorem ex_nth_ground_zero : nth v2nth 0 = some (0 : Int) := by decide
+
+/-- Concrete total read via the bridge: `seq.nth (seq.unit 0) 0 = 0` (any default),
+    binding the value the LIA core needs. -/
+theorem ex_nthD_ground_zero (d : Int) : nthD v2nth 0 d = 0 :=
+  nthD_eq_of_nth v2nth 0 d 0 ex_nth_ground_zero
+
+/-- **`seq_falsesat_nth_ground_eval` conflict.** The literal set
+    `{ nth (seq.unit 0) 0 = some v, (-3 - 4) ≥ v }` is unsatisfiable: the ground
+    read forces `v = 0`, and `-7 ≥ 0` is false in LIA. Kernel-checked (the
+    seq ground-eval hands the conflict to pure LIA). -/
+theorem ex_seq_nth_ground_lia_conflict :
+    ¬ (∃ v : Int, nth v2nth 0 = some v ∧ ((-3 : Int) - 4) ≥ v) := by
+  rintro ⟨v, hv, hle⟩
+  rw [ex_nth_ground_zero] at hv
+  simp at hv
+  omega
+
+/-! ## `seq.suffixof` — aligned-last-element content conflict.
+
+The SMT `seq.suffixof a b` holds iff `a` is a suffix of `b` — there is a prefix
+`p` with `b = p ++ a` (element sort generic). We model it as `suffixOf x y :=
+∃ p, y = p ++ x`, and prove the KEY firewall fact: a non-empty suffix shares the
+whole's LAST element. So if the alleged suffix `x` ends in `a` but the whole `y`
+ends in a *different* `b`, the suffix relation is impossible — the
+`seq_falsesat_suffixof_elem_mismatch` conflict (`[-1,-1]` cannot be a suffix of
+`v3 ++ [1]`: last elements `-1` vs `1` differ).
+
+These three definitions/lemmas are the kernel-verified building block prepped in
+`scratchpad/leanseq/Suffix.lean` (kept verbatim); `suffix_append_last_conflict`
+is the emitter-facing corollary that specializes the whole to a `p ++ t` shape
+(an arbitrary prefix `p` followed by a ground non-empty tail `t`), which is
+exactly the `(seq.++ v3 v1)` structure the firewall grounds in. -/
+
+/-- `seq.suffixof x y`: `x` is a suffix of `y` — some prefix `p` gives `y = p ++ x`. -/
+def suffixOf {α : Type} (x y : List α) : Prop := ∃ p : List α, y = p ++ x
+
+/-- **A non-empty suffix shares the last element.** If `x` is a suffix of `y` and
+    `x` is non-empty, then `y` and `x` have the same `getLast?`. -/
+theorem getLast?_of_suffix {α : Type} (x y : List α)
+    (h : suffixOf x y) (hne : x ≠ []) : y.getLast? = x.getLast? := by
+  obtain ⟨p, rfl⟩ := h
+  rw [List.getLast?_append]
+  cases hx : x.getLast? with
+  | none => exact absurd (List.getLast?_eq_none_iff.mp hx) hne
+  | some a => simp
+
+/-- **Suffix last-element conflict.** A non-empty `x` ending in `a` cannot be a
+    suffix of a `y` ending in a different `b`. -/
+theorem suffix_last_conflict {α : Type} (x y : List α) (a b : α)
+    (h : suffixOf x y) (hxne : x ≠ [])
+    (hx : x.getLast? = some a) (hy : y.getLast? = some b) (hab : a ≠ b) : False := by
+  have := getLast?_of_suffix x y h hxne
+  rw [hx, hy] at this
+  exact hab (Option.some.inj this.symm)
+
+/-- **Suffix-of-`p ++ t` last-element conflict** (emitter-facing). If `x` is a
+    suffix of `p ++ t` for an ARBITRARY prefix `p` and a ground non-empty tail
+    `t`, then `x` and `t` share the last element: `p ++ t` ends where `t` ends. So
+    a non-empty `x` ending in `a ≠ b = last t` can be a suffix of `p ++ t` for NO
+    prefix `p` — the `(seq.suffixof x (seq.++ … t))` firewall shape. -/
+theorem suffix_append_last_conflict {α : Type} (x p t : List α) (a b : α)
+    (h : suffixOf x (p ++ t)) (hxne : x ≠ []) (htne : t ≠ [])
+    (hx : x.getLast? = some a) (ht : t.getLast? = some b) (hab : a ≠ b) : False := by
+  have hy : (p ++ t).getLast? = some b := by
+    rw [getLast?_of_suffix t (p ++ t) ⟨p, rfl⟩ htne]; exact ht
+  exact suffix_last_conflict x (p ++ t) a b h hxne hx hy hab
+
+/-! ### Concrete, kernel-checked `seq.suffixof` conflict witness. -/
+
+/-- **`seq_falsesat_suffixof_elem_mismatch` conflict.** `v2 = [-1,-1]` is asserted
+    to be a suffix of `v3 ++ [1]` (with `v1 = [1]` non-empty). But `[-1,-1]` ends
+    in `-1` and `v3 ++ [1]` ends in `1` for EVERY `v3`, and `-1 ≠ 1`, so no `v3`
+    satisfies the suffix constraint — refuted for all `v3` via the general
+    last-element conflict. -/
+theorem ex_suffixof_elem_mismatch (v3 : List Int) :
+    ¬ suffixOf ([-1, -1] : List Int) (v3 ++ [1]) :=
+  fun h => suffix_append_last_conflict [-1, -1] v3 [1] (-1) 1 h
+    (by decide) (by decide) (by decide) (by decide) (by decide)
+
 end AySoundness.SeqThy

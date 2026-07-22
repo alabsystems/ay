@@ -58,7 +58,12 @@ pub struct ScopedEnvVar {
 
 impl ScopedEnvVar {
     /// Set `key=value` for the guard's lifetime.
-    pub fn set(key: &str, value: &str) -> Self {
+    ///
+    /// `value` accepts anything `set_var` does (`&str`, `String`, `&Path`, …) —
+    /// a backward-compatible generalization of the `&str`-only reference shape,
+    /// so callers can pass owned strings and temp paths without an extra `&` or
+    /// `.to_str()`.
+    pub fn set(key: &str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let previous = std::env::var_os(key);
         // Blessed choke point: serialized by lock_env()/with_* callers and
         // restored on drop — the one place raw set_var is allowed.
@@ -102,20 +107,23 @@ impl Drop for ScopedEnvVar {
 /// Run `f` with `vars` set, serialized behind the process-wide env lock;
 /// previous values are restored afterwards (also on panic).
 pub fn with_serialized_env_vars<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
-    let _env_lock = lock_env();
-    let _guards: Vec<_> = vars
-        .iter()
-        .map(|(key, value)| ScopedEnvVar::set(key, value))
-        .collect();
-    f()
+    with_env_edits(|env| {
+        for (key, value) in vars {
+            env.set(key, value);
+        }
+        f()
+    })
 }
 
 /// Run `f` with `vars` removed from the environment, serialized behind the
 /// process-wide env lock; previous values are restored afterwards.
 pub fn with_serialized_env_vars_removed<T>(vars: &[&str], f: impl FnOnce() -> T) -> T {
-    let _env_lock = lock_env();
-    let _guards: Vec<_> = vars.iter().map(|key| ScopedEnvVar::unset(key)).collect();
-    f()
+    with_env_edits(|env| {
+        for key in vars {
+            env.remove(key);
+        }
+        f()
+    })
 }
 
 /// Scoped editor for tests that walk a knob through several set/remove states
@@ -217,12 +225,24 @@ mod tests {
     #[test]
     fn serialized_vars_visible_inside_scope_only() {
         let key = "AY_TEST_SUPPORT_ENV_SERIALIZED";
+        let previous = std::env::var_os(key);
         with_serialized_env_vars(&[(key, "42")], || {
             assert_eq!(std::env::var(key).as_deref(), Ok("42"));
         });
-        assert!(std::env::var(key).is_err());
+        assert_eq!(std::env::var_os(key), previous);
         with_serialized_env_vars_removed(&[key], || {
             assert!(std::env::var(key).is_err());
         });
+        assert_eq!(std::env::var_os(key), previous);
+    }
+
+    #[test]
+    fn serialized_duplicate_key_restores_original_value() {
+        let key = "AY_TEST_SUPPORT_ENV_SERIALIZED_DUPLICATE";
+        let previous = std::env::var_os(key);
+        with_serialized_env_vars(&[(key, "first"), (key, "last")], || {
+            assert_eq!(std::env::var(key).as_deref(), Ok("last"));
+        });
+        assert_eq!(std::env::var_os(key), previous);
     }
 }

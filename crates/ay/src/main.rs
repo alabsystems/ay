@@ -4489,17 +4489,13 @@ fn run_solve(args: &SolveArgs) {
         .dump_bv_cnf
         .clone()
         .or_else(|| ay_core::bv_cnf_dump_path_from_env().map(PathBuf::from));
-    match solve_artifact_path_collision(args, dump_bv_cnf_path.as_deref()) {
-        Ok(Some(message)) => {
-            safe_eprintln!("Error: {message}");
-            std::process::exit(1);
-        }
-        Ok(None) => {}
-        Err(error) => {
-            safe_eprintln!("Error: cannot validate solve input/output paths: {error}");
-            std::process::exit(1);
-        }
-    }
+    // Path-collision preflight runs in ONE documented, deterministic order:
+    // the BV CNF certificate-transaction boundary (`bv_cnf_dump_collision`,
+    // which names the certificate member as the subject of every rejection)
+    // is checked first when `--dump-bv-cnf` is active, then the generic solve
+    // artifact boundary (`solve_artifact_path_collision`). Both checks always
+    // run before any solve output is created, so the rejected set is the
+    // union of both boundaries regardless of which message fires first.
     if let Some(path) = dump_bv_cnf_path.as_deref() {
         if path.to_str().is_none() {
             safe_eprintln!("Error: --dump-bv-cnf requires a UTF-8 output path");
@@ -4518,6 +4514,17 @@ fn run_solve(args: &SolveArgs) {
                 );
                 std::process::exit(1);
             }
+        }
+    }
+    match solve_artifact_path_collision(args, dump_bv_cnf_path.as_deref()) {
+        Ok(Some(message)) => {
+            safe_eprintln!("Error: {message}");
+            std::process::exit(1);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            safe_eprintln!("Error: cannot validate solve input/output paths: {error}");
+            std::process::exit(1);
         }
     }
 

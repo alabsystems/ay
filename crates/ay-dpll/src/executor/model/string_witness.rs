@@ -4,7 +4,7 @@
 
 //! Shared bridge between the string MODEL-CONSTRUCTION paths and the
 //! content-positive regex witness search `ay_strings::we_regex::find_witness`
-//! (strings increments W1-W3, `AY_STR_WITNESS=1`, default OFF).
+//! (strings increments W1-W3, default ON, `AY_STR_WITNESS=0` kill switch).
 //!
 //! ## Why this module exists
 //!

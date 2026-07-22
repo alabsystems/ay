@@ -88,6 +88,34 @@ impl LeanVerifier {
         self.run_command(cmd)
     }
 
+    /// Invoke Lean on a retained private snapshot stage plus the pinned
+    /// descriptor on stdin. Used on hosts without a re-openable descriptor
+    /// pathname: macOS has no `/proc/self/fd`, and its `/dev/fd` entries have
+    /// dup-offset semantics, so a verifier that opens its input path more
+    /// than once would read from EOF. The caller re-authenticates the pinned
+    /// descriptor bytes against the published digest before and after this
+    /// call, so the private stage pathname is never the trust root for the
+    /// verified-content claim.
+    #[cfg(unix)]
+    pub(crate) fn verify_snapshot_path(
+        &self,
+        snapshot_path: &std::path::Path,
+        proof_file: &std::fs::File,
+    ) -> LeanVerificationOutcome {
+        let inherited = match proof_file.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                return LeanVerificationOutcome::Unavailable {
+                    reason: format!("failed to clone authenticated Lean snapshot: {error}"),
+                };
+            }
+        };
+        let mut cmd = Command::new(&self.lean_path);
+        cmd.arg(snapshot_path)
+            .stdin(std::process::Stdio::from(inherited));
+        self.run_command(cmd)
+    }
+
     fn spawn_command(
         &self,
         mut cmd: Command,

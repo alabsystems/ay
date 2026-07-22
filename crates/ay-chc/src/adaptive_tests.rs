@@ -21,6 +21,8 @@ use ay_test_support::env::{lock_env, ScopedEnvVar};
 use ntest::timeout;
 use std::time::Duration;
 
+// The one workspace env choke point: serialized, restore-on-exit env mutation
+// (unifies the former ghost_pair_env_lock onto it).
 fn create_simple_loop() -> ChcProblem {
     let mut problem = ChcProblem::new();
     let inv = problem.declare_predicate("Inv", vec![ChcSort::Int]);
@@ -4573,7 +4575,12 @@ fn test_multi_pred_portfolio_timeout_reserves_retry_budget() {
 fn test_multi_pred_portfolio_timeout_clamps_small_remaining_budget() {
     assert_eq!(
         AdaptivePortfolio::multi_pred_portfolio_timeout(Duration::from_secs(2)),
-        Duration::from_secs(2)
+        Duration::ZERO
+    );
+    assert_eq!(
+        AdaptivePortfolio::multi_pred_portfolio_timeout(Duration::from_secs(4)),
+        Duration::from_secs(2),
+        "the nested portfolio's two-second cancellation grace must fit inside the global deadline"
     );
 }
 
@@ -5291,21 +5298,10 @@ fn create_array_ghost_pair_unsafe_problem() -> ChcProblem {
     .expect("ghost-pair unsafe fixture parses")
 }
 
-/// Serializes the ghost-pair route tests against the PROCESS-GLOBAL
-/// `ARRAY_GHOST_PAIR_DISABLE_ENV` kill switch: the kill-switch test sets the
-/// env var while the other route tests read it from parallel test threads, so
-/// without this lock a concurrently-running positive test observes the lane
-/// disabled and fails spuriously (`try_array_ghost_pair_route` returns `None`
-/// in ~0ms). Routed through the one workspace-wide env lock so it also
-/// serializes against every other env-touching test in this binary.
-fn ghost_pair_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    lock_env()
-}
-
 #[test]
 #[timeout(120000)]
 fn test_array_ghost_pair_route_kill_switch_returns_none() {
-    let _env_guard = ghost_pair_env_lock();
+    let _env_guard = lock_env();
     let problem = create_array_ghost_pair_safe_problem();
     let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
 
@@ -5322,7 +5318,7 @@ fn test_array_ghost_pair_route_kill_switch_returns_none() {
 #[test]
 #[timeout(300000)]
 fn test_array_ghost_pair_route_never_reports_safe_on_unsafe_problem() {
-    let _env_guard = ghost_pair_env_lock();
+    let _env_guard = lock_env();
     let problem = create_array_ghost_pair_unsafe_problem();
     let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
 
@@ -5343,7 +5339,7 @@ fn test_array_ghost_pair_route_never_reports_safe_on_unsafe_problem() {
 #[test]
 #[timeout(300000)]
 fn test_array_ghost_pair_route_certifies_safe_quantified_fixture() {
-    let _env_guard = ghost_pair_env_lock();
+    let _env_guard = lock_env();
     let problem = create_array_ghost_pair_safe_problem();
     let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
 
@@ -5493,7 +5489,7 @@ fn cancellation_handle_cancels_solve_from_another_thread() {
     // Budget far beyond the wall-clock assertion bound below, so only the
     // external cancel can explain a prompt return (the uncancelled baseline
     // grinds the full budget — see probe_guard_timeout_class_uncancelled_grind).
-    let config = AdaptiveConfig::with_budget(Duration::from_secs(600), false);
+    let config = AdaptiveConfig::with_budget(Duration::from_mins(10), false);
     let solver = AdaptivePortfolio::new(problem, config);
     let handle = solver.cancellation_handle();
 
@@ -5514,7 +5510,7 @@ fn cancellation_handle_cancels_solve_from_another_thread() {
     // Generous bound (vs. the ~0.3s cancel point) to avoid contention flakes;
     // the point is that it returns nowhere near the 600s budget.
     assert!(
-        elapsed < Duration::from_secs(60),
+        elapsed < Duration::from_mins(1),
         "cancelled solve took {:.1}s — cancellation did not propagate promptly",
         elapsed.as_secs_f64()
     );
@@ -5909,7 +5905,7 @@ fn bmc_only_lane_lands_ground_backtranslated_unsafe_on_hub_analogue() {
 fn bmc_only_lane_never_reports_safe_hub_analogue_unsafe() {
     let smt = bmc_only_hub_analogue_smt(false);
     let problem = ChcParser::parse(&smt).unwrap_or_else(|err| panic!("parse failed: {err}"));
-    let config = bmc_only_lane_config(&problem, Duration::from_secs(60));
+    let config = bmc_only_lane_config(&problem, Duration::from_mins(1));
     let result = crate::engines::solve_bmc_only(problem, config);
     assert!(
         !matches!(result, VerifiedChcResult::Unsafe(_)),

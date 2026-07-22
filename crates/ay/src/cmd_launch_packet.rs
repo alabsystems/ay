@@ -105,7 +105,7 @@ struct LaunchPacketIndexArgs {
     release_commit: Option<String>,
 
     /// Human-readable public claim to record in the index.
-    #[arg(long, default_value = "HN/Z3-successor public launch")]
+    #[arg(long, default_value = "broad public launch")]
     public_claim: String,
 
     /// UTC timestamp to record, mainly for deterministic tests.
@@ -234,7 +234,7 @@ struct ArtifactGroup {
 }
 
 const STANDARD_DOCS: &[(&str, &str)] = &[
-    ("HN launch readiness", "the development design notes"),
+    ("release readiness", "the development design notes"),
     (
         "Launch evidence packet checklist",
         "the development design notes",
@@ -268,16 +268,13 @@ const ARTIFACT_GROUPS: &[ArtifactGroup] = &[
         required: true,
     },
     ArtifactGroup {
-        label: "HN launch gate summary",
-        candidates: &[
-            "hn-launch-gate-summary.json",
-            "ay-hn-launch-gate-summary.json",
-        ],
+        label: "release gate summary",
+        candidates: &["release-gate-summary.json", "ay-release-gate-summary.json"],
         required: true,
     },
     ArtifactGroup {
-        label: "HN launch gate log",
-        candidates: &["hn-launch-gate.log"],
+        label: "release gate log",
+        candidates: &["release-gate.log"],
         required: true,
     },
     ArtifactGroup {
@@ -471,7 +468,7 @@ fn render_index(
         String::new(),
         "## Final Copy Guardrail".to_string(),
         String::new(),
-        "Do not publish a public HN/Z3-successor claim from this packet until `hn-launch-gate-summary.json` reports `status: pass`, `evidence_gate_failures: 0`, and `launch_blocker_count: 0`, and the public mirror evidence plus release manifest both name the exact release commit above. If any required artifact is missing, stale, or blocked, describe the packet as private or public-candidate evidence.".to_string(),
+        "Do not publish a public broad public-launch claim from this packet until `release-gate-summary.json` reports `status: pass`, `evidence_gate_failures: 0`, and `launch_blocker_count: 0`, and the public mirror evidence plus release manifest both name the exact release commit above. If any required artifact is missing, stale, or blocked, describe the packet as private or public-candidate evidence.".to_string(),
         String::new(),
         "## Native Gate Replay".to_string(),
         String::new(),
@@ -485,10 +482,7 @@ fn render_index(
 fn render_blocker_summary(packet_dir: &Path) -> Vec<String> {
     for path in first_existing(
         packet_dir,
-        &[
-            "hn-launch-gate-summary.json",
-            "ay-hn-launch-gate-summary.json",
-        ],
+        &["release-gate-summary.json", "ay-release-gate-summary.json"],
     ) {
         let Some(value) = read_json_object(&path) else {
             continue;
@@ -526,7 +520,7 @@ fn render_blocker_summary(packet_dir: &Path) -> Vec<String> {
         }
         return lines;
     }
-    vec!["- No HN launch gate summary JSON found in this packet.".to_string()]
+    vec!["- No release gate summary JSON found in this packet.".to_string()]
 }
 
 fn release_commit_from_packet(packet_dir: &Path) -> Option<String> {

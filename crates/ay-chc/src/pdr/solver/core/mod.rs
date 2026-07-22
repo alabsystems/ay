@@ -604,6 +604,8 @@ impl PdrSolver {
             strict_validation_demotions: 0,
             startup_converged_frame1_len: None,
             houdini_pruned_frame1_len: None,
+            // Counterexample-guided candidate-repair budget (#4751 L4).
+            candidate_repair_rounds_used: 0,
             // Deferred entry-inductive retry queue (#5970).
             deferred_entry_invariants: Vec::new(),
             // Deferred self-inductive retry queue (menlo_park_term_simpl_2).

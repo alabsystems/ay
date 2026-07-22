@@ -794,6 +794,32 @@ impl<'a> AlethePrinter<'a> {
                 premises,
                 args,
             } => self.format_certified_skolem_step(id, clause, premises, args),
+            // Extensionality diff-witness INTRODUCTION. This is AY-internal
+            // provenance (it lets AY's own checker certify the Skolemized
+            // extensionality clause); it is not an Alethe inference and has no
+            // conclusion, so it renders as a COMMENT. Emitting `(step tN (cl)
+            // ...)` here would hand an external checker a bogus derivation of
+            // the empty clause. The witness symbol itself is still declared in
+            // the `(declare-fun ...)` preamble, so the document stays complete.
+            ProofStep::Step {
+                rule: ay_core::AletheRule::ArrayExtDiffIntro,
+                clause,
+                premises,
+                args,
+            } => {
+                crate::checker::validate_ext_diff_intro_for_printer(
+                    self.terms, id, clause, premises, args,
+                )
+                .map_err(|err| AlethePrintError::InvalidSkolemStep {
+                    id,
+                    reason: err.to_string(),
+                })?;
+                let rendered: Vec<String> = args.iter().map(|&a| self.format_term(a)).collect();
+                Ok(format!(
+                    "; {id} array_ext_diff_intro witness {} for arrays {} {}",
+                    rendered[0], rendered[1], rendered[2]
+                ))
+            }
             ProofStep::Step {
                 rule,
                 clause,

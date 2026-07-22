@@ -17,10 +17,10 @@ num-bigint.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+ay-test-support.workspace = true
 criterion.workspace = true
 proptest.workspace = true
 serial_test.workspace = true
-ay-test-support.workspace = true
 
 [[bench]]
 name = "euf_bench"

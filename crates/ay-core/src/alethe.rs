@@ -199,6 +199,23 @@ pub enum AletheRule {
     ///
     /// `(=> (forall ((k Index)) (= (select a k) (select b k))) (= a b))`
     Extensionality,
+    /// Array extensionality difference-witness INTRODUCTION (a definition,
+    /// not an inference).
+    ///
+    /// Binds a fresh 0-ary symbol `k` — the Skolemization of the array theory's
+    /// `diff` function at one concrete array pair — to the UNORDERED pair
+    /// `{a, b}` it was minted for. The step carries NO conclusion clause (it
+    /// contributes nothing to the derivation and can never be a premise); its
+    /// entire content is the three `:args` `(k a b)`.
+    ///
+    /// Recording the introduction is what makes the Skolemized extensionality
+    /// clause `(cl (= a b) (not (= (select a k) (select b k))))` certifiable:
+    /// that clause is NOT a tautology, it is a conservative extension, and only
+    /// a checker that can see the witness's provenance (bound once, to exactly
+    /// this pair, over a symbol absent from the problem) can tell the two apart.
+    /// See `ay-proof` `ExtDiffRegistry` for the checks and their soundness
+    /// argument.
+    ArrayExtDiffIntro,
 
     // === Floating-point ===
     /// FP to BV translation: IEEE 754 encoding faithfulness.
@@ -305,6 +322,7 @@ impl AletheRule {
             Self::StorePermutation => "store_permutation",
             Self::ReadOverWriteChain => "read_over_write_chain",
             Self::Extensionality => "extensionality",
+            Self::ArrayExtDiffIntro => "array_ext_diff_intro",
             Self::FpToBv => "fp_to_bv",
             Self::StringLength => "string_length",
             Self::StringDecompose => "string_decompose",

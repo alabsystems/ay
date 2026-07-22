@@ -359,8 +359,10 @@ fn test_smt_farkas_history_prefers_core_derived_before_synthetic() {
         ChcExpr::ne(ChcExpr::var(b), ChcExpr::var(c)),
     ];
 
-    let shared: FxHashSet<String> =
-        FxHashSet::from_iter(["A", "B", "C", "D", "E"].into_iter().map(str::to_string));
+    let shared: FxHashSet<String> = ["A", "B", "C", "D", "E"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
 
     let mut smt = SmtContext::new();
     let interpolant = compute_interpolant_from_smt_farkas_history(

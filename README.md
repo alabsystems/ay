@@ -58,7 +58,7 @@ export PATH="$PWD/target/release:$PATH"
 ```
 
 > AY builds with stock stable Rust. The ALab
-> [Trust](development-only integration) compiler — a
+> Trust (development-only integration) compiler — a
 > verification-oriented Rust toolchain — will become the recommended way to
 > build AY when it is published.
 
@@ -140,7 +140,7 @@ answer. Choose how strict to be:
 Beyond external checkers, the shipped
 [`verification/lean`](verification/lean) project states soundness theorems for
 selected solver kernels in Lean 4, and the ALab
-[Clean](development-only integration) proof kernel reconstructs
+Clean (development-only integration) proof kernel reconstructs
 supported SAT, SMT, arithmetic, and Farkas evidence inside a minimal,
 auditable kernel. `ay check` validates SAT proof artifacts in-tree.
 
@@ -365,7 +365,7 @@ underlying techniques began here.
   See the [selector](crates/ay-chc/src/portfolio/selector.rs) and
   [acceptance gate](crates/ay-chc/src/portfolio/accept.rs).
 - **Checked code without a shadow implementation.** The
-  [Trust](development-only integration) toolchain machine-checks
+  Trust (development-only integration) toolchain machine-checks
   selected bounded kernels over the same source bytes compiled by Rust; this
   repository includes the corresponding source and exhaustive tests. This
   reduces drift between an executable function and a proof model. One example
@@ -383,11 +383,11 @@ AY is exercised as infrastructure by the other ALab Systems projects:
 
 | Project | How it uses AY |
 | --- | --- |
-| [Trust VC](development-only integration) / [Trust WP](development-only integration) | Lower Rust contracts and verification conditions to SMT, then retain AY's solve evidence for proof reconstruction. |
-| [Trust MC](development-only integration) / [Ty](development-only integration) | Power bounded and symbolic model checking with SAT, CHC/PDR, k-induction, counterexample validation, and LRAT-backed hardware checks. |
-| [Clean](development-only integration) | Discharge theorem goals with AY-backed tactics and reconstruct supported SAT, SMT, arithmetic, and Farkas evidence in the proof kernel. |
-| [NN](development-only integration) / [NY](development-only integration) | NN exposes partial NY/AY verification hooks; NY uses AY's in-process MILP and SMT escalation paths for network properties, returning validated counterexamples and supported certificates. |
-| [Trust IR](development-only integration) | Supply the typed compiler facts from which downstream verification conditions and solver artifacts are built. |
+| Trust VC (development-only integration) / Trust WP (development-only integration) | Lower Rust contracts and verification conditions to SMT, then retain AY's solve evidence for proof reconstruction. |
+| Trust MC (development-only integration) / Ty (development-only integration) | Power bounded and symbolic model checking with SAT, CHC/PDR, k-induction, counterexample validation, and LRAT-backed hardware checks. |
+| Clean (development-only integration) | Discharge theorem goals with AY-backed tactics and reconstruct supported SAT, SMT, arithmetic, and Farkas evidence in the proof kernel. |
+| NN (development-only integration) / NY (development-only integration) | NN exposes partial NY/AY verification hooks; NY uses AY's in-process MILP and SMT escalation paths for network properties, returning validated counterexamples and supported certificates. |
+| Trust IR (development-only integration) | Supply the typed compiler facts from which downstream verification conditions and solver artifacts are built. |
 
 ## Similar programs
 

@@ -26,7 +26,7 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-/// Strings increment P2 master switch (`AY_STR_P2=1`, default OFF).
+/// Strings increment P2 master switch (default ON, `AY_STR_P2=0` kill switch).
 ///
 /// Gates the eager NON-GROUND extended-function reduction package
 /// (Reynolds CAV'17 / CVC-style):

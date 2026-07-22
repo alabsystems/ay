@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 //! W4 — length-indexed per-position character witness synthesizer
-//! (`AY_STR_W4=1`, default OFF).
+//! (default ON, `AY_STR_W4=0` kill switch).
 //!
 //! ## Why
 //!
@@ -69,7 +69,7 @@
 //! `str.substr`/`str.at` only, so a violated atom whose haystack is rooted at
 //! `str.++`/`str.replace`, or that is keyed on an `str.indexof` RESULT, yields
 //! no edit at all and the climb plateaus. That measured residue is
-//! [`super::strings_w5`]'s (`AY_STR_W5=1`, default OFF), which searches WHERE
+//! [`super::strings_w5`]'s (default ON, `AY_STR_W5=0` kill switch), which searches WHERE
 //! the needle lands and hands the rest back to the loop below.
 
 // #8529: Use deterministic hash maps in all builds.
@@ -106,7 +106,7 @@ fn w4_test_enabled_override(value: bool) -> W4EnabledTestOverride {
     W4EnabledTestOverride { previous }
 }
 
-/// Master switch (`AY_STR_W4=1`, default OFF → byte-identical pipeline).
+/// Master switch (default ON, `AY_STR_W4=0` kill switch → byte-identical pipeline).
 pub(in crate::executor) fn str_w4_enabled() -> bool {
     #[cfg(test)]
     if let Some(value) = W4_ENABLED_TEST_OVERRIDE.with(std::cell::Cell::get) {

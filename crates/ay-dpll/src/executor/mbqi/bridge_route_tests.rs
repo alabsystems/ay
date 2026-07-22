@@ -16,6 +16,7 @@
 
 use super::*;
 use ay_frontend::parse;
+use ay_test_support::env::{lock_env, ScopedEnvVar};
 
 /// Execute the declares + asserts of `script` and return `(executor,
 /// foralls)` where `foralls` is each top-level forall's `(var_names, body)`.
@@ -141,8 +142,8 @@ fn precheck_claims_only_with_matching_in_snapshot_pin() {
     // The precheck's W1 leg applies the SAME premise gate, model-free: with
     // the pin present the snapshot is claimable; with the pin absent (or
     // mismatched) it is not. Env-gated: force the flag via a child-free check
-    // by setting the var around the call — serial test threads make this safe,
-    // and the var is restored either way.
+    // by setting the var around the call under the workspace env lock; the
+    // guard restores the previous value on every exit path.
     let (exec, _) = setup(FIXTURE);
     let snapshot = exec.ctx.assertions.clone();
     let (exec_nopin, _) = setup(
@@ -155,18 +156,277 @@ fn precheck_claims_only_with_matching_in_snapshot_pin() {
     );
     let snapshot_nopin = exec_nopin.ctx.assertions.clone();
 
-    let prev = std::env::var_os("AY_DT_CERT_BRIDGE_ROUTE");
-    std::env::set_var("AY_DT_CERT_BRIDGE_ROUTE", "1");
+    let _env_lock = lock_env();
+    let _route = ScopedEnvVar::set("AY_DT_CERT_BRIDGE_ROUTE", "1");
     let claimable_with_pin = exec.dt_cert_snapshot_structurally_claimable(&snapshot);
     let claimable_without_pin = exec_nopin.dt_cert_snapshot_structurally_claimable(&snapshot_nopin);
-    match prev {
-        Some(v) => std::env::set_var("AY_DT_CERT_BRIDGE_ROUTE", v),
-        None => std::env::remove_var("AY_DT_CERT_BRIDGE_ROUTE"),
-    }
     assert!(claimable_with_pin, "pinned snapshot must pass the precheck");
     assert!(
         !claimable_without_pin,
         "free-bridge snapshot must fail the precheck"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// EUF-extraction faithfulness guarantee (SAT-side base-recheck campaign, the
+// blocking pin #5). `dt_cert_extraction_faithful` cross-checks the certified
+// finite tables against the solver's COMMITTED per-application values. These
+// pins run IN-PROCESS over a real committed model (a ground satisfiable base
+// solved by `execute_all`), then inject the extraction-infidelity a future
+// [[regression-mutref-euf-lia-model]]-class bug would produce and confirm the
+// guarantee DECLINES it while a faithful extraction still passes.
+// ---------------------------------------------------------------------------
+
+/// A ground (quantifier-free) satisfiable base: `is-Cons c`, `logic_sum(c) = 0`.
+/// Solving it leaves `last_model` with logic_sum(c) committed to 0.
+const FAITH_BASE: &str = r#"
+    (set-logic ALL)
+    (declare-datatypes ((List 0)) (((Cons (hd Int) (tl List)) (Nil))))
+    (declare-const c List)
+    (declare-fun logic_sum (List) Int)
+    (assert (is-Cons c))
+    (assert (= (logic_sum c) 0))
+    (check-sat)
+"#;
+
+/// Solve a GROUND satisfiable base ending in `(check-sat)`, returning the
+/// executor and its committed model.
+fn solve_ground(script: &str) -> (Executor, Model) {
+    let commands = parse(script).expect("parse faithfulness fixture");
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).expect("execute fixture");
+    assert_eq!(
+        outputs.last().map(String::as_str),
+        Some("sat"),
+        "faithfulness ground base must be sat"
+    );
+    let model = exec.last_model.clone().expect("committed model after sat");
+    (exec, model)
+}
+
+/// Locate the `(logic_sum <arg>)` application and its argument in `exec`.
+fn find_logic_sum_app(exec: &Executor) -> (TermId, TermId) {
+    let mut stack: Vec<TermId> = exec.ctx.assertions.clone();
+    let mut seen: HashSet<TermId> = HashSet::default();
+    while let Some(t) = stack.pop() {
+        if !seen.insert(t) {
+            continue;
+        }
+        match exec.ctx.terms.get(t) {
+            TermData::App(sym, args) => {
+                if sym.name() == "logic_sum" && args.len() == 1 {
+                    return (t, args[0]);
+                }
+                for &a in args {
+                    stack.push(a);
+                }
+            }
+            TermData::Not(i) => stack.push(*i),
+            TermData::Ite(a, b, c) => {
+                stack.push(*a);
+                stack.push(*b);
+                stack.push(*c);
+            }
+            _ => {}
+        }
+    }
+    panic!("logic_sum application not found in assertions");
+}
+
+/// Build the certified `logic_sum` finite table + default + codomain the way a
+/// faithful-looking extraction would: the cell for `c`'s e-class is the nonneg
+/// default 0 (`0 >= 0`, which the F4 cell machinery certifies unconditionally).
+#[allow(clippy::type_complexity)]
+fn faith_cert_tables(
+    key: &str,
+) -> (
+    HashMap<String, TableCertSort>,
+    HashMap<String, HashMap<String, TableCertVal>>,
+    HashMap<String, TableCertVal>,
+) {
+    let mut table: HashMap<String, TableCertVal> = HashMap::default();
+    table.insert(
+        key.to_string(),
+        TableCertVal::Int(num_bigint::BigInt::from(0)),
+    );
+    let mut tables: HashMap<String, HashMap<String, TableCertVal>> = HashMap::default();
+    tables.insert("logic_sum".to_string(), table);
+    let mut defaults: HashMap<String, TableCertVal> = HashMap::default();
+    defaults.insert(
+        "logic_sum".to_string(),
+        TableCertVal::Int(num_bigint::BigInt::from(0)),
+    );
+    let mut table_syms: HashMap<String, TableCertSort> = HashMap::default();
+    table_syms.insert("logic_sum".to_string(), TableCertSort::Int);
+    (table_syms, tables, defaults)
+}
+
+#[test]
+fn faithfulness_declines_committed_value_disagreeing_with_certified_cell() {
+    // ★ THE ADVERSARIAL ATTACK. logic_sum(c)'s COMMITTED value is negative (-5) —
+    // as it would be if it reached the solver only via an EUF equality/congruence
+    // chain a buggy extraction then dropped/misassigned — but the certified table
+    // cell claims the nonneg default 0. The F4 cell machinery ALONE certifies
+    // (0 >= 0); the faithfulness guarantee MUST decline, closing the wrong-SAT
+    // hole. Without the guarantee this base would grant → vacuous proof Verified.
+    let (mut exec, mut model) = solve_ground(FAITH_BASE);
+    let (app, arg) = find_logic_sum_app(&exec);
+    let key = exec
+        .dt_cert_value_key(&model, arg)
+        .expect("resolvable argument e-class");
+    let (table_syms, tables, defaults) = faith_cert_tables(&key);
+    let bridge_rewrite: HashMap<String, (String, Sort)> = HashMap::default();
+    let snapshot = exec.ctx.assertions.clone();
+
+    // The genuine grant is PRESERVED: with the faithful committed value (0) the
+    // guarantee passes (committed 0 == certified cell 0).
+    assert!(
+        exec.dt_cert_extraction_faithful(
+            &model,
+            &snapshot,
+            &table_syms,
+            &tables,
+            &defaults,
+            &bridge_rewrite
+        )
+        .is_ok(),
+        "faithful extraction (committed 0 == cell 0) must pass"
+    );
+
+    // Inject the extraction infidelity: pin logic_sum(c)'s COMMITTED value to -5
+    // (the func_app_const_terms anchor a dropped-congruence bug would leave)
+    // while the certified table cell stays 0.
+    let neg5 = exec.ctx.terms.mk_int(num_bigint::BigInt::from(-5));
+    model
+        .euf_model
+        .as_mut()
+        .expect("euf model")
+        .func_app_const_terms
+        .insert(app, neg5);
+
+    let err = exec
+        .dt_cert_extraction_faithful(
+            &model,
+            &snapshot,
+            &table_syms,
+            &tables,
+            &defaults,
+            &bridge_rewrite,
+        )
+        .expect_err("faithfulness must DECLINE the infidel extraction");
+    assert!(
+        err.contains("disagrees with certified cell"),
+        "unexpected decline reason: {err}"
+    );
+}
+
+#[test]
+fn faithfulness_declines_function_table_conflict_flag() {
+    // The EUF extraction flags `logic_sum` as a cross-theory function-table
+    // conflict (rows that could not be repaired exactly after model combination
+    // — the regression-mutref failure mode). Its contract says consumers MUST
+    // fail closed; certifying a universal over such a symbol is the wrong-SAT
+    // vector. The guarantee MUST decline even though every table cell reads 0.
+    let (exec, mut model) = solve_ground(FAITH_BASE);
+    let (_, arg) = find_logic_sum_app(&exec);
+    let key = exec
+        .dt_cert_value_key(&model, arg)
+        .expect("resolvable argument e-class");
+    let (table_syms, tables, defaults) = faith_cert_tables(&key);
+    let bridge_rewrite: HashMap<String, (String, Sort)> = HashMap::default();
+    let snapshot = exec.ctx.assertions.clone();
+
+    model
+        .euf_model
+        .as_mut()
+        .expect("euf model")
+        .function_table_conflicts
+        .insert("logic_sum".to_string());
+
+    let err = exec
+        .dt_cert_extraction_faithful(
+            &model,
+            &snapshot,
+            &table_syms,
+            &tables,
+            &defaults,
+            &bridge_rewrite,
+        )
+        .expect_err("faithfulness must DECLINE a conflict-flagged relied-upon symbol");
+    assert!(
+        err.contains("flagged inconsistent"),
+        "unexpected decline reason: {err}"
+    );
+}
+
+#[test]
+fn faithfulness_declines_ground_application_without_independent_anchor() {
+    // A definite F4 cell is not an independent witness: it was produced by the
+    // same evaluator/table extraction this gate is checking. If all committed
+    // TermId-keyed anchors for a ground application disappear, the guarantee
+    // must decline instead of silently trusting that cell.
+    let (exec, mut model) = solve_ground(FAITH_BASE);
+    let (app, arg) = find_logic_sum_app(&exec);
+    let key = exec
+        .dt_cert_value_key(&model, arg)
+        .expect("resolvable argument e-class");
+    let (table_syms, tables, defaults) = faith_cert_tables(&key);
+    let bridge_rewrite: HashMap<String, (String, Sort)> = HashMap::default();
+    let snapshot = exec.ctx.assertions.clone();
+
+    let euf = model.euf_model.as_mut().expect("euf model");
+    euf.func_app_const_terms.remove(&app);
+    euf.int_values.remove(&app);
+    euf.term_values.remove(&app);
+
+    let err = exec
+        .dt_cert_extraction_faithful(
+            &model,
+            &snapshot,
+            &table_syms,
+            &tables,
+            &defaults,
+            &bridge_rewrite,
+        )
+        .expect_err("faithfulness must DECLINE a ground app with no independent anchor");
+    assert!(
+        err.contains("no independent committed value"),
+        "unexpected decline reason: {err}"
+    );
+}
+
+#[test]
+fn faithfulness_declines_ground_application_without_certified_cell() {
+    // Conversely, a committed value cannot certify a table decision that does
+    // not exist. Neither a row nor a default means the universal's decision at
+    // this e-class is missing, so the grant must fail closed.
+    let (exec, model) = solve_ground(FAITH_BASE);
+    let (_, arg) = find_logic_sum_app(&exec);
+    let key = exec
+        .dt_cert_value_key(&model, arg)
+        .expect("resolvable argument e-class");
+    let (table_syms, mut tables, mut defaults) = faith_cert_tables(&key);
+    tables
+        .get_mut("logic_sum")
+        .expect("logic_sum table")
+        .clear();
+    defaults.remove("logic_sum");
+    let bridge_rewrite: HashMap<String, (String, Sort)> = HashMap::default();
+    let snapshot = exec.ctx.assertions.clone();
+
+    let err = exec
+        .dt_cert_extraction_faithful(
+            &model,
+            &snapshot,
+            &table_syms,
+            &tables,
+            &defaults,
+            &bridge_rewrite,
+        )
+        .expect_err("faithfulness must DECLINE a ground app with no certified decision");
+    assert!(
+        err.contains("no certified row or default"),
+        "unexpected decline reason: {err}"
     );
 }
 
@@ -176,12 +436,9 @@ fn precheck_flag_off_declines_bridge_shape() {
     // the pre-route precheck.
     let (exec, _) = setup(FIXTURE);
     let snapshot = exec.ctx.assertions.clone();
-    let prev = std::env::var_os("AY_DT_CERT_BRIDGE_ROUTE");
-    std::env::remove_var("AY_DT_CERT_BRIDGE_ROUTE");
+    let _env_lock = lock_env();
+    let _route = ScopedEnvVar::unset("AY_DT_CERT_BRIDGE_ROUTE");
     let claimable = exec.dt_cert_snapshot_structurally_claimable(&snapshot);
-    if let Some(v) = prev {
-        std::env::set_var("AY_DT_CERT_BRIDGE_ROUTE", v);
-    }
     assert!(
         !claimable,
         "flag-off precheck must decline the bridge tautology shape"

@@ -29,29 +29,33 @@ use ay_frontend::parse;
 /// returning the final verdict line. The env var is set before every solve so
 /// the diet is armed regardless of test execution order.
 fn solve_diet(smt: &str, timeout: Duration) -> String {
-    std::env::set_var("AY_INTERFACE_DIET", "on");
-    let src = smt.to_string();
-    let interrupt = Arc::new(AtomicBool::new(false));
-    let interrupt_worker = Arc::clone(&interrupt);
-    let (tx, rx) = std::sync::mpsc::channel();
-    let _worker = std::thread::spawn(move || {
-        let commands = parse(&src).expect("parse interface-diet pin fixture");
-        let mut exec = Executor::new();
-        exec.set_interrupt(interrupt_worker);
-        exec.set_timeout(Some(timeout));
-        let verdict = match exec.execute_all(&commands) {
-            Ok(outputs) => outputs.last().cloned().unwrap_or_default(),
-            Err(_) => "unknown".to_string(),
-        };
-        let _ = tx.send(verdict);
-    });
-    match rx.recv_timeout(timeout + Duration::from_secs(5)) {
-        Ok(verdict) => verdict.trim().to_string(),
-        Err(_) => {
-            interrupt.store(true, Ordering::Relaxed);
-            "unknown".to_string()
+    // Serialized + restore-on-exit via the workspace env choke point; the diet
+    // is armed for the whole solve (read once per process at combiner
+    // construction, which happens inside the worker spawned below).
+    ay_test_support::env::with_serialized_env_vars(&[("AY_INTERFACE_DIET", "on")], || {
+        let src = smt.to_string();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let interrupt_worker = Arc::clone(&interrupt);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _worker = std::thread::spawn(move || {
+            let commands = parse(&src).expect("parse interface-diet pin fixture");
+            let mut exec = Executor::new();
+            exec.set_interrupt(interrupt_worker);
+            exec.set_timeout(Some(timeout));
+            let verdict = match exec.execute_all(&commands) {
+                Ok(outputs) => outputs.last().cloned().unwrap_or_default(),
+                Err(_) => "unknown".to_string(),
+            };
+            let _ = tx.send(verdict);
+        });
+        match rx.recv_timeout(timeout + Duration::from_secs(5)) {
+            Ok(verdict) => verdict.trim().to_string(),
+            Err(_) => {
+                interrupt.store(true, Ordering::Relaxed);
+                "unknown".to_string()
+            }
         }
-    }
+    })
 }
 
 /// Pin (i): `f(x) <= 4 /\ g(x) = 5 /\ f(x) = g(x)` — the pure-UF=UF link

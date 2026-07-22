@@ -156,11 +156,11 @@ struct PublishedDimacsProof {
     sha256: Sha256Digest,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const DIMACS_PROOF_STAGING_ATTEMPTS: u64 = 128;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const DIMACS_PROOF_STAGING_PREFIX: &str = ".ay-dimacs-proof-";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 static DIMACS_PROOF_STAGING_NONCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -183,7 +183,7 @@ struct OwnedDimacsProof {
     invalidation: DimacsPublicationInvalidation,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct DimacsProofStatusReservation {
     proof_path: PathBuf,
     status_path: PathBuf,
@@ -192,7 +192,7 @@ struct DimacsProofStatusReservation {
     lock_identity: ProofFileIdentity,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct DimacsProofStatusReservation;
 
 struct RetainedDimacsPublication {
@@ -211,7 +211,7 @@ enum DimacsPublicationInvalidation {
     Proof { binary: bool },
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InjectedDimacsProofCreateFailure {
     Identity,
@@ -220,24 +220,24 @@ enum InjectedDimacsProofCreateFailure {
 
 #[cfg(test)]
 std::thread_local! {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     static INJECTED_DIMACS_PROOF_CREATE_FAILURE:
         std::cell::Cell<Option<InjectedDimacsProofCreateFailure>> = const { std::cell::Cell::new(None) };
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     static INJECTED_DIMACS_PROOF_CLEANUP_FAILURE:
         std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     static INJECTED_DIMACS_PROOF_CLEANUP_REPLACEMENT:
         std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static INJECTED_OPTIONAL_DIMACS_WRITER_FAILURE:
         std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     static INJECTED_DIMACS_STATUS_LOCK_IDENTITY_FAILURE:
         std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(target_os = "linux")]
     static INJECTED_ANONYMOUS_DIMACS_STAGING_ERROR:
         std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     static INJECTED_DIMACS_RENAME_NOREPLACE_ERROR:
         std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
@@ -286,7 +286,7 @@ fn inject_dimacs_rename_noreplace_error_once(raw_os_error: i32) {
     INJECTED_DIMACS_RENAME_NOREPLACE_ERROR.with(|error| error.set(Some(raw_os_error)));
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn take_injected_dimacs_proof_create_failure(expected: InjectedDimacsProofCreateFailure) -> bool {
     INJECTED_DIMACS_PROOF_CREATE_FAILURE.with(|failure| {
         if failure.get() == Some(expected) {
@@ -298,12 +298,12 @@ fn take_injected_dimacs_proof_create_failure(expected: InjectedDimacsProofCreate
     })
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn take_injected_dimacs_proof_cleanup_failure() -> bool {
     INJECTED_DIMACS_PROOF_CLEANUP_FAILURE.with(|failure| failure.replace(false))
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn take_injected_dimacs_proof_cleanup_replacement() -> bool {
     INJECTED_DIMACS_PROOF_CLEANUP_REPLACEMENT.with(|replacement| replacement.replace(false))
 }
@@ -313,7 +313,7 @@ fn take_injected_optional_dimacs_writer_failure() -> bool {
     INJECTED_OPTIONAL_DIMACS_WRITER_FAILURE.with(|failure| failure.replace(false))
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn take_injected_dimacs_status_lock_identity_failure() -> bool {
     INJECTED_DIMACS_STATUS_LOCK_IDENTITY_FAILURE.with(|failure| failure.replace(false))
 }
@@ -323,7 +323,7 @@ fn take_injected_anonymous_dimacs_staging_error() -> Option<i32> {
     INJECTED_ANONYMOUS_DIMACS_STAGING_ERROR.with(|error| error.replace(None))
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn take_injected_dimacs_rename_noreplace_error() -> Option<i32> {
     INJECTED_DIMACS_RENAME_NOREPLACE_ERROR.with(|error| error.replace(None))
 }
@@ -423,7 +423,7 @@ fn regular_file_identity(file: &File, path: &Path) -> io::Result<ProofFileIdenti
     Ok(ProofFileIdentity::from_metadata(&metadata))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn create_private_dimacs_staging_directory(target: &Path) -> io::Result<(PathBuf, PathBuf)> {
     let parent = target.parent().ok_or_else(|| {
         io::Error::new(
@@ -497,7 +497,21 @@ fn anonymous_dimacs_staging_is_unsupported(error: &io::Error) -> bool {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+fn create_anonymous_dimacs_staging_file(_target: &Path) -> io::Result<File> {
+    // macOS has no O_TMPFILE-style anonymous inode. Report the documented
+    // "filesystem cannot stage anonymously" rejection so the caller falls
+    // back to the named single-link stage, which macOS publishes atomically
+    // with no-replace semantics via renamex_np(RENAME_EXCL).
+    Err(io::Error::from_raw_os_error(nix::libc::EOPNOTSUPP))
+}
+
+#[cfg(target_os = "macos")]
+fn anonymous_dimacs_staging_is_unsupported(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(nix::libc::EOPNOTSUPP))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn create_named_dimacs_staging_file(target: &Path) -> io::Result<(PathBuf, File)> {
     let parent = target.parent().ok_or_else(|| {
         io::Error::new(
@@ -536,7 +550,7 @@ fn create_named_dimacs_staging_file(target: &Path) -> io::Result<(PathBuf, File)
     ))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn cleanup_unregistered_dimacs_staging(
     descriptor: &File,
     staging_path: &Path,
@@ -564,7 +578,7 @@ fn cleanup_unregistered_dimacs_staging(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn dimacs_proof_setup_error(
     error: io::Error,
     cleanup: io::Result<()>,
@@ -579,7 +593,7 @@ fn dimacs_proof_setup_error(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn preexisting_dimacs_proof_error(path: &Path, error: Option<&io::Error>) -> io::Error {
     let detail = error.map_or_else(String::new, |error| format!(": {error}"));
     io::Error::new(
@@ -598,7 +612,7 @@ fn preexisting_dimacs_proof_error(path: &Path, error: Option<&io::Error>) -> io:
 /// Unsupported platforms fail before reserving any proof/status pathname. The
 /// registry retains a descriptor for every later seal, verification, artifact
 /// scan, and cleanup.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn create_owned_dimacs_proof_file_with_status(
     path: &str,
     status_reservation: &mut Option<DimacsProofStatusReservation>,
@@ -697,7 +711,7 @@ fn create_owned_dimacs_proof_file_with_status(
     Ok(file)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn create_owned_dimacs_proof_file_with_status(
     _path: &str,
     _status_reservation: &mut Option<DimacsProofStatusReservation>,
@@ -718,7 +732,7 @@ fn create_owned_dimacs_proof_file(path: &str) -> io::Result<File> {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn create_configured_dimacs_proof_file(proof: &ProofConfig) -> io::Result<File> {
     if !proof.synthesized_default {
         let mut status_reservation = None;
@@ -754,7 +768,7 @@ fn create_configured_dimacs_proof_file(proof: &ProofConfig) -> io::Result<File> 
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn create_configured_dimacs_proof_file(_proof: &ProofConfig) -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -925,7 +939,7 @@ fn publish_dimacs_descriptor_noreplace(descriptor: &File, target: &Path) -> io::
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rename_dimacs_noreplace(source: &Path, target: &Path) -> io::Result<()> {
     #[cfg(test)]
     if let Some(raw_os_error) = take_injected_dimacs_rename_noreplace_error() {
@@ -934,7 +948,7 @@ fn rename_dimacs_noreplace(source: &Path, target: &Path) -> io::Result<()> {
     ay_sys::fs::rename_noreplace(source, target)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn move_dimacs_proof_to_private_quarantine(source: &Path, target: &Path) -> io::Result<()> {
     // Never remove a public pathname unless the same platform can atomically
     // restore a quarantined replacement without clobbering another object.
@@ -988,7 +1002,7 @@ fn remove_authenticated_visible_file(
         )));
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let path_matches = match open_dimacs_regular_file(path) {
             Ok(visible) => {
@@ -1007,7 +1021,7 @@ fn remove_authenticated_visible_file(
         };
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let (private_directory, _) = match create_private_dimacs_staging_directory(path) {
             Ok(staging) => staging,
@@ -1196,7 +1210,7 @@ fn seal_owned_dimacs_proof(path: &str) -> io::Result<PublishedDimacsProof> {
                 .staging_path
                 .clone()
                 .ok_or_else(|| io::Error::other("named DIMACS proof staging path is missing"))?;
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let Err(error) = rename_dimacs_noreplace(&staging_path, &resolved) {
                 return Err(if error.kind() == io::ErrorKind::AlreadyExists {
                     preexisting_dimacs_proof_error(&resolved, Some(&error))
@@ -1204,7 +1218,7 @@ fn seal_owned_dimacs_proof(path: &str) -> io::Result<PublishedDimacsProof> {
                     error
                 });
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
@@ -1523,6 +1537,11 @@ struct AuthenticatedLeanSnapshot {
     identity: ProofFileIdentity,
     len: u64,
     sha256: Sha256Digest,
+    /// Retained private stage pathname handed to the kernel verifier on hosts
+    /// without a re-openable descriptor path (macOS). Never a trust root: the
+    /// descriptor bytes are re-authenticated around the kernel run.
+    #[cfg(target_os = "macos")]
+    snapshot_path: PathBuf,
 }
 
 impl AuthenticatedLeanSnapshot {
@@ -1553,7 +1572,52 @@ impl AuthenticatedLeanSnapshot {
         })
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    fn create(public_path: &str, published: PublishedDimacsProof) -> io::Result<Self> {
+        let bytes = read_published_dimacs_proof(public_path, published.sha256)?;
+        if bytes.len() as u64 != published.len || sha256_digest(&bytes) != published.sha256 {
+            return Err(io::Error::other(
+                "sealed DIMACS proof bytes changed before Lean snapshot creation",
+            ));
+        }
+
+        // macOS has no anonymous O_TMPFILE inode: stage the snapshot as a
+        // fresh mode-0600 single-link file inside a fresh private mode-0700
+        // staging directory instead. The retained descriptor pins the exact
+        // inode across exec, and `validate()` re-authenticates the bytes
+        // against the published digest before and after the kernel run, so
+        // the named stage never becomes a verifier trust root. The stage is
+        // retained as bounded private debris rather than pathname-deleted
+        // after a racy check.
+        let resolved = resolved_dimacs_proof_path(public_path)?;
+        let (_directory, snapshot_path) = create_private_dimacs_staging_directory(&resolved)?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+        }
+        let mut descriptor = options.open(&snapshot_path)?;
+        descriptor.write_all(&bytes)?;
+        descriptor.sync_all()?;
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            descriptor.set_permissions(std::fs::Permissions::from_mode(0o400))?;
+        }
+        let identity = regular_single_link_identity(&descriptor, &snapshot_path)?;
+        descriptor.seek(SeekFrom::Start(0))?;
+        Ok(Self {
+            descriptor,
+            identity,
+            len: published.len,
+            sha256: published.sha256,
+            snapshot_path,
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn create(_public_path: &str, _published: PublishedDimacsProof) -> io::Result<Self> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -2220,7 +2284,7 @@ pub(super) fn dimacs_proof_status_lock_path(path: &Path) -> PathBuf {
     PathBuf::from(lock)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn dimacs_proof_digest_hex(digest: Sha256Digest) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(digest.len() * 2);
@@ -2231,7 +2295,7 @@ fn dimacs_proof_digest_hex(digest: Sha256Digest) -> String {
     encoded
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn dimacs_proof_status_content(status: &str, sha256: Option<Sha256Digest>) -> String {
     let mut content = format!(
         "ay-dimacs-proof-status-v1\nstatus={status}\nproducer_pid={}\n",
@@ -2245,7 +2309,7 @@ fn dimacs_proof_status_content(status: &str, sha256: Option<Sha256Digest>) -> St
     content
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn status_transaction_error(
     operation_error: io::Error,
     cleanup: io::Result<bool>,
@@ -2259,7 +2323,7 @@ fn status_transaction_error(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn reserve_dimacs_proof_status(proof_path: &str) -> io::Result<DimacsProofStatusReservation> {
     let proof_path = resolved_dimacs_proof_path(proof_path)?;
     let status_path = dimacs_proof_status_path_from_path(&proof_path);
@@ -2391,7 +2455,7 @@ fn reserve_dimacs_proof_status(proof_path: &str) -> io::Result<DimacsProofStatus
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn reserve_dimacs_proof_status(_proof_path: &str) -> io::Result<DimacsProofStatusReservation> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -2399,7 +2463,7 @@ fn reserve_dimacs_proof_status(_proof_path: &str) -> io::Result<DimacsProofStatu
     ))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rewrite_reserved_dimacs_proof_status(
     descriptor: &File,
     path: &Path,
@@ -2427,7 +2491,7 @@ fn rewrite_reserved_dimacs_proof_status(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn publish_reserved_dimacs_proof_status(
     reservation: DimacsProofStatusReservation,
     status: &str,
@@ -2478,7 +2542,7 @@ fn publish_reserved_dimacs_proof_status(
     Ok(publication)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn publish_reserved_dimacs_proof_status(
     _reservation: DimacsProofStatusReservation,
     _status: &str,
@@ -7167,7 +7231,9 @@ fn verify_lean_proof(proof_config: Option<&ProofConfig>) -> bool {
     // remains useful as a retained artifact, but it is never a verifier input.
     #[cfg(target_os = "linux")]
     let outcome = verifier.verify_descriptor(&snapshot.descriptor);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    let outcome = verifier.verify_snapshot_path(&snapshot.snapshot_path, &snapshot.descriptor);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let outcome = LeanVerificationOutcome::Unavailable {
         reason: "authenticated anonymous Lean snapshots are not supported on this platform"
             .to_string(),

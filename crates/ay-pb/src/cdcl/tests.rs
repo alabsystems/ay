@@ -7081,7 +7081,7 @@ fn root_lp_budget_is_deadline_proportional() {
 
     // Plenty of remaining time: the flat cap binds (min).
     assert_eq!(
-        root_lp_budget_for(Some(Duration::from_secs(120))),
+        root_lp_budget_for(Some(Duration::from_mins(2))),
         ROOT_LP_BOUND_TIME_BUDGET
     );
     // Exactly at the crossover: remaining / fraction == cap.

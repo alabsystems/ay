@@ -110,6 +110,7 @@ nix = { workspace = true, optional = true, features = ["fs", "time"] }
 signal-hook = { workspace = true, optional = true }
 
 [dev-dependencies]
+ay-test-support.workspace = true
 criterion.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -121,7 +122,6 @@ ay-drat-check.workspace = true
 ay-lrat-check.workspace = true
 ay-replay.workspace = true
 ay-sat.workspace = true
-ay-test-support.workspace = true
 
 [[bin]]
 name = "ay"
@@ -131,6 +131,11 @@ required-features = ["cli"]
 [[test]]
 name = "bv_idl_combination"
 path = "tests/bv_idl_combination.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "group_bv"
+path = "tests/group_bv.rs"
 required-features = ["cli"]
 
 [[test]]

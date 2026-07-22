@@ -1656,7 +1656,7 @@ fn test_cli_chc_stats_json_binds_emitted_certificate_artifact_hashes() {
 (check-sat)
 "#;
     let (temp_path, _cleanup) = write_temp_smt2(input);
-    let (proof_path, _proof_cleanup) = temp_output_path("smt2");
+    let (proof_path, _proof_cleanup) = temp_output_path("chccert");
 
     let output = Command::new(ay_path)
         .arg("--chc")
@@ -1685,9 +1685,14 @@ fn test_cli_chc_stats_json_binds_emitted_certificate_artifact_hashes() {
         manifest["admission"]["proof_artifact_sha256"],
         proof["sha256"]
     );
+    // The manifest records the canonicalized artifact path; canonicalize the
+    // requested path for comparison (macOS TMPDIR lives behind a /var ->
+    // /private/var symlink).
     assert_eq!(
-        proof["path"],
-        proof_path.to_string_lossy().to_string(),
+        std::path::Path::new(proof["path"].as_str().expect("proof artifact path string")),
+        std::fs::canonicalize(&proof_path)
+            .expect("canonicalize requested proof path")
+            .as_path(),
         "proof artifact path should name the emitted certificate"
     );
     assert!(
@@ -1736,7 +1741,7 @@ fn test_cli_chc_stats_json_binds_unsafe_trace_validity_obligation_hash() {
 (check-sat)
 "#;
     let (temp_path, _cleanup) = write_temp_smt2(input);
-    let (proof_path, _proof_cleanup) = temp_output_path("smt2");
+    let (proof_path, _proof_cleanup) = temp_output_path("chccert");
 
     let output = Command::new(ay_path)
         .arg("--chc")

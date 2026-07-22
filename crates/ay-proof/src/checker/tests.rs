@@ -1492,6 +1492,7 @@ fn test_strict_not_ite2_valid() {
 }
 
 mod array_chain_axiom_tests;
+mod array_ext_axiom_tests;
 mod boolean_coverage_tests;
 mod boolean_negation_coverage_tests;
 mod datatype_axiom_tests;

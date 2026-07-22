@@ -148,7 +148,7 @@ mod tests {
     /// of hanging the suite.
     fn bounded_pdr_config() -> PdrConfig {
         PdrConfig {
-            solve_timeout: Some(std::time::Duration::from_secs(60)),
+            solve_timeout: Some(std::time::Duration::from_mins(1)),
             ..PdrConfig::default()
         }
     }

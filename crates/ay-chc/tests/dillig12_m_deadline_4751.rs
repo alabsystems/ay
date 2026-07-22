@@ -7,9 +7,15 @@ use ntest::timeout;
 use std::time::Duration;
 
 const DILLIG12_M_BENCHMARK_4751: &str =
-    include_str!("../../../../benchmarks/chc-comp/2025/extra-small-lia/dillig12_m_000.smt2");
+    include_str!("../../../benchmarks/chc-comp/2025/extra-small-lia/dillig12_m_000.smt2");
 
 /// Regression guard for #4751.
+///
+/// Dedicated test binary (not part of `group_misc`): the release-profile solve
+/// uses ~14s of a 20s wall-clock budget, so running it under `--test-threads=8`
+/// alongside other heavy solves measures scheduler contention instead of the
+/// solver (repo precedent: `u64_overflow_bv_derisk`). Cargo runs test binaries
+/// sequentially, so this binary gets the machine to itself.
 ///
 /// This is the full CHC-COMP `dillig12_m_000.smt2` benchmark from the issue
 /// report, not the reduced E=1 variant. The benchmark is known-safe and should

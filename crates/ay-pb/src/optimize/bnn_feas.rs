@@ -881,7 +881,7 @@ mod enum_probe {
             count += 1;
             eprintln!("  improve -> {v} @ {:?}", t0.elapsed());
         };
-        let deadline = t0 + std::time::Duration::from_secs(240);
+        let deadline = t0 + std::time::Duration::from_mins(4);
         let stop = || std::time::Instant::now() >= deadline;
         let best = enumerate_adversarial_incumbents(&inst, &obj, None, &stop, &mut stream);
         eprintln!(
@@ -1118,6 +1118,8 @@ mod timing_tests {
         } else {
             vec![glob.clone()]
         };
+        // Serialized for the whole run through the one workspace env choke point.
+        let _env_lock = lock_env();
         for path in paths {
             let text = std::fs::read_to_string(&path).expect("read");
             let instance = crate::parser::parse_opb(&text).expect("parse");
@@ -1156,6 +1158,7 @@ mod timing_tests {
                 let ft = first_t.map(|t| format!("{t:.4}s")).unwrap_or("none".into());
                 let fo = first_obj.map(|o| o.to_string()).unwrap_or("none".into());
                 eprintln!("TIMING {name:50} {label:10} first-feasible={ft:>10} obj={fo}");
+                // `_bnn` restores AY_PB_BNN_FEAS at the end of each iteration.
             }
         }
     }

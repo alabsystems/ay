@@ -17,14 +17,6 @@ use crate::{
     HornClause, VerifiedChcResult,
 };
 
-/// The route reads `AY_CHC_DISABLE_CATA` from the process environment, so
-/// every test in this module serializes through the one workspace-wide env
-/// lock to keep the kill-switch test from perturbing concurrently running
-/// route tests (and any other env-touching test in this binary).
-fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-    lock_env()
-}
-
 fn list_sort() -> ChcSort {
     ChcSort::Datatype {
         name: "Lst".to_string(),
@@ -287,7 +279,7 @@ fn cata_abstract_stages_work_for_equal_shape() {
 
 #[test]
 fn cata_route_certifies_equal_shape_list_problem_safe() {
-    let _guard = env_guard();
+    let _guard = lock_env();
     let solver = route_solver(equal_shape_safe_problem());
     let result = solver.try_cata_abstraction_route(None);
     match result {
@@ -328,7 +320,7 @@ fn cata_route_certifies_equal_shape_list_problem_safe() {
 
 #[test]
 fn cata_route_safe_survives_finalize_boundary() {
-    let _guard = env_guard();
+    let _guard = lock_env();
     let solver = route_solver(equal_shape_safe_problem());
     let Some((result, evidence)) = solver.try_cata_abstraction_route(None) else {
         panic!("cata route did not certify the equal-shape problem");
@@ -346,7 +338,7 @@ fn cata_route_safe_survives_finalize_boundary() {
 /// refines to a pool that certifies SAFE, or withholds (returns None).
 #[test]
 fn cata_route_never_reports_spurious_abstract_unsat() {
-    let _guard = env_guard();
+    let _guard = lock_env();
     let solver = route_solver(spurious_abstract_unsat_problem());
     let result = solver.try_cata_abstraction_route(None);
     match &result {
@@ -369,7 +361,7 @@ fn cata_route_never_reports_spurious_abstract_unsat() {
 /// BMC), but never Safe.
 #[test]
 fn cata_route_never_reports_false_safe_on_unsafe_problem() {
-    let _guard = env_guard();
+    let _guard = lock_env();
     let solver = route_solver(all_lists_unsafe_problem());
     match solver.try_cata_abstraction_route(None) {
         Some((PortfolioResult::Safe(_), _)) => {
@@ -389,7 +381,7 @@ fn cata_route_never_reports_false_safe_on_unsafe_problem() {
 /// SAT direction; concretization/over-approximation keeps the unsafety visible.
 #[test]
 fn cata_route_never_reports_false_safe_on_broken_sortedness() {
-    let _guard = env_guard();
+    let _guard = lock_env();
     // The CATA v3 element/ordering levels are on by default, so the route
     // exercises the `Sorted`/`Min` catamorphisms on this problem. Guard against
     // a sibling test leaving the opt-out kill switch set (restored on exit).
@@ -409,7 +401,7 @@ fn cata_route_never_reports_false_safe_on_broken_sortedness() {
 
 #[test]
 fn cata_route_respects_kill_switch() {
-    let _guard = env_guard();
+    let _guard = lock_env();
     let _cata = ScopedEnvVar::set("AY_CHC_DISABLE_CATA", "1");
     let solver = route_solver(equal_shape_safe_problem());
     let result = solver.try_cata_abstraction_route(None);
@@ -418,7 +410,7 @@ fn cata_route_respects_kill_switch() {
 
 #[test]
 fn cata_route_skips_non_recursive_datatype_problems() {
-    let _guard = env_guard();
+    let _guard = lock_env();
     // Pair(Int, Int) — non-recursive: dt_flatten territory, not cata.
     let pair_sort = ChcSort::Datatype {
         name: "Pair".to_string(),

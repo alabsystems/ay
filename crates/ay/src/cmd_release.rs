@@ -21,7 +21,7 @@ const PUBLIC_COMMIT_SCHEMA: &str = "ay-public-commit-evidence/v1";
 const RELEASE_PINS_SCHEMA: &str = "ay-public-release-pins/v1";
 const RELEASE_MANIFEST_SCHEMA: &str = "ay-release-manifest/v1";
 const RELEASE_MANIFEST_VERIFICATION_SCHEMA: &str = "ay-release-manifest-verification/v1";
-const HN_LAUNCH_GATE_SUMMARY_SCHEMA: &str = "ay-hn-launch-gate-summary/v1";
+const RELEASE_GATE_SUMMARY_SCHEMA: &str = "ay-release-gate-summary/v1";
 const DEFAULT_VERSION_COMMIT_PREFIX_LEN: usize = 12;
 
 // Expected release-pin repository URLs are deployment configuration: override
@@ -3146,9 +3146,9 @@ fn build_manifest(args: &GenerateManifestArgs) -> Result<(i32, Value)> {
             &mut errors,
             "launch_gate_summary_schemas",
             launch_gate_summaries.iter().all(|summary| {
-                summary.get("schema").and_then(Value::as_str) == Some(HN_LAUNCH_GATE_SUMMARY_SCHEMA)
+                summary.get("schema").and_then(Value::as_str) == Some(RELEASE_GATE_SUMMARY_SCHEMA)
             }),
-            &format!("all launch gate summaries must use schema {HN_LAUNCH_GATE_SUMMARY_SCHEMA}"),
+            &format!("all launch gate summaries must use schema {RELEASE_GATE_SUMMARY_SCHEMA}"),
         );
         bool_check(
             &mut checks,
@@ -3535,7 +3535,7 @@ fn verify_launch_gate_evidence(
             "launch_gate_summary_rows_pass",
             rows.iter().all(|row| {
                 row.get("exists").and_then(Value::as_bool) == Some(true)
-                    && row.get("schema").and_then(Value::as_str) == Some(HN_LAUNCH_GATE_SUMMARY_SCHEMA)
+                    && row.get("schema").and_then(Value::as_str) == Some(RELEASE_GATE_SUMMARY_SCHEMA)
                     && row.get("status").and_then(Value::as_str) == Some("pass")
                     && row.get("evidence_gate_failures").and_then(Value::as_i64) == Some(0)
                     && row.get("launch_blocker_count").and_then(Value::as_i64) == Some(0)

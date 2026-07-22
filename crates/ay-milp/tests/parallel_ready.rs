@@ -94,9 +94,7 @@ fn find_model(name: &str) -> Option<Model> {
     if let Ok(d) = std::env::var("AY_MILP_CORPUS") {
         dirs.push(PathBuf::from(d));
     }
-    for d in ["/private/tmp"] {
-        dirs.push(PathBuf::from(d));
-    }
+    dirs.push(PathBuf::from("/private/tmp"));
     for d in dirs {
         let p = d.join(format!("{name}.mps"));
         if let Ok(text) = std::fs::read_to_string(&p) {

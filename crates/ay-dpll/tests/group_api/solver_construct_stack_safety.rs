@@ -55,7 +55,7 @@ fn construct_on_small_stack(name: &str, stack: usize) {
         .expect("spawn small-stack thread");
 
     let result = rx
-        .recv_timeout(Duration::from_secs(60))
+        .recv_timeout(Duration::from_mins(1))
         .unwrap_or_else(|e| panic!("{name}: construction thread did not complete: {e:?}"));
     handle.join().expect("join small-stack thread");
     assert_eq!(
@@ -101,7 +101,7 @@ fn executor_construction_on_192kib_stack() {
         })
         .expect("spawn small-stack thread");
 
-    rx.recv_timeout(Duration::from_secs(60))
+    rx.recv_timeout(Duration::from_mins(1))
         .expect("executor construction thread did not complete");
     handle.join().expect("join small-stack thread");
 }

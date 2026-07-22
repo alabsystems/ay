@@ -81,9 +81,6 @@ pub const FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV: &str =
 pub const FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV: &str =
     "AY_SAT_FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT";
 
-#[cfg(test)]
-pub(crate) static FMLA_LEARNED_LRAT_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// The exact checker-verdict artifact needed before Main/LRAT route admission.
 pub const FMLA_MAIN_LRAT_EXTERNAL_CHECKER_VERDICT_REQUIREMENT:
     ExternalProofCheckerVerdictArtifactRequirement =

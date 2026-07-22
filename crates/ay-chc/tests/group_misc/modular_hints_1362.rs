@@ -27,7 +27,7 @@ fn adaptive_dillig02_m_benchmark_is_safe_1362() {
         .unwrap_or_else(|err| panic!("dillig02_m benchmark should validate: {err}"));
 
     let budget = if cfg!(debug_assertions) {
-        Duration::from_secs(60)
+        Duration::from_mins(1)
     } else {
         Duration::from_secs(20)
     };

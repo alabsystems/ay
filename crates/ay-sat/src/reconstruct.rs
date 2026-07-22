@@ -616,6 +616,7 @@ impl ReconstructionStack {
     ///
     /// Returns `None` if all sweep equivalences are consistent, or
     /// `Some((step_idx, var_idx, expected, actual))` for the first violation.
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn verify_sweep_consistency(
         &self,
         model: &[bool],

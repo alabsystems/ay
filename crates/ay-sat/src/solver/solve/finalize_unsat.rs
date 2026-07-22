@@ -827,7 +827,10 @@ impl Solver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ay_test_support::env::ScopedEnvVar;
+    // The one workspace env choke point: serialized, restore-on-exit env
+    // mutation (unifies the former FMLA_LEARNED_LRAT_ENV_TEST_LOCK + local
+    // EnvGuard onto it).
+    use ay_test_support::env::{lock_env, ScopedEnvVar};
     use serde_json::json;
 
     fn fmla_authority_replay_payload(
@@ -877,9 +880,7 @@ mod tests {
 
     #[test]
     fn fmla_authority_replay_admits_authorized_checked_proof_out() {
-        let _lock = crate::fmla_runtime_ledger::FMLA_LEARNED_LRAT_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = lock_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let proof_out_path = dir.path().join("proof.out");
         let proof_out = b"c checked proof\n9 1 0 1 0\n0 9 0\n";
@@ -892,13 +893,13 @@ mod tests {
             fmla_authority_replay_payload(dir.path(), &proof_out_path, proof_out, 2).to_string(),
         )
         .expect("write replay");
-        let _replay_env = ScopedEnvVar::set(
+        let _replay_guard = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV,
-            replay_path.to_str().expect("replay path utf8"),
+            replay_path.to_str().expect("temp path is UTF-8"),
         );
-        let _proof_out_env = ScopedEnvVar::set(
+        let _proof_guard = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV,
-            proof_out_path.to_str().expect("proof out path utf8"),
+            proof_out_path.to_str().expect("temp path is UTF-8"),
         );
 
         assert!(Solver::fmla_learned_lrat_main_proof_authority_replay_admits());
@@ -906,9 +907,7 @@ mod tests {
 
     #[test]
     fn fmla_authority_replay_rejects_stale_proof_out_hash() {
-        let _lock = crate::fmla_runtime_ledger::FMLA_LEARNED_LRAT_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = lock_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let proof_out_path = dir.path().join("proof.out");
         let proof_out = b"c checked proof\n9 1 0 1 0\n0 9 0\n";
@@ -922,13 +921,13 @@ mod tests {
         )
         .expect("write replay");
         std::fs::write(&proof_out_path, b"c stale proof\n").expect("rewrite proof.out");
-        let _replay_env = ScopedEnvVar::set(
+        let _replay_guard = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV,
-            replay_path.to_str().expect("replay path utf8"),
+            replay_path.to_str().expect("temp path is UTF-8"),
         );
-        let _proof_out_env = ScopedEnvVar::set(
+        let _proof_guard = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV,
-            proof_out_path.to_str().expect("proof out path utf8"),
+            proof_out_path.to_str().expect("temp path is UTF-8"),
         );
 
         assert!(!Solver::fmla_learned_lrat_main_proof_authority_replay_admits());
@@ -936,9 +935,7 @@ mod tests {
 
     #[test]
     fn fmla_authority_replay_rejects_zero_checked_rows() {
-        let _lock = crate::fmla_runtime_ledger::FMLA_LEARNED_LRAT_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = lock_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let proof_out_path = dir.path().join("proof.out");
         let proof_out = b"c checked proof\n";
@@ -951,13 +948,13 @@ mod tests {
             fmla_authority_replay_payload(dir.path(), &proof_out_path, proof_out, 0).to_string(),
         )
         .expect("write replay");
-        let _replay_env = ScopedEnvVar::set(
+        let _replay_guard = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV,
-            replay_path.to_str().expect("replay path utf8"),
+            replay_path.to_str().expect("temp path is UTF-8"),
         );
-        let _proof_out_env = ScopedEnvVar::set(
+        let _proof_guard = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV,
-            proof_out_path.to_str().expect("proof out path utf8"),
+            proof_out_path.to_str().expect("temp path is UTF-8"),
         );
 
         assert!(!Solver::fmla_learned_lrat_main_proof_authority_replay_admits());
@@ -965,9 +962,7 @@ mod tests {
 
     #[test]
     fn fmla_authority_replay_rejects_missing_checker_verdict_artifact() {
-        let _lock = crate::fmla_runtime_ledger::FMLA_LEARNED_LRAT_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = lock_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let proof_out_path = dir.path().join("proof.out");
         let proof_out = b"c checked proof\n9 1 0 1 0\n0 9 0\n";
@@ -985,13 +980,13 @@ mod tests {
                 .join("fmla-main-lrat-external-checker-verdict.json"),
         )
         .expect("remove retained checker verdict artifact");
-        let _replay_env = ScopedEnvVar::set(
+        let _replay_guard = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV,
-            replay_path.to_str().expect("replay path utf8"),
+            replay_path.to_str().expect("temp path is UTF-8"),
         );
-        let _proof_out_env = ScopedEnvVar::set(
+        let _proof_guard = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV,
-            proof_out_path.to_str().expect("proof out path utf8"),
+            proof_out_path.to_str().expect("temp path is UTF-8"),
         );
 
         assert!(!Solver::fmla_learned_lrat_main_proof_authority_replay_admits());
@@ -999,9 +994,7 @@ mod tests {
 
     #[test]
     fn fmla_authority_replay_rejects_different_current_proof_path() {
-        let _lock = crate::fmla_runtime_ledger::FMLA_LEARNED_LRAT_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _lock = lock_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let proof_out_path = dir.path().join("proof.out");
         let other_proof_out_path = dir.path().join("other-proof.out");
@@ -1016,11 +1009,11 @@ mod tests {
             fmla_authority_replay_payload(dir.path(), &proof_out_path, proof_out, 2).to_string(),
         )
         .expect("write replay");
-        let _replay_env = ScopedEnvVar::set(
+        let _replay_guard = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV,
-            replay_path.to_str().expect("replay path utf8"),
+            replay_path.to_str().expect("temp path is UTF-8"),
         );
-        let _proof_out_env = ScopedEnvVar::set(
+        let _proof_guard = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV,
             other_proof_out_path
                 .to_str()

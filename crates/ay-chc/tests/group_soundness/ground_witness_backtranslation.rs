@@ -373,7 +373,7 @@ fn scalar_multi_query_lanes(depth: usize, lanes: usize, reachable_lane: Option<u
 #[timeout(180_000)]
 fn unsafe_multi_query_analogue_converts() {
     let smt = scalar_multi_query_lanes(8, 3, Some(2));
-    let result = solve(&smt, Duration::from_secs(60));
+    let result = solve(&smt, Duration::from_mins(1));
     assert!(
         matches!(result, PortfolioResult::Unsafe(_)),
         "UNSAFE multi-query analogue did not convert: {result:?}"
@@ -386,7 +386,7 @@ fn unsafe_multi_query_analogue_converts() {
 #[timeout(180_000)]
 fn safe_scalar_multi_query_lanes_never_reported_unsafe() {
     let smt = scalar_multi_query_lanes(8, 3, None);
-    let result = solve(&smt, Duration::from_secs(60));
+    let result = solve(&smt, Duration::from_mins(1));
     assert!(
         !matches!(result, PortfolioResult::Unsafe(_)),
         "SAFE scalar multi-query analogue was reported UNSAFE: {result:?}"
@@ -403,11 +403,11 @@ fn safe_scalar_multi_query_lanes_never_reported_unsafe() {
 fn multi_query_and_single_query_analogues_agree() {
     let multi = solve(
         &scalar_multi_query_lanes(8, 3, Some(2)),
-        Duration::from_secs(60),
+        Duration::from_mins(1),
     );
     let single = solve(
         &scalar_multi_query_lanes(6, 1, Some(0)),
-        Duration::from_secs(60),
+        Duration::from_mins(1),
     );
     let unsafe_multi = matches!(multi, PortfolioResult::Unsafe(_));
     let unsafe_single = matches!(single, PortfolioResult::Unsafe(_));

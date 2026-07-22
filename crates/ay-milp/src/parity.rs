@@ -848,9 +848,10 @@ mod tests {
     #[test]
     fn kill_switch_disables_device() {
         let m = parity_model(&[vec![1]], &[-1]);
-        std::env::set_var("AY_MILP_NO_PARITY", "1");
-        let out = try_solve(&m, deadline());
-        std::env::remove_var("AY_MILP_NO_PARITY");
+        let out =
+            ay_test_support::env::with_serialized_env_vars(&[("AY_MILP_NO_PARITY", "1")], || {
+                try_solve(&m, deadline())
+            });
         assert!(out.is_none(), "kill switch must disable the device");
     }
 

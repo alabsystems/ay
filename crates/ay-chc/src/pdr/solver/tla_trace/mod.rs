@@ -397,7 +397,7 @@ impl PdrSolver {
         model: InvariantModel,
         stage: &'static str,
     ) -> Option<PdrResult> {
-        match self.finish_safe_with_result_trace(model, stage) {
+        match self.finish_safe_with_result_trace(model.clone(), stage) {
             PdrResult::Unknown => {
                 self.strict_validation_demotions =
                     self.strict_validation_demotions.saturating_add(1);
@@ -405,6 +405,22 @@ impl PdrSolver {
                     safe_eprintln!(
                         "PDR: {stage} demoted by strict validation; continuing discovery (#4751)"
                     );
+                }
+                // #4751 L4: counterexample-guided candidate repair. The strict
+                // verifier's concrete counterexamples identify the falsified
+                // ("poison") conjuncts; dropping them from the CANDIDATE only
+                // (frames untouched) is always sound, and the repaired model
+                // still goes through the full unmodified strict gate below.
+                if let Some(repaired) = self.repair_demoted_candidate(model) {
+                    if self.config.verbose {
+                        safe_eprintln!(
+                            "PDR: {stage}: repaired demoted candidate passes strict re-verification; finalizing (#4751 L4)"
+                        );
+                    }
+                    match self.finish_safe_with_result_trace(repaired, stage) {
+                        PdrResult::Unknown => return None,
+                        result => return Some(result),
+                    }
                 }
                 None
             }

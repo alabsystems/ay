@@ -572,20 +572,49 @@ const BRIDGE_ROUTE_FREE_BRIDGE_INPUT: &str = r#"
     "#;
 
 #[test]
-fn dt_cert_bridge_route_would_grant_is_withheld() {
-    // The route claims the W1 tautology via its premise pin, the certificate
-    // reaches the grant point, LOGS would-grant — and WITHHOLDS the grant:
-    // never `sat`, even under AY_DT_CERT=on.
+fn dt_cert_bridge_route_grants_under_authoritative() {
+    // FLIP (faithfulness-gated): with `AY_DT_CERT_BRIDGE_ROUTE`=1 (authoritative)
+    // the route claims the W1 tautology via its premise pin, the certificate
+    // passes the EUF-extraction faithfulness guarantee (logic_sum(self)=2 committed
+    // == certified cell), and GRANTS — the verdict is `sat`.
     let (verdict, stderr) =
         solve_with_bridge_route(Some("on"), false, Some("1"), BRIDGE_ROUTE_INPUT);
-    assert_ne!(verdict, "sat");
+    assert_eq!(
+        verdict, "sat",
+        "authoritative bridge route must grant:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("[BRIDGE-ROUTE] would-claim forall"),
+        "missing would-claim log:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("[FAITHFULNESS] verified"),
+        "missing faithfulness-verified log:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("[BRIDGE-ROUTE] grant (authoritative, faithfulness-verified)"),
+        "missing authoritative grant log:\n{stderr}"
+    );
+}
+
+#[test]
+fn dt_cert_bridge_route_shadow_withholds() {
+    // `AY_DT_CERT_BRIDGE_ROUTE`=shadow: the route still classifies + logs a
+    // would-grant (faithfulness runs first and passes), but the grant is
+    // WITHHELD — the verdict stays byte-identical to the route being absent.
+    let (verdict, stderr) =
+        solve_with_bridge_route(Some("on"), false, Some("shadow"), BRIDGE_ROUTE_INPUT);
+    assert_ne!(
+        verdict, "sat",
+        "shadow bridge route must NOT grant:\n{stderr}"
+    );
     assert!(
         stderr.contains("[BRIDGE-ROUTE] would-claim forall"),
         "missing would-claim shadow log:\n{stderr}"
     );
     assert!(
-        stderr.contains("[BRIDGE-ROUTE] would-grant base (shadow-only"),
-        "missing would-grant shadow log:\n{stderr}"
+        stderr.contains("[BRIDGE-ROUTE] would-grant base (bridge route in shadow"),
+        "missing shadow would-grant log:\n{stderr}"
     );
 }
 

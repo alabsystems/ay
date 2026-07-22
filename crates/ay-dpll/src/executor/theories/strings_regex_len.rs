@@ -172,7 +172,7 @@ impl Executor {
             }
         }
 
-        // W1b (`AY_STR_WITNESS=1`, default OFF): CONTENT-POSITIVE construction
+        // W1b (default ON, `AY_STR_WITNESS=0` kill switch): CONTENT-POSITIVE construction
         // for the variables the finite enumeration above had to skip.
         //
         // The enumeration is content-BLIND: it needs a derivable length window

@@ -6,8 +6,9 @@
 //! and incremental cache soundness tests
 
 use crate::{Executor, StatValue, Statistics};
+// The one workspace env choke point: serialized, restore-on-exit env mutation.
 use ay_frontend::parse;
-use ay_test_support::env::with_serialized_env_vars;
+use ay_test_support::env::{lock_env, ScopedEnvVar};
 use ntest::timeout;
 
 #[test]
@@ -1845,29 +1846,27 @@ fn test_dt_enum_selector_pigeonhole_not_false_sat() {
 #[timeout(60000)]
 fn test_deleted_env_kill_switches_have_no_effect_on_soundness_guards() {
     // Nothing reads these vars anymore; setting them must be inert. Serialized
-    // + restore-on-exit via the workspace env choke point.
-    let outputs = with_serialized_env_vars(
-        &[
-            ("AY_LRA_NO_ITE_SHARED_EQ", "0"),
-            ("AY_NO_LRA_CSA_UNSAT_GUARD", "1"),
-            ("AY_NO_DISEQ_CLOSURE_GUARD", "1"),
-            ("AY_NO_STALE_MODELEQ_SAT", "1"),
-        ],
-        || {
-            let smt = r#"
-                (set-logic QF_UFLRA)
-                (declare-const z Real)
-                (declare-const p Bool)
-                (declare-fun ga (Real) Real)
-                (assert (= (ga z) 5.0))
-                (assert (= z (ite p (- 3.0) (- 2.0))))
-                (check-sat)
-            "#;
-            let commands = parse(smt).unwrap();
-            let mut exec = Executor::new();
-            exec.execute_all(&commands).unwrap()
-        },
-    );
+    // + restored on scope exit through the one workspace env choke point.
+    let _env_lock = lock_env();
+    let _guards = [
+        ScopedEnvVar::set("AY_LRA_NO_ITE_SHARED_EQ", "0"),
+        ScopedEnvVar::set("AY_NO_LRA_CSA_UNSAT_GUARD", "1"),
+        ScopedEnvVar::set("AY_NO_DISEQ_CLOSURE_GUARD", "1"),
+        ScopedEnvVar::set("AY_NO_STALE_MODELEQ_SAT", "1"),
+    ];
+    let smt = r#"
+        (set-logic QF_UFLRA)
+        (declare-const z Real)
+        (declare-const p Bool)
+        (declare-fun ga (Real) Real)
+        (assert (= (ga z) 5.0))
+        (assert (= z (ite p (- 3.0) (- 2.0))))
+        (check-sat)
+    "#;
+    let commands = parse(smt).unwrap();
+    let mut exec = Executor::new();
+    let outputs = exec.execute_all(&commands).unwrap();
+    // `_guards` restore (drop) at end of scope, still under `_env_lock`.
     assert_eq!(
         outputs.last().map(String::as_str),
         Some("sat"),

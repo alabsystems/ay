@@ -9,6 +9,7 @@ use super::{
     FxHashMap, HornClause, InvariantModel, Lemma, PdrSolver, PredicateId, RelationType, SmtResult,
 };
 
+mod candidate_repair;
 mod classify;
 mod houdini_prune;
 mod inductive_accept_core;

@@ -162,9 +162,13 @@ fn cube_and_conquer_cli_requested_proof_sat_removes_stale_sidecar() {
     );
     let model = parse_dimacs_model(&stdout, 2);
     assert_model_satisfies(&model, &[&[1], &[2]]);
-    assert!(
-        !proof.exists(),
-        "SAT CnC proof-mode run must remove stale non-UNSAT proof artifact at {}",
+    // A pre-existing sidecar is not owned by this solve; the hardened
+    // publication boundary never unlinks a foreign path (it may be an
+    // unrelated hard-linked file). Non-UNSAT routes must leave it untouched.
+    assert_eq!(
+        std::fs::read(&proof).expect("pre-existing sidecar must be preserved"),
+        b"stale proof",
+        "SAT CnC proof-mode run must preserve the foreign pre-existing sidecar at {}",
         proof.display()
     );
 }
@@ -214,9 +218,13 @@ fn cube_and_conquer_cli_requested_proof_unsat_fails_closed_without_file() {
         !stdout.contains("s UNSATISFIABLE"),
         "proof-incomplete CnC must not print an UNSAT verdict: {stdout}"
     );
-    assert!(
-        !proof.exists(),
-        "proof-incomplete CnC must not leave a requested proof artifact at {}",
+    // A pre-existing sidecar is not owned by this solve; the hardened
+    // publication boundary never unlinks a foreign path. The incomplete-proof
+    // run must fail closed without replacing or removing it.
+    assert_eq!(
+        std::fs::read(&proof).expect("pre-existing sidecar must be preserved"),
+        b"stale proof",
+        "proof-incomplete CnC must preserve the foreign pre-existing sidecar at {}",
         proof.display()
     );
 
@@ -271,9 +279,13 @@ fn cube_and_conquer_cli_parse_error_with_requested_proof_removes_stale_sidecar()
         stdout.contains("s UNKNOWN"),
         "proof-mode CnC parse error should print UNKNOWN: {stdout}"
     );
-    assert!(
-        !proof.exists(),
-        "proof-mode CnC parse error must remove stale proof artifact at {}",
+    // A pre-existing sidecar is not owned by this solve; the hardened
+    // publication boundary never unlinks a foreign path. The parse-error run
+    // must fail without touching it.
+    assert_eq!(
+        std::fs::read(&proof).expect("pre-existing sidecar must be preserved"),
+        b"stale proof",
+        "proof-mode CnC parse error must preserve the foreign pre-existing sidecar at {}",
         proof.display()
     );
 }

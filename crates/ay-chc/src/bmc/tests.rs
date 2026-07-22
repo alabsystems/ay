@@ -2799,13 +2799,9 @@ fn diag_dt_bmc_formula_forms() {
 // replayed against the ORIGINAL clauses).
 // ---------------------------------------------------------------------------
 
-/// Serialize the env-var kill-switch test with the other DT-BMC tests so the
-/// process-global `AY_CHC_DISABLE_DT_BMC` cannot race a concurrent solve.
-/// Routed through the one workspace-wide env lock so it also serializes against
-/// every other env-touching test in this binary.
-fn dt_bmc_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    lock_env()
-}
+// Serialize the env-var kill-switch test with the other DT-BMC tests on the one
+// workspace env lock (`lock_env`) so the process-global `AY_CHC_DISABLE_DT_BMC`
+// cannot race a concurrent solve.
 
 // A genuine multi-step ADT refutation over a recursive datatype: P holds for
 // every Nat reachable from `zero` by `succ`, and the query flags P(succ(succ
@@ -2814,10 +2810,14 @@ fn dt_bmc_env_lock() -> std::sync::MutexGuard<'static, ()> {
 // unfolding can find. The reconstructed witness (concrete constructor values)
 // must replay Valid on the original clauses -> a validated Unsafe.
 #[test]
-#[timeout(60000)]
+// The timeout wrapper includes time spent waiting for the process-wide env
+// lock.  Keep this above the aggregate budget of the serialized DT-BMC tests;
+// otherwise a healthy test can time out before its body starts.
+#[timeout(300_000)]
 fn datatype_bounded_refutation_finds_nat_counterexample() {
-    let _guard = dt_bmc_env_lock();
-    let _dt_bmc = ScopedEnvVar::unset("AY_CHC_DISABLE_DT_BMC");
+    let _guard = lock_env();
+    // Enabled for the whole test; restored on scope exit.
+    let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_DT_BMC");
     let input = r#"
 (set-logic HORN)
 (declare-datatypes ((Nat 0)) (((zero) (succ (pred Nat)))))
@@ -2853,10 +2853,11 @@ fn datatype_bounded_refutation_finds_nat_counterexample() {
 // lane may only return Unknown here; a fabricated Unsafe would be a wrong
 // answer (the campaign's cardinal sin).
 #[test]
-#[timeout(60000)]
+#[timeout(300_000)]
 fn datatype_bounded_refutation_no_false_unsafe_on_safe() {
-    let _guard = dt_bmc_env_lock();
-    let _dt_bmc = ScopedEnvVar::unset("AY_CHC_DISABLE_DT_BMC");
+    let _guard = lock_env();
+    // Enabled for the whole test; restored on scope exit.
+    let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_DT_BMC");
     let input = r#"
 (set-logic HORN)
 (declare-datatypes ((Nat 0)) (((zero) (succ (pred Nat)))))
@@ -2886,9 +2887,9 @@ fn datatype_bounded_refutation_no_false_unsafe_on_safe() {
 // on the known-unsafe fixture (it never runs), so the capability can be turned
 // off without touching any other route.
 #[test]
-#[timeout(60000)]
+#[timeout(300_000)]
 fn datatype_bounded_refutation_kill_switch_returns_unknown() {
-    let _guard = dt_bmc_env_lock();
+    let _guard = lock_env();
     let input = r#"
 (set-logic HORN)
 (declare-datatypes ((Nat 0)) (((zero) (succ (pred Nat)))))
@@ -2906,10 +2907,10 @@ fn datatype_bounded_refutation_kill_switch_returns_unknown() {
             ..BmcConfig::default()
         },
     );
-    let dt_bmc_disable = ScopedEnvVar::set("AY_CHC_DISABLE_DT_BMC", "1");
-    let disabled =
-        solver.solve_datatype_bounded_refutation(6, std::time::Duration::from_secs(10), 6000);
-    drop(dt_bmc_disable);
+    let disabled = {
+        let _disable = ScopedEnvVar::set("AY_CHC_DISABLE_DT_BMC", "1");
+        solver.solve_datatype_bounded_refutation(6, std::time::Duration::from_secs(10), 6000)
+    };
     assert!(
         matches!(disabled, ChcEngineResult::Unknown),
         "kill switch must suppress the lane (Unknown), got {disabled:?}"
@@ -2940,10 +2941,11 @@ fn datatype_bounded_refutation_kill_switch_returns_unknown() {
 // intermediate DATATYPE values (nil/cons), which the replay gate independently
 // re-checks against the original clauses.
 #[test]
-#[timeout(90000)]
+#[timeout(300_000)]
 fn datatype_bounded_refutation_elimination_round_trips_drop_inj1() {
-    let _guard = dt_bmc_env_lock();
-    let _dt_bmc = ScopedEnvVar::unset("AY_CHC_DISABLE_DT_BMC");
+    let _guard = lock_env();
+    // Enabled for the whole test; restored on scope exit.
+    let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_DT_BMC");
     let input = r#"
 (set-logic HORN)
 (declare-datatypes ((list_298 0)) (((nil_331 ) (cons_296  (head_592 Int) (tail_594 list_298)))))
@@ -2958,7 +2960,7 @@ fn datatype_bounded_refutation_elimination_round_trips_drop_inj1() {
   (=> (and (drop_59 A C D) (drop_59 A B D) (not (= B C))) false)))
 (check-sat)
 "#;
-    let _dt_bmc_no_elim = ScopedEnvVar::unset("AY_DT_BMC_NO_ELIM");
+    let _no_elim = ScopedEnvVar::unset("AY_DT_BMC_NO_ELIM");
     let problem = crate::parser::ChcParser::parse(input).expect("parse");
     assert!(
         problem.has_datatype_sorts(),
@@ -3519,7 +3521,7 @@ fn test_polynomial_dag_bv_chain_safe_with_interval_skip() {
         max_depth: 12,
         acyclic_safe: true,
         prefer_exact_acyclic_first: true,
-        time_budget: Some(std::time::Duration::from_secs(60)),
+        time_budget: Some(std::time::Duration::from_mins(1)),
         ..BmcConfig::default()
     };
     let solver = BmcSolver::new(problem, config);
@@ -3546,7 +3548,7 @@ fn test_polynomial_dag_bv_chain_reachable_query_never_safe_with_interval_skip() 
         max_depth: 12,
         acyclic_safe: true,
         prefer_exact_acyclic_first: true,
-        time_budget: Some(std::time::Duration::from_secs(60)),
+        time_budget: Some(std::time::Duration::from_mins(1)),
         ..BmcConfig::default()
     };
     let solver = BmcSolver::new(problem, config);
@@ -3654,7 +3656,7 @@ fn solve_multi_lane_level_bmc(multi_query: bool) -> ChcEngineResult {
             acyclic_safe: false,
             prefer_exact_acyclic_first: false,
             per_depth_timeout: None,
-            time_budget: Some(std::time::Duration::from_secs(60)),
+            time_budget: Some(std::time::Duration::from_mins(1)),
             enable_k_induction: false,
             enable_adaptive_stepping: false,
             proof_cross_check: false,
@@ -3704,7 +3706,7 @@ fn test_level_bmc_multi_lane_unsafe_derivation_ground_validates() {
             acyclic_safe: false,
             prefer_exact_acyclic_first: false,
             per_depth_timeout: None,
-            time_budget: Some(std::time::Duration::from_secs(60)),
+            time_budget: Some(std::time::Duration::from_mins(1)),
             enable_k_induction: false,
             enable_adaptive_stepping: false,
             proof_cross_check: false,
@@ -3807,7 +3809,7 @@ fn test_level_bmc_safe_multi_lane_queries_never_unsafe() {
             acyclic_safe: false,
             prefer_exact_acyclic_first: false,
             per_depth_timeout: None,
-            time_budget: Some(std::time::Duration::from_secs(60)),
+            time_budget: Some(std::time::Duration::from_mins(1)),
             enable_k_induction: false,
             enable_adaptive_stepping: false,
             proof_cross_check: false,
@@ -3841,7 +3843,7 @@ fn residual_level_bmc_config() -> BmcConfig {
         acyclic_safe: false,
         prefer_exact_acyclic_first: false,
         per_depth_timeout: None,
-        time_budget: Some(std::time::Duration::from_secs(60)),
+        time_budget: Some(std::time::Duration::from_mins(1)),
         enable_k_induction: false,
         enable_adaptive_stepping: false,
         proof_cross_check: false,

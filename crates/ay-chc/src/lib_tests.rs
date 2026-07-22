@@ -1799,7 +1799,7 @@ fn test_bmc_acyclic_model_checker_consumer_fib_fail_reports_unsafe() {
         max_depth: 96,
         acyclic_safe: true,
         prefer_exact_acyclic_first: true,
-        time_budget: Some(std::time::Duration::from_secs(60)),
+        time_budget: Some(std::time::Duration::from_mins(1)),
         ..BmcConfig::default()
     };
     let result = engines::solve_bmc_only_from_str(smt2, config).expect("fixture should parse");
@@ -1878,7 +1878,7 @@ fn test_bmc_acyclic_model_checker_consumer_gauss_sum_nondet_reports_unsafe() {
         max_depth: 64,
         acyclic_safe: true,
         prefer_exact_acyclic_first: true,
-        time_budget: Some(std::time::Duration::from_secs(60)),
+        time_budget: Some(std::time::Duration::from_mins(1)),
         ..BmcConfig::default()
     };
     let result = engines::solve_bmc_only_from_str(smt2, config).expect("fixture should parse");
@@ -1900,7 +1900,7 @@ fn test_bmc_acyclic_model_checker_consumer_vec13_reports_unsafe() {
         max_depth: 64,
         acyclic_safe: true,
         prefer_exact_acyclic_first: true,
-        time_budget: Some(std::time::Duration::from_secs(60)),
+        time_budget: Some(std::time::Duration::from_mins(1)),
         ..BmcConfig::default()
     };
     let result = engines::solve_bmc_only_from_str(smt2, config).expect("fixture should parse");

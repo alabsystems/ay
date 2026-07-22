@@ -114,7 +114,7 @@
         },
         "launch_candidate": {
           "type": "boolean",
-          "x-ay-hn-launch-required-value": true,
+          "x-ay-release-required-value": true,
           "description": "True only for full-mode, full-inventory, passing, non-skipped evidence where all consumers have commits, all selected checkouts are clean, model-checker-consumer did not run in first-failure-only mode, and verification-consumer/deductive-checks (ex-quantifier_consumer/certificate_consumer) ran from clean origin/main temp worktrees."
         },
         "inventory_complete": {
@@ -279,7 +279,7 @@
     },
     "consumers": {
       "type": "object",
-      "$comment": "Inventory smoke consumers at schema update (canonical names): \"model-checker-consumer\", \"verification-consumer\", \"deductive-checks\", \"ty\", \"clean\" (legacy aliases: quantifier_consumer, certificate_consumer, tla2, proof_replay — still accepted; the former zani alias is no longer accepted). Broad HN/Z3-successor evidence must include every smoke consumer; filtered --only artifacts include only selected consumers.",
+      "$comment": "Inventory smoke consumers at schema update (canonical names): \"model-checker-consumer\", \"verification-consumer\", \"deductive-checks\", \"ty\", \"clean\" (legacy aliases: quantifier_consumer, certificate_consumer, tla2, proof_replay — still accepted; the former zani alias is no longer accepted). Broad broad public-launch evidence must include every smoke consumer; filtered --only artifacts include only selected consumers.",
       "description": "Consumers come from the development design notes rows with a smoke_script. Full inventory runs include every smoke consumer; filtered --only runs include only selected consumers. Missing checkouts are represented as SKIP rows when selected.",
       "additionalProperties": {
         "$ref": "#/$defs/consumerEvidence"
@@ -450,8 +450,8 @@
       },
       "additionalProperties": true
     },
-    "hnLaunchAcceptanceNotes": {
-      "$comment": "Broad HN/Z3-successor downstream evidence must have evidence.launch_candidate=true. Equivalently: mode=full, evidence.scope=full_inventory, selected_consumers=[], unprocessed_consumers=[], evidence.inventory_complete=true, evidence.partial=false, overall.status=PASS, overall.exit_code=0, summary.failed=0, summary.skipped=0, evidence.summary_counts_match=true, evidence.all_executed_logs_verified=true, evidence.ay_head_stable=true, evidence.ay_worktree_clean=true, evidence.model_checker_consumer_first_failure_mode=false, every inventory smoke consumer at status=PASS with a non-empty commit, clean git_status, non-empty command, existing log_path with matching log_sha256 and matching log header, and verification-consumer/deductive-checks (ex-quantifier_consumer/certificate_consumer) from temp_worktree=true at worktree_ref=origin/main when those checkouts exist."
+    "releaseAcceptanceNotes": {
+      "$comment": "Broad broad public-launch downstream evidence must have evidence.launch_candidate=true. Equivalently: mode=full, evidence.scope=full_inventory, selected_consumers=[], unprocessed_consumers=[], evidence.inventory_complete=true, evidence.partial=false, overall.status=PASS, overall.exit_code=0, summary.failed=0, summary.skipped=0, evidence.summary_counts_match=true, evidence.all_executed_logs_verified=true, evidence.ay_head_stable=true, evidence.ay_worktree_clean=true, evidence.model_checker_consumer_first_failure_mode=false, every inventory smoke consumer at status=PASS with a non-empty commit, clean git_status, non-empty command, existing log_path with matching log_sha256 and matching log header, and verification-consumer/deductive-checks (ex-quantifier_consumer/certificate_consumer) from temp_worktree=true at worktree_ref=origin/main when those checkouts exist."
     }
   }
 }

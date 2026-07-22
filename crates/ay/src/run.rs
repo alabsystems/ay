@@ -3304,7 +3304,15 @@ fn execute_and_print(
                 // elaboration failure (e.g. an `assert` over an unknown symbol).
                 // If it contributed to the problem, taint so check-sat answers
                 // `unknown` rather than a wrong sat on the remaining assertions.
-                if command_contributes_to_problem(cmd) {
+                //
+                // Exception: an IGNORED unsupported `(set-logic X)` is handled
+                // above with the documented z3-parity contract — solving
+                // CONTINUES with ALL semantics (no constraint or declaration is
+                // dropped, the logic is simply treated as never set), so it
+                // must not taint the session to `unknown`. Tainting here made
+                // the following `check-sat` answer `unknown` on a fully intact
+                // problem, contradicting the handler's own contract.
+                if command_contributes_to_problem(cmd) && !matches!(cmd, Command::SetLogic(_)) {
                     mark_problem_incomplete(executor, transcript);
                 }
                 if is_decision_query && !print_synthesized_public_unknown(transcript) {
@@ -5362,12 +5370,12 @@ fn create_firewall_staging_dir(
     ))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rename_path_noreplace(source: &std::path::Path, target: &std::path::Path) -> io::Result<()> {
     ay_sys::fs::rename_noreplace(source, target)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn rename_path_noreplace(_source: &std::path::Path, _target: &std::path::Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,

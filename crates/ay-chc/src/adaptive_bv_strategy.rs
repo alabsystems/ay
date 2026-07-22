@@ -1616,7 +1616,18 @@ impl AdaptivePortfolio {
         None
     }
 
-    fn try_adt_lia_constructor_case_synthesis(
+    /// Guess-and-check the IsaPlanner `last`-style constructor-case invariant
+    /// `list = nil \/ list = cons(x, nil) \/ tail(list) != nil` for
+    /// single-predicate ADT+LIA problems over one Int and one recursive
+    /// Int-list argument.
+    ///
+    /// Called from `solve_internal`'s pre-strategy sequence (after the
+    /// datatype bounded-BMC unsafe refutation, before the CATA abstraction
+    /// lane): the CATA lane's refinement rounds burn multi-second budgets on
+    /// exactly this shape, while this guess either validates in milliseconds
+    /// or fails closed. Sound: the candidate only leaves through strict
+    /// per-rule verification / SMT replay against the ORIGINAL clauses.
+    pub(super) fn try_adt_lia_constructor_case_synthesis(
         &self,
         features: &ProblemFeatures,
     ) -> Option<PortfolioResult> {
@@ -2183,9 +2194,10 @@ impl AdaptivePortfolio {
             return (result, ValidationEvidence::FullVerification);
         }
 
-        if let Some(result) = self.try_adt_lia_constructor_case_synthesis(features) {
-            return (result, ValidationEvidence::FullVerification);
-        }
+        // The ADT-LIA constructor-case guess (`try_adt_lia_constructor_case_synthesis`)
+        // moved to solve_internal's pre-strategy sequence: on the IsaPlanner
+        // `last`/singleton shape the CATA lane otherwise burns the whole
+        // budget before this cheap validated guess ever ran (#9700 margin).
 
         if let Some(result) = self.try_accumulator_lia_unsafe_counterexample(features) {
             return result;

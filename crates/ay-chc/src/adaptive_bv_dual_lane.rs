@@ -7157,6 +7157,8 @@ impl AdaptivePortfolio {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The one workspace env choke point: serialized, restore-on-exit env
+    // mutation (unifies the former ARRAY_REL_ENV_LOCK onto it).
     use ay_test_support::env::{lock_env, ScopedEnvVar};
 
     fn parse_problem(smt: &str) -> ChcProblem {
@@ -7563,9 +7565,8 @@ mod tests {
     // ---------------------------------------------------------------------
     // #chc25-array-relational: relational ARRAY-equality Houdini tests.
     // The env-var kill switch is process-global, so the array tests serialize
-    // on the one workspace-wide env lock (`lock_env`) to keep the
-    // enabled/disabled assertions race-free against each other and against every
-    // other env-touching test in this binary.
+    // on the one workspace env lock (`lock_env`) to keep the enabled/disabled
+    // assertions race-free.
     // ---------------------------------------------------------------------
 
     // A two-copy INV over (Int, (Array Int Int)) ×2 where both copies perform
@@ -7575,7 +7576,8 @@ mod tests {
     #[test]
     fn relational_array_equality_houdini_certifies_two_copy_safe() {
         let _guard = lock_env();
-        let _array_rel = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
+        // Enabled for the whole test; restored on scope exit.
+        let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7619,7 +7621,8 @@ mod tests {
     #[test]
     fn relational_array_equality_no_false_safe_on_diverging_arrays() {
         let _guard = lock_env();
-        let _array_rel = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
+        // Enabled for the whole test; restored on scope exit.
+        let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7668,10 +7671,10 @@ mod tests {
 (check-sat)
 "#;
         let problem = parse_problem(input);
-        let array_rel_disable = ScopedEnvVar::set("AY_CHC_DISABLE_ARRAY_RELATIONAL", "1");
-        let disabled =
-            super::try_relational_equality_houdini(&problem, std::time::Duration::from_secs(15));
-        drop(array_rel_disable);
+        let disabled = {
+            let _disable = ScopedEnvVar::set("AY_CHC_DISABLE_ARRAY_RELATIONAL", "1");
+            super::try_relational_equality_houdini(&problem, std::time::Duration::from_secs(15))
+        };
         assert!(
             disabled.is_none(),
             "kill switch AY_CHC_DISABLE_ARRAY_RELATIONAL=1 must disable the array lane"
@@ -7740,8 +7743,9 @@ mod tests {
     #[test]
     fn array_relational_v2_certifies_affine_index_alignment() {
         let _guard = lock_env();
-        let _array_rel = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
-        let _array_rel_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
+        // Both lanes enabled for the whole test; restored on scope exit.
+        let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
+        let _enabled_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7791,8 +7795,9 @@ mod tests {
     #[test]
     fn array_relational_v2_certifies_select_value_coupling() {
         let _guard = lock_env();
-        let _array_rel = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
-        let _array_rel_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
+        // Both lanes enabled for the whole test; restored on scope exit.
+        let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
+        let _enabled_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
         let input = r#"
 (set-logic HORN)
 (declare-fun INV ((Array Int Int) Int Int (Array Int Int)) Bool)
@@ -7839,8 +7844,9 @@ mod tests {
     #[test]
     fn array_relational_v2_no_false_safe_on_diverging_alignment() {
         let _guard = lock_env();
-        let _array_rel = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
-        let _array_rel_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
+        // Both lanes enabled for the whole test; restored on scope exit.
+        let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
+        let _enabled_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7870,8 +7876,10 @@ mod tests {
     #[test]
     fn array_relational_v2_kill_switch_disables_lane() {
         let _guard = lock_env();
-        let _array_rel = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
-        let _array_rel_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
+        // Both lanes enabled baseline for the whole test; the v2 kill-switch is
+        // toggled in a nested guard below. Restored on scope exit.
+        let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
+        let _enabled_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7888,10 +7896,10 @@ mod tests {
 (check-sat)
 "#;
         let problem = parse_problem(input);
-        let array_rel_v2_disable = ScopedEnvVar::set("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2", "1");
-        let disabled =
-            super::try_array_relational_houdini_v2(&problem, std::time::Duration::from_secs(20));
-        drop(array_rel_v2_disable);
+        let disabled = {
+            let _disable = ScopedEnvVar::set("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2", "1");
+            super::try_array_relational_houdini_v2(&problem, std::time::Duration::from_secs(20))
+        };
         assert!(
             disabled.is_none(),
             "v2 kill switch must disable the v2 templates"
@@ -8486,7 +8494,7 @@ mod tests {
             let problem = load(rel);
             let solver = AdaptivePortfolio::new(
                 problem.clone(),
-                crate::AdaptiveConfig::with_budget(Duration::from_secs(60), false),
+                crate::AdaptiveConfig::with_budget(Duration::from_mins(1), false),
             );
             let t = Instant::now();
             let res = solver.try_reve_coupling_houdini_lane();
@@ -8521,7 +8529,7 @@ mod tests {
             let problem = load(rel);
             let solver = AdaptivePortfolio::new(
                 problem,
-                crate::AdaptiveConfig::with_budget(Duration::from_secs(60), false),
+                crate::AdaptiveConfig::with_budget(Duration::from_mins(1), false),
             );
             let res = solver.try_reve_coupling_houdini_lane();
             let is_safe = matches!(res, Some(PortfolioResult::Safe(_)));
@@ -8620,7 +8628,7 @@ mod tests {
             let problem = load(rel);
             let solver = AdaptivePortfolio::new(
                 problem.clone(),
-                crate::AdaptiveConfig::with_budget(Duration::from_secs(60), false),
+                crate::AdaptiveConfig::with_budget(Duration::from_mins(1), false),
             );
             let t = Instant::now();
             let res = solver.try_cyclic_consistency_invariant_lane();
@@ -8681,7 +8689,7 @@ mod tests {
             let problem = load(rel);
             let solver = AdaptivePortfolio::new(
                 problem,
-                crate::AdaptiveConfig::with_budget(Duration::from_secs(60), false),
+                crate::AdaptiveConfig::with_budget(Duration::from_mins(1), false),
             );
             let res = solver.try_cyclic_consistency_invariant_lane();
             let is_safe = matches!(res, Some(PortfolioResult::Safe(_)));
@@ -8785,7 +8793,7 @@ mod tests {
             let problem = crate::parser::ChcParser::parse(&txt).unwrap();
             let solver = AdaptivePortfolio::new(
                 problem.clone(),
-                crate::AdaptiveConfig::with_budget(Duration::from_secs(60), false),
+                crate::AdaptiveConfig::with_budget(Duration::from_mins(1), false),
             );
             let t = Instant::now();
             let res = solver.try_cyclic_consistency_invariant_lane();

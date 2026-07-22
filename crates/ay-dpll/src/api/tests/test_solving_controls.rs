@@ -1430,20 +1430,20 @@ fn test_solver_config_default_no_timeout() {
 /// SolverConfig builder sets timeout.
 #[test]
 fn test_solver_config_with_timeout() {
-    let config = SolverConfig::default().with_timeout(Duration::from_millis(5000));
-    assert_eq!(config.timeout, Some(Duration::from_millis(5000)));
+    let config = SolverConfig::default().with_timeout(Duration::from_secs(5));
+    assert_eq!(config.timeout, Some(Duration::from_secs(5)));
 }
 
 /// SolverConfig builder chains multiple settings.
 #[test]
 fn test_solver_config_builder_chaining() {
     let config = SolverConfig::default()
-        .with_timeout(Duration::from_millis(5000))
+        .with_timeout(Duration::from_secs(5))
         .with_memory_limit(1024 * 1024 * 1024)
         .with_term_memory_limit(512 * 1024 * 1024)
         .with_learned_clause_limit(100_000)
         .with_clause_db_bytes_limit(256 * 1024 * 1024);
-    assert_eq!(config.timeout, Some(Duration::from_millis(5000)));
+    assert_eq!(config.timeout, Some(Duration::from_secs(5)));
     assert_eq!(config.memory_limit, Some(1024 * 1024 * 1024));
     assert_eq!(config.term_memory_limit, Some(512 * 1024 * 1024));
     assert_eq!(config.learned_clause_limit, Some(100_000));
@@ -1453,9 +1453,9 @@ fn test_solver_config_builder_chaining() {
 /// try_new_with_config respects timeout from config.
 #[test]
 fn test_try_new_with_config_timeout() {
-    let config = SolverConfig::default().with_timeout(Duration::from_millis(5000));
+    let config = SolverConfig::default().with_timeout(Duration::from_secs(5));
     let solver = Solver::try_new_with_config(Logic::QfLia, config).expect("QF_LIA is supported");
-    assert_eq!(solver.timeout(), Some(Duration::from_millis(5000)));
+    assert_eq!(solver.timeout(), Some(Duration::from_secs(5)));
 }
 
 /// try_new_with_config with default config has no timeout.
