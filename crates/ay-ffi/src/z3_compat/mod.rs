@@ -147,6 +147,224 @@ pub(crate) const MAX_FFI_REFINEMENT_PRECISION: c_uint = 4_096;
 /// This prevents a single `c_uint` from requesting multi-gigabyte allocations.
 pub(crate) const MAX_FFI_CONTAINER_ELEMENTS: c_uint = 1 << 20;
 
+/// Maximum byte length accepted for general caller-provided C strings.
+///
+/// String literals legitimately need a larger envelope than numerals, but they
+/// must not trigger an unbounded scan and clone from one foreign pointer.
+pub(crate) const MAX_FFI_TEXT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum source size accepted by SMT-LIB parser entry points.
+///
+/// AY's ordinary CLI is constrained by its process-memory envelope rather than
+/// a source-size switch. The compatibility layer still needs an explicit
+/// foreign-pointer/file ceiling, but it must accommodate large benchmark
+/// corpora. One GiB is intentionally much larger than scalar FFI text while
+/// remaining finite and below the harness's 8 GiB decompression ceiling.
+pub(crate) const MAX_FFI_PARSER_SOURCE_BYTES: usize = 1024 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FfiTextError {
+    Null,
+    TooLong(usize),
+    InvalidUtf8,
+}
+
+impl std::fmt::Display for FfiTextError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Null => formatter.write_str("null text pointer"),
+            Self::TooLong(max_bytes) => write!(
+                formatter,
+                "text exceeds the supported maximum {max_bytes} bytes"
+            ),
+            Self::InvalidUtf8 => formatter.write_str("text is not valid UTF-8"),
+        }
+    }
+}
+
+unsafe fn ffi_read_utf8_with_limit(
+    text: *const c_char,
+    max_bytes: usize,
+) -> Result<String, FfiTextError> {
+    if text.is_null() {
+        return Err(FfiTextError::Null);
+    }
+    for text_bytes in 0..=max_bytes {
+        // SAFETY: the caller guarantees a live NUL-terminated string, so every
+        // byte through its terminator is readable. The loop stops no later
+        // than the explicit `max_bytes + 1` inspection window.
+        if unsafe { *text.add(text_bytes) } == 0 {
+            // SAFETY: the bounded scan established the readable extent before
+            // the terminator; `u8` has alignment one.
+            let bytes = unsafe { std::slice::from_raw_parts(text.cast::<u8>(), text_bytes) };
+            return std::str::from_utf8(bytes)
+                .map(str::to_owned)
+                .map_err(|_| FfiTextError::InvalidUtf8);
+        }
+    }
+    Err(FfiTextError::TooLong(max_bytes))
+}
+
+/// Decode a caller-owned UTF-8 C string with an explicit scan/allocation cap.
+///
+/// # Safety
+/// `text` must be null or point to a valid NUL-terminated C string that remains
+/// live for this call. The NUL-termination contract guarantees readable storage
+/// through the terminator even when it lies beyond the bounded window.
+pub(crate) unsafe fn ffi_read_bounded_text(text: *const c_char) -> Result<String, FfiTextError> {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { ffi_read_utf8_with_limit(text, MAX_FFI_TEXT_BYTES) }
+}
+
+/// Decode an SMT-LIB source C string with the larger parser-source envelope.
+///
+/// # Safety
+/// Same as [`ffi_read_bounded_text`].
+pub(crate) unsafe fn ffi_read_bounded_parser_text(
+    text: *const c_char,
+) -> Result<String, FfiTextError> {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { ffi_read_utf8_with_limit(text, MAX_FFI_PARSER_SOURCE_BYTES) }
+}
+
+/// Read a UTF-8 regular file through the same bounded envelope as C parser
+/// input. The `take(max + 1)` reader keeps a file that grows after metadata
+/// lookup from bypassing the cap. FIFOs and devices are rejected before a
+/// potentially blocking read; Unix opens are additionally nonblocking so a
+/// path-type race cannot hang between the portable precheck and descriptor
+/// validation. Symlinks to regular files remain supported.
+fn ffi_read_text_file_with_limit(path: &str, max_bytes: usize) -> Result<String, String> {
+    use std::io::Read as _;
+
+    let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("input source is not a regular file".to_string());
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|error| error.to_string())?;
+    if !file
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .is_file()
+    {
+        return Err("opened input source is not a regular file".to_string());
+    }
+
+    let mut bytes = Vec::new();
+    file.take((max_bytes as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "input exceeds the supported maximum {max_bytes} bytes"
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| "input is not valid UTF-8".to_string())
+}
+
+pub(crate) fn ffi_read_bounded_parser_file(path: &str) -> Result<String, String> {
+    ffi_read_text_file_with_limit(path, MAX_FFI_PARSER_SOURCE_BYTES)
+}
+
+/// Maximum byte length accepted for caller-provided exact numeral text.
+/// Decimal-to-`BigInt` conversion can use substantially more CPU and memory
+/// than the source string itself, so reject oversized values before cloning or
+/// parsing them. 64 KiB still permits numerals far beyond ordinary solver use.
+pub(crate) const MAX_FFI_NUMERAL_TEXT_BYTES: usize = 64 * 1024;
+
+/// Read exact numeral text without first performing an unbounded C-string scan.
+/// At most `MAX_FFI_NUMERAL_TEXT_BYTES + 1` bytes are inspected; a NUL at the
+/// last position admits exactly the maximum text length.
+///
+/// # Safety
+/// `text` must be non-null and point to a valid NUL-terminated C string. That
+/// contract guarantees readable storage through the terminator even when it
+/// lies beyond this bounded window.
+pub(crate) unsafe fn ffi_read_bounded_numeral_text(
+    ctx: &mut Z3Context,
+    operation: &str,
+    text: *const c_char,
+) -> Option<String> {
+    // SAFETY: forwarded from this function's contract.
+    match unsafe { ffi_read_utf8_with_limit(text, MAX_FFI_NUMERAL_TEXT_BYTES) } {
+        Ok(value) => Some(value),
+        Err(FfiTextError::InvalidUtf8) => {
+            ctx.last_error = Z3_INVALID_ARG;
+            ctx.error_msg = Some(format!("{operation}: numeral text is not valid UTF-8"));
+            None
+        }
+        Err(FfiTextError::Null) => {
+            ctx.last_error = Z3_INVALID_ARG;
+            ctx.error_msg = Some(format!("{operation}: null numeral text"));
+            None
+        }
+        Err(FfiTextError::TooLong(_)) => {
+            ctx.last_error = Z3_INVALID_ARG;
+            ctx.error_msg = Some(format!(
+                "{operation}: numeral text exceeds the supported maximum \
+                 {MAX_FFI_NUMERAL_TEXT_BYTES} bytes"
+            ));
+            None
+        }
+    }
+}
+
+/// Reject an untrusted C array/count pair before any `Vec::with_capacity`,
+/// iterator collection, or raw-pointer walk can amplify the compact count into
+/// unbounded work. Call this before dereferencing the accompanying array.
+///
+/// # Safety
+/// `c` must be null or a live, exclusively borrowed context pointer for the
+/// duration of this call, matching every public Z3 entry point's contract.
+pub(crate) unsafe fn ffi_count_within_limit(c: Z3_context, operation: &str, count: c_uint) -> bool {
+    if count <= MAX_FFI_CONTAINER_ELEMENTS {
+        return true;
+    }
+    // SAFETY: guaranteed by this helper's contract; `as_mut` handles null.
+    if let Some(ctx) = unsafe { c.as_mut() } {
+        ctx.last_error = Z3_INVALID_ARG;
+        ctx.error_msg = Some(format!(
+            "{operation}: element count {count} exceeds the supported maximum {MAX_FFI_CONTAINER_ELEMENTS}"
+        ));
+    }
+    false
+}
+
+/// Apply the same ceiling to the aggregate number of elements traversed across
+/// multiple caller arrays in one FFI call. Each individual array can fit while
+/// their sum still requests product/duplicate-scale work.
+///
+/// # Safety
+/// Same context-pointer contract as [`ffi_count_within_limit`].
+pub(crate) unsafe fn ffi_counts_within_limit(
+    c: Z3_context,
+    operation: &str,
+    counts: &[c_uint],
+) -> bool {
+    let total = counts
+        .iter()
+        .try_fold(0u64, |sum, &count| sum.checked_add(u64::from(count)));
+    if total.is_some_and(|total| total <= u64::from(MAX_FFI_CONTAINER_ELEMENTS)) {
+        return true;
+    }
+    // SAFETY: guaranteed by this helper's contract; `as_mut` handles null.
+    if let Some(ctx) = unsafe { c.as_mut() } {
+        ctx.last_error = Z3_INVALID_ARG;
+        ctx.error_msg = Some(format!(
+            "{operation}: aggregate element count exceeds the supported maximum \
+             {MAX_FFI_CONTAINER_ELEMENTS}"
+        ));
+    }
+    false
+}
+
 /// Maximum exponent/root degree accepted by exact algebraic FFI operations.
 /// These arguments otherwise amplify into linear iteration counts and large
 /// exact-polynomial allocations.
@@ -157,7 +375,7 @@ use std::ffi::{c_char, c_int, c_uint, CString};
 use std::ptr;
 use std::time::Duration;
 
-use ay_dpll::api::{FuncDecl, Model, Solver, Sort, Tactic, Term};
+use ay_dpll::api::{FuncDecl, Model, Solver, Sort, Tactic, Term, TermKind};
 use ay_dpll::Statistics;
 // PatternHandle is available via `pub use quantifiers::*` above.
 
@@ -533,10 +751,20 @@ pub struct Z3Context {
     /// AY's core names applications with a string, so every distinct
     /// `(symbol kind/value, domain, range)` receives its own private name.
     pub(crate) ffi_func_names: HashMap<(SymbolKey, Vec<Sort>, Sort), String>,
+    /// Successfully registered native declaration for each exact C-API
+    /// function identity. Repeated `Z3_mk_func_decl` calls must allocate
+    /// distinct handles for one declaration, not attempt a second frontend
+    /// declaration of the same private name.
+    pub(crate) ffi_func_decls: HashMap<(SymbolKey, Vec<Sort>, Sort), FuncDecl>,
     /// Original Z3 symbol identity for solver-internal declaration names.
     /// Used to preserve `Z3_get_decl_name` kind/display after integer-symbol
     /// and fresh declarations are assigned collision-proof internal names.
     pub(crate) ffi_decl_symbols: HashMap<String, SymbolKey>,
+    /// Caller-supplied recognizer symbol keyed by datatype sort and semantic
+    /// constructor name. `DatatypeSort` stores constructor names but not
+    /// recognizer symbols, so this preserves exact C-API round-trips while the
+    /// core declaration retains its canonical `is-<constructor>` identity.
+    pub(crate) ffi_dt_recognizers: HashMap<(Sort, String), SymbolKey>,
     /// Original Z3 symbol identity for uninterpreted sorts whose solver name
     /// differs from the API-visible symbol.
     pub(crate) ffi_sort_symbols: HashMap<Sort, SymbolKey>,
@@ -880,6 +1108,287 @@ pub(crate) fn ensure_cross_context_translation_semantics(
         missing.join(", ")
     ));
     false
+}
+
+fn translation_metadata_error(target: &mut Z3Context, operation: &str, detail: &str) -> bool {
+    target.last_error = Z3_INVALID_USAGE;
+    target.error_msg = Some(format!(
+        "{operation}: cross-context translation metadata conflict: {detail}"
+    ));
+    false
+}
+
+fn sort_contains(root: &Sort, needle: &Sort) -> bool {
+    if root == needle {
+        return true;
+    }
+    match root {
+        Sort::Array(array) => {
+            sort_contains(&array.index_sort, needle) || sort_contains(&array.element_sort, needle)
+        }
+        Sort::Seq(element) => sort_contains(element, needle),
+        Sort::Datatype(datatype) => datatype.constructors.iter().any(|constructor| {
+            constructor
+                .fields
+                .iter()
+                .any(|field| sort_contains(&field.sort, needle))
+        }),
+        _ => false,
+    }
+}
+
+/// Carry C-API declaration/display identity alongside a translated term DAG.
+///
+/// `Solver::translate_terms_from` faithfully rebuilds core nodes, whose private
+/// names remain semantically authoritative, but the exact caller-visible Z3
+/// symbols live in [`Z3Context`] metadata. Walk the source/destination DAGs in
+/// lockstep, preflight all target collisions, and then copy only metadata
+/// reachable from the translated roots. A conflict fails closed instead of
+/// letting two context-local private identities alias.
+pub(crate) fn transfer_cross_context_ffi_metadata(
+    source: &Z3Context,
+    target: &mut Z3Context,
+    source_roots: &[Term],
+    target_roots: &[Term],
+    operation: &str,
+) -> bool {
+    if source_roots.len() != target_roots.len() {
+        return translation_metadata_error(target, operation, "root count changed during copy");
+    }
+
+    let mut pairs: HashMap<Term, Term> = HashMap::new();
+    let mut stack: Vec<(Term, Term)> = source_roots
+        .iter()
+        .copied()
+        .zip(target_roots.iter().copied())
+        .collect();
+    let mut relevant_names = std::collections::HashSet::new();
+    let mut relevant_sorts = std::collections::HashSet::new();
+    while let Some((source_term, target_term)) = stack.pop() {
+        if let Some(existing) = pairs.insert(source_term, target_term) {
+            if existing != target_term {
+                return translation_metadata_error(
+                    target,
+                    operation,
+                    "shared source node was translated to multiple target nodes",
+                );
+            }
+            continue;
+        }
+
+        relevant_sorts.insert(source.solver.term_sort(source_term));
+        match source.solver.term_kind(source_term) {
+            TermKind::App { name, .. } | TermKind::Var { name } => {
+                relevant_names.insert(name);
+            }
+            _ => {}
+        }
+        if let Some(vars) = source.solver.quantifier_bound_vars(source_term) {
+            relevant_sorts.extend(vars.into_iter().map(|(_, sort)| sort));
+        }
+
+        let source_children = source.solver.term_children(source_term);
+        let target_children = target.solver.term_children(target_term);
+        if source_children.len() != target_children.len() {
+            return translation_metadata_error(
+                target,
+                operation,
+                "term child count changed during copy",
+            );
+        }
+        stack.extend(source_children.into_iter().zip(target_children));
+
+        let source_triggers = source.solver.quantifier_triggers(source_term);
+        let target_triggers = target.solver.quantifier_triggers(target_term);
+        match (source_triggers, target_triggers) {
+            (None, None) => {}
+            (Some(source_sets), Some(target_sets)) if source_sets.len() == target_sets.len() => {
+                for (source_set, target_set) in source_sets.into_iter().zip(target_sets) {
+                    if source_set.len() != target_set.len() {
+                        return translation_metadata_error(
+                            target,
+                            operation,
+                            "quantifier trigger width changed during copy",
+                        );
+                    }
+                    stack.extend(source_set.into_iter().zip(target_set));
+                }
+            }
+            _ => {
+                return translation_metadata_error(
+                    target,
+                    operation,
+                    "quantifier triggers changed during copy",
+                );
+            }
+        }
+    }
+
+    let const_copies: Vec<(Term, String, SymbolKey, Sort)> = pairs
+        .iter()
+        .filter_map(|(source_term, target_term)| {
+            source
+                .ffi_const_metadata
+                .get(source_term)
+                .map(|(identity, symbol)| {
+                    (
+                        *target_term,
+                        identity.clone(),
+                        symbol.clone(),
+                        source.solver.term_sort(*source_term),
+                    )
+                })
+        })
+        .collect();
+    for (term, identity, symbol, sort) in &const_copies {
+        if target.ffi_const_metadata.get(term).is_some_and(
+            |(existing_identity, existing_symbol)| {
+                existing_identity != identity || existing_symbol != symbol
+            },
+        ) {
+            return translation_metadata_error(
+                target,
+                operation,
+                "translated constant node already has different public identity",
+            );
+        }
+        if target
+            .ffi_const_terms_by_identity
+            .get(identity)
+            .is_some_and(|existing| existing != term)
+        {
+            return translation_metadata_error(
+                target,
+                operation,
+                "translated constant private identity is already in use",
+            );
+        }
+        if target
+            .ffi_const_cache
+            .get(&(symbol.clone(), sort.clone()))
+            .is_some_and(|existing| existing != term)
+        {
+            return translation_metadata_error(
+                target,
+                operation,
+                "translated constant public symbol/signature is already bound differently",
+            );
+        }
+    }
+
+    let decl_symbol_copies: Vec<(String, SymbolKey)> = relevant_names
+        .iter()
+        .filter_map(|name| {
+            source
+                .ffi_decl_symbols
+                .get(name)
+                .map(|symbol| (name.clone(), symbol.clone()))
+        })
+        .collect();
+    for (name, symbol) in &decl_symbol_copies {
+        if target
+            .ffi_decl_symbols
+            .get(name)
+            .is_some_and(|existing| existing != symbol)
+        {
+            return translation_metadata_error(
+                target,
+                operation,
+                "translated function private identity has a different public symbol",
+            );
+        }
+    }
+
+    let function_copies: Vec<((SymbolKey, Vec<Sort>, Sort), String, Option<FuncDecl>)> = source
+        .ffi_func_names
+        .iter()
+        .filter(|(_, name)| relevant_names.contains(*name))
+        .map(|(key, name)| {
+            (
+                key.clone(),
+                name.clone(),
+                source.ffi_func_decls.get(key).cloned(),
+            )
+        })
+        .collect();
+    for (key, name, decl) in &function_copies {
+        if target
+            .ffi_func_names
+            .get(key)
+            .is_some_and(|existing| existing != name)
+            || target
+                .ffi_func_names
+                .iter()
+                .any(|(existing_key, existing_name)| existing_key != key && existing_name == name)
+        {
+            return translation_metadata_error(
+                target,
+                operation,
+                "translated function identity collides with a target declaration",
+            );
+        }
+        if let Some(decl) = decl {
+            if target
+                .ffi_func_decls
+                .get(key)
+                .is_some_and(|existing| existing != decl)
+            {
+                return translation_metadata_error(
+                    target,
+                    operation,
+                    "translated function signature is already bound differently",
+                );
+            }
+        }
+    }
+
+    let sort_copies: Vec<(Sort, SymbolKey)> = source
+        .ffi_sort_symbols
+        .iter()
+        .filter(|(sort, _)| {
+            relevant_sorts
+                .iter()
+                .any(|relevant| sort_contains(relevant, sort))
+        })
+        .map(|(sort, symbol)| (sort.clone(), symbol.clone()))
+        .collect();
+    for (sort, symbol) in &sort_copies {
+        if target
+            .ffi_sort_symbols
+            .get(sort)
+            .is_some_and(|existing| existing != symbol)
+        {
+            return translation_metadata_error(
+                target,
+                operation,
+                "translated sort identity has a different public symbol",
+            );
+        }
+    }
+
+    for (term, identity, symbol, sort) in const_copies {
+        target
+            .ffi_const_metadata
+            .insert(term, (identity.clone(), symbol.clone()));
+        target.ffi_const_terms_by_identity.insert(identity, term);
+        target.ffi_const_cache.insert((symbol.clone(), sort), term);
+        target.ffi_used_decl_names.insert(symbol.display_name());
+    }
+    for (name, symbol) in decl_symbol_copies {
+        target.ffi_decl_symbols.insert(name, symbol.clone());
+        target.ffi_used_decl_names.insert(symbol.display_name());
+    }
+    for (key, name, decl) in function_copies {
+        target.ffi_func_names.insert(key.clone(), name);
+        if let Some(decl) = decl {
+            target.ffi_func_decls.insert(key, decl);
+        }
+    }
+    for (sort, symbol) in sort_copies {
+        target.ffi_sort_symbols.insert(sort, symbol);
+    }
+    target.next_ffi_fresh_id = target.next_ffi_fresh_id.max(source.next_ffi_fresh_id);
+    true
 }
 
 /// One `Z3_mk_transitive_closure` registration (see
@@ -1719,8 +2228,17 @@ pub struct ProbeHandle {
 /// self-references (recursive datatypes referencing the datatype under
 /// construction); cross-datatype references via `Z3_mk_datatypes` are rejected.
 pub struct ConstructorHandle {
+    /// Collision-proof name used by AY's string-keyed datatype registry.
     pub(crate) name: String,
+    /// Exact caller-visible constructor symbol, including integer-vs-string
+    /// kind, retained for `Z3_get_decl_name`.
+    pub(crate) name_symbol: SymbolKey,
+    /// Exact caller-visible recognizer symbol.
+    pub(crate) recognizer_symbol: SymbolKey,
     pub(crate) field_names: Vec<String>,
+    /// Exact caller-visible accessor symbols, index-aligned with
+    /// `field_names`.
+    pub(crate) field_symbols: Vec<SymbolKey>,
     /// Concrete field sort, or `None` for a sort-reference field.
     pub(crate) field_sorts: Vec<Option<Sort>>,
     /// Z3 sort-reference index per field (only meaningful where `field_sorts` is
@@ -1749,7 +2267,7 @@ pub struct ConstructorListHandle {
 /// (`Solver::parse_smtlib2`) already keeps a PERSISTENT symbol table across
 /// calls: declarations from one parse are visible to the next. The parser
 /// context is a token over that shared table plus a record of the sorts/decls
-/// injected through `Z3_parser_context_add_sort`/`_add_decl` (threaded into the
+/// injected through `Z3_parser_context_add_sort`/`_add_decl` (registered in the
 /// context solver's symbol table at add time so subsequent
 /// `Z3_parser_context_from_string` calls resolve them by name). Every term the
 /// context yields is interned in — and therefore valid against — the parent
@@ -1760,9 +2278,9 @@ pub struct ConstructorListHandle {
 /// bookkeeping-only (they maintain [`refcount`](ParserContextHandle::refcount)
 /// but never free the handle early), matching AY's non-RC handle convention.
 pub struct ParserContextHandle {
-    /// Sorts injected via `Z3_parser_context_add_sort`, recorded so the handle
-    /// can (re-)thread them into the context solver's symbol table and for
-    /// introspection. Each was declared into the solver at add time.
+    /// Sorts injected via `Z3_parser_context_add_sort`, retained for membership
+    /// and introspection. Each was declared in the solver exactly once at add
+    /// time.
     pub(crate) added_sorts: Vec<Sort>,
     /// Function declarations injected via `Z3_parser_context_add_decl` (same
     /// role as `added_sorts`).
@@ -1905,6 +2423,130 @@ pub(crate) fn ffi_function_semantic_name(
     let name = format!("!ay.z3-func!{id}");
     ctx.ffi_func_names.insert(key, name.clone());
     name
+}
+
+/// Return the native declaration for an exact C-API function identity,
+/// declaring it on first use.
+///
+/// Z3 hash-conses declarations by symbol and signature. AY deliberately gives
+/// each C call a distinct pointer handle, but every such handle must refer to
+/// the same underlying declaration. Keeping that idempotence here also lets
+/// the frontend reject textual/native redeclarations without breaking the C
+/// compatibility boundary.
+pub(crate) fn ffi_try_declare_function(
+    ctx: &mut Z3Context,
+    symbol: &SymbolKey,
+    domain: &[Sort],
+    range: &Sort,
+) -> Result<FuncDecl, ay_dpll::api::SolverError> {
+    let key = (symbol.clone(), domain.to_vec(), range.clone());
+    if let Some(decl) = ctx.ffi_func_decls.get(&key) {
+        return Ok(decl.clone());
+    }
+
+    let semantic_name = ffi_function_semantic_name(ctx, symbol, domain, range);
+    match ctx
+        .solver
+        .try_declare_fun(&semantic_name, domain, range.clone())
+    {
+        Ok(decl) => {
+            ctx.ffi_func_decls.insert(key, decl.clone());
+            Ok(decl)
+        }
+        Err(error) => {
+            // Do not retain a private identity for a declaration that never
+            // became live; a later retry must take the normal first-use path.
+            ctx.ffi_func_names.remove(&key);
+            Err(error)
+        }
+    }
+}
+
+/// Translate private declaration/sort identities in formatted solver text back
+/// to the caller-visible Z3 symbols.
+///
+/// Internal names stay authoritative in the solver. Ordinary C-facing
+/// diagnostic text APIs apply this final token-level projection so
+/// overload-safe identities do not leak through `Z3_ast_to_string`,
+/// solver/goal dumps, model sorts, or fixedpoint output. Proof certificates are
+/// deliberately excluded: rewriting an overloaded declaration there could
+/// invalidate the certificate. String literals are copied verbatim;
+/// replacements happen only on complete SMT-LIB symbol tokens.
+pub(crate) fn ffi_surface_text(ctx: &Z3Context, rendered: &str) -> String {
+    let mut replacements: HashMap<String, String> = HashMap::new();
+    for (internal, symbol) in &ctx.ffi_decl_symbols {
+        replacements.insert(
+            ay_core::quote_symbol(internal),
+            ay_core::quote_symbol(&symbol.display_name()),
+        );
+    }
+    for (sort, symbol) in &ctx.ffi_sort_symbols {
+        let internal = match sort {
+            Sort::Uninterpreted(name) | Sort::FiniteDomain(name, _) | Sort::TypeVar(name) => {
+                Some(name)
+            }
+            Sort::Datatype(dt) => Some(&dt.name),
+            _ => None,
+        };
+        if let Some(internal) = internal {
+            replacements.insert(
+                ay_core::quote_symbol(internal),
+                ay_core::quote_symbol(&symbol.display_name()),
+            );
+        }
+    }
+    for (internal, symbol) in ctx.ffi_const_metadata.values() {
+        replacements.insert(
+            ay_core::quote_symbol(internal),
+            ay_core::quote_symbol(&symbol.display_name()),
+        );
+    }
+    if replacements.is_empty() {
+        return rendered.to_string();
+    }
+
+    let bytes = rendered.as_bytes();
+    let mut out = String::with_capacity(rendered.len());
+    let mut i = 0;
+    let is_delimiter = |byte: u8| byte.is_ascii_whitespace() || matches!(byte, b'(' | b')' | b',');
+    while i < bytes.len() {
+        if bytes[i] == b'"' {
+            // SMT-LIB escapes an embedded quote by doubling it.
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push_str(&rendered[start..i]);
+            continue;
+        }
+
+        let start = i;
+        if bytes[i] == b'|' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'|' {
+                i += 1;
+            }
+            i = (i + 1).min(bytes.len());
+        } else if is_delimiter(bytes[i]) {
+            i += 1;
+        } else {
+            while i < bytes.len() && !is_delimiter(bytes[i]) {
+                i += 1;
+            }
+        }
+        let token = &rendered[start..i];
+        out.push_str(replacements.get(token).map_or(token, String::as_str));
+    }
+    out
 }
 
 /// Z3's `max_char` (`zstring::max_char` = `0x2FFFF`): the largest SMT-LIB
@@ -2282,17 +2924,36 @@ pub(crate) fn cache_dt_func_decl(
     } else {
         (decl, dt_op)
     };
+    let symbol = ctx.ffi_decl_symbols.get(decl.name()).cloned();
     let decl_id = ctx.next_decl_id;
     ctx.next_decl_id += 1;
     let handle = Box::into_raw(Box::new(FuncDeclHandle {
         decl,
-        symbol: None,
+        symbol,
         params: Vec::new(),
         dt_op: Some(dt_op),
         decl_id,
     }));
     ctx.func_decl_cache.push(handle);
     handle
+}
+
+/// Datatype-declaration variant that records the exact caller-visible symbol
+/// while retaining a collision-proof internal declaration name.
+pub(crate) fn cache_dt_func_decl_with_symbol(
+    ctx: &mut Z3Context,
+    decl: FuncDecl,
+    dt_op: DatatypeOp,
+    symbol: SymbolKey,
+) -> Z3_func_decl {
+    if let DatatypeOp::Recognizer { ctor } = &dt_op {
+        if let Some(dt_sort) = decl.domain().first() {
+            ctx.ffi_dt_recognizers
+                .insert((dt_sort.clone(), ctor.clone()), symbol.clone());
+        }
+    }
+    ctx.ffi_decl_symbols.insert(decl.name().to_string(), symbol);
+    cache_dt_func_decl(ctx, decl, dt_op)
 }
 
 /// Reject user declarations whose NAME would be captured by an internal

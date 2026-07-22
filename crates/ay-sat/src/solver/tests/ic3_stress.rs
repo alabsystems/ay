@@ -675,9 +675,9 @@ fn test_ic3_unit_propagation_cascade_between_solves() {
     let r2 = s.solve_incremental_ic3(&[]);
     assert!(r2.is_sat(), "formula with x0=true should be SAT");
     if let AssumeResult::Sat(model) = r2.into_inner() {
-        for i in 0..10 {
+        for (i, &value) in model.iter().enumerate().take(10) {
             assert!(
-                model[i],
+                value,
                 "var {i} should be true due to unit propagation cascade"
             );
         }

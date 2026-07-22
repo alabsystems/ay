@@ -174,13 +174,13 @@ fn build_model(
     };
     if equilibrate {
         let cs: Vec<f64> = cscale.iter().filter(|&&c| c != 1.0).copied().collect();
-        let rs_lo = rscale.iter().cloned().fold(f64::INFINITY, f64::min);
-        let rs_hi = rscale.iter().cloned().fold(0.0f64, f64::max);
+        let rs_lo = rscale.iter().copied().fold(f64::INFINITY, f64::min);
+        let rs_hi = rscale.iter().copied().fold(0.0f64, f64::max);
         eprintln!(
             "EQUILIBRATE: {} cols scaled (C range {:.2e}..{:.2e}), R range {:.2e}..{:.2e}",
             cs.len(),
-            cs.iter().cloned().fold(f64::INFINITY, f64::min),
-            cs.iter().cloned().fold(0.0, f64::max),
+            cs.iter().copied().fold(f64::INFINITY, f64::min),
+            cs.iter().copied().fold(0.0, f64::max),
             rs_lo,
             rs_hi
         );

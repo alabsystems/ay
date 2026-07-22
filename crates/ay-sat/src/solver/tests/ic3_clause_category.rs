@@ -377,12 +377,10 @@ fn test_between_solve_reduce_skips_ic3_lemmas() {
     }
 
     // Manually add learned clauses and mark some as IC3 lemmas.
-    let mut _lemma_offsets = Vec::new();
     for i in 0..10u32 {
         let idx = solver.add_clause_db(&[neg(i), pos(i + 5), neg(i + 10)], true);
         solver.arena.set_lbd(idx, 8);
         solver.arena.set_ic3_lemma(idx, true);
-        _lemma_offsets.push(idx);
     }
 
     // Add many more non-lemma learned clauses (reduction candidates).

@@ -16,7 +16,7 @@ use crate::preprocess::{
 use ay_arrays::ArrayModel;
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::{Constant, TermData};
-use ay_core::{Sort, TermId};
+use ay_core::{Sort, TermId, TermStore};
 use ay_euf::EufModel;
 use ay_lia::LiaModel;
 use ay_lra::LraModel;
@@ -25,7 +25,7 @@ use ay_strings::StringModel;
 use num_traits::Zero;
 
 fn eliminate_mod_div_assertions_with_optional_sources(
-    terms: &mut ay_core::TermStore,
+    terms: &mut TermStore,
     assertions: Vec<TermId>,
     source_sets: Vec<Option<Vec<Vec<TermId>>>>,
     symbolic_divisors: bool,
@@ -56,7 +56,7 @@ fn eliminate_mod_div_assertions_with_optional_sources(
     (rewritten_assertions, rewritten_sources)
 }
 
-fn substitutable_int_constant_term(terms: &ay_core::TermStore, term: TermId) -> bool {
+fn substitutable_int_constant_term(terms: &TermStore, term: TermId) -> bool {
     if !matches!(terms.sort(term), Sort::Int) {
         return false;
     }
@@ -68,10 +68,7 @@ fn substitutable_int_constant_term(terms: &ay_core::TermStore, term: TermId) -> 
     }
 }
 
-fn int_constant_const_equality(
-    terms: &ay_core::TermStore,
-    assertion: TermId,
-) -> Option<(TermId, TermId)> {
+fn int_constant_const_equality(terms: &TermStore, assertion: TermId) -> Option<(TermId, TermId)> {
     let TermData::App(sym, args) = terms.get(assertion) else {
         return None;
     };
@@ -91,7 +88,7 @@ fn int_constant_const_equality(
 }
 
 fn substitute_int_const_terms(
-    terms: &mut ay_core::TermStore,
+    terms: &mut TermStore,
     replacements: &HashMap<TermId, TermId>,
     cache: &mut HashMap<TermId, TermId>,
     bound_names: &HashSet<String>,
@@ -235,12 +232,12 @@ fn substitute_int_const_terms(
     result
 }
 
-fn int_term_is_zero(terms: &ay_core::TermStore, term: TermId) -> bool {
+fn int_term_is_zero(terms: &TermStore, term: TermId) -> bool {
     matches!(terms.get(term), TermData::Const(Constant::Int(value)) if value.is_zero())
 }
 
 fn replacement_visible_in_scope(
-    terms: &ay_core::TermStore,
+    terms: &TermStore,
     term: TermId,
     bound_names: &HashSet<String>,
 ) -> bool {
@@ -251,7 +248,7 @@ fn replacement_visible_in_scope(
 }
 
 fn substitute_int_const_terms_root(
-    terms: &mut ay_core::TermStore,
+    terms: &mut TermStore,
     replacements: &HashMap<TermId, TermId>,
     cache: &mut HashMap<TermId, TermId>,
     term: TermId,
@@ -261,7 +258,7 @@ fn substitute_int_const_terms_root(
 }
 
 fn substitute_int_constants_preserving_definitions(
-    terms: &mut ay_core::TermStore,
+    terms: &mut TermStore,
     assertions: &mut [TermId],
     source_sets: &mut [Option<Vec<Vec<TermId>>>],
 ) -> bool {
@@ -454,7 +451,7 @@ impl Executor {
         if self.unit_prop_pass_enabled() {
             const MAX_UNIT_PROP_ROUNDS: usize = 8;
             let mut rewritten_total: u64 = 0;
-            let neg_of = |terms: &ay_core::TermStore, t: TermId| -> Option<TermId> {
+            let neg_of = |terms: &TermStore, t: TermId| -> Option<TermId> {
                 match terms.get(t) {
                     TermData::Not(inner) => Some(*inner),
                     _ => None,
@@ -1262,13 +1259,13 @@ impl Executor {
                 ay_core::kani_compat::DetHashSet::default();
             // `(ite c t e)` with Int-constant branches -> (c, t-value, e-value).
             let const_branch_ite =
-                |terms: &ay_core::TermStore,
+                |terms: &TermStore,
                  t: TermId|
                  -> Option<(TermId, num_bigint::BigInt, num_bigint::BigInt)> {
-                    if let ay_core::TermData::Ite(c, a, b) = terms.get(t) {
+                    if let TermData::Ite(c, a, b) = terms.get(t) {
                         if let (
-                            ay_core::TermData::Const(ay_core::Constant::Int(tv)),
-                            ay_core::TermData::Const(ay_core::Constant::Int(ev)),
+                            TermData::Const(Constant::Int(tv)),
+                            TermData::Const(Constant::Int(ev)),
                         ) = (terms.get(*a), terms.get(*b))
                         {
                             return Some((*c, tv.clone(), ev.clone()));
@@ -1293,14 +1290,14 @@ impl Executor {
                     num_bigint::BigInt,
                 )> = None; // (term, cond, then-value, else-value)
                 match self.ctx.terms.get(t) {
-                    ay_core::TermData::App(sym, args) => {
+                    TermData::App(sym, args) => {
                         if sym.name() == "*" && args.len() == 2 {
                             let (k, ite_arg) =
                                 match (self.ctx.terms.get(args[0]), self.ctx.terms.get(args[1])) {
-                                    (ay_core::TermData::Const(ay_core::Constant::Int(k)), _) => {
+                                    (TermData::Const(Constant::Int(k)), _) => {
                                         (Some(k.clone()), args[1])
                                     }
-                                    (_, ay_core::TermData::Const(ay_core::Constant::Int(k))) => {
+                                    (_, TermData::Const(Constant::Int(k))) => {
                                         (Some(k.clone()), args[0])
                                     }
                                     _ => (None, args[0]),
@@ -1313,8 +1310,8 @@ impl Executor {
                         }
                         stack.extend(args.iter().copied());
                     }
-                    ay_core::TermData::Not(inner) => stack.push(*inner),
-                    ay_core::TermData::Ite(c, a, b) => {
+                    TermData::Not(inner) => stack.push(*inner),
+                    TermData::Ite(c, a, b) => {
                         let (c, a, b) = (*c, *a, *b);
                         stack.push(c);
                         stack.push(a);
@@ -1365,9 +1362,9 @@ impl Executor {
                     continue;
                 }
                 match self.ctx.terms.get(t).clone() {
-                    ay_core::TermData::App(sym, args) => {
+                    TermData::App(sym, args) => {
                         if sym.name() == "select" && args.len() == 2 && row_seen.insert(t) {
-                            if let ay_core::TermData::App(inner_sym, inner_args) =
+                            if let TermData::App(inner_sym, inner_args) =
                                 self.ctx.terms.get(args[0]).clone()
                             {
                                 if inner_sym.name() == "store"
@@ -1397,8 +1394,8 @@ impl Executor {
                         }
                         stack.extend(args.iter().copied());
                     }
-                    ay_core::TermData::Not(inner) => stack.push(inner),
-                    ay_core::TermData::Ite(c, a, b) => {
+                    TermData::Not(inner) => stack.push(inner),
+                    TermData::Ite(c, a, b) => {
                         stack.push(c);
                         stack.push(a);
                         stack.push(b);

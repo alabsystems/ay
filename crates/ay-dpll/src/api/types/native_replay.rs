@@ -5,7 +5,7 @@
 //! Native API replay artifact types for downstream reducer/debugger handoff.
 
 use ay_core::term::TermData;
-use ay_core::{Sort, TermId};
+use ay_core::{DatatypeSort, Sort, TermId};
 
 /// Schema identifier for native API replay artifacts.
 pub const NATIVE_REPLAY_SCHEMA: &str = "ay.native-replay.v1";
@@ -95,6 +95,10 @@ pub struct NativeReplayTermNode {
     pub sort: Sort,
     /// Native term data.
     pub data: TermData,
+    /// This node is the exact bound term of a replayed nullary datatype
+    /// constructor. Name equality alone is insufficient because a fresh or
+    /// quantified variable may shadow the constructor's surface name.
+    pub is_datatype_constructor: bool,
 }
 
 /// Replay-relevant native API events.
@@ -145,6 +149,11 @@ pub enum NativeReplayEventKind {
         domain: Vec<Sort>,
         /// Range sort.
         range: Sort,
+    },
+    /// An algebraic datatype declaration was registered.
+    DeclareDatatype {
+        /// Complete datatype definition, including constructors and fields.
+        datatype: DatatypeSort,
     },
     /// A top-level assertion was added.
     Assert {

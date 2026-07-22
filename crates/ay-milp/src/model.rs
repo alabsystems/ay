@@ -227,12 +227,14 @@ impl Model {
     /// are summed; zero coefficients are dropped.
     ///
     /// # Panics
-    /// Panics if a bound or coefficient is NaN, or a column is out of range.
+    /// Panics if a bound is NaN, a coefficient is non-finite, or a column is
+    /// out of range. Duplicate coefficients whose sum overflows are rejected
+    /// too.
     pub fn add_row(&mut self, lb: f64, ub: f64, coeffs: &[(Col, f64)]) -> Row {
         assert!(!lb.is_nan() && !ub.is_nan(), "add_row: NaN bound");
         let mut merged: Vec<(u32, f64)> = Vec::with_capacity(coeffs.len());
         for &(col, a) in coeffs {
-            assert!(!a.is_nan(), "add_row: NaN coefficient");
+            assert!(a.is_finite(), "add_row: non-finite coefficient");
             assert!(
                 col.index() < self.cols.len(),
                 "add_row: column {} out of range ({} columns)",
@@ -250,6 +252,10 @@ impl Model {
                 false
             }
         });
+        assert!(
+            merged.iter().all(|&(_, a)| a.is_finite()),
+            "add_row: duplicate coefficient sum is non-finite"
+        );
         merged.retain(|&(_, a)| a != 0.0);
         let idx = u32::try_from(self.rows.len()).expect("row count exceeds u32");
         self.rows.push(RowSpec {
@@ -268,7 +274,8 @@ impl Model {
     /// one.
     ///
     /// # Panics
-    /// Panics if a bound or coefficient is NaN, or a column or the row is out of range.
+    /// Panics if a bound is NaN, a coefficient is non-finite, a duplicate
+    /// coefficient sum overflows, or a column or the row is out of range.
     pub(crate) fn set_row(&mut self, row: Row, lb: f64, ub: f64, coeffs: &[(Col, f64)]) {
         assert!(!lb.is_nan() && !ub.is_nan(), "set_row: NaN bound");
         assert!(
@@ -279,7 +286,7 @@ impl Model {
         );
         let mut merged: Vec<(u32, f64)> = Vec::with_capacity(coeffs.len());
         for &(col, a) in coeffs {
-            assert!(!a.is_nan(), "set_row: NaN coefficient");
+            assert!(a.is_finite(), "set_row: non-finite coefficient");
             assert!(
                 col.index() < self.cols.len(),
                 "set_row: column {} out of range ({} columns)",
@@ -297,6 +304,10 @@ impl Model {
                 false
             }
         });
+        assert!(
+            merged.iter().all(|&(_, a)| a.is_finite()),
+            "set_row: duplicate coefficient sum is non-finite"
+        );
         merged.retain(|&(_, a)| a != 0.0);
         self.rows[row.index()] = RowSpec {
             lb,
@@ -314,7 +325,7 @@ impl Model {
     /// direction. Replaces any previous objective.
     ///
     /// # Panics
-    /// Panics if a coefficient is NaN or a column is out of range.
+    /// Panics if a coefficient is non-finite or a column is out of range.
     pub fn set_objective(&mut self, coeffs: &[(Col, f64)], sense: Sense) {
         // Replacing the objective also replaces its exact side-store.  The MPS
         // reader calls this first and records the new overrides immediately
@@ -325,7 +336,7 @@ impl Model {
             spec.obj = 0.0;
         }
         for &(col, a) in coeffs {
-            assert!(!a.is_nan(), "set_objective: NaN coefficient");
+            assert!(a.is_finite(), "set_objective: non-finite coefficient");
             assert!(
                 col.index() < self.cols.len(),
                 "set_objective: column {} out of range ({} columns)",
@@ -350,8 +361,14 @@ impl Model {
     }
 
     /// Set a constant objective offset (added to every objective value).
+    ///
+    /// # Panics
+    /// Panics if `offset` is non-finite.
     pub fn set_objective_offset(&mut self, offset: f64) {
-        assert!(!offset.is_nan(), "set_objective_offset: NaN offset");
+        assert!(
+            offset.is_finite(),
+            "set_objective_offset: non-finite offset"
+        );
         self.obj_offset = offset;
         // Same replacement rule as `set_objective`: a previous parser-owned
         // exact offset no longer describes this value.
@@ -955,7 +972,7 @@ mod exact_tests {
             1.0 / 3.0,
             2.0 / 3.0,
             0.1,
-            123456789.123456789,
+            123_456_789.123_456_79,
             (1u64 << 53) as f64,
             ((1u64 << 53) - 1) as f64,
         ];
@@ -1000,6 +1017,58 @@ mod check_point_row_tests {
 
     fn rat(n: i64, d: i64) -> BigRational {
         BigRational::new(BigInt::from(n), BigInt::from(d))
+    }
+
+    /// Exact readers deliberately represent only finite coefficients. Reject
+    /// invalid public input at the mutator boundary instead of letting a later
+    /// `objective_value_at`/`check_point` panic or silently reinterpret it.
+    #[test]
+    fn coefficient_mutators_reject_non_finite_values() {
+        for bad in [f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(std::panic::catch_unwind(|| {
+                let mut m = Model::new();
+                let x = m.add_col(0.0, 1.0);
+                m.add_row(0.0, 1.0, &[(x, bad)]);
+            })
+            .is_err());
+            assert!(std::panic::catch_unwind(|| {
+                let mut m = Model::new();
+                let x = m.add_col(0.0, 1.0);
+                let row = m.add_row(0.0, 1.0, &[(x, 1.0)]);
+                m.set_row(row, 0.0, 1.0, &[(x, bad)]);
+            })
+            .is_err());
+            assert!(std::panic::catch_unwind(|| {
+                let mut m = Model::new();
+                let x = m.add_col(0.0, 1.0);
+                m.set_objective(&[(x, bad)], super::Sense::Minimize);
+            })
+            .is_err());
+            assert!(std::panic::catch_unwind(|| {
+                let mut m = Model::new();
+                m.set_objective_offset(bad);
+            })
+            .is_err());
+        }
+    }
+
+    /// Inputs can each be finite while duplicate-row normalization overflows.
+    /// Reject the normalized row immediately in both construction paths.
+    #[test]
+    fn row_mutators_reject_duplicate_sum_overflow() {
+        assert!(std::panic::catch_unwind(|| {
+            let mut m = Model::new();
+            let x = m.add_col(0.0, 1.0);
+            m.add_row(0.0, 1.0, &[(x, f64::MAX), (x, f64::MAX)]);
+        })
+        .is_err());
+        assert!(std::panic::catch_unwind(|| {
+            let mut m = Model::new();
+            let x = m.add_col(0.0, 1.0);
+            let row = m.add_row(0.0, 1.0, &[(x, 1.0)]);
+            m.set_row(row, 0.0, 1.0, &[(x, f64::MAX), (x, f64::MAX)]);
+        })
+        .is_err());
     }
 
     /// The common-denominator row evaluation must agree with the naive exact sum on

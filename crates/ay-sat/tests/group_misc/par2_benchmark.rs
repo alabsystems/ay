@@ -367,7 +367,7 @@ fn par2_benchmark_corpus() {
         .iter()
         .filter(|r| r.outcome == Outcome::Sat || r.outcome == Outcome::Unsat)
         .collect();
-    solved.sort_by(|a, b| b.wall_time.cmp(&a.wall_time));
+    solved.sort_by_key(|result| std::cmp::Reverse(result.wall_time));
 
     if !solved.is_empty() {
         let top_n = solved.len().min(10);

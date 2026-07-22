@@ -216,16 +216,17 @@ fn len_interval_regex_exact_window() {
     // point of the counter representation — no materialized `Σ?` chain, no cap.
     // Assert whichever contract is live rather than pinning the stale one.
     match len_interval_regex(1000, Some(2000)) {
-        None => assert!(
-            !crate::we_regex::s1_enabled(),
-            "only the pre-S1 cap may refuse"
-        ),
+        None => assert!(!s1_enabled(), "only the pre-S1 cap may refuse"),
         Some(r) => {
-            assert!(crate::we_regex::s1_enabled(), "only S1 may represent it");
+            assert!(s1_enabled(), "only S1 may represent it");
             // Exact, not fabricated: the window is non-empty and rejects
             // lengths outside [1000, 2000].
             assert!(!r.is_empty_lang());
-            assert_eq!(r.nullable(), false);
+            assert!(!r.nullable());
+            assert_eq!(r.matches(&"x".repeat(999)), Some(false));
+            assert_eq!(r.matches(&"x".repeat(1000)), Some(true));
+            assert_eq!(r.matches(&"x".repeat(2000)), Some(true));
+            assert_eq!(r.matches(&"x".repeat(2001)), Some(false));
         }
     }
 }

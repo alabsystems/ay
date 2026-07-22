@@ -234,7 +234,12 @@ mod eval_guard {
         /// across a stop are never memoized (unchanged from the original
         /// poison semantics for stops).
         stop_poison: u64,
-        enters: u32,
+        /// Monotone count of MEMO-MISSING `evaluate_term` node visits on this
+        /// thread — the evaluator's unit of real work (a memo hit never
+        /// reaches `enter`). Throttles the external-stop poll, and is the
+        /// deterministic clock W4's search budget is measured against
+        /// (`Executor::w4_work_deadline`).
+        enters: u64,
     }
 
     thread_local! {
@@ -279,7 +284,7 @@ mod eval_guard {
     pub(super) fn enter(term: TermId) -> Option<Entered> {
         STATE.with(|s| {
             let mut st = s.borrow_mut();
-            st.enters = st.enters.wrapping_add(1);
+            st.enters = st.enters.saturating_add(1);
             if let Some(&entry_depth) = st.in_progress.get(&term) {
                 st.min_reentry = st.min_reentry.min(entry_depth);
                 None
@@ -324,6 +329,11 @@ mod eval_guard {
         STATE.with(|s| s.borrow().enters & 511 == 0)
     }
 
+    /// This thread's memo-missing node-visit count (see `GuardState::enters`).
+    pub(super) fn enters() -> u64 {
+        STATE.with(|s| s.borrow().enters)
+    }
+
     pub(super) fn stop_poison() -> u64 {
         STATE.with(|s| s.borrow().stop_poison)
     }
@@ -338,6 +348,14 @@ mod eval_guard {
 /// (not `&self`) can call it.
 pub(super) fn eval_memo_clear() {
     eval_memo::clear();
+}
+
+/// This thread's monotone count of memo-missing `evaluate_term` node visits —
+/// the evaluator's deterministic work clock. Used by the W4 witness search to
+/// bound its hill-climb by WORK rather than by wall time, so the same file
+/// gets the same search on an idle box and a loaded one (`#w4-work-budget`).
+pub(crate) fn eval_node_visits() -> u64 {
+    eval_guard::enters()
 }
 
 /// A satisfying model from check-sat
@@ -688,6 +706,12 @@ impl Executor {
     /// and looks up values for variables and function applications.
     /// Uses `stacker::maybe_grow` for stack safety on deeply nested terms (#4602).
     pub(super) fn evaluate_term(&self, model: &Model, term_id: TermId) -> EvalValue {
+        // W4's search budget is cooperative inside evaluation, not merely at
+        // the outer hill-climb. Once spent, even a cached value must not let a
+        // partial atom sweep masquerade as a complete score.
+        if self.w4_budget_exhausted() {
+            return EvalValue::Unknown;
+        }
         // Datatype-field re-evaluation override (#dt-field-soundness). When the
         // materialized datatype re-evaluator (`dt_mat_eval`) is active it pins every
         // datatype selector/recognizer subterm to its concrete model value here, so
@@ -707,6 +731,9 @@ impl Executor {
             let Some(_entered) = eval_guard::enter(term_id) else {
                 return EvalValue::Unknown;
             };
+            if self.w4_budget_exhausted() {
+                return EvalValue::Unknown;
+            }
             return self.evaluate_term_inner(model, term_id);
         }
         // Result memo (perf-only, verdict-preserving; #eval-memo). Live only
@@ -723,6 +750,9 @@ impl Executor {
         let Some(_entered) = eval_guard::enter(term_id) else {
             return EvalValue::Unknown;
         };
+        if self.w4_budget_exhausted() {
+            return EvalValue::Unknown;
+        }
         // Periodic external-stop poll: lets an interrupt/deadline terminate
         // long evaluation passes instead of running them to completion.
         if eval_guard::should_poll_stop() && self.external_stop_reason().is_some() {
@@ -737,7 +767,10 @@ impl Executor {
         let stop_before = eval_guard::stop_poison();
         let v = self.evaluate_term_inner(model, term_id);
         let frame_min = eval_guard::min_reentry();
-        if frame_min >= eval_guard::depth() && eval_guard::stop_poison() == stop_before {
+        if !self.w4_budget_exhausted()
+            && frame_min >= eval_guard::depth()
+            && eval_guard::stop_poison() == stop_before
+        {
             eval_memo::put(term_id, &v);
         }
         eval_guard::fold_min(parent_min);

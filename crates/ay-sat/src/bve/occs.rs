@@ -536,9 +536,7 @@ impl BVE {
         if self.schedule_gate_pair_credit.len() < self.num_vars {
             self.schedule_gate_pair_credit.resize(self.num_vars, 0);
         }
-        for credit in &mut self.schedule_gate_pair_credit {
-            *credit = 0;
-        }
+        self.schedule_gate_pair_credit.fill(0);
 
         let mut extractor = GateExtractor::new(self.num_vars);
         let mut marks = LitMarks::new(self.num_vars.max(1));

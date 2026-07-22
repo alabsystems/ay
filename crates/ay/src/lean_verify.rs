@@ -22,7 +22,7 @@
 //! Until that migration lands, this module IS the canonical verification
 //! entry point invoked by `--lean-verify`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -41,8 +41,8 @@ pub(crate) enum LeanVerificationOutcome {
 /// Thin wrapper that invokes `lean <proof-file>`.
 ///
 /// The `--lean-verify` CLI flag constructs one of these per UNSAT result,
-/// invokes [`LeanVerifier::verify`] on the emitted proof path, and routes
-/// the outcome to the exit-code contract documented in
+/// invokes [`LeanVerifier::verify_descriptor`] on an authenticated proof
+/// snapshot, and routes the outcome to the exit-code contract documented in
 /// `crates/ay/README.md`.
 #[derive(Debug, Clone)]
 pub(crate) struct LeanVerifier {
@@ -65,47 +65,59 @@ impl LeanVerifier {
         self
     }
 
-    /// Invoke `lean <proof_file>` and classify the outcome.
-    ///
-    /// # Semantics
-    /// - Exit 0 with empty-or-warning stderr → [`LeanVerificationOutcome::Accepted`].
-    /// - Non-zero exit → [`LeanVerificationOutcome::Rejected`] carrying stderr.
-    /// - Spawn failure / timeout → [`LeanVerificationOutcome::Unavailable`].
-    ///
-    /// Timeouts are enforced cooperatively via [`wait_timeout::ChildExt`] if
-    /// available; otherwise the call blocks until `lean` returns.
-    pub(crate) fn verify(&self, proof_file: &Path) -> LeanVerificationOutcome {
-        if !proof_file.exists() {
-            return LeanVerificationOutcome::Unavailable {
-                reason: format!("proof file missing: {}", proof_file.display()),
-            };
-        }
-
+    /// Invoke Lean on the exact inode named by `proof_file`, not on a mutable
+    /// public pathname. The cloned descriptor is inherited across `exec`, and
+    /// Lean receives the child-local descriptor path.
+    #[cfg(unix)]
+    pub(crate) fn verify_descriptor(&self, proof_file: &std::fs::File) -> LeanVerificationOutcome {
+        let inherited = match proof_file.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                return LeanVerificationOutcome::Unavailable {
+                    reason: format!("failed to clone authenticated Lean snapshot: {error}"),
+                };
+            }
+        };
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let descriptor_path = PathBuf::from("/proc/self/fd/0");
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let descriptor_path = PathBuf::from("/dev/stdin");
         let mut cmd = Command::new(&self.lean_path);
-        cmd.arg(proof_file);
+        cmd.arg(descriptor_path)
+            .stdin(std::process::Stdio::from(inherited));
+        self.run_command(cmd)
+    }
+
+    fn spawn_command(
+        &self,
+        mut cmd: Command,
+    ) -> Result<std::process::Child, LeanVerificationOutcome> {
         // Capture both streams so Accepted warnings don't leak to the user's
         // stderr and Rejected stderr can be surfaced on failure.
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let child = match cmd.spawn() {
-            Ok(c) => c,
+        match cmd.spawn() {
+            Ok(child) => Ok(child),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return LeanVerificationOutcome::Unavailable {
+                Err(LeanVerificationOutcome::Unavailable {
                     reason: format!(
                         "lean binary not found at '{}' (use --lean-path to override)",
                         self.lean_path.display()
                     ),
-                };
+                })
             }
-            Err(err) => {
-                return LeanVerificationOutcome::Unavailable {
-                    reason: format!("failed to spawn '{}': {err}", self.lean_path.display()),
-                };
-            }
-        };
+            Err(err) => Err(LeanVerificationOutcome::Unavailable {
+                reason: format!("failed to spawn '{}': {err}", self.lean_path.display()),
+            }),
+        }
+    }
 
-        self.wait_child(child)
+    fn run_command(&self, cmd: Command) -> LeanVerificationOutcome {
+        match self.spawn_command(cmd) {
+            Ok(child) => self.wait_child(child),
+            Err(outcome) => outcome,
+        }
     }
 
     fn wait_child(&self, child: std::process::Child) -> LeanVerificationOutcome {
@@ -205,27 +217,18 @@ fn stderr_indicates_rejection(stderr: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn test_verifier_reports_unavailable_for_missing_binary() {
         let verifier = LeanVerifier::new().with_path("/nonexistent/bogus-lean-binary-xyz");
         let tmp = std::env::temp_dir().join("ay-lean-verify-unit-test.lean4");
         std::fs::write(&tmp, "theorem t : True := trivial\n").expect("write tmp");
-        let outcome = verifier.verify(&tmp);
+        let proof = std::fs::File::open(&tmp).expect("open tmp");
+        let outcome = verifier.verify_descriptor(&proof);
         let _ = std::fs::remove_file(&tmp);
         assert!(
             matches!(outcome, LeanVerificationOutcome::Unavailable { .. }),
             "expected Unavailable for missing binary, got {outcome:?}"
-        );
-    }
-
-    #[test]
-    fn test_verifier_reports_unavailable_for_missing_proof_file() {
-        let verifier = LeanVerifier::new();
-        let bogus = PathBuf::from("/tmp/this-file-does-not-exist-ay-lean-verify.lean4");
-        let outcome = verifier.verify(&bogus);
-        assert!(
-            matches!(outcome, LeanVerificationOutcome::Unavailable { .. }),
-            "expected Unavailable for missing proof file, got {outcome:?}"
         );
     }
 

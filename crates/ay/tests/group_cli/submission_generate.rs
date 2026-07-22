@@ -245,14 +245,20 @@ fn write_sat_env_probe_ay(sat_dir: &Path) {
     let ay = sat_dir.join("ay");
     fs::write(
         &ay,
-        r#"#!/usr/bin/env bash
+        concat!(
+            r#"#!/usr/bin/env bash
 set -euo pipefail
-printf 'authority=%s\n' "${AY_SAT_FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY-unset}"
-printf 'current=%s\n' "${AY_SAT_FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT-unset}"
-printf 'preflight=%s\n' "${AY_SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE-unset}"
-printf 'matrix=%s\n' "${AY_SATCOMP_MATRIX-unset}"
+printf 'authority=%s\n' "${"#,
+            r#"AY_SAT_FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY-unset}"
+printf 'current=%s\n' "${"#,
+            r#"AY_SAT_FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT-unset}"
+printf 'preflight=%s\n' "${"#,
+            r#"AY_SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE-unset}"
+printf 'matrix=%s\n' "${"#,
+            r#"AY_SATCOMP_MATRIX-unset}"
 printf 's UNKNOWN\n'
 "#,
+        ),
     )
     .expect("write SAT env probe ay");
     fs::set_permissions(&ay, fs::Permissions::from_mode(0o755)).expect("chmod SAT env probe ay");
@@ -579,10 +585,12 @@ fn sat_matrix_retains_fmla_dry_run_artifact_for_unknown_timeout_route() {
     let run_sh = solver_root.join("run.sh");
     fs::write(
         &run_sh,
-        r#"#!/usr/bin/env bash
+        concat!(
+            r#"#!/usr/bin/env bash
 set -euo pipefail
 
-artifact="${AY_SAT_FMLA_LEARNED_LRAT_DRY_RUN_ARTIFACT:-}"
+artifact="${"#,
+            r#"AY_SAT_FMLA_LEARNED_LRAT_DRY_RUN_ARTIFACT:-}"
 if [[ -n "$artifact" ]]; then
   mkdir -p "$(dirname "$artifact")"
   cat > "$artifact" <<'JSON'
@@ -592,6 +600,7 @@ fi
 printf 's UNKNOWN\n'
 printf 'c timeout\n' >&2
 "#,
+        ),
     )
     .expect("write fake SAT wrapper");
     fs::set_permissions(&run_sh, fs::Permissions::from_mode(0o755))

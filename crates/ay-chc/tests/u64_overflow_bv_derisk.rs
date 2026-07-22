@@ -57,10 +57,7 @@ fn solve_with_timeout(horn: &'static str) -> Option<VerifiedChcResult> {
         let result = AdaptivePortfolio::new(problem, config).solve();
         let _ = tx.send(result);
     });
-    match rx.recv_timeout(Duration::from_secs(45)) {
-        Ok(result) => Some(result),
-        Err(_) => None,
-    }
+    rx.recv_timeout(Duration::from_secs(45)).ok()
 }
 
 #[test]

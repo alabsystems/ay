@@ -278,8 +278,8 @@ impl CliqueGraph {
                 return false;
             };
             clique.push(u);
-            for i in 0..words {
-                cand[i] &= self.adj[u * words + i];
+            for (i, candidate) in cand.iter_mut().enumerate() {
+                *candidate &= self.adj[u * words + i];
             }
         }
     }
@@ -418,12 +418,12 @@ impl CliqueGraph {
         let mut cand = vec![u64::MAX; words];
         // Mask off bits beyond n.
         let n = self.n();
-        if n % 64 != 0 {
+        if !n.is_multiple_of(64) {
             cand[words - 1] = (1u64 << (n % 64)) - 1;
         }
         for &m in clique {
-            for i in 0..words {
-                cand[i] &= self.adj[m * words + i];
+            for (i, candidate) in cand.iter_mut().enumerate() {
+                *candidate &= self.adj[m * words + i];
             }
         }
         cand
@@ -786,7 +786,7 @@ impl Executor {
             .sort_by_key(|&(subject, coverage, t)| (!subject, std::cmp::Reverse(coverage), t.0));
         // Extra-edge budget: 2x the clique-edge count n*(n-1)/2.
         let mut edge_budget = n * (n - 1);
-        let mut push_pair_sources =
+        let push_pair_sources =
             |pair: (TermId, TermId), core: &mut Vec<TermId>, seen: &mut HashSet<TermId>| {
                 let &src = info.edges.get(&pair).expect("pair from info.edges");
                 if seen.insert(src) {
@@ -1277,7 +1277,7 @@ mod tests {
         let d: Vec<TermId> = (8..28).map(TermId).collect();
         let src = TermId(99);
         let mut edges: HashMap<(TermId, TermId), TermId> = HashMap::default();
-        let mut add = |a: TermId, b: TermId, edges: &mut HashMap<(TermId, TermId), TermId>| {
+        let add = |a: TermId, b: TermId, edges: &mut HashMap<(TermId, TermId), TermId>| {
             let pair = if a.0 < b.0 { (a, b) } else { (b, a) };
             edges.insert(pair, src);
         };
@@ -1337,7 +1337,7 @@ mod tests {
         let z = TermId(14);
         let src = TermId(99); // provenance is irrelevant at graph level
         let mut edges: HashMap<(TermId, TermId), TermId> = HashMap::default();
-        let mut add = |a: TermId, b: TermId, edges: &mut HashMap<(TermId, TermId), TermId>| {
+        let add = |a: TermId, b: TermId, edges: &mut HashMap<(TermId, TermId), TermId>| {
             let pair = if a.0 < b.0 { (a, b) } else { (b, a) };
             edges.insert(pair, src);
         };

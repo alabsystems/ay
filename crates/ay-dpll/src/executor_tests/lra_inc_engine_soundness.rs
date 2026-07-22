@@ -109,7 +109,7 @@ const BMC_STEP_SCRIPT: &str = "\
 
 /// The engine lane must match from-scratch ground truth on push/check/pop/check
 /// AND must not panic (the #8078 BCP-missed-conflict regression). The ground
-/// truth is pinned by the default (from-scratch) routing.
+/// truth is pinned by the explicit engine-off/from-scratch override.
 #[test]
 fn inc_engine_push_check_pop_check_matches_ground_truth() {
     let ground_truth = run_verdicts(PUSH_CHECK_POP_CHECK_SCRIPT, Some(false));

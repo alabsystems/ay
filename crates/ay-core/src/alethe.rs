@@ -188,6 +188,13 @@ pub enum AletheRule {
     ///
     /// `(=> (not (= i j)) (= (select (store a i v) j) (select a j)))`
     ReadOverWriteNeg,
+    /// Store permutation (n-ary store-commutativity): two `store` chains over
+    /// the same base writing the same `(index, value)` multiset are equal when
+    /// the indices are pairwise distinct.
+    StorePermutation,
+    /// Read-over-write evaluated through a `store` chain, optionally under an
+    /// array-equality premise.
+    ReadOverWriteChain,
     /// Extensionality: point-wise equal arrays are equal.
     ///
     /// `(=> (forall ((k Index)) (= (select a k) (select b k))) (= a b))`
@@ -295,6 +302,8 @@ impl AletheRule {
             Self::BvBitblast => "bv_bitblast",
             Self::ReadOverWritePos => "read_over_write_pos",
             Self::ReadOverWriteNeg => "read_over_write_neg",
+            Self::StorePermutation => "store_permutation",
+            Self::ReadOverWriteChain => "read_over_write_chain",
             Self::Extensionality => "extensionality",
             Self::FpToBv => "fp_to_bv",
             Self::StringLength => "string_length",

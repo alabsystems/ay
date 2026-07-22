@@ -7,7 +7,7 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 
-use crate::command::{MatchPattern, ParsedConstant, Term as ParsedTerm};
+use crate::command::{MatchPattern, ParsedConstant, QualifiedIdentifier, Term as ParsedTerm};
 use crate::sexp::{PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE};
 use ay_core::{Constant, Sort, Symbol, TermData, TermId};
 
@@ -62,7 +62,9 @@ fn collect_term_names(root: &ParsedTerm, out: &mut HashSet<String>) {
                 stack.extend(args.iter());
             }
             ParsedTerm::QualifiedApp(n, _, args) => {
-                out.insert(n.clone());
+                if let QualifiedIdentifier::Symbol(name) = n {
+                    out.insert(name.clone());
+                }
                 stack.extend(args.iter());
             }
             ParsedTerm::Let(bindings, body) => {
@@ -112,7 +114,7 @@ impl Context {
                 // Check function definitions FIRST (expand nullary define-fun)
                 // This must come before the symbols check to properly expand
                 // definitions like (define-fun my_eq () Bool (= a b))
-                if let Some((params, body)) = self.fun_defs.get(name).cloned() {
+                if let Some((params, result_sort, body)) = self.fun_defs.get(name).cloned() {
                     if params.is_empty() {
                         // It's a nullary function, just expand the body
                         let term = self.elaborate_term(&body, env)?;
@@ -121,86 +123,28 @@ impl Context {
                         // as Int but the declared sort is Real. Coerce to match.
                         // Without this, downstream mk_eq panics on sort mismatch
                         // and release builds produce false-UNSAT (#6812).
-                        if let Some(info) = self.symbols.get(name) {
-                            if info.sort == Sort::Real && *self.terms.sort(term) == Sort::Int {
-                                return Ok(self.coerce_int_to_real(term));
-                            }
+                        let actual = self.terms.sort(term).clone();
+                        if actual == result_sort {
+                            return Ok(term);
                         }
-                        return Ok(term);
+                        if actual == Sort::Int && result_sort == Sort::Real {
+                            return Ok(self.coerce_int_to_real(term));
+                        }
+                        return Err(ElaborateError::SortMismatch {
+                            expected: result_sort.to_string(),
+                            actual: actual.to_string(),
+                        });
                     }
                 }
-                // Check global symbols
-                if let Some(info) = self.symbols.get(name) {
+                // Check global symbols. Bare identifiers can denote only a
+                // unique nullary declaration; choosing the last entry of an
+                // overloaded name would silently change the user's formula.
+                if let Some(info) = self.resolve_bare_declared_symbol(name)? {
                     if let Some(id) = info.term {
                         return Ok(id);
                     }
-                    // It's a declared function with no definition - create a variable
-                    return Ok(self.terms.mk_var(name, info.sort.clone()));
-                }
-                // Handle bitvector numerals: (_ bvN W) where N is value and W is width
-                // SMT-LIB 2.6 Section 3.5 defines this as an alternative to #x and #b forms
-                // This fixes #924: parser rejects bitvector numeral syntax
-                if let Some(inner) = name.strip_prefix("(_ bv").and_then(|s| s.strip_suffix(')')) {
-                    let parts: Vec<&str> = inner.split_whitespace().collect();
-                    if parts.len() != 2 {
-                        return Err(ElaborateError::InvalidConstant(name.clone()));
-                    }
-                    let value = parts[0]
-                        .parse::<BigInt>()
-                        .map_err(|_| ElaborateError::InvalidConstant(name.clone()))?;
-                    let width = parts[1]
-                        .parse::<u32>()
-                        .map_err(|_| ElaborateError::InvalidConstant(name.clone()))?;
-                    Self::checked_bitvector_sort(width)?;
-                    return Ok(self.terms.mk_bitvec(value, width));
-                }
-                // Handle character literals `(_ Char n)` (decimal code point) and
-                // `(_ char #xNN)` (hex code point). SMT-LIB models `String` as
-                // `(Seq Char)` and a Char as a Unicode code point; AY lowers a Char
-                // to that bounded Int code point (see `Sort::Char`), so a char
-                // literal is its code point. The char operators (`char.to_int`,
-                // `char.<=`, `char.is_digit`, …) desugar to Int arithmetic on it.
-                if let Some(inner) = name
-                    .strip_prefix("(_ Char ")
-                    .or_else(|| name.strip_prefix("(_ char "))
-                    .and_then(|s| s.strip_suffix(')'))
-                {
-                    let inner = inner.trim();
-                    let code = if let Some(hex) = inner.strip_prefix("#x") {
-                        BigInt::parse_bytes(hex.as_bytes(), 16)
-                    } else {
-                        inner.parse::<BigInt>().ok()
-                    };
-                    if let Some(code) = code {
-                        return Ok(self.terms.mk_int(code));
-                    }
-                }
-                // Handle (_ as-array f): creates an array from a declared function.
-                // Parsed by parse_indexed_identifier as Symbol("(_ as-array f)").
-                if let Some(inner) = name
-                    .strip_prefix("(_ as-array ")
-                    .and_then(|s| s.strip_suffix(')'))
-                {
-                    let func_name = inner.trim();
-                    // Look up the function in the symbol table
-                    let func_info =
-                        self.symbols.get(func_name).cloned().ok_or_else(|| {
-                            ElaborateError::UndefinedSymbol(format!(
-                                "function '{func_name}' used in (_ as-array {func_name}) is not declared"
-                            ))
-                        })?;
-                    // Function must have exactly 1 argument (index sort) to form an array
-                    if func_info.arg_sorts.len() != 1 {
-                        return Err(ElaborateError::InvalidConstant(format!(
-                            "as-array requires a unary function, '{}' has {} arguments",
-                            func_name,
-                            func_info.arg_sorts.len()
-                        )));
-                    }
-                    let index_sort = func_info.arg_sorts[0].clone();
-                    let element_sort = func_info.sort;
-                    let array_sort = Sort::array(index_sort, element_sort);
-                    return Ok(self.terms.mk_as_array(func_name, array_sort));
+                    let internal_name = info.internal_name.as_deref().unwrap_or(name);
+                    return Ok(self.terms.mk_var(internal_name, info.sort));
                 }
                 // Handle negative numeric literals: -1, -42, -3.14, etc.
                 // In SMT-LIB these should be (- 1), (- 42) but many benchmarks
@@ -235,36 +179,6 @@ impl Context {
                                 let rational = BigRational::new(-numer, denom);
                                 return Ok(self.terms.mk_rational(rational));
                             }
-                        }
-                    }
-                }
-                // FP indexed nullary constants (#4127): (_ +zero eb sb), (_ -zero eb sb),
-                // (_ +oo eb sb), (_ -oo eb sb), (_ NaN eb sb)
-                if let Some(inner) = name.strip_prefix("(_ ").and_then(|s| s.strip_suffix(')')) {
-                    let parts: Vec<&str> = inner.split_whitespace().collect();
-                    if parts.len() == 3 {
-                        match parts[0] {
-                            "+zero" | "-zero" | "+oo" | "-oo" | "NaN" => {
-                                let eb = parts[1].parse::<u32>().map_err(|_| {
-                                    ElaborateError::InvalidConstant(format!(
-                                        "invalid FloatingPoint exponent width `{}`",
-                                        parts[1]
-                                    ))
-                                })?;
-                                let sb = parts[2].parse::<u32>().map_err(|_| {
-                                    ElaborateError::InvalidConstant(format!(
-                                        "invalid FloatingPoint significand width `{}`",
-                                        parts[2]
-                                    ))
-                                })?;
-                                let fp_sort = Self::checked_floating_point_sort(eb, sb)?;
-                                return Ok(self.terms.mk_app(
-                                    Symbol::indexed(parts[0], vec![eb, sb]),
-                                    vec![],
-                                    fp_sort,
-                                ));
-                            }
-                            _ => {}
                         }
                     }
                 }

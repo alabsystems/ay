@@ -4,7 +4,7 @@
 
 //! Native reducer/replay export for downstream consumers.
 
-use ay_core::kani_compat::DetHashMap as HashMap;
+use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::str::FromStr;
@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ay_core::panic_payload_to_string;
 use ay_core::term::{Constant, RationalWrapper, Symbol, TermData};
-use ay_core::{Sort, TermId};
+use ay_core::{DatatypeConstructor, DatatypeField, DatatypeSort, Sort, TermId, TermStore};
 use num_bigint::BigInt;
 use num_rational::BigRational;
 use serde_json::{json, Value};
@@ -102,12 +102,11 @@ impl Solver {
             .collect();
         declarations.sort_by_key(|decl| decl.term);
 
-        let function_declarations = function_declarations_from_events(&self.native_replay_events);
         let depths = self.executor.context().active_assertion_min_scope_depths();
         let mut active_assertion_metadata =
             active_assertion_metadata_from_events(&self.native_replay_events);
         let mut assertion_occurrences = HashMap::default();
-        let assertions = self
+        let assertions: Vec<_> = self
             .executor
             .context()
             .assertions
@@ -135,13 +134,49 @@ impl Solver {
                 }
             })
             .collect();
-        let terms = self
-            .terms()
-            .term_ids()
+        let mut roots: Vec<TermId> = assertions.iter().map(|assertion| assertion.term).collect();
+        if let Some(assumptions) = final_check_sat_assumptions(&self.native_replay_events) {
+            roots.extend_from_slice(assumptions);
+        }
+        let replay_terms = replay_term_dependency_closure(self.terms(), &roots);
+        let reachable: HashSet<TermId> = replay_terms.iter().copied().collect();
+        declarations.retain(|declaration| reachable.contains(&declaration.term));
+
+        let mut needed_functions: HashSet<String> = HashSet::default();
+        for &term in &replay_terms {
+            if let TermData::App(Symbol::Named(name), _) = self.terms().get(term) {
+                needed_functions.insert(name.clone());
+            }
+            // Higher-order array wrappers encode the referenced declaration in
+            // their symbol token rather than as a child term.
+            if let Some(name) = self.terms().get_as_array_func(term) {
+                needed_functions.insert(name.to_string());
+            }
+            if let Some((name, _)) = self.terms().get_array_map(term) {
+                needed_functions.insert(name.to_string());
+            }
+        }
+        let mut function_declarations =
+            function_declarations_from_events(&self.native_replay_events);
+        function_declarations.retain(|declaration| needed_functions.contains(&declaration.name));
+
+        let terms = replay_terms
+            .into_iter()
             .map(|id| NativeReplayTermNode {
                 id,
                 sort: self.terms().sort(id).clone(),
                 data: self.terms().get(id).clone(),
+                is_datatype_constructor: match self.terms().get(id) {
+                    TermData::Var(name, _) => {
+                        self.executor.context().is_constructor(name).is_some()
+                            && self
+                                .executor
+                                .context()
+                                .symbol_info_by_identity(name)
+                                .is_some_and(|info| info.term == Some(id))
+                    }
+                    _ => false,
+                },
             })
             .collect();
         let timeout_ms = self.timeout.map(|duration| duration.as_millis());
@@ -221,6 +256,9 @@ impl Solver {
             )));
         }
 
+        for datatype in datatype_declarations_from_events(&artifact.events) {
+            solver.try_declare_datatype(&datatype)?;
+        }
         for fun in &artifact.function_declarations {
             solver.try_declare_fun(&fun.name, &fun.domain, fun.range.clone())?;
         }
@@ -231,9 +269,9 @@ impl Solver {
             .map(|decl| (decl.term, decl))
             .collect();
         let mut term_map: HashMap<TermId, TermId> = HashMap::default();
-        let mut nodes = artifact.terms.clone();
-        nodes.sort_by_key(|node| node.id);
-        for node in &nodes {
+        // Export stores the dependency closure in deterministic topological
+        // order. Preserve it here instead of cloning/sorting the entire slice.
+        for node in &artifact.terms {
             if term_map.contains_key(&node.id) {
                 continue;
             }
@@ -314,12 +352,12 @@ impl NativeReplayArtifact {
             "schema": self.schema,
             "ay_revision": self.ay_revision,
             "ay_version": self.ay_version,
-            "created_unix_ms": self.created_unix_ms,
+            "created_unix_ms": u128_json(self.created_unix_ms),
             "metadata": metadata_json(&self.metadata),
             "logic": self.logic,
             "selected_route": self.selected_route,
             "scope_depth": self.scope_depth,
-            "timeout_ms": self.timeout_ms,
+            "timeout_ms": self.timeout_ms.map(u128_json),
             "events": self.events.iter().map(event_json).collect::<Vec<_>>(),
             "declarations": self.declarations.iter().map(declaration_json).collect::<Vec<_>>(),
             "function_declarations": self
@@ -536,7 +574,7 @@ fn native_replay_options_binding_json(artifact: &NativeReplayArtifact) -> Value 
         "artifact_schema": artifact.schema,
         "logic": artifact.logic,
         "selected_route": artifact.selected_route,
-        "timeout_ms": artifact.timeout_ms,
+        "timeout_ms": artifact.timeout_ms.map(u128_json),
     })
 }
 
@@ -642,6 +680,22 @@ fn function_declarations_from_events(
     declarations
 }
 
+fn datatype_declarations_from_events(events: &[NativeReplayEvent]) -> Vec<DatatypeSort> {
+    let mut declarations = Vec::new();
+    for event in events {
+        if let NativeReplayEventKind::DeclareDatatype { datatype } = &event.kind {
+            if declarations
+                .iter()
+                .any(|existing: &DatatypeSort| existing == datatype)
+            {
+                continue;
+            }
+            declarations.push(datatype.clone());
+        }
+    }
+    declarations
+}
+
 struct ActiveAssertionMetadata {
     name: Option<String>,
     scope_depth: usize,
@@ -676,6 +730,7 @@ fn active_assertion_metadata_from_events(
             NativeReplayEventKind::SetLogic { .. }
             | NativeReplayEventKind::DeclareConst { .. }
             | NativeReplayEventKind::DeclareFun { .. }
+            | NativeReplayEventKind::DeclareDatatype { .. }
             | NativeReplayEventKind::CheckSat
             | NativeReplayEventKind::CheckSatAssuming { .. } => {}
         }
@@ -716,6 +771,60 @@ fn final_check_sat_assumptions(events: &[NativeReplayEvent]) -> Option<&[TermId]
         }
     }
     None
+}
+
+/// Deterministic child-before-parent slice of the term DAG needed to replay the
+/// active assertions and the final check-sat assumptions. Discarded native term
+/// construction history is intentionally absent: besides shrinking artifacts,
+/// this prevents an unreachable future/unsupported node from blocking replay of
+/// an otherwise supported active problem.
+fn replay_term_dependency_closure(terms: &TermStore, roots: &[TermId]) -> Vec<TermId> {
+    let mut visited: HashSet<TermId> = HashSet::default();
+    let mut ordered = Vec::new();
+
+    for &root in roots {
+        if visited.contains(&root) {
+            continue;
+        }
+        let mut stack = vec![(root, false)];
+        while let Some((term, expanded)) = stack.pop() {
+            if expanded {
+                ordered.push(term);
+                continue;
+            }
+            if !visited.insert(term) {
+                continue;
+            }
+            stack.push((term, true));
+            let dependencies = replay_term_dependencies(terms.get(term));
+            for dependency in dependencies.into_iter().rev() {
+                if !visited.contains(&dependency) {
+                    stack.push((dependency, false));
+                }
+            }
+        }
+    }
+    ordered
+}
+
+fn replay_term_dependencies(data: &TermData) -> Vec<TermId> {
+    match data {
+        TermData::Const(_) | TermData::Var(_, _) => Vec::new(),
+        TermData::App(_, args) => args.clone(),
+        TermData::Let(bindings, body) => bindings
+            .iter()
+            .map(|(_, term)| *term)
+            .chain(std::iter::once(*body))
+            .collect(),
+        TermData::Not(inner) => vec![*inner],
+        TermData::Ite(cond, then_term, else_term) => vec![*cond, *then_term, *else_term],
+        TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
+            std::iter::once(*body)
+                .chain(triggers.iter().flatten().copied())
+                .collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn solve_summary_from_details(
@@ -916,6 +1025,21 @@ fn rebuild_term_node(
         TermData::Var(name, _) => {
             if let Some(decl) = declarations.get(&node.id) {
                 Ok(solver.declare_const(&decl.name, decl.sort.clone()).0)
+            } else if node.is_datatype_constructor {
+                // Nullary datatype constructors are stored as Vars. Reuse the
+                // term registered by the replayed datatype declaration so
+                // constructor distinctness/exhaustiveness applies to this node.
+                solver
+                    .executor
+                    .context()
+                    .symbol_info_by_identity(name)
+                    .and_then(|info| info.term)
+                    .ok_or_else(|| {
+                        native_replay_json_error(format!(
+                            "term {} claims nullary datatype-constructor provenance for missing constructor `{name}`",
+                            node.id
+                        ))
+                    })
             } else {
                 Ok(solver
                     .terms_mut()
@@ -1007,6 +1131,10 @@ fn metadata_json(metadata: &NativeReplayMetadata) -> Value {
     })
 }
 
+fn u128_json(value: u128) -> Value {
+    Value::String(value.to_string())
+}
+
 fn solver_identity_json(identity: &NativeReplaySolverIdentity) -> Value {
     json!({
         "engine": identity.engine,
@@ -1016,11 +1144,64 @@ fn solver_identity_json(identity: &NativeReplaySolverIdentity) -> Value {
     })
 }
 
+/// Lossless machine representation of every sort variant understood by this
+/// replay schema. The adjacent textual fields remain for humans and legacy
+/// readers; replay always prefers this structural form when present.
+fn sort_json(sort: &Sort) -> Value {
+    match sort {
+        Sort::Bool => json!({ "kind": "bool" }),
+        Sort::Int => json!({ "kind": "int" }),
+        Sort::Real => json!({ "kind": "real" }),
+        Sort::BitVec(sort) => json!({ "kind": "bitvec", "width": sort.width }),
+        Sort::Array(sort) => json!({
+            "kind": "array",
+            "index": sort_json(&sort.index_sort),
+            "element": sort_json(&sort.element_sort),
+        }),
+        Sort::String => json!({ "kind": "string" }),
+        Sort::RegLan => json!({ "kind": "reglan" }),
+        Sort::FloatingPoint(exponent, significand) => json!({
+            "kind": "floating_point",
+            "exponent": exponent,
+            "significand": significand,
+        }),
+        Sort::Uninterpreted(name) => json!({ "kind": "uninterpreted", "name": name }),
+        Sort::Datatype(datatype) => json!({
+            "kind": "datatype",
+            "datatype": datatype_sort_json(datatype),
+        }),
+        Sort::Seq(element) => json!({ "kind": "seq", "element": sort_json(element) }),
+        Sort::Char => json!({ "kind": "char" }),
+        Sort::FiniteDomain(name, size) => json!({
+            "kind": "finite_domain",
+            "name": name,
+            "size": size,
+        }),
+        Sort::TypeVar(name) => json!({ "kind": "type_var", "name": name }),
+        _ => json!({ "kind": "future", "debug": format!("{sort:?}") }),
+    }
+}
+
+fn datatype_sort_json(datatype: &DatatypeSort) -> Value {
+    json!({
+        "name": datatype.name,
+        "constructors": datatype.constructors.iter().map(|constructor| json!({
+            "name": constructor.name,
+            "fields": constructor.fields.iter().map(|field| json!({
+                "name": field.name,
+                "sort": field.sort.to_string(),
+                "sort_data": sort_json(&field.sort),
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn declaration_json(declaration: &NativeReplayDeclaration) -> Value {
     json!({
         "name": declaration.name,
         "term": declaration.term.0,
         "sort": declaration.sort.to_string(),
+        "sort_data": sort_json(&declaration.sort),
     })
 }
 
@@ -1028,7 +1209,9 @@ fn function_declaration_json(declaration: &NativeReplayFunctionDeclaration) -> V
     json!({
         "name": declaration.name,
         "domain": declaration.domain.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "domain_data": declaration.domain.iter().map(sort_json).collect::<Vec<_>>(),
         "range": declaration.range.to_string(),
+        "range_data": sort_json(&declaration.range),
     })
 }
 
@@ -1045,7 +1228,9 @@ fn term_node_json(node: &NativeReplayTermNode) -> Value {
     json!({
         "id": node.id.0,
         "sort": node.sort.to_string(),
+        "sort_data": sort_json(&node.sort),
         "data": term_data_json(&node.data),
+        "is_datatype_constructor": node.is_datatype_constructor,
     })
 }
 
@@ -1068,6 +1253,7 @@ fn event_kind_json(kind: &NativeReplayEventKind) -> Value {
             "name": name,
             "term": term.0,
             "sort": sort.to_string(),
+            "sort_data": sort_json(sort),
         }),
         NativeReplayEventKind::DeclareFun {
             name,
@@ -1077,7 +1263,21 @@ fn event_kind_json(kind: &NativeReplayEventKind) -> Value {
             "event": "declare_fun",
             "name": name,
             "domain": domain.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "domain_data": domain.iter().map(sort_json).collect::<Vec<_>>(),
             "range": range.to_string(),
+            "range_data": sort_json(range),
+        }),
+        NativeReplayEventKind::DeclareDatatype { datatype } => json!({
+            "event": "declare_datatype",
+            "name": datatype.name,
+            "constructors": datatype.constructors.iter().map(|constructor| json!({
+                "name": constructor.name,
+                "fields": constructor.fields.iter().map(|field| json!({
+                    "name": field.name,
+                    "sort": field.sort.to_string(),
+                    "sort_data": sort_json(&field.sort),
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
         }),
         NativeReplayEventKind::Assert { term, name } => json!({
             "event": "assert",
@@ -1104,11 +1304,11 @@ fn solve_json(solve: &NativeReplaySolveSummary) -> Value {
         "unknown_progress": solve.unknown_progress.as_ref().map(|progress| json!({
             "reason": progress.reason,
             "responsible_phase": progress.responsible_phase,
-            "wall_time_budget_ms": progress.wall_time_budget_ms,
-            "wall_time_elapsed_ms": progress.wall_time_elapsed_ms,
+            "wall_time_budget_ms": progress.wall_time_budget_ms.map(u128_json),
+            "wall_time_elapsed_ms": u128_json(progress.wall_time_elapsed_ms),
         })),
         "executor_error": solve.executor_error,
-        "elapsed_ms": solve.elapsed_ms,
+        "elapsed_ms": u128_json(solve.elapsed_ms),
         "verification_level": solve.verification_level,
         "proof": {
             "available": solve.proof.available,
@@ -1302,6 +1502,7 @@ fn vars_json(vars: &[(String, Sort)]) -> Vec<Value> {
             json!({
                 "name": name,
                 "sort": sort.to_string(),
+                "sort_data": sort_json(sort),
             })
         })
         .collect()
@@ -1385,7 +1586,7 @@ fn declaration_from_json(value: &Value) -> Result<NativeReplayDeclaration, Solve
     Ok(NativeReplayDeclaration {
         name: required_string(object, "name")?,
         term: required_term_id(object, "term")?,
-        sort: parse_sort_text(&required_string(object, "sort")?)?,
+        sort: sort_field(object, "sort", "sort_data")?,
     })
 }
 
@@ -1395,12 +1596,8 @@ fn function_declaration_from_json(
     let object = json_object(value, "function_declaration")?;
     Ok(NativeReplayFunctionDeclaration {
         name: required_string(object, "name")?,
-        domain: required_array(object, "domain")?
-            .iter()
-            .map(required_string_value)
-            .map(|sort| sort.and_then(|sort| parse_sort_text(&sort)))
-            .collect::<Result<Vec<_>, SolverError>>()?,
-        range: parse_sort_text(&required_string(object, "range")?)?,
+        domain: sort_array_field(object, "domain", "domain_data")?,
+        range: sort_field(object, "range", "range_data")?,
     })
 }
 
@@ -1418,8 +1615,9 @@ fn term_node_from_json(value: &Value) -> Result<NativeReplayTermNode, SolverErro
     let object = json_object(value, "term")?;
     Ok(NativeReplayTermNode {
         id: required_term_id(object, "id")?,
-        sort: parse_sort_text(&required_string(object, "sort")?)?,
+        sort: sort_field(object, "sort", "sort_data")?,
         data: term_data_from_json(required_field(object, "data")?)?,
+        is_datatype_constructor: optional_bool(object, "is_datatype_constructor")?.unwrap_or(false),
     })
 }
 
@@ -1433,6 +1631,23 @@ fn event_from_json(value: &Value) -> Result<NativeReplayEvent, SolverError> {
     })
 }
 
+fn datatype_constructor_from_json(value: &Value) -> Result<DatatypeConstructor, SolverError> {
+    let object = json_object(value, "event.kind.datatype.constructor")?;
+    Ok(DatatypeConstructor {
+        name: required_string(object, "name")?,
+        fields: required_array(object, "fields")?
+            .iter()
+            .map(|value| {
+                let field = json_object(value, "event.kind.datatype.field")?;
+                Ok(DatatypeField {
+                    name: required_string(field, "name")?,
+                    sort: sort_field(field, "sort", "sort_data")?,
+                })
+            })
+            .collect::<Result<Vec<_>, SolverError>>()?,
+    })
+}
+
 fn event_kind_from_json(value: &Value) -> Result<NativeReplayEventKind, SolverError> {
     let object = json_object(value, "event.kind")?;
     match required_string(object, "event")?.as_str() {
@@ -1442,16 +1657,21 @@ fn event_kind_from_json(value: &Value) -> Result<NativeReplayEventKind, SolverEr
         "declare_const" => Ok(NativeReplayEventKind::DeclareConst {
             name: required_string(object, "name")?,
             term: required_term_id(object, "term")?,
-            sort: parse_sort_text(&required_string(object, "sort")?)?,
+            sort: sort_field(object, "sort", "sort_data")?,
         }),
         "declare_fun" => Ok(NativeReplayEventKind::DeclareFun {
             name: required_string(object, "name")?,
-            domain: required_array(object, "domain")?
-                .iter()
-                .map(required_string_value)
-                .map(|sort| sort.and_then(|sort| parse_sort_text(&sort)))
-                .collect::<Result<Vec<_>, SolverError>>()?,
-            range: parse_sort_text(&required_string(object, "range")?)?,
+            domain: sort_array_field(object, "domain", "domain_data")?,
+            range: sort_field(object, "range", "range_data")?,
+        }),
+        "declare_datatype" => Ok(NativeReplayEventKind::DeclareDatatype {
+            datatype: DatatypeSort {
+                name: required_string(object, "name")?,
+                constructors: required_array(object, "constructors")?
+                    .iter()
+                    .map(datatype_constructor_from_json)
+                    .collect::<Result<Vec<_>, SolverError>>()?,
+            },
         }),
         "assert" => Ok(NativeReplayEventKind::Assert {
             term: required_term_id(object, "term")?,
@@ -1676,7 +1896,7 @@ fn vars_from_json(values: &[Value]) -> Result<Vec<(String, Sort)>, SolverError> 
             let object = json_object(value, "var")?;
             Ok((
                 required_string(object, "name")?,
-                parse_sort_text(&required_string(object, "sort")?)?,
+                sort_field(object, "sort", "sort_data")?,
             ))
         })
         .collect()
@@ -1695,6 +1915,95 @@ fn triggers_from_json(values: &[Value]) -> Result<Vec<Vec<TermId>>, SolverError>
                 .collect::<Result<Vec<_>, SolverError>>()
         })
         .collect()
+}
+
+fn sort_field(
+    object: &serde_json::Map<String, Value>,
+    legacy_key: &str,
+    structural_key: &str,
+) -> Result<Sort, SolverError> {
+    if let Some(value) = optional_field(object, structural_key)? {
+        sort_from_json(value)
+    } else {
+        parse_sort_text(&required_string(object, legacy_key)?)
+    }
+}
+
+fn sort_array_field(
+    object: &serde_json::Map<String, Value>,
+    legacy_key: &str,
+    structural_key: &str,
+) -> Result<Vec<Sort>, SolverError> {
+    if let Some(values) = optional_field(object, structural_key)? {
+        values
+            .as_array()
+            .ok_or_else(|| {
+                native_replay_json_error(format!(
+                    "native replay field `{structural_key}` must be an array"
+                ))
+            })?
+            .iter()
+            .map(sort_from_json)
+            .collect()
+    } else {
+        required_array(object, legacy_key)?
+            .iter()
+            .map(required_string_value)
+            .map(|sort| sort.and_then(|sort| parse_sort_text(&sort)))
+            .collect()
+    }
+}
+
+fn sort_from_json(value: &Value) -> Result<Sort, SolverError> {
+    let object = json_object(value, "sort_data")?;
+    match required_string(object, "kind")?.as_str() {
+        "bool" => Ok(Sort::Bool),
+        "int" => Ok(Sort::Int),
+        "real" => Ok(Sort::Real),
+        "bitvec" => Ok(Sort::bitvec(required_u32(object, "width")?)),
+        "array" => Ok(Sort::array(
+            sort_from_json(required_field(object, "index")?)?,
+            sort_from_json(required_field(object, "element")?)?,
+        )),
+        "string" => Ok(Sort::String),
+        "reglan" => Ok(Sort::RegLan),
+        "floating_point" => Ok(Sort::FloatingPoint(
+            required_u32(object, "exponent")?,
+            required_u32(object, "significand")?,
+        )),
+        "uninterpreted" => Ok(Sort::Uninterpreted(required_string(object, "name")?)),
+        "datatype" => Ok(Sort::Datatype(datatype_sort_from_json(required_field(
+            object, "datatype",
+        )?)?)),
+        "seq" => Ok(Sort::seq(sort_from_json(required_field(
+            object, "element",
+        )?)?)),
+        "char" => Ok(Sort::Char),
+        "finite_domain" => {
+            let size = required_u64(object, "size")?;
+            if size == 0 {
+                return Err(native_replay_json_error(
+                    "finite-domain replay sort must have positive cardinality",
+                ));
+            }
+            Ok(Sort::FiniteDomain(required_string(object, "name")?, size))
+        }
+        "type_var" => Ok(Sort::TypeVar(required_string(object, "name")?)),
+        other => Err(native_replay_json_error(format!(
+            "unsupported native replay structural sort kind `{other}`"
+        ))),
+    }
+}
+
+fn datatype_sort_from_json(value: &Value) -> Result<DatatypeSort, SolverError> {
+    let object = json_object(value, "datatype sort")?;
+    Ok(DatatypeSort {
+        name: required_string(object, "name")?,
+        constructors: required_array(object, "constructors")?
+            .iter()
+            .map(datatype_constructor_from_json)
+            .collect::<Result<Vec<_>, SolverError>>()?,
+    })
 }
 
 fn term_id_array(
@@ -1725,6 +2034,7 @@ fn parse_sort_text(text: &str) -> Result<Sort, SolverError> {
         "Real" => return Ok(Sort::Real),
         "String" => return Ok(Sort::String),
         "RegLan" => return Ok(Sort::RegLan),
+        "Char" => return Ok(Sort::Char),
         _ => {}
     }
     if let Some(width) = text
@@ -1878,6 +2188,19 @@ fn required_bool(object: &serde_json::Map<String, Value>, key: &str) -> Result<b
     })
 }
 
+fn optional_bool(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<bool>, SolverError> {
+    optional_field(object, key)?
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                native_replay_json_error(format!("native replay field `{key}` must be a boolean"))
+            })
+        })
+        .transpose()
+}
+
 fn required_u64(object: &serde_json::Map<String, Value>, key: &str) -> Result<u64, SolverError> {
     required_field(object, key)?.as_u64().ok_or_else(|| {
         native_replay_json_error(format!(
@@ -1902,7 +2225,23 @@ fn required_usize(
 }
 
 fn required_u128(object: &serde_json::Map<String, Value>, key: &str) -> Result<u128, SolverError> {
-    Ok(u128::from(required_u64(object, key)?))
+    let value = required_field(object, key)?;
+    if let Some(value) = value.as_u64() {
+        return Ok(u128::from(value));
+    }
+    value
+        .as_str()
+        .ok_or_else(|| {
+            native_replay_json_error(format!(
+                "native replay field `{key}` must be an unsigned integer or decimal string"
+            ))
+        })?
+        .parse::<u128>()
+        .map_err(|error| {
+            native_replay_json_error(format!(
+                "native replay field `{key}` is not a valid u128: {error}"
+            ))
+        })
 }
 
 fn optional_u128(

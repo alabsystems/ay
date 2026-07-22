@@ -39,7 +39,7 @@
 //!   bounded to in-range indices and therefore only ever yields REAL asserted
 //!   rules/names or nothing — it never invents a rule, name, or ground fact.
 
-use std::ffi::{c_int, c_uint, CStr};
+use std::ffi::{c_int, c_uint};
 
 use ay_chc::{ChcExpr, ChcSort, ChcVar, ClauseBody, ClauseHead, HornClause};
 use ay_dpll::api::Term;
@@ -49,10 +49,10 @@ use super::fixedpoint::{
     solve_problem, QueryOutcome, TranslateErr, REASON_UNTRANSLATABLE,
 };
 use super::{
-    ast_to_term, cache_ast_vector, cache_string, cache_symbol, ffi_guard_ast, ffi_guard_const_ptr,
-    ffi_guard_int, ffi_guard_ptr, ffi_guard_void, term_to_ast, Z3_ast, Z3_ast_vector, Z3_context,
-    Z3_fixedpoint, Z3_func_decl, Z3_string, Z3_symbol, Z3_EXCEPTION, Z3_INVALID_ARG,
-    Z3_INVALID_USAGE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK,
+    ast_to_term, cache_ast_vector, cache_string, cache_symbol, ffi_count_within_limit,
+    ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_void, term_to_ast,
+    Z3_ast, Z3_ast_vector, Z3_context, Z3_fixedpoint, Z3_func_decl, Z3_string, Z3_symbol,
+    Z3_EXCEPTION, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK,
 };
 
 // ============================================================================
@@ -199,6 +199,11 @@ pub unsafe extern "C" fn Z3_fixedpoint_query_relations(
     num_relations: c_uint,
     relations: *const Z3_func_decl,
 ) -> c_int {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_fixedpoint_query_relations", num_relations) } {
+        return Z3_L_UNDEF;
+    }
     if d.is_null() {
         return Z3_L_UNDEF;
     }
@@ -544,16 +549,9 @@ pub unsafe extern "C" fn Z3_fixedpoint_from_string(
     f: Z3_fixedpoint,
     s: Z3_string,
 ) -> Z3_ast_vector {
-    // Extract the script text outside the guard (raw-pointer deref).
-    let script: Option<String> = if s.is_null() {
-        None
-    } else {
-        // SAFETY: caller guarantees a valid null-terminated C string when non-null.
-        match unsafe { CStr::from_ptr(s) }.to_str() {
-            Ok(v) => Some(v.to_string()),
-            Err(_) => None,
-        }
-    };
+    // The dialect is unsupported and the source is never parsed, so a non-null
+    // pointer is intentionally not dereferenced or scanned.
+    let script_present = !s.is_null();
     // SAFETY: `ffi_guard_ptr` null-checks `c` and catches panics; `f` is
     // null-checked below.
     unsafe {
@@ -563,7 +561,11 @@ pub unsafe extern "C" fn Z3_fixedpoint_from_string(
                 ctx.error_msg = Some("null Z3_fixedpoint handle in from_string".to_string());
                 return cache_ast_vector(ctx, Vec::new());
             }
-            let _script = script;
+            if !script_present {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg = Some("Z3_fixedpoint_from_string: null source".to_string());
+                return cache_ast_vector(ctx, Vec::new());
+            }
             // DIVERGENCE: no fixedpoint-script parser — honest empty result
             // rather than fabricated rules/queries.
             ctx.last_error = Z3_EXCEPTION;

@@ -245,10 +245,7 @@ impl<'a> AlethePrinter<'a> {
 
             let (binder_token, body_surface) =
                 self.skolem_surface_binder_and_body(quantified, *body, binder);
-            let choice = format!(
-                "(choice (({} {})) (not {}))",
-                binder_token, binder_sort, body_surface
-            );
+            let choice = format!("(choice (({binder_token} {binder_sort})) (not {body_surface}))");
             let instance_surface = substitute_smt_symbol(&body_surface, &binder_token, &choice);
 
             self.insert_skolem_override(id, *witness, choice.clone())?;
@@ -792,13 +789,11 @@ impl<'a> AlethePrinter<'a> {
                 ..
             } => self.format_theory_lemma(id, theory, clause, farkas.as_ref(), kind),
             ProofStep::Step {
-                rule,
+                rule: ay_core::AletheRule::Skolem,
                 clause,
                 premises,
                 args,
-            } if matches!(rule, ay_core::AletheRule::Skolem) => {
-                self.format_certified_skolem_step(id, clause, premises, args)
-            }
+            } => self.format_certified_skolem_step(id, clause, premises, args),
             ProofStep::Step {
                 rule,
                 clause,
@@ -974,7 +969,8 @@ impl<'a> AlethePrinter<'a> {
                 let mut rest: Vec<String> = dclause
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, &l)| (i != didx).then(|| self.format_term(l)))
+                    .filter(|(i, _)| *i != didx)
+                    .map(|(_, &literal)| self.format_term(literal))
                     .collect();
                 let mut rest_sorted = rest.clone();
                 rest_sorted.sort();
@@ -1256,7 +1252,8 @@ impl<'a> AlethePrinter<'a> {
         }
         for info in &infos {
             if !info.is_conclusion
-                && !(info.canonical.starts_with("(not (= ") || info.distinct.is_some())
+                && !info.canonical.starts_with("(not (= ")
+                && info.distinct.is_none()
             {
                 return None;
             }

@@ -208,9 +208,18 @@ impl Executor {
             "str.in_re" | "str.in.re" if args.len() == 2 => {
                 match self.evaluate_term(model, args[0]) {
                     EvalValue::String(s) => {
-                        match ay_strings::ground_eval_in_re(&self.ctx.terms, &s, args[1]) {
-                            Some(b) => EvalValue::Bool(b),
-                            None => EvalValue::Unknown,
+                        let result = match self.w4_remaining_work() {
+                            Some(limit) => ay_strings::ground_eval_in_re_with_work_limit(
+                                &self.ctx.terms,
+                                &s,
+                                args[1],
+                                limit,
+                            ),
+                            None => Ok(ay_strings::ground_eval_in_re(&self.ctx.terms, &s, args[1])),
+                        };
+                        match result {
+                            Ok(Some(b)) => EvalValue::Bool(b),
+                            Ok(None) | Err(_) => EvalValue::Unknown,
                         }
                     }
                     _ => EvalValue::Unknown,
@@ -222,9 +231,24 @@ impl Executor {
                     self.evaluate_term(model, args[2]),
                 ) {
                     (EvalValue::String(s), EvalValue::String(t)) => {
-                        match ay_strings::ground_eval_replace_re(&self.ctx.terms, &s, args[1], &t) {
-                            Some(result) => EvalValue::String(result),
-                            None => EvalValue::Unknown,
+                        let result = match self.w4_remaining_work() {
+                            Some(limit) => ay_strings::ground_eval_replace_re_with_work_limit(
+                                &self.ctx.terms,
+                                &s,
+                                args[1],
+                                &t,
+                                limit,
+                            ),
+                            None => Ok(ay_strings::ground_eval_replace_re(
+                                &self.ctx.terms,
+                                &s,
+                                args[1],
+                                &t,
+                            )),
+                        };
+                        match result {
+                            Ok(Some(result)) => EvalValue::String(result),
+                            Ok(None) | Err(_) => EvalValue::Unknown,
                         }
                     }
                     _ => EvalValue::Unknown,
@@ -236,14 +260,24 @@ impl Executor {
                     self.evaluate_term(model, args[2]),
                 ) {
                     (EvalValue::String(s), EvalValue::String(t)) => {
-                        match ay_strings::ground_eval_replace_re_all(
-                            &self.ctx.terms,
-                            &s,
-                            args[1],
-                            &t,
-                        ) {
-                            Some(result) => EvalValue::String(result),
-                            None => EvalValue::Unknown,
+                        let result = match self.w4_remaining_work() {
+                            Some(limit) => ay_strings::ground_eval_replace_re_all_with_work_limit(
+                                &self.ctx.terms,
+                                &s,
+                                args[1],
+                                &t,
+                                limit,
+                            ),
+                            None => Ok(ay_strings::ground_eval_replace_re_all(
+                                &self.ctx.terms,
+                                &s,
+                                args[1],
+                                &t,
+                            )),
+                        };
+                        match result {
+                            Ok(Some(result)) => EvalValue::String(result),
+                            Ok(None) | Err(_) => EvalValue::Unknown,
                         }
                     }
                     _ => EvalValue::Unknown,

@@ -221,8 +221,147 @@ fn declare_after_recfun_is_not_a_redefinition_error() {
 }
 
 #[test]
+fn redefinition_probe_does_not_instantiate_sorts_in_live_context() {
+    let commands = parse(
+        "(declare-datatypes ((Box 1)) ((par (T) ((box (value T)))))) \
+         (declare-fun f (Int) Int)",
+    )
+    .expect("parse");
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command).expect("setup");
+    }
+    let before = (
+        ctx.sort_defs.len(),
+        ctx.datatypes.len(),
+        ctx.constructors.len(),
+        ctx.symbols.len(),
+    );
+    let box_int = Sort::Parameterized("Box".to_string(), vec![Sort::Simple("Int".to_string())]);
+    assert_eq!(
+        ctx.redefinition_error(
+            IntroKind::Declare,
+            "f",
+            &[box_int],
+            &Sort::Simple("Int".to_string()),
+        ),
+        None
+    );
+    assert_eq!(
+        (
+            ctx.sort_defs.len(),
+            ctx.datatypes.len(),
+            ctx.constructors.len(),
+            ctx.symbols.len(),
+        ),
+        before,
+        "a collision probe must not lazily instantiate `(Box Int)` in the live context"
+    );
+}
+
+#[test]
 fn declare_fun_overload_by_domain_accepts() {
     assert_accept("(declare-fun f (Int) Int)(declare-fun f (Bool) Int)");
+}
+
+#[test]
+fn process_command_enforces_redefinition_rules_without_cli_wrapper() {
+    let commands = parse(
+        "(declare-fun f (Int) Int) \
+         (declare-fun f (Int) Int)",
+    )
+    .expect("parse");
+    let mut ctx = Context::new();
+    ctx.process_command(&commands[0])
+        .expect("first declaration");
+    let before = ctx.symbols.get("f").cloned().expect("registered f");
+    let error = ctx
+        .process_command(&commands[1])
+        .expect_err("exact collision");
+    assert!(matches!(error, ElaborateError::Redefinition(_)));
+    assert_eq!(ctx.symbols.get("f"), Some(&before));
+
+    let macro_collision = parse("(define-fun f ((x Int)) Int x)").expect("parse");
+    assert!(matches!(
+        ctx.process_command(&macro_collision[0]),
+        Err(ElaborateError::Redefinition(_))
+    ));
+    assert_eq!(ctx.symbols.get("f"), Some(&before));
+
+    // A genuine overload remains legal through the same central gate.
+    let overload = parse("(declare-fun f (Bool) Int)").expect("parse");
+    ctx.process_command(&overload[0]).expect("legal overload");
+}
+
+#[test]
+fn process_command_rejects_recursive_batch_collision_before_mutation() {
+    let setup = parse("(define-fun-rec f ((x Int)) Int x)").expect("parse");
+    let mut ctx = Context::new();
+    ctx.process_command(&setup[0]).expect("setup recfun");
+    let before_symbols = ctx.symbols.clone();
+    let before_defs = ctx.fun_defs.clone();
+
+    let collision = parse(
+        "(define-funs-rec \
+           ((g ((x Int)) Int) (f ((x Int)) Int)) \
+           (x x))",
+    )
+    .expect("parse");
+    assert!(matches!(
+        ctx.process_command(&collision[0]),
+        Err(ElaborateError::Redefinition(_))
+    ));
+    assert_eq!(ctx.symbols, before_symbols);
+    assert_eq!(ctx.fun_defs, before_defs);
+    assert!(!ctx.symbols.contains_key("g"));
+}
+
+#[test]
+fn process_command_rejects_z3_accepted_but_unrepresentable_definition_overloads() {
+    for input in [
+        // Existing macro, incoming declaration at another domain.
+        "(define-fun f ((x Int)) Int x) (declare-fun f (Bool Bool) Bool)",
+        // Existing declaration, incoming macro at another domain.
+        "(declare-fun f (Int) Int) (define-fun f ((x Bool)) Bool x)",
+        // z3's recfun namespace permits these cross-pairs even at the same
+        // signature; AY's name-keyed expansion table cannot.
+        "(define-fun-rec f ((x Int)) Int x) (declare-fun f (Int) Int)",
+        "(declare-fun f (Int) Int) (define-fun-rec f ((x Int)) Int x)",
+    ] {
+        let commands = parse(input).expect("parse overload fixture");
+        let mut ctx = Context::new();
+        ctx.process_command(&commands[0]).expect("setup binding");
+        let before_symbols = ctx.symbols.clone();
+        let before_defs = ctx.fun_defs.clone();
+        assert!(matches!(
+            ctx.process_command(&commands[1]),
+            Err(ElaborateError::UnrepresentableOverload(_))
+        ));
+        assert_eq!(ctx.symbols, before_symbols, "fixture: {input}");
+        assert_eq!(ctx.fun_defs, before_defs, "fixture: {input}");
+    }
+}
+
+#[test]
+fn unrepresentable_recursive_batch_fails_before_registering_fresh_peers() {
+    let commands = parse(
+        "(declare-fun f (Int) Int) \
+         (define-funs-rec \
+           ((g ((x Int)) Int) (f ((x Int)) Int)) \
+           (x x))",
+    )
+    .expect("parse");
+    let mut ctx = Context::new();
+    ctx.process_command(&commands[0])
+        .expect("setup declaration");
+    let before_symbols = ctx.symbols.clone();
+    assert!(matches!(
+        ctx.process_command(&commands[1]),
+        Err(ElaborateError::UnrepresentableOverload(_))
+    ));
+    assert_eq!(ctx.symbols, before_symbols);
+    assert!(!ctx.fun_defs.contains_key("f"));
+    assert!(!ctx.fun_defs.contains_key("g"));
 }
 
 // --- A fresh name never collides (fast path). ---

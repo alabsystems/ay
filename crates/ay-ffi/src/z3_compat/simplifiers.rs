@@ -49,16 +49,15 @@
 //! matching z3's own "unknown simplifier" rejection). It NEVER silently returns a
 //! no-op pretending to be the requested simplifier.
 
-use std::ffi::CStr;
 use std::ptr;
 
 use ay_dpll::api::Tactic;
 use ay_frontend::{ApplyTactic, SExpr};
 
 use super::{
-    cache_string, ffi_guard_const_ptr, ffi_guard_ptr, ParamDescrsHandle, SimplifierHandle,
-    Z3Context, Z3SolverHandle, Z3_context, Z3_param_descrs, Z3_params, Z3_simplifier, Z3_solver,
-    Z3_string, Z3_INVALID_ARG, Z3_OK,
+    cache_string, ffi_guard_const_ptr, ffi_guard_ptr, ffi_read_bounded_text, ParamDescrsHandle,
+    SimplifierHandle, Z3Context, Z3SolverHandle, Z3_context, Z3_param_descrs, Z3_params,
+    Z3_simplifier, Z3_solver, Z3_string, Z3_INVALID_ARG, Z3_OK,
 };
 
 /// The curated set of names [`Z3_mk_simplifier`] accepts — genuine AY
@@ -119,7 +118,9 @@ fn simplifier_descr(name: &str) -> Option<&'static str> {
         "solve-eqs" => "solve variable equalities and eliminate the solved variables.",
         "propagate-values" => "propagate ground (= expr const) equalities.",
         "qe-light" => "apply light-weight quantifier elimination.",
-        "bit-blast" => "reduce bit-vector expressions into an equisatisfiable pure-Boolean (SAT) goal.",
+        "bit-blast" => {
+            "reduce bit-vector expressions into an equisatisfiable pure-Boolean (SAT) goal."
+        }
         "elim-and" => {
             "eliminate top-level conjunctions: split (and (and a b) c) into separate goal formulas {a, b, c}."
         }
@@ -147,8 +148,8 @@ pub unsafe extern "C" fn Z3_mk_simplifier(c: Z3_context, name: Z3_string) -> Z3_
     } else {
         // SAFETY: the caller's `# Safety` contract guarantees `name`, when non-null, points to a
         // valid null-terminated C string owned by the caller for the duration of this call.
-        match unsafe { CStr::from_ptr(name) }.to_str() {
-            Ok(s) => Some(s.to_string()),
+        match unsafe { ffi_read_bounded_text(name) } {
+            Ok(s) => Some(s),
             Err(_) => Some(String::new()), // non-UTF-8 -> unsupported below
         }
     };
@@ -377,10 +378,7 @@ pub unsafe extern "C" fn Z3_simplifier_get_descr(c: Z3_context, name: Z3_string)
         None
     } else {
         // SAFETY: caller contract guarantees a valid null-terminated C string.
-        unsafe { CStr::from_ptr(name) }
-            .to_str()
-            .ok()
-            .map(str::to_string)
+        unsafe { ffi_read_bounded_text(name) }.ok()
     };
     // SAFETY: `ffi_guard_const_ptr` handles null `c` and catches panics.
     unsafe {

@@ -33,26 +33,22 @@
 //! context threads its declarations into the context's shared symbol table
 //! rather than an isolated one; this is documented and honest.
 //!
-//! `add_sort`/`add_decl` record the injected sort/decl on the handle; at parse
-//! time [`Z3_parser_context_from_string`] (re-)threads them into the solver's
-//! symbol table (uninterpreted-sort `declare-sort` and arity>0 function
-//! signatures are idempotent, rebind-safe symbol-table insertions) so the string
-//! can reference them by name. Datatype sorts and any function created by
-//! `Z3_mk_func_decl` are already registered on the solver when they are built, so
-//! re-threading them is unnecessary and skipped (re-declaring an arity-0 constant
-//! would mint a FRESH term — an aliasing hazard — so we never do).
+//! `add_sort`/`add_decl` record the injected sort/decl on the handle and register
+//! it in the shared solver immediately. [`Z3_parser_context_from_string`] then
+//! parses directly against that persistent symbol table. Re-declaring all
+//! recorded entries before every parse is both unnecessary and incorrect: the
+//! frontend rejects duplicate declarations, and re-declaring an arity-0
+//! constant could mint a fresh term.
 //!
 //! All functions calling into the solver are wrapped via the `ffi_guard_*`
 //! helpers (#6192) to keep panics from unwinding across the FFI boundary.
 
-use std::ffi::CStr;
-
-use ay_dpll::api::{FuncDecl, Sort};
+use ay_dpll::api::Sort;
 
 use super::{
-    cache_ast_vector, cache_parser_context, ffi_guard_ptr, ffi_guard_void, term_to_ast, Z3Context,
-    Z3_ast_vector, Z3_context, Z3_func_decl, Z3_parser_context, Z3_sort, Z3_string, Z3_EXCEPTION,
-    Z3_INVALID_ARG, Z3_OK,
+    cache_ast_vector, cache_parser_context, ffi_guard_ptr, ffi_guard_void,
+    ffi_read_bounded_parser_text, term_to_ast, Z3Context, Z3_ast_vector, Z3_context, Z3_func_decl,
+    Z3_parser_context, Z3_sort, Z3_string, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_OK,
 };
 
 /// Render `name` as an SMT-LIB symbol usable inside a synthesized command.
@@ -84,9 +80,9 @@ fn smtlib_symbol(name: &str) -> Option<String> {
 /// Declare `sort`'s NAME into the context solver's symbol table so a subsequent
 /// parse resolves references to it.
 ///
-/// - `Uninterpreted(name)` → `(declare-sort name 0)` (idempotent; a
+/// - `Uninterpreted(name)` → `(declare-sort name 0)` (a
 ///   `Z3_mk_uninterpreted_sort` sort is otherwise a handle only, unknown to the
-///   parser).
+///   parser). The caller prevents duplicate registration.
 /// - `Datatype`/built-in sorts are already known to the parser (a datatype comes
 ///   from `Z3_mk_datatype`, which declares it; `Int`/`Bool`/`(Array …)`/… are
 ///   primitive), so nothing is done.
@@ -95,34 +91,9 @@ fn declare_sort_into_solver(ctx: &mut Z3Context, sort: &Sort) -> Result<(), Stri
         let sym = smtlib_symbol(name).ok_or_else(|| {
             format!("uninterpreted sort name {name:?} cannot be represented in SMT-LIB")
         })?;
-        // Idempotent: `declare-sort` just maps the name to an uninterpreted
-        // sort in `sort_defs` (a plain insert), binding no term.
         ctx.solver
             .parse_smtlib2(&format!("(declare-sort {sym} 0)"))
             .map_err(|e| format!("cannot thread sort {name:?}: {e}"))?;
-    }
-    Ok(())
-}
-
-/// (Re-)thread a parser context's recorded declarations into the solver's
-/// symbol table ahead of a parse. Idempotent and rebind-safe: uninterpreted
-/// sorts and arity>0 function signatures are pure symbol-table insertions that
-/// never rebind a term. Arity-0 constants are left alone (they were bound once,
-/// at `Z3_mk_func_decl` time; re-declaring would mint a fresh term).
-fn thread_declarations(
-    ctx: &mut Z3Context,
-    sorts: &[Sort],
-    decls: &[FuncDecl],
-) -> Result<(), String> {
-    for s in sorts {
-        declare_sort_into_solver(ctx, s)?;
-    }
-    for d in decls {
-        if d.arity() > 0 {
-            ctx.solver
-                .try_declare_fun(d.name(), d.domain(), d.range().clone())
-                .map_err(|e| format!("cannot thread declaration {:?}: {e}", d.name()))?;
-        }
     }
     Ok(())
 }
@@ -186,7 +157,7 @@ pub unsafe extern "C" fn Z3_parser_context_dec_ref(c: Z3_context, pc: Z3_parser_
 /// Add a sort to the parser context's symbol table (Z3's
 /// `Z3_parser_context_add_sort`).
 ///
-/// Records the sort on the handle and threads its declaration into the context
+/// Records the sort on the handle and registers its declaration in the context
 /// solver's symbol table, so a subsequent [`Z3_parser_context_from_string`] can
 /// reference the sort by name. A null `pc`/`s` is a no-op.
 ///
@@ -223,6 +194,10 @@ pub unsafe extern "C" fn Z3_parser_context_add_sort(
             };
             // SAFETY: `s` was resolved to a live arena-owned handle above.
             let sort = (*s).sort.clone();
+            if handle.added_sorts.contains(&sort) {
+                ctx.last_error = Z3_OK;
+                return;
+            }
             if let Err(e) = declare_sort_into_solver(ctx, &sort) {
                 ctx.last_error = Z3_EXCEPTION;
                 ctx.error_msg = Some(format!("Z3_parser_context_add_sort: {e}"));
@@ -239,9 +214,8 @@ pub unsafe extern "C" fn Z3_parser_context_add_sort(
 ///
 /// Records the decl on the handle. A function created by `Z3_mk_func_decl` is
 /// already registered on the context solver (so it is immediately resolvable by
-/// name in a subsequent parse); recording it lets
-/// [`Z3_parser_context_from_string`] re-thread its signature defensively. A null
-/// `pc`/`f` is a no-op.
+/// name in a subsequent parse); recording it retains parser-context membership
+/// and makes repeated additions idempotent. A null `pc`/`f` is a no-op.
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `pc`, when non-null, a valid parser
@@ -330,18 +304,14 @@ pub unsafe extern "C" fn Z3_parser_context_from_string(
     let input: Option<Result<String, ()>> = if s.is_null() {
         None
     } else {
-        // SAFETY: caller contract: `s` is a valid null-terminated C string.
-        Some(
-            unsafe { CStr::from_ptr(s) }
-                .to_str()
-                .map(str::to_string)
-                .map_err(|_| ()),
-        )
+        // SAFETY: caller contract: `s` is a valid NUL-terminated C string; the
+        // helper bounds the scan and clone.
+        Some(unsafe { ffi_read_bounded_parser_text(s) }.map_err(|_| ()))
     };
     // SAFETY: `ffi_guard_ptr` guards `c`; `pc` is a separate allocation.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let Some(handle) = pc.as_mut() else {
+            let Some(_handle) = pc.as_mut() else {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg =
                     Some("Z3_parser_context_from_string: null parser context".to_string());
@@ -362,15 +332,6 @@ pub unsafe extern "C" fn Z3_parser_context_from_string(
                 }
                 Some(Ok(t)) => t,
             };
-            // (Re-)thread this context's recorded declarations so the string can
-            // reference them (cloned to detach the borrow from `ctx`).
-            let sorts = handle.added_sorts.clone();
-            let decls = handle.added_decls.clone();
-            if let Err(e) = thread_declarations(ctx, &sorts, &decls) {
-                ctx.last_error = Z3_EXCEPTION;
-                ctx.error_msg = Some(format!("Z3_parser_context_from_string: {e}"));
-                return cache_ast_vector(ctx, Vec::new());
-            }
             let terms = super::solver::parse_solver_transaction(
                 ctx,
                 &text,

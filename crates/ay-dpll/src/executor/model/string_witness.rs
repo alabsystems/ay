@@ -107,6 +107,51 @@ pub(in crate::executor) fn str_witness_w3() -> bool {
     *V.get_or_init(|| sub_enabled("AY_STR_WITNESS_W3"))
 }
 
+/// The EXACT regular language of the strings that CONTAIN the constant
+/// `needle`: `Σ* · needle · Σ*` (NF-engine closure 6).
+///
+/// SOUNDNESS (exactness argument). `str.contains(x, w)` holds iff `x` can be
+/// split as `x = a ++ w ++ b` for some `a, b` — that is precisely membership
+/// in `Σ* · w · Σ*`, by the definition of concatenation of languages. The
+/// construction below is a literal transcription of that language:
+/// [`WeRegex::All`] is `Σ*` (`comp(All) = ∅`, `star(All) = All`), and
+/// [`WeRegex::lit`] is the singleton `{w}`. It is therefore an EXACT encoding
+/// in both directions, so its complement — via [`WeRegex::comp`], documented
+/// exact over the full SMT-LIB alphabet — is exactly the language of strings
+/// that do NOT contain `w`. For a single-character needle `c` the complement
+/// is the `(Σ \ {c})*` of the increment spec; for a multi-character needle it
+/// is the KMP "avoid `w`" language, which the derivative engine walks without
+/// ever materialising the automaton.
+///
+/// The empty needle is EXCLUDED by the caller: `contains(x, "")` is a
+/// tautology and its negation is unsatisfiable, so encoding it would only add
+/// an empty-language constraint that the search must then fail on. Skipping is
+/// safe under this module's contract (dropping a constraint can only make a
+/// constructed candidate more likely to be refuted by the unchanged gates).
+fn contains_language(needle: &str) -> WeRegex {
+    WeRegex::concat(vec![WeRegex::All, WeRegex::lit(needle), WeRegex::All])
+}
+
+/// The `str.contains(subject, needle)` atom's exact [`WeRegex`] constraint on
+/// `subject` at the given polarity, for a CONSTANT `needle` (closure 6).
+///
+/// `None` when the needle is not a string constant or is empty (see
+/// [`contains_language`]).
+pub(in crate::executor) fn contains_constraint(
+    terms: &ay_core::TermStore,
+    needle: TermId,
+    positive: bool,
+) -> Option<WeRegex> {
+    let TermData::Const(ay_core::term::Constant::String(w)) = terms.get(needle) else {
+        return None;
+    };
+    if w.is_empty() {
+        return None;
+    }
+    let lang = contains_language(w);
+    Some(if positive { lang } else { WeRegex::comp(lang) })
+}
+
 impl Executor {
     /// Harvest `var`'s `str.in_re` memberships FROM THE SAT ASSIGNMENT as
     /// [`WeRegex`] constraints (W1).
@@ -138,7 +183,18 @@ impl Executor {
             let TermData::App(sym, args) = self.ctx.terms.get(tid) else {
                 continue;
             };
-            if !matches!(sym.name(), "str.in_re" | "str.in.re") || args.len() != 2 {
+            // NF-engine closure 6 (`AY_STR_NF=1`): `str.contains(var, w)` with
+            // a CONSTANT needle is EXACTLY a membership in `Σ* w Σ*` (see
+            // `contains_constraint`), so it belongs in this harvest on the same
+            // terms as `str.in_re` — in BOTH polarities. Without it the witness
+            // search is blind to the dominant pyex/Reynolds idiom
+            // `¬str.contains(x, ",")` and happily constructs a value carrying
+            // the needle, which the gates then retract.
+            let is_contains = sym.name() == "str.contains"
+                && args.len() == 2
+                && ay_strings::str_nf_closure_enabled(6);
+            if !is_contains && (!matches!(sym.name(), "str.in_re" | "str.in.re") || args.len() != 2)
+            {
                 continue;
             }
             // Only memberships whose SUBJECT is exactly `var`: a concat
@@ -151,14 +207,21 @@ impl Executor {
             let Some(polarity) = self.term_value(&model.sat_model, &model.term_to_var, tid) else {
                 continue;
             };
-            let Some(regex) = self.translate_we_regex(args[1], 0) else {
+            let constraint = if is_contains {
+                contains_constraint(&self.ctx.terms, args[1], polarity)
+            } else {
+                self.translate_we_regex(args[1], 0).map(|regex| {
+                    if polarity {
+                        regex
+                    } else {
+                        WeRegex::comp(regex)
+                    }
+                })
+            };
+            let Some(constraint) = constraint else {
                 continue;
             };
-            out.push(if polarity {
-                regex
-            } else {
-                WeRegex::comp(regex)
-            });
+            out.push(constraint);
             if out.len() >= MAX_WITNESS_REGEXES {
                 break;
             }
@@ -171,15 +234,71 @@ impl Executor {
 mod tests {
     use super::*;
 
+    /// Witness construction went DEFAULT-ON (`AY_STR_WITNESS=0` kills it); the
+    /// pin is that the master switch and every sub-increment agree, so a
+    /// sub-increment can never be live while the master switch is off. (This
+    /// test previously asserted the pre-default-on contract and had gone stale.)
     #[test]
-    fn witness_flags_default_off() {
-        // The suite runs without the env var set, so every increment must be
-        // off by default (byte-identical pipeline).
+    fn witness_flags_track_the_master_switch() {
+        let master = str_witness_enabled();
         if std::env::var("AY_STR_WITNESS").is_err() {
-            assert!(!str_witness_enabled(), "AY_STR_WITNESS must default OFF");
-            assert!(!str_witness_w1(), "W1 must default OFF");
-            assert!(!str_witness_w2(), "W2 must default OFF");
-            assert!(!str_witness_w3(), "W3 must default OFF");
+            assert!(master, "AY_STR_WITNESS is DEFAULT-ON (=0 kills it)");
         }
+        for (name, live) in [
+            ("W1", str_witness_w1()),
+            ("W2", str_witness_w2()),
+            ("W3", str_witness_w3()),
+        ] {
+            assert!(
+                !live || master,
+                "{name} must never be live while the master switch is off"
+            );
+        }
+    }
+
+    /// NF-engine closure 6 EXACTNESS pin: `Σ* w Σ*` must accept exactly the
+    /// strings containing `w`, and its complement exactly those that do not —
+    /// on both a single-character and a multi-character needle. A drift here
+    /// would silently turn the witness constraint into an approximation, which
+    /// is the one thing the closure may not be.
+    #[test]
+    fn contains_language_is_exact_both_polarities() {
+        for needle in ["a", ",", "ab", "aab"] {
+            let pos = contains_language(needle);
+            let neg = WeRegex::comp(contains_language(needle));
+            for s in [
+                "", "a", "b", ",", "ab", "ba", "aab", "xaby", "aa", "abab", "x,y", "aaab",
+            ] {
+                let truth = s.contains(needle);
+                assert_eq!(
+                    pos.matches(s),
+                    Some(truth),
+                    "Σ*{needle}Σ* must decide {s:?} as contains={truth}"
+                );
+                assert_eq!(
+                    neg.matches(s),
+                    Some(!truth),
+                    "comp(Σ*{needle}Σ*) must decide {s:?} as ¬contains={}",
+                    !truth
+                );
+            }
+        }
+    }
+
+    /// The empty needle is deliberately NOT encoded: `contains(x, "")` is a
+    /// tautology, so the negative constraint would be the empty language and
+    /// every candidate would fail the search. Skipping is safe under this
+    /// module's contract; pin that it really is skipped.
+    #[test]
+    fn contains_constraint_skips_empty_and_non_constant_needles() {
+        let mut terms = ay_core::TermStore::new();
+        let empty = terms.mk_string(String::new());
+        let comma = terms.mk_string(",".to_string());
+        let var = terms.mk_var("v", ay_core::Sort::String);
+        assert!(contains_constraint(&terms, empty, false).is_none());
+        assert!(contains_constraint(&terms, empty, true).is_none());
+        assert!(contains_constraint(&terms, var, false).is_none());
+        assert!(contains_constraint(&terms, comma, false).is_some());
+        assert!(contains_constraint(&terms, comma, true).is_some());
     }
 }

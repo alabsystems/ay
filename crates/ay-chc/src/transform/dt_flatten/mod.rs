@@ -911,7 +911,11 @@ fn collect_dt_vars_from_expr(expr: &ChcExpr, expansion: &mut VarExpansion, disc:
 }
 
 /// Expand predicate arguments: DT args become their flattened field expressions.
-fn expand_pred_args(args: &[ChcExpr], original_sorts: &[ChcSort], cx: &FlattenCx) -> Vec<ChcExpr> {
+fn expand_pred_args(
+    args: &[ChcExpr],
+    original_sorts: &[ChcSort],
+    cx: &FlattenCx<'_>,
+) -> Vec<ChcExpr> {
     let mut expanded = Vec::new();
     for (arg, sort) in args.iter().zip(original_sorts.iter()) {
         if matches!(sort, ChcSort::Datatype { .. }) {
@@ -1136,7 +1140,7 @@ fn selector_step(current_sort: &ChcSort, sel_name: &str) -> Option<(String, ChcS
 ///   variants default-filled)
 /// - ITE: distribute across branches column-wise
 /// - Other: fall back to selector extraction
-fn flatten_dt_expr(expr: &ChcExpr, sort: &ChcSort, cx: &FlattenCx) -> Vec<ChcExpr> {
+fn flatten_dt_expr(expr: &ChcExpr, sort: &ChcSort, cx: &FlattenCx<'_>) -> Vec<ChcExpr> {
     let ChcSort::Datatype { constructors, .. } = sort else {
         return vec![rewrite_expr(expr, cx)];
     };
@@ -1287,7 +1291,7 @@ fn resolve_selector_on_dt_subject_components(
     sel_name: &str,
     args: &[Arc<ChcExpr>],
     sel_ret_sort: &ChcSort,
-    cx: &FlattenCx,
+    cx: &FlattenCx<'_>,
 ) -> Option<Vec<ChcExpr>> {
     if args.len() != 1 {
         return None;
@@ -1337,7 +1341,7 @@ fn resolve_selector_on_dt_subject_components(
 fn resolve_nested_dt_components(
     expr: &ChcExpr,
     expected_sort: &ChcSort,
-    cx: &FlattenCx,
+    cx: &FlattenCx<'_>,
 ) -> Option<Vec<ChcExpr>> {
     let mut chain: Vec<&str> = Vec::new();
     let mut cursor = expr;
@@ -1399,7 +1403,7 @@ fn resolve_nested_dt_components(
 /// applications (wrong-variant reads are the theory's free accessor values,
 /// which is precisely the per-variant column semantics). The output keeps DT
 /// sub-expressions, so this path never yields a DT-free problem by itself.
-fn selector_extraction(expr: &ChcExpr, sort: &ChcSort, cx: &FlattenCx) -> Vec<ChcExpr> {
+fn selector_extraction(expr: &ChcExpr, sort: &ChcSort, cx: &FlattenCx<'_>) -> Vec<ChcExpr> {
     let ChcSort::Datatype { constructors, .. } = sort else {
         return vec![rewrite_expr(expr, cx)];
     };
@@ -1492,7 +1496,7 @@ fn tester_discriminant_chain(
 fn resolve_nested_selector(
     outer_sel_name: &str,
     inner_expr: &ChcExpr,
-    cx: &FlattenCx,
+    cx: &FlattenCx<'_>,
 ) -> Option<ChcExpr> {
     // Collect the selector chain from outside-in.
     // E.g., ok_val(tag(s)) -> chain = ["ok_val", "tag"], base_var = "s"
@@ -1542,7 +1546,11 @@ fn resolve_nested_selector(
 /// Handles patterns like `is-ok(tag(s))` where `tag` returns a nested DT
 /// and `s` is in the var expansion. Returns a discriminant equality check
 /// using the nested DT's discriminant variable.
-fn resolve_nested_tester(ctor_name: &str, inner_expr: &ChcExpr, cx: &FlattenCx) -> Option<ChcExpr> {
+fn resolve_nested_tester(
+    ctor_name: &str,
+    inner_expr: &ChcExpr,
+    cx: &FlattenCx<'_>,
+) -> Option<ChcExpr> {
     // Walk selector chain to find base variable and collect path.
     let mut chain: Vec<&str> = Vec::new();
     let mut cursor = inner_expr;
@@ -1790,7 +1798,7 @@ fn multi_ctor_slice_eq(
 
 /// Rewrite a scalar expression, replacing DT operations with their scalar
 /// equivalents.
-fn rewrite_expr(expr: &ChcExpr, cx: &FlattenCx) -> ChcExpr {
+fn rewrite_expr(expr: &ChcExpr, cx: &FlattenCx<'_>) -> ChcExpr {
     crate::expr::maybe_grow_expr_stack(|| match expr {
         // Tester on a DT expression: replace with discriminant check.
         // MUST be checked before the selector arm because testers also

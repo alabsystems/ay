@@ -695,11 +695,14 @@ fn test_ic3_frame_storage_bounded_delta_encoding() {
 ///
 /// - Init: acc = c0 = c1 = c2 = c3 = 0
 /// - Trans (deterministic increment-by-1 + acc toggle):
-///     acc' = ¬acc
-///     c0'  = ¬c0
-///     c1'  = c1 ⊕ c0
-///     c2'  = c2 ⊕ (c1 ∧ c0)
-///     c3'  = c3 ⊕ (c2 ∧ c1 ∧ c0)
+///
+///   ```text
+///   acc' = ¬acc
+///   c0'  = ¬c0
+///   c1'  = c1 ⊕ c0
+///   c2'  = c2 ⊕ (c1 ∧ c0)
+///   c3'  = c3 ⊕ (c2 ∧ c1 ∧ c0)
+///   ```
 /// - Bad: acc ⊕ c0   (i.e. acc ≠ count[0])
 ///
 /// Because acc and c0 both toggle every step from 0, the reachable states all

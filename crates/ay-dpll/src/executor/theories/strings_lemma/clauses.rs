@@ -440,6 +440,38 @@ impl Executor {
         lemma: &StringLemma,
         skolem_cache: &mut ExecutorSkolemCache,
     ) -> Vec<Vec<TermId>> {
+        // Strings NF-engine closure 5 bookkeeping. This is the SINGLE
+        // chokepoint through which every string lemma reaches the SAT solver,
+        // so classifying here cannot be bypassed.
+        //
+        // UNIVERSALLY VALID (true in every model of the original formula, the
+        // fresh skolems being a conservative extension):
+        //   - the extended-function reduction axioms — each is the exact
+        //     SMT-LIB characterization of its operator (see reductions.rs);
+        //   - the tautological splits, which lower to clauses containing both
+        //     `p` and `¬p` (`[eq, ¬eq]`, optionally with extra guard
+        //     literals, which only weakens them).
+        // NOT universally valid — they hold only relative to the normal-form
+        // alignment that produced them, or are asserted unconditionally:
+        //   ConstSplit, VarSplit, ConstUnify, ContainsPositive.
+        if !matches!(
+            lemma.kind,
+            StringLemmaKind::LengthSplit
+                | StringLemmaKind::EmptySplit
+                | StringLemmaKind::EqualitySplit
+                | StringLemmaKind::DeqEmptySplit
+                | StringLemmaKind::DeqFirstCharEqSplit
+                | StringLemmaKind::SubstrReduction
+                | StringLemmaKind::IndexofReduction
+                | StringLemmaKind::ReplaceReduction
+                | StringLemmaKind::ToIntReduction
+                | StringLemmaKind::FromIntReduction
+                | StringLemmaKind::ReplaceAllReduction
+                | StringLemmaKind::ReplaceReReduction
+                | StringLemmaKind::ReplaceReAllReduction
+        ) {
+            self.string_lemma_kinds_all_valid = false;
+        }
         match lemma.kind {
             StringLemmaKind::LengthSplit => {
                 // Case 6: introduce len(x) = len(y) as a decision atom.

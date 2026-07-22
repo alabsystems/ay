@@ -66,9 +66,11 @@ pub use bv_blast_solver::{
     BvSolvedExportError, SolvedObligation,
 };
 pub use bv_cnf_refutation::surface_bv_cnf_refutation;
-pub use checker::recognize_array_select_store;
 pub use checker::recognize_ite_same;
+pub use checker::recognize_regex_intersect_empty;
+pub use checker::recognize_string_ground_eval;
 pub use checker::{check_proof, check_proof_collecting_trust, ProofCheckError};
+pub use checker::{recognize_array_select_store, recognize_array_theory_lemma};
 pub use checker::{recognize_bool_tautology, recognize_bv_bitblast};
 pub use checker::{recognize_datatype_distinct, recognize_datatype_selector_project};
 pub use checker::{recognize_fp_classification, recognize_fp_classification_op};

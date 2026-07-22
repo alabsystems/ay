@@ -63,9 +63,10 @@ use ay_nra::{rcf_api, RealScalar};
 
 use super::rcf_series::{self, TransKind};
 use super::{
-    cache_string, cache_symbol, ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint,
-    ffi_guard_void, Z3Context, Z3_context, Z3_string, Z3_symbol, MAX_FFI_ALGEBRAIC_EXPONENT,
-    MAX_FFI_DECIMAL_PRECISION, MAX_FFI_REFINEMENT_PRECISION, Z3_EXCEPTION, Z3_OK,
+    cache_string, cache_symbol, ffi_counts_within_limit, ffi_guard_const_ptr, ffi_guard_int,
+    ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, ffi_read_bounded_numeral_text, Z3Context,
+    Z3_context, Z3_string, Z3_symbol, MAX_FFI_ALGEBRAIC_EXPONENT, MAX_FFI_DECIMAL_PRECISION,
+    MAX_FFI_REFINEMENT_PRECISION, Z3_EXCEPTION, Z3_OK,
 };
 
 /// An exact Real Closed Field numeral.
@@ -211,7 +212,9 @@ fn expect_real<'a>(
         Some(_) => {
             fail(
                 ctx,
-                format!("{who}: unsupported for a transcendental/infinitesimal operand (no defining polynomial over Q)"),
+                format!(
+                    "{who}: unsupported for a transcendental/infinitesimal operand (no defining polynomial over Q)"
+                ),
             );
             None
         }
@@ -794,14 +797,13 @@ pub unsafe extern "C" fn Z3_rcf_mk_rational(c: Z3_context, val: Z3_string) -> Z3
                 fail(ctx, "Z3_rcf_mk_rational: null string".into());
                 return ptr::null_mut();
             }
-            let s = match std::ffi::CStr::from_ptr(val).to_str() {
-                Ok(s) => s,
-                Err(_) => {
-                    fail(ctx, "Z3_rcf_mk_rational: non-UTF-8 string".into());
-                    return ptr::null_mut();
-                }
+            // SAFETY: `val` was null-checked and the caller guarantees a live
+            // NUL-terminated string for this call.
+            let s = match ffi_read_bounded_numeral_text(ctx, "Z3_rcf_mk_rational", val) {
+                Some(text) => text,
+                None => return ptr::null_mut(),
             };
-            match parse_rcf_rational(s) {
+            match parse_rcf_rational(&s) {
                 Some(r) => produce(ctx, Some(RealScalar::Rational(r)), "Z3_rcf_mk_rational"),
                 None => {
                     fail(ctx, format!("Z3_rcf_mk_rational: malformed rational '{s}'"));
@@ -944,6 +946,11 @@ pub unsafe extern "C" fn Z3_rcf_mk_roots(
     a: *const Z3_rcf_num,
     roots: *mut Z3_rcf_num,
 ) -> c_uint {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_counts_within_limit(c, "Z3_rcf_mk_roots input and output arrays", &[n, n]) } {
+        return 0;
+    }
     let n_usize = n as usize;
     // Read the coefficient handles before entering the guard.
     let coeff_handles: Vec<Z3_rcf_num> = if n_usize == 0 || a.is_null() {
@@ -1543,7 +1550,7 @@ fn decimal_string(s: &RealScalar, prec: c_uint) -> Option<String> {
                     // An irrational never equals a rational midpoint, but stay
                     // fail-safe: the exact value is `mid`, truncate it.
                     Ordering::Equal => {
-                        return Some(format!("{}?", format_rational_decimal(&mid, prec)))
+                        return Some(format!("{}?", format_rational_decimal(&mid, prec)));
                     }
                 }
             }
@@ -2126,18 +2133,21 @@ pub unsafe extern "C" fn Z3_rcf_num_sign_condition_coefficients(
                 return 0;
             };
             match rcf_api::thom_sign_conditions(s) {
-                Some(conds) => {
-                    match conds.get(i as usize) {
-                        Some((coeffs, _)) => {
-                            ctx.last_error = Z3_OK;
-                            coeffs.len() as c_uint
-                        }
-                        None => {
-                            fail(ctx, format!("Z3_rcf_num_sign_condition_coefficients: index {i} out of range"));
-                            0
-                        }
+                Some(conds) => match conds.get(i as usize) {
+                    Some((coeffs, _)) => {
+                        ctx.last_error = Z3_OK;
+                        coeffs.len() as c_uint
                     }
-                }
+                    None => {
+                        fail(
+                            ctx,
+                            format!(
+                                "Z3_rcf_num_sign_condition_coefficients: index {i} out of range"
+                            ),
+                        );
+                        0
+                    }
+                },
                 None => {
                     fail(ctx, "Z3_rcf_num_sign_condition_coefficients: not exactly computable — fail-closed".into());
                     0

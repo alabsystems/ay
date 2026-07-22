@@ -5890,7 +5890,7 @@ new_preprocess={:.3}s new_constraints={} new_build={:.3}s",
     #[test]
     fn test_preprocess_randomized_differential_solution_set() {
         // Default pipeline: entailed-only (safe under later assumptions).
-        run_randomized_differential(0x9E37_79B9_7F4A_7C15, |instance| preprocess(instance));
+        run_randomized_differential(0x9E37_79B9_7F4A_7C15, preprocess);
     }
 
     #[test]

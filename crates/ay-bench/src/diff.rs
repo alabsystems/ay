@@ -515,6 +515,7 @@ mod tests {
             proof_exists: None,
             proof_bytes: None,
             proof_hash: None,
+            proof_validation: None,
             family: None,
             clause_width_max: None,
             clause_width_mean: None,

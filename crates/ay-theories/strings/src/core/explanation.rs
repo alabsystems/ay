@@ -373,6 +373,205 @@ impl CoreSolver {
         }
     }
 
+    /// Entailed concrete length of a string term WITH its proof-forest
+    /// justification (NF-engine closure 2, `AY_STR_NF=1`).
+    ///
+    /// Unlike `SolverState::known_length_full`, every returned fact carries
+    /// the literals that justify it:
+    /// - EQC constant: `explain(t, const_tid)` — why `t` equals the constant
+    ///   whose char count is the length.
+    /// - Registered length term resolved to a concrete integer:
+    ///   `explain(len_term, const_tid)` (why `str.len(x) = k`) plus
+    ///   `explain(t, x)` (why `t` is the term the length term measures).
+    ///
+    /// Returns `None` when the length is unknown OR any non-trivial link is
+    /// unexplainable — an unexplained fact must never feed a derived equality
+    /// (empty-explanation laundering ⇒ false-UNSAT, #3826/#6273).
+    pub(super) fn known_len_with_reasons(
+        terms: &TermStore,
+        state: &SolverState,
+        t: TermId,
+    ) -> Option<(usize, Vec<TheoryLit>)> {
+        let rep = state.find(t);
+        // Source 1: the EQC carries a string constant.
+        if let Some(n) = state.known_length(terms, rep) {
+            let const_tid = state.find_constant_term_id(terms, t)?;
+            let mut reasons = Vec::new();
+            if t != const_tid {
+                let e = state.explain(t, const_tid);
+                if e.is_empty() {
+                    return None;
+                }
+                reasons = e;
+            }
+            return Some((n, reasons));
+        }
+        // Source 2: registered `str.len` term merged with a concrete integer.
+        let lt = state.get_length_term(&rep)?;
+        let (k, ktid) = state.resolve_int_constant_with_term(terms, lt)?;
+        let k = usize::try_from(k).ok()?;
+        let mut reasons = Vec::new();
+        if lt != ktid {
+            let e = state.explain(lt, ktid);
+            if e.is_empty() {
+                return None;
+            }
+            reasons = e;
+        }
+        // The length term is `str.len(x)` for some `x` in `t`'s EQC — the
+        // derived fact `len(t) = k` additionally needs `t = x`.
+        let x = state.get_str_len_arg(terms, lt)?;
+        if x != t {
+            let e = state.explain(t, x);
+            if e.is_empty() {
+                return None;
+            }
+            reasons.extend(e);
+        }
+        Some((k, reasons))
+    }
+
+    /// Justification for `len(a) = len(b)` when it is entailed by tracked
+    /// facts (NF-engine closure 2, `AY_STR_NF=1`).
+    ///
+    /// Mirrors the reason-free `are_lengths_equal_with_entail` paths that CAN
+    /// be explained: same EQC, equal concrete lengths, or length terms merged
+    /// in the union-find. Returns `None` for entailments whose provenance is
+    /// not tracked (e.g. pure `ArithEntail` derivations) — callers keep their
+    /// pre-closure behavior in that case.
+    pub(super) fn length_equality_reasons(
+        terms: &TermStore,
+        state: &SolverState,
+        a: TermId,
+        b: TermId,
+    ) -> Option<Vec<TheoryLit>> {
+        if state.find(a) == state.find(b) {
+            return Some(state.explain(a, b));
+        }
+        if let (Some((ka, mut reasons)), Some((kb, rb))) = (
+            Self::known_len_with_reasons(terms, state, a),
+            Self::known_len_with_reasons(terms, state, b),
+        ) {
+            if ka != kb {
+                return None;
+            }
+            reasons.extend(rb);
+            return Some(reasons);
+        }
+        // Length terms merged in the union-find (`len(a) = len(b)` decided).
+        let la = state.get_length_term(&state.find(a))?;
+        let lb = state.get_length_term(&state.find(b))?;
+        if state.find(la) != state.find(lb) {
+            return None;
+        }
+        let mut reasons = state.explain(la, lb);
+        if reasons.is_empty() && la != lb {
+            return None;
+        }
+        for (t, l) in [(a, la), (b, lb)] {
+            let x = state.get_str_len_arg(terms, l)?;
+            if x != t {
+                let e = state.explain(t, x);
+                if e.is_empty() {
+                    return None;
+                }
+                reasons.extend(e);
+            }
+        }
+        Some(reasons)
+    }
+
+    /// Prefix component-transfer candidate (NF-engine closure 2,
+    /// `AY_STR_NF=1`): given two NF components `c1`/`c2` that lead EQUAL
+    /// remainders of an NF comparison, find a leading sub-component of one
+    /// side's concat decomposition that must equal the other side's whole
+    /// component because both have the same entailed concrete length.
+    ///
+    /// Shape (the pyex zz core): comparing `[skt_substr, sk_suf]` against
+    /// `[btk, b_suf]` where `len(btk) = 1` is entailed and `skt_substr`'s EQC
+    /// carries the reduced decomposition `a_pre ++ atk ++ a_suf` with
+    /// `a_pre = ""` entailed and `len(atk) = 1` entailed: both `btk` and
+    /// `atk` are the length-1 prefix of the same string ⇒ `btk = atk`
+    /// (`N_UNIFY`). Reference: CVC5 skolem-decomposition splits,
+    /// `core_solver.cpp:2112-2306`.
+    ///
+    /// Returns `(x, y, reasons)` where `x = y` is the derived equality and
+    /// `reasons` justifies the decomposition path: the component-to-concat
+    /// EQC merges, every skipped-empty prefix component, and BOTH length
+    /// facts. The caller must combine these with the NF pair explanation.
+    /// Every link is validated non-empty — unexplainable candidates are
+    /// skipped, never laundered.
+    pub(super) fn find_component_transfer(
+        terms: &TermStore,
+        state: &SolverState,
+        c1: TermId,
+        c2: TermId,
+    ) -> Option<(TermId, TermId, Vec<TheoryLit>)> {
+        for (a, b) in [(c1, c2), (c2, c1)] {
+            // `a` is the side whose WHOLE component has an entailed length.
+            let Some((k, a_reasons)) = Self::known_len_with_reasons(terms, state, a) else {
+                continue;
+            };
+            if k == 0 {
+                continue; // empty components are the empty-skip machinery's domain
+            }
+            let rb = state.find(b);
+            let Some(eqc) = state.get_eqc(&rb) else {
+                continue;
+            };
+            // Walk each concat decomposition of `b` (INCLUDING reduced ones —
+            // reduction webs are exactly the target), skipping entailed-empty
+            // leading children, to its first real component.
+            'concats: for &ct in &eqc.concat_terms {
+                let Some(children) = state.get_concat_children(terms, ct) else {
+                    continue;
+                };
+                let mut reasons = a_reasons.clone();
+                if b != ct {
+                    let e = state.explain(b, ct);
+                    if e.is_empty() {
+                        continue;
+                    }
+                    reasons.extend(e);
+                }
+                let mut leading = None;
+                for &child in children {
+                    if state.is_empty_string(terms, child) {
+                        match state.find_constant_term_id(terms, child) {
+                            Some(eid) if child != eid => {
+                                let e = state.explain(child, eid);
+                                if e.is_empty() {
+                                    continue 'concats;
+                                }
+                                reasons.extend(e);
+                            }
+                            Some(_) => {} // child IS the empty constant
+                            None => continue 'concats,
+                        }
+                        continue;
+                    }
+                    leading = Some(child);
+                    break;
+                }
+                let Some(d) = leading else {
+                    continue;
+                };
+                if state.find(d) == state.find(a) {
+                    continue; // already unified — nothing to derive
+                }
+                let Some((kd, d_reasons)) = Self::known_len_with_reasons(terms, state, d) else {
+                    continue;
+                };
+                if kd != k {
+                    continue;
+                }
+                reasons.extend(d_reasons);
+                return Some((a, d, reasons));
+            }
+        }
+        None
+    }
+
     /// Extract a string constant value from a term directly.
     pub(super) fn get_string_constant(terms: &TermStore, t: TermId) -> Option<&str> {
         match terms.get(t) {

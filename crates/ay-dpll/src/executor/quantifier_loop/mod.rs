@@ -429,6 +429,10 @@ impl Executor {
         // The conflict-verification verdict memo (#4535) is keyed against the
         // support set — rebuild of the support set invalidates it.
         self.conflict_semantic_verify_memo.clear();
+        // The propagation-verification memo (#verify-memo) does not read the
+        // support set, but clearing on the same boundary keeps one lifecycle
+        // contract for both verify-lane memos (conservative, never unsound).
+        self.prop_semantic_verify_memo.clear();
 
         // 1. Early exit if no quantifiers present.
         // contains_quantifier uses memoization (visited set) to avoid

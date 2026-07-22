@@ -300,8 +300,10 @@ fn test_pdr_uses_configured_array_scalarization_extra_indices() {
         ClauseHead::Predicate(inv, vec![ChcExpr::var(array)]),
     ));
 
-    let mut config = PdrConfig::default();
-    config.array_scalarization_extra_indices = vec![(key_sort, ChcExpr::BitVec(4, 160))];
+    let config = PdrConfig {
+        array_scalarization_extra_indices: vec![(key_sort, ChcExpr::BitVec(4, 160))],
+        ..PdrConfig::default()
+    };
     let solver = PdrSolver::new(problem, config);
 
     assert_eq!(solver.array_scalarization_maps.len(), 1);

@@ -8,6 +8,11 @@ use ay_frontend::parse;
 use ay_proof::check_proof_partial;
 use num_bigint::BigInt;
 
+fn emit_firewall_lean(exec: &Executor, proof: &Proof) -> Vec<String> {
+    exec.emit_datatype_firewall_lean_bounded(proof, usize::MAX, usize::MAX)
+        .expect("test fixture must fit in the address-space bounds")
+}
+
 #[test]
 fn contextual_row2_unit_is_rebuilt_as_guarded_strict_proof() {
     let mut exec = Executor::new();
@@ -576,6 +581,7 @@ fn test_qf_bv_idempotent_collapse_is_strict_checkable() {
         ("bvand", "(not (= (bvand x x) x))"),
         ("bvor", "(not (= (bvor x x) x))"),
         ("bvxor", "(not (= (bvxor x x) #x0))"),
+        ("bv0", "(not (= (bvand x (_ bv0 4)) (_ bv0 4)))"),
         ("bvnot", "(not (= (bvnot (bvnot x)) x))"),
         ("extract", "(not (= ((_ extract 3 0) x) x))"),
         ("repeat", "(not (= ((_ repeat 1) x) x))"),
@@ -617,6 +623,22 @@ fn test_qf_bv_idempotent_collapse_is_strict_checkable() {
             Err(e) => panic!("{body} proof must pass strict check, got {e:?}"),
         }
     }
+}
+
+#[test]
+fn qfbv_proof_rebuilder_accepts_structured_decimal_literal() {
+    let mut terms = TermStore::new();
+    let parsed = FrontendTerm::IndexedApp(
+        "bv3".to_string(),
+        vec![FrontendIndex::Numeral("4".to_string())],
+        Vec::new(),
+    );
+    let rebuilt = build_qfbv_pterm(&mut terms, &parsed)
+        .expect("structured decimal bitvector literal must rebuild");
+    let expected = terms.mk_bitvec(BigInt::from(3), 4);
+    assert_eq!(rebuilt, expected);
+    assert_eq!(terms.sort(rebuilt), &Sort::bitvec(4));
+    assert!(build_qfbv_pterm(&mut terms, &FrontendTerm::Symbol("(_ bv3 4)".to_string())).is_none());
 }
 
 #[test]
@@ -702,9 +724,25 @@ fn test_qf_bool_tautology_emits_firewall_lean() {
     let cmds = parse(input).unwrap();
     let mut ex = Executor::new();
     assert_eq!(ex.execute_all(&cmds).unwrap(), vec!["unsat"]);
-    let fw = ex.emit_datatype_firewall_lean(ex.last_proof.as_ref().unwrap());
+    let proof = ex.last_proof.as_ref().unwrap();
+    let fw = emit_firewall_lean(&ex, proof);
     assert_eq!(fw.len(), 1, "expected 1 Boolean firewall file");
     assert!(fw[0].contains("firewall_combined_unsat") && fw[0].contains("abbrev Val := Bool"));
+    assert!(
+        ex.emit_datatype_firewall_lean_bounded(proof, 0, usize::MAX)
+            .is_none(),
+        "file-count bound must reject before retaining an artifact"
+    );
+    assert!(
+        ex.emit_datatype_firewall_lean_bounded(proof, 1, fw[0].len() - 1)
+            .is_none(),
+        "aggregate byte bound must reject an oversized artifact"
+    );
+    assert_eq!(
+        ex.emit_datatype_firewall_lean_bounded(proof, 1, fw[0].len())
+            .expect("exact bounds must accept"),
+        fw
+    );
 }
 
 #[test]
@@ -716,7 +754,7 @@ fn test_qf_ite_same_emits_firewall_lean() {
     let commands = parse(input).unwrap();
     let mut exec = Executor::new();
     assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
-    let fw = exec.emit_datatype_firewall_lean(exec.last_proof.as_ref().unwrap());
+    let fw = emit_firewall_lean(&exec, exec.last_proof.as_ref().unwrap());
     let ite = fw
         .iter()
         .find(|f| f.contains("IteSame"))
@@ -741,7 +779,7 @@ fn test_qf_fp_identity_emits_firewall_lean() {
         let commands = parse(&input).unwrap();
         let mut exec = Executor::new();
         assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
-        let fw = exec.emit_datatype_firewall_lean(exec.last_proof.as_ref().unwrap());
+        let fw = emit_firewall_lean(&exec, exec.last_proof.as_ref().unwrap());
         let f = fw
             .iter()
             .find(|f| f.contains("FpIdent"))
@@ -782,7 +820,7 @@ fn test_closed_identity_classes_emit_firewall_lean() {
             vec!["unsat"],
             "{body}"
         );
-        let fw = exec.emit_datatype_firewall_lean(exec.last_proof.as_ref().unwrap());
+        let fw = emit_firewall_lean(&exec, exec.last_proof.as_ref().unwrap());
         let f = fw
             .iter()
             .find(|f| f.contains(tag))
@@ -1777,7 +1815,7 @@ fn test_runtime_emits_datatype_firewall_lean() {
     assert_eq!(outputs, vec!["unsat"]);
 
     let proof = exec.last_proof().expect("a proof was produced").clone();
-    let emitted = exec.emit_datatype_firewall_lean(&proof);
+    let emitted = emit_firewall_lean(&exec, &proof);
 
     assert!(
         !emitted.is_empty(),
@@ -1815,7 +1853,7 @@ fn test_runtime_emits_lia_firewall_lean() {
     assert_eq!(outputs, vec!["unsat"]);
 
     let proof = exec.last_proof().expect("a proof was produced").clone();
-    let emitted = exec.emit_datatype_firewall_lean(&proof);
+    let emitted = emit_firewall_lean(&exec, &proof);
 
     assert!(
         !emitted.is_empty(),
@@ -1856,7 +1894,7 @@ fn test_runtime_emits_euf_firewall_lean() {
     assert_eq!(outputs, vec!["unsat"]);
 
     let proof = exec.last_proof().expect("a proof was produced").clone();
-    let emitted = exec.emit_datatype_firewall_lean(&proof);
+    let emitted = emit_firewall_lean(&exec, &proof);
 
     assert!(
         !emitted.is_empty(),
@@ -1898,7 +1936,7 @@ fn test_runtime_emits_euf_congruence_firewall_lean() {
     assert_eq!(outputs, vec!["unsat"]);
 
     let proof = exec.last_proof().expect("a proof was produced").clone();
-    let emitted = exec.emit_datatype_firewall_lean(&proof);
+    let emitted = emit_firewall_lean(&exec, &proof);
 
     assert!(
         !emitted.is_empty(),
@@ -1942,7 +1980,7 @@ fn test_runtime_emits_euf_pred_congruence_firewall_lean() {
     assert_eq!(outputs, vec!["unsat"]);
 
     let proof = exec.last_proof().expect("a proof was produced").clone();
-    let emitted = exec.emit_datatype_firewall_lean(&proof);
+    let emitted = emit_firewall_lean(&exec, &proof);
 
     assert!(
         !emitted.is_empty(),
@@ -1988,7 +2026,7 @@ fn test_runtime_emits_array_row2_firewall_lean() {
     assert_eq!(outputs, vec!["unsat"]);
 
     let proof = exec.last_proof().expect("a proof was produced").clone();
-    let emitted = exec.emit_datatype_firewall_lean(&proof);
+    let emitted = emit_firewall_lean(&exec, &proof);
 
     assert!(
         !emitted.is_empty(),
@@ -2029,7 +2067,7 @@ fn test_runtime_emits_string_length_firewall_lean() {
     assert_eq!(outputs, vec!["unsat"]);
 
     let proof = exec.last_proof().expect("a proof was produced").clone();
-    let emitted = exec.emit_datatype_firewall_lean(&proof);
+    let emitted = emit_firewall_lean(&exec, &proof);
 
     assert!(
         emitted
@@ -2062,7 +2100,7 @@ fn test_runtime_emits_bv_firewall_lean() {
     assert_eq!(outputs, vec!["unsat"]);
 
     let proof = exec.last_proof().expect("a proof was produced").clone();
-    let emitted = exec.emit_datatype_firewall_lean(&proof);
+    let emitted = emit_firewall_lean(&exec, &proof);
 
     assert!(
         emitted
@@ -2097,7 +2135,7 @@ fn test_runtime_emits_array_row1_firewall_lean() {
     assert_eq!(outputs, vec!["unsat"]);
 
     let proof = exec.last_proof().expect("a proof was produced").clone();
-    let emitted = exec.emit_datatype_firewall_lean(&proof);
+    let emitted = emit_firewall_lean(&exec, &proof);
 
     assert!(
         emitted
@@ -2133,7 +2171,7 @@ fn test_runtime_emits_binary_euf_congruence_firewall_lean() {
     assert_eq!(outputs, vec!["unsat"]);
 
     let proof = exec.last_proof().expect("a proof was produced").clone();
-    let emitted = exec.emit_datatype_firewall_lean(&proof);
+    let emitted = emit_firewall_lean(&exec, &proof);
 
     assert!(
         emitted
@@ -2333,5 +2371,180 @@ fn self_check_authored_rescue_never_manufactures_sat() {
         outputs,
         vec!["sat"],
         "unsatisfiable input must never self-certify as sat"
+    );
+}
+
+#[test]
+fn qf_s_ground_regex_refutation_self_certifies_from_authored_assertions() {
+    // The QF_S `slog_stranger` "sink" family, verbatim in shape: a string
+    // constant is pinned by an authored equality and then asserted to be in a
+    // ground regex language it does not belong to.
+    //
+    // Before the ground string/regex checker and the substitution bridge this
+    // exported as `assume (str.in_re "/mod/forum/" R)` (a preprocessing
+    // artifact, NOT a problem premise) plus a `:rule trust` lemma, so
+    // `--self-check` degraded the UNSAT to `unknown`. Now the leaf is DERIVED
+    // from the authored assertion by `eq_congruent_pred` and the refutation is
+    // a `string_ground_eval` lemma the checker decides outright.
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_S)
+        (declare-fun literal_5 () String)
+        (assert (= literal_5 "/mod/forum/"))
+        (assert (str.in_re literal_5
+                  (re.++ (re.* re.allchar)
+                         (re.++ (str.to_re "\u{5c}\u{3c}SCRIPT") (re.* re.allchar)))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
+
+    let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
+    match ay_proof::check_proof_strict(proof, &exec.ctx.terms) {
+        Ok(quality) => assert_eq!(quality.trust_count, 0, "strict: zero trust steps"),
+        Err(e) => panic!("ground-regex refutation must pass strict check, got {e:?}"),
+    }
+    assert!(
+        proof.steps.iter().any(|s| matches!(
+            s,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::StringGroundEval,
+                ..
+            }
+        )),
+        "the refuting lemma must carry the strict-checkable ground-eval kind"
+    );
+    assert!(
+        proof.steps.iter().any(|s| matches!(
+            s,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::EufCongruentPred,
+                ..
+            }
+        )),
+        "the substituted leaf must be bridged, not assumed"
+    );
+
+    // Every `assume` must be an AUTHORED assertion.
+    let authored = exec.proof_original_problem_assertions();
+    for step in &proof.steps {
+        if let ProofStep::Assume(term) = step {
+            assert!(
+                authored.contains(term),
+                "proof assumes a non-authored term {term:?}; authored = {authored:?}"
+            );
+        }
+    }
+
+    let text = exec.get_proof();
+    assert!(
+        !text.contains(":rule trust"),
+        "ground-regex refutation must not fall back to trust; got:\n{text}"
+    );
+    assert!(
+        text.contains(":rule string_ground_eval") && text.contains(":rule eq_congruent_pred"),
+        "expected the ground-eval lemma and the congruence bridge; got:\n{text}"
+    );
+    assert!(
+        exec.unsat_proof_self_certified(),
+        "the refutation must now self-certify"
+    );
+}
+
+#[test]
+fn qf_s_ground_regex_membership_that_holds_is_sat() {
+    // The soundness twin of the test above: when the pinned constant IS in the
+    // language, the ground evaluator must NOT manufacture a refutation.
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_S)
+        (declare-fun literal_5 () String)
+        (assert (= literal_5 "xx\u{5c}\u{3c}SCRIPTyy"))
+        (assert (str.in_re literal_5
+                  (re.++ (re.* re.allchar)
+                         (re.++ (str.to_re "\u{5c}\u{3c}SCRIPT") (re.* re.allchar)))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    assert_eq!(
+        exec.execute_all(&commands).unwrap(),
+        vec!["sat"],
+        "a membership that genuinely holds must stay SAT"
+    );
+}
+
+#[test]
+fn qf_s_symbolic_regex_intersection_refutation_self_certifies() {
+    // The QF_S `automatark` family, verbatim in shape: a SYMBOLIC string
+    // variable is asserted to be in two ground regex languages whose
+    // intersection is empty. The ground evaluator cannot touch this — the fact
+    // is not ground — so before the regex-emptiness certificate the refuting
+    // lemma exported as `:rule trust` and `--self-check` degraded the UNSAT to
+    // `unknown`. Now the lemma carries `RegexIntersectEmpty` and the checker
+    // re-derives the whole derivative-product reachability argument itself.
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_S)
+        (declare-const X String)
+        (assert (str.in_re X (re.++ (str.to_re "/f") (re.* (re.range "0" "9"))
+                                    (str.to_re "/end"))))
+        (assert (str.in_re X (re.++ (str.to_re "/f") (re.* (re.range "a" "z"))
+                                    (str.to_re "/x"))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
+
+    let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
+    assert!(
+        proof.steps.iter().any(|s| matches!(
+            s,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::RegexIntersectEmpty,
+                ..
+            }
+        )),
+        "the refuting lemma must carry the strict-checkable regex-emptiness kind"
+    );
+    match ay_proof::check_proof_strict(proof, &exec.ctx.terms) {
+        Ok(quality) => assert_eq!(quality.trust_count, 0, "strict: zero trust steps"),
+        Err(e) => panic!("symbolic regex refutation must pass strict check, got {e:?}"),
+    }
+    let text = exec.get_proof();
+    assert!(
+        !text.contains(":rule trust"),
+        "symbolic regex refutation must not fall back to trust; got:\n{text}"
+    );
+    assert!(
+        text.contains(":rule regex_intersect_empty"),
+        "expected the regex-emptiness lemma; got:\n{text}"
+    );
+    assert!(
+        exec.unsat_proof_self_certified(),
+        "the refutation must now self-certify"
+    );
+}
+
+#[test]
+fn qf_s_symbolic_regex_intersection_that_is_non_empty_stays_sat() {
+    // The soundness twin: overlapping languages must NOT manufacture a
+    // refutation. `X` = "007" satisfies both memberships.
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_S)
+        (declare-const X String)
+        (assert (str.in_re X (re.++ (re.range "0" "9") (re.range "0" "9") (re.range "0" "9"))))
+        (assert (str.in_re X (re.* (re.range "0" "9"))))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    assert_eq!(
+        exec.execute_all(&commands).unwrap(),
+        vec!["sat"],
+        "an intersection with a member must stay SAT"
     );
 }

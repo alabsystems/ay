@@ -425,6 +425,9 @@ where
 }
 
 #[cfg(test)]
+// The recursive reference oracle stays adjacent to the iterative builder it
+// validates; moving this large test block would separate the two implementations.
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

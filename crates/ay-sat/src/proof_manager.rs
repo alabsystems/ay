@@ -2777,6 +2777,17 @@ impl ProofManager {
         self.last_add = None;
     }
 
+    /// Whether the proof stream's most recent addition is a usable empty
+    /// clause. DRAT has no clause-ID visibility bookkeeping; a successful
+    /// write is sufficient there. LRAT additionally requires the terminal ID
+    /// to remain visible to the standalone checker.
+    #[inline]
+    pub(crate) fn has_file_visible_terminal_empty(&self) -> bool {
+        self.last_add.is_some_and(|last_add| {
+            last_add.is_empty && (!self.lrat_mode || self.lrat_id_visible_in_file(last_add.id))
+        })
+    }
+
     /// Structural LRAT chain integrity check: verify all hints reference
     /// known, live clause IDs. Always-on in all builds (#5005).
     fn validate_lrat_hints(&self, clause: &[Literal], hints: &[u64], kind: ProofAddKind) {
@@ -2953,9 +2964,12 @@ impl ProofManager {
         // invalid — the proof manager may have been corrupted or the
         // finalization sequence was incomplete.
         match self.last_add {
-            Some(last_add) if last_add.is_empty => Ok(()),
+            Some(_) if self.has_file_visible_terminal_empty() => Ok(()),
+            Some(last_add) if last_add.is_empty => {
+                Err("LRAT terminal empty clause is not visible in the proof")
+            }
             Some(_) => Err("LRAT proof did not end with empty clause"),
-            None => Ok(()),
+            None => Err("LRAT proof has no recorded empty-clause addition"),
         }
     }
 

@@ -2,8 +2,9 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Licensed under the Apache License, Version 2.0
 
-//! Strict-mode schema validation for `TheoryLemmaKind::ArraySelectStore` and
-//! `TheoryLemmaKind::ArrayExtensionality` proof steps.
+//! Strict-mode schema validation for the array `TheoryLemmaKind`s:
+//! `ArraySelectStore`, `ArrayStorePermutation`, `ArrayRowChain`, and
+//! `ArrayExtensionality`.
 //!
 //! Context (#8820): the previous checker accepted any non-empty clause here,
 //! so an attacker could forge an "array axiom" lemma containing arbitrary
@@ -17,6 +18,13 @@
 //! - `ArraySelectStore { index_eq: false }` — read-over-write negative: the
 //!   clause must mention both a `select` over a `store` and a disequality
 //!   literal between the store and read indices.
+//! - `ArrayStorePermutation` — n-ary store-commutativity: two `store` chains
+//!   over one base array that write the same `(index, value)` multiset, with
+//!   the pairwise index disjointness carried as clause literals (see
+//!   [`validate_array_store_permutation`]).
+//! - `ArrayRowChain` — read-over-write evaluated through a `store` CHAIN,
+//!   optionally under an array-equality premise (see
+//!   [`validate_array_row_chain`]).
 //! - `ArrayExtensionality` is fail-closed in strict mode unless a future
 //!   checker can verify that the select index is a real extensionality/diff
 //!   witness for the array pair. A syntactic `select` witness is not enough.
@@ -25,7 +33,9 @@
 //! the exact read-over-write schemas and rejects unverified extensionality
 //! witnesses instead of accepting them by shape alone.
 
-use ay_core::{ProofId, Sort, TermData, TermId, TermStore};
+// #8529: deterministic hash containers in all builds.
+use ay_core::kani_compat::{det_hash_set_new, DetHashSet};
+use ay_core::{ProofId, Sort, TermData, TermId, TermStore, TheoryLemmaKind};
 
 use super::ProofCheckError;
 
@@ -94,6 +104,157 @@ pub fn recognize_array_select_store(terms: &TermStore, clause: &[TermId]) -> Opt
     } else {
         None
     }
+}
+
+/// Recognize the array theory lemma kind `clause` can be strict-validated as,
+/// or `None` when no exact schema matches (the lemma must then stay `Generic`
+/// / `:rule trust`).
+///
+/// This is the EXACT inverse of the `validate_*` entry points in this module,
+/// so the proof classifier (`ay-dpll` `theory_inference`) assigns precisely the
+/// kind strict mode will accept — no classifier/checker drift. Ordering keeps
+/// the narrow depth-1 `ArraySelectStore` kinds first so existing rule emission
+/// (and its Lean firewall) is unchanged; the n-ary schemas only ever claim
+/// clauses that were previously `Generic`.
+///
+/// Extensionality is intentionally NOT recognized: strict mode cannot yet
+/// validate the diff witness (#8073).
+#[must_use]
+pub fn recognize_array_theory_lemma(
+    terms: &TermStore,
+    clause: &[TermId],
+) -> Option<TheoryLemmaKind> {
+    if let Some(index_eq) = recognize_array_select_store(terms, clause) {
+        return Some(TheoryLemmaKind::ArraySelectStore { index_eq });
+    }
+    if clause.is_empty()
+        || clause
+            .iter()
+            .any(|&lit| !matches!(terms.sort(lit), Sort::Bool))
+    {
+        return None;
+    }
+    let literals = flatten_clause_literals(terms, clause);
+    if matches_store_permutation(terms, &literals) {
+        return Some(TheoryLemmaKind::ArrayStorePermutation);
+    }
+    if matches_row_chain(terms, &literals) {
+        return Some(TheoryLemmaKind::ArrayRowChain);
+    }
+    None
+}
+
+/// Validate an `ArrayStorePermutation` lemma in strict mode.
+///
+/// SCHEMA (all conditions are necessary; any failure REJECTS):
+///
+/// The clause must contain a POSITIVE literal `(= L R)` where
+///  1. `L` and `R` both parse as maximal `store` chains whose every node is a
+///     well-sorted array `store`, and both chains bottom out in the SAME base
+///     array term (identical `TermId`);
+///  2. both chains have the same length `n >= 2`;
+///  3. the `n` index terms of `L`'s chain are PAIRWISE DISTINCT `TermId`s
+///     (a repeated index term is rejected: `store(store(b,i,v),i,w)` and
+///     `store(store(b,i,w),i,v)` write the same pair multiset but denote
+///     different arrays);
+///  4. the multisets of `(index, value)` `TermId` pairs of the two chains are
+///     EQUAL (so `R` is a permutation of `L`);
+///  5. for EVERY unordered pair `{i_p, i_q}` of the `n` index terms the clause
+///     carries a POSITIVE literal `(= i_p i_q)` or `(= i_q i_p)`.
+///
+/// SOUNDNESS. Assume the clause false. By (5) every index pair is distinct, so
+/// by (3)+(4) each chain maps `i_k` to `v_k` and agrees with the base array
+/// everywhere else; the two chains are therefore pointwise equal, hence equal
+/// by extensionality (SMT-LIB `ArraysEx`, the theory every array logic uses).
+/// That contradicts the assumed-false conclusion literal, so the clause is a
+/// theory tautology. Extra literals are harmless: a superset of a valid clause
+/// is valid.
+pub(crate) fn validate_array_store_permutation(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+) -> Result<(), ProofCheckError> {
+    if clause.is_empty() {
+        return Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "array axiom clause must be non-empty".to_string(),
+        });
+    }
+    reject_non_bool_literals(terms, step_id, clause, "array store permutation")?;
+
+    let literals = flatten_clause_literals(terms, clause);
+    if matches_store_permutation(terms, &literals) {
+        return Ok(());
+    }
+    Err(ProofCheckError::InvalidTheoryLemma {
+        step: step_id,
+        reason: "array store-permutation clause does not match the exact schema: it needs a \
+                 positive equality between two well-sorted store chains over one common base \
+                 array that are a permutation of the same (index, value) pairs, with pairwise \
+                 distinct index terms and one `(= i j)` literal for every unordered index pair"
+            .to_string(),
+    })
+}
+
+/// Validate an `ArrayRowChain` lemma in strict mode.
+///
+/// SCHEMA. Write `eval(C, x)` for the partial read-over-write evaluation of an
+/// array term `C` at index `x`: walk `C`'s `store` chain OUTERMOST-FIRST; on an
+/// entry `(i, v)` return `v` when `i` IS syntactically `x`, otherwise the
+/// clause must carry a POSITIVE literal `(= x i)` (else `eval` FAILS and the
+/// lemma is rejected) and the walk continues inward; when the chain is
+/// exhausted the result is the term `(select base x)`. Every `store` node and
+/// the final `select` must be well-sorted array operations.
+///
+/// The clause is accepted when either sub-schema holds:
+///
+/// (A) CHAIN EVALUATION. A POSITIVE literal `(= P Q)` where `P` is a well-
+///     sorted `(select C x)` and `eval(C, x)` denotes exactly `Q` (or the
+///     mirror image), and `sort(P) == sort(Q)`.
+///
+/// (B) UNDER AN ARRAY EQUALITY. A NEGATIVE literal `(not (= L R))` with
+///     `sort(L) == sort(R) == Array(as)`, plus a POSITIVE literal `(= U W)`
+///     with `sort(U) == sort(W) == as.element_sort`, and an index term `x` of
+///     sort `as.index_sort` such that `eval(L, x)` denotes `U` and
+///     `eval(R, x)` denotes `W` (or the mirror image). `x` is taken from a
+///     top-level `(select _ x)` on either side of the conclusion literal; a
+///     conclusion with no such select is REJECTED (the checker will not guess a
+///     witness index).
+///
+/// SOUNDNESS. Assume the clause false. Then every `(= x i)` literal consumed by
+/// `eval` is false, i.e. `x != i`, so each skipped `store` is transparent at
+/// `x` by the read-over-write-negative axiom and each taken entry gives its
+/// value by read-over-write-positive: `select(C, x) = eval(C, x)`.
+/// For (A) that already contradicts the assumed-false conclusion.
+/// For (B) the negative literal being false gives `L = R`, so by congruence
+/// `select(L, x) = select(R, x)`, i.e. `U = W` — again contradicting the
+/// assumed-false conclusion. Extra literals are harmless.
+pub(crate) fn validate_array_row_chain(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+) -> Result<(), ProofCheckError> {
+    if clause.is_empty() {
+        return Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "array axiom clause must be non-empty".to_string(),
+        });
+    }
+    reject_non_bool_literals(terms, step_id, clause, "array read-over-write chain")?;
+
+    let literals = flatten_clause_literals(terms, clause);
+    if matches_row_chain(terms, &literals) {
+        return Ok(());
+    }
+    Err(ProofCheckError::InvalidTheoryLemma {
+        step: step_id,
+        reason: "array read-over-write-chain clause does not match the exact schema: every \
+                 store skipped while evaluating the chain at the read index must be justified \
+                 by a positive `(= x i)` literal in the same clause, and the conclusion must be \
+                 the evaluated equality (optionally under a `(not (= L R))` array-equality \
+                 premise whose conclusion carries a top-level select at the read index)"
+            .to_string(),
+    })
 }
 
 /// Validate an `ArrayExtensionality` lemma in strict mode.
@@ -350,6 +511,304 @@ fn select_parts(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
         }
         _ => None,
     }
+}
+
+// ---------- n-ary store-chain schemas ----------
+
+/// A maximally-unrolled `store` chain: the innermost non-`store` base array
+/// plus the written `(index, value)` pairs listed OUTERMOST-FIRST.
+struct StoreChain {
+    base: TermId,
+    entries: Vec<(TermId, TermId)>,
+}
+
+/// Parse `term` as a maximal chain of well-sorted array `store` applications.
+///
+/// Returns `None` unless the term (and every `store` node inside it) is
+/// array-sorted with a signature that agrees with the base array's sort.
+/// `TermStore` intentionally permits raw applications, so the strict proof
+/// boundary cannot assume the frontend checked these relationships.
+fn parse_store_chain(terms: &TermStore, term: TermId) -> Option<StoreChain> {
+    let Sort::Array(_) = terms.sort(term) else {
+        return None;
+    };
+    let mut entries = Vec::new();
+    let mut current = term;
+    while let TermData::App(sym, args) = terms.get(current) {
+        if sym.name() != "store" || args.len() != 3 {
+            break;
+        }
+        let (base, index, value) = (args[0], args[1], args[2]);
+        let Sort::Array(array_sort) = terms.sort(base) else {
+            return None;
+        };
+        if terms.sort(current) != terms.sort(base)
+            || terms.sort(index) != &array_sort.index_sort
+            || terms.sort(value) != &array_sort.element_sort
+        {
+            return None;
+        }
+        entries.push((index, value));
+        current = base;
+    }
+    Some(StoreChain {
+        base: current,
+        entries,
+    })
+}
+
+/// The positive `(= p q)` literals of a clause, normalized to unordered pairs
+/// so `(= i j)` and `(= j i)` both answer a lookup for `{i, j}`.
+struct PositiveEqPairs {
+    pairs: DetHashSet<(TermId, TermId)>,
+}
+
+impl PositiveEqPairs {
+    fn collect(terms: &TermStore, literals: &[TermId]) -> Self {
+        let mut pairs = det_hash_set_new();
+        for &lit in literals {
+            if let Some((a, b)) = equality_sides(terms, lit) {
+                pairs.insert(unordered(a, b));
+            }
+        }
+        Self { pairs }
+    }
+
+    fn contains(&self, a: TermId, b: TermId) -> bool {
+        self.pairs.contains(&unordered(a, b))
+    }
+}
+
+fn unordered(a: TermId, b: TermId) -> (TermId, TermId) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// See [`validate_array_store_permutation`] for the schema and its soundness
+/// argument. Every numbered condition there is enforced here.
+fn matches_store_permutation(terms: &TermStore, literals: &[TermId]) -> bool {
+    // Cheap pre-filter: the schema needs at least one positive equality between
+    // two array-sorted `store` applications, plus one index-equality literal.
+    if literals.len() < 2 {
+        return false;
+    }
+    let mut pairs: Option<PositiveEqPairs> = None;
+    for &lit in literals {
+        let Some((lhs, rhs)) = equality_sides(terms, lit) else {
+            continue;
+        };
+        if !matches!(terms.sort(lhs), Sort::Array(_)) || terms.sort(lhs) != terms.sort(rhs) {
+            continue;
+        }
+        let (Some(left), Some(right)) =
+            (parse_store_chain(terms, lhs), parse_store_chain(terms, rhs))
+        else {
+            continue;
+        };
+        // (1) same base array, (2) same chain length >= 2.
+        if left.base != right.base || left.entries.len() != right.entries.len() {
+            continue;
+        }
+        let n = left.entries.len();
+        if n < 2 {
+            continue;
+        }
+        // (3) pairwise distinct index TERMS on the left chain. Combined with
+        // (4) this makes the right chain's indices distinct as well.
+        let mut indices: Vec<TermId> = left.entries.iter().map(|&(i, _)| i).collect();
+        let distinct: DetHashSet<TermId> = indices.iter().copied().collect();
+        if distinct.len() != n {
+            continue;
+        }
+        // (4) the two chains write the same multiset of (index, value) pairs.
+        let mut left_pairs = left.entries.clone();
+        let mut right_pairs = right.entries.clone();
+        left_pairs.sort_unstable();
+        right_pairs.sort_unstable();
+        if left_pairs != right_pairs {
+            continue;
+        }
+        // (5) one `(= i_p i_q)` literal per unordered index pair.
+        let eqs = pairs.get_or_insert_with(|| PositiveEqPairs::collect(terms, literals));
+        indices.sort_unstable();
+        let all_pairs_present = indices
+            .iter()
+            .enumerate()
+            .all(|(p, &ip)| indices[p + 1..].iter().all(|&iq| eqs.contains(ip, iq)));
+        if all_pairs_present {
+            return true;
+        }
+    }
+    false
+}
+
+/// The denotation of `eval(C, x)`: either a value term lifted straight out of
+/// the chain, or the `select` of the chain's base array at `x`.
+///
+/// The `select` case is kept symbolic because the checker holds an immutable
+/// `TermStore` and cannot intern `(select base x)` to compare `TermId`s.
+enum ChainValue {
+    Value(TermId),
+    SelectOfBase { array: TermId, index: TermId },
+}
+
+impl ChainValue {
+    /// Whether `term` denotes this evaluation result.
+    fn denotes(&self, terms: &TermStore, term: TermId) -> bool {
+        match *self {
+            Self::Value(v) => v == term,
+            Self::SelectOfBase { array, index } => is_select_of(terms, term, array, index),
+        }
+    }
+}
+
+/// Read-over-write evaluation of `term` at `index`, consuming one positive
+/// `(= index i)` clause literal per skipped `store`. Returns `None` when the
+/// chain cannot be evaluated with the disequalities the clause actually
+/// carries — the fail-closed case.
+fn eval_chain_at(
+    terms: &TermStore,
+    term: TermId,
+    index: TermId,
+    eqs: &PositiveEqPairs,
+) -> Option<ChainValue> {
+    let chain = parse_store_chain(terms, term)?;
+    let Sort::Array(array_sort) = terms.sort(term) else {
+        return None;
+    };
+    if terms.sort(index) != &array_sort.index_sort {
+        return None;
+    }
+    for &(entry_index, entry_value) in &chain.entries {
+        if entry_index == index {
+            return Some(ChainValue::Value(entry_value));
+        }
+        // Skipping this store is only justified when the clause itself carries
+        // the `(= index entry_index)` literal we get to assume false.
+        if !eqs.contains(index, entry_index) {
+            return None;
+        }
+    }
+    Some(ChainValue::SelectOfBase {
+        array: chain.base,
+        index,
+    })
+}
+
+/// See [`validate_array_row_chain`] for the schema and its soundness argument.
+fn matches_row_chain(terms: &TermStore, literals: &[TermId]) -> bool {
+    let eqs = PositiveEqPairs::collect(terms, literals);
+    matches_row_chain_eval(terms, literals, &eqs)
+        || matches_row_chain_under_array_eq(terms, literals, &eqs)
+}
+
+/// Sub-schema (A): `(= (select C x) eval(C, x))`.
+fn matches_row_chain_eval(terms: &TermStore, literals: &[TermId], eqs: &PositiveEqPairs) -> bool {
+    for &lit in literals {
+        let Some((lhs, rhs)) = equality_sides(terms, lit) else {
+            continue;
+        };
+        if terms.sort(lhs) != terms.sort(rhs) {
+            continue;
+        }
+        for (select_side, value_side) in [(lhs, rhs), (rhs, lhs)] {
+            let Some((array, read_index)) = well_sorted_select_parts(terms, select_side) else {
+                continue;
+            };
+            // A depth-0 "chain" would make this the reflexivity of the very
+            // literal being concluded, which proves nothing new; require at
+            // least one store so the step is a genuine ROW instance.
+            let Some(chain) = parse_store_chain(terms, array) else {
+                continue;
+            };
+            if chain.entries.is_empty() {
+                continue;
+            }
+            if eval_chain_at(terms, array, read_index, eqs)
+                .is_some_and(|value| value.denotes(terms, value_side))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Sub-schema (B): `(not (= L R))` plus `(= eval(L, x) eval(R, x))`.
+fn matches_row_chain_under_array_eq(
+    terms: &TermStore,
+    literals: &[TermId],
+    eqs: &PositiveEqPairs,
+) -> bool {
+    // Array-equality premises are rare; conclusions carrying a top-level
+    // select are the only candidates, so this stays close to linear in
+    // practice and never enumerates unrelated index terms.
+    let premises: Vec<(TermId, TermId)> = literals
+        .iter()
+        .filter_map(|&lit| negated_equality_sides(terms, lit))
+        .filter(|&(l, r)| matches!(terms.sort(l), Sort::Array(_)) && terms.sort(l) == terms.sort(r))
+        .collect();
+    if premises.is_empty() {
+        return false;
+    }
+    for &lit in literals {
+        let Some((lhs, rhs)) = equality_sides(terms, lit) else {
+            continue;
+        };
+        if terms.sort(lhs) != terms.sort(rhs) {
+            continue;
+        }
+        // The witness index is read off the conclusion's own selects; the
+        // checker never invents one.
+        let mut candidates: Vec<TermId> = Vec::new();
+        for side in [lhs, rhs] {
+            if let Some((_, read_index)) = well_sorted_select_parts(terms, side) {
+                if !candidates.contains(&read_index) {
+                    candidates.push(read_index);
+                }
+            }
+        }
+        for &(left, right) in &premises {
+            let Sort::Array(array_sort) = terms.sort(left) else {
+                continue;
+            };
+            if terms.sort(lhs) != &array_sort.element_sort {
+                continue;
+            }
+            for &read_index in &candidates {
+                if terms.sort(read_index) != &array_sort.index_sort {
+                    continue;
+                }
+                let (Some(left_value), Some(right_value)) = (
+                    eval_chain_at(terms, left, read_index, eqs),
+                    eval_chain_at(terms, right, read_index, eqs),
+                ) else {
+                    continue;
+                };
+                if (left_value.denotes(terms, lhs) && right_value.denotes(terms, rhs))
+                    || (left_value.denotes(terms, rhs) && right_value.denotes(terms, lhs))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `(select array index)` with a signature that agrees with `array`'s sort.
+fn well_sorted_select_parts(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
+    let (array, index) = select_parts(terms, term)?;
+    let Sort::Array(array_sort) = terms.sort(array) else {
+        return None;
+    };
+    if terms.sort(index) != &array_sort.index_sort || terms.sort(term) != &array_sort.element_sort {
+        return None;
+    }
+    Some((array, index))
 }
 
 fn equality_sides(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {

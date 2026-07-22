@@ -399,7 +399,7 @@ fn dead_block_state_args_slice_to_parity_coi() {
 
     // Full latch count without slicing: acc(1) + (1 + ndead) Int args * INT_WIDTH.
     let full = 1 + (1 + ndead) * INT_WIDTH;
-    assert!(full >= 1 + 5 * INT_WIDTH, "header should be wide");
+    assert!(full > 5 * INT_WIDTH, "header should be wide");
 
     let lowering = lower_loop(&problem).expect("dead-arg count-parity CHC should map");
     // COI slice keeps only {acc(0), count[0](1)}.

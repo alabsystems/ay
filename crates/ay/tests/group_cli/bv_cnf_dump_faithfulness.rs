@@ -828,6 +828,135 @@ fn dump_destination_and_coordination_lock_cannot_alias_other_cli_paths() {
 
 #[test]
 #[timeout(60_000)]
+fn paired_drat_destination_and_lock_cannot_alias_input_or_other_outputs() {
+    let temp = TempDir::new("drat-expanded-path-collision");
+    let input = temp.write("input.smt2", CONSTRAINED_BV_SAT);
+    let original_input = std::fs::read(&input).expect("read original input");
+    let dump = temp.path("certificate.cnf");
+
+    let input_collision = Command::new(ay_binary())
+        .arg("solve")
+        .arg("--no-verify-proof")
+        .arg("--dump-bv-cnf")
+        .arg(&dump)
+        .arg("--proof")
+        .arg(&input)
+        .arg("--proof-format")
+        .arg("drat")
+        .arg(&input)
+        .output()
+        .expect("spawn DRAT/input collision check");
+    let (stdout, stderr) = output_text(&input_collision);
+    assert!(
+        !input_collision.status.success(),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("BV DRAT proof path") || stderr.contains("BV DRAT proof path"),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&input).expect("input survives DRAT collision rejection"),
+        original_input
+    );
+    assert!(!dump.exists());
+
+    let proof = temp.path("certificate.drat");
+    let drat_lock = temp.path(".certificate.drat.ay-bv-cnf.lock");
+    let lock_collision = Command::new(ay_binary())
+        .arg("solve")
+        .arg("--no-verify-proof")
+        .arg("--dump-bv-cnf")
+        .arg(&dump)
+        .arg("--proof")
+        .arg(&proof)
+        .arg("--trace-file")
+        .arg(&drat_lock)
+        .arg(&input)
+        .output()
+        .expect("spawn DRAT-lock/output collision check");
+    let (stdout, stderr) = output_text(&lock_collision);
+    assert!(
+        !lock_collision.status.success(),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        (stdout.contains("DRAT coordination lock") || stderr.contains("DRAT coordination lock"))
+            && (stdout.contains("trace output") || stderr.contains("trace output")),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(!dump.exists());
+    assert!(!proof.exists());
+    assert!(!drat_lock.exists());
+}
+
+#[test]
+#[timeout(60_000)]
+fn paired_cnf_and_drat_paths_are_pairwise_disjoint() {
+    let temp = TempDir::new("certificate-pairwise-collision");
+    let input = temp.write("input.smt2", CONSTRAINED_BV_SAT);
+    let dump = temp.path("certificate.cnf");
+    let cnf_lock = temp.path(".certificate.cnf.ay-bv-cnf.lock");
+
+    let output = Command::new(ay_binary())
+        .arg("solve")
+        .arg("--no-verify-proof")
+        .arg("--dump-bv-cnf")
+        .arg(&dump)
+        .arg("--proof")
+        .arg(&cnf_lock)
+        .arg("--proof-format")
+        .arg("drat")
+        .arg(&input)
+        .output()
+        .expect("spawn pairwise CNF-lock/DRAT collision check");
+    let (stdout, stderr) = output_text(&output);
+    assert!(!output.status.success(), "stdout={stdout}; stderr={stderr}");
+    assert!(
+        (stdout.contains("CNF coordination lock") || stderr.contains("CNF coordination lock"))
+            && (stdout.contains("proof path") || stderr.contains("proof path")),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(!dump.exists());
+    assert!(!cnf_lock.exists());
+}
+
+#[test]
+#[cfg(unix)]
+#[timeout(60_000)]
+fn paired_drat_hard_link_alias_of_input_is_rejected() {
+    let temp = TempDir::new("drat-hard-link-input-collision");
+    let input = temp.write("input.smt2", CONSTRAINED_BV_SAT);
+    let original_input = std::fs::read(&input).expect("read original input");
+    let proof_alias = temp.path("proof.drat");
+    std::fs::hard_link(&input, &proof_alias).expect("hard-link proof path to input");
+    let dump = temp.path("certificate.cnf");
+
+    let output = Command::new(ay_binary())
+        .arg("solve")
+        .arg("--no-verify-proof")
+        .arg("--dump-bv-cnf")
+        .arg(&dump)
+        .arg("--proof")
+        .arg(&proof_alias)
+        .arg(&input)
+        .output()
+        .expect("spawn hard-link collision check");
+    let (stdout, stderr) = output_text(&output);
+    assert!(!output.status.success(), "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.contains("BV DRAT proof path") || stderr.contains("BV DRAT proof path"),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&input).expect("input survives hard-link rejection"),
+        original_input
+    );
+    assert!(!dump.exists());
+}
+
+#[test]
+#[timeout(60_000)]
 fn non_solve_early_modes_reject_requested_export_and_remove_stale_artifact() {
     for mode in ["features", "z3-params"] {
         let temp = TempDir::new(mode);

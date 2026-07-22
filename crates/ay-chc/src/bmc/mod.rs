@@ -6840,7 +6840,7 @@ impl BmcSolver {
             // 64 fresh rule instances; a `None` here degrades exactly like
             // the existing unsupported-shape bail (caller falls back /
             // returns Unknown — never a verdict).
-            if instance % 64 == 0
+            if instance.is_multiple_of(64)
                 && matches!(
                     self.solve_deadline.get(),
                     Some(d) if ay_core::time::Instant::now() >= d

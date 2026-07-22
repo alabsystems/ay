@@ -269,11 +269,15 @@ pub(crate) fn reconstruct_missing_farkas_coefficients(
             TheoryLemmaKind::BvBitBlast
                 | TheoryLemmaKind::BvBitBlastGate { .. }
                 | TheoryLemmaKind::ArraySelectStore { .. }
+                | TheoryLemmaKind::ArrayStorePermutation
+                | TheoryLemmaKind::ArrayRowChain
                 | TheoryLemmaKind::ArrayExtensionality
                 | TheoryLemmaKind::FpToBv { .. }
                 | TheoryLemmaKind::StringLengthAxiom
                 | TheoryLemmaKind::StringContentAxiom
                 | TheoryLemmaKind::StringNormalForm
+                | TheoryLemmaKind::StringGroundEval
+                | TheoryLemmaKind::RegexIntersectEmpty
                 | TheoryLemmaKind::EufTransitive
                 | TheoryLemmaKind::EufCongruent
                 | TheoryLemmaKind::EufCongruentPred

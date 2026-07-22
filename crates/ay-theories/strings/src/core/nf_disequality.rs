@@ -200,9 +200,26 @@ impl CoreSolver {
                 }
             }
 
-            if Self::is_unresolved_string_application(terms, state, t1)
-                || Self::is_unresolved_string_application(terms, state, t2)
-            {
+            // Closure 1 (`AY_STR_NF=1`, sub-flag 1): reduction awareness.
+            //
+            // An unresolved string application that has been REDUCED via a
+            // DPLL-level reduction lemma (str.at/str.substr/... decomposition)
+            // no longer needs theory-side evaluation: its semantics are fully
+            // captured by the reduction axioms in the SAT encoding, and its
+            // EQC carries the reduction bridge skolem (`at(s,i) = skt`,
+            // `substr(s,n,m) = skt`), so the NF deq machinery above (Phase 2
+            // walk + LengthSplit/EqualitySplit lemmas) already processed the
+            // disequality through the skolem web. Latching `incomplete` here
+            // anyway — the pre-closure behavior — permanently re-latched every
+            // `¬(at(..) = c)` each round (the dominant pyex idiom), even when
+            // the deq had been fully certified. SAT-side soundness is
+            // unaffected: models still pass the definitive model-validation
+            // chokepoint before SAT is trusted.
+            let latches_unresolved = |t: TermId| {
+                Self::is_unresolved_string_application(terms, state, t)
+                    && !(crate::str_nf_closure_enabled(1) && self.reduced_terms.contains(&t))
+            };
+            if latches_unresolved(t1) || latches_unresolved(t2) {
                 saw_incomplete = true;
             }
         }

@@ -5148,7 +5148,10 @@ impl ChcProofTranscriptMetadata {
         if !base.accepted_as_proof || !matches!(base.result.as_str(), "safe" | "unsafe") {
             return None;
         }
-        if summary.verdict != base.result || manifest.result != base.result {
+        if summary.verdict != base.result {
+            return None;
+        }
+        if manifest.result != base.result {
             return None;
         }
         if summary.problem.sha256 != base.normalized_input_sha256

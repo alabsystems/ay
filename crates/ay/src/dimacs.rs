@@ -12,13 +12,17 @@ use super::{
     TIMED_OUT, VERDICT_PRINTED,
 };
 use crate::proof_artifact::{
-    write_proof_artifact_or_exit, ProofArtifactProblem, ProofArtifactTheoryMetadata,
+    write_sealed_proof_artifact, ProofArtifactProblem, ProofArtifactTheoryMetadata,
 };
-use std::fs::File;
-use std::io::{self, BufWriter, Read, Write};
+use sha2::{Digest as _, Sha256};
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::Ordering;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock,
+};
 
 #[cfg(test)]
 const DIMACS_TIMEOUT_EXIT_CODE: i32 = 124;
@@ -30,6 +34,1618 @@ const CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV: &str =
 
 fn proof_output_writer(file: File) -> BufWriter<File> {
     BufWriter::with_capacity(PROOF_OUTPUT_BUFFER_CAPACITY, file)
+}
+
+enum SolverDimacsProofWriter {
+    Required(BufWriter<File>),
+    Optional {
+        writer: BufWriter<File>,
+        path: String,
+        failed: Arc<AtomicBool>,
+    },
+}
+
+impl Write for SolverDimacsProofWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Required(writer) => writer.write(buffer),
+            Self::Optional {
+                writer,
+                path,
+                failed,
+            } => {
+                if failed.load(Ordering::Acquire) {
+                    return Ok(buffer.len());
+                }
+                #[cfg(test)]
+                if take_injected_optional_dimacs_writer_failure() {
+                    safe_eprintln!(
+                        "c Warning: optional synthesized DIMACS proof {path} stopped recording after an injected write failure; solver verdict remains authoritative"
+                    );
+                    failed.store(true, Ordering::Release);
+                    return Ok(buffer.len());
+                }
+                match writer.write_all(buffer) {
+                    Ok(()) => Ok(buffer.len()),
+                    Err(error) => {
+                        safe_eprintln!(
+                            "c Warning: optional synthesized DIMACS proof {path} stopped recording after a write failure: {error}; solver verdict remains authoritative"
+                        );
+                        failed.store(true, Ordering::Release);
+                        Ok(buffer.len())
+                    }
+                }
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Required(writer) => writer.flush(),
+            Self::Optional {
+                writer,
+                path,
+                failed,
+            } => {
+                if failed.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if let Err(error) = writer.flush() {
+                    safe_eprintln!(
+                        "c Warning: optional synthesized DIMACS proof {path} failed to flush: {error}; solver verdict remains authoritative"
+                    );
+                    failed.store(true, Ordering::Release);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn solver_proof_output_writer(
+    file: File,
+    proof: &ProofConfig,
+) -> io::Result<SolverDimacsProofWriter> {
+    let writer = proof_output_writer(file);
+    if synthesized_default_dimacs_proof_is_optional(proof) {
+        Ok(SolverDimacsProofWriter::Optional {
+            writer,
+            path: proof.path.clone(),
+            failed: owned_dimacs_proof_write_failure_flag(&proof.path)?,
+        })
+    } else {
+        Ok(SolverDimacsProofWriter::Required(writer))
+    }
+}
+
+pub(crate) type Sha256Digest = [u8; 32];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProofFileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    created: Option<std::time::SystemTime>,
+}
+
+impl ProofFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Self {
+                created: metadata.created().ok(),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PublishedDimacsProof {
+    identity: ProofFileIdentity,
+    len: u64,
+    sha256: Sha256Digest,
+}
+
+#[cfg(target_os = "linux")]
+const DIMACS_PROOF_STAGING_ATTEMPTS: u64 = 128;
+#[cfg(target_os = "linux")]
+const DIMACS_PROOF_STAGING_PREFIX: &str = ".ay-dimacs-proof-";
+#[cfg(target_os = "linux")]
+static DIMACS_PROOF_STAGING_NONCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnedDimacsProofLocation {
+    Anonymous,
+    Staged,
+    Public,
+    Removed,
+}
+
+struct OwnedDimacsProof {
+    descriptor: File,
+    identity: ProofFileIdentity,
+    staging_path: Option<PathBuf>,
+    location: OwnedDimacsProofLocation,
+    write_failed: Arc<AtomicBool>,
+    published: Option<PublishedDimacsProof>,
+    status_reservation: Option<DimacsProofStatusReservation>,
+    invalidation: DimacsPublicationInvalidation,
+}
+
+#[cfg(target_os = "linux")]
+struct DimacsProofStatusReservation {
+    proof_path: PathBuf,
+    status_path: PathBuf,
+    lock_path: PathBuf,
+    lock_descriptor: File,
+    lock_identity: ProofFileIdentity,
+}
+
+#[cfg(not(target_os = "linux"))]
+struct DimacsProofStatusReservation;
+
+struct RetainedDimacsPublication {
+    descriptor: File,
+    path: PathBuf,
+    identity: ProofFileIdentity,
+    len: u64,
+    sha256: Sha256Digest,
+    label: &'static str,
+    invalidation: DimacsPublicationInvalidation,
+}
+
+#[derive(Clone, Copy)]
+enum DimacsPublicationInvalidation {
+    Empty,
+    Proof { binary: bool },
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InjectedDimacsProofCreateFailure {
+    Identity,
+    Clone,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    #[cfg(target_os = "linux")]
+    static INJECTED_DIMACS_PROOF_CREATE_FAILURE:
+        std::cell::Cell<Option<InjectedDimacsProofCreateFailure>> = const { std::cell::Cell::new(None) };
+    #[cfg(target_os = "linux")]
+    static INJECTED_DIMACS_PROOF_CLEANUP_FAILURE:
+        std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(target_os = "linux")]
+    static INJECTED_DIMACS_PROOF_CLEANUP_REPLACEMENT:
+        std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static INJECTED_OPTIONAL_DIMACS_WRITER_FAILURE:
+        std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(target_os = "linux")]
+    static INJECTED_DIMACS_STATUS_LOCK_IDENTITY_FAILURE:
+        std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(target_os = "linux")]
+    static INJECTED_ANONYMOUS_DIMACS_STAGING_ERROR:
+        std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    #[cfg(target_os = "linux")]
+    static INJECTED_DIMACS_RENAME_NOREPLACE_ERROR:
+        std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn inject_dimacs_proof_identity_failure_once() {
+    INJECTED_DIMACS_PROOF_CREATE_FAILURE.with(|failure| {
+        failure.set(Some(InjectedDimacsProofCreateFailure::Identity));
+    });
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn inject_dimacs_proof_clone_failure_once() {
+    INJECTED_DIMACS_PROOF_CREATE_FAILURE.with(|failure| {
+        failure.set(Some(InjectedDimacsProofCreateFailure::Clone));
+    });
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn inject_dimacs_proof_cleanup_failure_once() {
+    INJECTED_DIMACS_PROOF_CLEANUP_FAILURE.with(|failure| failure.set(true));
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn inject_dimacs_proof_cleanup_replacement_once() {
+    INJECTED_DIMACS_PROOF_CLEANUP_REPLACEMENT.with(|replacement| replacement.set(true));
+}
+
+#[cfg(test)]
+fn inject_optional_dimacs_writer_failure_once() {
+    INJECTED_OPTIONAL_DIMACS_WRITER_FAILURE.with(|failure| failure.set(true));
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn inject_dimacs_status_lock_identity_failure_once() {
+    INJECTED_DIMACS_STATUS_LOCK_IDENTITY_FAILURE.with(|failure| failure.set(true));
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn inject_anonymous_dimacs_staging_error_once(raw_os_error: i32) {
+    INJECTED_ANONYMOUS_DIMACS_STAGING_ERROR.with(|error| error.set(Some(raw_os_error)));
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn inject_dimacs_rename_noreplace_error_once(raw_os_error: i32) {
+    INJECTED_DIMACS_RENAME_NOREPLACE_ERROR.with(|error| error.set(Some(raw_os_error)));
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn take_injected_dimacs_proof_create_failure(expected: InjectedDimacsProofCreateFailure) -> bool {
+    INJECTED_DIMACS_PROOF_CREATE_FAILURE.with(|failure| {
+        if failure.get() == Some(expected) {
+            failure.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn take_injected_dimacs_proof_cleanup_failure() -> bool {
+    INJECTED_DIMACS_PROOF_CLEANUP_FAILURE.with(|failure| failure.replace(false))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn take_injected_dimacs_proof_cleanup_replacement() -> bool {
+    INJECTED_DIMACS_PROOF_CLEANUP_REPLACEMENT.with(|replacement| replacement.replace(false))
+}
+
+#[cfg(test)]
+fn take_injected_optional_dimacs_writer_failure() -> bool {
+    INJECTED_OPTIONAL_DIMACS_WRITER_FAILURE.with(|failure| failure.replace(false))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn take_injected_dimacs_status_lock_identity_failure() -> bool {
+    INJECTED_DIMACS_STATUS_LOCK_IDENTITY_FAILURE.with(|failure| failure.replace(false))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn take_injected_anonymous_dimacs_staging_error() -> Option<i32> {
+    INJECTED_ANONYMOUS_DIMACS_STAGING_ERROR.with(|error| error.replace(None))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn take_injected_dimacs_rename_noreplace_error() -> Option<i32> {
+    INJECTED_DIMACS_RENAME_NOREPLACE_ERROR.with(|error| error.replace(None))
+}
+
+fn owned_dimacs_proofs() -> &'static Mutex<HashMap<PathBuf, OwnedDimacsProof>> {
+    static OWNED: OnceLock<Mutex<HashMap<PathBuf, OwnedDimacsProof>>> = OnceLock::new();
+    OWNED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn dimacs_proof_registry_error() -> io::Error {
+    io::Error::other("DIMACS proof ownership registry is poisoned")
+}
+
+fn resolved_dimacs_proof_path(path: &str) -> io::Result<PathBuf> {
+    crate::run::resolve_artifact_target(Path::new(path))
+}
+
+fn owned_dimacs_proof_write_failure_flag(path: &str) -> io::Result<Arc<AtomicBool>> {
+    let resolved = resolved_dimacs_proof_path(path)?;
+    owned_dimacs_proofs()
+        .lock()
+        .map_err(|_| dimacs_proof_registry_error())?
+        .get(&resolved)
+        .map(|state| Arc::clone(&state.write_failed))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "no active DIMACS proof writer exists for '{}'",
+                    resolved.display()
+                ),
+            )
+        })
+}
+
+fn regular_single_link_identity(file: &File, path: &Path) -> io::Result<ProofFileIdentity> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "DIMACS proof output '{}' is not a regular file",
+                path.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "DIMACS proof output '{}' has {} hard links; exactly one is required",
+                    path.display(),
+                    metadata.nlink()
+                ),
+            ));
+        }
+    }
+    Ok(ProofFileIdentity::from_metadata(&metadata))
+}
+
+fn open_dimacs_regular_file(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("'{}' is not a regular file", path.display()),
+            ));
+        }
+        File::open(path)
+    }
+}
+
+fn regular_file_identity(file: &File, path: &Path) -> io::Result<ProofFileIdentity> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "DIMACS proof output '{}' is not a regular file",
+                path.display()
+            ),
+        ));
+    }
+    Ok(ProofFileIdentity::from_metadata(&metadata))
+}
+
+#[cfg(target_os = "linux")]
+fn create_private_dimacs_staging_directory(target: &Path) -> io::Result<(PathBuf, PathBuf)> {
+    let parent = target.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "DIMACS proof target has no parent directory",
+        )
+    })?;
+    let first =
+        DIMACS_PROOF_STAGING_NONCE.fetch_add(DIMACS_PROOF_STAGING_ATTEMPTS, Ordering::Relaxed);
+    for offset in 0..DIMACS_PROOF_STAGING_ATTEMPTS {
+        let directory = parent.join(format!(
+            "{DIMACS_PROOF_STAGING_PREFIX}{}-{}",
+            std::process::id(),
+            first.wrapping_add(offset)
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        match builder.create(&directory) {
+            Ok(()) => return Ok((directory.clone(), directory.join("proof"))),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "could not reserve a private DIMACS proof staging directory after {DIMACS_PROOF_STAGING_ATTEMPTS} attempts"
+        ),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn create_anonymous_dimacs_staging_file(target: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    #[cfg(test)]
+    if let Some(raw_os_error) = take_injected_anonymous_dimacs_staging_error() {
+        return Err(io::Error::from_raw_os_error(raw_os_error));
+    }
+
+    let parent = target.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "DIMACS proof target has no parent directory",
+        )
+    })?;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_TMPFILE | nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    options.open(parent)
+}
+
+#[cfg(target_os = "linux")]
+fn anonymous_dimacs_staging_is_unsupported(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        // EOPNOTSUPP is the documented filesystem rejection. EINVAL is
+        // returned by filesystems which reject the O_TMPFILE flag combination.
+        // EISDIR can identify a pre-O_TMPFILE kernel, which also lacks the
+        // renameat2 primitive required to publish and quarantine a named stage;
+        // it must therefore remain fail closed. Permission, quota, I/O, and
+        // exhaustion failures likewise retain their precise result.
+        Some(nix::libc::EOPNOTSUPP | nix::libc::EINVAL)
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn create_named_dimacs_staging_file(target: &Path) -> io::Result<(PathBuf, File)> {
+    let parent = target.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "DIMACS proof target has no parent directory",
+        )
+    })?;
+    let first =
+        DIMACS_PROOF_STAGING_NONCE.fetch_add(DIMACS_PROOF_STAGING_ATTEMPTS, Ordering::Relaxed);
+    for offset in 0..DIMACS_PROOF_STAGING_ATTEMPTS {
+        let staging_path = parent.join(format!(
+            "{DIMACS_PROOF_STAGING_PREFIX}{}-{}.stage",
+            std::process::id(),
+            first.wrapping_add(offset)
+        ));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+        }
+        match options.open(&staging_path) {
+            Ok(file) => return Ok((staging_path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "could not reserve a named DIMACS proof staging file after {DIMACS_PROOF_STAGING_ATTEMPTS} attempts"
+        ),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn cleanup_unregistered_dimacs_staging(
+    descriptor: &File,
+    staging_path: &Path,
+    invalidation: DimacsPublicationInvalidation,
+) -> io::Result<()> {
+    let descriptor_identity = regular_file_identity(descriptor, staging_path)?;
+    if !remove_authenticated_visible_file(
+        staging_path,
+        descriptor,
+        descriptor_identity,
+        "private DIMACS staging file",
+        invalidation,
+    )? {
+        match std::fs::symlink_metadata(staging_path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(io::Error::other(format!(
+                    "private DIMACS proof staging path '{}' was replaced during failed setup; it was preserved",
+                    staging_path.display()
+                )));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn dimacs_proof_setup_error(
+    error: io::Error,
+    cleanup: io::Result<()>,
+    staging_path: &Path,
+) -> io::Error {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup_error) => io::Error::other(format!(
+            "{error}; failed to clean descriptor-owned private DIMACS staging file '{}': {cleanup_error}",
+            staging_path.display()
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn preexisting_dimacs_proof_error(path: &Path, error: Option<&io::Error>) -> io::Error {
+    let detail = error.map_or_else(String::new, |error| format!(": {error}"));
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "refusing to overwrite pre-existing DIMACS proof output '{}'{detail}",
+            path.display()
+        ),
+    )
+}
+
+/// Reserve a proof target for this process without following or truncating an
+/// existing object. Linux prefers an anonymous descriptor and falls back to a
+/// randomized mode-0600 sibling stage when the filesystem lacks `O_TMPFILE`.
+/// Sealing publishes the authenticated generation with no-clobber semantics.
+/// Unsupported platforms fail before reserving any proof/status pathname. The
+/// registry retains a descriptor for every later seal, verification, artifact
+/// scan, and cleanup.
+#[cfg(target_os = "linux")]
+fn create_owned_dimacs_proof_file_with_status(
+    path: &str,
+    status_reservation: &mut Option<DimacsProofStatusReservation>,
+    invalidation: DimacsPublicationInvalidation,
+) -> io::Result<File> {
+    let resolved = match status_reservation.as_ref() {
+        Some(reservation) => reservation.proof_path.clone(),
+        None => resolved_dimacs_proof_path(path)?,
+    };
+    let mut owned = owned_dimacs_proofs()
+        .lock()
+        .map_err(|_| dimacs_proof_registry_error())?;
+    if owned.contains_key(&resolved) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "DIMACS proof output '{}' is already active",
+                resolved.display()
+            ),
+        ));
+    }
+
+    match std::fs::symlink_metadata(&resolved) {
+        Ok(_) => return Err(preexisting_dimacs_proof_error(&resolved, None)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let (file, staging_path, location) = match create_anonymous_dimacs_staging_file(&resolved) {
+        Ok(file) => (file, None, OwnedDimacsProofLocation::Anonymous),
+        Err(error) if anonymous_dimacs_staging_is_unsupported(&error) => {
+            let (staging, file) = create_named_dimacs_staging_file(&resolved)?;
+            (file, Some(staging), OwnedDimacsProofLocation::Staged)
+        }
+        Err(error) => return Err(error),
+    };
+    let staging_label = staging_path.as_deref().unwrap_or(&resolved);
+    #[cfg(test)]
+    let identity_result =
+        if take_injected_dimacs_proof_create_failure(InjectedDimacsProofCreateFailure::Identity) {
+            Err(io::Error::other("injected DIMACS proof identity failure"))
+        } else {
+            match location {
+                OwnedDimacsProofLocation::Anonymous => regular_file_identity(&file, staging_label),
+                _ => regular_single_link_identity(&file, staging_label),
+            }
+        };
+    #[cfg(not(test))]
+    let identity_result = match location {
+        OwnedDimacsProofLocation::Anonymous => regular_file_identity(&file, staging_label),
+        _ => regular_single_link_identity(&file, staging_label),
+    };
+    let identity = match identity_result {
+        Ok(identity) => identity,
+        Err(error) => {
+            let cleanup = staging_path
+                .as_deref()
+                .map(|staging| cleanup_unregistered_dimacs_staging(&file, staging, invalidation))
+                .unwrap_or(Ok(()));
+            return Err(dimacs_proof_setup_error(error, cleanup, staging_label));
+        }
+    };
+    #[cfg(test)]
+    let descriptor_result =
+        if take_injected_dimacs_proof_create_failure(InjectedDimacsProofCreateFailure::Clone) {
+            Err(io::Error::other("injected DIMACS proof clone failure"))
+        } else {
+            file.try_clone()
+        };
+    #[cfg(not(test))]
+    let descriptor_result = file.try_clone();
+    let descriptor = match descriptor_result {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            let cleanup = staging_path
+                .as_deref()
+                .map(|staging| cleanup_unregistered_dimacs_staging(&file, staging, invalidation))
+                .unwrap_or(Ok(()));
+            return Err(dimacs_proof_setup_error(error, cleanup, staging_label));
+        }
+    };
+    let write_failed = Arc::new(AtomicBool::new(false));
+    owned.insert(
+        resolved,
+        OwnedDimacsProof {
+            descriptor,
+            identity,
+            staging_path,
+            location,
+            write_failed,
+            published: None,
+            status_reservation: status_reservation.take(),
+            invalidation,
+        },
+    );
+    Ok(file)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_owned_dimacs_proof_file_with_status(
+    _path: &str,
+    _status_reservation: &mut Option<DimacsProofStatusReservation>,
+    _invalidation: DimacsPublicationInvalidation,
+) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "transactional DIMACS proof publication is unavailable on this platform",
+    ))
+}
+
+fn create_owned_dimacs_proof_file(path: &str) -> io::Result<File> {
+    let mut status_reservation = None;
+    create_owned_dimacs_proof_file_with_status(
+        path,
+        &mut status_reservation,
+        DimacsPublicationInvalidation::Proof { binary: false },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn create_configured_dimacs_proof_file(proof: &ProofConfig) -> io::Result<File> {
+    if !proof.synthesized_default {
+        let mut status_reservation = None;
+        return create_owned_dimacs_proof_file_with_status(
+            &proof.path,
+            &mut status_reservation,
+            DimacsPublicationInvalidation::Proof {
+                binary: proof.binary,
+            },
+        );
+    }
+
+    let mut status_reservation = Some(reserve_dimacs_proof_status(&proof.path)?);
+    match create_owned_dimacs_proof_file_with_status(
+        &proof.path,
+        &mut status_reservation,
+        DimacsPublicationInvalidation::Proof {
+            binary: proof.binary,
+        },
+    ) {
+        Ok(file) => Ok(file),
+        Err(proof_error) => {
+            let Some(reservation) = status_reservation.take() else {
+                return Err(proof_error);
+            };
+            match publish_reserved_dimacs_proof_status(reservation, "stale-not-current", None) {
+                Ok(_) => Err(proof_error),
+                Err(status_error) => Err(io::Error::other(format!(
+                    "{proof_error}; failed to publish the synthesized-default stale status: {status_error}"
+                ))),
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_configured_dimacs_proof_file(_proof: &ProofConfig) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "transactional DIMACS proof publication is unavailable on this platform",
+    ))
+}
+
+fn hash_file(file: &mut File) -> io::Result<(u64, Sha256Digest)> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut len = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        len = len
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("DIMACS proof length overflow"))?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((len, hasher.finalize().into()))
+}
+
+impl RetainedDimacsPublication {
+    fn capture(
+        mut descriptor: File,
+        path: PathBuf,
+        label: &'static str,
+        expected: Option<PublishedDimacsProof>,
+        invalidation: DimacsPublicationInvalidation,
+    ) -> io::Result<Self> {
+        let invalidation_descriptor = match descriptor.try_clone() {
+            Ok(clone) => clone,
+            Err(error) => {
+                return Err(dimacs_invalidation_error(
+                    error,
+                    invalidate_dimacs_descriptor(&descriptor, invalidation),
+                    label,
+                ));
+            }
+        };
+        let captured = (|| -> io::Result<Self> {
+            let identity = regular_single_link_identity(&descriptor, &path)?;
+            let (len, sha256) = hash_file(&mut descriptor)?;
+            if let Some(expected) = expected {
+                if identity != expected.identity || len != expected.len || sha256 != expected.sha256
+                {
+                    return Err(io::Error::other(format!(
+                        "retained {label} descriptor does not match its same-run publication seal"
+                    )));
+                }
+            }
+            let mut visible = open_dimacs_regular_file(&path)?;
+            if regular_single_link_identity(&visible, &path)? != identity {
+                return Err(io::Error::other(format!(
+                    "{label} path '{}' does not name its retained same-run descriptor",
+                    path.display()
+                )));
+            }
+            let (visible_len, visible_sha256) = hash_file(&mut visible)?;
+            if visible_len != len || visible_sha256 != sha256 {
+                return Err(io::Error::other(format!(
+                    "{label} path '{}' changed while publication authority was captured",
+                    path.display()
+                )));
+            }
+            Ok(Self {
+                descriptor,
+                path,
+                identity,
+                len,
+                sha256,
+                label,
+                invalidation,
+            })
+        })();
+        match captured {
+            Ok(publication) => Ok(publication),
+            Err(error) => Err(dimacs_invalidation_error(
+                error,
+                invalidate_dimacs_descriptor(&invalidation_descriptor, invalidation),
+                label,
+            )),
+        }
+    }
+
+    fn validate(&mut self) -> io::Result<()> {
+        if regular_single_link_identity(&self.descriptor, &self.path)? != self.identity {
+            return Err(io::Error::other(format!(
+                "retained {} descriptor identity changed",
+                self.label
+            )));
+        }
+        let (descriptor_len, descriptor_sha256) = hash_file(&mut self.descriptor)?;
+        if descriptor_len != self.len || descriptor_sha256 != self.sha256 {
+            return Err(io::Error::other(format!(
+                "retained {} descriptor bytes changed",
+                self.label
+            )));
+        }
+        let mut visible = open_dimacs_regular_file(&self.path)?;
+        if regular_single_link_identity(&visible, &self.path)? != self.identity {
+            return Err(io::Error::other(format!(
+                "{} path '{}' was replaced",
+                self.label,
+                self.path.display()
+            )));
+        }
+        let (visible_len, visible_sha256) = hash_file(&mut visible)?;
+        if visible_len != self.len || visible_sha256 != self.sha256 {
+            return Err(io::Error::other(format!(
+                "{} path '{}' changed after authorization",
+                self.label,
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn invalidate_exact(&self) -> io::Result<()> {
+        invalidate_dimacs_descriptor(&self.descriptor, self.invalidation)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn publish_dimacs_descriptor_noreplace(descriptor: &File, target: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    let empty_path_error = match nix::unistd::linkat(
+        Some(descriptor.as_raw_fd()),
+        Path::new(""),
+        None,
+        target,
+        nix::fcntl::AtFlags::AT_EMPTY_PATH,
+    ) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if !matches!(
+        empty_path_error,
+        nix::errno::Errno::ENOENT | nix::errno::Errno::EPERM | nix::errno::Errno::EACCES
+    ) {
+        return Err(io::Error::from_raw_os_error(empty_path_error as i32));
+    }
+
+    // Ordinary unprivileged processes commonly lack CAP_DAC_READ_SEARCH,
+    // which Linux requires for AT_EMPTY_PATH. /proc/self/fd exposes the same
+    // already-authenticated descriptor; AT_SYMLINK_FOLLOW follows that procfs
+    // link and `linkat` still fails with EEXIST instead of replacing `target`.
+    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd()));
+    nix::unistd::linkat(
+        None,
+        descriptor_path.as_path(),
+        None,
+        target,
+        nix::fcntl::AtFlags::AT_SYMLINK_FOLLOW,
+    )
+    .map_err(|proc_error| {
+        let proc_error = io::Error::from_raw_os_error(proc_error as i32);
+        io::Error::new(
+            proc_error.kind(),
+            format!(
+                "descriptor publication failed via AT_EMPTY_PATH ({empty_path_error}) and /proc/self/fd ({proc_error})"
+            ),
+        )
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn rename_dimacs_noreplace(source: &Path, target: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(raw_os_error) = take_injected_dimacs_rename_noreplace_error() {
+        return Err(io::Error::from_raw_os_error(raw_os_error));
+    }
+    ay_sys::fs::rename_noreplace(source, target)
+}
+
+#[cfg(target_os = "linux")]
+fn move_dimacs_proof_to_private_quarantine(source: &Path, target: &Path) -> io::Result<()> {
+    // Never remove a public pathname unless the same platform can atomically
+    // restore a quarantined replacement without clobbering another object.
+    // Unsupported platforms fail before mutating either pathname.
+    rename_dimacs_noreplace(source, target)
+}
+
+fn invalidate_dimacs_descriptor(
+    descriptor: &File,
+    invalidation: DimacsPublicationInvalidation,
+) -> io::Result<()> {
+    let tombstone: &[u8] = match invalidation {
+        DimacsPublicationInvalidation::Empty => b"",
+        // Empty DRAT/LRAT can certify an input that already contains the empty
+        // clause. These tombstones are syntactically invalid in their declared
+        // encodings: text has a non-numeric unterminated record; binary has a
+        // non-UTF-8 byte that is neither an `a` nor `d` record marker.
+        DimacsPublicationInvalidation::Proof { binary: false } => b"invalidated-by-ay\n",
+        DimacsPublicationInvalidation::Proof { binary: true } => b"\x80",
+    };
+    descriptor.set_len(0)?;
+    let mut writer = descriptor;
+    writer.seek(SeekFrom::Start(0))?;
+    writer.write_all(tombstone)?;
+    descriptor.sync_all()
+}
+
+fn dimacs_invalidation_error(
+    operation_error: io::Error,
+    invalidation: io::Result<()>,
+    label: &str,
+) -> io::Error {
+    match invalidation {
+        Ok(()) => operation_error,
+        Err(invalidation_error) => io::Error::other(format!(
+            "{operation_error}; exact {label} descriptor invalidation also failed: {invalidation_error}"
+        )),
+    }
+}
+
+fn remove_authenticated_visible_file(
+    path: &Path,
+    descriptor: &File,
+    identity: ProofFileIdentity,
+    label: &str,
+    invalidation: DimacsPublicationInvalidation,
+) -> io::Result<bool> {
+    if regular_file_identity(descriptor, path)? != identity {
+        return Err(io::Error::other(format!(
+            "owned {label} descriptor identity changed before cleanup"
+        )));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let path_matches = match open_dimacs_regular_file(path) {
+            Ok(visible) => {
+                regular_single_link_identity(&visible, path).map(|found| found == identity)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        };
+        let invalidation_result = invalidate_dimacs_descriptor(descriptor, invalidation);
+        return match (path_matches, invalidation_result) {
+            (Ok(matches), Ok(())) => Ok(matches),
+            (Err(error), invalidation) => {
+                Err(dimacs_invalidation_error(error, invalidation, label))
+            }
+            (Ok(_), Err(error)) => Err(error),
+        };
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let (private_directory, _) = match create_private_dimacs_staging_directory(path) {
+            Ok(staging) => staging,
+            Err(error) => {
+                return Err(dimacs_invalidation_error(
+                    error,
+                    invalidate_dimacs_descriptor(descriptor, invalidation),
+                    label,
+                ));
+            }
+        };
+        let quarantine_path = private_directory.join("discard");
+        match move_dimacs_proof_to_private_quarantine(path, &quarantine_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                invalidate_dimacs_descriptor(descriptor, invalidation)?;
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(dimacs_invalidation_error(
+                    error,
+                    invalidate_dimacs_descriptor(descriptor, invalidation),
+                    label,
+                ));
+            }
+        }
+
+        #[cfg(test)]
+        if take_injected_dimacs_proof_cleanup_replacement() {
+            std::fs::write(path, b"raced replacement\n")?;
+        }
+        #[cfg(test)]
+        if take_injected_dimacs_proof_cleanup_failure() {
+            return Err(dimacs_invalidation_error(
+                io::Error::other("injected DIMACS proof cleanup failure after quarantine"),
+                invalidate_dimacs_descriptor(descriptor, invalidation),
+                label,
+            ));
+        }
+
+        let quarantined = match open_dimacs_regular_file(&quarantine_path) {
+            Ok(file) => file,
+            Err(inspect_error) => {
+                let restore = rename_dimacs_noreplace(&quarantine_path, path);
+                let operation_error = match restore {
+                Ok(()) => io::Error::other(format!(
+                    "could not authenticate quarantined {label}; it was restored to '{}': {inspect_error}",
+                    path.display()
+                )),
+                Err(restore_error) => io::Error::other(format!(
+                    "could not authenticate quarantined {label} at '{}': {inspect_error}; restoration to '{}' also failed: {restore_error}; the quarantined object was preserved",
+                    quarantine_path.display(),
+                    path.display()
+                )),
+            };
+                return Err(dimacs_invalidation_error(
+                    operation_error,
+                    invalidate_dimacs_descriptor(descriptor, invalidation),
+                    label,
+                ));
+            }
+        };
+        let quarantined_identity = match regular_file_identity(&quarantined, &quarantine_path) {
+            Ok(identity) => identity,
+            Err(inspect_error) => {
+                drop(quarantined);
+                let restore = rename_dimacs_noreplace(&quarantine_path, path);
+                let operation_error = match restore {
+                Ok(()) => io::Error::other(format!(
+                    "could not authenticate quarantined {label}; it was restored to '{}': {inspect_error}",
+                    path.display()
+                )),
+                Err(restore_error) => io::Error::other(format!(
+                    "could not authenticate quarantined {label} at '{}': {inspect_error}; restoration to '{}' also failed: {restore_error}; the quarantined object was preserved",
+                    quarantine_path.display(),
+                    path.display()
+                )),
+            };
+                return Err(dimacs_invalidation_error(
+                    operation_error,
+                    invalidate_dimacs_descriptor(descriptor, invalidation),
+                    label,
+                ));
+            }
+        };
+        if quarantined_identity != identity {
+            drop(quarantined);
+            let restore = rename_dimacs_noreplace(&quarantine_path, path).map_err(|error| {
+            io::Error::other(format!(
+                "{label} cleanup quarantined a replacement at '{}', then could not restore it to '{}': {error}; the replacement was preserved",
+                quarantine_path.display(),
+                path.display()
+            ))
+        });
+            let invalidation_result = invalidate_dimacs_descriptor(descriptor, invalidation);
+            return match (restore, invalidation_result) {
+                (Ok(()), Ok(())) => Ok(false),
+                (Err(error), invalidation) => {
+                    Err(dimacs_invalidation_error(error, invalidation, label))
+                }
+                (Ok(()), Err(error)) => Err(error),
+            };
+        }
+
+        // The exact owned inode stays under the fresh private quarantine name as an
+        // inert tombstone. Pathname unlink after descriptor authentication is
+        // a TOCTOU deletion primitive: a same-UID process could exchange the path
+        // and make AY delete its replacement. Retained debris is safe and bounded;
+        // deleting a foreign object is not.
+        invalidate_dimacs_descriptor(descriptor, invalidation)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            File::open(parent)?.sync_all()?;
+        }
+        drop(quarantined);
+        Ok(true)
+    }
+}
+
+fn seal_owned_dimacs_proof(path: &str) -> io::Result<PublishedDimacsProof> {
+    let resolved = resolved_dimacs_proof_path(path)?;
+    let mut owned = owned_dimacs_proofs()
+        .lock()
+        .map_err(|_| dimacs_proof_registry_error())?;
+    let state = owned.get_mut(&resolved).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "no proof output owned by this run exists at '{}'",
+                resolved.display()
+            ),
+        )
+    })?;
+    if state.write_failed.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!(
+                "DIMACS proof output '{}' had an earlier optional writer failure",
+                resolved.display()
+            ),
+        ));
+    }
+    if let Some(published) = state.published {
+        return Ok(published);
+    }
+
+    state.descriptor.sync_all()?;
+    let descriptor_label = state.staging_path.as_deref().unwrap_or(&resolved);
+    let descriptor_identity = match state.location {
+        OwnedDimacsProofLocation::Anonymous => {
+            regular_file_identity(&state.descriptor, descriptor_label)?
+        }
+        _ => regular_single_link_identity(&state.descriptor, descriptor_label)?,
+    };
+    if descriptor_identity != state.identity {
+        return Err(io::Error::other(
+            "DIMACS proof descriptor identity changed before publication",
+        ));
+    }
+
+    match state.location {
+        OwnedDimacsProofLocation::Anonymous => {
+            #[cfg(target_os = "linux")]
+            {
+                if let Err(error) =
+                    publish_dimacs_descriptor_noreplace(&state.descriptor, &resolved)
+                {
+                    return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+                        preexisting_dimacs_proof_error(&resolved, Some(&error))
+                    } else {
+                        error
+                    });
+                }
+                state.location = OwnedDimacsProofLocation::Public;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "anonymous DIMACS proof publication is not supported on this platform",
+                ));
+            }
+        }
+        OwnedDimacsProofLocation::Staged => {
+            let staging_path = state
+                .staging_path
+                .clone()
+                .ok_or_else(|| io::Error::other("named DIMACS proof staging path is missing"))?;
+            #[cfg(target_os = "linux")]
+            if let Err(error) = rename_dimacs_noreplace(&staging_path, &resolved) {
+                return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+                    preexisting_dimacs_proof_error(&resolved, Some(&error))
+                } else {
+                    error
+                });
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "descriptor-authenticated DIMACS proof publication is not supported on this platform",
+                ));
+            }
+            state.location = OwnedDimacsProofLocation::Public;
+            // renameat2 moved the only name; no hard-link dual-publication
+            // window exists. The empty private directory is intentionally
+            // retained rather than pathname-deleted after a racy check.
+            state.staging_path = None;
+        }
+        OwnedDimacsProofLocation::Public => {}
+        OwnedDimacsProofLocation::Removed => {
+            return Err(io::Error::other(
+                "DIMACS proof generation was removed before publication",
+            ));
+        }
+    }
+
+    let mut visible = open_dimacs_regular_file(&resolved)?;
+    let visible_identity = regular_single_link_identity(&visible, &resolved)?;
+    if visible_identity != state.identity {
+        return Err(io::Error::other(format!(
+            "DIMACS proof path '{}' was replaced before publication",
+            resolved.display()
+        )));
+    }
+    let before_len = visible.metadata()?.len();
+    let (len, sha256) = hash_file(&mut visible)?;
+    let after_metadata = visible.metadata()?;
+    if ProofFileIdentity::from_metadata(&after_metadata) != state.identity
+        || before_len != len
+        || after_metadata.len() != len
+    {
+        return Err(io::Error::other(format!(
+            "DIMACS proof output '{}' changed while it was sealed",
+            resolved.display()
+        )));
+    }
+    let published = PublishedDimacsProof {
+        identity: state.identity,
+        len,
+        sha256,
+    };
+    #[cfg(unix)]
+    if let Some(parent) = resolved.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    state.published = Some(published);
+    Ok(published)
+}
+
+fn published_dimacs_proof(path: &str) -> io::Result<PublishedDimacsProof> {
+    let resolved = resolved_dimacs_proof_path(path)?;
+    let owned = owned_dimacs_proofs()
+        .lock()
+        .map_err(|_| dimacs_proof_registry_error())?;
+    owned
+        .get(&resolved)
+        .and_then(|state| state.published)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "proof output '{}' was not emitted and sealed by this run",
+                    resolved.display()
+                ),
+            )
+        })
+}
+
+fn validate_published_dimacs_proof(path: &str) -> io::Result<PublishedDimacsProof> {
+    let resolved = resolved_dimacs_proof_path(path)?;
+    let published = published_dimacs_proof(path)?;
+    let mut file = open_dimacs_regular_file(&resolved)?;
+    if regular_single_link_identity(&file, &resolved)? != published.identity {
+        return Err(io::Error::other(format!(
+            "DIMACS proof path '{}' was replaced after publication",
+            resolved.display()
+        )));
+    }
+    let before_len = file.metadata()?.len();
+    let (len, sha256) = hash_file(&mut file)?;
+    let after = file.metadata()?;
+    if ProofFileIdentity::from_metadata(&after) != published.identity
+        || before_len != published.len
+        || len != published.len
+        || after.len() != published.len
+        || sha256 != published.sha256
+    {
+        return Err(io::Error::other(format!(
+            "DIMACS proof output '{}' changed after publication",
+            resolved.display()
+        )));
+    }
+    Ok(published)
+}
+
+fn retain_published_dimacs_proof(
+    path: &str,
+    published: PublishedDimacsProof,
+    binary: bool,
+) -> io::Result<RetainedDimacsPublication> {
+    let resolved = resolved_dimacs_proof_path(path)?;
+    let descriptor = {
+        let owned = owned_dimacs_proofs()
+            .lock()
+            .map_err(|_| dimacs_proof_registry_error())?;
+        let state = owned.get(&resolved).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "same-run DIMACS proof ownership disappeared before authorization",
+            )
+        })?;
+        if state.published != Some(published) {
+            return Err(io::Error::other(
+                "same-run DIMACS proof seal changed before authorization",
+            ));
+        }
+        state.descriptor.try_clone()?
+    };
+    RetainedDimacsPublication::capture(
+        descriptor,
+        resolved,
+        "DIMACS proof",
+        Some(published),
+        DimacsPublicationInvalidation::Proof { binary },
+    )
+}
+
+struct DimacsUnsatPublicationTransaction {
+    proof: RetainedDimacsPublication,
+    status: Option<RetainedDimacsPublication>,
+    artifact: Option<RetainedDimacsPublication>,
+    optional: bool,
+    invalidate_on_drop: bool,
+}
+
+impl DimacsUnsatPublicationTransaction {
+    fn new(
+        proof: RetainedDimacsPublication,
+        artifact: Option<RetainedDimacsPublication>,
+        optional: bool,
+    ) -> Self {
+        Self {
+            proof,
+            status: None,
+            artifact,
+            optional,
+            invalidate_on_drop: true,
+        }
+    }
+
+    fn validate(&mut self) -> io::Result<()> {
+        self.proof.validate()?;
+        if let Some(status) = &mut self.status {
+            status.validate()?;
+        }
+        if let Some(artifact) = &mut self.artifact {
+            artifact.validate()?;
+        }
+        Ok(())
+    }
+
+    fn invalidate_exact(&mut self) -> String {
+        let mut errors = Vec::new();
+        if let Some(status) = &self.status {
+            if let Err(error) = status.invalidate_exact() {
+                errors.push(format!("status marker: {error}"));
+            }
+        }
+        if let Some(artifact) = &self.artifact {
+            if let Err(error) = artifact.invalidate_exact() {
+                errors.push(format!("proof artifact: {error}"));
+            }
+        }
+        if let Err(error) = self.proof.invalidate_exact() {
+            errors.push(format!("proof: {error}"));
+        }
+        self.invalidate_on_drop = false;
+        if errors.is_empty() {
+            "; exact same-run DIMACS publications were descriptor-invalidated".to_string()
+        } else {
+            format!(
+                "; WARNING: retained DIMACS publication invalidation also failed ({})",
+                errors.join("; ")
+            )
+        }
+    }
+
+    fn commit(&mut self) {
+        self.invalidate_on_drop = false;
+    }
+}
+
+impl Drop for DimacsUnsatPublicationTransaction {
+    fn drop(&mut self) {
+        if self.invalidate_on_drop {
+            let _ = self.invalidate_exact();
+        }
+    }
+}
+
+struct AuthorizedDimacsUnsatPublication {
+    publication: Option<DimacsUnsatPublicationTransaction>,
+    temp_proof_path: Option<String>,
+}
+
+impl AuthorizedDimacsUnsatPublication {
+    fn without_artifacts() -> Self {
+        Self {
+            publication: None,
+            temp_proof_path: None,
+        }
+    }
+
+    fn validate_before_verdict(&mut self) -> Result<(), (bool, String)> {
+        let Some(publication) = &mut self.publication else {
+            return Ok(());
+        };
+        if let Err(error) = publication.validate() {
+            let optional = publication.optional;
+            let invalidation = publication.invalidate_exact();
+            let failure = Err((
+                optional,
+                format!(
+                    "same-run DIMACS publication lost namespace authority before UNSAT: {error}{invalidation}"
+                ),
+            ));
+            // A failed optional publication no longer participates in later
+            // output gates. Its exact members have already been invalidated;
+            // retaining it would only repeat the same warning at each gate.
+            self.publication = None;
+            return failure;
+        }
+        Ok(())
+    }
+
+    fn commit_after_verdict(&mut self) {
+        if let Some(path) = self.temp_proof_path.take() {
+            let cleanup = remove_owned_dimacs_proof(&path);
+            let proof_invalidation = self
+                .publication
+                .as_ref()
+                .map(|publication| publication.proof.invalidate_exact())
+                .transpose();
+            if let Err(error) = cleanup {
+                safe_eprintln!(
+                    "c Warning: failed to settle verified temporary DIMACS proof {path} after verdict output: {error}"
+                );
+            }
+            if let Err(error) = proof_invalidation {
+                let fallback = self.publication.as_mut().map_or_else(
+                    String::new,
+                    DimacsUnsatPublicationTransaction::invalidate_exact,
+                );
+                safe_eprintln!(
+                    "c Warning: failed to exact-invalidate verified temporary DIMACS proof {path} after verdict output: {error}{fallback}"
+                );
+            }
+        }
+        if let Some(publication) = &mut self.publication {
+            publication.commit();
+        }
+    }
+}
+
+fn validate_dimacs_unsat_publication_before_verdict(
+    authority: &mut AuthorizedDimacsUnsatPublication,
+) {
+    match authority.validate_before_verdict() {
+        Ok(()) => {}
+        Err((true, error)) => safe_eprintln!(
+            "c Warning: optional synthesized DIMACS publication changed before verdict ({error}); UNSAT verdict remains authoritative"
+        ),
+        Err((false, error)) => fail_dimacs_certification_or_exit(&error),
+    }
+}
+
+pub(crate) fn read_published_dimacs_proof(
+    path: &str,
+    expected_sha256: Sha256Digest,
+) -> io::Result<Vec<u8>> {
+    let resolved = resolved_dimacs_proof_path(path)?;
+    let published = validate_published_dimacs_proof(path)?;
+    if published.sha256 != expected_sha256 {
+        return Err(io::Error::other("DIMACS proof seal digest mismatch"));
+    }
+    let mut file = open_dimacs_regular_file(&resolved)?;
+    if regular_single_link_identity(&file, &resolved)? != published.identity {
+        return Err(io::Error::other(
+            "DIMACS proof changed before verifier read",
+        ));
+    }
+    let capacity = usize::try_from(published.len)
+        .map_err(|_| io::Error::other("DIMACS proof is too large to verify in memory"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if ProofFileIdentity::from_metadata(&after) != published.identity
+        || after.len() != published.len
+        || bytes.len() as u64 != published.len
+        || sha256_digest(&bytes) != expected_sha256
+    {
+        return Err(io::Error::other(format!(
+            "DIMACS proof output '{}' changed after publication",
+            resolved.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+struct AuthenticatedLeanSnapshot {
+    descriptor: File,
+    identity: ProofFileIdentity,
+    len: u64,
+    sha256: Sha256Digest,
+}
+
+impl AuthenticatedLeanSnapshot {
+    #[cfg(target_os = "linux")]
+    fn create(public_path: &str, published: PublishedDimacsProof) -> io::Result<Self> {
+        let bytes = read_published_dimacs_proof(public_path, published.sha256)?;
+        if bytes.len() as u64 != published.len || sha256_digest(&bytes) != published.sha256 {
+            return Err(io::Error::other(
+                "sealed DIMACS proof bytes changed before Lean snapshot creation",
+            ));
+        }
+
+        let resolved = resolved_dimacs_proof_path(public_path)?;
+        let mut descriptor = create_anonymous_dimacs_staging_file(&resolved)?;
+        descriptor.write_all(&bytes)?;
+        descriptor.sync_all()?;
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            descriptor.set_permissions(std::fs::Permissions::from_mode(0o400))?;
+        }
+        let identity = regular_file_identity(&descriptor, &resolved)?;
+        descriptor.seek(SeekFrom::Start(0))?;
+        Ok(Self {
+            descriptor,
+            identity,
+            len: published.len,
+            sha256: published.sha256,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn create(_public_path: &str, _published: PublishedDimacsProof) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "authenticated anonymous Lean snapshots are not supported on this platform",
+        ))
+    }
+
+    fn validate(&mut self) -> io::Result<()> {
+        let metadata = self.descriptor.metadata()?;
+        if ProofFileIdentity::from_metadata(&metadata) != self.identity
+            || metadata.len() != self.len
+        {
+            return Err(io::Error::other(
+                "authenticated Lean snapshot descriptor changed",
+            ));
+        }
+        let (descriptor_len, descriptor_sha256) = hash_file(&mut self.descriptor)?;
+        if descriptor_len != self.len || descriptor_sha256 != self.sha256 {
+            return Err(io::Error::other(
+                "authenticated Lean snapshot bytes changed",
+            ));
+        }
+        self.descriptor.seek(SeekFrom::Start(0))?;
+        Ok(())
+    }
+}
+
+fn cleanup_owned_dimacs_proof_state(
+    resolved: &Path,
+    state: &mut OwnedDimacsProof,
+) -> io::Result<bool> {
+    if state.location == OwnedDimacsProofLocation::Anonymous {
+        invalidate_dimacs_descriptor(&state.descriptor, state.invalidation)?;
+        state.location = OwnedDimacsProofLocation::Removed;
+        return Ok(true);
+    }
+    if state.location == OwnedDimacsProofLocation::Removed {
+        return Ok(false);
+    }
+
+    let visible_path = match state.location {
+        OwnedDimacsProofLocation::Anonymous | OwnedDimacsProofLocation::Removed => {
+            unreachable!("handled above")
+        }
+        OwnedDimacsProofLocation::Staged => state
+            .staging_path
+            .as_deref()
+            .ok_or_else(|| io::Error::other("DIMACS proof staging path is missing"))?,
+        OwnedDimacsProofLocation::Public => resolved,
+    };
+    let settled = remove_authenticated_visible_file(
+        visible_path,
+        &state.descriptor,
+        state.identity,
+        "DIMACS proof generation",
+        state.invalidation,
+    )?;
+    state.staging_path = None;
+    state.location = OwnedDimacsProofLocation::Removed;
+    Ok(settled)
+}
+
+fn remove_owned_dimacs_proof(path: &str) -> io::Result<bool> {
+    let resolved = resolved_dimacs_proof_path(path)?;
+    let mut owned = owned_dimacs_proofs()
+        .lock()
+        .map_err(|_| dimacs_proof_registry_error())?;
+    let Some(state) = owned.get_mut(&resolved) else {
+        return Ok(false);
+    };
+    let status_cleanup = match state.status_reservation.take() {
+        Some(reservation) => {
+            publish_reserved_dimacs_proof_status(reservation, "stale-not-current", None).map(drop)
+        }
+        None => Ok(()),
+    };
+    let proof_cleanup = cleanup_owned_dimacs_proof_state(&resolved, state);
+    if proof_cleanup.is_ok() && status_cleanup.is_ok() {
+        // Retain both the authoritative descriptor and the registry entry until
+        // proof and status cleanup have each either removed the owned
+        // generation or restored an unrelated replacement. Retryable failures
+        // keep the remaining authority in place.
+        owned.remove(&resolved);
+    }
+    match (proof_cleanup, status_cleanup) {
+        (Ok(removed), Ok(())) => Ok(removed),
+        (Err(proof_error), Ok(())) => Err(proof_error),
+        (Ok(_), Err(status_error)) => Err(status_error),
+        (Err(proof_error), Err(status_error)) => Err(io::Error::other(format!(
+            "{proof_error}; failed to release synthesized-default proof status transaction: {status_error}"
+        ))),
+    }
 }
 
 fn flush_dimacs_timeout_outputs(solver: Option<&mut SatSolver>) {
@@ -70,14 +1686,12 @@ fn emit_dimacs_sat_model(model: &[bool]) {
 }
 
 fn circuit_multiplier22_retained_sat_model_authority_requested() -> bool {
-    std::env::var(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV)
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+    std::env::var(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn exit_if_circuit_multiplier22_retained_sat_model_authority_admits(content: &str) {
@@ -95,6 +1709,7 @@ fn exit_if_circuit_multiplier22_retained_sat_model_authority_admits(content: &st
 }
 
 fn exit_with_circuit_multiplier22_retained_sat_model(model: &[bool]) -> ! {
+    reject_dimacs_decision_trace_or_exit();
     safe_eprintln!("c Circuit_multiplier22 retained original-DIMACS SAT model authority admitted");
     crate::mark_verdict_printed();
     safe_println!("s SATISFIABLE");
@@ -571,14 +2186,464 @@ fn fail_closed_satcomp_proof_setup(reason: &str) -> ! {
     std::process::exit(0);
 }
 
-fn exit_failed_proof_create(path: &str, error: &io::Error) -> ! {
-    if official_sat_main_regular_route_from_env() {
+fn fail_dimacs_certification_or_exit(reason: &str) -> ! {
+    if let Some(gate) = required_dimacs_proof_gate_name() {
         fail_closed_satcomp_proof_setup(&format!(
-            "proof output unavailable: failed to create proof file {path}: {error}"
+            "{gate} rejected UNSAT because certification failed: {reason}"
         ));
     }
-    safe_eprintln!("Error: failed to create proof file {path}: {error}");
+    safe_eprintln!("Error: {reason}");
     std::process::exit(1);
+}
+
+fn synthesized_default_dimacs_proof_is_optional(proof: &ProofConfig) -> bool {
+    proof.synthesized_default
+        && required_dimacs_proof_gate_name().is_none()
+        && !super::EXPLICIT_VERIFY_PROOF_ENABLED.load(Ordering::SeqCst)
+        && proof.artifact_path.is_none()
+        && !super::LEAN_VERIFY_ENABLED.load(Ordering::SeqCst)
+}
+
+pub(super) fn dimacs_proof_status_path(path: &str) -> PathBuf {
+    dimacs_proof_status_path_from_path(Path::new(path))
+}
+
+fn dimacs_proof_status_path_from_path(path: &Path) -> PathBuf {
+    let mut status = path.as_os_str().to_os_string();
+    status.push(".ay-status");
+    PathBuf::from(status)
+}
+
+pub(super) fn dimacs_proof_status_lock_path(path: &Path) -> PathBuf {
+    let mut lock = path.as_os_str().to_os_string();
+    lock.push(".lock");
+    PathBuf::from(lock)
+}
+
+#[cfg(target_os = "linux")]
+fn dimacs_proof_digest_hex(digest: Sha256Digest) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+#[cfg(target_os = "linux")]
+fn dimacs_proof_status_content(status: &str, sha256: Option<Sha256Digest>) -> String {
+    let mut content = format!(
+        "ay-dimacs-proof-status-v1\nstatus={status}\nproducer_pid={}\n",
+        std::process::id()
+    );
+    if let Some(sha256) = sha256 {
+        content.push_str("sha256=");
+        content.push_str(&dimacs_proof_digest_hex(sha256));
+        content.push('\n');
+    }
+    content
+}
+
+#[cfg(target_os = "linux")]
+fn status_transaction_error(
+    operation_error: io::Error,
+    cleanup: io::Result<bool>,
+    label: &str,
+) -> io::Error {
+    match cleanup {
+        Ok(_) => operation_error,
+        Err(cleanup_error) => io::Error::other(format!(
+            "{operation_error}; failed to clean the owned {label}: {cleanup_error}"
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reserve_dimacs_proof_status(proof_path: &str) -> io::Result<DimacsProofStatusReservation> {
+    let proof_path = resolved_dimacs_proof_path(proof_path)?;
+    let status_path = dimacs_proof_status_path_from_path(&proof_path);
+    let lock_path = dimacs_proof_status_lock_path(&status_path);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    let mut lock_descriptor = options.open(&lock_path).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "synthesized-default proof status transaction '{}' is already active",
+                    lock_path.display()
+                ),
+            )
+        } else {
+            error
+        }
+    })?;
+    let lock_identity = match regular_file_identity(&lock_descriptor, &lock_path) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return Err(dimacs_invalidation_error(
+                error,
+                invalidate_dimacs_descriptor(
+                    &lock_descriptor,
+                    DimacsPublicationInvalidation::Empty,
+                ),
+                "DIMACS proof status transaction lock",
+            ));
+        }
+    };
+    #[cfg(test)]
+    let lock_identity_validation: io::Result<ProofFileIdentity> =
+        if take_injected_dimacs_status_lock_identity_failure() {
+            Err(io::Error::other(
+                "injected DIMACS proof status lock identity failure",
+            ))
+        } else {
+            regular_single_link_identity(&lock_descriptor, &lock_path)
+        };
+    #[cfg(not(test))]
+    let lock_identity_validation = regular_single_link_identity(&lock_descriptor, &lock_path);
+    if let Err(error) = lock_identity_validation {
+        return Err(status_transaction_error(
+            error,
+            remove_authenticated_visible_file(
+                &lock_path,
+                &lock_descriptor,
+                lock_identity,
+                "DIMACS proof status transaction lock",
+                DimacsPublicationInvalidation::Empty,
+            ),
+            "DIMACS proof status transaction lock",
+        ));
+    }
+    let lock_content = format!(
+        "ay-dimacs-proof-status-transaction-v1\nproducer_pid={}\n",
+        std::process::id()
+    );
+    if let Err(error) = lock_descriptor
+        .write_all(lock_content.as_bytes())
+        .and_then(|()| lock_descriptor.sync_all())
+    {
+        return Err(status_transaction_error(
+            error,
+            remove_authenticated_visible_file(
+                &lock_path,
+                &lock_descriptor,
+                lock_identity,
+                "DIMACS proof status transaction lock",
+                DimacsPublicationInvalidation::Empty,
+            ),
+            "DIMACS proof status transaction lock",
+        ));
+    }
+
+    let reservation = DimacsProofStatusReservation {
+        proof_path,
+        status_path,
+        lock_path,
+        lock_descriptor,
+        lock_identity,
+    };
+    match std::fs::symlink_metadata(&reservation.status_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(reservation),
+        Ok(_) => {
+            let error = io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "refusing to overwrite pre-existing DIMACS proof status output '{}'",
+                    reservation.status_path.display()
+                ),
+            );
+            let cleanup = remove_authenticated_visible_file(
+                &reservation.lock_path,
+                &reservation.lock_descriptor,
+                reservation.lock_identity,
+                "DIMACS proof status transaction lock",
+                DimacsPublicationInvalidation::Empty,
+            );
+            Err(status_transaction_error(
+                error,
+                cleanup,
+                "DIMACS proof status transaction lock",
+            ))
+        }
+        Err(error) => {
+            let cleanup = remove_authenticated_visible_file(
+                &reservation.lock_path,
+                &reservation.lock_descriptor,
+                reservation.lock_identity,
+                "DIMACS proof status transaction lock",
+                DimacsPublicationInvalidation::Empty,
+            );
+            Err(status_transaction_error(
+                error,
+                cleanup,
+                "DIMACS proof status transaction lock",
+            ))
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn reserve_dimacs_proof_status(_proof_path: &str) -> io::Result<DimacsProofStatusReservation> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "transactional DIMACS proof status publication is unavailable on this platform",
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn rewrite_reserved_dimacs_proof_status(
+    descriptor: &File,
+    path: &Path,
+    identity: ProofFileIdentity,
+    content: &[u8],
+) -> io::Result<()> {
+    let visible = open_dimacs_regular_file(path)?;
+    if regular_single_link_identity(&visible, path)? != identity {
+        return Err(io::Error::other(format!(
+            "DIMACS proof status path '{}' was replaced",
+            path.display()
+        )));
+    }
+    let mut writer = descriptor;
+    writer.set_len(0)?;
+    writer.seek(SeekFrom::Start(0))?;
+    writer.write_all(content)?;
+    writer.sync_all()?;
+    if regular_single_link_identity(descriptor, path)? != identity {
+        return Err(io::Error::other(format!(
+            "DIMACS proof status path '{}' changed during update",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn publish_reserved_dimacs_proof_status(
+    reservation: DimacsProofStatusReservation,
+    status: &str,
+    sha256: Option<Sha256Digest>,
+) -> io::Result<RetainedDimacsPublication> {
+    let content = dimacs_proof_status_content(status, sha256);
+    if let Err(error) = rewrite_reserved_dimacs_proof_status(
+        &reservation.lock_descriptor,
+        &reservation.lock_path,
+        reservation.lock_identity,
+        content.as_bytes(),
+    ) {
+        return Err(dimacs_invalidation_error(
+            error,
+            invalidate_dimacs_descriptor(
+                &reservation.lock_descriptor,
+                DimacsPublicationInvalidation::Empty,
+            ),
+            "DIMACS proof status transaction lock",
+        ));
+    }
+    if let Err(error) = rename_dimacs_noreplace(&reservation.lock_path, &reservation.status_path) {
+        return Err(dimacs_invalidation_error(
+            error,
+            invalidate_dimacs_descriptor(
+                &reservation.lock_descriptor,
+                DimacsPublicationInvalidation::Empty,
+            ),
+            "DIMACS proof status transaction lock",
+        ));
+    }
+    let publication = RetainedDimacsPublication::capture(
+        reservation.lock_descriptor,
+        reservation.status_path.clone(),
+        "DIMACS proof status marker",
+        None,
+        DimacsPublicationInvalidation::Empty,
+    )?;
+    if let Some(parent) = reservation.status_path.parent() {
+        if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
+            return Err(dimacs_invalidation_error(
+                error,
+                publication.invalidate_exact(),
+                "DIMACS proof status marker",
+            ));
+        }
+    }
+    Ok(publication)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn publish_reserved_dimacs_proof_status(
+    _reservation: DimacsProofStatusReservation,
+    _status: &str,
+    _sha256: Option<Sha256Digest>,
+) -> io::Result<RetainedDimacsPublication> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "transactional DIMACS proof status publication is unavailable on this platform",
+    ))
+}
+
+fn take_owned_dimacs_proof_status_reservation(
+    proof_path: &str,
+) -> io::Result<Option<DimacsProofStatusReservation>> {
+    let resolved = resolved_dimacs_proof_path(proof_path)?;
+    Ok(owned_dimacs_proofs()
+        .lock()
+        .map_err(|_| dimacs_proof_registry_error())?
+        .get_mut(&resolved)
+        .and_then(|state| state.status_reservation.take()))
+}
+
+fn mark_synthesized_default_dimacs_proof_stale(proof: &ProofConfig) {
+    debug_assert!(proof.synthesized_default);
+    let reservation =
+        take_owned_dimacs_proof_status_reservation(&proof.path).and_then(|reservation| {
+            match reservation {
+                Some(reservation) => Ok(reservation),
+                None => reserve_dimacs_proof_status(&proof.path),
+            }
+        });
+    match reservation.and_then(|reservation| {
+        publish_reserved_dimacs_proof_status(reservation, "stale-not-current", None)
+    }) {
+        Ok(status_publication) => safe_eprintln!(
+            "c proof-status: stale-not-current ({}; marker {})",
+            proof.path,
+            status_publication.path.display()
+        ),
+        Err(error) => safe_eprintln!(
+            "c proof-status: stale-not-current ({}; status marker unavailable: {error})",
+            proof.path
+        ),
+    }
+}
+
+fn mark_synthesized_default_dimacs_proof_current(
+    proof: &ProofConfig,
+    published: PublishedDimacsProof,
+    publication: &mut DimacsUnsatPublicationTransaction,
+) -> io::Result<()> {
+    if validate_published_dimacs_proof(&proof.path)? != published {
+        return Err(io::Error::other(
+            "synthesized-default proof publication changed before status commit",
+        ));
+    }
+    publication.proof.validate()?;
+    let reservation =
+        take_owned_dimacs_proof_status_reservation(&proof.path)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "synthesized-default proof status transaction is not owned by this run",
+            )
+        })?;
+    let status_publication = publish_reserved_dimacs_proof_status(
+        reservation,
+        "current-same-run",
+        Some(published.sha256),
+    )?;
+    let status_path = status_publication.path.clone();
+    publication.status = Some(status_publication);
+
+    // The current marker was the last participant to become public. Re-check
+    // the exact proof only after that publication so no status can authorize a
+    // proof generation replaced in the marker-commit window.
+    if validate_published_dimacs_proof(&proof.path)? != published {
+        return Err(io::Error::other(
+            "synthesized-default proof publication changed during status commit",
+        ));
+    }
+    publication.proof.validate()?;
+    safe_eprintln!(
+        "c proof-status: current-same-run ({}; marker {})",
+        proof.path,
+        status_path.display()
+    );
+    Ok(())
+}
+
+fn warn_optional_dimacs_proof_failure(proof: &ProofConfig, reason: &str) {
+    mark_synthesized_default_dimacs_proof_stale(proof);
+    safe_eprintln!(
+        "c Warning: optional synthesized DIMACS proof {} was not published: {reason}; solver verdict remains authoritative",
+        proof.path
+    );
+}
+
+fn handle_dimacs_proof_io_failure(proof: &ProofConfig, operation: &str, error: &io::Error) {
+    let mut reason = format!("failed to {operation} DIMACS proof {}: {error}", proof.path);
+    if synthesized_default_dimacs_proof_is_optional(proof) {
+        warn_optional_dimacs_proof_failure(proof, &reason);
+        if let Err(cleanup_error) = remove_owned_dimacs_proof(&proof.path) {
+            safe_eprintln!(
+                "c Warning: failed to discard unpublished optional DIMACS proof {}: {cleanup_error}",
+                proof.path
+            );
+        }
+        return;
+    }
+    if proof.synthesized_default {
+        if let Err(cleanup_error) = invalidate_synthesized_default_dimacs_proof(proof) {
+            reason.push_str(&format!(
+                "; failed to remove only AY's authenticated proof generation: {cleanup_error}"
+            ));
+        }
+    }
+    if let Some(gate) = required_dimacs_proof_gate_name() {
+        if proof.synthesized_default || proof.is_temp {
+            fail_closed_satcomp_proof_setup(&format!(
+                "{gate} rejected UNSAT because required proof I/O failed: {reason}"
+            ));
+        }
+    }
+    safe_eprintln!("Error: {reason}");
+    std::process::exit(1);
+}
+
+fn handle_failed_proof_create(proof: &ProofConfig, error: &io::Error) {
+    if synthesized_default_dimacs_proof_is_optional(proof) {
+        handle_dimacs_proof_io_failure(proof, "create", error);
+        return;
+    }
+    if official_sat_main_regular_route_from_env() {
+        let mut reason = format!(
+            "proof output unavailable: failed to create proof file {}: {error}",
+            proof.path
+        );
+        if proof.synthesized_default {
+            if let Err(cleanup_error) = invalidate_synthesized_default_dimacs_proof(proof) {
+                reason.push_str(&format!(
+                    "; failed to remove only AY's authenticated proof generation: {cleanup_error}"
+                ));
+            }
+        }
+        fail_closed_satcomp_proof_setup(&reason);
+    }
+    handle_dimacs_proof_io_failure(proof, "create", error);
+}
+
+fn sink_proof_output_after_optional_create_failure(
+    proof: &ProofConfig,
+    num_original_clauses: u64,
+    error: &io::Error,
+) -> ProofOutput {
+    handle_failed_proof_create(proof, error);
+    debug_assert!(synthesized_default_dimacs_proof_is_optional(proof));
+    match (proof.format, proof.binary) {
+        (ProofFormat::Drat, false) => ProofOutput::drat_text(io::sink()),
+        (ProofFormat::Drat, true) => ProofOutput::drat_binary(io::sink()),
+        (ProofFormat::Lrat, false) => ProofOutput::lrat_text(io::sink(), num_original_clauses),
+        (ProofFormat::Lrat, true) => ProofOutput::lrat_binary(io::sink(), num_original_clauses),
+        (ProofFormat::Alethe | ProofFormat::Lean4, _) => {
+            unreachable!("Alethe/Lean4 do not create a pre-solve DIMACS proof file")
+        }
+    }
 }
 
 fn variant_input_for_dimacs(
@@ -1742,19 +3807,9 @@ fn insert_empty_multiplier_equiv_conservation_scout_stats(
 fn dimacs_source_text_for_scout(source: DimacsInputSource<'_>) -> Option<String> {
     match source {
         DimacsInputSource::Content(content) => Some(content.to_string()),
-        DimacsInputSource::FilePath(path)
-            if Path::new(path)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("xz")) =>
-        {
-            let output = Command::new("xz").arg("-dc").arg(path).output().ok()?;
-            if output.status.success() {
-                String::from_utf8(output.stdout).ok()
-            } else {
-                None
-            }
+        DimacsInputSource::FilePath { path, sha256 } => {
+            read_authenticated_dimacs_source(path, sha256).ok()
         }
-        DimacsInputSource::FilePath(path) => std::fs::read_to_string(path).ok(),
         DimacsInputSource::Unavailable => None,
     }
 }
@@ -2299,6 +4354,7 @@ fn maybe_run_dense_clique_php_proof_route(
     proof: &ProofConfig,
     source: DimacsInputSource<'_>,
 ) {
+    reject_dimacs_decision_trace_or_exit();
     if !requested {
         return;
     }
@@ -2361,30 +4417,43 @@ fn maybe_run_dense_clique_php_proof_route(
         }
     };
     let proof_text = route_proof.as_str();
-    let file = match File::create(&proof.path) {
-        Ok(file) => file,
-        Err(error) => exit_failed_proof_create(&proof.path, &error),
+    // The streaming parser provisioned an ordinary proof writer before exact
+    // route admission. Discard that owned generation before publishing the
+    // independently validated bundled proof.
+    let _ = cleanup_dimacs_non_unsat_proof_sidecar(solver, &SatResult::Unknown, Some(proof));
+    let proof_file = match create_configured_dimacs_proof_file(proof) {
+        Ok(file) => Some(file),
+        Err(error) => {
+            handle_failed_proof_create(proof, &error);
+            None
+        }
     };
-    let mut writer = proof_output_writer(file);
-    if let Err(error) = writer.write_all(proof_text.as_bytes()) {
-        fail_closed_satcomp_proof_setup(&format!(
-            "dense clique PHP proof route failed to write proof file {}: {error}",
-            proof.path
-        ));
+    let publication_result = proof_file.map(|file| -> io::Result<()> {
+        let mut writer = proof_output_writer(file);
+        writer.write_all(proof_text.as_bytes())?;
+        writer.flush()?;
+        drop(writer);
+        seal_owned_dimacs_proof(&proof.path)?;
+        Ok(())
+    });
+    if let Some(Err(error)) = publication_result {
+        if proof.synthesized_default {
+            handle_dimacs_proof_io_failure(proof, "publish dense-clique", &error);
+        } else {
+            fail_closed_satcomp_proof_setup(&format!(
+                "dense clique PHP proof route failed to publish proof file {}: {error}",
+                proof.path
+            ));
+        }
     }
-    if let Err(error) = writer.flush() {
-        fail_closed_satcomp_proof_setup(&format!(
-            "dense clique PHP proof route failed to flush proof file {}: {error}",
-            proof.path
-        ));
-    }
-    write_proof_artifact_or_exit(
-        source.proof_artifact_problem(),
-        proof,
+    let mut unsat_authority = authorize_dimacs_unsat_artifacts(
+        source,
+        Some(proof),
         ProofArtifactTheoryMetadata::dimacs_sat(num_vars, num_clauses_declared),
     );
 
     let variant = selected_sat_variant();
+    validate_dimacs_unsat_publication_before_verdict(&mut unsat_authority);
     emit_sat_applied_run_summary(
         "dense-clique-php-proof-route-v1",
         sat_variant_source_label(),
@@ -2503,6 +4572,7 @@ fn maybe_run_dense_clique_php_proof_route(
         run_stats.insert("sat.proof_writer_additions", 0);
         run_stats.insert("sat.proof_writer_deletions", 0);
         run_stats.insert("time.total_ms", global_elapsed().as_millis() as u64);
+        validate_dimacs_unsat_publication_before_verdict(&mut unsat_authority);
         emit_dimacs_run_stats(
             &run_stats,
             stats_cfg,
@@ -2514,8 +4584,10 @@ fn maybe_run_dense_clique_php_proof_route(
         if route_proof.is_materialized_lrat() { "materialized LRAT" } else { "asset" },
         admission.asset.name
     );
+    validate_dimacs_unsat_publication_before_verdict(&mut unsat_authority);
     crate::mark_verdict_printed();
     safe_println!("s UNSATISFIABLE");
+    unsat_authority.commit_after_verdict();
     let _ = io::stdout().flush();
     let _ = io::stderr().flush();
     std::process::exit(20);
@@ -3217,23 +5289,361 @@ fn cleanup_dimacs_non_unsat_proof_paths(proof_config: Option<&ProofConfig>) {
     let Some(proof) = proof_config else {
         return;
     };
-    for path in std::iter::once(proof.path.as_str()).chain(proof.artifact_path.as_deref()) {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
+    if let Err(error) = remove_owned_dimacs_proof(&proof.path) {
+        safe_eprintln!(
+            "c Warning: failed to remove owned non-UNSAT proof output {}: {error}",
+            proof.path
+        );
+    }
+    // Proof artifacts are only published after a sealed UNSAT proof exists.
+    // Never unlink a pre-existing sidecar on a non-UNSAT route: it is not
+    // owned by this solve and may be an unrelated hard-linked file.
+}
+
+fn finalize_solver_dimacs_proof_or_exit(solver: &mut SatSolver, proof: &ProofConfig) {
+    if published_dimacs_proof(&proof.path).is_ok() {
+        return;
+    }
+    let Some(mut output) = solver.take_proof_writer() else {
+        if synthesized_default_dimacs_proof_is_optional(proof) {
+            warn_optional_dimacs_proof_failure(proof, "the UNSAT solve produced no proof writer");
+            if let Err(error) = remove_owned_dimacs_proof(&proof.path) {
                 safe_eprintln!(
-                    "c Warning: failed to remove non-UNSAT proof sidecar {path}: {error}"
+                    "c Warning: failed to discard writerless optional DIMACS proof {}: {error}",
+                    proof.path
                 );
             }
+            return;
+        }
+        fail_dimacs_certification_or_exit(&format!(
+            "UNSAT result produced no proof writer for requested output {}",
+            proof.path
+        ));
+    };
+    if let Err(error) = output.flush() {
+        handle_dimacs_proof_io_failure(proof, "flush", &error);
+        return;
+    }
+    drop(output);
+    if let Err(error) = seal_owned_dimacs_proof(&proof.path) {
+        handle_dimacs_proof_io_failure(proof, "seal", &error);
+    }
+}
+
+fn required_dimacs_proof_gate_name() -> Option<&'static str> {
+    let strict = super::STRICT_PROOFS_ENABLED.load(Ordering::SeqCst);
+    let self_check = super::SELF_CHECK_ENABLED.load(Ordering::SeqCst);
+    match (strict, self_check) {
+        (true, true) => Some("--strict-proofs/--self-check"),
+        (true, false) => Some("--strict-proofs"),
+        (false, true) => Some("--self-check"),
+        (false, false) => None,
+    }
+}
+
+fn required_dimacs_proof_gate_error(proof_config: Option<&ProofConfig>) -> Option<String> {
+    let gate = required_dimacs_proof_gate_name()?;
+    if !super::VERIFY_PROOF_ENABLED.load(Ordering::SeqCst) {
+        return Some(format!(
+            "{gate} requires authenticated DIMACS proof re-checking; --no-verify-proof and competition proof opt-outs are incompatible with this route"
+        ));
+    }
+    let Some(proof) = proof_config else {
+        return Some(format!(
+            "{gate} requires a same-run DIMACS refutation; --no-proof, --z3-mode, and competition proof opt-outs are incompatible with this route"
+        ));
+    };
+    if !matches!(proof.format, ProofFormat::Drat | ProofFormat::Lrat) {
+        return Some(format!(
+            "{gate} requires a DIMACS proof format supported by AY's independent checker (DRAT or LRAT); got {}",
+            proof_format_name(proof.format)
+        ));
+    }
+    None
+}
+
+fn enforce_required_dimacs_proof_gate(proof_config: Option<&ProofConfig>) {
+    if let Some(error) = required_dimacs_proof_gate_error(proof_config) {
+        safe_eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn invalidate_synthesized_default_dimacs_proof(proof: &ProofConfig) -> io::Result<bool> {
+    debug_assert!(proof.synthesized_default);
+    mark_synthesized_default_dimacs_proof_stale(proof);
+    remove_owned_dimacs_proof(&proof.path)
+}
+
+/// Complete every mandatory UNSAT proof gate before publishing a proof
+/// artifact or exposing UNSAT through stats/stdout. The proof bytes themselves
+/// must already have been emitted and descriptor-sealed by the route.
+fn authorize_dimacs_unsat_artifacts(
+    source: DimacsInputSource<'_>,
+    proof_config: Option<&ProofConfig>,
+    theory: ProofArtifactTheoryMetadata,
+) -> AuthorizedDimacsUnsatPublication {
+    enforce_required_dimacs_proof_gate(proof_config);
+    let Some(proof) = proof_config else {
+        if !verify_unsat_proof_from_source(source, None) {
+            fail_dimacs_certification_or_exit("independent DIMACS proof re-check did not accept");
+        }
+        if !verify_lean_proof(None) {
+            std::process::exit(2);
+        }
+        return AuthorizedDimacsUnsatPublication::without_artifacts();
+    };
+
+    let optional = synthesized_default_dimacs_proof_is_optional(proof);
+    let published = match published_dimacs_proof(&proof.path) {
+        Ok(published) => published,
+        Err(error) => {
+            let mut reason = format!("same-run proof publication failed: {error}");
+            if proof.synthesized_default {
+                mark_synthesized_default_dimacs_proof_stale(proof);
+            }
+            if let Err(cleanup_error) = remove_owned_dimacs_proof(&proof.path) {
+                reason.push_str(&format!(
+                    "; failed to settle only AY's authenticated proof generation: {cleanup_error}"
+                ));
+            }
+            if optional {
+                safe_eprintln!(
+                    "c Warning: optional synthesized DIMACS proof {} was not published: {reason}; solver verdict remains authoritative",
+                    proof.path
+                );
+                return AuthorizedDimacsUnsatPublication::without_artifacts();
+            }
+            fail_dimacs_certification_or_exit(&reason);
+        }
+    };
+    let retained_proof = match retain_published_dimacs_proof(&proof.path, published, proof.binary) {
+        Ok(publication) => publication,
+        Err(error) => {
+            let mut reason = format!(
+                "same-run proof publication could not retain descriptor authority: {error}"
+            );
+            if proof.synthesized_default {
+                mark_synthesized_default_dimacs_proof_stale(proof);
+            }
+            if let Err(cleanup_error) = remove_owned_dimacs_proof(&proof.path) {
+                reason.push_str(&format!(
+                    "; failed to settle only AY's authenticated proof generation: {cleanup_error}"
+                ));
+            }
+            if optional {
+                safe_eprintln!(
+                    "c Warning: optional synthesized DIMACS proof {} was not published: {reason}; solver verdict remains authoritative",
+                    proof.path
+                );
+                return AuthorizedDimacsUnsatPublication::without_artifacts();
+            }
+            fail_dimacs_certification_or_exit(&reason);
+        }
+    };
+    let mut publication = DimacsUnsatPublicationTransaction::new(retained_proof, None, optional);
+
+    if !verify_unsat_proof_from_source(source, proof_config) {
+        let mut reason = "independent DIMACS proof re-check did not accept".to_string();
+        reason.push_str(&publication.invalidate_exact());
+        if proof.synthesized_default {
+            mark_synthesized_default_dimacs_proof_stale(proof);
+        }
+        if let Err(cleanup_error) = remove_owned_dimacs_proof(&proof.path) {
+            reason.push_str(&format!(
+                "; failed to settle only AY's authenticated proof generation: {cleanup_error}"
+            ));
+        }
+        if optional {
+            safe_eprintln!(
+                "c Warning: optional synthesized DIMACS proof {} was not published: {reason}; solver verdict remains authoritative",
+                proof.path
+            );
+            return AuthorizedDimacsUnsatPublication::without_artifacts();
+        }
+        fail_dimacs_certification_or_exit(&reason);
+    }
+    if !verify_lean_proof(proof_config) {
+        let invalidation = publication.invalidate_exact();
+        safe_eprintln!("c Error: Lean-rejected DIMACS publications were invalidated{invalidation}");
+        if proof.synthesized_default {
+            mark_synthesized_default_dimacs_proof_stale(proof);
+        }
+        if let Err(cleanup_error) = remove_owned_dimacs_proof(&proof.path) {
+            safe_eprintln!(
+                "c Error: failed to settle Lean-rejected DIMACS proof generation {}: {cleanup_error}",
+                proof.path
+            );
+        }
+        std::process::exit(2);
+    }
+
+    let artifact_result = write_sealed_proof_artifact(
+        source.proof_artifact_problem(),
+        proof,
+        theory,
+        published.sha256,
+    )
+    .and_then(|artifact| {
+        artifact
+            .map(|(descriptor, path)| {
+                RetainedDimacsPublication::capture(
+                    descriptor,
+                    path,
+                    "DIMACS proof artifact",
+                    None,
+                    DimacsPublicationInvalidation::Empty,
+                )
+            })
+            .transpose()
+    });
+    match artifact_result {
+        Ok(artifact) => publication.artifact = artifact,
+        Err(error) => {
+            let mut reason = format!(
+                "proof artifact could not retain same-run authority for {}: {error}",
+                proof.path
+            );
+            reason.push_str(&publication.invalidate_exact());
+            if proof.synthesized_default {
+                mark_synthesized_default_dimacs_proof_stale(proof);
+            }
+            if let Err(cleanup_error) = remove_owned_dimacs_proof(&proof.path) {
+                reason.push_str(&format!(
+                    "; failed to settle only AY's authenticated proof generation: {cleanup_error}"
+                ));
+            }
+            if optional {
+                safe_eprintln!(
+                    "c Warning: optional synthesized DIMACS proof {} was not published: {reason}; solver verdict remains authoritative",
+                    proof.path
+                );
+                return AuthorizedDimacsUnsatPublication::without_artifacts();
+            }
+            fail_dimacs_certification_or_exit(&reason);
         }
     }
+
+    if proof.synthesized_default {
+        if let Err(error) =
+            mark_synthesized_default_dimacs_proof_current(proof, published, &mut publication)
+        {
+            let mut reason = format!(
+                "same-run proof status could not retain authority for {}: {error}",
+                proof.path
+            );
+            reason.push_str(&publication.invalidate_exact());
+            if let Err(cleanup_error) = remove_owned_dimacs_proof(&proof.path) {
+                reason.push_str(&format!(
+                    "; failed to settle only AY's authenticated proof generation: {cleanup_error}"
+                ));
+            }
+            if optional {
+                safe_eprintln!(
+                    "c Warning: optional synthesized DIMACS proof {} was not published: {reason}; solver verdict remains authoritative",
+                    proof.path
+                );
+                return AuthorizedDimacsUnsatPublication::without_artifacts();
+            }
+            fail_dimacs_certification_or_exit(&reason);
+        }
+    }
+
+    if let Err(error) = publication.validate() {
+        let mut reason =
+            format!("same-run DIMACS publication changed before authorization completed: {error}");
+        reason.push_str(&publication.invalidate_exact());
+        if let Err(cleanup_error) = remove_owned_dimacs_proof(&proof.path) {
+            reason.push_str(&format!(
+                "; failed to settle only AY's authenticated proof generation: {cleanup_error}"
+            ));
+        }
+        if optional {
+            safe_eprintln!(
+                "c Warning: optional synthesized DIMACS proof {} was not published: {reason}; solver verdict remains authoritative",
+                proof.path
+            );
+            return AuthorizedDimacsUnsatPublication::without_artifacts();
+        }
+        fail_dimacs_certification_or_exit(&reason);
+    }
+
+    AuthorizedDimacsUnsatPublication {
+        publication: Some(publication),
+        temp_proof_path: proof.is_temp.then(|| proof.path.clone()),
+    }
+}
+
+fn sha256_digest(bytes: &[u8]) -> Sha256Digest {
+    Sha256::digest(bytes).into()
+}
+
+fn read_authenticated_dimacs_source(
+    path: &str,
+    expected_sha256: Sha256Digest,
+) -> io::Result<String> {
+    let mut file = open_dimacs_regular_file(Path::new(path))?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("DIMACS source '{path}' is not a regular file"),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let after = file.metadata()?;
+    if ProofFileIdentity::from_metadata(&before) != ProofFileIdentity::from_metadata(&after)
+        || before.len() != after.len()
+        || bytes.len() as u64 != before.len()
+    {
+        return Err(io::Error::other(format!(
+            "DIMACS source '{path}' changed while it was read"
+        )));
+    }
+    if sha256_digest(&bytes) != expected_sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("DIMACS source '{path}' no longer matches the input that was parsed"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("DIMACS source '{path}' is not valid UTF-8/ASCII: {error}"),
+        )
+    })
+}
+
+fn reject_proof_input_alias(input_path: &str, proof_path: &str) -> io::Result<()> {
+    let input = std::fs::canonicalize(input_path)?;
+    let output = resolved_dimacs_proof_path(proof_path)?;
+    if input == output {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "DIMACS proof output aliases the input problem",
+        ));
+    }
+    #[cfg(unix)]
+    if let Ok(output_metadata) = std::fs::metadata(&output) {
+        use std::os::unix::fs::MetadataExt as _;
+        let input_metadata = std::fs::metadata(&input)?;
+        if output_metadata.dev() == input_metadata.dev()
+            && output_metadata.ino() == input_metadata.ino()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DIMACS proof output hard-links the input problem",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
 enum DimacsInputSource<'a> {
     Content(&'a str),
-    FilePath(&'a str),
+    FilePath { path: &'a str, sha256: Sha256Digest },
     Unavailable,
 }
 
@@ -3241,7 +5651,9 @@ impl<'a> DimacsInputSource<'a> {
     fn proof_artifact_problem(self) -> ProofArtifactProblem<'a> {
         match self {
             Self::Content(content) => ProofArtifactProblem::Text(content),
-            Self::FilePath(path) => ProofArtifactProblem::FilePath(path),
+            Self::FilePath { path, sha256 } => {
+                ProofArtifactProblem::AuthenticatedFilePath { path, sha256 }
+            }
             Self::Unavailable => ProofArtifactProblem::Unavailable("DIMACS stream"),
         }
     }
@@ -3334,12 +5746,34 @@ impl SeparatorCoverSidecarRunStats {
     }
 }
 
+fn reject_dimacs_decision_trace_or_exit() {
+    let Some(path) = ay_core::trace_config().decision_trace_path.as_deref() else {
+        return;
+    };
+    if let Err(error) = ay_sat::invalidate_reserved_decision_trace(path) {
+        safe_eprintln!(
+            "Error: --decision-trace is incompatible with DIMACS solving, and its reserved output could not be invalidated: {error}"
+        );
+        std::process::exit(1);
+    }
+    safe_eprintln!(
+        "Error: --decision-trace is incompatible with DIMACS solving until every DIMACS route authenticates a terminal trace correlated with its final public verdict"
+    );
+    std::process::exit(1);
+}
+
 pub(crate) fn run_dimacs_proof_from_file(
     path: &str,
     stats_cfg: stats_output::StatsConfig,
     proof: &ProofConfig,
 ) {
+    reject_dimacs_decision_trace_or_exit();
+    enforce_required_dimacs_proof_gate(Some(proof));
     exit_if_circuit_multiplier22_retained_sat_model_authority_admits_file(path);
+    if let Err(error) = reject_proof_input_alias(path, &proof.path) {
+        safe_eprintln!("Error: unsafe DIMACS proof path {}: {error}", proof.path);
+        std::process::exit(1);
+    }
     let separator_cover_sidecar = discover_and_check_separator_cover_sidecar_from_file(path);
     if separator_cover_sidecar
         .as_ref()
@@ -3355,13 +5789,31 @@ pub(crate) fn run_dimacs_proof_from_file(
     // ACTUALLY appear (content-driven), rather than trusting the declared header.
     // The raw bytes are O(file size) — the streaming below still avoids
     // materializing parsed clause structures.
-    let bytes = match std::fs::read(path) {
+    let canonical_input = match std::fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(error) => {
+            safe_eprintln!("Error resolving file '{path}': {error}");
+            std::process::exit(1);
+        }
+    };
+    let canonical_input_text = canonical_input.to_string_lossy().into_owned();
+    let bytes = match open_dimacs_regular_file(&canonical_input).and_then(|mut file| {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }) {
         Ok(bytes) => bytes,
         Err(error) => {
             safe_eprintln!("Error reading file '{path}': {error}");
             std::process::exit(1);
         }
     };
+    if let Err(error) = std::str::from_utf8(&bytes) {
+        safe_eprintln!("c Parse error: DIMACS input is not valid UTF-8/ASCII: {error}");
+        safe_println!("s UNKNOWN");
+        std::process::exit(1);
+    }
+    let input_sha256 = sha256_digest(&bytes);
     let content_max_var = scan_max_variable(&bytes);
     // Giant-mode memory lever (`AY_AB_GIANT_MEM`, default ON): hand the byte
     // buffer to the reader BY VALUE. `parse_dimacs_events` consumes the
@@ -3378,7 +5830,10 @@ pub(crate) fn run_dimacs_proof_from_file(
             stats_cfg,
             selected_sat_variant(),
             proof,
-            DimacsInputSource::FilePath(path),
+            DimacsInputSource::FilePath {
+                path: &canonical_input_text,
+                sha256: input_sha256,
+            },
             Some(content_max_var),
         );
     } else {
@@ -3387,7 +5842,10 @@ pub(crate) fn run_dimacs_proof_from_file(
             stats_cfg,
             selected_sat_variant(),
             proof,
-            DimacsInputSource::FilePath(path),
+            DimacsInputSource::FilePath {
+                path: &canonical_input_text,
+                sha256: input_sha256,
+            },
             Some(content_max_var),
         );
     }
@@ -3421,6 +5879,8 @@ pub(crate) fn run_dimacs_proof_from_reader<R>(
 ) where
     R: Read,
 {
+    reject_dimacs_decision_trace_or_exit();
+    enforce_required_dimacs_proof_gate(Some(proof));
     run_proof_streaming_reader(
         reader,
         stats_cfg,
@@ -3474,6 +5934,8 @@ fn run_dimacs_from_content_impl(
     proof_config: Option<&ProofConfig>,
     input_path: Option<&str>,
 ) {
+    reject_dimacs_decision_trace_or_exit();
+    enforce_required_dimacs_proof_gate(proof_config);
     let sat_variant = selected_sat_variant();
     // Auto-route Default -> Probe for binary-dominant mid-size formulas unless
     // the user pinned a variant with `--sat-variant` (kill-switch:
@@ -3638,11 +6100,6 @@ fn run_dimacs_from_content_impl(
                     return;
                 }
 
-                let file = match File::create(&proof.path) {
-                    Ok(file) => file,
-                    Err(error) => exit_failed_proof_create(&proof.path, &error),
-                };
-                let writer = proof_output_writer(file);
                 let lrat_output = matches!(proof.format, ProofFormat::Lrat);
                 let features = SatFeatures::extract(formula.num_vars, &formula.clauses);
                 let variant_config = variant_profile_plan_for_dimacs_features(
@@ -3656,19 +6113,30 @@ fn run_dimacs_from_content_impl(
                 )
                 .config;
 
-                let output = match (proof.format, proof.binary) {
-                    (ProofFormat::Drat, false) => ProofOutput::drat_text(writer),
-                    (ProofFormat::Drat, true) => ProofOutput::drat_binary(writer),
-                    (ProofFormat::Lrat, false) => {
-                        ProofOutput::lrat_text(writer, num_original_clauses)
+                let output = match create_configured_dimacs_proof_file(proof)
+                    .and_then(|file| solver_proof_output_writer(file, proof))
+                {
+                    Ok(writer) => {
+                        match (proof.format, proof.binary) {
+                            (ProofFormat::Drat, false) => ProofOutput::drat_text(writer),
+                            (ProofFormat::Drat, true) => ProofOutput::drat_binary(writer),
+                            (ProofFormat::Lrat, false) => {
+                                ProofOutput::lrat_text(writer, num_original_clauses)
+                            }
+                            (ProofFormat::Lrat, true) => {
+                                ProofOutput::lrat_binary(writer, num_original_clauses)
+                            }
+                            (ProofFormat::Alethe | ProofFormat::Lean4, _) => {
+                                // These formats are handled above via post-solve certificate export.
+                                unreachable!("Alethe/Lean4 handled by pre-solve branch")
+                            }
+                        }
                     }
-                    (ProofFormat::Lrat, true) => {
-                        ProofOutput::lrat_binary(writer, num_original_clauses)
-                    }
-                    (ProofFormat::Alethe | ProofFormat::Lean4, _) => {
-                        // These formats are handled above via post-solve certificate export.
-                        unreachable!("Alethe/Lean4 handled by pre-solve branch")
-                    }
+                    Err(error) => sink_proof_output_after_optional_create_failure(
+                        proof,
+                        num_original_clauses,
+                        &error,
+                    ),
                 };
                 let mut solver = SatSolver::with_proof_output(formula.num_vars, output);
                 variant_config.apply_to_solver(&mut solver);
@@ -3961,6 +6429,8 @@ pub(crate) fn run_dimacs_parallel(
     proof_config: Option<&ProofConfig>,
     num_threads: usize,
 ) {
+    reject_dimacs_decision_trace_or_exit();
+    enforce_required_dimacs_proof_gate(proof_config);
     match parse_dimacs(content) {
         Ok(formula) => {
             safe_eprintln!(
@@ -3988,7 +6458,27 @@ pub(crate) fn run_dimacs_parallel(
             );
             cleanup_dimacs_non_unsat_proof_paths_for_result(&result, proof_config);
 
-            // Emit stats if requested.
+            // Write proof file from the forward DRAT bytes if available,
+            // otherwise fall back to materializing from the ProofCertificate (#8428).
+            if let (SatResult::Unsat(ref cert), Some(proof)) = (&result, proof_config) {
+                let original_clauses = dimacs_original_clauses_from_literals(&formula.clauses);
+                write_parallel_proof(raw_proof_bytes.as_deref(), cert, proof, &original_clauses);
+            }
+            let mut unsat_authority = if matches!(&result, SatResult::Unsat(_)) {
+                Some(authorize_dimacs_unsat_artifacts(
+                    DimacsInputSource::Content(content),
+                    proof_config,
+                    ProofArtifactTheoryMetadata::dimacs_sat(
+                        formula.num_vars,
+                        formula.clauses.len(),
+                    ),
+                ))
+            } else {
+                None
+            };
+
+            // Definitive stats are public result output too; emit them only
+            // after every mandatory UNSAT gate and artifact publication.
             if stats_cfg.any() {
                 let result_str = match &result {
                     SatResult::Sat(_) => "sat",
@@ -4003,7 +6493,6 @@ pub(crate) fn run_dimacs_parallel(
                     global_elapsed(),
                 );
                 run_stats.insert("sat.parallel_threads", num_threads as u64);
-                // #8640: Resource consumption statistics.
                 run_stats.insert(
                     "resource.rss_peak_bytes",
                     ay_sys::current_rss_bytes() as u64,
@@ -4013,24 +6502,15 @@ pub(crate) fn run_dimacs_parallel(
                     ay_sys::get_process_memory_limit() as u64,
                 );
                 run_stats.insert("time.total_ms", global_elapsed().as_millis() as u64);
+                if let Some(authority) = &mut unsat_authority {
+                    validate_dimacs_unsat_publication_before_verdict(authority);
+                }
                 run_stats.emit(stats_cfg);
             }
 
-            // Write proof file from the forward DRAT bytes if available,
-            // otherwise fall back to materializing from the ProofCertificate (#8428).
-            if let (SatResult::Unsat(ref cert), Some(proof)) = (&result, proof_config) {
-                let original_clauses = dimacs_original_clauses_from_literals(&formula.clauses);
-                write_parallel_proof(raw_proof_bytes.as_deref(), cert, proof, &original_clauses);
-                write_proof_artifact_or_exit(
-                    ProofArtifactProblem::Text(content),
-                    proof,
-                    ProofArtifactTheoryMetadata::dimacs_sat(
-                        formula.num_vars,
-                        formula.clauses.len(),
-                    ),
-                );
+            if let Some(authority) = &mut unsat_authority {
+                validate_dimacs_unsat_publication_before_verdict(authority);
             }
-
             emit_sat_applied_run_summary(
                 "parallel-portfolio",
                 "--parallel",
@@ -4049,16 +6529,17 @@ pub(crate) fn run_dimacs_parallel(
                     std::process::exit(10);
                 }
                 SatResult::Unsat(_) => {
+                    let Some(authority) = &mut unsat_authority else {
+                        fail_dimacs_certification_or_exit(
+                            "parallel UNSAT route lost its publication authority",
+                        );
+                    };
+                    validate_dimacs_unsat_publication_before_verdict(authority);
                     crate::mark_verdict_printed();
                     safe_println!("s UNSATISFIABLE");
+                    authority.commit_after_verdict();
                     let _ = io::stdout().flush();
                     let _ = io::stderr().flush();
-                    if !verify_unsat_proof(content, proof_config) {
-                        std::process::exit(1);
-                    }
-                    if !verify_lean_proof(proof_config) {
-                        std::process::exit(2);
-                    }
                     std::process::exit(20);
                 }
                 SatResult::Unknown => {
@@ -4096,10 +6577,11 @@ fn write_parallel_proof(
     proof_config: &ProofConfig,
     original_clauses: &[(u64, Vec<i32>)],
 ) {
-    let file = match File::create(&proof_config.path) {
+    let file = match create_configured_dimacs_proof_file(proof_config) {
         Ok(file) => file,
         Err(error) => {
-            exit_failed_proof_create(&proof_config.path, &error);
+            handle_failed_proof_create(proof_config, &error);
+            return;
         }
     };
     let mut writer = proof_output_writer(file);
@@ -4116,11 +6598,12 @@ fn write_parallel_proof(
         };
         if write_result.is_ok() {
             if let Err(error) = writer.flush() {
-                safe_eprintln!(
-                    "Error: failed to flush proof file {}: {error}",
-                    proof_config.path
-                );
-                std::process::exit(1);
+                handle_dimacs_proof_io_failure(proof_config, "flush", &error);
+                return;
+            }
+            drop(writer);
+            if let Err(error) = seal_owned_dimacs_proof(&proof_config.path) {
+                handle_dimacs_proof_io_failure(proof_config, "seal", &error);
             }
             return;
         }
@@ -4145,18 +6628,16 @@ fn write_parallel_proof(
         ProofFormat::Alethe => cert.write_alethe(&mut writer),
     };
     if let Err(error) = write_result {
-        safe_eprintln!(
-            "Error: failed to write proof to {}: {error}",
-            proof_config.path
-        );
-        std::process::exit(1);
+        handle_dimacs_proof_io_failure(proof_config, "write", &error);
+        return;
     }
     if let Err(error) = writer.flush() {
-        safe_eprintln!(
-            "Error: failed to flush proof file {}: {error}",
-            proof_config.path
-        );
-        std::process::exit(1);
+        handle_dimacs_proof_io_failure(proof_config, "flush", &error);
+        return;
+    }
+    drop(writer);
+    if let Err(error) = seal_owned_dimacs_proof(&proof_config.path) {
+        handle_dimacs_proof_io_failure(proof_config, "seal", &error);
     }
 }
 
@@ -4209,6 +6690,8 @@ pub(crate) fn run_dimacs_cube_and_conquer(
 ) {
     use ay_sat::CubeAndConquerSolver;
 
+    reject_dimacs_decision_trace_or_exit();
+    enforce_required_dimacs_proof_gate(proof_config);
     match parse_dimacs(content) {
         Ok(formula) => {
             safe_eprintln!(
@@ -4228,7 +6711,23 @@ pub(crate) fn run_dimacs_cube_and_conquer(
             );
             cleanup_dimacs_non_unsat_proof_paths_for_result(&result, proof_config);
 
-            // Emit stats if requested.
+            if let (SatResult::Unsat(ref cert), Some(proof)) = (&result, proof_config) {
+                let original_clauses = dimacs_original_clauses_from_literals(&formula.clauses);
+                write_parallel_proof(None, cert, proof, &original_clauses);
+            }
+            let mut unsat_authority = if matches!(&result, SatResult::Unsat(_)) {
+                Some(authorize_dimacs_unsat_artifacts(
+                    DimacsInputSource::Content(content),
+                    proof_config,
+                    ProofArtifactTheoryMetadata::dimacs_sat(
+                        formula.num_vars,
+                        formula.clauses.len(),
+                    ),
+                ))
+            } else {
+                None
+            };
+
             if stats_cfg.any() {
                 let result_str = match &result {
                     SatResult::Sat(_) => "sat",
@@ -4244,7 +6743,6 @@ pub(crate) fn run_dimacs_cube_and_conquer(
                 );
                 run_stats.insert("sat.cube_and_conquer_depth", depth as u64);
                 run_stats.insert("sat.cube_and_conquer_threads", num_threads as u64);
-                // #8640: Resource consumption statistics.
                 run_stats.insert(
                     "resource.rss_peak_bytes",
                     ay_sys::current_rss_bytes() as u64,
@@ -4254,9 +6752,15 @@ pub(crate) fn run_dimacs_cube_and_conquer(
                     ay_sys::get_process_memory_limit() as u64,
                 );
                 run_stats.insert("time.total_ms", global_elapsed().as_millis() as u64);
+                if let Some(authority) = &mut unsat_authority {
+                    validate_dimacs_unsat_publication_before_verdict(authority);
+                }
                 run_stats.emit(stats_cfg);
             }
 
+            if let Some(authority) = &mut unsat_authority {
+                validate_dimacs_unsat_publication_before_verdict(authority);
+            }
             emit_sat_applied_run_summary(
                 "cube-and-conquer",
                 "--cube-and-conquer",
@@ -4275,16 +6779,17 @@ pub(crate) fn run_dimacs_cube_and_conquer(
                     std::process::exit(10);
                 }
                 SatResult::Unsat(_) => {
+                    let Some(authority) = &mut unsat_authority else {
+                        fail_dimacs_certification_or_exit(
+                            "cube-and-conquer UNSAT route lost its publication authority",
+                        );
+                    };
+                    validate_dimacs_unsat_publication_before_verdict(authority);
                     crate::mark_verdict_printed();
                     safe_println!("s UNSATISFIABLE");
+                    authority.commit_after_verdict();
                     let _ = io::stdout().flush();
                     let _ = io::stderr().flush();
-                    if !verify_unsat_proof(content, proof_config) {
-                        std::process::exit(1);
-                    }
-                    if !verify_lean_proof(proof_config) {
-                        std::process::exit(2);
-                    }
                     std::process::exit(20);
                 }
                 SatResult::Unknown => {
@@ -4459,7 +6964,7 @@ fn run_dimacs_solver_lean4_with_source(
     if let SatResult::Unsat(ref cert) = result {
         let (lean_cert, telemetry) = take_text_lrat_certificate(solver, cert);
         proof_writer_telemetry = telemetry;
-        let file = match File::create(lean4_path) {
+        let file = match create_owned_dimacs_proof_file(lean4_path) {
             Ok(f) => f,
             Err(e) => {
                 safe_eprintln!("Error: failed to create Lean4 proof file {lean4_path}: {e}");
@@ -4473,6 +6978,11 @@ fn run_dimacs_solver_lean4_with_source(
         }
         if let Err(e) = writer.flush() {
             safe_eprintln!("Error: failed to flush Lean4 proof file {lean4_path}: {e}");
+            std::process::exit(1);
+        }
+        drop(writer);
+        if let Err(e) = seal_owned_dimacs_proof(lean4_path) {
+            safe_eprintln!("Error: failed to seal Lean4 proof file {lean4_path}: {e}");
             std::process::exit(1);
         }
     }
@@ -4552,7 +7062,7 @@ fn run_dimacs_solver_alethe_with_source(
 
     // On UNSAT, write the Alethe LRAT export before finish_dimacs_solve exits.
     if let SatResult::Unsat(ref cert) = result {
-        let file = match File::create(alethe_path) {
+        let file = match create_owned_dimacs_proof_file(alethe_path) {
             Ok(f) => f,
             Err(e) => {
                 safe_eprintln!("Error: failed to create Alethe proof file {alethe_path}: {e}");
@@ -4566,6 +7076,11 @@ fn run_dimacs_solver_alethe_with_source(
         }
         if let Err(e) = writer.flush() {
             safe_eprintln!("Error: failed to flush Alethe proof file {alethe_path}: {e}");
+            std::process::exit(1);
+        }
+        drop(writer);
+        if let Err(e) = seal_owned_dimacs_proof(alethe_path) {
+            safe_eprintln!("Error: failed to seal Alethe proof file {alethe_path}: {e}");
             std::process::exit(1);
         }
     }
@@ -4584,16 +7099,14 @@ fn run_dimacs_solver_alethe_with_source(
 
 /// Verify the emitted Lean4 proof file post-UNSAT when `--lean-verify` is
 /// enabled (#8773, Phase 1 thin wrapper). Returns `true` when the proof is
-/// accepted or verification was skipped (flag off / non-Lean format / lean
-/// binary unavailable), `false` when the Lean kernel rejects the proof — a
-/// soundness failure.
+/// accepted, `false` when an explicitly requested kernel check cannot run or
+/// rejects the exact proof generation emitted by this solve.
 ///
 /// Exit-code contract (see the development design notes):
 /// - Accepted  → true  (caller proceeds to exit 20 = UNSAT)
 /// - Rejected  → false (caller should exit 2 = soundness failure)
-/// - Unavailable (lean missing, timeout, IO error) → true + stderr note;
-///   this is not a soundness failure — the solver still proved UNSAT via its
-///   internal DRAT/LRAT checker, we just could not run the Lean kernel.
+/// - Unavailable (lean missing, timeout, IO error) → false (the explicit
+///   verification promise was not fulfilled).
 ///
 /// Safe to call unconditionally; it becomes a no-op when `--lean-verify` is
 /// disabled or the emitted proof is not Lean4.
@@ -4605,18 +7118,43 @@ fn verify_lean_proof(proof_config: Option<&ProofConfig>) -> bool {
     let proof = match proof_config {
         Some(p) => p,
         None => {
-            safe_eprintln!(
-                "c Warning: --lean-verify set but no proof was emitted; skipping Lean kernel check"
-            );
-            return true;
+            safe_eprintln!("c Error: --lean-verify set but no proof was emitted");
+            return false;
         }
     };
     if proof.format != ProofFormat::Lean4 {
         safe_eprintln!(
-            "c Warning: --lean-verify requires a Lean4 proof (.lean4 or --proof-format lean4); got {:?} — skipping",
+            "c Error: --lean-verify requires a Lean4 proof (.lean4 or --proof-format lean4); got {:?}",
             proof.format
         );
-        return true;
+        return false;
+    }
+    let published = match validate_published_dimacs_proof(&proof.path) {
+        Ok(published) => published,
+        Err(error) => {
+            safe_eprintln!(
+                "c Error: Lean verification refused unauthenticated proof {}: {error}",
+                proof.path
+            );
+            return false;
+        }
+    };
+    let mut snapshot = match AuthenticatedLeanSnapshot::create(&proof.path, published) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            safe_eprintln!(
+                "c Error: failed to create authenticated Lean snapshot for {}: {error}",
+                proof.path
+            );
+            return false;
+        }
+    };
+    if let Err(error) = snapshot.validate() {
+        safe_eprintln!(
+            "c Error: authenticated Lean snapshot for {} failed validation: {error}",
+            proof.path
+        );
+        return false;
     }
 
     use super::lean_verify::{LeanVerificationOutcome, LeanVerifier};
@@ -4624,9 +7162,32 @@ fn verify_lean_proof(proof_config: Option<&ProofConfig>) -> bool {
     if let Some(path) = super::LEAN_BINARY_PATH.get() {
         verifier = verifier.with_path(path);
     }
-    let outcome = verifier.verify(Path::new(&proof.path));
+    // Lean sees only the anonymous digest-bound snapshot. The inherited
+    // descriptor pins the exact inode across exec; the public proof path
+    // remains useful as a retained artifact, but it is never a verifier input.
+    #[cfg(target_os = "linux")]
+    let outcome = verifier.verify_descriptor(&snapshot.descriptor);
+    #[cfg(not(target_os = "linux"))]
+    let outcome = LeanVerificationOutcome::Unavailable {
+        reason: "authenticated anonymous Lean snapshots are not supported on this platform"
+            .to_string(),
+    };
+    if let Err(error) = snapshot.validate() {
+        safe_eprintln!(
+            "c Error: authenticated Lean snapshot for {} changed during kernel verification: {error}",
+            proof.path
+        );
+        return false;
+    }
     match outcome {
         LeanVerificationOutcome::Accepted => {
+            if let Err(error) = validate_published_dimacs_proof(&proof.path) {
+                safe_eprintln!(
+                    "c Error: Lean proof {} changed during kernel verification: {error}",
+                    proof.path
+                );
+                return false;
+            }
             safe_eprintln!("c Lean verification: OK ({})", proof.path);
             true
         }
@@ -4647,17 +7208,21 @@ fn verify_lean_proof(proof_config: Option<&ProofConfig>) -> bool {
         }
         LeanVerificationOutcome::Unavailable { reason } => {
             safe_eprintln!(
-                "c Lean verification unavailable: {reason} (Lean4 proof was emitted but the kernel check did not run)"
+                "c Error: Lean verification unavailable: {reason} (the requested kernel check did not run)"
             );
-            true
+            false
         }
     }
 }
 
 fn cleanup_temp_proof_file(proof: &ProofConfig) {
     if proof.is_temp {
-        let _ = std::fs::remove_file(&proof.path);
+        let _ = remove_owned_dimacs_proof(&proof.path);
     }
+}
+
+fn verification_skip_is_acceptable(explicitly_requested: bool) -> bool {
+    !explicitly_requested && required_dimacs_proof_gate_name().is_none()
 }
 
 /// Verify the emitted proof file post-UNSAT when `--verify-proof` is enabled
@@ -4675,17 +7240,36 @@ fn verify_unsat_proof(content: &str, proof_config: Option<&ProofConfig>) -> bool
     if !super::VERIFY_PROOF_ENABLED.load(Ordering::SeqCst) {
         return true;
     }
+    let explicitly_requested = super::EXPLICIT_VERIFY_PROOF_ENABLED.load(Ordering::SeqCst);
     let proof = match proof_config {
         Some(p) => p,
+        None if explicitly_requested => {
+            safe_eprintln!("c Error: --verify-proof set but no proof was emitted");
+            return false;
+        }
         None => return true,
+    };
+    let optional_default = synthesized_default_dimacs_proof_is_optional(proof);
+
+    let expected_sha256 = match published_dimacs_proof(&proof.path) {
+        Ok(published) => published.sha256,
+        Err(error) => {
+            if optional_default {
+                safe_eprintln!(
+                    "c Warning: automatic proof verification skipped output not emitted by this run: {error}"
+                );
+            } else {
+                safe_eprintln!(
+                    "c Error: proof verification refused output not emitted by this run: {error}"
+                );
+            }
+            cleanup_temp_proof_file(proof);
+            return false;
+        }
     };
 
     use super::proof_verify::{verify_proof_file, VerifyOutcome};
-    let outcome = verify_proof_file(content, proof);
-
-    // Temporary proof files are synthesized by `--verify-proof` with no
-    // user-supplied `--proof` and should not persist beyond verification.
-    let cleanup = || cleanup_temp_proof_file(proof);
+    let outcome = verify_proof_file(content, proof, expected_sha256);
 
     match outcome {
         VerifyOutcome::Verified => {
@@ -4699,15 +7283,37 @@ fn verify_unsat_proof(content: &str, proof_config: Option<&ProofConfig>) -> bool
                     ProofFormat::Lean4 => "Lean4",
                 }
             );
-            cleanup();
             true
         }
         VerifyOutcome::Skipped { reason } => {
-            safe_eprintln!("c Warning: verify-proof skipped: {reason}");
-            cleanup();
-            true
+            let required_gate = required_dimacs_proof_gate_name();
+            if let Some(gate) = required_gate {
+                safe_eprintln!("c Error: {gate} DIMACS proof re-check could not run: {reason}");
+            } else if explicitly_requested {
+                safe_eprintln!("c Error: --verify-proof could not be fulfilled: {reason}");
+            } else {
+                safe_eprintln!("c Warning: automatic proof verification skipped: {reason}");
+            }
+            let accepted = verification_skip_is_acceptable(explicitly_requested);
+            if !accepted {
+                cleanup_temp_proof_file(proof);
+            }
+            accepted
         }
         VerifyOutcome::Rejected { reason } => {
+            if optional_default {
+                safe_eprintln!(
+                    "c Warning: automatic proof verification failed for {}: {reason}",
+                    proof.path
+                );
+                if let Err(error) = remove_owned_dimacs_proof(&proof.path) {
+                    safe_eprintln!(
+                        "c Warning: failed to remove rejected optional DIMACS proof {}: {error}",
+                        proof.path
+                    );
+                }
+                return false;
+            }
             safe_eprintln!(
                 "c Error: proof verification FAILED for {} — {reason}",
                 proof.path
@@ -4718,7 +7324,7 @@ fn verify_unsat_proof(content: &str, proof_config: Option<&ProofConfig>) -> bool
             // Leave the proof file on disk when it was user-requested, so
             // the user can re-run drat-trim / lrat-check to diagnose.
             // Remove it if we synthesized it (no user requested it).
-            cleanup();
+            cleanup_temp_proof_file(proof);
             let _ = io::stdout().flush();
             let _ = io::stderr().flush();
             false
@@ -4737,29 +7343,44 @@ fn verify_unsat_proof_from_source(
 
     match source {
         DimacsInputSource::Content(content) => verify_unsat_proof(content, proof_config),
-        DimacsInputSource::FilePath(path) => {
-            let content = match std::fs::read_to_string(path) {
+        DimacsInputSource::FilePath { path, sha256 } => {
+            let content = match read_authenticated_dimacs_source(path, sha256) {
                 Ok(content) => content,
                 Err(error) => {
-                    safe_eprintln!(
-                        "c Warning: verify-proof skipped: failed to read DIMACS input {path}: {error}"
-                    );
+                    let optional_default =
+                        proof_config.is_some_and(synthesized_default_dimacs_proof_is_optional);
+                    if optional_default {
+                        safe_eprintln!(
+                            "c Warning: automatic proof verification skipped changed or unreadable DIMACS input {path}: {error}"
+                        );
+                    } else {
+                        safe_eprintln!(
+                            "c Error: verify-proof refused changed or unreadable DIMACS input {path}: {error}"
+                        );
+                    }
                     if let Some(proof) = proof_config {
                         cleanup_temp_proof_file(proof);
                     }
-                    return true;
+                    return false;
                 }
             };
             verify_unsat_proof(&content, proof_config)
         }
         DimacsInputSource::Unavailable => {
-            safe_eprintln!(
-                "c Warning: verify-proof skipped: original DIMACS content unavailable for streamed stdin"
-            );
+            let explicitly_requested = super::EXPLICIT_VERIFY_PROOF_ENABLED.load(Ordering::SeqCst);
+            if explicitly_requested {
+                safe_eprintln!(
+                    "c Error: --verify-proof cannot verify streamed input whose original bytes are unavailable"
+                );
+            } else {
+                safe_eprintln!(
+                    "c Warning: automatic proof verification skipped: original DIMACS content unavailable for streamed input"
+                );
+            }
             if let Some(proof) = proof_config {
                 cleanup_temp_proof_file(proof);
             }
-            true
+            verification_skip_is_acceptable(explicitly_requested)
         }
     }
 }
@@ -4888,7 +7509,7 @@ fn configure_dimacs_solver(solver: &mut SatSolver, _stats_cfg: stats_output::Sta
 // env_mutation lint prescription — mirrors deductive-checks-merge-contract's
 // RUSTC_BOOTSTRAP pattern). Two concurrent solves can no longer race the
 // variable or restore each other's values.
-static FMLA_PROOF_OUT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static FMLA_PROOF_OUT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct FmlaCurrentProofOutEnvGuard {
     previous: Option<std::ffi::OsString>,
@@ -4896,6 +7517,10 @@ struct FmlaCurrentProofOutEnvGuard {
 }
 
 impl FmlaCurrentProofOutEnvGuard {
+    // Blessed env_mutation site: this IS the lock-scoped-helper pattern the
+    // lint prescribes — an RAII guard that captures the previous value here
+    // and restores it in Drop below; the CLI solve path holding it is
+    // single-threaded with respect to this variable's readers.
     #[allow(unknown_lints, env_mutation)]
     fn set_for_proof(proof_config: Option<&ProofConfig>) -> Self {
         let lock = FMLA_PROOF_OUT_ENV_LOCK
@@ -4922,6 +7547,7 @@ impl FmlaCurrentProofOutEnvGuard {
 }
 
 impl Drop for FmlaCurrentProofOutEnvGuard {
+    // Blessed env_mutation site: restore arm of the RAII guard above.
     #[allow(unknown_lints, env_mutation)]
     fn drop(&mut self) {
         if let Some(previous) = self.previous.take() {
@@ -4977,8 +7603,51 @@ fn finish_dimacs_solve_with_source(
         route_profile,
         proof_config,
     );
-    let proof_writer_telemetry_override = proof_writer_telemetry_override
+    let mut proof_writer_telemetry_override = proof_writer_telemetry_override
         .or_else(|| cleanup_dimacs_non_unsat_proof_sidecar(solver, &result, proof_config));
+
+    // FINALIZE_SAT_FAIL rescue must settle the authoritative result before
+    // statistics are rendered. Otherwise a rejected first model can stamp an
+    // `unknown` record even when the fresh original-formula retry proves SAT or
+    // UNSAT. The initial non-UNSAT proof writer was cleaned up above so a
+    // proof-mode retry can safely recreate its stream from scratch.
+    let mut result = result;
+    let mut rescue_storage: Option<SatSolver> = None;
+    if finalize_rescue_applicable(solver, &result, proof_config) {
+        if let Some((retry_result, retry_solver)) = run_finalize_rescue(source, proof_config) {
+            result = retry_result;
+            rescue_storage = Some(retry_solver);
+            // Telemetry now belongs to the retry solver/proof stream, not the
+            // discarded first attempt.
+            proof_writer_telemetry_override = None;
+        }
+    }
+    let solver: &mut SatSolver = match rescue_storage.as_mut() {
+        Some(retry_solver) => retry_solver,
+        None => solver,
+    };
+
+    // Settle every requested UNSAT authority gate and only then publish the
+    // proof-artifact envelope or authoritative result statistics. A rejected
+    // proof must leave neither a public UNSAT verdict nor an ordinary
+    // proof-artifact-v1 sidecar that appears to certify one.
+    let mut unsat_authority = if matches!(&result, SatResult::Unsat(_)) {
+        if let Some(proof) = proof_config {
+            proof_writer_telemetry_override =
+                proof_writer_telemetry_override.or_else(|| dimacs_proof_writer_telemetry(solver));
+            finalize_solver_dimacs_proof_or_exit(solver, proof);
+        }
+        Some(authorize_dimacs_unsat_artifacts(
+            source,
+            proof_config,
+            ProofArtifactTheoryMetadata::dimacs_sat(
+                solver.user_num_vars(),
+                solver.num_original_clauses(),
+            ),
+        ))
+    } else {
+        None
+    };
 
     if stats_cfg.any() {
         let props = solver.num_propagations();
@@ -7484,42 +10153,11 @@ fn finish_dimacs_solve_with_source(
             ay_core::TermStore::global_term_bytes() as u64,
         );
         run_stats.insert("time.total_ms", global_elapsed().as_millis() as u64);
+        if let Some(authority) = &mut unsat_authority {
+            validate_dimacs_unsat_publication_before_verdict(authority);
+        }
         emit_dimacs_run_stats(&run_stats, stats_cfg, route_profile);
     }
-    // FINALIZE_SAT_FAIL rescue lane: when the finalize original-ledger gate
-    // rejected a candidate model (InvalidSatModel) and wall budget remains,
-    // retry ONCE with a fresh solver on the original formula with every
-    // model-mutating preprocessing/inprocessing technique disabled. Safe by
-    // construction: a retry SAT passes the SAME finalize gate inside
-    // declare_sat_from_model (the retry solver's original ledger IS the
-    // original formula); a retry UNSAT comes from a fresh, unpoisoned solver
-    // (status quo trust level for non-proof mode). One retry only (no storm):
-    // the retry result replaces `result` here and cannot re-enter this branch.
-    // Budget: solve_interruptible(is_timed_out) polls the same global
-    // watchdog, so total wall stays <= the original -t budget. Scoped to
-    // non-proof mode (a proof-mode retry would have to re-emit the DRAT/LRAT
-    // stream from scratch; see design notes). Kill-switch:
-    // AY_AB_FINALIZE_RESCUE=0 (default ON — worst case == status quo UNKNOWN).
-    //
-    // Proof interaction: the non-UNSAT sidecar cleanup above already took the
-    // first solver's proof writer and deleted the proof file, so the retry
-    // recreates the DRAT/LRAT stream from scratch on its own solver — a
-    // retry UNSAT flows through the same artifact-write + proof-verification
-    // path below as any first-attempt UNSAT. Alethe/Lean4 exports happen in
-    // their dedicated runners before this point, so those formats are
-    // excluded from the lane.
-    let mut result = result;
-    let mut rescue_storage: Option<SatSolver> = None;
-    if finalize_rescue_applicable(solver, &result, proof_config) {
-        if let Some((retry_result, retry_solver)) = run_finalize_rescue(source, proof_config) {
-            result = retry_result;
-            rescue_storage = Some(retry_solver);
-        }
-    }
-    let solver: &mut SatSolver = match rescue_storage.as_mut() {
-        Some(retry_solver) => retry_solver,
-        None => solver,
-    };
     match result {
         SatResult::Sat(model) => {
             crate::mark_verdict_printed();
@@ -7532,37 +10170,18 @@ fn finish_dimacs_solve_with_source(
             std::process::exit(10);
         }
         SatResult::Unsat(_) => {
+            let Some(authority) = &mut unsat_authority else {
+                fail_dimacs_certification_or_exit(
+                    "sequential UNSAT route lost its publication authority",
+                );
+            };
+            validate_dimacs_unsat_publication_before_verdict(authority);
             crate::mark_verdict_printed();
             safe_println!("s UNSATISFIABLE");
+            authority.commit_after_verdict();
             // SAT Competition exit code 20 = UNSATISFIABLE.
             let _ = io::stdout().flush();
             let _ = io::stderr().flush();
-
-            if let Some(proof) = proof_config {
-                write_proof_artifact_or_exit(
-                    source.proof_artifact_problem(),
-                    proof,
-                    ProofArtifactTheoryMetadata::dimacs_sat(
-                        solver.user_num_vars(),
-                        solver.num_original_clauses(),
-                    ),
-                );
-            }
-
-            // Post-solve proof verification (#8771). Default-on under
-            // `debug_assertions`, off in release unless `--verify-proof`.
-            // Returns true = accepted/skipped, false = rejected (soundness).
-            if !verify_unsat_proof_from_source(source, proof_config) {
-                std::process::exit(1);
-            }
-
-            // Optional Lean kernel verification (#8773, Phase 1). Only runs
-            // when `--lean-verify` was set. Exit 2 on kernel rejection per
-            // the design doc's exit-code contract.
-            if !verify_lean_proof(proof_config) {
-                std::process::exit(2);
-            }
-
             std::process::exit(20);
         }
         SatResult::Unknown => {
@@ -7655,11 +10274,13 @@ fn run_finalize_rescue(
     let owned_content;
     let content = match source {
         DimacsInputSource::Content(content) => content,
-        DimacsInputSource::FilePath(path) => {
-            owned_content = match std::fs::read_to_string(path) {
+        DimacsInputSource::FilePath { path, sha256 } => {
+            owned_content = match read_authenticated_dimacs_source(path, sha256) {
                 Ok(text) => text,
                 Err(error) => {
-                    safe_eprintln!("c FINALIZE_RESCUE: skipped (re-read failed: {error})");
+                    safe_eprintln!(
+                        "c FINALIZE_RESCUE: skipped (authenticated re-read failed: {error})"
+                    );
                     return None;
                 }
             };
@@ -7687,25 +10308,38 @@ fn run_finalize_rescue(
         Some(proof) => {
             // The non-UNSAT sidecar cleanup already deleted the first
             // attempt's proof file; recreate it for a from-scratch stream.
-            let file = match File::create(&proof.path) {
-                Ok(file) => file,
+            let num_original_clauses = formula.clauses.len() as u64;
+            let output = match create_configured_dimacs_proof_file(proof)
+                .and_then(|file| solver_proof_output_writer(file, proof))
+            {
+                Ok(writer) => {
+                    match (proof.format, proof.binary) {
+                        (ProofFormat::Drat, false) => ProofOutput::drat_text(writer),
+                        (ProofFormat::Drat, true) => ProofOutput::drat_binary(writer),
+                        (ProofFormat::Lrat, false) => {
+                            ProofOutput::lrat_text(writer, num_original_clauses)
+                        }
+                        (ProofFormat::Lrat, true) => {
+                            ProofOutput::lrat_binary(writer, num_original_clauses)
+                        }
+                        (ProofFormat::Alethe | ProofFormat::Lean4, _) => {
+                            // Excluded by finalize_rescue_applicable.
+                            return None;
+                        }
+                    }
+                }
+                Err(error) if synthesized_default_dimacs_proof_is_optional(proof) => {
+                    sink_proof_output_after_optional_create_failure(
+                        proof,
+                        num_original_clauses,
+                        &error,
+                    )
+                }
                 Err(error) => {
                     safe_eprintln!(
                         "c FINALIZE_RESCUE: skipped (proof re-create failed for {}: {error})",
                         proof.path
                     );
-                    return None;
-                }
-            };
-            let writer = proof_output_writer(file);
-            let num_original_clauses = formula.clauses.len() as u64;
-            let output = match (proof.format, proof.binary) {
-                (ProofFormat::Drat, false) => ProofOutput::drat_text(writer),
-                (ProofFormat::Drat, true) => ProofOutput::drat_binary(writer),
-                (ProofFormat::Lrat, false) => ProofOutput::lrat_text(writer, num_original_clauses),
-                (ProofFormat::Lrat, true) => ProofOutput::lrat_binary(writer, num_original_clauses),
-                (ProofFormat::Alethe | ProofFormat::Lean4, _) => {
-                    // Excluded by finalize_rescue_applicable.
                     return None;
                 }
             };
@@ -7841,21 +10475,25 @@ fn run_proof_streaming_reader<R>(
                         ProofOutput::lrat_text(Vec::<u8>::new(), num_original_clauses)
                     }
                     ProofFormat::Drat | ProofFormat::Lrat => {
-                        let file = match File::create(&proof.path) {
-                            Ok(file) => file,
-                            Err(error) => exit_failed_proof_create(&proof.path, &error),
-                        };
-                        let writer = proof_output_writer(file);
-                        match (proof.format, proof.binary) {
-                            (ProofFormat::Drat, false) => ProofOutput::drat_text(writer),
-                            (ProofFormat::Drat, true) => ProofOutput::drat_binary(writer),
-                            (ProofFormat::Lrat, false) => {
-                                ProofOutput::lrat_text(writer, num_original_clauses)
-                            }
-                            (ProofFormat::Lrat, true) => {
-                                ProofOutput::lrat_binary(writer, num_original_clauses)
-                            }
-                            (ProofFormat::Alethe | ProofFormat::Lean4, _) => unreachable!(),
+                        match create_configured_dimacs_proof_file(proof)
+                            .and_then(|file| solver_proof_output_writer(file, proof))
+                        {
+                            Ok(writer) => match (proof.format, proof.binary) {
+                                (ProofFormat::Drat, false) => ProofOutput::drat_text(writer),
+                                (ProofFormat::Drat, true) => ProofOutput::drat_binary(writer),
+                                (ProofFormat::Lrat, false) => {
+                                    ProofOutput::lrat_text(writer, num_original_clauses)
+                                }
+                                (ProofFormat::Lrat, true) => {
+                                    ProofOutput::lrat_binary(writer, num_original_clauses)
+                                }
+                                (ProofFormat::Alethe | ProofFormat::Lean4, _) => unreachable!(),
+                            },
+                            Err(error) => sink_proof_output_after_optional_create_failure(
+                                proof,
+                                num_original_clauses,
+                                &error,
+                            ),
                         }
                     }
                 };

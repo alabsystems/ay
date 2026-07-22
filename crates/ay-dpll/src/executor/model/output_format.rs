@@ -8,6 +8,8 @@
 //! `get-objectives` methods remain in `output.rs`; this module has the formatting
 //! and placeholder-resolution methods they call.
 
+use std::collections::HashMap;
+
 use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::term::TermData;
 use ay_core::{quote_symbol, string_literal, Sort, TermId};
@@ -188,8 +190,7 @@ impl Executor {
         // upstream lane-unification (combined_solvers/models.rs) makes this
         // never trigger on a validated model; if it ever does, fail closed with
         // an explicit error rather than emit a falsifying witness.
-        let mut seen_points: std::collections::HashMap<Vec<String>, String> =
-            std::collections::HashMap::new();
+        let mut seen_points: HashMap<Vec<String>, String> = HashMap::new();
         let mut deduped: Vec<(Vec<String>, String)> = Vec::with_capacity(resolved_table.len());
         for (args, result) in resolved_table {
             match seen_points.get(&args) {
@@ -350,7 +351,7 @@ impl Executor {
             }
             match self.ctx.terms.get(u) {
                 TermData::Var(n, _) => {
-                    if self.ctx.symbol_info(n).is_none() {
+                    if self.ctx.symbol_info_by_identity(n).is_none() {
                         return true;
                     }
                 }
@@ -533,7 +534,7 @@ impl Executor {
         if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
-        Some(crate::executor_format::format_model_atom(sort, &bare))
+        Some(format_model_atom(sort, &bare))
     }
 
     /// Upsert `(idx, val)` into an ordered store list: overwrite an existing

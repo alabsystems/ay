@@ -8,15 +8,15 @@
 //! the `ffi_guard_*` helpers (#6192) to prevent undefined behavior from panics
 //! unwinding across the `extern "C"` boundary.
 
-use std::ffi::{c_char, c_int, c_uint, CStr};
+use std::ffi::{c_char, c_int, c_uint};
 use std::ptr;
 
 use ay_dpll::api::{Logic, Solver};
 
 use super::{
     apply_supported_params, ast_to_term, cache_int_symbol, cache_string, cache_symbol,
-    ffi_guard_const_ptr, ffi_guard_ptr, ffi_guard_void, Z3Config, Z3Context, Z3_ast, Z3_config,
-    Z3_context, Z3_symbol, Z3_DEC_REF_ERROR, Z3_OK,
+    ffi_guard_const_ptr, ffi_guard_ptr, ffi_guard_void, ffi_read_bounded_text, Z3Config, Z3Context,
+    Z3_ast, Z3_config, Z3_context, Z3_symbol, Z3_DEC_REF_ERROR, Z3_OK,
 };
 
 /// Create a new configuration object.
@@ -57,17 +57,16 @@ pub unsafe extern "C" fn Z3_set_param_value(
     if c.is_null() || param_id.is_null() || param_value.is_null() {
         return;
     }
-    // SAFETY: The caller's `# Safety` contract requires the C string pointer to be non-null
-    // and to point to a valid, null-terminated sequence of bytes owned by the caller for the
-    // duration of this call. The pointer was null-checked before entering this block.
+    // SAFETY: both pointers are non-null and valid NUL-terminated strings per
+    // the caller contract; the helper bounds each scan and clone.
+    let (Ok(key), Ok(value)) = (unsafe { ffi_read_bounded_text(param_id) }, unsafe {
+        ffi_read_bounded_text(param_value)
+    }) else {
+        return;
+    };
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
         let cfg = &mut *c;
-        if let (Ok(k), Ok(v)) = (
-            CStr::from_ptr(param_id).to_str(),
-            CStr::from_ptr(param_value).to_str(),
-        ) {
-            cfg.params.push((k.to_string(), v.to_string()));
-        }
+        cfg.params.push((key, value));
     }));
 }
 
@@ -106,7 +105,9 @@ unsafe fn mk_context_inner(c: Z3_config, ref_counted: bool) -> Z3_context {
             ffi_const_metadata: std::collections::HashMap::new(),
             ffi_const_terms_by_identity: std::collections::HashMap::new(),
             ffi_func_names: std::collections::HashMap::new(),
+            ffi_func_decls: std::collections::HashMap::new(),
             ffi_decl_symbols: std::collections::HashMap::new(),
+            ffi_dt_recognizers: std::collections::HashMap::new(),
             ffi_sort_symbols: std::collections::HashMap::new(),
             ffi_used_decl_names: std::collections::HashSet::new(),
             next_ffi_fresh_id: 0,
@@ -348,11 +349,10 @@ pub unsafe extern "C" fn Z3_mk_string_symbol(c: Z3_context, s: *const c_char) ->
     if s.is_null() {
         return ptr::null_mut();
     }
-    // SAFETY: The caller's `# Safety` contract requires the C string pointer to be non-null
-    // and to point to a valid, null-terminated sequence of bytes owned by the caller for the
-    // duration of this call. The pointer was null-checked before entering this block.
-    let name = match unsafe { CStr::from_ptr(s).to_str() } {
-        Ok(n) => n.to_string(),
+    // SAFETY: `s` is non-null and a valid NUL-terminated string per the caller
+    // contract; the helper bounds the scan and clone.
+    let name = match unsafe { ffi_read_bounded_text(s) } {
+        Ok(name) => name,
         Err(_) => return ptr::null_mut(),
     };
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this

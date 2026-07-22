@@ -86,7 +86,7 @@ use ay_core::term::{Constant, Symbol, TermData, TermId};
 
 use super::super::model::{EvalValue, Model};
 use super::super::Executor;
-use super::strings_w4::{w4_memo_reset, w4_pick_char, w4_set_char, w4_trial_model, MAX_W4_LEN};
+use super::strings_w4::{w4_memo_reset, w4_pick_char, w4_set_char, MAX_W4_LEN};
 
 /// Master switch (`AY_STR_W5=1`, default OFF → byte-identical to W4-only).
 pub(in crate::executor) fn str_w5_enabled() -> bool {
@@ -157,7 +157,9 @@ impl Executor {
         numeric: &HashSet<TermId>,
         fresh: char,
     ) -> bool {
-        let mut score = self.w4_violations(atoms, assign);
+        let Some(mut score) = self.w4_violations_complete(atoms, assign) else {
+            return false;
+        };
         if score == 0 {
             return true;
         }
@@ -165,7 +167,9 @@ impl Executor {
             return false;
         }
         for _round in 0..MAX_W5_ROUNDS {
-            if self.should_abort_theory_loop() {
+            // W4's deterministic WORK budget bounds the placement search too —
+            // it is W4's own climb, re-run once per candidate placement.
+            if self.w4_budget_exhausted() || self.should_abort_theory_loop() {
                 return false;
             }
             let placements = self.w5_placements(atoms, assign, fresh);
@@ -174,7 +178,7 @@ impl Executor {
             }
             let mut best: Option<(HashMap<TermId, String>, usize)> = None;
             for (var, value) in placements {
-                if self.should_abort_theory_loop() {
+                if self.w4_budget_exhausted() || self.should_abort_theory_loop() {
                     break;
                 }
                 let mut trial = assign.clone();
@@ -183,7 +187,9 @@ impl Executor {
                 // over every coupled variable — W5 only chooses where the
                 // needle lands.
                 self.w4_synthesize(var_atoms, &mut trial, alphabet, numeric, fresh);
-                let trial_score = self.w4_violations(atoms, &trial);
+                let Some(trial_score) = self.w4_violations_complete(atoms, &trial) else {
+                    return false;
+                };
                 if trial_score == 0 {
                     *assign = trial;
                     return true;
@@ -206,13 +212,13 @@ impl Executor {
 
     /// Candidate `(variable, new value)` placements for the currently-violated
     /// atoms, best-first and hard-capped at [`MAX_W5_PLACEMENTS`].
-    fn w5_placements(
+    pub(super) fn w5_placements(
         &self,
         atoms: &[(TermId, bool)],
         assign: &HashMap<TermId, String>,
         fresh: char,
     ) -> Vec<(TermId, String)> {
-        let model = w4_trial_model(assign);
+        let model = self.w4_model_of(assign);
         w4_memo_reset();
         let violated: Vec<TermId> = atoms
             .iter()

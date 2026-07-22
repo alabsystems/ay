@@ -629,14 +629,14 @@ fn quantifier_id_and_skolem_id_roundtrip() {
         assert!(!got_qid.is_null(), "explicit :qid must round-trip");
         let qname = CStr::from_ptr(Z3_get_symbol_string(c, got_qid))
             .to_str()
-            .unwrap();
+            .expect("quantifier ID must be valid UTF-8");
         assert_eq!(qname, "myqid");
 
         let got_skid = Z3_get_quantifier_skolem_id(c, q);
         assert!(!got_skid.is_null(), "explicit :skolemid must round-trip");
         let sname = CStr::from_ptr(Z3_get_symbol_string(c, got_skid))
             .to_str()
-            .unwrap();
+            .expect("quantifier Skolem ID must be valid UTF-8");
         assert_eq!(sname, "myskid");
 
         // A STRUCTURALLY-DISTINCT quantifier with NO explicit qid → honest null

@@ -6,9 +6,6 @@
 use super::*;
 use crate::bv_blast_export::{BvBlastValidateError, ClauseProvenance, ResRule};
 use proptest::prelude::*;
-// `BvExpr`'s arithmetic constructors are `std::ops` trait impls; bring the
-// traits into scope so the `BvExpr::add(..)`-style path calls resolve.
-use std::ops::{Add as _, Mul as _, Not as _, Shl as _, Sub as _};
 
 /// A genuinely non-identical, valid obligation (commutativity of `bvadd`) at a
 /// real width (>= 8) yields a `BvBlastProof` whose `validate()` passes: every

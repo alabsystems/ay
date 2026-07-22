@@ -1237,7 +1237,7 @@ fn bv_brute_optimum(width: u32, maximize: bool, feasible: impl Fn(u64) -> bool) 
 /// Width-`w` SMT-LIB bitvector literal (hex when divisible by 4, else binary)
 /// matching AY/Z3 output conventions.
 fn bv_lit(value: u64, width: u32) -> String {
-    if width % 4 == 0 {
+    if width.is_multiple_of(4) {
         format!("#x{:0width$x}", value, width = (width / 4) as usize)
     } else {
         format!("#b{:0width$b}", value, width = width as usize)

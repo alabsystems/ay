@@ -5,15 +5,17 @@
 //! Unit tests for the W4 per-position witness synthesizer helpers.
 
 use super::*;
+use ay_frontend::parse;
 
 #[test]
-fn w4_defaults_on_with_kill_switch() {
-    // W4 became DEFAULT-ON in 360a85b477 (31/92 sat-side conversions, 29 of
-    // 31 models z3-pinned, 0 regressions on a 404-file sweep). The contract
-    // the gate must keep is now: on unless explicitly killed with `=0`.
-    if std::env::var("AY_STR_W4").is_err() {
-        assert!(str_w4_enabled(), "AY_STR_W4 must default ON");
-    }
+fn w4_default_tracks_the_env_kill_switch() {
+    // W4 went DEFAULT-ON (`AY_STR_W4=0` is the kill switch); this test
+    // previously asserted the pre-default-on contract and had gone stale.
+    assert_eq!(
+        str_w4_enabled(),
+        !matches!(std::env::var("AY_STR_W4").ok().as_deref(), Some("0")),
+        "W4 is DEFAULT-ON; only AY_STR_W4=0 turns it off"
+    );
 }
 
 #[test]
@@ -68,4 +70,110 @@ fn pick_char_prefers_fresh_then_alphabet() {
     assert_eq!(w4_pick_char(&excluded, &alpha, 'q'), 'q');
     excluded.insert('q');
     assert_eq!(w4_pick_char(&excluded, &alpha, 'q'), 'x');
+}
+
+// ── The deterministic search budget (#w4-work-budget) ──────────────
+
+#[test]
+fn work_budget_default_and_kill_switch() {
+    // Default is the calibrated cap; `AY_STR_W4_WORK=0` restores the
+    // pre-budget unbounded search exactly.
+    match std::env::var("AY_STR_W4_WORK").ok().as_deref() {
+        Some("0") => assert_eq!(w4_search_work_budget(), None),
+        Some(s) if s.trim().parse::<u64>().is_ok() => {
+            assert_eq!(w4_search_work_budget(), Some(s.trim().parse().unwrap()));
+        }
+        _ => assert_eq!(w4_search_work_budget(), Some(MAX_W4_SEARCH_WORK)),
+    }
+}
+
+#[test]
+fn work_budget_keeps_every_measured_conversion_in_range() {
+    // The census these constants come from (see `MAX_W4_SEARCH_WORK`): the
+    // costliest W4/W5/W6 search that ever produced a battery-accepted witness
+    // on the 600-file QF_S + QF_SLIA canary cost 84.4M units, and the cheapest
+    // starvation case cost 242.9M. The cap must separate them, and the wide
+    // band's reduced share must still clear the 14,812 units `kaluza/sat/big/398`
+    // needs — otherwise the constants have drifted away from their evidence.
+    const COSTLIEST_CONVERSION: u64 = 84_379_455;
+    const CHEAPEST_STARVATION: u64 = 242_988_834;
+    const KALUZA_398_WIDE_SEARCH: u64 = 14_812;
+    const {
+        assert!(
+            MAX_W4_SEARCH_WORK > COSTLIEST_CONVERSION,
+            "budget must not cut a search that is known to succeed"
+        );
+        assert!(
+            MAX_W4_SEARCH_WORK < CHEAPEST_STARVATION,
+            "budget must cut the measured starvation cases"
+        );
+        assert!(
+            MAX_W4_SEARCH_WORK / W4_WIDE_WORK_SHARE > KALUZA_398_WIDE_SEARCH,
+            "the wide band's reduced share must still fit its measured conversion"
+        );
+        assert!(
+            MAX_W4_WIDE_VARS >= 85,
+            "kaluza/sat/big/398 declares 85 vars"
+        );
+    }
+}
+
+#[test]
+fn work_clock_is_monotone() {
+    let a = w4_work_clock();
+    let b = w4_work_clock();
+    assert!(b >= a, "the search work clock must never run backwards");
+}
+
+#[test]
+fn budget_is_disarmed_outside_the_pass() {
+    // A fresh executor has no deadline armed, so `w4_budget_exhausted` is
+    // false — W6's and W7's own passes must never inherit W4's budget.
+    let exec = Executor::new();
+    assert_eq!(exec.w4_work_deadline.get(), None);
+    assert!(!exec.w4_budget_exhausted());
+}
+
+#[test]
+fn partial_budget_score_is_rejected_and_not_memoised() {
+    let mut exec = Executor::new();
+    let true_term = exec.ctx.terms.mk_bool(true);
+    let false_term = exec.ctx.terms.mk_bool(false);
+    let atoms = [(true_term, true), (false_term, true)];
+    let assign = HashMap::default();
+
+    exec.w4_work_deadline
+        .set(Some(w4_work_clock().saturating_add(1)));
+    assert_eq!(exec.w4_violations_complete(&atoms, &assign), None);
+    assert_eq!(exec.w4_violations(&atoms, &assign), usize::MAX);
+
+    exec.w4_work_deadline.set(None);
+    assert_eq!(exec.w4_violations_complete(&atoms, &assign), Some(1));
+}
+
+#[test]
+fn tiny_budget_full_w4_entrypoint_rejects_partial_candidate() {
+    let _enabled = w4_test_enabled_override(true);
+    let _budget = w4_test_work_budget_override(Some(1));
+    let mut exec = Executor::new();
+    let commands = parse(
+        r#"
+        (set-logic QF_S)
+        (declare-const x String)
+        (assert (= x "a"))
+        (assert (str.in_re x (str.to_re "a")))
+        "#,
+    )
+    .expect("parse tiny W4 formula");
+    for command in &commands {
+        exec.execute(command).expect("install tiny W4 formula");
+    }
+
+    let work_before = w4_work_clock();
+    assert!(exec
+        .try_per_position_witnesses()
+        .expect("W4 search")
+        .is_none());
+    assert_eq!(w4_work_clock().saturating_sub(work_before), 1);
+    assert_eq!(exec.w4_work_deadline.get(), None);
 }

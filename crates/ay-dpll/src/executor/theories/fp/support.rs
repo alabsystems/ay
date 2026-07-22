@@ -187,7 +187,7 @@ pub(super) fn check_fp_support(terms: &TermStore, roots: &[TermId]) -> FpSupport
         // every in-scope symbolic RM before this walk; whatever it could not
         // eliminate (RM ites, RM-valued UF apps, >cap var counts) must return
         // `unknown`, never a guess.
-        if matches!(terms.sort(term), ay_core::Sort::Uninterpreted(name) if name == "RoundingMode")
+        if matches!(terms.sort(term), Sort::Uninterpreted(name) if name == "RoundingMode")
             && !is_literal_rounding_mode(terms, term)
         {
             return FpSupportStatus::Unsupported;

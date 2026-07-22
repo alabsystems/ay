@@ -58,7 +58,10 @@ fn expired_deadline_fails_closed() {
         m.add_row(0.0, 0.0, &[(prev, 1.0), (next, -1.0)]);
         prev = next;
     }
-    let opts = SolveOpts::new().with_deadline(Instant::now() - Duration::from_secs(1));
+    let expired_deadline = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .expect("test clock must support a one-second lookback");
+    let opts = SolveOpts::new().with_deadline(expired_deadline);
     let mut s = LpSession::new(&m, &opts).unwrap();
     match s.optimize(prev, Sense::Maximize).unwrap() {
         Outcome::Unknown { .. } | Outcome::Optimal { .. } | Outcome::Unbounded => {}

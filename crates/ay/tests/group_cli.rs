@@ -43,6 +43,9 @@ mod cli_env_migration_8726;
 #[path = "group_cli/bv_cnf_dump_faithfulness.rs"]
 mod bv_cnf_dump_faithfulness;
 
+#[path = "group_cli/self_check_bv_drat.rs"]
+mod self_check_bv_drat;
+
 #[path = "group_cli/cli_error_fatal.rs"]
 mod cli_error_fatal;
 
@@ -84,6 +87,12 @@ mod fp_signed_zero_regressions;
 
 #[path = "group_cli/gate_cli.rs"]
 mod gate_cli;
+
+#[path = "group_cli/firewall_route_rejection.rs"]
+mod firewall_route_rejection;
+
+#[path = "group_cli/fail_closed_result_authority.rs"]
+mod fail_closed_result_authority;
 
 #[path = "group_cli/lean_verify_8773.rs"]
 mod lean_verify_8773;

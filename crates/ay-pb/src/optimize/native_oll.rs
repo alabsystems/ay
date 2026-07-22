@@ -1990,6 +1990,7 @@ mod tests {
     use super::*;
     use crate::parser::{parse_opb, parse_wbo};
     use crate::types::{PbConstraint, PbTerm};
+    use ay_test_support::env::{lock_env, ScopedEnvVar};
 
     /// Runs native OLL to completion (no timeout) on a parsed OPB instance and
     /// returns the result.
@@ -2730,26 +2731,20 @@ mod tests {
         assert!(checked >= 25, "only {checked} feasible instances checked");
     }
 
-    /// Serializes tests that mutate the process-global `AY_PB_REDUCED_COST` env var
-    /// so they cannot race the readers in parallel test execution.
-    static REDUCED_COST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Regression: the instance that exposed the OLL hardening/core collapse must be
     /// solved to the proven optimum 4 WITH reduced-cost fixing enabled (it was
     /// returning a stale Satisfiable(6) before the post-fix re-solve was added).
     #[test]
     fn native_oll_reduced_cost_fixing_solves_hardening_collapse_regression() {
-        let _g = REDUCED_COST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        // Serialized + restore-on-exit via the workspace env choke point.
+        let _g = lock_env();
         let input = "* #variable= 5 #constraint= 1\n\
             min: +4 x1 +92 ~x2 +6 x3 +3 x4 +10 x5 ;\n\
             +1 x1 +1 x2 +1 x3 >= 2 ;\n";
         let instance = parse_opb(input).expect("parse");
         let objective = instance.objective.clone().expect("obj");
-        std::env::set_var(REDUCED_COST_ENV, "on");
+        let _reduced_cost = ScopedEnvVar::set(REDUCED_COST_ENV, "on");
         let with = solve(&instance, &objective, || false, None, None);
-        std::env::remove_var(REDUCED_COST_ENV);
         assert!(
             matches!(with, Some(OptResult::Optimal(_, 4))),
             "expected proven Optimal(4) WITH reduced-cost fixing, got {with:?}"
@@ -2761,9 +2756,8 @@ mod tests {
     /// aggressive fix that removed the optimum would make the WITH run disagree.
     #[test]
     fn native_oll_reduced_cost_fixing_preserves_optimum_vs_disabled_and_brute_force() {
-        let _guard = REDUCED_COST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        // Serialized + restore-on-exit via the workspace env choke point.
+        let _guard = lock_env();
 
         let mut seed: u64 = 0xD1CE_F00D_2024_BEEF;
         let mut next = || {
@@ -2836,12 +2830,15 @@ mod tests {
             let bf = brute_force_optimum(&instance, &objective);
 
             // WITHOUT reduced-cost fixing (default OFF).
-            std::env::set_var(REDUCED_COST_ENV, "off");
-            let without = solve(&instance, &objective, || false, None, None);
+            let without = {
+                let _rc = ScopedEnvVar::set(REDUCED_COST_ENV, "off");
+                solve(&instance, &objective, || false, None, None)
+            };
             // WITH reduced-cost fixing (opt-in).
-            std::env::set_var(REDUCED_COST_ENV, "on");
-            let with = solve(&instance, &objective, || false, None, None);
-            std::env::remove_var(REDUCED_COST_ENV);
+            let with = {
+                let _rc = ScopedEnvVar::set(REDUCED_COST_ENV, "on");
+                solve(&instance, &objective, || false, None, None)
+            };
 
             let opt_of = |r: &Option<OptResult>| match r {
                 Some(OptResult::Optimal(_, v)) => Some(*v),

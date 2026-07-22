@@ -31,7 +31,9 @@ unsafe fn ctx() -> Z3_context {
 
 unsafe fn cstr<'a>(p: *const c_char) -> &'a str {
     assert!(!p.is_null(), "expected a non-null string");
-    unsafe { CStr::from_ptr(p) }.to_str().unwrap()
+    unsafe { CStr::from_ptr(p) }
+        .to_str()
+        .expect("Z3 string result must be valid UTF-8")
 }
 
 // ============================================================================
@@ -326,22 +328,22 @@ fn global_params_store_measured_z3_parity() {
         // -- defaults (never set): registry values, measured verbatim.
         Z3_global_param_reset_all();
         let mut out: Z3_string = ptr::null();
-        assert!(Z3_global_param_get(c"timeout".as_ptr(), &mut out));
+        assert!(Z3_global_param_get(c"timeout".as_ptr(), &raw mut out));
         assert_eq!(cstr(out), "4294967295");
-        assert!(Z3_global_param_get(c"verbose".as_ptr(), &mut out));
+        assert!(Z3_global_param_get(c"verbose".as_ptr(), &raw mut out));
         assert_eq!(cstr(out), "0");
-        assert!(Z3_global_param_get(c"pp.decimal".as_ptr(), &mut out));
+        assert!(Z3_global_param_get(c"pp.decimal".as_ptr(), &raw mut out));
         assert_eq!(cstr(out), "false");
-        assert!(Z3_global_param_get(c"pp.max_depth".as_ptr(), &mut out));
+        assert!(Z3_global_param_get(c"pp.max_depth".as_ptr(), &raw mut out));
         assert_eq!(cstr(out), "5");
 
         // -- set/get round trip + case/dash normalization (measured:
         // 'pp.MAX-WIDTH' ≡ 'pp.max_width', 'VERBOSE' readable as 'verbose').
         Z3_global_param_set(c"VERBOSE".as_ptr(), c"3".as_ptr());
-        assert!(Z3_global_param_get(c"verbose".as_ptr(), &mut out));
+        assert!(Z3_global_param_get(c"verbose".as_ptr(), &raw mut out));
         assert_eq!(cstr(out), "3");
         Z3_global_param_set(c"pp.MAX-WIDTH".as_ptr(), c"70".as_ptr());
-        assert!(Z3_global_param_get(c"pp.max_width".as_ptr(), &mut out));
+        assert!(Z3_global_param_get(c"pp.max_width".as_ptr(), &raw mut out));
         assert_eq!(cstr(out), "70");
 
         // -- unknown key: false + NULLED out-buffer (measured: z3 overwrites
@@ -349,34 +351,37 @@ fn global_params_store_measured_z3_parity() {
         let mut sentinel: Z3_string = c"SENTINEL".as_ptr();
         assert!(!Z3_global_param_get(
             c"definitely_not_a_param".as_ptr(),
-            &mut sentinel
+            &raw mut sentinel
         ));
         assert!(sentinel.is_null(), "out-buffer must be nulled on failure");
         // -- unknown module: set refused, get false (measured).
         Z3_global_param_set(c"nomod.foo".as_ptr(), c"bar".as_ptr());
         let mut sentinel2: Z3_string = c"SENTINEL".as_ptr();
-        assert!(!Z3_global_param_get(c"nomod.foo".as_ptr(), &mut sentinel2));
+        assert!(!Z3_global_param_get(
+            c"nomod.foo".as_ptr(),
+            &raw mut sentinel2
+        ));
         assert!(sentinel2.is_null());
         // -- unknown param in the KNOWN pp module: refused too (measured).
         Z3_global_param_set(c"pp.not_a_param".as_ptr(), c"7".as_ptr());
         let mut sentinel3: Z3_string = c"SENTINEL".as_ptr();
         assert!(!Z3_global_param_get(
             c"pp.not_a_param".as_ptr(),
-            &mut sentinel3
+            &raw mut sentinel3
         ));
         assert!(sentinel3.is_null());
 
         // -- invalid value for the registered type: refused, prior value kept
         // (measured: verbose=notanum keeps 3; pp.max_depth=notanum keeps set).
         Z3_global_param_set(c"verbose".as_ptr(), c"notanum".as_ptr());
-        assert!(Z3_global_param_get(c"verbose".as_ptr(), &mut out));
+        assert!(Z3_global_param_get(c"verbose".as_ptr(), &raw mut out));
         assert_eq!(cstr(out), "3");
 
         // -- reset_all restores defaults (measured).
         Z3_global_param_reset_all();
-        assert!(Z3_global_param_get(c"verbose".as_ptr(), &mut out));
+        assert!(Z3_global_param_get(c"verbose".as_ptr(), &raw mut out));
         assert_eq!(cstr(out), "0");
-        assert!(Z3_global_param_get(c"pp.max_width".as_ptr(), &mut out));
+        assert!(Z3_global_param_get(c"pp.max_width".as_ptr(), &raw mut out));
         assert_eq!(cstr(out), "80");
     }
 }
@@ -575,8 +580,8 @@ fn recursive_datatype_sort_ast_is_canonical_and_constructs() {
             c,
             cons_ctor,
             2,
-            &mut cons_decl,
-            &mut tester,
+            &raw mut cons_decl,
+            &raw mut tester,
             accessors.as_mut_ptr(),
         );
         let mut nil_decl: Z3_func_decl = ptr::null_mut();
@@ -584,7 +589,7 @@ fn recursive_datatype_sort_ast_is_canonical_and_constructs() {
             c,
             nil_ctor,
             0,
-            &mut nil_decl,
+            &raw mut nil_decl,
             ptr::null_mut(),
             ptr::null_mut(),
         );
@@ -617,7 +622,7 @@ fn recursive_datatype_sort_ast_is_canonical_and_constructs() {
         let cons_t = Z3_mk_app(c, cons_decl, 2, args.as_ptr());
         assert_ne!(cons_t, 0, "cons(5, nil) must construct (raised pre-repair)");
         assert_eq!(Z3_get_error_code(c), Z3_OK);
-        let car_of = Z3_mk_app(c, accessors[0], 1, &cons_t);
+        let car_of = Z3_mk_app(c, accessors[0], 1, &raw const cons_t);
         assert_ne!(car_of, 0);
 
         // wrong-fact must be unsat
@@ -664,7 +669,13 @@ fn foreign_context_tagged_handles_fail_closed() {
             "foreign-context sort ast must not decode"
         );
         // Same for decl asts through Z3_to_func_decl.
-        let f = Z3_mk_func_decl(c1, Z3_mk_string_symbol(c1, c"f".as_ptr()), 1, &int1, int1);
+        let f = Z3_mk_func_decl(
+            c1,
+            Z3_mk_string_symbol(c1, c"f".as_ptr()),
+            1,
+            &raw const int1,
+            int1,
+        );
         let fa = Z3_func_decl_to_ast(c1, f);
         assert!(
             !Z3_to_func_decl(c1, fa).is_null(),
@@ -692,7 +703,13 @@ fn reserved_map_and_internal_names_are_refused() {
         let c = ctx();
         let int = Z3_mk_int_sort(c);
         // Z3_mk_func_decl: `map[f]` refused with a detailed message.
-        let d = Z3_mk_func_decl(c, Z3_mk_string_symbol(c, c"map[f]".as_ptr()), 1, &int, int);
+        let d = Z3_mk_func_decl(
+            c,
+            Z3_mk_string_symbol(c, c"map[f]".as_ptr()),
+            1,
+            &raw const int,
+            int,
+        );
         assert!(d.is_null(), "map[f] decl must be refused");
         assert_eq!(Z3_get_error_code(c), Z3_INVALID_ARG);
         assert!(cstr(Z3_get_error_msg(c, Z3_INVALID_ARG)).contains("reserved"));
@@ -700,7 +717,13 @@ fn reserved_map_and_internal_names_are_refused() {
         let k = Z3_mk_const(c, Z3_mk_string_symbol(c, c"!ay.array-ext!0".as_ptr()), int);
         assert_eq!(k, 0, "!ay.* const must be refused");
         // Control: ordinary names still work.
-        let ok = Z3_mk_func_decl(c, Z3_mk_string_symbol(c, c"mapf".as_ptr()), 1, &int, int);
+        let ok = Z3_mk_func_decl(
+            c,
+            Z3_mk_string_symbol(c, c"mapf".as_ptr()),
+            1,
+            &raw const int,
+            int,
+        );
         assert!(!ok.is_null(), "non-reserved name must still declare");
         // SMT-LIB text bridge: quoted `|map[f]|` declaration fails closed…
         let bad = c"(declare-fun |map[f]| ((Array Int Int)) (Array Int Int)) (declare-const a (Array Int Int)) (assert (= (select (|map[f]| a) 3) 7)) (check-sat)";
@@ -818,6 +841,149 @@ fn symbol_kind_and_constant_sort_overloads_keep_distinct_identities() {
     }
 }
 
+#[test]
+fn datatype_symbols_round_trip_kind_without_private_name_leaks() {
+    unsafe {
+        let c = ctx();
+        let int_sort = Z3_mk_int_sort(c);
+
+        let build = |sort_symbol: Z3_symbol,
+                     ctor_symbol: Z3_symbol,
+                     recognizer_symbol: Z3_symbol,
+                     field_symbol: Z3_symbol| {
+            let field_names = [field_symbol];
+            let field_sorts = [int_sort];
+            let sort_refs = [0];
+            let descriptor = Z3_mk_constructor(
+                c,
+                ctor_symbol,
+                recognizer_symbol,
+                1,
+                field_names.as_ptr(),
+                field_sorts.as_ptr(),
+                sort_refs.as_ptr(),
+            );
+            assert!(!descriptor.is_null());
+            let mut descriptors = [descriptor];
+            let sort = Z3_mk_datatype(c, sort_symbol, 1, descriptors.as_mut_ptr());
+            assert!(!sort.is_null());
+
+            let mut ctor = ptr::null_mut();
+            let mut recognizer = ptr::null_mut();
+            let mut accessor = ptr::null_mut();
+            Z3_query_constructor(
+                c,
+                descriptor,
+                1,
+                &raw mut ctor,
+                &raw mut recognizer,
+                &raw mut accessor,
+            );
+            assert!(!ctor.is_null() && !recognizer.is_null() && !accessor.is_null());
+            (descriptor, sort, ctor, recognizer, accessor)
+        };
+
+        let integer = build(
+            Z3_mk_int_symbol(c, 31),
+            Z3_mk_int_symbol(c, 32),
+            Z3_mk_int_symbol(c, 33),
+            Z3_mk_int_symbol(c, 34),
+        );
+        let string = build(
+            Z3_mk_string_symbol(c, c"s!31".as_ptr()),
+            Z3_mk_string_symbol(c, c"s!32".as_ptr()),
+            Z3_mk_string_symbol(c, c"s!33".as_ptr()),
+            Z3_mk_string_symbol(c, c"s!34".as_ptr()),
+        );
+
+        for (sort, ctor, recognizer, accessor, expected_kind) in [
+            (integer.1, integer.2, integer.3, integer.4, 0),
+            (string.1, string.2, string.3, string.4, 1),
+        ] {
+            assert_eq!(
+                Z3_get_symbol_kind(c, Z3_get_sort_name(c, sort)),
+                expected_kind
+            );
+            for decl in [ctor, recognizer, accessor] {
+                assert_eq!(
+                    Z3_get_symbol_kind(c, Z3_get_decl_name(c, decl)),
+                    expected_kind
+                );
+                let rendered = cstr(Z3_func_decl_to_string(c, decl));
+                assert!(
+                    !rendered.contains("!ay.z3-"),
+                    "leaked FFI identity: {rendered}"
+                );
+            }
+
+            // Sort-based introspection must preserve the same exact symbols,
+            // not reconstruct string-kind names from private semantic text.
+            for decl in [
+                Z3_get_datatype_sort_constructor(c, sort, 0),
+                Z3_get_datatype_sort_recognizer(c, sort, 0),
+                Z3_get_datatype_sort_constructor_accessor(c, sort, 0, 0),
+            ] {
+                assert_eq!(
+                    Z3_get_symbol_kind(c, Z3_get_decl_name(c, decl)),
+                    expected_kind
+                );
+            }
+        }
+
+        assert!(!Z3_is_eq_sort(c, integer.1, string.1));
+        assert!(!Z3_is_eq_func_decl(c, integer.2, string.2));
+        assert!(!Z3_is_eq_func_decl(c, integer.3, string.3));
+        assert!(!Z3_is_eq_func_decl(c, integer.4, string.4));
+
+        let ten = Z3_mk_int(c, 10, int_sort);
+        let twenty = Z3_mk_int(c, 20, int_sort);
+        let integer_value = Z3_mk_app(c, integer.2, 1, &raw const ten);
+        let string_value = Z3_mk_app(c, string.2, 1, &raw const twenty);
+        let integer_projection = Z3_mk_app(c, integer.4, 1, &raw const integer_value);
+        let string_projection = Z3_mk_app(c, string.4, 1, &raw const string_value);
+        let integer_test = Z3_mk_app(c, integer.3, 1, &raw const integer_value);
+        let string_test = Z3_mk_app(c, string.3, 1, &raw const string_value);
+
+        let solver = Z3_mk_solver(c);
+        Z3_solver_assert(c, solver, integer_test);
+        Z3_solver_assert(c, solver, string_test);
+        Z3_solver_assert(c, solver, Z3_mk_eq(c, integer_projection, ten));
+        Z3_solver_assert(c, solver, Z3_mk_eq(c, string_projection, twenty));
+        assert_eq!(Z3_solver_check(c, solver), Z3_L_TRUE);
+
+        Z3_del_constructor(c, integer.0);
+        Z3_del_constructor(c, string.0);
+        Z3_del_context(c);
+    }
+}
+
+#[test]
+fn finite_domain_and_type_variable_symbols_preserve_kind_and_hide_private_names() {
+    unsafe {
+        let c = ctx();
+
+        let integer = Z3_mk_finite_domain_sort(c, Z3_mk_int_symbol(c, 41), 7);
+        let string = Z3_mk_finite_domain_sort(c, Z3_mk_string_symbol(c, c"s!41".as_ptr()), 7);
+        assert!(!integer.is_null() && !string.is_null());
+        assert!(!Z3_is_eq_sort(c, integer, string));
+        assert_eq!(Z3_get_symbol_kind(c, Z3_get_sort_name(c, integer)), 0);
+        assert_eq!(Z3_get_symbol_kind(c, Z3_get_sort_name(c, string)), 1);
+        assert_eq!(cstr(Z3_sort_to_string(c, integer)), "s!41");
+        assert_eq!(cstr(Z3_sort_to_string(c, string)), "s!41");
+
+        let integer = Z3_mk_type_variable(c, Z3_mk_int_symbol(c, 42));
+        let string = Z3_mk_type_variable(c, Z3_mk_string_symbol(c, c"s!42".as_ptr()));
+        assert!(!integer.is_null() && !string.is_null());
+        assert!(!Z3_is_eq_sort(c, integer, string));
+        assert_eq!(Z3_get_symbol_kind(c, Z3_get_sort_name(c, integer)), 0);
+        assert_eq!(Z3_get_symbol_kind(c, Z3_get_sort_name(c, string)), 1);
+        assert_eq!(cstr(Z3_sort_to_string(c, integer)), "s!42");
+        assert_eq!(cstr(Z3_sort_to_string(c, string)), "s!42");
+
+        Z3_del_context(c);
+    }
+}
+
 /// Function declarations use `(symbol kind/value, domain, range)` identity,
 /// while fresh declarations have a private identity and skip already-used
 /// display names.  These constraints would be UNSAT if either pair aliased.
@@ -831,19 +997,19 @@ fn function_overloads_and_fresh_declarations_do_not_alias_named_ones() {
 
         let int_symbol = Z3_mk_int_symbol(c, 9);
         let string_symbol = Z3_mk_string_symbol(c, c"s!9".as_ptr());
-        let int_symbol_fun = Z3_mk_func_decl(c, int_symbol, 1, &int, int);
-        let string_symbol_fun = Z3_mk_func_decl(c, string_symbol, 1, &int, int);
-        let int_app = Z3_mk_app(c, int_symbol_fun, 1, &arg);
-        let string_app = Z3_mk_app(c, string_symbol_fun, 1, &arg);
+        let int_symbol_fun = Z3_mk_func_decl(c, int_symbol, 1, &raw const int, int);
+        let string_symbol_fun = Z3_mk_func_decl(c, string_symbol, 1, &raw const int, int);
+        let int_app = Z3_mk_app(c, int_symbol_fun, 1, &raw const arg);
+        let string_app = Z3_mk_app(c, string_symbol_fun, 1, &raw const arg);
         assert_ne!(int_app, string_app);
 
         // Same string symbol, different signature: both declarations remain
         // usable with their own range sort.
         let overload = Z3_mk_string_symbol(c, c"ovf".as_ptr());
-        let ovf_int = Z3_mk_func_decl(c, overload, 1, &int, int);
-        let ovf_bool = Z3_mk_func_decl(c, overload, 1, &int, bool_sort);
-        let ovf_int_app = Z3_mk_app(c, ovf_int, 1, &arg);
-        let ovf_bool_app = Z3_mk_app(c, ovf_bool, 1, &arg);
+        let ovf_int = Z3_mk_func_decl(c, overload, 1, &raw const int, int);
+        let ovf_bool = Z3_mk_func_decl(c, overload, 1, &raw const int, bool_sort);
+        let ovf_int_app = Z3_mk_app(c, ovf_int, 1, &raw const arg);
+        let ovf_bool_app = Z3_mk_app(c, ovf_bool, 1, &raw const arg);
         assert!(Z3_is_eq_sort(c, Z3_get_sort(c, ovf_int_app), int));
         assert!(Z3_is_eq_sort(c, Z3_get_sort(c, ovf_bool_app), bool_sort));
 
@@ -852,11 +1018,17 @@ fn function_overloads_and_fresh_declarations_do_not_alias_named_ones() {
         let named_const = Z3_mk_const(c, Z3_mk_string_symbol(c, c"p!2".as_ptr()), int);
         let fresh_const = Z3_mk_fresh_const(c, c"p".as_ptr(), int);
         assert_ne!(named_const, fresh_const);
-        let named_fun = Z3_mk_func_decl(c, Z3_mk_string_symbol(c, c"f!2".as_ptr()), 1, &int, int);
-        let fresh_fun = Z3_mk_fresh_func_decl(c, c"f".as_ptr(), 1, &int, int);
+        let named_fun = Z3_mk_func_decl(
+            c,
+            Z3_mk_string_symbol(c, c"f!2".as_ptr()),
+            1,
+            &raw const int,
+            int,
+        );
+        let fresh_fun = Z3_mk_fresh_func_decl(c, c"f".as_ptr(), 1, &raw const int, int);
         assert!(!Z3_is_eq_func_decl(c, named_fun, fresh_fun));
-        let named_fun_app = Z3_mk_app(c, named_fun, 1, &arg);
-        let fresh_fun_app = Z3_mk_app(c, fresh_fun, 1, &arg);
+        let named_fun_app = Z3_mk_app(c, named_fun, 1, &raw const arg);
+        let fresh_fun_app = Z3_mk_app(c, fresh_fun, 1, &raw const arg);
 
         let solver = Z3_mk_solver(c);
         for (term, value) in [
@@ -873,6 +1045,118 @@ fn function_overloads_and_fresh_declarations_do_not_alias_named_ones() {
         Z3_solver_assert(c, solver, ovf_bool_app);
         assert_eq!(Z3_solver_check(c, solver), Z3_L_TRUE);
 
+        Z3_del_context(c);
+    }
+}
+
+/// Collision-proof identities are solver-internal only. Ordinary diagnostic
+/// text APIs project function/constant names and nested uninterpreted-sort
+/// names back to their original Z3 symbols. (Proof artifacts intentionally
+/// retain certificate identities so projection cannot make overloads
+/// ambiguous.)
+#[test]
+fn public_text_apis_hide_private_ffi_identities() {
+    unsafe {
+        let c = ctx();
+        let sort_symbol = Z3_mk_int_symbol(c, 17);
+        let elem = Z3_mk_uninterpreted_sort(c, sort_symbol);
+        let array = Z3_mk_array_sort(c, elem, elem);
+        assert_eq!(cstr(Z3_sort_to_string(c, elem)), "s!17");
+        assert_eq!(cstr(Z3_sort_to_string(c, array)), "(Array s!17 s!17)");
+
+        let fun_symbol = Z3_mk_string_symbol(c, c"surface fun".as_ptr());
+        let fun = Z3_mk_func_decl(c, fun_symbol, 1, &raw const array, array);
+        let x = Z3_mk_const(c, Z3_mk_string_symbol(c, c"surface const".as_ptr()), array);
+        let app = Z3_mk_app(c, fun, 1, &raw const x);
+        let app_text = cstr(Z3_ast_to_string(c, app));
+        assert!(app_text.contains("|surface fun|"), "got: {app_text}");
+        assert!(app_text.contains("|surface const|"), "got: {app_text}");
+        assert!(!app_text.contains("!ay.z3-"), "got: {app_text}");
+
+        let decl_text = cstr(Z3_func_decl_to_string(c, fun));
+        assert!(decl_text.contains("|surface fun|"), "got: {decl_text}");
+        assert!(decl_text.contains("s!17"), "got: {decl_text}");
+        assert!(!decl_text.contains("!ay.z3-"), "got: {decl_text}");
+
+        let solver = Z3_mk_solver(c);
+        Z3_solver_assert(c, solver, Z3_mk_eq(c, app, x));
+        let solver_text = cstr(Z3_solver_to_string(c, solver));
+        assert!(solver_text.contains("|surface fun|"), "got: {solver_text}");
+        assert!(
+            solver_text.contains("|surface const|"),
+            "got: {solver_text}"
+        );
+        assert!(solver_text.contains("s!17"), "got: {solver_text}");
+        assert!(!solver_text.contains("!ay.z3-"), "got: {solver_text}");
+
+        Z3_del_context(c);
+    }
+}
+
+/// Compact C counts are caller-controlled. Reject oversized arrays at the ABI
+/// boundary instead of turning a single `c_uint` into an unbounded allocation,
+/// pointer walk, or multi-gigabyte construction.
+#[test]
+fn oversized_ffi_array_counts_are_rejected() {
+    unsafe {
+        let c = ctx();
+        let excessive = MAX_FFI_CONTAINER_ELEMENTS + 1;
+
+        let int_sort = Z3_mk_int_sort(c);
+        let domains = vec![int_sort; excessive as usize];
+        let name = Z3_mk_string_symbol(c, c"oversized".as_ptr());
+        assert!(Z3_mk_func_decl(c, name, excessive, domains.as_ptr(), int_sort).is_null());
+        assert_eq!(Z3_get_error_code(c), Z3_INVALID_ARG);
+        drop(domains);
+
+        let truth = Z3_mk_true(c);
+        let terms = vec![truth; excessive as usize];
+        assert_eq!(Z3_mk_and(c, excessive, terms.as_ptr()), 0);
+        assert_eq!(Z3_get_error_code(c), Z3_INVALID_ARG);
+
+        Z3_del_context(c);
+    }
+}
+
+/// Parallel C arrays share one aggregate budget: accepting each count in
+/// isolation still permits one call to multiply the pointer walk and retained
+/// allocations beyond the advertised ceiling.
+#[test]
+fn aggregate_ffi_array_counts_are_rejected_before_pointer_walks() {
+    unsafe {
+        let c = ctx();
+        let individually_valid = MAX_FFI_CONTAINER_ELEMENTS / 2 + 1;
+
+        assert_eq!(
+            Z3_mk_pble(c, individually_valid, ptr::null(), ptr::null(), 0,),
+            0
+        );
+        assert_eq!(Z3_get_error_code(c), Z3_INVALID_ARG);
+
+        assert_eq!(
+            Z3_substitute_funs(
+                c,
+                Z3_mk_true(c),
+                individually_valid,
+                ptr::null(),
+                ptr::null(),
+            ),
+            0
+        );
+        assert_eq!(Z3_get_error_code(c), Z3_INVALID_ARG);
+
+        Z3_del_context(c);
+    }
+}
+
+#[test]
+fn ffi_regex_loop_rejects_inverted_bounds() {
+    unsafe {
+        let c = ctx();
+        let literal = Z3_mk_string(c, c"a".as_ptr());
+        let regex = Z3_mk_seq_to_re(c, literal);
+        assert_eq!(Z3_mk_re_loop(c, regex, 4, 3), 0);
+        assert_eq!(Z3_get_error_code(c), Z3_INVALID_ARG);
         Z3_del_context(c);
     }
 }

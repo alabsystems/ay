@@ -73,8 +73,7 @@ static REPLAYABLE_CONE_CACHE: OnceLock<Mutex<ReplayableInterpolationConeCache>> 
 
 fn replayable_cone_cache_enabled() -> bool {
     std::env::var(CONE_CACHE_ENV)
-        .ok()
-        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
 fn replayable_cone_cache() -> &'static Mutex<ReplayableInterpolationConeCache> {

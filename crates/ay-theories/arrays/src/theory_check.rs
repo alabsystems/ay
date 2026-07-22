@@ -19,10 +19,11 @@ impl ArraySolver<'_> {
     /// - `NeedLemmas` are batched and returned together
     /// - `NeedModelEquality` requests are batched at lower priority
     pub(crate) fn check_impl(&mut self) -> TheoryResult {
-        // #8615: Early exit if the external interrupt flag is set. Array theory
+        // #8615: Early exit if the external interrupt flag is set or the
+        // caller's deadline expired (#array-deadline-forward). Array theory
         // check can be very expensive with many sub-checks; returning Unknown
         // allows the DPLL(T) loop to detect the interrupt.
-        if self.is_interrupted() {
+        if self.interrupted_or_deadline() {
             return TheoryResult::Unknown;
         }
 

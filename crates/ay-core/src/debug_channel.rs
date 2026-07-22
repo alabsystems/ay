@@ -640,11 +640,10 @@ fn init_sat_debug_env_from_env() -> SatDebugEnvFlags {
         bve_max_rounds: std::env::var("AY_BVE_MAX_ROUNDS")
             .ok()
             .and_then(|s| s.parse::<usize>().ok()),
-        log_enabled: std::env::var("AY_LOG").ok().is_some_and(|v| v == "1"),
+        log_enabled: std::env::var("AY_LOG").is_ok_and(|v| v == "1"),
         dump_conflicts: std::env::var_os("AY_DUMP_CONFLICTS").is_some(),
         clause_provenance: std::env::var("AY_CLAUSE_PROVENANCE")
-            .ok()
-            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
         debug_transred_clause: std::env::var("AY_DEBUG_TRANSRED_CLAUSE")
             .ok()
             .and_then(|s| s.parse::<u32>().ok()),
@@ -705,6 +704,18 @@ pub struct TraceConfig {
     pub bv_drat_path: Option<String>,
     /// Whether the DRAT proof at `bv_drat_path` is written in binary format.
     pub bv_drat_binary: bool,
+    /// Private temp CNF path for `--self-check` BV DRAT self-certification.
+    ///
+    /// Populated by the CLI ONLY when `--self-check` is set and the user did not
+    /// request an explicit `--dump-bv-cnf`. Distinct from `dump_bv_cnf_path` so
+    /// that none of the user-facing `--dump-bv-cnf` error/no-verdict handling is
+    /// triggered: the emission machinery reaches these paths solely through the
+    /// thread-local self-cert arm (see `bv_cnf_dump::configured_path`), which is
+    /// set only around an eligible top-level pure-QF_BV `(check-sat)`. Never
+    /// env-driven; text DRAT only.
+    pub bv_drat_self_cert_cnf_path: Option<String>,
+    /// Private temp DRAT path companion to `bv_drat_self_cert_cnf_path`.
+    pub bv_drat_self_cert_drat_path: Option<String>,
     /// AY_KIND_DUMP_DIR — k-induction TS formula dump directory (#8834)
     pub kind_dump_dir: Option<String>,
     /// AY_DUMP_ENCODING — pre-solve DIMACS encoding dump path (#8834)
@@ -742,10 +753,7 @@ fn init_trace_config_from_env() -> TraceConfig {
             .filter(|s| !s.is_empty())
         {
             Some(path)
-        } else if std::env::var("AY_DIAGNOSTIC")
-            .ok()
-            .is_some_and(|v| v.trim() == "1")
-        {
+        } else if std::env::var("AY_DIAGNOSTIC").is_ok_and(|v| v.trim() == "1") {
             let pid = std::process::id();
             let path = std::env::temp_dir().join(format!("ay_sat_diagnostic_{pid}.jsonl"));
             Some(path.to_string_lossy().into_owned())
@@ -779,6 +787,9 @@ fn init_trace_config_from_env() -> TraceConfig {
         // DRAT-for-BV is a CLI-only coupling to `--dump-bv-cnf`; no env alias.
         bv_drat_path: None,
         bv_drat_binary: false,
+        // Self-cert temp paths are CLI-only (`--self-check`); never env-driven.
+        bv_drat_self_cert_cnf_path: None,
+        bv_drat_self_cert_drat_path: None,
         kind_dump_dir: std::env::var("AY_KIND_DUMP_DIR")
             .ok()
             .map(|s| s.trim().to_string())
@@ -872,11 +883,9 @@ static GLOBAL_CHC_DEBUG_ENV_FLAGS: OnceLock<ChcDebugEnvFlags> = OnceLock::new();
 fn init_chc_debug_env_from_env() -> ChcDebugEnvFlags {
     ChcDebugEnvFlags {
         iuc_trace: std::env::var("AY_IUC_TRACE")
-            .ok()
-            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
         iuc_require_farkas: std::env::var("AY_IUC_REQUIRE_FARKAS")
-            .ok()
-            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
     }
 }
 
@@ -936,9 +945,8 @@ fn init_misc_cli_flags_from_env() -> MiscCliFlags {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let dpll_diagnostic_enabled = std::env::var("AY_DPLL_DIAGNOSTIC")
-        .ok()
-        .is_some_and(|v| v.trim() == "1");
+    let dpll_diagnostic_enabled =
+        std::env::var("AY_DPLL_DIAGNOSTIC").is_ok_and(|v| v.trim() == "1");
     let dpll_trace_file = std::env::var("AY_DPLL_TRACE_FILE")
         .ok()
         .map(|s| s.trim().to_string())

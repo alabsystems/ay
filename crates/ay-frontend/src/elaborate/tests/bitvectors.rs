@@ -60,35 +60,31 @@ fn bitvector_apps_reject_non_bitvector_operands_before_core_builders() {
 }
 
 #[test]
-fn both_indexed_paths_reject_invalid_extract_bounds() {
-    use crate::command::Term;
+fn structured_indexed_path_rejects_invalid_extract_bounds() {
+    use crate::command::{Index, Term};
 
     let commands = parse("(declare-const x (_ BitVec 8))").unwrap();
     let mut ctx = Context::new();
     ctx.process_command(&commands[0]).unwrap();
     let env = ay_core::kani_compat::DetHashMap::default();
 
-    for term in [
-        Term::IndexedApp(
-            "extract".to_string(),
-            vec!["0".to_string(), "1".to_string()],
-            vec![Term::Symbol("x".to_string())],
-        ),
-        Term::App(
-            "(_ extract 0 1)".to_string(),
-            vec![Term::Symbol("x".to_string())],
-        ),
-    ] {
-        let error = ctx
-            .elaborate_term(&term, &env)
-            .expect_err("inverted extract bounds must be rejected");
-        assert!(error.to_string().contains("below low index"), "{error}");
-    }
+    let term = Term::IndexedApp(
+        "extract".to_string(),
+        vec![
+            Index::Numeral("0".to_string()),
+            Index::Numeral("1".to_string()),
+        ],
+        vec![Term::Symbol("x".to_string())],
+    );
+    let error = ctx
+        .elaborate_term(&term, &env)
+        .expect_err("inverted extract bounds must be rejected");
+    assert!(error.to_string().contains("below low index"), "{error}");
 }
 
 #[test]
-fn both_indexed_paths_reject_wrong_operand_sorts() {
-    use crate::command::{Constant as ParsedConstant, Term};
+fn structured_indexed_path_rejects_wrong_operand_sorts() {
+    use crate::command::{Constant as ParsedConstant, Index, Term};
 
     let env = ay_core::kani_compat::DetHashMap::default();
     for (name, indices, operand) in [
@@ -108,22 +104,56 @@ fn both_indexed_paths_reject_wrong_operand_sorts() {
             Term::Const(ParsedConstant::Numeral("1".to_string())),
         ),
     ] {
-        for term in [
-            Term::IndexedApp(name.to_string(), indices.clone(), vec![operand.clone()]),
-            Term::App(
-                format!("(_ {name} {})", indices.join(" ")),
-                vec![operand.clone()],
-            ),
-        ] {
-            let mut ctx = Context::new();
-            let error = ctx
-                .elaborate_term(&term, &env)
-                .expect_err("wrong-sort indexed operand must be rejected");
-            assert!(
-                matches!(error, ElaborateError::SortMismatch { .. }),
-                "{name}: {error}"
-            );
-        }
+        let term = Term::IndexedApp(
+            name.to_string(),
+            indices.into_iter().map(Index::Numeral).collect(),
+            vec![operand],
+        );
+        let mut ctx = Context::new();
+        let error = ctx
+            .elaborate_term(&term, &env)
+            .expect_err("wrong-sort indexed operand must be rejected");
+        assert!(
+            matches!(error, ElaborateError::SortMismatch { .. }),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn indexed_parser_rejects_invalid_or_missing_indices() {
+    for input in [
+        "(assert (= ((_ extract 7 0 1.5) #x00) #x00))",
+        "(assert (= (_ bv0 8 1.5) #x00))",
+        "(assert (_))",
+        "(assert (_ bv0))",
+        "(assert ((_ extract) #x00))",
+        "(assert (= ((_ bv0 8)) #x00))",
+    ] {
+        assert!(
+            parse(input).is_err(),
+            "malformed indexed term parsed: {input}"
+        );
+    }
+}
+
+#[test]
+fn quoted_numeric_indices_do_not_become_numeric_tokens() {
+    for input in [
+        "(assert (= (_ bv0 |8|) #x00))",
+        "(assert (= (_ Char |65|) 65))",
+        "(assert (= (_ char |#x41|) 65))",
+        "(assert (= (_ +zero |8| 24) (_ +zero 8 24)))",
+        "(assert (= ((_ extract |7| 0) #xff) #xff))",
+        "(declare-const x (_ BitVec |8|))",
+        "(declare-const x (_ FloatingPoint |8| 24))",
+    ] {
+        let commands = parse(input).expect("quoted index syntax parses");
+        let mut ctx = Context::new();
+        assert!(
+            ctx.process_command(&commands[0]).is_err(),
+            "quoted numeric index was treated as a numeral: {input}"
+        );
     }
 }
 

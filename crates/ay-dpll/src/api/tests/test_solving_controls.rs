@@ -1054,8 +1054,8 @@ fn test_ematching_statistics_populated_8614() {
     // This should fire 1 E-matching round, producing 1 instance.
     let u = Sort::Uninterpreted("U".to_string());
     let a = solver.declare_const("a", u.clone());
-    let p = solver.declare_fun("P", &[u.clone()], Sort::Bool);
-    let q = solver.declare_fun("Q", &[u.clone()], Sort::Bool);
+    let p = solver.declare_fun("P", std::slice::from_ref(&u), Sort::Bool);
+    let q = solver.declare_fun("Q", std::slice::from_ref(&u), Sort::Bool);
     let p_a = solver.apply(&p, &[a]);
     let q_a = solver.apply(&q, &[a]);
     let not_q_a = solver.not(q_a);
@@ -1314,7 +1314,7 @@ fn test_fp_interrupt_returns_unknown_8636() {
 fn test_euf_interrupt_returns_unknown_8636() {
     let mut solver = Solver::new(Logic::QfUf);
     let u = Sort::Uninterpreted("U".to_string());
-    let f = solver.declare_fun("f", &[u.clone()], u.clone());
+    let f = solver.declare_fun("f", std::slice::from_ref(&u), u.clone());
     let x = solver.declare_const("x", u.clone());
     let y = solver.declare_const("y", u);
     let fx = solver.apply(&f, &[x]);

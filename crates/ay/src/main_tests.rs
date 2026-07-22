@@ -11,6 +11,79 @@ fn strings(items: &[&str]) -> Vec<String> {
 }
 
 #[test]
+fn decision_trace_preflight_retains_the_validated_input_bytes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("input.smt2");
+    let validated = "(set-logic QF_UF)\n(assert false)\n(check-sat)\n";
+    std::fs::write(&path, validated).expect("write input");
+
+    let snapshot =
+        preflight_decision_trace_file(path.to_str().expect("UTF-8 path")).expect("preflight input");
+    std::fs::remove_file(&path).expect("unlink original name");
+    std::fs::write(&path, "(set-logic QF_UF)\n(check-sat)\n(check-sat)\n")
+        .expect("replace input name");
+
+    assert_eq!(snapshot.content, validated);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let opened_identity = snapshot
+            .file
+            .as_ref()
+            .expect("snapshot descriptor")
+            .metadata()
+            .expect("snapshot metadata");
+        let replacement_identity = std::fs::metadata(&path).expect("replacement metadata");
+        assert_ne!(
+            (opened_identity.dev(), opened_identity.ino()),
+            (replacement_identity.dev(), replacement_identity.ino())
+        );
+    }
+}
+
+#[test]
+fn decision_trace_preflight_rejects_parseable_dimacs() {
+    let error = validate_decision_trace_content("input.cnf", "p cnf 1 1\n1 0\n")
+        .expect_err("DIMACS decision traces are not end-to-end authenticated");
+    assert!(
+        error.contains("currently unsupported for DIMACS input"),
+        "unexpected rejection: {error}"
+    );
+}
+
+#[test]
+fn z3_model_materialization_retains_source_bytes_without_a_temp_path() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join("input.smt2");
+    let original = "(set-logic QF_UF)\n(assert false)\n(check-sat)\n";
+    std::fs::write(&path, original).expect("write input");
+
+    let materialized = materialize_z3_model_file_input(path.to_str().expect("UTF-8 path"))
+        .expect("materialize model input");
+    std::fs::remove_file(&path).expect("unlink original name");
+    std::fs::write(&path, "(set-logic QF_UF)\n(check-sat)\n").expect("replace input name");
+
+    assert_eq!(materialized.logical_path, path.to_string_lossy());
+    assert!(materialized.content.starts_with(original));
+    assert!(materialized.content.ends_with("(get-model)\n"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let opened = materialized
+            .source_file
+            .as_ref()
+            .expect("source descriptor")
+            .metadata()
+            .expect("source metadata");
+        let replacement = std::fs::metadata(&path).expect("replacement metadata");
+        assert_ne!(
+            (opened.dev(), opened.ino()),
+            (replacement.dev(), replacement.ino())
+        );
+    }
+}
+
+#[test]
 fn test_is_horn_logic() {
     // HORN logic
     let horn_content = "(set-logic HORN)
@@ -627,12 +700,77 @@ fn test_default_proofs_suppressed_by_competition() {
 }
 
 #[test]
+fn test_firewall_emission_requires_persistent_alethe_proof() {
+    assert!(firewall_emission_config_error(false, None).is_none());
+    assert!(firewall_emission_config_error(true, None)
+        .is_some_and(|error| error.contains("persistent Alethe proof")));
+
+    let drat = ProofConfig::new("proof.drat".to_string(), ProofFormat::Drat, false);
+    assert!(firewall_emission_config_error(true, Some(&drat))
+        .is_some_and(|error| error.contains("requires an Alethe proof")));
+
+    let temporary = ProofConfig::new_temp("proof.alethe".to_string(), ProofFormat::Alethe, false);
+    assert!(firewall_emission_config_error(true, Some(&temporary))
+        .is_some_and(|error| error.contains("temporary checker proof")));
+
+    let persistent = ProofConfig::new_default("proof.alethe".to_string(), ProofFormat::Alethe);
+    assert!(firewall_emission_config_error(true, Some(&persistent)).is_none());
+}
+
+#[test]
 fn test_new_default_marks_synthesized_default() {
     let cfg = ProofConfig::new_default("out.alethe".to_string(), ProofFormat::Alethe);
     assert!(cfg.synthesized_default);
     assert!(!cfg.is_temp);
     assert_eq!(cfg.format, ProofFormat::Alethe);
     assert!(!cfg.binary);
+}
+
+#[test]
+fn default_dimacs_status_collides_with_every_solve_path_class() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let input = temp.path().join("problem.cnf");
+    std::fs::write(&input, b"p cnf 1 1\n1 0\n").expect("write input");
+    let (proof, format) = default_proof_path(Some(&input)).expect("default DIMACS proof");
+    assert_eq!(format, ProofFormat::Drat);
+    let status = dimacs::dimacs_proof_status_path(&proof);
+    let status_lock = dimacs::dimacs_proof_status_lock_path(&status);
+
+    let mut read_collision = SolveArgs {
+        file: Some(input.clone()),
+        ..SolveArgs::default()
+    };
+    read_collision.solution_file = Some(status.clone());
+    let message = solve_artifact_path_collision(&read_collision, None)
+        .expect("validate paths")
+        .expect("status must collide with read path");
+    assert!(message.contains("default proof status"), "{message}");
+    assert!(message.contains("solution witness"), "{message}");
+
+    let mut output_collision = SolveArgs {
+        file: Some(input.clone()),
+        ..SolveArgs::default()
+    };
+    output_collision.progress_json = Some(status);
+    let message = solve_artifact_path_collision(&output_collision, None)
+        .expect("validate paths")
+        .expect("status must collide with output path");
+    assert!(message.contains("default proof status"), "{message}");
+    assert!(message.contains("progress JSON"), "{message}");
+
+    let mut lock_collision = SolveArgs {
+        file: Some(input),
+        ..SolveArgs::default()
+    };
+    lock_collision.diagnostic_file = Some(status_lock);
+    let message = solve_artifact_path_collision(&lock_collision, None)
+        .expect("validate paths")
+        .expect("status lock must collide with output path");
+    assert!(
+        message.contains("default proof status transaction lock"),
+        "{message}"
+    );
+    assert!(message.contains("diagnostic output"), "{message}");
 }
 
 // ---------------------------------------------------------------------------

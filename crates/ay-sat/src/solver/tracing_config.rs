@@ -279,14 +279,26 @@ impl Solver {
         Ok(())
     }
 
+    /// Close and detach the active decision-trace writer, if any.
+    ///
+    /// Call this before deleting or replacing the trace path. Merely opening
+    /// the path again is unsafe while the old buffered file descriptor remains
+    /// live: later events could append at its stale offset and corrupt or
+    /// re-expose a result that the public boundary rejected.
+    pub fn disable_decision_trace(&mut self) -> bool {
+        self.cold.decision_trace.take().is_some()
+    }
+
     /// Enable deterministic SAT decision tracing from `AY_DECISION_TRACE_FILE`.
     ///
-    /// No-op if the env var is not set. Logs a warning and continues if the
-    /// trace file cannot be created.
+    /// No-op if the env var is not set. A configured trace is an explicit
+    /// artifact contract, so initialization failure terminates before the SAT
+    /// solver can publish a verdict.
     pub fn maybe_enable_decision_trace_from_env(&mut self) {
         if let Some(path) = decision_trace::decision_trace_path_from_env() {
             if let Err(e) = self.enable_decision_trace(&path) {
-                eprintln!("warning: failed to enable SAT decision trace to {path}: {e}");
+                eprintln!("Error: failed to initialize SAT decision trace {path}: {e}");
+                std::process::exit(1);
             }
         }
     }

@@ -266,6 +266,13 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                 state.round_trips += 1;
                 _iaslp_timing.dpll.round_trips += 1;
 
+                // #array-deadline-forward: forward the executor's live
+                // per-solve deadline into the SAT solver so the phases the
+                // budgets cannot bound (incremental inprocessing, level-0
+                // GC) and this arm's NON-interruptible
+                // `solve_with_assumptions` entry honor the caller's wall
+                // budget. Refreshed before every solve; `None` clears.
+                solver.set_solve_deadline($self.solve_deadline.get());
                 // Deterministic resource budgets (#8749 `:rlimit` +
                 // #ground-determinism defaults), assume-arm parity with the
                 // other split loops.

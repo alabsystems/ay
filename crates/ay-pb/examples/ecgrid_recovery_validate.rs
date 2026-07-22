@@ -205,11 +205,11 @@ fn main() {
                 brute = String::from("FALSE-UNSAT");
                 any_flag = true;
             } else {
-                brute = format!("ok(sat={})", feasible_exists);
+                brute = format!("ok(sat={feasible_exists})");
             }
         }
 
-        if (recov_unsat && !indep_ok) || (!indep_ok && !recovered.is_empty()) {
+        if !indep_ok && (recov_unsat || !recovered.is_empty()) {
             any_flag = true;
         }
 

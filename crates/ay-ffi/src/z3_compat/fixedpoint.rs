@@ -303,73 +303,6 @@ pub(super) fn record_outcome(handle: &mut FixedpointHandle, outcome: QueryOutcom
     outcome.status
 }
 
-/// Translate collision-proof function names in formatted solver terms back to
-/// their caller-visible Z3 symbols. Internal names remain authoritative in the
-/// CHC translator and solver; this is used only at the string API boundary.
-///
-/// The small lexer deliberately skips SMT string literals, so a user string
-/// that happens to contain an internal-name spelling is never rewritten.
-fn fixedpoint_surface_text(ctx: &super::Z3Context, rendered: &str) -> String {
-    let replacements: std::collections::HashMap<String, String> = ctx
-        .ffi_decl_symbols
-        .iter()
-        .map(|(internal, symbol)| {
-            (
-                ay_core::quote_symbol(internal),
-                ay_core::quote_symbol(&symbol.display_name()),
-            )
-        })
-        .collect();
-    if replacements.is_empty() {
-        return rendered.to_string();
-    }
-
-    let bytes = rendered.as_bytes();
-    let mut out = String::with_capacity(rendered.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'"' {
-            // SMT-LIB escapes a quote inside a string by doubling it.
-            let start = i;
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'"' {
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            out.push_str(&rendered[start..i]);
-            continue;
-        }
-
-        let start = i;
-        if bytes[i] == b'|' {
-            i += 1;
-            while i < bytes.len() && bytes[i] != b'|' {
-                i += 1;
-            }
-            i = (i + 1).min(bytes.len());
-        } else if bytes[i].is_ascii_whitespace() || matches!(bytes[i], b'(' | b')') {
-            i += 1;
-        } else {
-            while i < bytes.len()
-                && !bytes[i].is_ascii_whitespace()
-                && !matches!(bytes[i], b'(' | b')')
-            {
-                i += 1;
-            }
-        }
-        let token = &rendered[start..i];
-        out.push_str(replacements.get(token).map_or(token, String::as_str));
-    }
-    out
-}
-
 /// Render the fixedpoint rule set as a string (best-effort, context-owned).
 ///
 /// # Safety
@@ -404,9 +337,10 @@ pub unsafe extern "C" fn Z3_fixedpoint_to_string(c: Z3_context, d: Z3_fixedpoint
             for &rule in &handle.rules {
                 out.push_str("(rule ");
                 let rendered = ctx.solver.format_term(rule);
-                out.push_str(&fixedpoint_surface_text(ctx, &rendered));
+                out.push_str(&super::ffi_surface_text(ctx, &rendered));
                 out.push_str(")\n");
             }
+            let out = super::ffi_surface_text(ctx, &out);
             cache_string(ctx, out)
         })
     }

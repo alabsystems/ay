@@ -14,9 +14,9 @@ use std::ptr;
 use ay_dpll::api::{Sort, Term};
 
 use super::{
-    ast_to_term, bounded_sort_hi, ffi_guard_ast, ffi_guard_ptr, lookup_ast_sort, range_guard_term,
-    record_ast_sort, term_to_ast, Z3Context, Z3_ast, Z3_context, Z3_sort, Z3_symbol,
-    Z3_INVALID_ARG,
+    ast_to_term, bounded_sort_hi, ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast,
+    ffi_guard_ptr, lookup_ast_sort, range_guard_term, record_ast_sort, term_to_ast, Z3Context,
+    Z3_ast, Z3_context, Z3_sort, Z3_symbol, MAX_FFI_CONTAINER_ELEMENTS, Z3_INVALID_ARG,
 };
 
 // ============================================================================
@@ -48,6 +48,11 @@ pub unsafe extern "C" fn Z3_mk_pattern(
     num_patterns: c_uint,
     terms: *const Z3_ast,
 ) -> Z3_pattern {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_pattern", num_patterns) } {
+        return ptr::null_mut();
+    }
     if num_patterns == 0 || terms.is_null() {
         // Need context to set error — guard handles null context
         // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
@@ -180,6 +185,17 @@ pub unsafe extern "C" fn Z3_mk_forall_const(
     patterns: *const Z3_pattern,
     body: Z3_ast,
 ) -> Z3_ast {
+    // SAFETY: every caller of this unsafe helper forwards a null or live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "quantifier bound variables and patterns",
+            &[num_bound, num_patterns],
+        )
+    } {
+        return 0;
+    }
     // SAFETY: caller guarantees pointer validity per function contract
     unsafe { mk_quantifier_const(c, true, num_bound, bound, num_patterns, patterns, body) }
 }
@@ -200,6 +216,17 @@ pub unsafe extern "C" fn Z3_mk_exists_const(
     patterns: *const Z3_pattern,
     body: Z3_ast,
 ) -> Z3_ast {
+    // SAFETY: every caller of this unsafe helper forwards a null or live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "quantifier bound variables and patterns",
+            &[num_bound, num_patterns],
+        )
+    } {
+        return 0;
+    }
     // SAFETY: caller guarantees pointer validity per function contract
     unsafe { mk_quantifier_const(c, false, num_bound, bound, num_patterns, patterns, body) }
 }
@@ -243,6 +270,7 @@ unsafe fn mk_quantifier_const(
     // Collect trigger patterns before entering the guard
     let trigger_slices: Option<Vec<Vec<Term>>> = if num_patterns > 0 && !patterns.is_null() {
         let mut slices = Vec::new();
+        let mut total_terms = (num_bound as usize).saturating_add(num_patterns as usize);
         for i in 0..num_patterns as usize {
             // SAFETY: The caller's `# Safety` contract guarantees `patterns` points to at
             // least the declared number of elements. The count was range-checked above, and
@@ -255,6 +283,19 @@ unsafe fn mk_quantifier_const(
                 // extern "C" function guarantees they remain valid for the duration of the
                 // call.
                 let handle = unsafe { &*pat };
+                total_terms = total_terms.saturating_add(handle.terms.len());
+                if total_terms > MAX_FFI_CONTAINER_ELEMENTS as usize {
+                    // SAFETY: this public entry point requires `c` to be null or a live,
+                    // exclusively borrowed context; the bound checker only updates its error state.
+                    unsafe {
+                        ffi_count_within_limit(
+                            c,
+                            "quantifier trigger terms",
+                            MAX_FFI_CONTAINER_ELEMENTS + 1,
+                        );
+                    }
+                    return 0;
+                }
                 slices.push(handle.terms.clone());
             }
         }
@@ -399,6 +440,17 @@ unsafe fn mk_quantifier_db(
     decl_names: *const Z3_symbol,
     body: Z3_ast,
 ) -> Z3_ast {
+    // SAFETY: every caller of this unsafe helper forwards a null or live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "quantifier declaration arrays and patterns",
+            &[num_decls, num_decls, num_patterns],
+        )
+    } {
+        return 0;
+    }
     if num_decls == 0 || sorts.is_null() || decl_names.is_null() {
         // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
         // extern "C" function requires it to be a valid, non-aliased pointer (or null).
@@ -484,10 +536,25 @@ unsafe fn mk_quantifier_db(
             let trigger_slices: Option<Vec<Vec<Term>>> = if num_patterns > 0 && !patterns.is_null()
             {
                 let mut slices = Vec::new();
+                let mut total_terms = (num_decls as usize)
+                    .saturating_mul(2)
+                    .saturating_add(num_patterns as usize);
                 for i in 0..num_patterns as usize {
+                    // SAFETY: the aggregate count was checked before this pointer
+                    // walk and the caller supplies `num_patterns` live entries.
                     let pat = *patterns.add(i);
                     if !pat.is_null() {
+                        // SAFETY: non-null pattern handles are live for this call
+                        // under the entry point's ownership contract.
                         let handle = &*pat;
+                        total_terms = total_terms.saturating_add(handle.terms.len());
+                        if total_terms > MAX_FFI_CONTAINER_ELEMENTS as usize {
+                            ctx.last_error = Z3_INVALID_ARG;
+                            ctx.error_msg = Some(format!(
+                                "quantifier trigger terms: element count exceeds the supported maximum {MAX_FFI_CONTAINER_ELEMENTS}"
+                            ));
+                            return 0;
+                        }
                         slices.push(handle.terms.clone());
                     }
                 }

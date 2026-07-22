@@ -2075,7 +2075,7 @@ mod tests {
     /// add is not RAT it fails at that earlier step. `AY_SAT_IR_MAX_GENERATORS`
     /// caps the number of generators (set 1 for the single-generator probe).
     #[test]
-    #[ignore]
+    #[ignore = "manual DRAT-RAT probe requires AY_CLIQUE_CNF and AY_SBP_PROOF_OUT"]
     fn probe_sbp_drat_rat() {
         let path = std::env::var("AY_CLIQUE_CNF").expect("set AY_CLIQUE_CNF");
         let out = std::env::var("AY_SBP_PROOF_OUT").expect("set AY_SBP_PROOF_OUT");
@@ -2375,13 +2375,13 @@ mod tests {
     #[test]
     fn native_sr_checker_fails_closed_on_non_redundant() {
         use ay_drat_check::drat_parser::ProofStep;
-        let f = vec![vec![Literal::positive(Variable(0))]];
+        let f = [vec![Literal::positive(Variable(0))]];
         let dc_f: Vec<_> = f
             .iter()
             .map(|c| c.iter().map(|&l| to_dc(l)).collect())
             .collect();
-        let clause = vec![Literal::negative(Variable(0))];
-        let witness = vec![
+        let clause = [Literal::negative(Variable(0))];
+        let witness = [
             Literal::negative(Variable(0)),
             Literal::negative(Variable(0)),
         ];

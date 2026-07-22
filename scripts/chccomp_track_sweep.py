@@ -13,55 +13,73 @@ Usage:
       --jobs 8 --tracks LIA-Lin,LIA,LRA-Lin,ADT-LIA,LIA-Lin-Arrays
 """
 from __future__ import annotations
-import argparse, json, os, subprocess, sys, time
+import argparse, json, os, sys, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import chccomp_harness as H  # noqa: E402
-from _oom_guard import plan_solver_resources, warn_concurrent_build  # noqa: E402
+from _oom_guard import (  # noqa: E402
+    plan_solver_resources,
+    run_captured,
+    warn_concurrent_build,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 
 
-def run_one(task, timeout_s, ay_bin, memlimit_mb=0):
+def run_one(task, timeout_s, ay_bin, memlimit_mb=0, nbcore=1,
+            resource_envelope=None):
+    if memlimit_mb <= 0 or nbcore <= 0:
+        raise ValueError("track sweep requires positive memory and core budgets")
     argv = [ay_bin, "--chc", "--competition", "--timeout", str(timeout_s * 1000)]
     if memlimit_mb:
         argv += ["--memory", str(memlimit_mb)]
     argv.append(task.smt2)
-    t0 = time.time()
+    child_env = dict(os.environ, NBCORE=str(max(1, nbcore)))
+    if memlimit_mb:
+        child_env["MEMLIMIT"] = str(memlimit_mb)
+    t0 = time.monotonic()
     status = "error"
+    exit_code = None
+    memout = False
+    timed_out = False
+    output_truncated = False
     try:
-        popen_kwargs = {}
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        result = run_captured(
+            argv,
+            memlimit_mb,
+            timeout_s=timeout_s + 15,
+            label="chccomp_track_sweep.py",
+            env=child_env,
+        )
+        exit_code = result.returncode
+        memout = result.memout
+        timed_out = result.timed_out
+        output_truncated = result.output_truncated
+        if memout:
+            status = "memout"
+        elif timed_out:
+            status = "timeout"
+        elif output_truncated:
+            status = "error"
         else:
-            popen_kwargs["start_new_session"] = True
-        p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, encoding="utf-8", errors="replace", **popen_kwargs)
-        try:
-            out, _ = p.communicate(timeout=timeout_s + 15)
-            status = H.parse_status(out)
+            status = H.parse_status(result.stdout)
             if status == "no-status":
                 status = "unknown"
-        except subprocess.TimeoutExpired:
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)], capture_output=True)
-            else:
-                import signal as sig
-                os.killpg(os.getpgid(p.pid), sig.SIGKILL)
-            p.communicate()
-            status = "timeout"
-    except OSError:
-        pass
+    except (OSError, RuntimeError, ValueError):
+        status = "error"
     correct = None
     if status in ("sat", "unsat") and task.verdict is not None:
         correct = status == task.verdict
-    # memlimit_mb (0 = solver default) is recorded per record so sweep files
-    # taken under different --memory envelopes are never silently compared.
+    # The exact positive envelope is recorded per row so sweeps taken under
+    # different limits are never silently compared.
     return {"inst": task.rel_id, "status": status, "correct": correct,
-            "verdict": task.verdict, "wall": round(time.time() - t0, 1),
-            "memlimit_mb": memlimit_mb}
+            "verdict": task.verdict, "wall": round(time.monotonic() - t0, 1),
+            "timeout_sec": timeout_s, "memlimit_mb": memlimit_mb,
+            "nbcore": nbcore, "resource_envelope": resource_envelope,
+            "exit_code": exit_code, "memout": memout,
+            "timed_out": timed_out, "output_truncated": output_truncated}
 
 
 def main():
@@ -83,7 +101,8 @@ def main():
     # an 85%-of-RAM memory
     # limit, sibling-blind — cap jobs and pass each child an explicit --memory.
     warn_concurrent_build()
-    plan = plan_solver_resources(args.jobs, headroom_mb=args.mem_headroom_mb,
+    requested_jobs = args.jobs
+    plan = plan_solver_resources(requested_jobs, headroom_mb=args.mem_headroom_mb,
                                  label="chccomp_track_sweep.py")
     args.jobs = plan.jobs
     # Always print the plan (mirrors wind_tunnel.py): the per-child --memory
@@ -91,8 +110,17 @@ def main():
     # under different envelopes are not comparable and the envelope must be
     # visible in the log as well as in each JSONL record.
     print(f"track sweep: resource plan: jobs={plan.jobs}, "
-          f"--memory={plan.memlimit_mb or 'default'} MiB/child, "
+          f"--memory={plan.memlimit_mb} MiB/child, NBCORE={plan.nbcore}, "
           f"headroom={plan.headroom_mb} MiB", flush=True)
+    resource_envelope = {
+        "requested_jobs": requested_jobs,
+        "jobs": plan.jobs,
+        "memlimit_mb_per_child": plan.memlimit_mb,
+        "nbcore_per_child": plan.nbcore,
+        "headroom_mb": plan.headroom_mb,
+        "enforcement": "exec-stopped + rss-watchdog-zero-grace; ay --memory; "
+                       "MEMLIMIT/NBCORE environment; bounded 1MiB/stream capture",
+    }
 
     for track in args.tracks.split(","):
         H._CURRENT_TRACK = track
@@ -102,11 +130,15 @@ def main():
         outdir = REPO / f"evals/results/chccomp-harness/{args.year}/{track}/{args.tag}"
         outdir.mkdir(parents=True, exist_ok=True)
         outp = outdir / "ay_sample.jsonl"
+        (outdir / "resource-envelope.json").write_text(
+            json.dumps(resource_envelope, indent=2) + "\n"
+        )
         recs = []
         t0 = time.time()
         with outp.open("w") as fh, ThreadPoolExecutor(max_workers=args.jobs) as pool:
             futs = [pool.submit(run_one, t, args.timeout, args.ay_bin,
-                                plan.memlimit_mb) for t in sample]
+                                plan.memlimit_mb, plan.nbcore,
+                                resource_envelope) for t in sample]
             done = 0
             for f in as_completed(futs):
                 r = f.result()

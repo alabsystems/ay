@@ -7157,6 +7157,7 @@ impl AdaptivePortfolio {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ay_test_support::env::{lock_env, ScopedEnvVar};
 
     fn parse_problem(smt: &str) -> ChcProblem {
         crate::parser::ChcParser::parse(smt).expect("test CHC should parse")
@@ -7561,10 +7562,11 @@ mod tests {
 
     // ---------------------------------------------------------------------
     // #chc25-array-relational: relational ARRAY-equality Houdini tests.
-    // The env-var kill switch is process-global, so the three array tests
-    // serialize on this lock to keep the enabled/disabled assertions race-free.
+    // The env-var kill switch is process-global, so the array tests serialize
+    // on the one workspace-wide env lock (`lock_env`) to keep the
+    // enabled/disabled assertions race-free against each other and against every
+    // other env-touching test in this binary.
     // ---------------------------------------------------------------------
-    static ARRAY_REL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // A two-copy INV over (Int, (Array Int Int)) ×2 where both copies perform
     // the SAME store in lockstep, so the relational invariant is the array
@@ -7572,8 +7574,8 @@ mod tests {
     // must synthesize it AND it must re-verify inductive on the original CHC.
     #[test]
     fn relational_array_equality_houdini_certifies_two_copy_safe() {
-        let _guard = ARRAY_REL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        std::env::remove_var("AY_CHC_DISABLE_ARRAY_RELATIONAL");
+        let _guard = lock_env();
+        let _array_rel = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7616,8 +7618,8 @@ mod tests {
     // is NOT inductive; the lane must NOT certify Safe (fail-closed to None).
     #[test]
     fn relational_array_equality_no_false_safe_on_diverging_arrays() {
-        let _guard = ARRAY_REL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        std::env::remove_var("AY_CHC_DISABLE_ARRAY_RELATIONAL");
+        let _guard = lock_env();
+        let _array_rel = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7647,7 +7649,7 @@ mod tests {
     // (returns None even on the certifiable Safe problem); unset re-enables it.
     #[test]
     fn relational_array_equality_kill_switch_disables_lane() {
-        let _guard = ARRAY_REL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = lock_env();
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7666,10 +7668,10 @@ mod tests {
 (check-sat)
 "#;
         let problem = parse_problem(input);
-        std::env::set_var("AY_CHC_DISABLE_ARRAY_RELATIONAL", "1");
+        let array_rel_disable = ScopedEnvVar::set("AY_CHC_DISABLE_ARRAY_RELATIONAL", "1");
         let disabled =
             super::try_relational_equality_houdini(&problem, std::time::Duration::from_secs(15));
-        std::env::remove_var("AY_CHC_DISABLE_ARRAY_RELATIONAL");
+        drop(array_rel_disable);
         assert!(
             disabled.is_none(),
             "kill switch AY_CHC_DISABLE_ARRAY_RELATIONAL=1 must disable the array lane"
@@ -7737,9 +7739,9 @@ mod tests {
     // required. v2 must certify Safe AND re-verify inductive on the original CHC.
     #[test]
     fn array_relational_v2_certifies_affine_index_alignment() {
-        let _guard = ARRAY_REL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        std::env::remove_var("AY_CHC_DISABLE_ARRAY_RELATIONAL");
-        std::env::remove_var("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
+        let _guard = lock_env();
+        let _array_rel = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
+        let _array_rel_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7788,9 +7790,9 @@ mod tests {
     // `a[idx]`, so the foundation FAILS; v2's select-value coupling is required.
     #[test]
     fn array_relational_v2_certifies_select_value_coupling() {
-        let _guard = ARRAY_REL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        std::env::remove_var("AY_CHC_DISABLE_ARRAY_RELATIONAL");
-        std::env::remove_var("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
+        let _guard = lock_env();
+        let _array_rel = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
+        let _array_rel_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
         let input = r#"
 (set-logic HORN)
 (declare-fun INV ((Array Int Int) Int Int (Array Int Int)) Bool)
@@ -7836,9 +7838,9 @@ mod tests {
     // is reachable, and v2 must fail closed to None — NEVER a Safe.
     #[test]
     fn array_relational_v2_no_false_safe_on_diverging_alignment() {
-        let _guard = ARRAY_REL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        std::env::remove_var("AY_CHC_DISABLE_ARRAY_RELATIONAL");
-        std::env::remove_var("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
+        let _guard = lock_env();
+        let _array_rel = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
+        let _array_rel_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7867,9 +7869,9 @@ mod tests {
     // re-enables. The umbrella `AY_CHC_DISABLE_ARRAY_RELATIONAL=1` also disables.
     #[test]
     fn array_relational_v2_kill_switch_disables_lane() {
-        let _guard = ARRAY_REL_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        std::env::remove_var("AY_CHC_DISABLE_ARRAY_RELATIONAL");
-        std::env::remove_var("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
+        let _guard = lock_env();
+        let _array_rel = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL");
+        let _array_rel_v2 = ScopedEnvVar::unset("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
         let input = r#"
 (set-logic HORN)
 (declare-fun INV (Int Int (Array Int Int) Int (Array Int Int)) Bool)
@@ -7886,10 +7888,10 @@ mod tests {
 (check-sat)
 "#;
         let problem = parse_problem(input);
-        std::env::set_var("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2", "1");
+        let array_rel_v2_disable = ScopedEnvVar::set("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2", "1");
         let disabled =
             super::try_array_relational_houdini_v2(&problem, std::time::Duration::from_secs(20));
-        std::env::remove_var("AY_CHC_DISABLE_ARRAY_RELATIONAL_V2");
+        drop(array_rel_v2_disable);
         assert!(
             disabled.is_none(),
             "v2 kill switch must disable the v2 templates"

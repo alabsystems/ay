@@ -1604,6 +1604,40 @@ fn test_verify_unsat_chain_passes_after_valid_proof() {
 }
 
 #[test]
+fn test_verify_unsat_chain_rejects_missing_terminal_addition() {
+    let output = ProofOutput::lrat_text(Vec::new(), 2);
+    let mut manager = ProofManager::new(output, 2);
+
+    manager.register_original_clause(&[lit(0, true)]);
+    manager.register_clause_id(1);
+    manager.register_original_clause(&[lit(0, false)]);
+    manager.register_clause_id(2);
+
+    assert_eq!(
+        manager.try_verify_unsat_chain(),
+        Err("LRAT proof has no recorded empty-clause addition")
+    );
+}
+
+#[test]
+fn test_verify_unsat_chain_rejects_hidden_empty_clause() {
+    let output = ProofOutput::lrat_text(Vec::new(), 1);
+    let mut manager = ProofManager::new(output, 1);
+
+    manager.register_original_clause(&[lit(0, true)]);
+    manager.register_clause_id(1);
+    let hidden_id = manager
+        .emit_add(&[], &[], ProofAddKind::Derived)
+        .expect("missing-hint empty clause reserves a hidden ID");
+
+    assert_ne!(hidden_id, 0);
+    assert_eq!(
+        manager.try_verify_unsat_chain(),
+        Err("LRAT terminal empty clause is not visible in the proof")
+    );
+}
+
+#[test]
 fn test_last_add_tracks_scalar_metadata() {
     let output = ProofOutput::lrat_text(Vec::new(), 2);
     let mut manager = ProofManager::new(output, 2);

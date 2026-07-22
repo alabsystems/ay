@@ -2020,12 +2020,14 @@ fn test_simplify_or_negation_through_multiple() {
 
 #[test]
 fn test_simplify_and_negation_through_removes_inner() {
-    // (and x (or (not x))) simplifies:
-    // First (or (not x)) = (not x) (single element)
+    // Duplicate elimination keeps the input valid SMT-LIB while exercising
+    // the same inner collapse:
+    // (and x (or (not x) (not x))) simplifies:
+    // First (or (not x) (not x)) = (not x)
     // Then (and x (not x)) = false (complement)
     let input = r#"
         (declare-const x Bool)
-        (simplify (and x (or (not x))))
+        (simplify (and x (or (not x) (not x))))
     "#;
 
     let commands = parse(input).unwrap();
@@ -2038,12 +2040,14 @@ fn test_simplify_and_negation_through_removes_inner() {
 
 #[test]
 fn test_simplify_or_negation_through_removes_inner() {
-    // (or x (and (not x))) simplifies:
-    // First (and (not x)) = (not x) (single element)
+    // Duplicate elimination keeps the input valid SMT-LIB while exercising
+    // the same inner collapse:
+    // (or x (and (not x) (not x))) simplifies:
+    // First (and (not x) (not x)) = (not x)
     // Then (or x (not x)) = true (complement)
     let input = r#"
         (declare-const x Bool)
-        (simplify (or x (and (not x))))
+        (simplify (or x (and (not x) (not x))))
     "#;
 
     let commands = parse(input).unwrap();

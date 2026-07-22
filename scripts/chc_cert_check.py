@@ -23,12 +23,20 @@ Exit 0 = certificate VALID; 2 = some clause FAILED (prints which); 3 = unknown.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _oom_guard import (  # noqa: E402
+    ResourcePlan,
+    plan_solver_resources,
+    run_captured,
+    warn_concurrent_build,
+)
 
 def top_level_forms(text: str) -> list[str]:
     """Split SMT-LIB text into top-level s-expression forms (comment-aware)."""
@@ -89,7 +97,48 @@ def main() -> int:
     ap.add_argument("--z3", default=str(Path(__file__).resolve().parent.parent / "reference/chc-solvers/bin/z3.exe"))
     ap.add_argument("--timeout-ms", type=int, default=120000)
     ap.add_argument("--keep", action="store_true", help="keep the generated check file")
+    ap.add_argument("--evidence-out", default="",
+                    help="optional JSON checker evidence output")
+    ap.add_argument("--memlimit-mb", type=int,
+                    help="reuse an outer harness per-child memory budget")
+    ap.add_argument("--nbcore", type=int,
+                    help="reuse an outer harness per-child CPU budget")
+    ap.add_argument("--headroom-mb", type=int,
+                    help="reuse an outer harness headroom value")
+    ap.add_argument("--resource-jobs", type=int, default=1,
+                    help="outer plan's admitted job count")
+    ap.add_argument("--resource-requested-jobs", type=int, default=1,
+                    help="outer plan's requested job count")
     args = ap.parse_args()
+    if args.timeout_ms <= 0:
+        ap.error("--timeout-ms must be positive")
+
+    warn_concurrent_build()
+    explicit = (args.memlimit_mb, args.nbcore, args.headroom_mb)
+    if any(value is not None for value in explicit):
+        if any(value is None for value in explicit):
+            ap.error("--memlimit-mb, --nbcore, and --headroom-mb must be supplied together")
+        if args.memlimit_mb <= 0 or args.nbcore <= 0 or args.headroom_mb < 0:
+            ap.error("explicit resource values must be positive (headroom may be zero)")
+        if args.resource_jobs <= 0 or args.resource_requested_jobs <= 0:
+            ap.error("explicit resource job counts must be positive")
+        plan = ResourcePlan(
+            args.resource_jobs,
+            args.memlimit_mb,
+            args.nbcore,
+            args.headroom_mb,
+        )
+    else:
+        plan = plan_solver_resources(1, label="chc_cert_check.py")
+    resource_plan = {
+        "requested_jobs": args.resource_requested_jobs if args.memlimit_mb else 1,
+        "jobs": plan.jobs,
+        "memlimit_mb_per_child": plan.memlimit_mb,
+        "nbcore_per_child": plan.nbcore,
+        "headroom_mb": plan.headroom_mb,
+        "enforcement": "process-group rss_watchdog; MEMLIMIT/NBCORE environment",
+    }
+    print(f"cert-check: resource plan {json.dumps(resource_plan, sort_keys=True)}")
 
     problem = Path(args.smt2).read_text(encoding="utf-8", errors="replace")
     cert = Path(args.cert).read_text(encoding="utf-8", errors="replace")
@@ -138,16 +187,34 @@ def main() -> int:
 
     try:
         try:
-            proc = subprocess.run(
+            proc = run_captured(
                 [args.z3, f"-T:{max(1, args.timeout_ms // 1000)}", check_path],
-                capture_output=True,
-                text=True,
-                timeout=args.timeout_ms / 1000 + 30,
+                plan.memlimit_mb,
+                args.timeout_ms / 1000 + 30,
+                label="chc_cert_check.py[z3]",
+                env=dict(os.environ, MEMLIMIT=str(plan.memlimit_mb),
+                         NBCORE=str(plan.nbcore)),
             )
-        except subprocess.TimeoutExpired:
+        except (OSError, RuntimeError) as error:
+            print(f"cert-check: INCOMPLETE (could not run external z3: {error})")
+            return 3
+        if proc.timed_out or proc.memout or proc.output_truncated:
             # Keep the documented exit contract (0 valid / 2 failed / 3 unknown)
-            # even when the external z3 blows through its own -T wall limit.
-            print("cert-check: INCOMPLETE (external z3 wall timeout)")
+            # when the external z3 exceeds either enforced budget.
+            reason = (
+                "memory envelope"
+                if proc.memout
+                else "wall timeout"
+                if proc.timed_out
+                else "bounded output capture"
+            )
+            if args.evidence_out:
+                Path(args.evidence_out).write_text(json.dumps({
+                    "resource_plan": resource_plan,
+                    "status": "incomplete",
+                    "reason": reason,
+                }, indent=2) + "\n")
+            print(f"cert-check: INCOMPLETE (external z3 {reason})")
             return 3
         outp = proc.stdout.splitlines()
         verdicts: dict[str, str] = {}
@@ -160,6 +227,17 @@ def main() -> int:
                 verdicts[current] = line
                 current = None
         bad = {k: v for k, v in verdicts.items() if v != "unsat"}
+        status = ("valid" if len(verdicts) == len(asserts) and not bad else
+                  "invalid" if any(v == "sat" for v in bad.values()) else
+                  "incomplete")
+        if args.evidence_out:
+            Path(args.evidence_out).write_text(json.dumps({
+                "resource_plan": resource_plan,
+                "status": status,
+                "clauses": len(asserts),
+                "clauses_checked": len(verdicts),
+                "solver_exit_code": proc.returncode,
+            }, indent=2) + "\n")
         print(f"cert-check: {len(verdicts)}/{len(asserts)} clauses checked")
         if len(verdicts) < len(asserts):
             print("cert-check: INCOMPLETE (solver died or timed out mid-run)")

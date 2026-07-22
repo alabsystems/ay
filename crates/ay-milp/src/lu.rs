@@ -1971,9 +1971,8 @@ mod tests {
                 alpha[r] += v;
             }
             eng.ftran(&mut alpha);
-            match eng.update(p, &alpha) {
-                Err(_) => continue, // singular replacement — try another
-                Ok(()) => {}
+            if eng.update(p, &alpha).is_err() {
+                continue; // singular replacement — try another
             }
             cols[p] = cand;
             accepted += 1;

@@ -309,6 +309,8 @@ pub(crate) mod eq_paths_cache {
 
     type PathMap = HashMap<TermId, Vec<TheoryLit>>;
     type PairReason = Option<Vec<TheoryLit>>;
+    type AssertedPredecessors = HashMap<TermId, (TermId, TermId)>;
+    type SharedAssertedPredecessors = Rc<AssertedPredecessors>;
 
     /// Memoized payload of `find_store_through_eq_with_mode`:
     /// `(base, index, value, eq_terms, reasons)`.
@@ -355,7 +357,7 @@ pub(crate) mod eq_paths_cache {
         /// the search would have early-exited, so a path reconstructed from
         /// this forest is byte-identical to the legacy per-goal early-exit
         /// BFS (`asserted_equality_path_bfs`). Frozen-graph window only.
-        asserted_prev: HashMap<TermId, Rc<HashMap<TermId, (TermId, TermId)>>>,
+        asserted_prev: HashMap<TermId, SharedAssertedPredecessors>,
     }
 
     thread_local! {
@@ -427,16 +429,14 @@ pub(crate) mod eq_paths_cache {
     /// `Some(Some(forest))` on a warm hit, `Some(None)` when the window is
     /// active but cold for `start`, `None` when no window is active.
     #[allow(clippy::option_option)]
-    pub(crate) fn get_asserted_prev(
-        start: TermId,
-    ) -> Option<Option<Rc<HashMap<TermId, (TermId, TermId)>>>> {
+    pub(crate) fn get_asserted_prev(start: TermId) -> Option<Option<SharedAssertedPredecessors>> {
         CACHE.with(|c| {
             c.borrow()
                 .as_ref()
                 .map(|t| t.asserted_prev.get(&start).cloned())
         })
     }
-    pub(crate) fn put_asserted_prev(start: TermId, prev: &Rc<HashMap<TermId, (TermId, TermId)>>) {
+    pub(crate) fn put_asserted_prev(start: TermId, prev: &SharedAssertedPredecessors) {
         CACHE.with(|c| {
             if let Some(t) = c.borrow_mut().as_mut() {
                 t.asserted_prev.insert(start, prev.clone());
@@ -962,6 +962,19 @@ pub struct ArraySolver<'a> {
     /// and `interrupt()` to take effect during array theory solving, rather
     /// than only between theory solver calls.
     interrupt: Option<Arc<AtomicBool>>,
+    /// Hard wall-clock deadline pushed down from the caller
+    /// (#array-deadline-forward, mirroring `LiaSolver::set_deadline` #8749).
+    ///
+    /// The Nelson-Oppen driver only polls its own deadline BETWEEN theory
+    /// checks, so a single dense `final_check` (the O(pairs x graph)
+    /// `check_row2_extended` explain loop) could overshoot the caller's wall
+    /// budget by tens of seconds (measured: a QF_AX storecomm subset re-solve
+    /// under an ~8.7s slice ran 40+s inside one final_check until an external
+    /// watchdog killed the already-answered run). `interrupted_or_deadline`
+    /// polls this at sub-check boundaries and amortized inside the pair
+    /// loops, so the check exits `Unknown` at the boundary — fail-closed,
+    /// verdict-neutral by construction.
+    deadline: Option<ay_core::time::Instant>,
 }
 
 pub(crate) type AffineIntExpr = (HashMap<String, BigInt>, BigInt);
@@ -1115,6 +1128,7 @@ impl<'a> ArraySolver<'a> {
             shadow_uf: union_find::ArrayUnionFind::default(),
             shadow_uf_stale: true,
             interrupt: None,
+            deadline: None,
         }
     }
 
@@ -1155,6 +1169,30 @@ impl<'a> ArraySolver<'a> {
         self.interrupt
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
+    /// Install a hard wall-clock deadline (#array-deadline-forward; see the
+    /// `deadline` field docs). Mirrors `LiaSolver::set_deadline` (#8749): the
+    /// combiner forwards its own deadline here so a single dense
+    /// `final_check` cannot overshoot the caller's wall budget.
+    pub fn set_deadline(&mut self, deadline: ay_core::time::Instant) {
+        self.deadline = Some(deadline);
+    }
+
+    /// Interrupt flag OR deadline poll for the expensive final-check /
+    /// propagation loops (#array-deadline-forward).
+    ///
+    /// FAIL-CLOSED: every caller maps `true` to `TheoryResult::Unknown` (or
+    /// returns the partial-but-sound lemma batch found so far) — a stop can
+    /// only degrade completeness for THIS check round, never flip a verdict.
+    /// The outer DPLL(T)/executor loops observe the same expired deadline at
+    /// their own polls and abort with `Unknown(Timeout)`.
+    pub fn interrupted_or_deadline(&self) -> bool {
+        if self.is_interrupted() {
+            return true;
+        }
+        self.deadline
+            .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
     }
 }
 

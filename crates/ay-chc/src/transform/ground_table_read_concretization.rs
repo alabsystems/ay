@@ -624,7 +624,7 @@ fn replace_pin_atoms(expr: &ChcExpr, depth: usize) -> ChcExpr {
             op @ (ChcOp::And | ChcOp::Or | ChcOp::Not | ChcOp::Implies | ChcOp::Ite),
             args,
         ) => ChcExpr::Op(
-            op.clone(),
+            *op,
             args.iter()
                 .map(|a| std::sync::Arc::new(replace_pin_atoms(a, depth + 1)))
                 .collect(),

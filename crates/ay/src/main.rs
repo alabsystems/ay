@@ -94,13 +94,9 @@ mod stats_output;
 mod tracing_setup;
 mod z3_params;
 
-// Import is_horn_logic so main_tests.rs can use `use super::*;`
-#[cfg(test)]
-pub(crate) use run::is_horn_logic;
-
-// Import is_fixedpoint_format so main_tests.rs can use `use super::*;`
-#[cfg(test)]
-pub(crate) use run::is_fixedpoint_format;
+// Keep format classifiers in this module's scope for both CLI preflight and
+// `main_tests.rs`, which imports them through `use super::*`.
+pub(crate) use run::{is_fixedpoint_format, is_horn_logic};
 
 const DEFAULT_TIMEOUT_EXIT_CODE: i32 = 124;
 const SAT_COMPETITION_UNKNOWN_EXIT_CODE: i32 = 0;
@@ -152,20 +148,17 @@ pub(crate) static STRICT_PROOFS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// `unknown`. The point is that AY checks its own answers — no external oracle
 /// is needed to trust a `sat`/`unsat` it emits under `--self-check`.
 pub(crate) static SELF_CHECK_ENABLED: AtomicBool = AtomicBool::new(false);
-/// Directory to write per-theory verified-firewall Lean proofs into, set by
-/// `--emit-firewall-lean <DIR>`. When set, the runtime emits the
-/// import-the-verified-theorem Lean shape (one file per groundable theory lemma:
-/// datatypes / LIA / EUF / arrays-ROW2 / strings) on UNSAT, grounded in the
-/// verified `AySoundness.firewall_combined_unsat` theorem.
+/// Directory to write per-theory diagnostic firewall Lean lemmas into, set by
+/// `--emit-firewall-lean <DIR>`. Each file covers one locally groundable theory
+/// obligation (datatypes / LIA / EUF / arrays-ROW2 / strings); these files do
+/// not by themselves certify the solver's complete UNSAT derivation.
 pub(crate) static FIREWALL_LEAN_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-/// Whether the verified-firewall self-cert gate is enabled (`--verify-firewall`).
+/// Whether the diagnostic firewall result gate is enabled (`--verify-firewall`).
 ///
-/// When set, an `unsat` result is emitted only if AY can reconstruct at least
-/// one per-theory firewall Lean proof and every one kernel-checks under the real
-/// Lean toolchain (`lake env lean` inside `verification/lean`, grounded in the
-/// verified `AySoundness.firewall_combined_unsat` theorem). Any `unsat` AY
-/// cannot self-certify this way downgrades to a sound `unknown`. Read on the
-/// SMT check-sat result path in `run.rs`.
+/// Current firewall files prove local theory obligations but are not bound to
+/// the complete query/refutation, so every current internal UNSAT is
+/// conservatively downgraded to `unknown` after diagnostics. Read on the SMT
+/// check-sat result path in `run.rs`.
 pub(crate) static VERIFY_FIREWALL_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Whether post-solve proof auto-verification is enabled (#8771).
 ///
@@ -175,6 +168,11 @@ pub(crate) static VERIFY_FIREWALL_ENABLED: AtomicBool = AtomicBool::new(false);
 /// `--competition` (speed opt-out); an explicit `--verify-proof` forces it on.
 /// Read by `dimacs.rs` after UNSAT and before exit.
 pub(crate) static VERIFY_PROOF_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Whether the user explicitly requested `--verify-proof` (as opposed to the
+/// default-on DRAT/LRAT auto-check). Non-DIMACS routes use this distinction to
+/// reject a verification promise they cannot fulfill without disabling their
+/// fast paths merely because the default auto-check is enabled.
+pub(crate) static EXPLICIT_VERIFY_PROOF_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Whether `--lean-verify` is active (#8773, Phase 1 thin wrapper).
 ///
 /// Set by the CLI flag. Read by `dimacs.rs` after UNSAT + proof emission to
@@ -272,13 +270,22 @@ pub(crate) struct ProofConfig {
     /// emission (no explicit `--proof`) on a supported file input.
     ///
     /// A synthesized default differs from an explicit `--proof` in its failure
-    /// posture: if AY cannot render a checkable certificate for an otherwise
-    /// valid UNSAT, a *default* config warns and continues (the verdict stands;
-    /// only the optional certificate is missing), whereas an explicit `--proof`
-    /// fails loud. It also lets logic-specific runners (e.g. CHC) retarget the
+    /// posture: outside a mandatory proof gate, failure to render the default
+    /// certificate warns and leaves the verdict standing; under
+    /// `--strict-proofs` or `--self-check`, the uncertified result instead
+    /// downgrades to `unknown`. An explicit user output failure remains fatal.
+    /// This marker also lets logic-specific runners (e.g. CHC) retarget the
     /// path/format to their native certificate kind, since the default path is
     /// chosen from the input extension before the logic is known.
     pub(crate) synthesized_default: bool,
+    /// True when the user selected a format-bearing flag (`--proof-format` or
+    /// one of the legacy `--drat`/`--lrat` flags), rather than letting AY infer
+    /// the format from `--proof FILE`.
+    ///
+    /// CHC has its own `ay-chc-cert` text format, which is not represented by
+    /// the DIMACS/SMT `--proof-format` enum. The CHC preflight uses this marker
+    /// to reject an explicit, incompatible format before solving.
+    pub(crate) format_was_explicit: bool,
 }
 
 impl ProofConfig {
@@ -291,6 +298,7 @@ impl ProofConfig {
             artifact_path: None,
             is_temp: false,
             synthesized_default: false,
+            format_was_explicit: false,
         }
     }
 
@@ -302,6 +310,7 @@ impl ProofConfig {
             artifact_path: None,
             is_temp: false,
             synthesized_default: false,
+            format_was_explicit: true,
         }
     }
 
@@ -316,6 +325,7 @@ impl ProofConfig {
             artifact_path: None,
             is_temp: true,
             synthesized_default: false,
+            format_was_explicit: false,
         }
     }
 
@@ -330,6 +340,7 @@ impl ProofConfig {
             artifact_path: None,
             is_temp: false,
             synthesized_default: true,
+            format_was_explicit: false,
         }
     }
 
@@ -364,7 +375,7 @@ fn infer_proof_format(path: &str) -> (ProofFormat, bool) {
         // unusable proof for a DIMACS solve.
         "dpr" => (ProofFormat::Drat, false),
         "dprb" => (ProofFormat::Drat, true),
-        "alethe" => (ProofFormat::Alethe, false),
+        "alethe" | "chccert" => (ProofFormat::Alethe, false),
         other => {
             safe_eprintln!(
                 "c Warning: unknown proof extension '.{other}', defaulting to Alethe format"
@@ -881,25 +892,26 @@ struct SolveArgs {
     #[arg(long)]
     strict_proofs: bool,
 
-    /// Write verified-firewall Lean proofs into DIR on UNSAT (one file per
-    /// groundable theory lemma: datatypes / LIA / EUF / arrays-ROW2 / strings).
-    /// Each file imports the verified `AySoundness` theorems and kernel-checks.
-    /// Requires `--proof` (Alethe).
+    /// Write diagnostic firewall Lean lemmas into DIR on UNSAT (one file per
+    /// groundable local theory obligation: datatypes / LIA / EUF / arrays-ROW2
+    /// / strings). These lemmas audit covered theory steps but do not certify
+    /// the complete UNSAT derivation. Requires a persistent Alethe proof,
+    /// either from `--proof FILE.alethe` or default SMT-LIB file emission.
     #[arg(long = "emit-firewall-lean", value_name = "DIR")]
     emit_firewall_lean: Option<PathBuf>,
 
-    /// Verified self-cert gate: prove AY's own `unsat`, kernel-checked, in one
-    /// command.
+    /// Fail-closed diagnostic firewall gate for AY's own `unsat`.
     ///
-    /// On UNSAT, AY reconstructs the per-theory "firewall" Lean proofs (the same
-    /// import-the-verified-`AySoundness`-theorem shape as `--emit-firewall-lean`)
-    /// into a private temp dir and kernel-checks each with the real Lean
-    /// toolchain (`lake env lean` inside `verification/lean`). It reports
-    /// per-lemma PASS/FAIL to stderr. The `unsat` stands only if at least one
-    /// firewall lemma was produced and every one kernel-checks; otherwise the
-    /// verdict downgrades to a sound `unknown` (honest fail-close — downgrading
-    /// `unsat`→`unknown` is always sound). Batteries included: no env vars, the
-    /// Lean project and `lake` are auto-located.
+    /// On UNSAT, AY reconstructs the per-theory "firewall" Lean proofs, prepends
+    /// the verified theorem sources embedded at build time, and kernel-checks
+    /// each with the real Lean toolchain. A mandatory axiom audit permits only
+    /// `propext`, `Classical.choice`, and `Quot.sound`. Current files cover local
+    /// theory obligations but are not bound to the complete query/refutation,
+    /// so current UNSAT results always downgrade to sound `unknown` after the
+    /// diagnostic checks. No env vars are needed; the build source tree supplies
+    /// the pinned Lean toolchain project and `lake` is auto-located.
+    /// Supported only by the SMT-LIB DPLL(T) route; DIMACS, CHC/fixedpoint, and
+    /// forced `--chc`/`--portfolio` routes are rejected rather than bypassing it.
     #[arg(long = "verify-firewall")]
     verify_firewall: bool,
 
@@ -952,15 +964,17 @@ struct SolveArgs {
     #[arg(long, value_enum, requires = "proof")]
     proof_format: Option<CliProofFormat>,
 
-    /// Write binary proof (with --proof)
+    /// Write binary DRAT/LRAT proof (with --proof).
+    /// SMT Alethe and CHC certificate routes reject binary output.
     #[arg(long, requires = "proof")]
     proof_binary: bool,
 
-    /// Write a Lean 4 proof-artifact-v1 JSON envelope for the emitted proof.
+    /// Write a Lean 4 proof-artifact-v1 JSON envelope for a DIMACS/SMT proof.
     ///
     /// The envelope is emitted only for UNSAT proof-producing runs and records
     /// ay build provenance, input/proof hashes, proof format, theory metadata,
     /// and the proof payload in a schema accepted by Lean 4's artifact parser.
+    /// CHC certificates do not yet have this envelope and reject the request.
     #[arg(
         long,
         value_name = "FILE",
@@ -975,25 +989,29 @@ struct SolveArgs {
     /// UNSAT result, ay attempts to write a proof artifact next to the input —
     /// DRAT for DIMACS (`<input>.drat`), Alethe for SMT (`<input>.alethe`), or
     /// an ay-chc-cert for CHC (`<input>.chccert`). Support depends on the solver
-    /// path, theory, and format; default emission failure warns without turning
-    /// the verdict into a certificate. Treat an artifact as certified only
-    /// when it is trust-free and its intended independent checker accepts it.
-    /// Pass `--no-proof` to suppress the default (e.g. for benchmarking where
-    /// proof I/O adds overhead). Explicit `--proof FILE` always wins and is
-    /// unaffected by this flag.
+    /// path, theory, and format. Outside `--strict-proofs`/`--self-check`, a
+    /// default-emission failure warns without changing the solver verdict;
+    /// those gates instead fail closed. Treat an artifact as independently
+    /// certified only after its intended checker accepts it. Pass `--no-proof`
+    /// to suppress the default (e.g. when proof I/O adds benchmark overhead),
+    /// or select an explicit `--proof FILE`; clap rejects combining the two.
     #[arg(long, help_heading = "Proof verification", conflicts_with = "proof")]
     no_proof: bool,
 
     /// Re-check the emitted proof after UNSAT using the built-in DRAT/LRAT
-    /// checker. If no `--proof` path is given, a temporary DRAT file is
-    /// written and deleted after verification. Default: ON in all builds
+    /// checker. If no `--proof` path is given for DIMACS, a temporary DRAT file
+    /// is written and deleted after verification. Default: ON in all builds
     /// (batteries included), turned off by `--no-verify-proof` or
     /// `--competition`; an explicit proof opt-out (`--no-proof` / `--z3-mode`)
     /// also suppresses the temp-proof synthesis this implies (re-checking a
     /// certificate the user declined is incoherent, and the synthesis enables
-    /// costly in-solver proof tracking). A rejected proof downgrades the
-    /// result to an error (exit code 1). Unsupported formats (Alethe, Lean4)
-    /// emit a warning and are treated as "not verified".
+    /// costly in-solver proof tracking). A rejected explicitly required proof
+    /// is an error (exit code 1); failure of an opportunistic synthesized
+    /// default proof warns and preserves the solver verdict unless
+    /// `--strict-proofs` or `--self-check` makes certification mandatory.
+    /// Explicit `--verify-proof` is rejected for SMT-LIB/Alethe and CHC inputs
+    /// because this checker supports DIMACS DRAT/LRAT only; it is never
+    /// silently treated as verification.
     #[arg(long, help_heading = "Proof verification")]
     verify_proof: bool,
 
@@ -1011,8 +1029,9 @@ struct SolveArgs {
     /// This is a stricter variant of `--verify-proof`: rather than using ay's
     /// built-in DRAT/LRAT checker, it routes the emitted theorem through Lean.
     /// Requires `--proof FILE.lean4` (or `--proof-format lean4`). Exit codes:
-    /// 20 (UNSAT + Lean verified), 2 (Lean rejected — soundness failure),
-    /// 20 plus a warning when Lean is unavailable.
+    /// 20 only when Lean accepts the proof; 2 when Lean rejects it, cannot run,
+    /// or the requested proof is not Lean4. An unfulfilled explicit kernel
+    /// check never publishes UNSAT.
     #[arg(long, help_heading = "Proof verification", requires = "proof")]
     lean_verify: bool,
 
@@ -1421,7 +1440,7 @@ struct SolveArgs {
     )]
     dpll_diagnostic: bool,
 
-    /// Write DPLL(T) decision trace to FILE
+    /// Write a single-query SMT-LIB FILE's DPLL(T) decision trace to FILE
     #[arg(
         long,
         value_name = "FILE",
@@ -1472,8 +1491,7 @@ struct SolveArgs {
 
 pub(crate) fn sat_competition_wrapper_timeout_policy() -> bool {
     env::var(SAT_COMPETITION_WRAPPER_ENV)
-        .ok()
-        .is_some_and(|value| is_sat_competition_wrapper_token(&value))
+        .is_ok_and(|value| is_sat_competition_wrapper_token(&value))
 }
 
 pub(crate) fn is_sat_competition_wrapper_token(value: &str) -> bool {
@@ -3002,31 +3020,31 @@ fn is_z3_unsigned_value(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit())
 }
 
-struct TempInputFile {
-    path: PathBuf,
+struct MaterializedInput {
+    logical_path: String,
+    content: String,
+    source_file: Option<std::fs::File>,
 }
 
-impl TempInputFile {
-    fn write(contents: &str) -> io::Result<Self> {
-        let mut path = env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let pid = std::process::id();
-        path.push(format!("ay-z3-model-{pid}-{nanos}.smt2"));
-        std::fs::write(&path, contents)?;
-        Ok(Self { path })
+impl MaterializedInput {
+    fn from_content(
+        logical_path: String,
+        content: String,
+        source_file: Option<std::fs::File>,
+    ) -> Self {
+        Self {
+            logical_path,
+            content,
+            source_file,
+        }
     }
 
     fn path_string(&self) -> String {
-        self.path.to_string_lossy().into_owned()
+        self.logical_path.clone()
     }
-}
 
-impl Drop for TempInputFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+    fn preloaded(&self) -> (&str, Option<&std::fs::File>) {
+        (self.content.as_str(), self.source_file.as_ref())
     }
 }
 
@@ -3154,30 +3172,40 @@ fn is_smtlib_command_delimiter(byte: u8) -> bool {
     is_smtlib_whitespace(byte) || matches!(byte, b')' | b';')
 }
 
-fn materialize_z3_model_input(content: &str) -> io::Result<TempInputFile> {
+fn materialize_z3_model_input(content: &str) -> MaterializedInput {
     let should_append_model =
         !dimacs::is_dimacs_format(content) && !content_already_requests_model(content);
-    if should_append_model {
-        TempInputFile::write(&append_get_model_command(content))
+    let materialized = if should_append_model {
+        append_get_model_command(content)
     } else {
-        TempInputFile::write(content)
-    }
+        content.to_string()
+    };
+    MaterializedInput::from_content("<stdin-model>.smt2".to_string(), materialized, None)
 }
 
-fn materialize_z3_model_file_input(path: &str) -> Option<TempInputFile> {
-    let Ok(content) = std::fs::read_to_string(path) else {
+fn materialize_z3_model_file_input(path: &str) -> Option<MaterializedInput> {
+    use std::io::Read as _;
+
+    let Ok(mut source_file) = std::fs::File::open(path) else {
         return None;
     };
+    let mut content = String::new();
+    if source_file.read_to_string(&mut content).is_err() {
+        return None;
+    }
     if dimacs::has_cnf_extension(path) || dimacs::is_dimacs_format(&content) {
         return None;
     }
-    match materialize_z3_model_input(&content) {
-        Ok(temp) => Some(temp),
-        Err(error) => {
-            safe_eprintln!("Error: failed to prepare -model input: {error}");
-            std::process::exit(1);
-        }
-    }
+    let materialized = if content_already_requests_model(&content) {
+        content
+    } else {
+        append_get_model_command(&content)
+    };
+    Some(MaterializedInput::from_content(
+        path.to_string(),
+        materialized,
+        Some(source_file),
+    ))
 }
 
 /// If no known subcommand is present, inject "solve" at position 1.
@@ -3549,9 +3577,10 @@ fn process_is_single_threaded() -> bool {
 /// Crash-injection gate hook (#chc25-crash): when `AY_INTERNAL_TEST_ABORT_SOLVE_CHILD`
 /// is set, drive the solve CHILD into the requested fatal-fault / hang class so the
 /// crash-injection gate can assert the parent observer converts each one into a sound
-/// `unknown` (or, for `sat-then-abort`, keeps the child's real first-line verdict)
-/// against the REAL binary's fork path. Never fires on any production invocation
-/// (the env var is test-only); the fault primitives live in `ay-sys::supervisor`.
+/// `unknown` against the REAL binary's fork path. The hook can only terminate or hang
+/// the child; it must never synthesize a definitive result before doing so. Never
+/// fires on any production invocation (the env var is test-only); the fault
+/// primitives live in `ay-sys::supervisor`.
 ///
 /// The hang variants faithfully arm the child's OWN post-fork machinery — the timeout
 /// watchdog (`set_global_timeout`, as `run_solve` does) or the cooperative SIGTERM
@@ -3574,13 +3603,6 @@ fn maybe_inject_test_child_fault() {
         "trap" => ay_sys::supervisor::die_with_signal(nix::libc::SIGTRAP),
         // Genuine stack overflow (guard-page fault → SIGILL on arm64 macOS).
         "stackoverflow" => ay_sys::supervisor::crash_stack_overflow(),
-        // Phase-4: print the real verdict, THEN crash — the parent's trailing
-        // `unknown` must be inert (scorers take the first stdout line).
-        "sat-then-abort" => {
-            let _ = Write::write_all(&mut io::stdout(), b"sat\n");
-            let _ = Write::flush(&mut io::stdout());
-            std::process::abort();
-        }
         // Livelock guarded by the child's OWN timeout watchdog, armed post-fork.
         "hang-watchdog" => {
             set_global_timeout(800);
@@ -3874,7 +3896,7 @@ fn comparable_output_path(path: &FsPath) -> io::Result<PathBuf> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "symbolic-link path '{}' is unsupported at the BV CNF certificate boundary",
+                    "symbolic-link path '{}' is unsupported at the solver artifact boundary",
                     path.display()
                 ),
             ));
@@ -3888,42 +3910,95 @@ fn comparable_output_path(path: &FsPath) -> io::Result<PathBuf> {
     } else {
         env::current_dir()?.join(path)
     };
-    let parent = absolute.parent().unwrap_or_else(|| FsPath::new("."));
-    let canonical_parent = match std::fs::canonicalize(parent) {
-        Ok(parent) => parent,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => parent.to_path_buf(),
-        Err(error) => return Err(error),
-    };
-    let file_name = absolute
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    Ok(canonical_parent.join(file_name))
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(std::path::MAIN_SEPARATOR_STR),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("path '{}' escapes the filesystem root", path.display()),
+                    ));
+                }
+            }
+            std::path::Component::Normal(component) => normalized.push(component),
+        }
+    }
+
+    // Resolve the nearest existing ancestor, then append the normalized
+    // missing suffix. This keeps `..` and symlinked-parent aliases comparable
+    // even when one or more destination directories do not exist yet.
+    let mut cursor = normalized.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(cursor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let name = cursor.file_name().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "path has no existing ancestor")
+                })?;
+                missing.push(name.to_os_string());
+                cursor = cursor.parent().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "path has no existing ancestor")
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let mut comparable = std::fs::canonicalize(cursor)?;
+    for component in missing.iter().rev() {
+        comparable.push(component);
+    }
+    Ok(comparable)
+}
+
+fn comparable_read_path(path: &FsPath) -> io::Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => comparable_output_path(path),
+        Err(error) => Err(error),
+    }
 }
 
 fn certificate_path_key(path: &FsPath) -> io::Result<String> {
-    let text = path.to_str().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "non-UTF-8 path '{}' is unsupported at the BV CNF certificate boundary",
-                path.display()
-            ),
-        )
-    })?;
-    if !text.is_ascii() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "non-ASCII path '{}' is unsupported at the BV CNF certificate boundary because filesystem Unicode normalization is platform-dependent",
-                path.display()
-            ),
-        ));
-    }
-    Ok(text.to_ascii_lowercase())
+    // This key is only a conservative preflight: exact filesystem identity is
+    // checked separately below. Lossy Unicode case folding may reject two
+    // distinct exotic names, but it must never allow a likely case alias to
+    // destroy an input or another output.
+    Ok(path.as_os_str().to_string_lossy().to_lowercase())
 }
 
 fn certificate_paths_may_alias(left: &FsPath, right: &FsPath) -> io::Result<bool> {
-    Ok(left == right || certificate_path_key(left)? == certificate_path_key(right)?)
+    if left == right || certificate_path_key(left)? == certificate_path_key(right)? {
+        return Ok(true);
+    }
+
+    let (Ok(left_metadata), Ok(right_metadata)) =
+        (std::fs::metadata(left), std::fs::metadata(right))
+    else {
+        return Ok(false);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        Ok(left_metadata.dev() == right_metadata.dev()
+            && left_metadata.ino() == right_metadata.ino())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        return Ok(left_metadata.volume_serial_number().is_some()
+            && left_metadata.volume_serial_number() == right_metadata.volume_serial_number()
+            && left_metadata.file_index().is_some()
+            && left_metadata.file_index() == right_metadata.file_index());
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(false)
+    }
 }
 
 fn certificate_path_is_within(path: &FsPath, directory: &FsPath) -> io::Result<bool> {
@@ -3936,6 +4011,160 @@ fn certificate_path_is_within(path: &FsPath, directory: &FsPath) -> io::Result<b
         directory.push(std::path::MAIN_SEPARATOR);
     }
     Ok(path.starts_with(&directory))
+}
+
+fn solve_artifact_path_collision(
+    args: &SolveArgs,
+    dump_bv_cnf: Option<&FsPath>,
+) -> io::Result<Option<String>> {
+    let mut read_paths: Vec<(&str, PathBuf)> = Vec::new();
+    for (label, path) in [
+        ("input", args.file.as_deref()),
+        ("replay input", args.replay.as_deref()),
+        ("Lean binary", args.lean_path.as_deref()),
+        ("solution witness", args.solution_file.as_deref()),
+    ] {
+        if let Some(path) = path {
+            read_paths.push((label, comparable_read_path(path)?));
+        }
+    }
+
+    let mut output_paths: Vec<(&str, PathBuf)> = Vec::new();
+    for (label, path) in [
+        ("progress JSON", args.progress_json.as_deref()),
+        ("proof", args.proof.as_deref()),
+        ("proof artifact", args.proof_artifact.as_deref()),
+        ("diagnostic output", args.diagnostic_file.as_deref()),
+        ("decision trace", args.decision_trace.as_deref()),
+        ("trace output", args.trace_file.as_deref()),
+        ("encoding dump", args.dump_encoding.as_deref()),
+        ("DRAT proof", args.drat.as_deref()),
+        ("binary DRAT proof", args.drat_binary.as_deref()),
+        ("LRAT proof", args.lrat.as_deref()),
+        ("binary LRAT proof", args.lrat_binary.as_deref()),
+        ("decision log", args.decision_log.as_deref()),
+        (
+            "DPLL diagnostic output",
+            args.dpll_diagnostic_file.as_deref(),
+        ),
+        ("DPLL trace output", args.dpll_trace_file.as_deref()),
+        ("BV CNF output", dump_bv_cnf),
+    ] {
+        if let Some(path) = path {
+            output_paths.push((label, comparable_output_path(path)?));
+        }
+    }
+
+    let has_explicit_proof = args.proof.is_some()
+        || args.drat.is_some()
+        || args.drat_binary.is_some()
+        || args.lrat.is_some()
+        || args.lrat_binary.is_some();
+    if !has_explicit_proof
+        && !default_proofs_suppressed(args.no_proof, args.z3_mode, competition_mode(args))
+    {
+        if let Some((path, format)) = default_proof_path(args.file.as_deref()) {
+            output_paths.push(("default proof", comparable_output_path(FsPath::new(&path))?));
+            if format == ProofFormat::Drat {
+                let status_path = dimacs::dimacs_proof_status_path(&path);
+                let status_lock_path = dimacs::dimacs_proof_status_lock_path(&status_path);
+                output_paths.push((
+                    "default proof status",
+                    comparable_output_path(&status_path)?,
+                ));
+                output_paths.push((
+                    "default proof status transaction lock",
+                    comparable_output_path(&status_lock_path)?,
+                ));
+            }
+            if format == ProofFormat::Alethe {
+                let mut chc_path = PathBuf::from(path);
+                chc_path.set_extension("chccert");
+                output_paths.push((
+                    "default CHC certificate",
+                    comparable_output_path(&chc_path)?,
+                ));
+            }
+        }
+    }
+
+    for (output_label, output) in &output_paths {
+        for (read_label, read) in &read_paths {
+            if certificate_paths_may_alias(output, read)? {
+                return Ok(Some(format!(
+                    "{output_label} path '{}' aliases the {read_label} path '{}'",
+                    output.display(),
+                    read.display()
+                )));
+            }
+        }
+    }
+    for left in 0..output_paths.len() {
+        for right in (left + 1)..output_paths.len() {
+            let (left_label, left_path) = &output_paths[left];
+            let (right_label, right_path) = &output_paths[right];
+            if certificate_paths_may_alias(left_path, right_path)? {
+                return Ok(Some(format!(
+                    "{left_label} path '{}' aliases the {right_label} path '{}'",
+                    left_path.display(),
+                    right_path.display()
+                )));
+            }
+        }
+    }
+
+    let mut output_directories = Vec::new();
+    for (label, directory) in [
+        (
+            "firewall Lean output directory",
+            args.emit_firewall_lean.as_deref(),
+        ),
+        ("k-induction dump directory", args.kind_dump_dir.as_deref()),
+    ] {
+        if let Some(directory) = directory {
+            output_directories.push((label, comparable_output_path(directory)?));
+        }
+    }
+    for (directory_label, directory) in &output_directories {
+        for (read_label, read) in &read_paths {
+            if certificate_path_is_within(read, directory)?
+                || certificate_path_is_within(directory, read)?
+            {
+                return Ok(Some(format!(
+                    "{directory_label} '{}' overlaps the {read_label} path '{}'",
+                    directory.display(),
+                    read.display()
+                )));
+            }
+        }
+        for (output_label, output) in &output_paths {
+            if certificate_path_is_within(output, directory)?
+                || certificate_path_is_within(directory, output)?
+            {
+                return Ok(Some(format!(
+                    "{output_label} path '{}' overlaps the {directory_label} '{}'",
+                    output.display(),
+                    directory.display()
+                )));
+            }
+        }
+    }
+    for left in 0..output_directories.len() {
+        for right in (left + 1)..output_directories.len() {
+            let (left_label, left_path) = &output_directories[left];
+            let (right_label, right_path) = &output_directories[right];
+            if certificate_path_is_within(left_path, right_path)?
+                || certificate_path_is_within(right_path, left_path)?
+            {
+                return Ok(Some(format!(
+                    "{left_label} '{}' overlaps the {right_label} '{}'",
+                    left_path.display(),
+                    right_path.display()
+                )));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn bv_cnf_dump_lock_path(dump: &FsPath) -> io::Result<PathBuf> {
@@ -3951,19 +4180,62 @@ fn bv_cnf_dump_lock_path(dump: &FsPath) -> io::Result<PathBuf> {
 
 fn bv_cnf_dump_collision(args: &SolveArgs, dump: &FsPath) -> io::Result<Option<String>> {
     let comparable_dump = comparable_output_path(dump)?;
-    let lock_path = bv_cnf_dump_lock_path(dump)?;
-    let comparable_lock = comparable_output_path(&lock_path)?;
-    if certificate_paths_may_alias(&comparable_dump, &comparable_lock)? {
-        return Ok(Some(format!(
-            "--dump-bv-cnf output '{}' aliases its coordination lock '{}'",
-            dump.display(),
-            lock_path.display()
-        )));
+    let cnf_lock = bv_cnf_dump_lock_path(&comparable_dump)?;
+    let comparable_cnf_lock = comparable_output_path(&cnf_lock)?;
+    let bv_drat = explicit_bv_drat_target(args).map(|(path, _)| PathBuf::from(path));
+
+    // Treat the CNF, its lock, the optional paired DRAT, and its lock as one
+    // certificate transaction. Every pair must be disjoint, including aliases
+    // through hard links, case folding, `..`, and symlinked parent directories.
+    let mut certificate_paths = vec![
+        ("CNF output", dump.to_path_buf(), comparable_dump),
+        (
+            "CNF coordination lock",
+            cnf_lock.clone(),
+            comparable_cnf_lock,
+        ),
+    ];
+    if let Some(drat) = bv_drat.as_deref() {
+        let comparable_drat = comparable_output_path(drat)?;
+        let drat_lock = bv_cnf_dump_lock_path(&comparable_drat)?;
+        let comparable_drat_lock = comparable_output_path(&drat_lock)?;
+        certificate_paths.push(("proof path", drat.to_path_buf(), comparable_drat));
+        certificate_paths.push(("DRAT coordination lock", drat_lock, comparable_drat_lock));
+    }
+
+    for left in 0..certificate_paths.len() {
+        for right in (left + 1)..certificate_paths.len() {
+            let (left_label, left_requested, left_comparable) = &certificate_paths[left];
+            let (right_label, right_requested, right_comparable) = &certificate_paths[right];
+            if certificate_paths_may_alias(left_comparable, right_comparable)? {
+                let message = if left == 0 && right_label == &"proof path" {
+                    format!(
+                        "--dump-bv-cnf output '{}' aliases the proof path '{}'",
+                        left_requested.display(),
+                        right_requested.display()
+                    )
+                } else if left == 0 && right == 1 {
+                    format!(
+                        "--dump-bv-cnf output '{}' aliases its coordination lock '{}'",
+                        left_requested.display(),
+                        right_requested.display()
+                    )
+                } else {
+                    format!(
+                        "BV certificate {left_label} '{}' aliases the {right_label} '{}'",
+                        left_requested.display(),
+                        right_requested.display()
+                    )
+                };
+                return Ok(Some(message));
+            }
+        }
     }
 
     // Every explicit file or directory path in SolveArgs participates in this
     // boundary.  Read-side aliases can be truncated by the export transaction;
     // write-side aliases can replace a finalized certificate after the check.
+    let selected_bv_drat = bv_drat.is_some();
     let explicit_paths: [(&str, Option<&FsPath>); 20] = [
         ("input", args.file.as_deref()),
         (
@@ -3971,7 +4243,12 @@ fn bv_cnf_dump_collision(args: &SolveArgs, dump: &FsPath) -> io::Result<Option<S
             args.emit_firewall_lean.as_deref(),
         ),
         ("progress JSON", args.progress_json.as_deref()),
-        ("proof", args.proof.as_deref()),
+        (
+            "proof",
+            (!selected_bv_drat)
+                .then_some(args.proof.as_deref())
+                .flatten(),
+        ),
         ("proof artifact", args.proof_artifact.as_deref()),
         ("Lean binary", args.lean_path.as_deref()),
         ("replay input", args.replay.as_deref()),
@@ -3980,8 +4257,18 @@ fn bv_cnf_dump_collision(args: &SolveArgs, dump: &FsPath) -> io::Result<Option<S
         ("solution witness", args.solution_file.as_deref()),
         ("trace output", args.trace_file.as_deref()),
         ("encoding dump", args.dump_encoding.as_deref()),
-        ("DRAT proof", args.drat.as_deref()),
-        ("binary DRAT proof", args.drat_binary.as_deref()),
+        (
+            "DRAT proof",
+            (!selected_bv_drat)
+                .then_some(args.drat.as_deref())
+                .flatten(),
+        ),
+        (
+            "binary DRAT proof",
+            (!selected_bv_drat)
+                .then_some(args.drat_binary.as_deref())
+                .flatten(),
+        ),
         ("LRAT proof", args.lrat.as_deref()),
         ("binary LRAT proof", args.lrat_binary.as_deref()),
         ("decision log", args.decision_log.as_deref()),
@@ -3995,17 +4282,20 @@ fn bv_cnf_dump_collision(args: &SolveArgs, dump: &FsPath) -> io::Result<Option<S
     for (label, candidate) in explicit_paths {
         if let Some(candidate) = candidate {
             let candidate = comparable_output_path(candidate)?;
-            if certificate_paths_may_alias(&candidate, &comparable_dump)? {
-                return Ok(Some(format!(
-                    "--dump-bv-cnf output '{}' aliases the {label} path",
-                    dump.display()
-                )));
-            }
-            if certificate_paths_may_alias(&candidate, &comparable_lock)? {
-                return Ok(Some(format!(
-                    "--dump-bv-cnf coordination lock '{}' aliases the {label} path",
-                    lock_path.display()
-                )));
+            for (certificate_label, requested, comparable) in &certificate_paths {
+                if certificate_paths_may_alias(&candidate, comparable)? {
+                    let subject = match *certificate_label {
+                        "CNF output" => format!("--dump-bv-cnf output '{}'", dump.display()),
+                        "CNF coordination lock" => {
+                            format!("--dump-bv-cnf coordination lock '{}'", requested.display())
+                        }
+                        "proof path" => {
+                            format!("BV DRAT proof path '{}'", requested.display())
+                        }
+                        _ => format!("BV DRAT coordination lock '{}'", requested.display()),
+                    };
+                    return Ok(Some(format!("{subject} aliases the {label} path")));
+                }
             }
         }
     }
@@ -4019,12 +4309,12 @@ fn bv_cnf_dump_collision(args: &SolveArgs, dump: &FsPath) -> io::Result<Option<S
     ] {
         if let Some(directory) = directory {
             let directory = comparable_output_path(directory)?;
-            if certificate_path_is_within(&comparable_dump, &directory)?
-                || certificate_path_is_within(&comparable_lock, &directory)?
-            {
-                return Ok(Some(format!(
-                    "--dump-bv-cnf output or coordination lock is inside the {label}"
-                )));
+            for (_, _, comparable) in &certificate_paths {
+                if certificate_path_is_within(comparable, &directory)? {
+                    return Ok(Some(format!(
+                        "a BV certificate output or coordination lock is inside the {label}"
+                    )));
+                }
             }
         }
     }
@@ -4039,17 +4329,18 @@ fn bv_cnf_dump_collision(args: &SolveArgs, dump: &FsPath) -> io::Result<Option<S
     {
         if let Some((default_path, _)) = default_proof_path(args.file.as_deref()) {
             let default_path = comparable_output_path(FsPath::new(&default_path))?;
-            if certificate_paths_may_alias(&default_path, &comparable_dump)? {
-                return Ok(Some(format!(
-                    "--dump-bv-cnf output '{}' aliases the default proof path",
-                    dump.display()
-                )));
-            }
-            if certificate_paths_may_alias(&default_path, &comparable_lock)? {
-                return Ok(Some(format!(
-                    "--dump-bv-cnf coordination lock '{}' aliases the default proof path",
-                    lock_path.display()
-                )));
+            for (certificate_label, requested, comparable) in &certificate_paths {
+                if certificate_paths_may_alias(&default_path, comparable)? {
+                    let subject = if *certificate_label == "CNF output" {
+                        format!("--dump-bv-cnf output '{}'", dump.display())
+                    } else {
+                        format!(
+                            "BV certificate {certificate_label} '{}'",
+                            requested.display()
+                        )
+                    };
+                    return Ok(Some(format!("{subject} aliases the default proof path")));
+                }
             }
         }
     }
@@ -4095,6 +4386,10 @@ fn trace_config_from_solve_args(
             .map(ToOwned::to_owned),
         bv_drat_path: bv_drat.as_ref().map(|(path, _)| path.clone()),
         bv_drat_binary: bv_drat.as_ref().map(|(_, binary)| *binary).unwrap_or(false),
+        // Populated separately in `run_solve` for `--self-check` (not here — it
+        // requires the parsed `SolveArgs.self_check` plus a private temp dir).
+        bv_drat_self_cert_cnf_path: None,
+        bv_drat_self_cert_drat_path: None,
         kind_dump_dir: args
             .kind_dump_dir
             .as_ref()
@@ -4104,6 +4399,65 @@ fn trace_config_from_solve_args(
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
     }
+}
+
+struct PreflightedDecisionTraceFile {
+    file: Option<std::fs::File>,
+    content: String,
+}
+
+fn validate_decision_trace_content(path: &str, content: &str) -> Result<(), String> {
+    if dimacs::has_cnf_extension(path) || dimacs::is_dimacs_format(content) {
+        ay_sat::parse_dimacs(content).map_err(|error| {
+            format!("--decision-trace requires fully parseable DIMACS input: {error}")
+        })?;
+        return Err(
+            "--decision-trace is currently unsupported for DIMACS input; use a single-query SMT-LIB FILE"
+                .to_string(),
+        );
+    }
+    if is_horn_logic(content) || is_fixedpoint_format(content) {
+        return Err(
+            "--decision-trace is incompatible with CHC/fixedpoint input; decision traces support one SMT-LIB decision query"
+                .to_string(),
+        );
+    }
+    let commands = ay_frontend::parse(content).map_err(|error| {
+        format!("--decision-trace requires a fully parseable single-query SMT-LIB input: {error}")
+    })?;
+    let query_count = commands
+        .iter()
+        .filter(|command| {
+            matches!(
+                command,
+                ay_frontend::Command::CheckSat | ay_frontend::Command::CheckSatAssuming(_)
+            )
+        })
+        .count();
+    if query_count != 1 {
+        return Err(format!(
+            "--decision-trace requires exactly one check-sat/check-sat-assuming query; input contains {query_count}"
+        ));
+    }
+    Ok(())
+}
+
+fn preflight_decision_trace_file(path: &str) -> Result<PreflightedDecisionTraceFile, String> {
+    use std::io::Read as _;
+
+    // Open once and retain this descriptor through solving. The pathname may
+    // be replaced after preflight, but the verdict and trace must describe the
+    // exact bytes whose single-query shape was validated here.
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("cannot open decision-trace input '{path}': {error}"))?;
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|error| format!("cannot read decision-trace input '{path}': {error}"))?;
+    validate_decision_trace_content(path, &content)?;
+    Ok(PreflightedDecisionTraceFile {
+        file: Some(file),
+        content,
+    })
 }
 
 /// Execute the solve subcommand by bridging SolveArgs to existing execution logic.
@@ -4135,6 +4489,17 @@ fn run_solve(args: &SolveArgs) {
         .dump_bv_cnf
         .clone()
         .or_else(|| ay_core::bv_cnf_dump_path_from_env().map(PathBuf::from));
+    match solve_artifact_path_collision(args, dump_bv_cnf_path.as_deref()) {
+        Ok(Some(message)) => {
+            safe_eprintln!("Error: {message}");
+            std::process::exit(1);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            safe_eprintln!("Error: cannot validate solve input/output paths: {error}");
+            std::process::exit(1);
+        }
+    }
     if let Some(path) = dump_bv_cnf_path.as_deref() {
         if path.to_str().is_none() {
             safe_eprintln!("Error: --dump-bv-cnf requires a UTF-8 output path");
@@ -4156,15 +4521,43 @@ fn run_solve(args: &SolveArgs) {
         }
     }
 
+    // `--self-check` BV DRAT self-certification (batteries-included, no env
+    // vars): when the user asked AY to check its own answers but did NOT request
+    // an explicit `--dump-bv-cnf`, point two private temp files at the eager
+    // bit-blast CNF and its single-invocation DRAT. The emission machinery only
+    // ever reaches these paths through the thread-local self-cert arm (armed
+    // solely around an eligible top-level pure-QF_BV check-sat), so populating
+    // them here does NOT turn on any user-facing `--dump-bv-cnf` handling. The
+    // files are cleaned up before `run_solve` returns.
+    let mut trace_config = trace_config_from_solve_args(args, dump_bv_cnf_path.as_deref());
+    let self_cert_bv_paths: Option<(PathBuf, PathBuf)> =
+        if args.self_check && dump_bv_cnf_path.is_none() {
+            let dir = env::temp_dir();
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let cnf = dir.join(format!("ay-selfcert-{pid}-{nanos}.cnf"));
+            let drat = dir.join(format!("ay-selfcert-{pid}-{nanos}.drat"));
+            match (cnf.to_str(), drat.to_str()) {
+                (Some(cnf_str), Some(drat_str)) => {
+                    trace_config.bv_drat_self_cert_cnf_path = Some(cnf_str.to_owned());
+                    trace_config.bv_drat_self_cert_drat_path = Some(drat_str.to_owned());
+                    Some((cnf, drat))
+                }
+                // Non-UTF-8 temp dir: skip self-cert emission (fail-closed —
+                // BV unsat simply stays `unknown` under --self-check).
+                _ => None,
+            }
+        } else {
+            None
+        };
+
     // Install the path configuration before any solve-mode early exit.  A
     // requested certificate is invalidated immediately, so argument/setup
     // failures cannot leave a previous process or previous query authoritative.
-    if ay_core::set_global_trace_config(trace_config_from_solve_args(
-        args,
-        dump_bv_cnf_path.as_deref(),
-    ))
-    .is_err()
-    {
+    if ay_core::set_global_trace_config(trace_config).is_err() {
         if let Some(path) = dump_bv_cnf_path.as_deref() {
             let _ = std::fs::remove_file(path);
         }
@@ -4409,12 +4802,12 @@ fn run_solve(args: &SolveArgs) {
         SELF_CHECK_ENABLED.store(true, Ordering::SeqCst);
     }
 
-    // Verified-firewall Lean emission directory.
+    // Diagnostic firewall Lean emission directory.
     if let Some(dir) = &args.emit_firewall_lean {
         let _ = FIREWALL_LEAN_DIR.set(dir.clone());
     }
 
-    // Verified-firewall self-cert gate.
+    // Fail-closed firewall diagnostic gate.
     if args.verify_firewall {
         VERIFY_FIREWALL_ENABLED.store(true, Ordering::SeqCst);
     }
@@ -4464,7 +4857,16 @@ fn run_solve(args: &SolveArgs) {
         if mb == 0 {
             0
         } else {
-            (mb as usize) * 1024 * 1024
+            let Some(bytes) = usize::try_from(mb)
+                .ok()
+                .and_then(|value| value.checked_mul(1024 * 1024))
+            else {
+                safe_eprintln!(
+                    "Error: --memory {mb} MiB exceeds this platform's addressable limit"
+                );
+                std::process::exit(1);
+            };
+            bytes
         }
     } else {
         // Auto-detect for the standalone binary: 85% of physical RAM
@@ -4492,6 +4894,7 @@ fn run_solve(args: &SolveArgs) {
     // CLI overrides here. Precedence: explicit `--verify-proof` forces on;
     // otherwise `--no-verify-proof` or competition/benchmark mode turns it off
     // for speed; otherwise the default (on) stands.
+    EXPLICIT_VERIFY_PROOF_ENABLED.store(args.verify_proof, Ordering::SeqCst);
     if args.verify_proof {
         VERIFY_PROOF_ENABLED.store(true, Ordering::SeqCst);
     } else if args.no_verify_proof || competition_mode(args) {
@@ -4508,8 +4911,16 @@ fn run_solve(args: &SolveArgs) {
         }
     }
 
-    // Build proof config from flags
+    // Build proof config from flags. An explicit firewall-artifact request is
+    // mandatory: it must never disappear merely because default proof output
+    // was suppressed or no persistent proof path could be synthesized.
     let proof_config = build_proof_config(args);
+    if let Some(error) =
+        firewall_emission_config_error(args.emit_firewall_lean.is_some(), proof_config.as_ref())
+    {
+        safe_eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
     let visualization = args.visualize.map(Into::into);
 
     // Determine CHC mode
@@ -4536,7 +4947,7 @@ fn run_solve(args: &SolveArgs) {
     // Stdin mode
     let mut stdin_mode = args.stdin || args.incremental;
     let mut file_str = args.file.as_ref().map(|p| p.to_string_lossy().to_string());
-    let mut z3_model_temp: Option<TempInputFile> = None;
+    let mut z3_model_input: Option<MaterializedInput> = None;
     if args.z3_model && !args.incremental {
         if stdin_mode {
             use std::io::{IsTerminal, Read};
@@ -4548,28 +4959,18 @@ fn run_solve(args: &SolveArgs) {
                     safe_eprintln!("Error: failed to read stdin for -model: {error}");
                     std::process::exit(1);
                 }
-                match materialize_z3_model_input(&content) {
-                    Ok(temp) => {
-                        file_str = Some(temp.path_string());
-                        z3_model_temp = Some(temp);
-                        stdin_mode = false;
-                    }
-                    Err(error) => {
-                        safe_eprintln!("Error: failed to prepare -model input: {error}");
-                        std::process::exit(1);
-                    }
-                }
+                let materialized = materialize_z3_model_input(&content);
+                file_str = Some(materialized.path_string());
+                z3_model_input = Some(materialized);
+                stdin_mode = false;
             }
         } else if let Some(path) = file_str.clone() {
-            if let Some(temp) = materialize_z3_model_file_input(&path) {
-                file_str = Some(temp.path_string());
-                z3_model_temp = Some(temp);
+            if let Some(materialized) = materialize_z3_model_file_input(&path) {
+                file_str = Some(materialized.path_string());
+                z3_model_input = Some(materialized);
             }
         }
     }
-
-    // Keep materialized -model stdin/file temporaries alive while the selected mode runs.
-    let _z3_model_temp_guard = z3_model_temp.as_ref();
 
     // Runtime result validation is ON BY DEFAULT (batteries included).
     // Precedence: `--no-validate` off; else explicit (deprecated) `--validate`
@@ -4586,13 +4987,75 @@ fn run_solve(args: &SolveArgs) {
     // consulted for FILE input (`determine_execution_mode` returns Interactive
     // for stdin / no-file first). Fail loudly instead of silently solving
     // stdin content as plain SMT with the force flag dropped. Checked after
-    // the `-model` materialization above, which can turn piped stdin into a
-    // temporary input file.
+    // the `-model` materialization above, which can turn piped stdin into an
+    // immutable in-memory file snapshot.
     if (args.chc || args.portfolio) && (stdin_mode || file_str.is_none()) {
         safe_eprintln!(
             "Error: --chc/--portfolio require an input FILE (not stdin/interactive mode)"
         );
         std::process::exit(1);
+    }
+    if args.decision_trace.is_some() && (stdin_mode || file_str.is_none()) {
+        safe_eprintln!(
+            "Error: --decision-trace requires an input FILE so complete single-query preflight can finish before any verdict; stdin/interactive/incremental streams are unsupported"
+        );
+        std::process::exit(1);
+    }
+    if args.decision_trace.is_some() && (args.parallel.is_some() || args.cube_and_conquer.is_some())
+    {
+        safe_eprintln!(
+            "Error: --decision-trace is incompatible with --parallel/--cube-and-conquer; those DIMACS routes do not produce the single-solver decision trace"
+        );
+        std::process::exit(1);
+    }
+    if args.decision_trace.is_some() && (args.chc || args.portfolio) {
+        safe_eprintln!(
+            "Error: --decision-trace is incompatible with forced CHC/portfolio solving; decision traces support one SMT-LIB decision query"
+        );
+        std::process::exit(1);
+    }
+    if args.chc || args.portfolio {
+        run::reject_firewall_emission_for_route("forced CHC/portfolio");
+        run::reject_firewall_verification_for_route("forced CHC/portfolio");
+        run::reject_explicit_proof_verification_for_route("forced CHC/portfolio", "CHC replay");
+    }
+
+    let mut preflighted_decision_input = None;
+    if args.decision_trace.is_some() {
+        if let Some(path) = file_str.as_deref() {
+            if let Some(materialized) = z3_model_input.as_ref() {
+                if let Err(error) = validate_decision_trace_content(path, &materialized.content) {
+                    safe_eprintln!("Error: {error}");
+                    std::process::exit(1);
+                }
+            } else {
+                match preflight_decision_trace_file(path) {
+                    Ok(preflighted) => preflighted_decision_input = Some(preflighted),
+                    Err(error) => {
+                        safe_eprintln!("Error: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    }
+
+    // Reserve the single-result decision trace only after every argument-only
+    // early exit has completed. Feature/parameter reports and rejected forced
+    // CHC routes must not leave an initialized, header-only file that could be
+    // mistaken for a replay artifact.
+    if let Some(path) = args.decision_trace.as_deref() {
+        let Some(path_text) = path.to_str() else {
+            safe_eprintln!("Error: --decision-trace requires a UTF-8 output path");
+            std::process::exit(1);
+        };
+        if let Err(error) = ay_sat::reserve_decision_trace(path_text) {
+            safe_eprintln!(
+                "Error: cannot reserve --decision-trace output '{}': {error}",
+                path.display()
+            );
+            std::process::exit(1);
+        }
     }
 
     // Route to existing execution logic
@@ -4624,6 +5087,10 @@ fn run_solve(args: &SolveArgs) {
             if let Some(ref f) = file_str {
                 run::run_file(
                     f,
+                    preflighted_decision_input
+                        .as_ref()
+                        .map(|input| (input.content.as_str(), input.file.as_ref()))
+                        .or_else(|| z3_model_input.as_ref().map(MaterializedInput::preloaded)),
                     stats_cfg,
                     proof_config.as_ref(),
                     args.parallel,
@@ -4634,6 +5101,14 @@ fn run_solve(args: &SolveArgs) {
                 );
             }
         }
+    }
+
+    // Clean up the private `--self-check` BV DRAT self-cert temp artifacts.
+    // Best-effort: on a hard timeout/exit path a small temp file may linger,
+    // which the OS temp reaper collects; it never affects a verdict.
+    if let Some((cnf, drat)) = self_cert_bv_paths {
+        let _ = std::fs::remove_file(&cnf);
+        let _ = std::fs::remove_file(&drat);
     }
 
     // Final timeout check
@@ -4655,7 +5130,7 @@ fn competition_env_active() -> bool {
     ];
     SIGNALS
         .iter()
-        .any(|name| env::var(name).ok().is_some_and(|v| !v.trim().is_empty()))
+        .any(|name| env::var(name).is_ok_and(|v| !v.trim().is_empty()))
 }
 
 /// Competition / benchmark mode: batteries OFF for raw speed. True when
@@ -4829,6 +5304,34 @@ fn build_proof_config(args: &SolveArgs) -> Option<ProofConfig> {
         ));
     }
 
+    None
+}
+
+fn firewall_emission_config_error(
+    requested: bool,
+    proof_config: Option<&ProofConfig>,
+) -> Option<String> {
+    if !requested {
+        return None;
+    }
+    let Some(proof) = proof_config else {
+        return Some(
+            "--emit-firewall-lean requires a persistent Alethe proof; pass --proof FILE.alethe or solve an SMT-LIB file with default proof emission enabled"
+                .to_string(),
+        );
+    };
+    if proof.is_temp {
+        return Some(
+            "--emit-firewall-lean cannot use a temporary checker proof; pass --proof FILE.alethe"
+                .to_string(),
+        );
+    }
+    if proof.format != ProofFormat::Alethe {
+        return Some(format!(
+            "--emit-firewall-lean requires an Alethe proof, but the selected proof format is {:?}",
+            proof.format
+        ));
+    }
     None
 }
 

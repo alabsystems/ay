@@ -4,6 +4,18 @@
 
 use super::*;
 
+/// #group-l-shortpoly: cached `AY_LRA_SHORTEST_POLY` gate — DEFAULT-ON (opt out =0).
+/// See `pivot_error_key`. Cheap OnceLock atomic-load in the pivot-selection hot path.
+/// Adopted from OpenSMT (2025 Inc QF_LRA winner): the shortest-polynomial leaving-
+/// variable rule beats AY's prior Z3/Dantzig most-violated rule on the scored
+/// hybrid_networks corpus — measured +9% (@60s, 342->373; all on .bmc's wide
+/// unrolling rows), 0-wrong vs z3 (216 check-sats) + 3 soundness tests. Sound by
+/// construction: leaving-variable choice never changes the Farkas conflict.
+fn shortest_poly_pivot_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("AY_LRA_SHORTEST_POLY").map_or(true, |v| v != "0"))
+}
+
 impl LraSolver {
     /// Check if a variable's current value violates its bounds.
     ///
@@ -67,6 +79,34 @@ impl LraSolver {
         0.0
     }
 
+    /// #group-l-shortpoly (`AY_LRA_SHORTEST_POLY`): the pivot leaving-variable
+    /// selection key. Default (OFF) = Z3/Dantzig most-violated rule (violation
+    /// magnitude, cuts iteration COUNT). ON = OpenSMT's shortest-polynomial rule:
+    /// among infeasible basic vars prefer the one whose tableau ROW has the fewest
+    /// terms, because pivoting on a short row substitutes into fewer/smaller rows,
+    /// so each pivot is O(small). OpenSMT (the 2025 Inc QF_LRA winner) uses this as
+    /// its default (getBasicVarToFixByShortestPoly). SOUND: leaving-variable choice
+    /// never changes the Farkas conflict, only the pivot path — verdicts are
+    /// identical, only speed differs. Max-heap semantics → negate the width so the
+    /// SHORTEST row is popped first.
+    #[inline]
+    fn pivot_error_key(&self, var: u32) -> f64 {
+        if self.bland_mode {
+            // Anti-cycling: smallest var index first (negated for the max-heap).
+            return -f64::from(var);
+        }
+        if shortest_poly_pivot_enabled() {
+            if let Some(VarStatus::Basic(row_idx)) = self.vars[var as usize].status {
+                if let Some(row) = self.rows.get(row_idx) {
+                    // fewest-terms-first; tiebreak toward smaller var index for determinism
+                    return -(row.coeffs.len() as f64) - f64::from(var) * 1e-9;
+                }
+            }
+            return -f64::from(var);
+        }
+        self.compute_violation_error(var)
+    }
+
     /// Update the infeasible_heap membership for a variable (#4919).
     /// If the variable is basic and violates its bounds, ensure it's in the heap
     /// with its current violation magnitude as the key.
@@ -107,13 +147,7 @@ impl LraSolver {
         }
         if violation.is_some() && self.in_infeasible_heap[vi] != self.heap_epoch {
             self.in_infeasible_heap[vi] = self.heap_epoch;
-            let error = if self.bland_mode {
-                // In bland mode, use negative var index so smallest-index wins
-                // (BinaryHeap is max-heap, so -var gives smallest-first ordering)
-                -f64::from(var)
-            } else {
-                self.compute_violation_error(var)
-            };
+            let error = self.pivot_error_key(var);
             self.infeasible_heap.push(ErrorKey(error, var));
         } else if violation.is_none() && self.in_infeasible_heap[vi] == self.heap_epoch {
             self.in_infeasible_heap[vi] = 0;
@@ -136,11 +170,7 @@ impl LraSolver {
             let var = row.basic_var;
             if self.violates_bounds(var).is_some() {
                 self.in_infeasible_heap[var as usize] = self.heap_epoch;
-                let error = if self.bland_mode {
-                    -f64::from(var)
-                } else {
-                    self.compute_violation_error(var)
-                };
+                let error = self.pivot_error_key(var);
                 self.infeasible_heap.push(ErrorKey(error, var));
             }
         }

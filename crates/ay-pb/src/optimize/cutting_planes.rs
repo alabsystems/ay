@@ -245,7 +245,7 @@ impl ConflictGraph {
         for (i, c) in constraints.iter().enumerate() {
             // Poll the deadline every so often: the per-constraint pairwise scan is
             // cheap but the total over many constraints is not.
-            if i % 256 == 0 && should_stop() {
+            if i.is_multiple_of(256) && should_stop() {
                 break;
             }
             collect_binary_conflicts(c, num_vars, &mut edges);
@@ -1360,7 +1360,7 @@ mod tests {
             rel: PbRel::Eq,
             rhs: 1,
         };
-        let constraints = vec![c];
+        let constraints = [c];
         let x = frac(&[(1, 3), (1, 3), (1, 3), (1, 3)]); // sum 4/3 > 1: violated
         let cuts = separate_cuts(&constraints, 4, &x, &|| false);
         assert!(!cuts.is_empty(), "expected a clique cut from exactly-one");
@@ -1380,7 +1380,7 @@ mod tests {
             vec![term(-5, lit(1)), term(-5, lit(2)), term(-1, lit(3))],
             -6,
         );
-        let constraints = vec![c];
+        let constraints = [c];
         let x = frac(&[(3, 5), (3, 5), (1, 5)]); // x1+x2 = 6/5 > 1: violated pair
         let cuts = separate_cuts(&constraints, 3, &x, &|| false);
         for cut in &cuts {
@@ -1401,7 +1401,7 @@ mod tests {
             vec![term(-3, lit(1)), term(-3, lit(2)), term(-3, lit(3))],
             -4,
         );
-        let constraints = vec![c];
+        let constraints = [c];
         // x1=x2=0.7, x3=0 violates x1+x2 <= 1 (sum 1.4 > 1).
         let x = frac(&[(7, 10), (7, 10), (0, 1)]);
         let cuts = separate_cuts(&constraints, 3, &x, &|| false);
@@ -1489,7 +1489,7 @@ mod tests {
             vec![term(-2, lit(1)), term(-2, lit(2)), term(-2, lit(3))],
             -3,
         );
-        let constraints = vec![c];
+        let constraints = [c];
         let x = frac(&[(1, 1), (0, 1), (0, 1)]); // integral, feasible
         let knap = knapsack_views(&constraints[0], 3)
             .into_iter()
@@ -1611,7 +1611,7 @@ mod tests {
                     terms.push(term(1, lit(1)));
                 }
                 let rhs = rng.range(-4, 5);
-                let rel = if rng.next() % 4 == 0 {
+                let rel = if rng.next().is_multiple_of(4) {
                     PbRel::Eq
                 } else {
                     PbRel::Ge
@@ -1738,7 +1738,7 @@ mod tests {
             ],
             -6,
         );
-        let constraints = vec![c];
+        let constraints = [c];
         // x1=x2=0.7 (cover {x1,x2} violated: 1.4 > 1), x3=x4=0.1. Both the unlifted
         // and the lifted cut select the SAME cover {x1,x2} and are both violated, so
         // we can compare them directly. (At x=all-1/2 the unlifted cover is NOT
@@ -1775,7 +1775,7 @@ mod tests {
             assert_eq!(uc, lc, "cover var {v} coeff unchanged by lifting");
         }
         // Every lifted coefficient is >= 0, and the lifted cut has >= as many terms.
-        for (_, &lc) in &lif_coeffs {
+        for &lc in lif_coeffs.values() {
             assert!(lc >= 0, "lifting coefficient must be non-negative");
         }
         assert!(
@@ -1813,7 +1813,7 @@ mod tests {
             vec![term(-4, lit(1)), term(-4, lit(2)), term(-4, lit(3))],
             -6,
         );
-        let constraints = vec![c];
+        let constraints = [c];
         let x = frac(&[(1, 1), (0, 1), (0, 1)]); // x1=1 feasible, integral.
         let knap = knapsack_views(&constraints[0], 3)
             .into_iter()

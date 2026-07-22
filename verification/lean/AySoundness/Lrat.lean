@@ -102,8 +102,7 @@ theorem litSat_neg {M : Nat → Bool} {l : Int} (hl : l ≠ 0) :
   by_cases h : l > 0
   · have h3 : (- -l) = l := by omega
     simp [h, h3] <;> omega
-  · have h2 : (-l) > 0 := by omega
-    simp [h, h2] <;> omega
+  · simp [h] <;> omega
 
 theorem mem_of_contains {a : Assign} {x : Int} (h : a.contains x = true) : x ∈ a := by
   simpa using h

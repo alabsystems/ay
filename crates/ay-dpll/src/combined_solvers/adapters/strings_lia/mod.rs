@@ -658,6 +658,14 @@ impl TheorySolver for StringsLiaSolver<'_> {
         // a genuine conflict is still caught there — completeness of THIS
         // lane's early conflict detection is the only thing given up.
         let str_result = defer_non_local_result(self.strings.check_during_propagate());
+        // NF-engine closure 5 precondition (now UNCONDITIONAL on main, and
+        // strictly stronger than the closure-5 form: it also covers
+        // `UnsatWithFarkas`): an NF-dependent string conflict found during BCP
+        // must NOT become a learned SAT clause, because `check()` (lines
+        // 267-283) would refuse to trust it — otherwise a propositional UNSAT
+        // could rest on a conflict the solver itself distrusts. Degrading to
+        // `Sat` here loses nothing: `needs_final_check_after_sat` forces a
+        // full, gated `check()` before any SAT is accepted.
         match &str_result {
             TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
                 if !(self.strings.is_ground_conflict()
@@ -680,6 +688,12 @@ impl TheorySolver for StringsLiaSolver<'_> {
         props.extend(self.euf.propagate());
         props.extend(self.lia.propagate());
         props
+    }
+
+    /// Forward the string theory's batched lemma queue (NF-engine closure 3).
+    /// Only the string sub-solver produces string lemmas.
+    fn take_pending_string_lemmas(&mut self) -> Vec<ay_core::StringLemma> {
+        self.strings.take_pending_string_lemmas()
     }
 
     fn has_pending_propagations(&self) -> bool {

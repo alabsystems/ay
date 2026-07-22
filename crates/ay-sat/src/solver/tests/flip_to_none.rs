@@ -195,10 +195,10 @@ fn test_flip_to_none_already_unassigned() {
         SatResult::Sat(_) => {
             // Vars 1, 2, 3 may or may not be assigned depending on solver state.
             // If a var is unassigned, flip_to_none should return true.
-            for i in 1..4 {
-                if !solver.var_is_assigned(vars[i].index()) {
+            for (i, &var) in vars.iter().enumerate().skip(1) {
+                if !solver.var_is_assigned(var.index()) {
                     assert!(
-                        solver.flip_to_none(vars[i]),
+                        solver.flip_to_none(var),
                         "unassigned var {i} should flip to none"
                     );
                 }

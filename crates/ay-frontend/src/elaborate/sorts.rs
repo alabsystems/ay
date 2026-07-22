@@ -23,6 +23,25 @@ pub(super) const MAX_FP_EXPONENT_BITS: u32 = 31;
 pub(super) const MAX_FP_SIGNIFICAND_BITS: u32 = MAX_BITVECTOR_WIDTH;
 
 impl Context {
+    /// Run one lazy sort-synonym expansion while keeping the recursion guard
+    /// balanced even if an internal bug panics during recursive elaboration.
+    /// This mirrors the unwind-safe restoration used for native global-
+    /// declaration tracking: a caught panic must not poison later work on the
+    /// same context with a false "recursive sort synonym" diagnosis.
+    pub(super) fn with_sort_synonym_expansion<T>(
+        &mut self,
+        name: String,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        self.expanding_sort_synonyms.push(name);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(self)));
+        self.expanding_sort_synonyms.pop();
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     pub(super) fn expect_bv_operand_width(&self, operation: &str, operand: TermId) -> Result<u32> {
         match self.terms.sort(operand) {
             Sort::BitVec(bv) => Ok(bv.width),
@@ -297,13 +316,15 @@ impl Context {
                             "BitVec sort requires exactly 1 width index".to_string(),
                         ));
                     }
-                    let width: u32 =
-                        indices
-                            .first()
-                            .and_then(|s| s.parse().ok())
-                            .ok_or_else(|| {
-                                ElaborateError::InvalidConstant("BitVec width".to_string())
-                            })?;
+                    let width: u32 = indices
+                        .first()
+                        .and_then(command::Index::as_numeral)
+                        .and_then(|width| width.parse().ok())
+                        .ok_or_else(|| {
+                            ElaborateError::InvalidConstant(
+                                "BitVec width must be a numeral token".to_string(),
+                            )
+                        })?;
                     Self::checked_bitvector_sort(width)
                 }
                 "FloatingPoint" => {
@@ -312,20 +333,25 @@ impl Context {
                             "FloatingPoint sort requires exactly 2 indices (eb sb)".to_string(),
                         ));
                     }
-                    let eb: u32 =
-                        indices
-                            .first()
-                            .and_then(|s| s.parse().ok())
-                            .ok_or_else(|| {
-                                ElaborateError::InvalidConstant(
-                                    "FloatingPoint exponent bits".to_string(),
-                                )
-                            })?;
-                    let sb: u32 = indices.get(1).and_then(|s| s.parse().ok()).ok_or_else(|| {
-                        ElaborateError::InvalidConstant(
-                            "FloatingPoint significand bits".to_string(),
-                        )
-                    })?;
+                    let eb: u32 = indices
+                        .first()
+                        .and_then(command::Index::as_numeral)
+                        .and_then(|width| width.parse().ok())
+                        .ok_or_else(|| {
+                            ElaborateError::InvalidConstant(
+                                "FloatingPoint exponent bits must be a numeral token".to_string(),
+                            )
+                        })?;
+                    let sb: u32 = indices
+                        .get(1)
+                        .and_then(command::Index::as_numeral)
+                        .and_then(|width| width.parse().ok())
+                        .ok_or_else(|| {
+                            ElaborateError::InvalidConstant(
+                                "FloatingPoint significand bits must be a numeral token"
+                                    .to_string(),
+                            )
+                        })?;
                     Self::checked_floating_point_sort(eb, sb)
                 }
                 other => Err(ElaborateError::Unsupported(format!(
@@ -413,7 +439,15 @@ impl Context {
                     }
                     // Clone the template to release the immutable borrow before the
                     // `&mut self` elaboration calls below.
-                    let (param_names, body) = self.parametric_sort_defs.get(other).unwrap().clone();
+                    let (param_names, body) = self
+                        .parametric_sort_defs
+                        .get(other)
+                        .cloned()
+                        .ok_or_else(|| {
+                            ElaborateError::InvalidConstant(format!(
+                                "sort synonym disappeared during expansion: {other}"
+                            ))
+                        })?;
                     if params.len() != param_names.len() {
                         return Err(ElaborateError::InvalidConstant(format!(
                             "sort synonym {other} expects {} argument(s), got {}",
@@ -432,10 +466,9 @@ impl Context {
                     for (name, arg) in param_names.into_iter().zip(args) {
                         inner.insert(name, arg);
                     }
-                    self.expanding_sort_synonyms.push(other.to_string());
-                    let result = self.elaborate_sort_inner(&body, &inner);
-                    self.expanding_sort_synonyms.pop();
-                    result
+                    self.with_sort_synonym_expansion(other.to_string(), |context| {
+                        context.elaborate_sort_inner(&body, &inner)
+                    })
                 }
                 // A user-declared parametric (polymorphic) datatype applied to
                 // ground arguments: lazily monomorphize the instance.

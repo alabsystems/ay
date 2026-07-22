@@ -256,6 +256,10 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                     let _ = solver.pop();
                     break 'split_loop Ok(SolveResult::Unknown);
                 }
+                // #array-deadline-forward: forward the executor's live
+                // per-solve deadline so inprocessing/L0-GC phases honor the
+                // caller's wall budget (see the assume arm).
+                solver.set_solve_deadline($self.solve_deadline.get());
                 // Deterministic resource budgets (#8749 `:rlimit` +
                 // #ground-determinism defaults). Bound this refinement's SAT
                 // solve; with the split cap this guarantees

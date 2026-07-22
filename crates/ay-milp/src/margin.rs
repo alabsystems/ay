@@ -154,7 +154,7 @@ fn build_reframed(model: &Model, row: Row, sense: Sense) -> Model {
             .iter()
             .filter_map(|&(c, a)| {
                 let ex = model.row_coeff_exact(ridx, c, a);
-                (Some(&ex) != exact(a).as_ref()).then(|| (c, ex))
+                (Some(&ex) != exact(a).as_ref()).then_some((c, ex))
             })
             .collect()
     } else {

@@ -193,9 +193,9 @@ impl ArraySolver<'_> {
             .collect();
 
         for (select_term, array) in select_entries {
-            // #8615: Check interrupt periodically to avoid indefinite axiom
-            // generation on large formulas (no budget limit in this path).
-            if self.is_interrupted() {
+            // #8615: Check interrupt/deadline periodically to avoid indefinite
+            // axiom generation on large formulas (no budget limit in this path).
+            if self.interrupted_or_deadline() {
                 return;
             }
             let stores = match self.array_vars.get(&array) {
@@ -519,7 +519,16 @@ impl ArraySolver<'_> {
         let pairs = self.pending_row2_upward.take();
         let mut pending_requests = Vec::new();
 
-        for (select_on_base, store_term) in pairs {
+        for (pair_idx, (select_on_base, store_term)) in pairs.into_iter().enumerate() {
+            // #array-deadline-forward: amortized interrupt/deadline poll —
+            // same O(pairs x explain-BFS) shape as the ROW2-extended loop.
+            // FAIL-CLOSED: the remaining pairs are dropped for THIS round
+            // only (populate_final_check_row2_upward_queue rebuilds them each
+            // final_check); already-gathered requests stay sound, and the
+            // final_check boundary poll maps the stop to Unknown.
+            if pair_idx % 32 == 0 && self.interrupted_or_deadline() {
+                break;
+            }
             let Some(&(select_array, select_idx)) = self.select_cache.get(&select_on_base) else {
                 continue;
             };
@@ -671,7 +680,16 @@ impl ArraySolver<'_> {
             })
             .collect();
 
-        for &(sel1_term, sel2_term) in candidate_pairs.iter() {
+        for (pair_idx, &(sel1_term, sel2_term)) in candidate_pairs.iter().enumerate() {
+            // #array-deadline-forward: this O(pairs) loop calls the
+            // explain_* BFS per pair and was measured running 40+s past the
+            // caller's wall budget on QF_AX storecomm subset re-solves (the
+            // dominant final_check cost). Amortized poll: every 32 pairs.
+            // FAIL-CLOSED: stop and return the (sound) lemmas found so far;
+            // the next final_check boundary poll maps the stop to Unknown.
+            if pair_idx % 32 == 0 && self.interrupted_or_deadline() {
+                break;
+            }
             let Some(sel1) = select_terms.get(&sel1_term) else {
                 continue;
             };

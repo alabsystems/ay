@@ -32,8 +32,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import signal
-import subprocess
 import sys
 import tempfile
 import threading
@@ -41,32 +39,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _oom_guard import plan_solver_resources, rss_watchdog, warn_concurrent_build  # noqa: E402
+from _oom_guard import plan_solver_resources, run_captured, warn_concurrent_build  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 Z3 = REPO / "reference/chc-solvers/bin/z3.exe"
 CERT_CHECK = REPO / "scripts/chc_cert_check.py"
 BENCH = REPO / "benchmarks/chc/chc-comp25-benchmarks"
-
-
-def _popen_kwargs() -> dict:
-    """Start each solver child in its own process group / session so timeouts,
-    the early-exit kill sweep, and the rss_watchdog cover its whole tree."""
-    if os.name == "nt":
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-    return {"start_new_session": True}
-
-
-def _kill_tree(proc: subprocess.Popen) -> None:
-    """SIGKILL a child's whole process group; tolerate an already-dead child."""
-    if os.name == "nt":
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                       capture_output=True)
-        return
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
 
 
 def extract_cert(stdout: str) -> str | None:
@@ -87,6 +65,7 @@ def main() -> int:
     ap.add_argument("--attempts", type=int, default=8)
     ap.add_argument("--solve-timeout-ms", type=int, default=900000)
     ap.add_argument("--ay-bin", default=os.environ.get("AY_BIN", str(REPO / "target_lever/release/ay.exe")))
+    ap.add_argument("--out", default="", help="optional JSON audit evidence output")
     args = ap.parse_args()
 
     # OOM guard (scripts/_oom_guard.py): cap the reproduction pool so
@@ -96,6 +75,15 @@ def main() -> int:
     # honored memory knob) with an rss_watchdog.
     warn_concurrent_build()
     plan = plan_solver_resources(min(8, args.attempts), label="chc_disagreement_audit.py")
+    resource_plan = {
+        "requested_jobs": min(8, args.attempts),
+        "jobs": plan.jobs,
+        "memlimit_mb_per_child": plan.memlimit_mb,
+        "nbcore_per_child": plan.nbcore,
+        "headroom_mb": plan.headroom_mb,
+        "enforcement": "ay --memory; external process-group rss_watchdog; MEMLIMIT/NBCORE environment",
+    }
+    print(f"[audit] resource plan: {json.dumps(resource_plan, sort_keys=True)}")
 
     run_path = REPO / f"evals/results/chccomp-harness/{args.year}/{args.track}/{args.tag}/ay.jsonl"
     corrections_path = REPO / "the development design notes"
@@ -131,8 +119,6 @@ def main() -> int:
         if ay_says == "sat":
             cert = None
             stop = threading.Event()
-            procs = []
-            procs_lock = threading.Lock()
 
             def attempt(i):
                 if stop.is_set():
@@ -142,22 +128,29 @@ def main() -> int:
                 if plan.memlimit_mb:
                     argv += ["--memory", str(plan.memlimit_mb)]
                 argv.append(str(smt2))
-                proc = subprocess.Popen(
-                    argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, encoding="utf-8", errors="replace",
-                    **_popen_kwargs())
-                with procs_lock:
-                    procs.append(proc)
-                if stop.is_set():
-                    # A certificate arrived while we were spawning: kill now
-                    # rather than race the sweep and orphan a 15-minute solve.
-                    _kill_tree(proc)
                 try:
-                    out, err = proc.communicate(timeout=args.solve_timeout_ms / 1000 + 60)
-                except subprocess.TimeoutExpired:
-                    _kill_tree(proc)
-                    out, err = proc.communicate()
-                return extract_cert((out or "") + "\n" + (err or ""))
+                    proc = run_captured(
+                        argv,
+                        plan.memlimit_mb,
+                        args.solve_timeout_ms / 1000 + 60,
+                        label="chc_disagreement_audit.py[ay]",
+                        cancel_event=stop,
+                        env=dict(
+                            os.environ,
+                            MEMLIMIT=str(plan.memlimit_mb),
+                            NBCORE=str(plan.nbcore),
+                        ),
+                    )
+                except (OSError, RuntimeError):
+                    return None
+                if (
+                    proc.memout
+                    or proc.timed_out
+                    or proc.cancelled
+                    or proc.output_truncated
+                ):
+                    return None
+                return extract_cert((proc.stdout or "") + "\n" + (proc.stderr or ""))
 
             with ThreadPoolExecutor(max_workers=plan.jobs) as pool:
                 futs = [pool.submit(attempt, i) for i in range(args.attempts)]
@@ -166,14 +159,9 @@ def main() -> int:
                     if c:
                         cert = c
                         # Genuine early exit: cancel pending futures, tell
-                        # workers to stop, and kill the live solver process
-                        # groups so the pool drains immediately (Future.cancel
-                        # alone is a no-op on already-running tasks).
+                        # workers to stop, and let each guarded run reap its
+                        # process group so the pool drains immediately.
                         stop.set()
-                        pool.shutdown(wait=False, cancel_futures=True)
-                        with procs_lock:
-                            for pr in procs:
-                                _kill_tree(pr)
                         break
             if not cert:
                 print(f"[audit] {rid}: could not reproduce a certificate — UNRESOLVED")
@@ -182,11 +170,44 @@ def main() -> int:
             with tempfile.NamedTemporaryFile("w", suffix=".smt2", delete=False, encoding="utf-8") as fh:
                 fh.write(cert)
                 cert_path = fh.name
-            p = subprocess.run(
-                [sys.executable, str(CERT_CHECK), "--smt2", str(smt2), "--cert", cert_path,
-                 "--timeout-ms", "300000"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace")
+            checker_argv = [
+                sys.executable,
+                str(CERT_CHECK),
+                "--smt2",
+                str(smt2),
+                "--cert",
+                cert_path,
+                "--timeout-ms",
+                "300000",
+                "--memlimit-mb",
+                str(plan.memlimit_mb),
+                "--nbcore",
+                str(plan.nbcore),
+                "--headroom-mb",
+                str(plan.headroom_mb),
+                "--resource-jobs",
+                str(plan.jobs),
+                "--resource-requested-jobs",
+                str(min(8, args.attempts)),
+            ]
+            try:
+                p = run_captured(
+                    checker_argv,
+                    plan.memlimit_mb,
+                    360,
+                    label="chc_disagreement_audit.py[cert-check]",
+                    env=dict(
+                        os.environ,
+                        MEMLIMIT=str(plan.memlimit_mb),
+                        NBCORE=str(plan.nbcore),
+                    ),
+                )
+            except (OSError, RuntimeError):
+                p = None
             os.unlink(cert_path)
+            if p is None or p.memout or p.timed_out or p.output_truncated:
+                verdicts.append((rid, "unresolved-cert-unknown"))
+                continue
             print((p.stdout or "").strip())
             if p.returncode == 0:
                 print(f"[audit] {rid}: CORPUS LABEL WRONG — correction candidate: sat")
@@ -197,29 +218,29 @@ def main() -> int:
             else:
                 verdicts.append((rid, "unresolved-cert-unknown"))
         else:  # AY said unsat
-            proc = subprocess.Popen(
-                [str(Z3), "-T:600", str(smt2)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                encoding="utf-8", errors="replace", **_popen_kwargs())
-            # z3 has no honored memory knob (-memory: silently overshoots; see
-            # _oom_guard docstring), so the rss_watchdog is the only enforcement.
-            guard = rss_watchdog(
-                proc,
-                plan.memlimit_mb,
-                label="chc_disagreement_audit.py[z3]",
-                grace_mb=0,
-            )
             try:
-                z3_out, _ = proc.communicate(timeout=660)
-            except subprocess.TimeoutExpired:
-                _kill_tree(proc)
-                z3_out, _ = proc.communicate()
-            finally:
-                guard.stop()
-            if guard.breached:
+                proc = run_captured(
+                    [str(Z3), "-T:600", str(smt2)],
+                    plan.memlimit_mb,
+                    660,
+                    label="chc_disagreement_audit.py[z3]",
+                    env=dict(
+                        os.environ,
+                        MEMLIMIT=str(plan.memlimit_mb),
+                        NBCORE=str(plan.nbcore),
+                    ),
+                )
+            except (OSError, RuntimeError):
+                proc = None
+            if (
+                proc is None
+                or proc.memout
+                or proc.timed_out
+                or proc.output_truncated
+            ):
                 z = "unknown"  # memout: leave unresolved, never guess
             else:
-                z = next((l.strip() for l in (z3_out or "").splitlines()
+                z = next((l.strip() for l in (proc.stdout or "").splitlines()
                           if l.strip() in ("sat", "unsat")), "unknown")
             print(f"[audit] {rid}: external z3 says {z}")
             if z == "unsat":
@@ -234,6 +255,16 @@ def main() -> int:
     print("\n=== AUDIT SUMMARY ===")
     for rid, v in verdicts:
         print(f"  {v:28s} {rid}")
+    if args.out:
+        Path(args.out).write_text(json.dumps({
+            "resource_plan": resource_plan,
+            "track": args.track,
+            "year": args.year,
+            "tag": args.tag,
+            "verdicts": [{"instance": rid, "classification": verdict}
+                         for rid, verdict in verdicts],
+        }, indent=2) + "\n")
+        print(f"[audit] wrote {args.out}")
     return 0
 
 

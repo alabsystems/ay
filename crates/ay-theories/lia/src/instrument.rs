@@ -121,6 +121,41 @@ define_counters! {
     FARKAS_PROBE_PROVED     => "farkas_probe_proved",
     FARKAS_PROBE_SUBSET_SUM => "farkas_probe_subset_sum",
     FARKAS_PROBE_CLOSURE_SUM => "farkas_probe_closure_sum",
+    // #verify-memo (eager-theory-prop design §5.6 follow-up): caller-site
+    // partition of the verify lane. LIA_CHECK_VERIFY_CALLS counts CHECKS
+    // inside verification combiners (set_verify_only), so it conflates the
+    // extension's sampled propagation verification with conflict
+    // verification and multiplies each verification by its N-O fixpoint
+    // iterations. These count VERIFICATIONS at the caller, per site.
+    //
+    // Extension sampled propagation-verify lane (extension/propagate.rs):
+    // SELECTED = props chosen by the #8256 sampling policy (COVERAGE — must
+    // be identical on-vs-off for AY_VERIFY_MEMO); MIXED_FULL = cached
+    // Nelson-Oppen combiner checks performed; FRESH_FULL = fresh-solver
+    // dispatch (verify_propagation_semantic) runs.
+    VERIFY_PROP_SELECTED    => "verify_prop_selected",
+    VERIFY_PROP_MIXED_FULL  => "verify_prop_mixed_full",
+    VERIFY_PROP_FRESH_FULL  => "verify_prop_fresh_full",
+    // AY_VERIFY_MEMO obligation memo: HIT = identical-obligation short-
+    // circuit (verdict previously recorded from a FULL verification of the
+    // byte-identical literal set); MISS = eligible obligation fully verified.
+    VERIFY_PROP_MEMO_HITS   => "verify_prop_memo_hits",
+    VERIFY_PROP_MEMO_MISSES => "verify_prop_memo_misses",
+    // Conflict-verification memo traffic: EXT = the eager extension's
+    // trust-true-only memo (extension/helpers.rs); MEMOIZED = the #4535
+    // memoized wrapper used by the lazy/pipeline arms (dispatch.rs).
+    // FULL = full fail-closed re-verification ran; HITS = memo short-circuit.
+    VERIFY_CONFLICT_EXT_FULL     => "verify_conflict_ext_full",
+    VERIFY_CONFLICT_EXT_HITS     => "verify_conflict_ext_memo_hits",
+    VERIFY_CONFLICT_MEMOIZED_FULL => "verify_conflict_memoized_full",
+    VERIFY_CONFLICT_MEMOIZED_HITS => "verify_conflict_memoized_hits",
+    // Fresh bare verification solvers (NOT verify_only-flagged, so their LIA
+    // checks land in LIA_CHECK_TOP_CALLS — this counter de-pollutes TOP) and
+    // the verify_lra_propagation two-tier split (algebraic O(1) arm vs fresh
+    // LRA solver per verification).
+    VERIFY_FRESH_LIA_SOLVES => "verify_fresh_lia_solves",
+    VERIFY_FRESH_LRA_SOLVES => "verify_fresh_lra_solves",
+    VERIFY_LRA_ALGEBRAIC    => "verify_lra_algebraic",
 }
 
 /// 0 = uninitialised, 1 = disabled, 2 = enabled.
@@ -253,4 +288,80 @@ pub fn bump_split_round() {
 pub fn add_round_props_discarded(props: u64, pending: u64) {
     bump_by(&ROUND_PROPS_DISCARDED, props);
     bump_by(&ROUND_PENDING_DISCARDED, pending);
+}
+
+// ---------------------------------------------------------------------------
+// #verify-memo: verify-lane caller-partition bumps for ay-dpll. Same contract
+// as every other entry point — no-op after one relaxed load when
+// `AY_LIA_INSTRUMENT` is unset; write-only telemetry, never read by verdicts.
+// ---------------------------------------------------------------------------
+
+/// A propagation was SELECTED for semantic verification by the sampling
+/// policy (extension sampled-verify lane; coverage counter).
+#[inline]
+pub fn bump_verify_prop_selected() {
+    bump(&VERIFY_PROP_SELECTED);
+}
+
+/// The cached mixed-domain Nelson-Oppen verifier performed a full check.
+#[inline]
+pub fn bump_verify_prop_mixed_full() {
+    bump(&VERIFY_PROP_MIXED_FULL);
+}
+
+/// The fresh-solver dispatch (verify_propagation_semantic) ran from the
+/// extension's sampled-verify lane.
+#[inline]
+pub fn bump_verify_prop_fresh_full() {
+    bump(&VERIFY_PROP_FRESH_FULL);
+}
+
+/// AY_VERIFY_MEMO propagation-obligation memo outcome.
+#[inline]
+pub fn bump_verify_prop_memo(hit: bool) {
+    bump(if hit {
+        &VERIFY_PROP_MEMO_HITS
+    } else {
+        &VERIFY_PROP_MEMO_MISSES
+    });
+}
+
+/// Extension conflict-verification memo outcome (trust-true-only memo).
+#[inline]
+pub fn bump_verify_conflict_ext(hit: bool) {
+    bump(if hit {
+        &VERIFY_CONFLICT_EXT_HITS
+    } else {
+        &VERIFY_CONFLICT_EXT_FULL
+    });
+}
+
+/// #4535 memoized conflict-verification wrapper outcome (lazy/pipeline arms).
+#[inline]
+pub fn bump_verify_conflict_memoized(hit: bool) {
+    bump(if hit {
+        &VERIFY_CONFLICT_MEMOIZED_HITS
+    } else {
+        &VERIFY_CONFLICT_MEMOIZED_FULL
+    });
+}
+
+/// A fresh bare LiaSolver verification re-solve ran (these bump
+/// LIA_CHECK_TOP_CALLS, not the verify partition — see counter docs).
+#[inline]
+pub fn bump_verify_fresh_lia_solve() {
+    bump(&VERIFY_FRESH_LIA_SOLVES);
+}
+
+/// A fresh bare LraSolver verification re-solve ran (invisible to the LIA
+/// check counters entirely — LRA checks are not counted there).
+#[inline]
+pub fn bump_verify_fresh_lra_solve() {
+    bump(&VERIFY_FRESH_LRA_SOLVES);
+}
+
+/// verify_lra_propagation resolved in the O(1) algebraic tier.
+#[inline]
+pub fn bump_verify_lra_algebraic() {
+    bump(&VERIFY_LRA_ALGEBRAIC);
 }

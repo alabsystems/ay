@@ -490,6 +490,17 @@ impl Executor {
         // prevents re-entry: each witness solve recurses through the solver, and
         // the inner call must run the normal pipeline rather than re-detecting
         // witnesses.
+        if debug_auflia_enabled() {
+            safe_eprintln!(
+                "[QF_S] === solve_strings ENTER depth={} (witness cascade {}) ===",
+                self.pivot_enum_depth,
+                if self.pivot_enum_depth == 0 {
+                    "armed"
+                } else {
+                    "SKIPPED — re-entrant depth>0"
+                }
+            );
+        }
         if self.pivot_enum_depth == 0 {
             if let Some(result) = self.try_prefix_suffix_witnesses()? {
                 return Ok(result);
@@ -525,6 +536,18 @@ impl Executor {
             // contract — a failed construction never concludes UNSAT.
             if super::strings_w6::str_w6_enabled() {
                 if let Some(result) = self.try_regex_word_witnesses()? {
+                    return Ok(result);
+                }
+            }
+            // W7 (`AY_STR_W7=1`, default off): chain-definition, multi-atom
+            // placement and distinct-witness moves (see `strings_w7.rs`).
+            // LAST in the cascade, deliberately: W6 measured that moving a
+            // later witness pass earlier costs the earlier passes' own
+            // conversions (24 pyex files) by displacing their candidates on
+            // ties and exhausting their budget. Same validated-candidate
+            // contract — a failed construction never concludes UNSAT.
+            if super::strings_w7::str_w7_enabled() {
+                if let Some(result) = self.try_w7_witnesses()? {
                     return Ok(result);
                 }
             }
@@ -760,6 +783,12 @@ impl Executor {
                     }
                     last_lemma = Some(lemma.clone());
 
+                    // Strings NF-engine closure 3 (`AY_STR_NF=1`): drain the
+                    // lemmas queued behind this one so the whole batch is
+                    // lowered in ONE iteration. Empty with the closure off.
+                    let extra_lemmas =
+                        ay_core::TheorySolver::take_pending_string_lemmas(dpll.theory_solver_mut());
+
                     // #3762: Capture warm state before dropping the theory solver.
                     // Statistics and reduced terms survive across CEGAR iterations.
                     warm_state = Some(dpll.theory_solver().take_warm_state());
@@ -791,12 +820,15 @@ impl Executor {
                         self.last_unknown_reason = Some(UnknownReason::SplitLimit);
                         return Ok(SolveResult::Unknown);
                     }
-                    for tid in self.string_lemma_reduced_terms(&lemma, &mut skolem_cache) {
-                        if !dynamic_reduced_term_ids.contains(&tid) {
-                            dynamic_reduced_term_ids.push(tid);
+                    let mut clauses: Vec<Vec<TermId>> = Vec::new();
+                    for one in std::iter::once(&lemma).chain(extra_lemmas.iter()) {
+                        for tid in self.string_lemma_reduced_terms(one, &mut skolem_cache) {
+                            if !dynamic_reduced_term_ids.contains(&tid) {
+                                dynamic_reduced_term_ids.push(tid);
+                            }
                         }
+                        clauses.extend(self.create_string_lemma_clauses(one, &mut skolem_cache));
                     }
-                    let clauses = self.create_string_lemma_clauses(&lemma, &mut skolem_cache);
                     if proof_enabled {
                         for clause in &clauses {
                             for &atom in clause {

@@ -45,18 +45,69 @@ fn emits_firewall_lean_for_binary_distinctness() {
     for needle in [
         "import AySoundness.Firewall",
         "import AySoundness.Datatype",
-        "namespace AySoundness.Emitted.Color",
+        "namespace AySoundness.Emitted.s_436f6c6f72",
         "inductive T where",
-        "  | red",
-        "  | green",
-        "  | blue",
-        "decide (c = T.red)",
-        "decide (c = T.green)",
+        "  | s_726564",
+        "  | s_677265656e",
+        "  | s_626c7565",
+        "decide (c = T.s_726564)",
+        "decide (c = T.s_677265656e)",
         "firewall_combined_unsat",
         "theorem no_model",
     ] {
         assert!(lean.contains(needle), "emitted Lean missing: {needle}");
     }
+}
+
+#[test]
+fn datatype_names_cannot_escape_generated_lean_comments_or_identifiers() {
+    const PAYLOAD: &str = "victim-/\n#eval IO.println \"injected\"\n/-";
+    const OTHER: &str = "other-/\r\n#check unsafeCast\n/-";
+    let mut terms = TermStore::new();
+    let c = terms.mk_var("c", Sort::Uninterpreted(PAYLOAD.to_string()));
+    let first = ctor(&mut terms, PAYLOAD, PAYLOAD);
+    let second = ctor(&mut terms, OTHER, PAYLOAD);
+    let l0 = neq(&mut terms, c, first);
+    let l1 = neq(&mut terms, c, second);
+    let decls = vec![(
+        PAYLOAD.to_string(),
+        vec![PAYLOAD.to_string(), OTHER.to_string()],
+    )];
+
+    let lean = emit_datatype_distinct_firewall_lean(&terms, &decls, &[l0, l1])
+        .expect("malicious but valid SMT names should emit through safe encoding");
+
+    for forbidden in [PAYLOAD, OTHER, "#eval", "IO.println", "unsafeCast"] {
+        assert!(
+            !lean.contains(forbidden),
+            "untrusted SMT text escaped into generated Lean source: {forbidden:?}"
+        );
+    }
+    assert!(lean.contains("namespace AySoundness.Emitted.s_"));
+    assert!(lean.contains("firewall_combined_unsat"));
+}
+
+#[test]
+fn datatype_name_encoding_is_keyword_safe_and_injective() {
+    let mut terms = TermStore::new();
+    let c = terms.mk_var("c", Sort::Uninterpreted("namespace".to_string()));
+    let keyword = ctor(&mut terms, "end", "namespace");
+    let formerly_colliding = ctor(&mut terms, "c_2d", "namespace");
+    let l0 = neq(&mut terms, c, keyword);
+    let l1 = neq(&mut terms, c, formerly_colliding);
+    let decls = vec![(
+        "namespace".to_string(),
+        vec!["end".to_string(), "c_2d".to_string(), "-".to_string()],
+    )];
+
+    let lean = emit_datatype_distinct_firewall_lean(&terms, &decls, &[l0, l1])
+        .expect("keyword-like names should emit through safe encoding");
+    for encoded in ["s_6e616d657370616365", "s_656e64", "s_635f3264", "s_2d"] {
+        assert!(lean.contains(encoded), "missing encoded name {encoded}");
+    }
+    assert_ne!("s_635f3264", "s_2d");
+    assert!(!lean.contains("  | end\n"));
+    assert!(!lean.contains("namespace AySoundness.Emitted.namespace"));
 }
 
 #[test]
@@ -724,6 +775,165 @@ fn array_row1_declines_index_mismatch() {
     let eqn = PTerm::App("=".to_string(), vec![sel, PTerm::Symbol("v".to_string())]);
     let parsed = vec![PTerm::App("not".to_string(), vec![eqn])];
     assert!(emit_array_row1_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+#[test]
+fn emits_array_nested_store_row_from_parsed() {
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let store = |a: PTerm, i: PTerm, v: PTerm| PTerm::App("store".to_string(), vec![a, i, v]);
+    let select = |a: PTerm, i: PTerm| PTerm::App("select".to_string(), vec![a, i]);
+    // write_write_overwrite: i ≠ j ∧
+    //   select (store (store a i v1) i v2) j ≠ select (store a i v2) j.
+    // Both sides reduce (j ≠ i) to select a j, so it is UNSAT.
+    let diseq = PTerm::App(
+        "not".to_string(),
+        vec![PTerm::App("=".to_string(), vec![sym("i"), sym("j")])],
+    );
+    let lhs = select(
+        store(store(sym("a"), sym("i"), sym("v1")), sym("i"), sym("v2")),
+        sym("j"),
+    );
+    let rhs = select(store(sym("a"), sym("i"), sym("v2")), sym("j"));
+    let main = PTerm::App(
+        "not".to_string(),
+        vec![PTerm::App("=".to_string(), vec![lhs, rhs])],
+    );
+    let parsed = vec![diseq, main.clone()];
+
+    let lean = emit_array_nested_store_row_firewall_lean_from_parsed(&parsed)
+        .expect("nested-store read-over-write conflict should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("abbrev Val := (Nat → Nat) × (Nat → Nat)"));
+    // The nested if-update unfolding of the outer/inner store layers: the read
+    // index `j` is registered first (valuation 0), the store index `i` second
+    // (valuation 1), and both store layers unfold to the same `if`-condition.
+    assert!(lean.contains("(if (m.2 0) = (m.2 1) then (m.2 2) else (if (m.2 0) = (m.2 1) then"));
+    assert!(lean.contains("by_cases h2 : (m.2 0) = (m.2 1)"));
+    assert!(lean.contains("firewall_combined_unsat"));
+
+    // Without the guard `i ≠ j`, this particular instance remains
+    // UNCONDITIONALLY valid — both stores are at `i`, so the outer overwrite makes
+    // `select (store (store a i v1) i v2) j = select (store a i v2) j` hold for all
+    // `j` (the guarded and all-distinct branches both close). The relaxed emitter
+    // recognizes that and grounds the unconditional `row_eq` lemma.
+    let uncond = emit_array_nested_store_row_firewall_lean_from_parsed(&[main])
+        .expect("unconditional store-overwrite identity should emit even without the guard");
+    assert!(uncond.contains("namespace AySoundness.Emitted.ArrUncond_"));
+    assert!(uncond.contains("firewall_combined_unsat"));
+
+    // Genuine fail-closed: a ROW-OTHER read `select (store a i v) j` vs
+    // `select a j` WITHOUT `i ≠ j` is SATISFIABLE (take `j = i`: the sides are `v`
+    // and `a j`, which may differ), and the two if-trees DISAGREE on the `j = i`
+    // branch, so the unconditional check declines — emitting would be UNSOUND.
+    let sat_lhs = select(store(sym("a"), sym("i"), sym("v")), sym("j"));
+    let sat_main = PTerm::App(
+        "not".to_string(),
+        vec![PTerm::App(
+            "=".to_string(),
+            vec![sat_lhs, select(sym("a"), sym("j"))],
+        )],
+    );
+    assert!(emit_array_nested_store_row_firewall_lean_from_parsed(&[sat_main]).is_none());
+}
+
+#[test]
+fn array_nested_store_declines_literal_symbol_identity_collisions() {
+    use ay_frontend::command::{Constant as PConst, Index as PIndex, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let store = |a: PTerm, i: PTerm, v: PTerm| PTerm::App("store".to_string(), vec![a, i, v]);
+    let select = |a: PTerm, i: PTerm| PTerm::App("select".to_string(), vec![a, i]);
+
+    let assert_declines = |literal: PTerm, colliding_symbol: &str| {
+        // This formula is SAT: choose r != i and interpret the quoted symbol
+        // independently from the literal. The nested read equals the literal,
+        // not the same-spelled symbol.
+        let guard = PTerm::App(
+            "not".to_string(),
+            vec![PTerm::App("=".to_string(), vec![sym("r"), sym("i")])],
+        );
+        let lhs = select(
+            store(store(sym("a"), sym("r"), literal), sym("i"), sym("v")),
+            sym("r"),
+        );
+        let main = PTerm::App(
+            "not".to_string(),
+            vec![PTerm::App(
+                "=".to_string(),
+                vec![lhs, sym(colliding_symbol)],
+            )],
+        );
+
+        assert!(emit_array_nested_store_row_firewall_lean_from_parsed(&[guard, main]).is_none());
+    };
+
+    let constants = [
+        PConst::True,
+        PConst::False,
+        PConst::Numeral("0".to_string()),
+        PConst::Decimal("0.0".to_string()),
+        PConst::Hexadecimal("#x00".to_string()),
+        PConst::Binary("#b0".to_string()),
+        PConst::String("s".to_string()),
+    ];
+    for constant in constants {
+        let colliding_symbol = format!("{constant:?}");
+        assert_declines(PTerm::Const(constant), &colliding_symbol);
+    }
+
+    for (name, indices) in [
+        ("bv0", vec![PIndex::Numeral("8".to_string())]),
+        ("Char", vec![PIndex::Numeral("65".to_string())]),
+        ("char", vec![PIndex::Hexadecimal("#x41".to_string())]),
+        (
+            "+zero",
+            vec![
+                PIndex::Numeral("8".to_string()),
+                PIndex::Numeral("24".to_string()),
+            ],
+        ),
+        (
+            "-zero",
+            vec![
+                PIndex::Numeral("8".to_string()),
+                PIndex::Numeral("24".to_string()),
+            ],
+        ),
+        (
+            "+oo",
+            vec![
+                PIndex::Numeral("8".to_string()),
+                PIndex::Numeral("24".to_string()),
+            ],
+        ),
+        (
+            "-oo",
+            vec![
+                PIndex::Numeral("8".to_string()),
+                PIndex::Numeral("24".to_string()),
+            ],
+        ),
+        (
+            "NaN",
+            vec![
+                PIndex::Numeral("8".to_string()),
+                PIndex::Numeral("24".to_string()),
+            ],
+        ),
+    ] {
+        let colliding_symbol = format!(
+            "(_ {name} {})",
+            indices
+                .iter()
+                .map(PIndex::text)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert_declines(
+            PTerm::IndexedApp(name.to_string(), indices, Vec::new()),
+            &colliding_symbol,
+        );
+    }
 }
 
 #[test]
@@ -1737,4 +1947,979 @@ fn general_declines_without_empty_clause() {
         // No empty clause.
     ]);
     assert!(emit_general_firewall_lean(&terms, &proof).is_none());
+}
+
+// ==== APPENDED TESTS: word_equations ====
+#[test]
+fn emits_str_word_eq_len_from_parsed_assertions() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let strlit = |s: &str| PTerm::Const(PConst::String(s.to_string()));
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let concat = |xs: Vec<PTerm>| PTerm::App("str.++".to_string(), xs);
+    let eq = |a: PTerm, b: PTerm| PTerm::App("=".to_string(), vec![a, b]);
+    let str_len_eq = |v: &str, k: &str| {
+        eq(
+            PTerm::App("str.len".to_string(), vec![sym(v)]),
+            PTerm::Const(PConst::Numeral(k.to_string())),
+        )
+    };
+
+    // POSITIVE (we02): (= (str.++ x x) "aba") → 2·len x = 3, ℕ-infeasible.
+    let we02 = vec![eq(concat(vec![sym("x"), sym("x")]), strlit("aba"))];
+    let lean = emit_str_word_eq_len_firewall_lean_from_parsed(&we02)
+        .expect("we02 parity word-equation length conflict should emit");
+    assert!(lean.contains("import AySoundness.StringThy"));
+    assert!(lean.contains("StringThy.len_cat"));
+    assert!(lean.contains("firewall_combined_unsat"));
+    assert!(lean.contains("abbrev Val := StringThy.Str"));
+    assert!(lean.contains("StringThy.cat m m"));
+
+    // POSITIVE (we08): x·"ab" = "a"·y ∧ |x|=1 ∧ |y|=1 → 1+2 = 1+1, infeasible.
+    let we08 = vec![
+        eq(
+            concat(vec![sym("x"), strlit("ab")]),
+            concat(vec![strlit("a"), sym("y")]),
+        ),
+        str_len_eq("x", "1"),
+        str_len_eq("y", "1"),
+    ];
+    let lean08 = emit_str_word_eq_len_firewall_lean_from_parsed(&we08)
+        .expect("we08 length-pin word-equation conflict should emit");
+    assert!(lean08.contains("StringThy.Str × StringThy.Str"));
+    assert!(lean08.contains("firewall_combined_unsat"));
+
+    // POSITIVE (we11): (= (str.++ x x x) "ab") → 3·len x = 2, ℕ-infeasible.
+    let we11 = vec![eq(concat(vec![sym("x"), sym("x"), sym("x")]), strlit("ab"))];
+    assert!(emit_str_word_eq_len_firewall_lean_from_parsed(&we11).is_some());
+
+    // NEGATIVE (we03-shape): "a"·x = x·"b" — equal lengths (1+len x each), the
+    // length projection is SATISFIABLE, so decline (needs positional reasoning,
+    // not a length conflict).
+    let we03 = vec![eq(
+        concat(vec![strlit("a"), sym("x")]),
+        concat(vec![sym("x"), strlit("b")]),
+    )];
+    assert!(emit_str_word_eq_len_firewall_lean_from_parsed(&we03).is_none());
+
+    // NEGATIVE (we01-shape): (= (str.++ x y) "aba") — two FREE variable lengths,
+    // length system is satisfiable, decline.
+    let we01 = vec![eq(concat(vec![sym("x"), sym("y")]), strlit("aba"))];
+    assert!(emit_str_word_eq_len_firewall_lean_from_parsed(&we01).is_none());
+}
+
+// ==== APPENDED TESTS: sets_setlia ====
+/// Build `(set.singleton n)`.
+#[cfg(test)]
+fn set_singleton_pterm(n: i64) -> ay_frontend::command::Term {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    PTerm::App(
+        "set.singleton".to_string(),
+        vec![PTerm::Const(PConst::Numeral(n.to_string()))],
+    )
+}
+
+/// Build `(set.insert n s)`.
+#[cfg(test)]
+fn set_insert_pterm(n: i64, s: ay_frontend::command::Term) -> ay_frontend::command::Term {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    PTerm::App(
+        "set.insert".to_string(),
+        vec![PTerm::Const(PConst::Numeral(n.to_string())), s],
+    )
+}
+
+#[test]
+fn emits_set_subset_structural_from_parsed() {
+    use ay_frontend::command::Term as PTerm;
+    // (not (set.subset {1} {0,1})) -- subset HOLDS, negation UNSAT.
+    let subset = PTerm::App(
+        "set.subset".to_string(),
+        vec![
+            set_singleton_pterm(1),
+            set_insert_pterm(0, set_singleton_pterm(1)),
+        ],
+    );
+    let parsed = vec![PTerm::App("not".to_string(), vec![subset])];
+    let lean = emit_set_subset_structural_firewall_lean_from_parsed(&parsed)
+        .expect("negated-valid-subset conflict should emit");
+    assert!(lean.contains("firewall_combined_unsat"));
+    assert!(
+        lean.contains("SetThy.subset (SetThy.singleton 1) (SetThy.insert 0 (SetThy.singleton 1))")
+    );
+    assert!(lean.contains("[(1, [-1])]"));
+}
+
+#[test]
+fn set_subset_structural_declines_when_subset_fails() {
+    use ay_frontend::command::Term as PTerm;
+    // (not (set.subset {0} {1})) -- subset FAILS, negation SAT; decline.
+    let subset = PTerm::App(
+        "set.subset".to_string(),
+        vec![set_singleton_pterm(0), set_singleton_pterm(1)],
+    );
+    let parsed = vec![PTerm::App("not".to_string(), vec![subset])];
+    assert!(emit_set_subset_structural_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+#[test]
+fn set_subset_structural_declines_non_structural() {
+    use ay_frontend::command::Term as PTerm;
+    let subset = PTerm::App(
+        "set.subset".to_string(),
+        vec![
+            PTerm::Symbol("s".to_string()),
+            PTerm::Symbol("t".to_string()),
+        ],
+    );
+    let parsed = vec![PTerm::App("not".to_string(), vec![subset])];
+    assert!(emit_set_subset_structural_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+#[test]
+fn emits_set_eq_structural_from_parsed() {
+    use ay_frontend::command::Term as PTerm;
+    // (= {0} {1}) -- not equal, UNSAT.
+    let parsed = vec![PTerm::App(
+        "=".to_string(),
+        vec![set_singleton_pterm(0), set_singleton_pterm(1)],
+    )];
+    let lean = emit_set_eq_structural_firewall_lean_from_parsed(&parsed)
+        .expect("false set-equality conflict should emit");
+    assert!(lean.contains("firewall_combined_unsat"));
+    assert!(lean.contains("SetThy.seteq (SetThy.singleton 0) (SetThy.singleton 1)"));
+    assert!(lean.contains("[(1, [1])]"));
+}
+
+#[test]
+fn set_eq_structural_declines_when_equal() {
+    use ay_frontend::command::Term as PTerm;
+    // (= {0,1} {0,1}) -- equal, SAT; decline.
+    let parsed = vec![PTerm::App(
+        "=".to_string(),
+        vec![
+            set_insert_pterm(0, set_singleton_pterm(1)),
+            set_insert_pterm(1, set_singleton_pterm(0)),
+        ],
+    )];
+    assert!(emit_set_eq_structural_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+#[test]
+fn set_eq_structural_declines_non_structural() {
+    use ay_frontend::command::Term as PTerm;
+    let parsed = vec![PTerm::App(
+        "=".to_string(),
+        vec![PTerm::Symbol("s".to_string()), set_singleton_pterm(1)],
+    )];
+    assert!(emit_set_eq_structural_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+#[test]
+fn emits_set_subset_structural_false_from_parsed() {
+    use ay_frontend::command::Term as PTerm;
+    // (set.subset {0} {1}) -- subset FAILS, positive assertion UNSAT.
+    let parsed = vec![PTerm::App(
+        "set.subset".to_string(),
+        vec![set_singleton_pterm(0), set_singleton_pterm(1)],
+    )];
+    let lean = emit_set_subset_structural_false_firewall_lean_from_parsed(&parsed)
+        .expect("false-subset conflict should emit");
+    assert!(lean.contains("firewall_combined_unsat"));
+    assert!(lean.contains("SetThy.subset (SetThy.singleton 0) (SetThy.singleton 1)"));
+    assert!(lean.contains("[(1, [1])]"));
+}
+
+#[test]
+fn set_subset_structural_false_declines_when_subset_holds() {
+    use ay_frontend::command::Term as PTerm;
+    // (set.subset {1} {0,1}) -- subset HOLDS, positive assertion SAT; decline.
+    let parsed = vec![PTerm::App(
+        "set.subset".to_string(),
+        vec![
+            set_singleton_pterm(1),
+            set_insert_pterm(0, set_singleton_pterm(1)),
+        ],
+    )];
+    assert!(emit_set_subset_structural_false_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+// ==== APPENDED TESTS: arrays_alia ====
+#[test]
+fn emits_array_row_mismatch_from_parsed() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    // (= (select (store a i 5) i) 10) — ROW-same yields 5, asserted 10 → UNSAT.
+    let store = PTerm::App(
+        "store".to_string(),
+        vec![
+            PTerm::Symbol("a".to_string()),
+            PTerm::Symbol("i".to_string()),
+            num("5"),
+        ],
+    );
+    let sel = PTerm::App(
+        "select".to_string(),
+        vec![store, PTerm::Symbol("i".to_string())],
+    );
+    let eqn = PTerm::App("=".to_string(), vec![sel, num("10")]);
+    let parsed = vec![eqn];
+
+    let lean = emit_array_row_mismatch_firewall_lean_from_parsed(&parsed)
+        .expect("ROW-same positive mismatch should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("abbrev Val := (Nat → Nat) × (Nat → Nat)"));
+    assert!(lean.contains("if (m.2 0) = (m.2 0) then (5 : Nat) else"));
+    assert!(lean.contains("= (10 : Nat)"));
+    assert!(lean.contains("firewall_combined_unsat"));
+
+    // Arith-normalized read index (+ i 0) ≡ i — still a mismatch.
+    let store2 = PTerm::App(
+        "store".to_string(),
+        vec![
+            PTerm::Symbol("a".to_string()),
+            PTerm::Symbol("i".to_string()),
+            num("42"),
+        ],
+    );
+    let ridx = PTerm::App(
+        "+".to_string(),
+        vec![PTerm::Symbol("i".to_string()), num("0")],
+    );
+    let sel2 = PTerm::App("select".to_string(), vec![store2, ridx]);
+    let eqn2 = PTerm::App("=".to_string(), vec![sel2, num("43")]);
+    assert!(emit_array_row_mismatch_firewall_lean_from_parsed(&[eqn2]).is_some());
+}
+
+#[test]
+fn array_row_mismatch_declines_matching_value() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    // (= (select (store a i 5) i) 5) — read yields 5, asserted 5: SAT, must decline.
+    let store = PTerm::App(
+        "store".to_string(),
+        vec![
+            PTerm::Symbol("a".to_string()),
+            PTerm::Symbol("i".to_string()),
+            num("5"),
+        ],
+    );
+    let sel = PTerm::App(
+        "select".to_string(),
+        vec![store, PTerm::Symbol("i".to_string())],
+    );
+    let eqn = PTerm::App("=".to_string(), vec![sel, num("5")]);
+    assert!(emit_array_row_mismatch_firewall_lean_from_parsed(&[eqn]).is_none());
+
+    // Different (non-normalizing) read index j ≠ i: not ROW-same → decline.
+    let store2 = PTerm::App(
+        "store".to_string(),
+        vec![
+            PTerm::Symbol("a".to_string()),
+            PTerm::Symbol("i".to_string()),
+            num("5"),
+        ],
+    );
+    let sel2 = PTerm::App(
+        "select".to_string(),
+        vec![store2, PTerm::Symbol("j".to_string())],
+    );
+    let eqn2 = PTerm::App("=".to_string(), vec![sel2, num("10")]);
+    assert!(emit_array_row_mismatch_firewall_lean_from_parsed(&[eqn2]).is_none());
+}
+
+#[test]
+fn emits_array_inlined_nested_store_swap_from_parsed() {
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let store = |a: PTerm, i: PTerm, v: PTerm| PTerm::App("store".to_string(), vec![a, i, v]);
+    let select = |a: PTerm, i: PTerm| PTerm::App("select".to_string(), vec![a, i]);
+    // (not (= i j)), (= b (store (store a i (select a j)) j (select a i))),
+    // (not (= (select b i) (select a j))). After swap b[i] = a[j], so UNSAT.
+    let diseq = PTerm::App(
+        "not".to_string(),
+        vec![PTerm::App("=".to_string(), vec![sym("i"), sym("j")])],
+    );
+    let swap = store(
+        store(sym("a"), sym("i"), select(sym("a"), sym("j"))),
+        sym("j"),
+        select(sym("a"), sym("i")),
+    );
+    let bdef = PTerm::App("=".to_string(), vec![sym("b"), swap]);
+    let target = PTerm::App(
+        "not".to_string(),
+        vec![PTerm::App(
+            "=".to_string(),
+            vec![select(sym("b"), sym("i")), select(sym("a"), sym("j"))],
+        )],
+    );
+    let parsed = vec![diseq.clone(), bdef, target.clone()];
+
+    let lean = emit_array_inlined_nested_store_firewall_lean_from_parsed(&parsed)
+        .expect("array-let swap conflict should emit after inlining");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("abbrev Val := (Nat → Nat) × (Nat → Nat)"));
+    assert!(lean.contains("firewall_combined_unsat"));
+
+    // Declines when there is no array-let to inline (nothing this wrapper adds).
+    assert!(emit_array_inlined_nested_store_firewall_lean_from_parsed(&[diseq, target]).is_none());
+}
+
+// ==== APPENDED TESTS: array unconditional / define-fun expansion ====
+
+// store_idempotent: `select (store (store a i v) i v) j = select (store a i v) j`
+// holds for ALL j with NO guarding disequality — the two if-trees agree on both
+// the `j = i` and `j ≠ i` branches. The relaxed nested emitter grounds the
+// UNCONDITIONAL `row_eq` lemma (non-empty but unbacked guard `j = i`).
+#[test]
+fn emits_array_store_idempotent_unconditional_from_parsed() {
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let store = |a: PTerm, i: PTerm, v: PTerm| PTerm::App("store".to_string(), vec![a, i, v]);
+    let select = |a: PTerm, i: PTerm| PTerm::App("select".to_string(), vec![a, i]);
+
+    let lhs = select(
+        store(store(sym("a"), sym("i"), sym("v")), sym("i"), sym("v")),
+        sym("j"),
+    );
+    let rhs = select(store(sym("a"), sym("i"), sym("v")), sym("j"));
+    let main = PTerm::App(
+        "not".to_string(),
+        vec![PTerm::App("=".to_string(), vec![lhs, rhs])],
+    );
+
+    let lean = emit_array_nested_store_row_firewall_lean_from_parsed(&[main])
+        .expect("store-idempotence identity should emit unconditionally");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("namespace AySoundness.Emitted.ArrUncond_"));
+    // The unconditional lemma clause is the bare row_eq `[1]`, no guard atoms.
+    assert!(lean.contains("def lemmas   : List (Cid × Clause) := [(2, [1])]"));
+    // The single non-reflexive `if`-condition `j = i` is discharged by by_cases.
+    assert!(lean.contains("by_cases h2 : (m.2 0) = (m.2 1)"));
+    assert!(lean.contains("firewall_combined_unsat"));
+}
+
+// store_eq_transitivity / array_bv_store, in their inlined form: after the
+// array-let `b = store a i e` is substituted, `select b i = e` collapses to a
+// reflexive single-store ROW1 with an EMPTY guard. The unconditional emitter
+// grounds it with a plain `simp` (no by_cases).
+#[test]
+fn emits_array_reflexive_row1_empty_guard_from_parsed() {
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let store = |a: PTerm, i: PTerm, v: PTerm| PTerm::App("store".to_string(), vec![a, i, v]);
+    let select = |a: PTerm, i: PTerm| PTerm::App("select".to_string(), vec![a, i]);
+
+    // b = store a i e ; not (= (select b i) e)  — the store_eq_transitivity shape.
+    let bdef = PTerm::App(
+        "=".to_string(),
+        vec![sym("b"), store(sym("a"), sym("i"), sym("e"))],
+    );
+    let target = PTerm::App(
+        "not".to_string(),
+        vec![PTerm::App(
+            "=".to_string(),
+            vec![select(sym("b"), sym("i")), sym("e")],
+        )],
+    );
+    let parsed = vec![bdef, target];
+
+    let lean = emit_array_inlined_nested_store_firewall_lean_from_parsed(&parsed)
+        .expect("reflexive ROW1 behind an array-let should emit after inlining");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    // Either the unconditional (empty-guard) grounding or the plain ROW1 grounding
+    // is a sound certificate; both share the firewall attribution.
+    assert!(
+        lean.contains("namespace AySoundness.Emitted.ArrUncond_")
+            || lean.contains("namespace AySoundness.Emitted.ArrRow1_")
+    );
+    assert!(lean.contains("firewall_combined_unsat"));
+}
+
+// storecomm_t1_np_sf_ai_00003, in its macro-expanded form: `fwd`/`rev` are nullary
+// define-funs whose bodies are opposite-order 3-store chains, `(distinct i0 i1 i2)`
+// backs the pairwise index inequalities, and `select fwd i0`/`select rev i0` both
+// reduce to `e0`. Substituting the macro bodies exposes the guarded nested ROW
+// conflict, and the `distinct` expansion backs every guard.
+#[test]
+fn emits_array_storecomm_defexpanded_from_parsed() {
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let store = |a: PTerm, i: PTerm, v: PTerm| PTerm::App("store".to_string(), vec![a, i, v]);
+    let select = |a: PTerm, i: PTerm| PTerm::App("select".to_string(), vec![a, i]);
+
+    let distinct = PTerm::App(
+        "distinct".to_string(),
+        vec![sym("i0"), sym("i1"), sym("i2")],
+    );
+    let target = PTerm::App(
+        "not".to_string(),
+        vec![PTerm::App(
+            "=".to_string(),
+            vec![select(sym("fwd"), sym("i0")), select(sym("rev"), sym("i0"))],
+        )],
+    );
+    let parsed = vec![distinct, target];
+
+    // fwd = store(store(store a0 i0 e0) i1 e1) i2 e2 ; rev = reverse order.
+    let fwd = store(
+        store(store(sym("a0"), sym("i0"), sym("e0")), sym("i1"), sym("e1")),
+        sym("i2"),
+        sym("e2"),
+    );
+    let rev = store(
+        store(store(sym("a0"), sym("i2"), sym("e2")), sym("i1"), sym("e1")),
+        sym("i0"),
+        sym("e0"),
+    );
+    let defs = vec![("fwd".to_string(), fwd), ("rev".to_string(), rev)];
+
+    let lean = emit_array_defexpanded_firewall_lean_from_parsed(&parsed, &defs)
+        .expect("macro store-commute conflict should emit after define-fun expansion");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("abbrev Val := (Nat → Nat) × (Nat → Nat)"));
+    assert!(lean.contains("firewall_combined_unsat"));
+    // Guarded nested emitter: the pairwise index coincidences (expanded from the
+    // `distinct`) appear as by_cases guards.
+    assert!(lean.contains("by_cases"));
+
+    // Declines when no macro expands (empty defs — nothing to substitute).
+    assert!(emit_array_defexpanded_firewall_lean_from_parsed(&parsed, &[]).is_none());
+    // Declines when the `distinct` is absent: the guards are then unbacked and the
+    // conflict is not unconditionally valid (opposite-order writes at genuinely
+    // possibly-equal indices) — fail closed.
+    let no_distinct = vec![parsed[1].clone()];
+    assert!(emit_array_defexpanded_firewall_lean_from_parsed(&no_distinct, &defs).is_none());
+}
+
+// ==== APPENDED TESTS: lia ====
+#[test]
+fn emits_lia_linear_conflict_from_parsed() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    // (> x 5) ∧ (< x 3): jointly integer-UNSAT bound conflict.
+    let parsed = vec![
+        PTerm::App(">".to_string(), vec![sym("x"), num("5")]),
+        PTerm::App("<".to_string(), vec![sym("x"), num("3")]),
+    ];
+    let lean = emit_lia_firewall_lean_from_parsed(&parsed)
+        .expect("linear integer bound conflict should emit");
+    assert!(lean.contains("abbrev Val := Nat → Int"));
+    assert!(lean.contains("firewall_combined_unsat"));
+    assert!(lean.contains("(m 0)"));
+    // A multi-variable linear system rendering distinct `(m i)` projections.
+    let multi = vec![
+        PTerm::App(
+            "=".to_string(),
+            vec![
+                PTerm::App("+".to_string(), vec![sym("a"), sym("b")]),
+                num("1"),
+            ],
+        ),
+        PTerm::App(">=".to_string(), vec![sym("a"), num("1")]),
+        PTerm::App(">=".to_string(), vec![sym("b"), num("1")]),
+    ];
+    let lean2 = emit_lia_firewall_lean_from_parsed(&multi)
+        .expect("multi-variable linear conflict should emit");
+    assert!(lean2.contains("(m 0)") && lean2.contains("(m 1)"));
+
+    // Declines a genuinely NONLINEAR var*var product (omega cannot discharge).
+    let nonlinear = vec![PTerm::App(
+        "=".to_string(),
+        vec![
+            PTerm::App("*".to_string(), vec![sym("x"), sym("y")]),
+            num("7"),
+        ],
+    )];
+    assert!(emit_lia_firewall_lean_from_parsed(&nonlinear).is_none());
+    // Declines non-arithmetic propositional structure (`or`).
+    let prop = vec![PTerm::App("or".to_string(), vec![sym("p"), sym("q")])];
+    assert!(emit_lia_firewall_lean_from_parsed(&prop).is_none());
+}
+
+// ==== APPENDED TESTS: euf_uflia ====
+#[test]
+fn emits_euf_lia_congruence_from_parsed_assertions() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+
+    // POSITIVE: a>=3, a<=3, b=3, f(a)=10, f(b)=20 -> a=b=3 forces f(a)=f(b), 10!=20.
+    let parsed = vec![
+        app(">=", vec![sym("a"), num("3")]),
+        app("<=", vec![sym("a"), num("3")]),
+        app("=", vec![sym("b"), num("3")]),
+        app("=", vec![app("f", vec![sym("a")]), num("10")]),
+        app("=", vec![app("f", vec![sym("b")]), num("20")]),
+    ];
+    let lean = emit_euf_lia_congruence_firewall_lean_from_parsed(&parsed)
+        .expect("parsed EUF+LIA congruence conflict should emit");
+    assert!(lean.contains("import AySoundness.Firewall"));
+    assert!(lean.contains("firewall_combined_unsat"));
+    assert!(lean.contains("f_f : Int -> Int"));
+    assert!(lean.contains("omega"));
+    assert!(lean.contains("rw [he"));
+
+    // POSITIVE (implied-equality + one negated value atom): a+1=b+1, b+2=c+2,
+    // f(a)=10, f(c)=10, !(f(b)=10) -> a=b=c so f(b)=f(a)=10, contradiction.
+    let parsed3 = vec![
+        app(
+            "=",
+            vec![
+                app("+", vec![sym("a"), num("1")]),
+                app("+", vec![sym("b"), num("1")]),
+            ],
+        ),
+        app(
+            "=",
+            vec![
+                app("+", vec![sym("b"), num("2")]),
+                app("+", vec![sym("c"), num("2")]),
+            ],
+        ),
+        app("=", vec![app("f", vec![sym("a")]), num("10")]),
+        app("=", vec![app("f", vec![sym("c")]), num("10")]),
+        app(
+            "not",
+            vec![app("=", vec![app("f", vec![sym("b")]), num("10")])],
+        ),
+    ];
+    assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&parsed3).is_some());
+
+    // NEGATIVE (no implied equality): a and b unconstrained, f(a)=10, f(b)=20 --
+    // no LIA fact forces a=b, so no congruence conflict -> decline.
+    let no_eq = vec![
+        app("=", vec![app("f", vec![sym("a")]), num("10")]),
+        app("=", vec![app("f", vec![sym("b")]), num("20")]),
+    ];
+    assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&no_eq).is_none());
+
+    // NEGATIVE (consistent values): a=b but f(a)=10, f(b)=10 -- no conflict.
+    let consistent = vec![
+        app("=", vec![sym("a"), num("3")]),
+        app("=", vec![sym("b"), num("3")]),
+        app("=", vec![app("f", vec![sym("a")]), num("10")]),
+        app("=", vec![app("f", vec![sym("b")]), num("10")]),
+    ];
+    assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&consistent).is_none());
+
+    // NEGATIVE (Real / QF_UFLRA gate): decimal numerals are not Int -> decline.
+    let real = vec![
+        app(
+            "=",
+            vec![sym("a"), PTerm::Const(PConst::Decimal("5.0".to_string()))],
+        ),
+        app(
+            "=",
+            vec![sym("b"), PTerm::Const(PConst::Decimal("5.0".to_string()))],
+        ),
+        app("=", vec![app("f", vec![sym("a")]), num("10")]),
+        app("=", vec![app("f", vec![sym("b")]), num("20")]),
+    ];
+    assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&real).is_none());
+}
+
+#[test]
+fn emits_dt_occurs_check_from_parsed() {
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    // (= x (cons h (cons h x))) — the r3_rank1 recursive-list occurs-check:
+    // `x` occurs as a PROPER subterm under two `cons` constructor layers.
+    let inner = app("cons", vec![sym("h"), sym("x")]);
+    let rhs = app("cons", vec![sym("h"), inner]);
+    let parsed = vec![app("=", vec![sym("x"), rhs])];
+    let ctors = vec!["cons".to_string(), "nil".to_string()];
+    let decls: Vec<(String, Vec<String>)> = vec![("Lst".to_string(), ctors.clone())];
+    let sels: Vec<(String, Vec<String>)> = vec![
+        ("cons".to_string(), vec!["hd".to_string(), "tl".to_string()]),
+        ("nil".to_string(), vec![]),
+    ];
+
+    let lean = emit_dt_occurs_check_firewall_lean_from_parsed(&parsed, &ctors, &decls, &sels)
+        .expect("acyclicity / occurs-check conflict should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("import AySoundness.Datatype"));
+    assert!(lean.contains("acyclic_conflict_generic"));
+    assert!(lean.contains("DtT.wrap.sizeOf_spec"));
+    assert!(lean.contains("firewall_combined_unsat"));
+    // depth 2 -> two nested `wrap` layers in the context.
+    assert!(lean.contains("DtT.wrap (DtT.wrap (z))"));
+
+    // Reversed orientation `(= (cons h (cons h x)) x)` also fires.
+    let inner2 = app("cons", vec![sym("h"), sym("x")]);
+    let rhs2 = app("cons", vec![sym("h"), inner2]);
+    let rev = vec![app("=", vec![rhs2, sym("x")])];
+    assert!(emit_dt_occurs_check_firewall_lean_from_parsed(&rev, &ctors, &decls, &sels).is_some());
+}
+
+#[test]
+fn emits_dt_occurs_check_selector_mediated_from_parsed() {
+    // Shape (B): `x = cons(cons(tl x))` over `Lst = cons(tl Lst) | nil`.
+    // `x` occurs only under the selector `tl`, so the pure-constructor pass
+    // declines; projecting field 0 of the top `cons` via its own selector `tl`
+    // gives `tl x = cons(tl x)` = `t = cons t`, a depth-1 occurs-check.
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let ctors = vec!["cons".to_string(), "nil".to_string()];
+    let decls: Vec<(String, Vec<String>)> = vec![("Lst".to_string(), ctors.clone())];
+    // Single-field `cons` with selector `tl` (matches the target .smt2).
+    let sels: Vec<(String, Vec<String>)> = vec![
+        ("cons".to_string(), vec!["tl".to_string()]),
+        ("nil".to_string(), vec![]),
+    ];
+
+    let parsed = vec![app(
+        "=",
+        vec![
+            sym("x"),
+            app("cons", vec![app("cons", vec![app("tl", vec![sym("x")])])]),
+        ],
+    )];
+    let lean = emit_dt_occurs_check_firewall_lean_from_parsed(&parsed, &ctors, &decls, &sels)
+        .expect("selector-mediated occurs-check should emit");
+    assert!(lean.contains("acyclic_conflict_generic"));
+    assert!(lean.contains("DtT.wrap.sizeOf_spec"));
+    // depth 1 -> a single `wrap` layer.
+    assert!(lean.contains("DtT.wrap (z)"));
+
+    // Reversed orientation fires too.
+    let rev = vec![app(
+        "=",
+        vec![
+            app("cons", vec![app("cons", vec![app("tl", vec![sym("x")])])]),
+            sym("x"),
+        ],
+    )];
+    assert!(emit_dt_occurs_check_firewall_lean_from_parsed(&rev, &ctors, &decls, &sels).is_some());
+
+    // WITHOUT selector metadata the emitter cannot soundly project — decline.
+    let no_sels: Vec<(String, Vec<String>)> = vec![];
+    assert!(
+        emit_dt_occurs_check_firewall_lean_from_parsed(&parsed, &ctors, &decls, &no_sels).is_none()
+    );
+}
+
+#[test]
+fn emits_dt_occurs_check_safe_ite_tester_from_parsed() {
+    // Shape (C): tautological-tester `ite` + selector-self-eq under an asserted
+    // tester, over `Rec = mkRec` (single ctor) and `Tree = leaf | node(left,right)`.
+    //   (= (ite ((_ is mkRec) r) v12 v11) (left v12))
+    //   ((_ is node) v12)
+    // `is-mkRec` is a tautology (Rec single-ctor) so the ite folds to `v12`,
+    // giving `v12 = left v12`; the asserted `is-node v12` gives the node form,
+    // and substitution yields `v12 = node(v12, right v12)` = depth-1 occurs-check.
+    use ay_frontend::command::{Index as PIndex, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let tester = |c: &str, on: &str| {
+        PTerm::IndexedApp(
+            "is".to_string(),
+            vec![PIndex::Symbol(c.to_string())],
+            vec![sym(on)],
+        )
+    };
+    let ctors = vec!["mkRec".to_string(), "leaf".to_string(), "node".to_string()];
+    let decls: Vec<(String, Vec<String>)> = vec![
+        ("Rec".to_string(), vec!["mkRec".to_string()]),
+        (
+            "Tree".to_string(),
+            vec!["leaf".to_string(), "node".to_string()],
+        ),
+    ];
+    let sels: Vec<(String, Vec<String>)> = vec![
+        ("mkRec".to_string(), vec![]),
+        ("leaf".to_string(), vec![]),
+        (
+            "node".to_string(),
+            vec!["left".to_string(), "right".to_string()],
+        ),
+    ];
+
+    let eq = app(
+        "=",
+        vec![
+            app("ite", vec![tester("mkRec", "r"), sym("v12"), sym("v11")]),
+            app("left", vec![sym("v12")]),
+        ],
+    );
+    let parsed = vec![eq, tester("node", "v12")];
+    let lean = emit_dt_occurs_check_firewall_lean_from_parsed(&parsed, &ctors, &decls, &sels)
+        .expect("safe-ite tester occurs-check should emit");
+    assert!(lean.contains("acyclic_conflict_generic"));
+    assert!(lean.contains("DtT.wrap.sizeOf_spec"));
+    assert!(lean.contains("DtT.wrap (z)"));
+
+    // Without the asserted `(_ is node) v12`, the node form is not derivable —
+    // `v12 = left v12` alone is SAT (a fixpoint under `left`) — decline.
+    let no_tester = vec![app(
+        "=",
+        vec![
+            app("ite", vec![tester("mkRec", "r"), sym("v12"), sym("v11")]),
+            app("left", vec![sym("v12")]),
+        ],
+    )];
+    assert!(
+        emit_dt_occurs_check_firewall_lean_from_parsed(&no_tester, &ctors, &decls, &sels).is_none()
+    );
+
+    // If the ite guard is NOT a sole-constructor tester it is not a tautology
+    // and must not fold — decline.
+    let multi_decls: Vec<(String, Vec<String>)> = vec![
+        (
+            "Rec".to_string(),
+            vec!["mkRec".to_string(), "mkRec2".to_string()],
+        ),
+        (
+            "Tree".to_string(),
+            vec!["leaf".to_string(), "node".to_string()],
+        ),
+    ];
+    assert!(
+        emit_dt_occurs_check_firewall_lean_from_parsed(&parsed, &ctors, &multi_decls, &sels)
+            .is_none()
+    );
+}
+
+#[test]
+fn dt_occurs_check_declines_non_occurrence_and_selectors() {
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let ctors = vec!["cons".to_string(), "nil".to_string()];
+    let decls: Vec<(String, Vec<String>)> = vec![("Lst".to_string(), ctors.clone())];
+    let sels: Vec<(String, Vec<String>)> = vec![
+        ("cons".to_string(), vec!["hd".to_string(), "tl".to_string()]),
+        ("nil".to_string(), vec![]),
+    ];
+
+    // No occurrence: `x = cons(h, y)` with y != x — genuinely SAT, must decline.
+    let sat = vec![app(
+        "=",
+        vec![sym("x"), app("cons", vec![sym("h"), sym("y")])],
+    )];
+    assert!(emit_dt_occurs_check_firewall_lean_from_parsed(&sat, &ctors, &decls, &sels).is_none());
+
+    // Non-constructor head (`t` is itself absent from a real ctor path): decline.
+    let bogus = vec![app("=", vec![sym("x"), app("f", vec![sym("x")])])];
+    assert!(
+        emit_dt_occurs_check_firewall_lean_from_parsed(&bogus, &ctors, &decls, &sels).is_none()
+    );
+
+    // Selector-mediated shape (B) but the projected selector does not match the
+    // occurring one: `x = cons(cons(tl x))` while `cons`'s single field selector
+    // is `hd` (not `tl`). Projecting field 0 via `hd` yields `hd x`, which does
+    // NOT occur in `cons(tl x)` — decline (fail-closed on selector mismatch).
+    let mismatch_sels: Vec<(String, Vec<String>)> = vec![
+        ("cons".to_string(), vec!["hd".to_string()]),
+        ("nil".to_string(), vec![]),
+    ];
+    let sel = vec![app(
+        "=",
+        vec![
+            sym("x"),
+            app("cons", vec![app("cons", vec![app("tl", vec![sym("x")])])]),
+        ],
+    )];
+    assert!(
+        emit_dt_occurs_check_firewall_lean_from_parsed(&sel, &ctors, &decls, &mismatch_sels)
+            .is_none()
+    );
+}
+
+#[test]
+fn emits_dt_case_split_ite_from_parsed() {
+    // boolean-ite-guard, bench `qf_dt_occurs_ite_ctor_eq_false_sat.smt2`:
+    //   (= (cons F) (ite b F nil))  over  Lst = cons(tl:Lst) | nil.
+    // by_cases b: (b=true) `cons F = F` OCCURS-CHECK; (b=false) `cons F = nil`
+    // DISTINCTNESS. Single lemma clause `[-1]` validated by the split.
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let ctors = vec!["cons".to_string(), "nil".to_string()];
+    let decls: Vec<(String, Vec<String>)> = vec![("Lst".to_string(), ctors.clone())];
+
+    let parsed = vec![app(
+        "=",
+        vec![
+            app("cons", vec![sym("F")]),
+            app("ite", vec![sym("b"), sym("F"), sym("nil")]),
+        ],
+    )];
+    let lean = emit_dt_case_split_firewall_lean_from_parsed(&parsed, &ctors, &decls)
+        .expect("boolean-ite-guard case split should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("import AySoundness.Datatype"));
+    assert!(lean.contains("firewall_combined_unsat"));
+    assert!(lean.contains("cases hg : m.g"));
+    assert!(lean.contains("acyclic_conflict_generic")); // occurs branch
+    assert!(lean.contains("DtT.noConfusion")); // distinctness branch
+    assert!(lean.contains("cond m.g (m.t) (DtT.base)"));
+
+    // Reversed orientation `(= (ite b F nil) (cons F))` also fires.
+    let rev = vec![app(
+        "=",
+        vec![
+            app("ite", vec![sym("b"), sym("F"), sym("nil")]),
+            app("cons", vec![sym("F")]),
+        ],
+    )];
+    assert!(emit_dt_case_split_firewall_lean_from_parsed(&rev, &ctors, &decls).is_some());
+}
+
+#[test]
+fn emits_dt_case_split_ite_with_folding_from_parsed() {
+    // boolean-ite-guard AFTER sound const-folds, bench `dt_residual_falsesat_1.smt2`:
+    //   (= (node v11 (ite v15 v5 v5) v10)
+    //      (ite ((_ is nil) (cons v16 nil)) (ite v16 v12 (leaf c2)) (ite v15 v11 (leaf v2))))
+    // Folds: reflexive `(ite v15 v5 v5)`→v5; tester `((_ is nil)(cons ..))`→false so
+    // the outer ite→ELSE `(ite v15 v11 (leaf v2))`. Residual `node v11 v5 v10 =
+    // ite v15 v11 (leaf v2)`: (v15=true) OCCURS-CHECK `node.. ≠ v11`; (v15=false)
+    // DISTINCTNESS `node.. ≠ leaf v2`.
+    use ay_frontend::command::{Index as PIndex, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let tester = |c: &str, on: PTerm| {
+        PTerm::IndexedApp(
+            "is".to_string(),
+            vec![PIndex::Symbol(c.to_string())],
+            vec![on],
+        )
+    };
+    let ctors = vec![
+        "node".to_string(),
+        "leaf".to_string(),
+        "cons".to_string(),
+        "nil".to_string(),
+    ];
+    let decls: Vec<(String, Vec<String>)> = vec![
+        (
+            "Tree".to_string(),
+            vec!["leaf".to_string(), "node".to_string()],
+        ),
+        (
+            "Lst".to_string(),
+            vec!["cons".to_string(), "nil".to_string()],
+        ),
+    ];
+    let lhs = app(
+        "node",
+        vec![
+            sym("v11"),
+            app("ite", vec![sym("v15"), sym("v5"), sym("v5")]),
+            sym("v10"),
+        ],
+    );
+    let rhs = app(
+        "ite",
+        vec![
+            tester("nil", app("cons", vec![sym("v16"), sym("nil")])),
+            app(
+                "ite",
+                vec![sym("v16"), sym("v12"), app("leaf", vec![sym("c2")])],
+            ),
+            app(
+                "ite",
+                vec![sym("v15"), sym("v11"), app("leaf", vec![sym("v2")])],
+            ),
+        ],
+    );
+    let parsed = vec![app("=", vec![lhs, rhs])];
+    let lean = emit_dt_case_split_firewall_lean_from_parsed(&parsed, &ctors, &decls)
+        .expect("folded boolean-ite-guard case split should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("acyclic_conflict_generic"));
+    assert!(lean.contains("DtT.noConfusion"));
+    assert!(lean.contains("cases hg : m.g"));
+}
+
+#[test]
+fn emits_dt_case_split_distinct_disjunction_from_parsed() {
+    // finite-distinct-disjunction, bench `qf_dt_acyclicity_casesplit_false_sat.smt2`:
+    //   ((_ is nd) x)   and   (not (distinct (nd y x) lf x))
+    // over Tree = lf | nd(lc,rc). The 3-way OR resolves against distinctness
+    // `[-2]` (nd≠lf), occurs `[-3]` (nd(y,x)≠x) and tester-exclusion `[-1,-4]`.
+    use ay_frontend::command::{Index as PIndex, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let tester = |c: &str, on: &str| {
+        PTerm::IndexedApp(
+            "is".to_string(),
+            vec![PIndex::Symbol(c.to_string())],
+            vec![sym(on)],
+        )
+    };
+    let ctors = vec!["lf".to_string(), "nd".to_string()];
+    let decls: Vec<(String, Vec<String>)> = vec![("Tree".to_string(), ctors.clone())];
+    let parsed = vec![
+        tester("nd", "x"),
+        app(
+            "not",
+            vec![app(
+                "distinct",
+                vec![app("nd", vec![sym("y"), sym("x")]), sym("lf"), sym("x")],
+            )],
+        ),
+    ];
+    let lean = emit_dt_case_split_firewall_lean_from_parsed(&parsed, &ctors, &decls)
+        .expect("distinct-disjunction case split should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("import AySoundness.Datatype"));
+    assert!(lean.contains("firewall_combined_unsat"));
+    assert!(lean.contains("tester_node_leaf_excl") || lean.contains("isNode"));
+    assert!(lean.contains("Tree.node_ne_leaf"));
+    assert!(lean.contains("Tree.acyclic_r"));
+    // The 3-lemma resolution table + disjunctive original clause.
+    assert!(lean.contains("[(1, [1]), (2, [2, 3, 4])]"));
+    assert!(lean.contains("[(3, [-2]), (4, [-3]), (5, [-1, -4])]"));
+}
+
+#[test]
+fn dt_case_split_declines_unsound_shapes() {
+    // Fail-closed guarantees: emit ONLY when both `ite` branches are refutable.
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let app = |o: &str, a: Vec<PTerm>| PTerm::App(o.to_string(), a);
+    let ctors = vec!["cons".to_string(), "nil".to_string()];
+    let decls: Vec<(String, Vec<String>)> = vec![("Lst".to_string(), ctors.clone())];
+
+    // A branch that is a FRESH variable (not occurring in K, not a constructor)
+    // makes `cons F = y` genuinely SAT — decline.
+    let sat = vec![app(
+        "=",
+        vec![
+            app("cons", vec![sym("F")]),
+            app("ite", vec![sym("b"), sym("F"), sym("y")]),
+        ],
+    )];
+    assert!(emit_dt_case_split_firewall_lean_from_parsed(&sat, &ctors, &decls).is_none());
+
+    // K side is not a constructor application — decline.
+    let non_ctor = vec![app(
+        "=",
+        vec![
+            app("f", vec![sym("F")]),
+            app("ite", vec![sym("b"), sym("F"), sym("nil")]),
+        ],
+    )];
+    assert!(emit_dt_case_split_firewall_lean_from_parsed(&non_ctor, &ctors, &decls).is_none());
+
+    // distinct-disjunction WITHOUT the asserted tester — the `lf = x` disjunct is
+    // not refutable (x could genuinely be lf) — decline.
+    let no_tester = vec![app(
+        "not",
+        vec![app(
+            "distinct",
+            vec![app("nd", vec![sym("y"), sym("x")]), sym("lf"), sym("x")],
+        )],
+    )];
+    let tree_decls: Vec<(String, Vec<String>)> =
+        vec![("Tree".to_string(), vec!["lf".to_string(), "nd".to_string()])];
+    let tree_ctors = vec!["lf".to_string(), "nd".to_string()];
+    assert!(
+        emit_dt_case_split_firewall_lean_from_parsed(&no_tester, &tree_ctors, &tree_decls)
+            .is_none()
+    );
 }

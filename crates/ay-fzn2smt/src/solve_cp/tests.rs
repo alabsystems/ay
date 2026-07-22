@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 use ay_cp::engine::CpSolveResult;
 use ay_cp::variable::IntVarId;
@@ -112,9 +113,10 @@ fn invalid_parallel_worker_counts_are_rejected() {
 fn test_nqueens_specialist_emits_constructive_solution() {
     let n = 8;
     let coeffs = "array [1..2] of int: coeffs = [1,-1];\n";
-    let vars = (0..n)
-        .map(|i| format!("var 1..{n}: q{i};\n"))
-        .collect::<String>();
+    let mut vars = String::new();
+    for i in 0..n {
+        writeln!(&mut vars, "var 1..{n}: q{i};").expect("writing to a String cannot fail");
+    }
     let output = format!(
         "array [1..{n}] of var int: q :: output_array([1..{n}]) = [{}];\n",
         (0..n)

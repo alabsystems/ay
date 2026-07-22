@@ -889,8 +889,7 @@ mod tests {
                             for b in blo..=bhi {
                                 assert!(
                                     contains(&p, a * b),
-                                    "{a}*{b} not in {:?} (A=[{alo},{ahi}] B=[{blo},{bhi}])",
-                                    p
+                                    "{a}*{b} not in {p:?} (A=[{alo},{ahi}] B=[{blo},{bhi}])"
                                 );
                             }
                         }
@@ -911,8 +910,7 @@ mod tests {
                         let v64 = v.to_i64().unwrap();
                         assert!(
                             contains(&p, v64),
-                            "{s}^{m}={v64} not in {:?} ([{lo},{hi}])",
-                            p
+                            "{s}^{m}={v64} not in {p:?} ([{lo},{hi}])"
                         );
                     }
                 }
@@ -952,8 +950,7 @@ mod tests {
                                 if n % o == 0 {
                                     assert!(
                                         contains(&q, n / o),
-                                        "{n}/{o} not in {:?} (N=[{nlo},{nhi}] D=[{dlo},{dhi}])",
-                                        q
+                                        "{n}/{o} not in {q:?} (N=[{nlo},{nhi}] D=[{dlo},{dhi}])"
                                     );
                                 }
                             }
@@ -1051,8 +1048,7 @@ mod tests {
                         if p >= tlo && p <= thi {
                             assert!(
                                 contains(&c, s),
-                                "s={s} (s^{m}={p} in [{tlo},{thi}]) excluded by {:?}",
-                                c
+                                "s={s} (s^{m}={p} in [{tlo},{thi}]) excluded by {c:?}"
                             );
                         }
                     }

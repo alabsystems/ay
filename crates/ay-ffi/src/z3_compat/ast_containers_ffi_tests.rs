@@ -53,7 +53,12 @@ unsafe fn int_var(ctx: Z3_context, n: &CStr) -> Z3_ast {
 /// `p` must be a valid, NUL-terminated pointer owned by the context.
 unsafe fn s(p: Z3_string) -> String {
     // SAFETY: `p` is a context-owned C string per the caller's contract.
-    unsafe { CStr::from_ptr(p).to_str().unwrap().to_string() }
+    unsafe {
+        CStr::from_ptr(p)
+            .to_str()
+            .expect("Z3 string result must be valid UTF-8")
+            .to_string()
+    }
 }
 
 #[test]

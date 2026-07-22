@@ -734,23 +734,31 @@ pub(super) fn ground_eval_int_term(terms: &ay_core::TermStore, t: TermId) -> Opt
 }
 
 /// SMT-LIB `str.substr(s, start, len)` with ground arguments.
+///
+/// SMT-LIB 2.6: the result is the unique `w` with `s = u·w·v`, `|u| = start`
+/// and `|w| = min(len, |s| - start)`, when `0 <= start < |s|` and `0 < len`;
+/// the empty string otherwise. `len` is therefore only ever a CLAMP, so a `len`
+/// too large for `usize` selects the whole suffix — it is never a reason to
+/// refuse the fold, and `start + len` must never be computed unguarded:
+/// `(str.substr "abc" 1 18446744073709551615)` used to panic with "attempt to
+/// add with overflow" (release keeps overflow checks on), turning an `unsat`
+/// into `unknown` (#string-substr-length-overflow).
 pub(super) fn eval_substr(s: &str, start: &BigInt, len: &BigInt) -> Option<String> {
     let zero = BigInt::from(0);
     if *start < zero || *len <= zero {
         return Some(String::new());
     }
-    let start_usize: usize = start.try_into().ok()?;
-    let len_usize: usize = len.try_into().ok()?;
+    // A `start` too large for `usize` is necessarily `>= |s|`.
+    let Ok(start_usize) = usize::try_from(start) else {
+        return Some(String::new());
+    };
     let chars: Vec<char> = s.chars().collect();
     if start_usize >= chars.len() {
         return Some(String::new());
     }
-    debug_assert!(
-        start_usize.checked_add(len_usize).is_some(),
-        "BUG: eval_substr overflow: start {start_usize} + len {len_usize} overflows usize"
-    );
-    let end = std::cmp::min(start_usize + len_usize, chars.len());
-    Some(chars[start_usize..end].iter().collect())
+    let avail = chars.len() - start_usize;
+    let take = usize::try_from(len).map_or(avail, |n| std::cmp::min(n, avail));
+    Some(chars[start_usize..start_usize + take].iter().collect())
 }
 
 /// SMT-LIB `str.at(s, i)` with ground arguments.
@@ -759,7 +767,10 @@ pub(super) fn eval_str_at(s: &str, i: &BigInt) -> Option<String> {
     if *i < zero {
         return Some(String::new());
     }
-    let idx: usize = i.try_into().ok()?;
+    // An index too large for `usize` is necessarily `>= |s|`.
+    let Ok(idx) = usize::try_from(i) else {
+        return Some(String::new());
+    };
     let chars: Vec<char> = s.chars().collect();
     if idx >= chars.len() {
         Some(String::new())

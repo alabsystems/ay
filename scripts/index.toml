@@ -127,6 +127,7 @@ lang    = "python"
 group   = "bench.sat"
 summary = "Soundness audit for the BVE-enabled build: flag wrong answers on known-verdict instances."
 publish = "public"
+requires = ["oom-guard"]
 cli_note = "no fronting subcommand yet"
 docs    = "scripts/sat_bench/README.md"
 
@@ -267,6 +268,7 @@ lang    = "python"
 group   = "audit.chc"
 summary = "Independent CHC SAFE-certificate checker (external SMT arbiter)."
 publish = "public"
+requires = ["oom-guard"]
 cli_note = "no fronting subcommand yet"
 
 [[script]]
@@ -276,6 +278,7 @@ lang    = "python"
 group   = "gate.chc"
 summary = "Compare current AY CHC results against a checked-in baseline snapshot."
 publish = "public"
+requires = ["oom-guard"]
 cli     = "ay submission"
 
 [[script]]
@@ -385,6 +388,7 @@ group   = "fuzz"
 summary = "Differential SMT fuzzer: random well-typed formulas in a declared logic, AY vs Z3."
 publish = "public"
 tools   = ["z3"]
+requires = ["oom-guard"]
 cli_note = "no fronting subcommand yet"
 
 [[script]]
@@ -395,6 +399,7 @@ group   = "fuzz"
 summary = "Differential SMT fuzzer for datatypes (QF_DT, QF_UFDT, QF_UFDTLIA, AUFDTLIA)."
 publish = "public"
 tools   = ["z3"]
+requires = ["oom-guard"]
 cli_note = "no fronting subcommand yet"
 
 [[script]]
@@ -404,6 +409,7 @@ lang    = "python"
 group   = "fuzz"
 summary = "Differential soundness fuzz for word-equation (string) solving."
 publish = "public"
+requires = ["oom-guard"]
 cli_note = "no fronting subcommand yet"
 
 [[script]]
@@ -413,6 +419,7 @@ lang    = "python"
 group   = "fuzz"
 summary = "Differential soundness fuzz for SCC equivalent-literal substitution on planted-SAT CNFs."
 publish = "public"
+requires = ["oom-guard"]
 cli_note = "no fronting subcommand yet"
 
 [[script]]
@@ -479,6 +486,7 @@ group   = "bench.milp"
 summary = "ay-milp vs HiGHS verdict agreement on the real .milp corpus."
 publish = "public"
 tools   = ["highs", "scip", "gurobi"]
+requires = ["oom-guard"]
 cli_note = "no fronting subcommand yet; rename file to milp_compare.py post-0.1.0"
 
 [[script]]
@@ -489,6 +497,7 @@ group   = "bench.milp"
 summary = "Convert the .milp serialization to standard MPS (bit-exact f64 fields)."
 publish = "public"
 tools   = ["highs", "scip", "gurobi"]
+requires = ["oom-guard"]
 cli_note = "no fronting subcommand yet"
 
 [[script]]
@@ -499,6 +508,7 @@ group   = "bench.milp"
 summary = "HiGHS + SCIP + Gurobi verdicts on the .milp corpus via the exact-MPS bridge."
 publish = "public"
 tools   = ["highs", "scip", "gurobi"]
+requires = ["oom-guard"]
 cli_note = "no fronting subcommand yet"
 
 [[script]]
@@ -509,6 +519,7 @@ group   = "bench.milp"
 summary = "Time LP/MILP solvers on a corpus and compare verdicts."
 publish = "public"
 tools   = ["highs", "scip", "gurobi"]
+requires = ["oom-guard"]
 cli_note = "no fronting subcommand yet"
 
 [[script]]
@@ -519,6 +530,7 @@ group   = "bench.milp"
 summary = "Run ay-milp and HiGHS on the same MPS files and compare verdicts."
 publish = "public"
 tools   = ["highs", "scip", "gurobi"]
+requires = ["oom-guard"]
 cli_note = "no fronting subcommand yet"
 
 [[script]]
@@ -741,9 +753,8 @@ name    = "doc-reality-gate"
 path    = "scripts/check_doc_reality.sh"
 lang    = "bash"
 group   = "gate.release"
-summary = "placeholder: no checks configured"
+summary = "Check that local Markdown links in AY's public documentation resolve inside the checkout."
 publish = "public"
-status  = "placeholder"
 cli     = "ay gate"
 
 [[script]]

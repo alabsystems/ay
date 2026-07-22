@@ -31,7 +31,10 @@ unsafe fn num_str(c: Z3_context, a: Z3_ast) -> String {
     unsafe {
         let p = Z3_get_numeral_string(c, a);
         assert!(!p.is_null(), "expected a numeral string");
-        CStr::from_ptr(p).to_str().unwrap().to_string()
+        CStr::from_ptr(p)
+            .to_str()
+            .expect("numeral string must be valid UTF-8")
+            .to_string()
     }
 }
 
@@ -48,7 +51,7 @@ fn numerator_denominator_of_real_and_int() {
         assert_eq!(Z3_get_sort_kind(c, num_sort), Z3_INT_SORT);
 
         let neg = {
-            let s = CString::new("-7/2").unwrap();
+            let s = CString::new("-7/2").expect("negative rational literal has no NUL byte");
             Z3_mk_numeral(c, s.as_ptr(), Z3_mk_real_sort(c))
         };
         assert_eq!(num_str(c, Z3_get_numerator(c, neg)), "-7");
@@ -78,7 +81,7 @@ fn numeral_double_matches_exact_rational() {
         let third = Z3_mk_real(c, 1, 3);
         assert_eq!(Z3_get_numeral_double(c, third), 1.0 / 3.0);
         // BV numeral: libz3 raises Z3_INVALID_ARG and returns 0.0.
-        let s = CString::new("10").unwrap();
+        let s = CString::new("10").expect("bit-vector numeral literal has no NUL byte");
         let bv = Z3_mk_numeral(c, s.as_ptr(), Z3_mk_bv_sort(c, 8));
         assert_eq!(Z3_get_numeral_double(c, bv), 0.0);
         Z3_del_context(c);
@@ -92,20 +95,20 @@ fn numeral_rational_int64_and_small() {
         let c = ctx();
         let (mut n, mut d) = (0i64, 0i64);
         let r = Z3_mk_real(c, 3, 4);
-        assert!(Z3_get_numeral_rational_int64(c, r, &mut n, &mut d));
+        assert!(Z3_get_numeral_rational_int64(c, r, &raw mut n, &raw mut d));
         assert_eq!((n, d), (3, 4));
         let i5 = Z3_mk_int64(c, -5, Z3_mk_int_sort(c));
-        assert!(Z3_get_numeral_small(c, i5, &mut n, &mut d));
+        assert!(Z3_get_numeral_small(c, i5, &raw mut n, &raw mut d));
         assert_eq!((n, d), (-5, 1));
         // BV numerals report (value, 1), as libz3 does.
-        let s = CString::new("10").unwrap();
+        let s = CString::new("10").expect("bit-vector numeral literal has no NUL byte");
         let bv = Z3_mk_numeral(c, s.as_ptr(), Z3_mk_bv_sort(c, 8));
-        assert!(Z3_get_numeral_rational_int64(c, bv, &mut n, &mut d));
+        assert!(Z3_get_numeral_rational_int64(c, bv, &raw mut n, &raw mut d));
         assert_eq!((n, d), (10, 1));
         // Non-numeral: false.
         let sym = Z3_mk_string_symbol(c, c"y".as_ptr());
         let y = Z3_mk_const(c, sym, Z3_mk_int_sort(c));
-        assert!(!Z3_get_numeral_rational_int64(c, y, &mut n, &mut d));
+        assert!(!Z3_get_numeral_rational_int64(c, y, &raw mut n, &raw mut d));
         Z3_del_context(c);
     }
 }
@@ -115,18 +118,33 @@ fn numeral_binary_string() {
     // SAFETY: all handles live within one context.
     unsafe {
         let c = ctx();
-        let s = CString::new("10").unwrap();
+        let s = CString::new("10").expect("bit-vector numeral literal has no NUL byte");
         let bv = Z3_mk_numeral(c, s.as_ptr(), Z3_mk_bv_sort(c, 8));
         let p = Z3_get_numeral_binary_string(c, bv);
-        assert_eq!(CStr::from_ptr(p).to_str().unwrap(), "1010");
-        let z = CString::new("0").unwrap();
+        assert_eq!(
+            CStr::from_ptr(p)
+                .to_str()
+                .expect("bit-vector binary rendering must be valid UTF-8"),
+            "1010"
+        );
+        let z = CString::new("0").expect("zero bit-vector literal has no NUL byte");
         let bv0 = Z3_mk_numeral(c, z.as_ptr(), Z3_mk_bv_sort(c, 4));
         let p0 = Z3_get_numeral_binary_string(c, bv0);
-        assert_eq!(CStr::from_ptr(p0).to_str().unwrap(), "0");
+        assert_eq!(
+            CStr::from_ptr(p0)
+                .to_str()
+                .expect("zero bit-vector rendering must be valid UTF-8"),
+            "0"
+        );
         // Non-negative Int numerals are also in libz3's domain: 5 -> "101".
         let i5 = Z3_mk_int(c, 5, Z3_mk_int_sort(c));
         let p5 = Z3_get_numeral_binary_string(c, i5);
-        assert_eq!(CStr::from_ptr(p5).to_str().unwrap(), "101");
+        assert_eq!(
+            CStr::from_ptr(p5)
+                .to_str()
+                .expect("integer binary rendering must be valid UTF-8"),
+            "101"
+        );
         // Negative Int: null.
         let m = Z3_mk_int(c, -5, Z3_mk_int_sort(c));
         assert!(Z3_get_numeral_binary_string(c, m).is_null());
@@ -140,17 +158,22 @@ fn string_contents_and_lstring() {
     // sized to the reported length.
     unsafe {
         let c = ctx();
-        let lit = CString::new("hive").unwrap();
+        let lit = CString::new("hive").expect("string literal has no NUL byte");
         let s = Z3_mk_string(c, lit.as_ptr());
         let len = Z3_get_string_length(c, s);
         assert_eq!(len, 4);
-        let mut buf = vec![0 as c_uint; len as usize];
+        let mut buf = vec![0; len as usize];
         Z3_get_string_contents(c, s, len, buf.as_mut_ptr());
         assert_eq!(buf, vec![104, 105, 118, 101]); // h i v e
         let mut blen: c_uint = 999;
-        let p = Z3_get_lstring(c, s, &mut blen);
+        let p = Z3_get_lstring(c, s, &raw mut blen);
         assert_eq!(blen, 4);
-        assert_eq!(CStr::from_ptr(p).to_str().unwrap(), "hive");
+        assert_eq!(
+            CStr::from_ptr(p)
+                .to_str()
+                .expect("string literal readback must be valid UTF-8"),
+            "hive"
+        );
         // Non-literal: libz3 returns a non-null EMPTY string, sets INVALID_ARG
         // and leaves *length untouched (measured). The error code is the signal,
         // not the pointer — returning null instead would segfault a consumer
@@ -158,9 +181,14 @@ fn string_contents_and_lstring() {
         let sym = Z3_mk_string_symbol(c, c"sv".as_ptr());
         let v = Z3_mk_const(c, sym, Z3_mk_string_sort(c));
         let mut vlen: c_uint = 999;
-        let q = Z3_get_lstring(c, v, &mut vlen);
+        let q = Z3_get_lstring(c, v, &raw mut vlen);
         assert!(!q.is_null());
-        assert_eq!(CStr::from_ptr(q).to_str().unwrap(), "");
+        assert_eq!(
+            CStr::from_ptr(q)
+                .to_str()
+                .expect("non-literal string sentinel must be valid UTF-8"),
+            ""
+        );
         assert_eq!(Z3_get_error_code(c), Z3_INVALID_ARG);
         assert_eq!(vlen, 999);
         Z3_del_context(c);
@@ -236,10 +264,14 @@ fn finite_domain_sort_size_zero_and_false_for_non_fd_sorts() {
         assert!(!Z3_get_finite_domain_sort_size(
             c,
             Z3_mk_int_sort(c),
-            &mut sz
+            &raw mut sz
         ));
         assert_eq!(sz, 0);
-        assert!(!Z3_get_finite_domain_sort_size(c, ptr::null_mut(), &mut sz));
+        assert!(!Z3_get_finite_domain_sort_size(
+            c,
+            ptr::null_mut(),
+            &raw mut sz
+        ));
         Z3_del_context(c);
     }
 }
@@ -257,7 +289,7 @@ fn tuple_sort_introspection_via_single_ctor_datatype() {
             Z3_mk_string_symbol(c, c"snd".as_ptr()),
         ];
         let fsorts = [int_s, real_s];
-        let refs = [0 as c_uint, 0];
+        let refs: [c_uint; 2] = [0, 0];
         let ctor = Z3_mk_constructor(
             c,
             Z3_mk_string_symbol(c, c"mk-pair".as_ptr()),
@@ -279,17 +311,32 @@ fn tuple_sort_introspection_via_single_ctor_datatype() {
 
         let f0 = Z3_get_tuple_sort_field_decl(c, pair, 0);
         let f0_name = Z3_get_symbol_string(c, Z3_get_decl_name(c, f0));
-        assert_eq!(CStr::from_ptr(f0_name).to_str().unwrap(), "fst");
+        assert_eq!(
+            CStr::from_ptr(f0_name)
+                .to_str()
+                .expect("first tuple field name must be valid UTF-8"),
+            "fst"
+        );
         assert_eq!(Z3_get_sort_kind(c, Z3_get_range(c, f0)), Z3_INT_SORT);
 
         let f1 = Z3_get_tuple_sort_field_decl(c, pair, 1);
         let f1_name = Z3_get_symbol_string(c, Z3_get_decl_name(c, f1));
-        assert_eq!(CStr::from_ptr(f1_name).to_str().unwrap(), "snd");
+        assert_eq!(
+            CStr::from_ptr(f1_name)
+                .to_str()
+                .expect("second tuple field name must be valid UTF-8"),
+            "snd"
+        );
         assert!(Z3_get_tuple_sort_field_decl(c, pair, 2).is_null());
 
         let mk = Z3_get_tuple_sort_mk_decl(c, pair);
         let mk_name = Z3_get_symbol_string(c, Z3_get_decl_name(c, mk));
-        assert_eq!(CStr::from_ptr(mk_name).to_str().unwrap(), "mk-pair");
+        assert_eq!(
+            CStr::from_ptr(mk_name)
+                .to_str()
+                .expect("tuple constructor name must be valid UTF-8"),
+            "mk-pair"
+        );
         assert_eq!(Z3_get_arity(c, mk), 2);
         assert_eq!(Z3_get_sort_kind(c, Z3_get_range(c, mk)), Z3_DATATYPE_SORT);
 

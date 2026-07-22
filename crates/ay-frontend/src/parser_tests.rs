@@ -45,7 +45,10 @@ fn test_parse_bitvector_problem() {
     if let Command::DeclareConst(name, Sort::Indexed(sort, indices)) = &commands[1] {
         assert_eq!(name, "x");
         assert_eq!(sort, "BitVec");
-        assert_eq!(indices, &vec!["32".to_string()]);
+        assert_eq!(
+            indices,
+            &vec![crate::command::Index::Numeral("32".to_string())]
+        );
     } else {
         panic!("Expected DeclareConst with indexed sort");
     }
@@ -347,6 +350,13 @@ fn drain_stream(input: &str) -> Vec<CommandStreamItem> {
     CommandStream::new(input).collect()
 }
 
+fn stream_item_is_check_sat(item: &CommandStreamItem) -> bool {
+    matches!(
+        item,
+        CommandStreamItem::Command(command) if matches!(command.as_ref(), Command::CheckSat)
+    )
+}
+
 #[test]
 fn command_stream_matches_parse_for_valid_input() {
     let input = r#"
@@ -361,7 +371,7 @@ fn command_stream_matches_parse_for_valid_input() {
     assert_eq!(stream.len(), direct.len());
     for (item, expected) in stream.iter().zip(direct.iter()) {
         match item {
-            CommandStreamItem::Command(cmd) => assert_eq!(cmd, expected),
+            CommandStreamItem::Command(cmd) => assert_eq!(cmd.as_ref(), expected),
             CommandStreamItem::Error(e) => panic!("unexpected error for valid input: {e}"),
         }
     }
@@ -377,7 +387,11 @@ fn command_stream_recovers_from_unknown_command() {
     let mut check_sats = 0;
     for item in &items {
         match item {
-            CommandStreamItem::Command(Command::CheckSat) => check_sats += 1,
+            CommandStreamItem::Command(command)
+                if matches!(command.as_ref(), Command::CheckSat) =>
+            {
+                check_sats += 1;
+            }
             CommandStreamItem::Command(_) => {}
             CommandStreamItem::Error(_) => errors += 1,
         }
@@ -386,10 +400,7 @@ fn command_stream_recovers_from_unknown_command() {
     assert_eq!(check_sats, 2, "both check-sats must survive: {items:?}");
     // The command after the error must still parse.
     assert!(
-        matches!(
-            items.last(),
-            Some(CommandStreamItem::Command(Command::CheckSat))
-        ),
+        items.last().is_some_and(stream_item_is_check_sat),
         "stream must continue past the bad command"
     );
 }
@@ -401,7 +412,7 @@ fn command_stream_recovers_from_stray_close_paren() {
     let items = drain_stream(input);
     let check_sats = items
         .iter()
-        .filter(|i| matches!(i, CommandStreamItem::Command(Command::CheckSat)))
+        .filter(|item| stream_item_is_check_sat(item))
         .count();
     let errors = items
         .iter()
@@ -417,10 +428,7 @@ fn command_stream_error_does_not_consume_following_command() {
     let input = "(bogus)(check-sat)";
     let items = drain_stream(input);
     assert!(matches!(items[0], CommandStreamItem::Error(_)));
-    assert!(matches!(
-        items[1],
-        CommandStreamItem::Command(Command::CheckSat)
-    ));
+    assert!(stream_item_is_check_sat(&items[1]));
     assert_eq!(items.len(), 2);
 }
 
@@ -447,10 +455,7 @@ fn command_stream_coalesces_stray_atom_run_into_one_positioned_error() {
         }
         other => panic!("expected coalesced stray-token error, got: {other:?}"),
     }
-    assert!(matches!(
-        items[1],
-        CommandStreamItem::Command(Command::CheckSat)
-    ));
+    assert!(stream_item_is_check_sat(&items[1]));
 }
 
 #[test]
@@ -487,7 +492,7 @@ fn command_stream_resync_skips_comments_and_strings() {
     let items = drain_stream(input);
     let check_sats = items
         .iter()
-        .filter(|i| matches!(i, CommandStreamItem::Command(Command::CheckSat)))
+        .filter(|item| stream_item_is_check_sat(item))
         .count();
     assert_eq!(
         check_sats, 1,

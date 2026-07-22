@@ -481,9 +481,11 @@ pub(super) fn verify_lra_propagation(
     // a tighter bound on variable x implies a weaker bound on the same x.
     // Covers single-reason chains and multi-reason interval propagations.
     if let Some(result) = try_algebraic_verify(propagation, terms) {
+        ay_lia::instrument::bump_verify_lra_algebraic();
         return result;
     }
 
+    ay_lia::instrument::bump_verify_fresh_lra_solve();
     let mut verify_lra = LraSolver::new(terms);
     // #8257: Enable verification mode to skip post-simplex propagation
     // (implied bounds, bound propagations). The verification solver only
@@ -562,6 +564,7 @@ pub(super) fn verify_lia_propagation(
 
     verify_theory_propagation(propagation)?;
 
+    ay_lia::instrument::bump_verify_fresh_lia_solve();
     let mut verify_lia = LiaSolver::new(terms);
     for lit in &propagation.reason {
         verify_lia.assert_literal(lit.term, lit.value);
@@ -1618,6 +1621,7 @@ pub(crate) fn verify_lra_conflict_semantic(
     use ay_core::{TheoryResult, TheorySolver};
     use ay_lra::LraSolver;
 
+    ay_lia::instrument::bump_verify_fresh_lra_solve();
     let mut verify_lra = LraSolver::new(terms);
     // #8257: Enable verification mode to skip post-simplex propagation.
     verify_lra.set_verification_mode();
@@ -1655,6 +1659,7 @@ pub(crate) fn verify_lia_conflict_semantic(
     use ay_core::{TheoryResult, TheorySolver};
     use ay_lia::LiaSolver;
 
+    ay_lia::instrument::bump_verify_fresh_lia_solve();
     let mut verify_lia = LiaSolver::new(terms);
     for lit in conflict {
         verify_lia.assert_literal(lit.term, lit.value);
@@ -2469,6 +2474,7 @@ pub(crate) fn verify_conflict_semantic_memoized(
     let mut key = conflict.to_vec();
     key.sort_unstable();
     if let Some(&ok) = memo.get(&key) {
+        ay_lia::instrument::bump_verify_conflict_memoized(true);
         return if ok {
             Ok(())
         } else {
@@ -2479,6 +2485,7 @@ pub(crate) fn verify_conflict_semantic_memoized(
             ))
         };
     }
+    ay_lia::instrument::bump_verify_conflict_memoized(false);
     let result = verify_conflict_semantic_impl(conflict, terms, support_axioms, false);
     memo.insert(key, result.is_ok());
     result
@@ -3358,7 +3365,7 @@ mod mixed_string_conflict_gate_tests {
         // Distinct arithmetic literals over distinct Int vars, so the
         // duplicate/tautology pre-checks do not short-circuit.
         for i in 0..MAX_MIXED_STRING_CONFLICT_LITS {
-            let v = terms.mk_var(&format!("n{i}"), Sort::Int);
+            let v = terms.mk_var(format!("n{i}"), Sort::Int);
             let k = terms.mk_int(num_bigint::BigInt::from(i as i64));
             let atom = terms.mk_ge(v, k);
             conflict.push(TheoryLit::new(atom, true));

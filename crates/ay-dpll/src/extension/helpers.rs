@@ -127,9 +127,13 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         });
         if let (Some(memo), Some(key)) = (self.verify_memo.as_deref_mut(), key.as_ref()) {
             if memo.get(key) == Some(&true) {
+                ay_lia::instrument::bump_verify_conflict_ext(true);
                 return Ok(());
             }
         }
+        // #verify-memo instrumentation: full fail-closed re-verification runs
+        // (memo miss, memoized-false, or no memo wired).
+        ay_lia::instrument::bump_verify_conflict_ext(false);
         let result = if euf_prechecked {
             crate::verification::verify_conflict_semantic_euf_prechecked(
                 conflict,

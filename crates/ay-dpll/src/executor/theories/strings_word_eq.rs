@@ -114,22 +114,6 @@ fn max_we_loop() -> u32 {
     *V.get_or_init(|| parse_max_we_loop(std::env::var("AY_WE_MAX_LOOP").ok().as_deref()))
 }
 
-#[cfg(test)]
-mod config_tests {
-    use super::*;
-
-    #[test]
-    fn max_we_loop_defaults_accepts_overrides_and_caps_before_allocation() {
-        assert_eq!(parse_max_we_loop(None), MAX_WE_LOOP);
-        assert_eq!(parse_max_we_loop(Some("64")), 64);
-        assert_eq!(parse_max_we_loop(Some("invalid")), MAX_WE_LOOP);
-        assert_eq!(
-            parse_max_we_loop(Some("4294967295")),
-            MAX_WE_REGEX_SIZE as u32
-        );
-    }
-}
-
 /// The extracted word-equation fragment plus the TermId for each variable
 /// index (`var_terms[i]` is the term for `WeSym::Var(i as u32)`).
 ///
@@ -1540,5 +1524,21 @@ impl Executor {
             saved_skip_model_eval,
         );
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn max_we_loop_defaults_accepts_overrides_and_caps_before_allocation() {
+        assert_eq!(parse_max_we_loop(None), MAX_WE_LOOP);
+        assert_eq!(parse_max_we_loop(Some("64")), 64);
+        assert_eq!(parse_max_we_loop(Some("invalid")), MAX_WE_LOOP);
+        assert_eq!(
+            parse_max_we_loop(Some("4294967295")),
+            MAX_WE_REGEX_SIZE as u32
+        );
     }
 }

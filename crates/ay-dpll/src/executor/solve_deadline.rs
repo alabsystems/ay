@@ -83,7 +83,9 @@ mod tests {
         let handle = cell.clone();
         assert_eq!(handle.get(), None);
         assert!(!handle.expired());
-        let past = Instant::now() - Duration::from_millis(1);
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("1 millisecond must fit before the current test instant");
         cell.set(Some(past));
         assert_eq!(handle.get(), Some(past));
         assert!(handle.expired());

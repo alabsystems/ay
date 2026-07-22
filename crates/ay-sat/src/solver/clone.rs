@@ -545,6 +545,7 @@ impl cold::ColdState {
             preprocess_enabled: self.preprocess_enabled,
             preprocess_watches_valid: self.preprocess_watches_valid,
             preprocess_deadline: None,
+            solve_deadline: None,
             incremental_watch_boundary: self.incremental_watch_boundary,
             symmetry_enabled: self.symmetry_enabled,
             symmetry_stats: self.symmetry_stats.clone(),
@@ -877,8 +878,7 @@ mod tests {
         let clone = solver.clone_for_ic3();
 
         // Verify activities are preserved in the clone.
-        for i in 0..4 {
-            let orig = activities_before[i];
+        for (i, &orig) in activities_before.iter().enumerate() {
             let cloned = clone.vsids.activity(Variable(i as u32));
             assert!(
                 (orig - cloned).abs() < f64::EPSILON,

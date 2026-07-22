@@ -20,7 +20,7 @@ fn rat(n: i64, d: i64) -> BigRational {
 
 /// Build a solver over the given assertions, run `check()` (which parses atoms
 /// and sets bounds), and return the interned objective variable for `obj`.
-fn checked_solver(terms: &TermStore, assertions: &[(ay_core::TermId, bool)]) -> LraSolver {
+fn checked_solver(terms: &TermStore, assertions: &[(TermId, bool)]) -> LraSolver {
     let mut solver = LraSolver::new(terms);
     for &(atom, polarity) in assertions {
         solver.assert_literal(atom, polarity);
@@ -32,7 +32,7 @@ fn checked_solver(terms: &TermStore, assertions: &[(ay_core::TermId, bool)]) -> 
     solver
 }
 
-fn objective_of(solver: &LraSolver, var_term: ay_core::TermId) -> LinearExpr {
+fn objective_of(solver: &LraSolver, var_term: TermId) -> LinearExpr {
     LinearExpr::var(*solver.term_to_var().get(&var_term).expect("interned"))
 }
 

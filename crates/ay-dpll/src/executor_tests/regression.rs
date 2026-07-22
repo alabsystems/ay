@@ -7,6 +7,7 @@
 
 use crate::{Executor, StatValue, Statistics};
 use ay_frontend::parse;
+use ay_test_support::env::with_serialized_env_vars;
 use ntest::timeout;
 
 #[test]
@@ -1843,27 +1844,30 @@ fn test_dt_enum_selector_pigeonhole_not_false_sat() {
 #[test]
 #[timeout(60000)]
 fn test_deleted_env_kill_switches_have_no_effect_on_soundness_guards() {
-    // Nothing reads these vars anymore; setting them must be inert.
-    std::env::set_var("AY_LRA_NO_ITE_SHARED_EQ", "0");
-    std::env::set_var("AY_NO_LRA_CSA_UNSAT_GUARD", "1");
-    std::env::set_var("AY_NO_DISEQ_CLOSURE_GUARD", "1");
-    std::env::set_var("AY_NO_STALE_MODELEQ_SAT", "1");
-    let smt = r#"
-        (set-logic QF_UFLRA)
-        (declare-const z Real)
-        (declare-const p Bool)
-        (declare-fun ga (Real) Real)
-        (assert (= (ga z) 5.0))
-        (assert (= z (ite p (- 3.0) (- 2.0))))
-        (check-sat)
-    "#;
-    let commands = parse(smt).unwrap();
-    let mut exec = Executor::new();
-    let outputs = exec.execute_all(&commands).unwrap();
-    std::env::remove_var("AY_LRA_NO_ITE_SHARED_EQ");
-    std::env::remove_var("AY_NO_LRA_CSA_UNSAT_GUARD");
-    std::env::remove_var("AY_NO_DISEQ_CLOSURE_GUARD");
-    std::env::remove_var("AY_NO_STALE_MODELEQ_SAT");
+    // Nothing reads these vars anymore; setting them must be inert. Serialized
+    // + restore-on-exit via the workspace env choke point.
+    let outputs = with_serialized_env_vars(
+        &[
+            ("AY_LRA_NO_ITE_SHARED_EQ", "0"),
+            ("AY_NO_LRA_CSA_UNSAT_GUARD", "1"),
+            ("AY_NO_DISEQ_CLOSURE_GUARD", "1"),
+            ("AY_NO_STALE_MODELEQ_SAT", "1"),
+        ],
+        || {
+            let smt = r#"
+                (set-logic QF_UFLRA)
+                (declare-const z Real)
+                (declare-const p Bool)
+                (declare-fun ga (Real) Real)
+                (assert (= (ga z) 5.0))
+                (assert (= z (ite p (- 3.0) (- 2.0))))
+                (check-sat)
+            "#;
+            let commands = parse(smt).unwrap();
+            let mut exec = Executor::new();
+            exec.execute_all(&commands).unwrap()
+        },
+    );
     assert_eq!(
         outputs.last().map(String::as_str),
         Some("sat"),

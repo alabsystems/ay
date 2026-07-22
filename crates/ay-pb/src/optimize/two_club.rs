@@ -191,6 +191,10 @@ struct TwoClub {
     n: usize,
     /// Non-adjacent pairs: (i, j, common-neighbour list), 0-based vertices.
     pairs: Vec<(u32, u32, Vec<u32>)>,
+    /// G-adjacency bitset: `adj_bits[v]` bit `u` set iff `{u,v} in E`
+    /// (complement of `pairs`, no self-loops). Used by the 2-domination
+    /// separator (independence tests + neighbourhood scans).
+    adj_bits: Vec<Vec<u64>>,
     /// For each vertex, the indices into `pairs` where it appears as i or j.
     pair_of_vertex: Vec<Vec<u32>>,
     /// For each vertex, the indices into `pairs` whose CN list contains it.
@@ -301,9 +305,25 @@ fn recognize(instance: &PbInstance, objective: &PbObjective) -> Option<TwoClub> 
             cn_of_vertex[k as usize].push(idx as u32);
         }
     }
+    let words = n.div_ceil(64);
+    let mut adj_bits = vec![vec![u64::MAX; words]; n];
+    for (v, row) in adj_bits.iter_mut().enumerate() {
+        row[v / 64] &= !(1u64 << (v % 64));
+        let tail = n % 64;
+        if tail != 0 {
+            row[words - 1] &= (1u64 << tail) - 1;
+        }
+    }
+    for &(a, b, _) in &pairs {
+        let (a, b) = (a as usize, b as usize);
+        adj_bits[a][b / 64] &= !(1u64 << (b % 64));
+        adj_bits[b][a / 64] &= !(1u64 << (a % 64));
+    }
+
     Some(TwoClub {
         n,
         pairs,
+        adj_bits,
         pair_of_vertex,
         cn_of_vertex,
     })
@@ -560,6 +580,199 @@ fn viol_odd_hole_rows(tc: &TwoClub, state: &SearchState, cap: usize) -> Vec<Vec<
         }
     }
     out
+}
+
+/// Violated independent-set 2-DOMINATION cuts at the fractional point `x*`
+/// (exact over triples of the top-80 x*-mass candidates — see the diagnostic
+/// history in the development design notes*). Returns up to `cap` cuts
+/// `(I = [a,b,c], hubs = [(v, coeff)])` with violation > 0.03, meaning
+/// `Σ_I x − Σ_hubs coeff·x_v > 1 + 0.03` at x*. Validity of each cut for every
+/// 2-club `S ⊆ C` (and every descendant C' — removed members/hubs only relax/
+/// re-derive the same proof): the witness-clique spanning-tree argument of
+/// Mahdavi Pajouh–Balasundaram–Hicks 2016.
+fn indep_2dom_cuts(
+    tc: &TwoClub,
+    state: &SearchState,
+    x: &[f64],
+    cap: usize,
+) -> Vec<(Vec<u32>, Vec<(u32, u8)>)> {
+    let n = tc.n;
+    let words = n.div_ceil(64);
+    let mut order: Vec<u32> = (0..n as u32).filter(|&v| state.in_c[v as usize]).collect();
+    order.sort_unstable_by(|&a, &b| {
+        x[b as usize]
+            .partial_cmp(&x[a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    order.truncate(80);
+    let k = order.len();
+    if k < 3 {
+        return Vec::new();
+    }
+    let mut cmask = vec![0u64; words];
+    for v in 0..n {
+        if state.in_c[v] {
+            cmask[v / 64] |= 1u64 << (v % 64);
+        }
+    }
+    let nb: Vec<Vec<u64>> = order
+        .iter()
+        .map(|&u| {
+            tc.adj_bits[u as usize]
+                .iter()
+                .zip(cmask.iter())
+                .map(|(&a, &c)| a & c)
+                .collect::<Vec<u64>>()
+        })
+        .collect();
+    let mass = |bits: &[u64]| -> f64 {
+        let mut s = 0.0;
+        for (w, &b0) in bits.iter().enumerate() {
+            let mut b = b0;
+            while b != 0 {
+                let v = w * 64 + b.trailing_zeros() as usize;
+                b &= b - 1;
+                s += x[v];
+            }
+        }
+        s
+    };
+    let adj = |i: usize, j: usize| -> bool {
+        let vj = order[j] as usize;
+        tc.adj_bits[order[i] as usize][vj / 64] & (1u64 << (vj % 64)) != 0
+    };
+    let mut pair_mass = vec![f64::NAN; k * k];
+    let mut buf = vec![0u64; words];
+    for i in 0..k {
+        for j in (i + 1)..k {
+            if adj(i, j) {
+                continue;
+            }
+            for w in 0..words {
+                buf[w] = nb[i][w] & nb[j][w];
+            }
+            pair_mass[i * k + j] = mass(&buf);
+        }
+    }
+    // Collect violated triples.
+    let mut found: Vec<(f64, usize, usize, usize)> = Vec::new();
+    for i in 0..k {
+        for j in (i + 1)..k {
+            let mij = pair_mass[i * k + j];
+            if mij.is_nan() {
+                continue;
+            }
+            for l in (j + 1)..k {
+                let mil = pair_mass[i * k + l];
+                let mjl = pair_mass[j * k + l];
+                if mil.is_nan() || mjl.is_nan() {
+                    continue;
+                }
+                let mut m3 = 0.0;
+                for w in 0..words {
+                    let mut b = nb[i][w] & nb[j][w] & nb[l][w];
+                    while b != 0 {
+                        let v = w * 64 + b.trailing_zeros() as usize;
+                        b &= b - 1;
+                        m3 += x[v];
+                    }
+                }
+                let viol = x[order[i] as usize] + x[order[j] as usize] + x[order[l] as usize]
+                    - (mij + mil + mjl - m3)
+                    - 1.0;
+                if viol > 0.03 {
+                    found.push((viol, i, j, l));
+                }
+            }
+        }
+    }
+    found.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    found.truncate(cap);
+    // Materialize hub coefficient lists: coeff = cover-1 for cover in {2,3}.
+    let mut out = Vec::with_capacity(found.len());
+    for &(_, i, j, l) in &found {
+        let members = vec![order[i], order[j], order[l]];
+        let mut hubs: Vec<(u32, u8)> = Vec::new();
+        for w in 0..words {
+            let bi = nb[i][w];
+            let bj = nb[j][w];
+            let bl = nb[l][w];
+            let mut two = (bi & bj) | (bi & bl) | (bj & bl);
+            let three = bi & bj & bl;
+            two &= !three;
+            let mut b = two;
+            while b != 0 {
+                let v = (w * 64 + b.trailing_zeros() as usize) as u32;
+                b &= b - 1;
+                hubs.push((v, 1));
+            }
+            let mut b = three;
+            while b != 0 {
+                let v = (w * 64 + b.trailing_zeros() as usize) as u32;
+                b &= b - 1;
+                hubs.push((v, 2));
+            }
+        }
+        out.push((members, hubs));
+    }
+    out
+}
+
+/// Builds the Solve-mode model rows: pair rows (CN restricted to `C`, sorted
+/// merge of endpoints into the CN stream) followed by clique-cut rows.
+/// Returns `(rows_raw, pair_of_row, cliques)`; `None` if over `cfg.max_rows`.
+#[allow(clippy::type_complexity)]
+fn build_solve_rows(
+    tc: &TwoClub,
+    state: &SearchState,
+    cfg: &LpNodeBound,
+) -> Option<(Vec<(Vec<(usize, f64)>, f64)>, Vec<u32>, Vec<Vec<u32>>)> {
+    let mut rows_raw: Vec<(Vec<(usize, f64)>, f64)> = Vec::new();
+    let mut pair_of_row: Vec<u32> = Vec::new();
+    for (pi, (a, b, cn)) in tc.pairs.iter().enumerate() {
+        if !state.both_in[pi] {
+            continue;
+        }
+        let (a, b) = (*a as usize, *b as usize);
+        let mut coeffs: Vec<(usize, f64)> = Vec::with_capacity(cn.len() + 2);
+        let mut placed_a = false;
+        let mut placed_b = false;
+        for &k in cn {
+            let k = k as usize;
+            if state.in_c[k] {
+                if !placed_a && a < k {
+                    coeffs.push((a, -1.0));
+                    placed_a = true;
+                }
+                if !placed_b && b < k {
+                    if !placed_a {
+                        coeffs.push((a, -1.0));
+                        placed_a = true;
+                    }
+                    coeffs.push((b, -1.0));
+                    placed_b = true;
+                }
+                coeffs.push((k, 1.0));
+            }
+        }
+        if !placed_a {
+            coeffs.push((a, -1.0));
+        }
+        if !placed_b {
+            coeffs.push((b, -1.0));
+        }
+        rows_raw.push((coeffs, -1.0));
+        pair_of_row.push(pi as u32);
+        if cfg.max_rows != 0 && rows_raw.len() > cfg.max_rows {
+            return None;
+        }
+    }
+    let cliques = viol_clique_rows(tc, state, 2000);
+    for q in &cliques {
+        let coeffs: Vec<(usize, f64)> = q.iter().map(|&v| (v as usize, -1.0)).collect();
+        rows_raw.push((coeffs, -1.0));
+    }
+    Some((rows_raw, pair_of_row, cliques))
 }
 
 /// Fixed-point scale for the exact-integer dual arithmetic. Duals are rounded
@@ -929,7 +1142,7 @@ fn refresh_dual_snapshot(
         rows_raw.push((coeffs, -2.0));
     }
     let nrows_dbg = rows_raw.len();
-    let duals = match crate::optimize::safe_lp_bound::safe_lp_duals_from_raw(
+    let (duals, xstar) = match crate::optimize::safe_lp_bound::safe_lp_duals_and_primal_from_raw(
         n,
         c,
         rows_raw,
@@ -937,7 +1150,7 @@ fn refresh_dual_snapshot(
         Some(-(best_floor as f64) + 0.5),
         should_stop,
     ) {
-        Some(d) => d,
+        Some(dp) => dp,
         None => {
             if trace {
                 eprintln!("  [solve-none-raw] raw returned None (rows={nrows_dbg})");
@@ -1011,12 +1224,113 @@ fn refresh_dual_snapshot(
             ay[v as usize] -= m;
         }
     }
-    let d: Vec<i128> = ay.iter().map(|&a| -DUAL_SCALE - a).collect();
-    let sum: i128 = (0..n).filter(|&v| state.in_c[v]).map(|v| d[v].min(0)).sum();
+    let mut d: Vec<i128> = ay.iter().map(|&a| -DUAL_SCALE - a).collect();
+    let mut sum: i128 = (0..n).filter(|&v| state.in_c[v]).map(|v| d[v].min(0)).sum();
 
     // Prune decisions, all on the exact scaled grid: UB ≤ floor  ⇔
     // base + sum ≥ -floor·SCALE.
     let mut prune = base + sum >= -best_floor * DUAL_SCALE;
+    // 2-DOMINATION CUT ROUND (near-misses only): separate the facet family at
+    // x*, append violated cuts, resolve ONCE, re-price exactly, and adopt the
+    // strengthened pricing when tighter. Diagnostic history: exact-triple
+    // separation finds violations 0.05-0.33 at ~2/3 of near-misses, exactly at
+    // the binding points (the development design notes*).
+    if !prune && base + sum >= -(best_floor + 4) * DUAL_SCALE {
+        let cuts = indep_2dom_cuts(tc, state, &xstar, 50);
+        if !cuts.is_empty() {
+            if let Some((mut rows2, pair_of_row2, cliques2)) = build_solve_rows(tc, state, cfg) {
+                let n_pc = rows2.len();
+                for (members, hubs) in &cuts {
+                    let mut coeffs: Vec<(usize, f64)> = members
+                        .iter()
+                        .map(|&i| (i as usize, -1.0))
+                        .chain(hubs.iter().map(|&(v, c)| (v as usize, c as f64)))
+                        .collect();
+                    coeffs.sort_unstable_by_key(|e| e.0);
+                    rows2.push((coeffs, -1.0));
+                }
+                let c2: Vec<f64> = (0..n)
+                    .map(|v| if state.in_c[v] { -1.0 } else { 0.0 })
+                    .collect();
+                if let Some((duals2, _x2)) =
+                    crate::optimize::safe_lp_bound::safe_lp_duals_and_primal_from_raw(
+                        n,
+                        c2,
+                        rows2,
+                        Some(-(best_floor as f64) + 0.5),
+                        should_stop,
+                    )
+                {
+                    if duals2.len() == n_pc + cuts.len() {
+                        let mut base2: i128 = 0;
+                        let mut ay2 = vec![0i128; n];
+                        for (row_i, &pi) in pair_of_row2.iter().enumerate() {
+                            let m = ((duals2[row_i] * DUAL_SCALE as f64).floor() as i128)
+                                .clamp(0, DUAL_M_MAX);
+                            if m == 0 {
+                                continue;
+                            }
+                            base2 -= m;
+                            let (a, b, cn) = &tc.pairs[pi as usize];
+                            ay2[*a as usize] -= m;
+                            ay2[*b as usize] -= m;
+                            for &kk in cn {
+                                if state.in_c[kk as usize] {
+                                    ay2[kk as usize] += m;
+                                }
+                            }
+                        }
+                        for (qi, q) in cliques2.iter().enumerate() {
+                            let m = ((duals2[pair_of_row2.len() + qi] * DUAL_SCALE as f64).floor()
+                                as i128)
+                                .clamp(0, DUAL_M_MAX);
+                            if m == 0 {
+                                continue;
+                            }
+                            base2 -= m;
+                            for &v in q {
+                                ay2[v as usize] -= m;
+                            }
+                        }
+                        for (ci, (members, hubs)) in cuts.iter().enumerate() {
+                            let m = ((duals2[n_pc + ci] * DUAL_SCALE as f64).floor() as i128)
+                                .clamp(0, DUAL_M_MAX);
+                            if m == 0 {
+                                continue;
+                            }
+                            base2 -= m;
+                            for &i in members {
+                                ay2[i as usize] -= m;
+                            }
+                            for &(v, cc) in hubs {
+                                ay2[v as usize] += (cc as i128) * m;
+                            }
+                        }
+                        let d2: Vec<i128> = ay2.iter().map(|&a| -DUAL_SCALE - a).collect();
+                        let sum2: i128 = (0..n)
+                            .filter(|&v| state.in_c[v])
+                            .map(|v| d2[v].min(0))
+                            .sum();
+                        if std::env::var_os("TWO_CLUB_TRACE").is_some() {
+                            eprintln!(
+                                "  [2cut] c={} ub_before={:.2} ub_after={:.2} ncuts={}",
+                                state.c_size,
+                                -((base + sum) as f64) / DUAL_SCALE as f64,
+                                -((base2 + sum2) as f64) / DUAL_SCALE as f64,
+                                cuts.len(),
+                            );
+                        }
+                        if base2 + sum2 > base + sum {
+                            base = base2;
+                            d = d2;
+                            sum = sum2;
+                            prune = base + sum >= -best_floor * DUAL_SCALE;
+                        }
+                    }
+                }
+            }
+        }
+    }
     if !prune && cfg.exact_margin > 0 && base + sum >= -(best_floor + cfg.exact_margin) * DUAL_SCALE
     {
         // Near miss: escalate to the exact rational LP + cutting-plane loop,
@@ -1150,9 +1464,9 @@ fn solve_exact_cell(
     let mut rx_170: u64 = 0; // [170,200]
     let mut rx_lo: u64 = 0; //  < 150
     let mut lp_ceil_kill_a: u64 = 0; // float-solve tier
-    let mut lp_ceil_kill_b: u64 = 0; // exact LP+cuts tier
-                                     // Dual SUPPORT pairs from the most recent FULL refresh; Support solves
-                                     // re-optimize y on just these rows (~100x cheaper) at nearby nodes.
+    let lp_ceil_kill_b: u64 = 0; // exact LP+cuts tier
+                                 // Dual SUPPORT pairs from the most recent FULL refresh; Support solves
+                                 // re-optimize y on just these rows (~100x cheaper) at nearby nodes.
     let mut dual_support: Option<Vec<u32>> = None;
 
     // Explicit DFS: each frame is (vertex_removed, undo_log, phase).
@@ -1347,7 +1661,8 @@ fn solve_exact_cell(
                             // for non-pruning ones the UB says whether stronger
                             // in-refresh cuts could convert them.
                             if progress
-                                && (lp_refreshes % 128 == 0 || (!f.prune && lp_refreshes % 32 == 0))
+                                && (lp_refreshes.is_multiple_of(128)
+                                    || (!f.prune && lp_refreshes.is_multiple_of(32)))
                             {
                                 eprintln!(
                                     "  [refresh] c={} ub={:.2} floor={best_floor} pruned={} nu={}",

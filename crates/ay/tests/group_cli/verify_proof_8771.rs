@@ -134,18 +134,105 @@ fn test_no_verify_proof_skips_verification() {
     );
 }
 
-/// Soundness test (CLI): run ay with `--verify-proof` and point `--proof`
-/// at a pre-written UNSAT-for-a-different-formula DIMACS proof file. Since
-/// the solver overwrites the proof file as part of UNSAT emission, we
-/// instead exercise the rejection path via an empty proof file — the
-/// library layer rejects empty proofs with `Rejected` outcome, which the
-/// CLI forwards as exit code 1.
-///
-/// We simulate this by constructing a parallel test: run ay with
-/// `--verify-proof --proof <path>` on a SAT formula — the solver writes
-/// nothing to the proof path, and the post-solve verify is skipped on SAT.
-/// Then separately, exercise the library rejection path via the
-/// DRAT checker using a syntactically-valid-but-semantically-invalid proof.
+/// `--strict-proofs` and `--self-check` are route-independent result promises.
+/// On DIMACS they therefore require AY to emit, descriptor-seal, and re-check
+/// a same-run DRAT/LRAT refutation before publishing UNSAT. Explicit proof or
+/// checker opt-outs are incompatible and must fail before any verdict.
+#[test]
+fn test_dimacs_required_proof_gates_reject_proof_opt_outs_before_verdict() {
+    for gate in ["--strict-proofs", "--self-check"] {
+        let (cnf, proof, _guard) = temp_paths(&format!(
+            "{}_opt_out",
+            gate.trim_start_matches("--").replace('-', "_")
+        ));
+
+        let no_proof = Command::new(ay_binary())
+            .arg(gate)
+            .arg("--no-proof")
+            .arg(&cnf)
+            .output()
+            .expect("spawn ay --no-proof gate regression");
+        let stdout = String::from_utf8_lossy(&no_proof.stdout);
+        let stderr = String::from_utf8_lossy(&no_proof.stderr);
+        assert_eq!(
+            no_proof.status.code(),
+            Some(1),
+            "{gate} --no-proof must fail closed; stdout={stdout}; stderr={stderr}"
+        );
+        assert!(
+            !stdout.contains("SATISFIABLE") && !stdout.contains("UNKNOWN"),
+            "{gate} --no-proof leaked a DIMACS verdict: {stdout}"
+        );
+        assert!(
+            stderr.contains("requires a same-run DIMACS refutation"),
+            "{gate} --no-proof diagnostic did not explain the contract: {stderr}"
+        );
+
+        let no_verify = Command::new(ay_binary())
+            .arg(gate)
+            .arg("--no-verify-proof")
+            .arg("--proof")
+            .arg(&proof)
+            .arg(&cnf)
+            .output()
+            .expect("spawn ay --no-verify-proof gate regression");
+        let stdout = String::from_utf8_lossy(&no_verify.stdout);
+        let stderr = String::from_utf8_lossy(&no_verify.stderr);
+        assert_eq!(
+            no_verify.status.code(),
+            Some(1),
+            "{gate} --no-verify-proof must fail closed; stdout={stdout}; stderr={stderr}"
+        );
+        assert!(
+            !stdout.contains("SATISFIABLE") && !stdout.contains("UNKNOWN"),
+            "{gate} --no-verify-proof leaked a DIMACS verdict: {stdout}"
+        );
+        assert!(
+            stderr.contains("requires authenticated DIMACS proof re-checking"),
+            "{gate} --no-verify-proof diagnostic did not explain the contract: {stderr}"
+        );
+        assert!(
+            !proof.exists(),
+            "incompatible {gate} route should be rejected before creating a proof"
+        );
+    }
+}
+
+#[test]
+fn test_dimacs_required_proof_gates_emit_and_recheck_same_run_proof() {
+    for gate in ["--strict-proofs", "--self-check"] {
+        let (cnf, proof, _guard) = temp_paths(&format!(
+            "{}_checked",
+            gate.trim_start_matches("--").replace('-', "_")
+        ));
+        let output = Command::new(ay_binary())
+            .arg(gate)
+            .arg("--proof")
+            .arg(&proof)
+            .arg(&cnf)
+            .output()
+            .expect("spawn ay required DIMACS proof gate");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(20),
+            "{gate} should accept a verified same-run proof; stdout={stdout}; stderr={stderr}"
+        );
+        assert!(
+            stdout.contains("s UNSATISFIABLE"),
+            "{gate} did not publish checked UNSAT: {stdout}"
+        );
+        assert!(
+            stderr.contains("verify-proof:") && stderr.contains("verified"),
+            "{gate} did not run the independent proof checker: {stderr}"
+        );
+        assert!(proof.exists(), "{gate} did not emit its required proof");
+    }
+}
+
+/// Soundness test for the checker itself: a proof that claims the empty
+/// clause for a satisfiable formula must be rejected.
 #[test]
 fn test_checker_rejects_nonderiving_proof() {
     use ay_drat_check::checker::DratChecker;
@@ -170,16 +257,60 @@ fn test_checker_rejects_nonderiving_proof() {
     );
 }
 
-/// End-to-end negative test (CLI exit code): write a user-supplied proof
-/// file that the solver overwrites on UNSAT, so this only exercises the
-/// default-accept path. But we can still probe the explicit-rejection path
-/// by pointing `--proof` at a pre-existing invalid file. Since the solver
-/// truncates the file on UNSAT and re-writes a valid proof, a CLI-round-trip
-/// corruption test is not possible without injecting at the solver level.
-/// The closest end-to-end coverage is `test_verify_proof_explicit_on_accepts_valid_proof`
-/// plus the checker-level test above: together they prove the CLI pipeline
-/// accepts valid proofs AND the checker rejects bad proofs. Library unit
-/// tests in `proof_verify::tests` cover the dispatch glue.
+/// An explicitly required checker is an authority gate, so a proof format the
+/// internal DIMACS checker cannot verify must fail before any public UNSAT
+/// surface is emitted. The proof file itself is diagnostic output and may
+/// remain, but neither result statistics nor a proof-artifact envelope may
+/// claim that the run was authorized.
+#[test]
+fn test_required_verification_precedes_unsat_stats_and_artifact() {
+    let (cnf, drat, mut guard) = temp_paths("authority_order");
+    let proof = drat.with_extension("alethe");
+    let artifact = drat.with_extension("proof-artifact.json");
+    guard.0.push(proof.clone());
+    guard.0.push(artifact.clone());
+
+    let output = Command::new(ay_binary())
+        .arg("--verify-proof")
+        .arg("--stats-json")
+        .arg("--proof")
+        .arg(&proof)
+        .arg("--proof-artifact")
+        .arg(&artifact)
+        .arg(&cnf)
+        .output()
+        .expect("spawn ay");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "unsupported mandatory verification must fail; stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        proof.exists(),
+        "the test must reach post-solve verification after emitting a proof"
+    );
+    assert!(
+        !stdout.contains("s UNSATISFIABLE"),
+        "failed authority gate leaked an UNSAT verdict: {stdout}"
+    );
+    assert!(
+        !stderr.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|value| value.get("result").cloned())
+                .is_some_and(|result| result == "unsat")
+        }),
+        "failed authority gate leaked UNSAT statistics: {stderr}"
+    );
+    assert!(
+        !artifact.exists(),
+        "failed authority gate published a proof artifact"
+    );
+}
+
 #[test]
 fn test_verify_proof_cli_flag_in_help() {
     let output = Command::new(ay_binary())

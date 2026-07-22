@@ -56,30 +56,30 @@ struct PropState {
 }
 
 unsafe extern "C" fn push_cb(u: *mut c_void, _cb: Z3_solver_callback) {
-    let st = unsafe { &mut *(u as *mut PropState) };
+    let st = unsafe { &mut *u.cast::<PropState>() };
     st.pushes += 1;
 }
 
 unsafe extern "C" fn pop_cb(u: *mut c_void, _cb: Z3_solver_callback, _n: c_uint) {
-    let st = unsafe { &mut *(u as *mut PropState) };
+    let st = unsafe { &mut *u.cast::<PropState>() };
     st.pops += 1;
     st.fixed.clear();
 }
 
 unsafe extern "C" fn fixed_cb(u: *mut c_void, _cb: Z3_solver_callback, t: Z3_ast, v: Z3_ast) {
-    let st = unsafe { &mut *(u as *mut PropState) };
+    let st = unsafe { &mut *u.cast::<PropState>() };
     st.fixed.push((t, v));
 }
 
 unsafe extern "C" fn eq_cb(u: *mut c_void, _cb: Z3_solver_callback, a: Z3_ast, b: Z3_ast) {
-    let st = unsafe { &mut *(u as *mut PropState) };
+    let st = unsafe { &mut *u.cast::<PropState>() };
     if (a == st.x && b == st.y) || (a == st.y && b == st.x) {
         st.saw_eq = true;
     }
 }
 
 unsafe extern "C" fn diseq_cb(u: *mut c_void, _cb: Z3_solver_callback, a: Z3_ast, b: Z3_ast) {
-    let st = unsafe { &mut *(u as *mut PropState) };
+    let st = unsafe { &mut *u.cast::<PropState>() };
     if (a == st.x && b == st.y) || (a == st.y && b == st.x) {
         st.saw_diseq = true;
     }
@@ -87,7 +87,7 @@ unsafe extern "C" fn diseq_cb(u: *mut c_void, _cb: Z3_solver_callback, a: Z3_ast
 
 /// Final check for the pseudo-theory `x ≠ y`.
 unsafe extern "C" fn final_cb(u: *mut c_void, cb: Z3_solver_callback) {
-    let st = unsafe { &mut *(u as *mut PropState) };
+    let st = unsafe { &mut *u.cast::<PropState>() };
     st.final_rounds += 1;
     if st.justified_mode {
         // Object only when the candidate model fixes x and y to the SAME value:
@@ -159,7 +159,7 @@ unsafe fn setup_propagator(c: Z3_context, justified_mode: bool) -> (Z3_solver, *
         Z3_solver_propagate_init(
             c,
             solver,
-            st as *mut c_void,
+            st.cast::<c_void>(),
             Some(push_cb),
             Some(pop_cb),
             None,
@@ -181,9 +181,9 @@ unsafe fn model_int(c: Z3_context, s: Z3_solver, t: Z3_ast) -> i64 {
     let m = unsafe { Z3_solver_get_model(c, s) };
     assert!(!m.is_null());
     let mut v: Z3_ast = 0;
-    assert!(unsafe { Z3_model_eval(c, m, t, true, &mut v) });
+    assert!(unsafe { Z3_model_eval(c, m, t, true, &raw mut v) });
     let mut out: i64 = 0;
-    assert!(unsafe { Z3_get_numeral_int64(c, v, &mut out) });
+    assert!(unsafe { Z3_get_numeral_int64(c, v, &raw mut out) });
     out
 }
 

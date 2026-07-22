@@ -137,7 +137,8 @@ pub unsafe extern "C" fn Z3_func_decl_to_string(c: Z3_context, d: Z3_func_decl) 
                 return cache_string(ctx, "(null)".to_string());
             }
             let decl = &(*d).decl;
-            cache_string(ctx, format!("{decl}"))
+            let rendered = super::ffi_surface_text(ctx, &format!("{decl}"));
+            cache_string(ctx, rendered)
         })
     }
 }

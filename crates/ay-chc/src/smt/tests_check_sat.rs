@@ -203,7 +203,7 @@ fn test_check_sat_growing_formula_reuse_is_sound_vs_fresh_oracle_5877() {
     let c1 = add_eq("x1", 2, 5);
     let c2 = add_eq("x2", 3, 7);
     let c3 = add_eq("x3", 4, 9);
-    let queries = vec![
+    let queries = [
         c0.clone(),
         and(vec![c0.clone(), c1.clone()]),
         and(vec![c0.clone(), c1.clone(), c2.clone()]),

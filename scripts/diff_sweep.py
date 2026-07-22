@@ -17,7 +17,7 @@ Usage:
   scripts/diff_sweep.py --corpus benchmarks/smtcomp-incremental/QF_UFLIA \
       --timeout 20 --out evals/results/incr-sweep/qf_uflia.json [--limit N]
 """
-import argparse, json, os, random, signal, subprocess, sys, time
+import argparse, json, os, random, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _oom_guard import (  # noqa: E402
     plan_solver_resources,
-    rss_watchdog,
+    run_captured,
     warn_concurrent_build,
 )
 
@@ -72,7 +72,7 @@ def available_solvers():
     return avail
 
 
-def run_solver(argv, fpath, timeout, memlimit_mb=0):
+def run_solver(argv, fpath, timeout, memlimit_mb=0, nbcore=1):
     """Return (tokens:list[str], status:str, wall:float).
     status in {ok, timeout, memout, error}. tokens are the ordered
     sat/unsat/unknown.
@@ -84,33 +84,33 @@ def run_solver(argv, fpath, timeout, memlimit_mb=0):
     graceful `unknown` before the backstop fires.
     """
     cmd = ["gtimeout", str(timeout)] + [a.replace("{f}", fpath) for a in argv]
-    t0 = time.time()
     try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, start_new_session=True)
+        result = run_captured(
+            cmd,
+            memlimit_mb,
+            timeout_s=timeout + 30,
+            label="diff_sweep.py",
+            env=dict(os.environ, MEMLIMIT=str(memlimit_mb),
+                     NBCORE=str(max(1, nbcore))),
+        )
     except Exception as e:  # noqa
-        return [], f"error:{e}", time.time() - t0
-    guard = rss_watchdog(p, memlimit_mb, label="diff_sweep.py", grace_mb=0)
-    try:
-        stdout, stderr = p.communicate(timeout=timeout + 30)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-        stdout, stderr = p.communicate()
-    finally:
-        guard.stop()
-    wall = time.time() - t0
-    if guard.breached:
+        return [], f"error:{e}", 0.0
+    wall = result.wall_sec
+    if result.memout:
         return [], "memout", wall
-    if p.returncode == 124:
+    if result.timed_out or result.returncode == 124:
         return [], "timeout", wall
-    tokens = [ln.strip() for ln in (stdout or "").splitlines() if ln.strip() in RESULT_TOKENS]
+    if result.output_truncated:
+        return [], "error:solver output exceeded capture limit", wall
+    tokens = [
+        ln.strip()
+        for ln in result.stdout.splitlines()
+        if ln.strip() in RESULT_TOKENS
+    ]
     if not tokens:
         # error or unsupported logic; capture a short reason
-        reason = (stderr or stdout or "").strip().splitlines()
-        msg = reason[0][:80] if reason else f"rc={p.returncode}"
+        reason = (result.stderr or result.stdout).strip().splitlines()
+        msg = reason[0][:80] if reason else f"rc={result.returncode}"
         return [], f"error:{msg}", wall
     return tokens, "ok", wall
 
@@ -138,14 +138,17 @@ def main():
     # run_solver (status "memout"). ay additionally gets --memory so it trips
     # its internal guard and answers `unknown` gracefully before the backstop.
     warn_concurrent_build()
-    plan = plan_solver_resources(args.jobs, label="diff_sweep.py")
+    requested_jobs = args.jobs
+    plan = plan_solver_resources(requested_jobs, label="diff_sweep.py")
     args.jobs = plan.jobs
 
     solvers = available_solvers()
     if "ay" in solvers and plan.memlimit_mb:
         ay_argv = solvers["ay"]
         solvers["ay"] = ay_argv[:-1] + ["--memory", str(plan.memlimit_mb)] + ay_argv[-1:]
-    resource_plan = dict(jobs=args.jobs, memlimit_mb_per_child=plan.memlimit_mb,
+    resource_plan = dict(requested_jobs=requested_jobs, jobs=args.jobs,
+                         memlimit_mb_per_child=plan.memlimit_mb,
+                         nbcore_per_child=plan.nbcore,
                          headroom_mb=plan.headroom_mb,
                          enforcement="rss_watchdog(all solvers) + ay --memory")
     print(f"solvers: {', '.join(solvers)} (jobs={args.jobs}, "
@@ -184,7 +187,8 @@ def main():
         res = {}
         for s, argv in solvers.items():
             tokens, status, wall = run_solver(argv, fp, args.timeout,
-                                              memlimit_mb=plan.memlimit_mb)
+                                              memlimit_mb=plan.memlimit_mb,
+                                              nbcore=plan.nbcore)
             res[s] = dict(tokens=tokens, status=status, wall=round(wall, 3))
         return fp, res
 

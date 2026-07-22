@@ -161,11 +161,13 @@ fn model_entries(solver: &Solver, model: &Model) -> Vec<(String, Sort)> {
 }
 
 fn model_entry_display_name(ctx: &Z3Context, identity: &str) -> String {
-    ctx.ffi_const_terms_by_identity
+    let display = ctx
+        .ffi_const_terms_by_identity
         .get(identity)
         .and_then(|term| ctx.ffi_const_metadata.get(term))
         .map(|(_, symbol)| symbol.display_name())
-        .unwrap_or_else(|| identity.to_string())
+        .unwrap_or_else(|| identity.to_string());
+    ay_core::quote_symbol(&display)
 }
 
 /// Convert a snapshot [`ModelValue`] into a value TERM of the given sort.
@@ -1064,7 +1066,7 @@ pub unsafe extern "C" fn Z3_model_to_string(c: Z3_context, m: Z3_model) -> *cons
                     .unwrap_or_else(|| Sort::Uninterpreted(el.to_string()));
                 parts.push(format!("(define-fun {display_name} () {sort} {el})"));
             }
-            let output = parts.join("\n");
+            let output = super::ffi_surface_text(ctx, &parts.join("\n"));
             cache_string(ctx, output)
         })
     }

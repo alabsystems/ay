@@ -12,7 +12,8 @@ per-child share so concurrent portfolio solvers cannot each claim the machine.
 """
 import argparse, concurrent.futures as cf, glob, json, math, os, signal, subprocess, sys, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _oom_guard import plan_solver_resources, rss_watchdog, warn_concurrent_build
+from _oom_guard import (copy_stream_limited, plan_solver_resources,
+                        run_captured, warn_concurrent_build)
 
 def parse_pb(out):
     status, obj = "unknown", None
@@ -45,11 +46,7 @@ def _decompress_to_temp(f):
     fd, tmp = tempfile.mkstemp(suffix=inner_ext, prefix="pbsweep-")
     try:
         with mod.open(f, "rb") as src, os.fdopen(fd, "wb") as dst:
-            while True:
-                chunk = src.read(1 << 20)
-                if not chunk:
-                    break
-                dst.write(chunk)
+            copy_stream_limited(src, dst)
     except Exception:
         try: os.remove(tmp)
         except OSError: pass
@@ -77,37 +74,19 @@ def run_one(name, cmd_tmpl, f, timeout_s, env=None, memlimit_mb=0,
         cmd.append(solve_path)
     else:  # roundingsat: reads OPB on argv; external timeout
         cmd = [cmd_tmpl, solve_path]
-    start = time.monotonic(); killed = False
+    start = time.monotonic()
     try:
-        # A disk-backed capture avoids buffering hostile solver output in the
-        # harness; parse it as a stream after the process group is reaped.
-        with tempfile.TemporaryFile(mode="w+b") as stdout_file:
-            p = subprocess.Popen(cmd, stdout=stdout_file, stderr=subprocess.DEVNULL,
-                                 start_new_session=True, env=env)
-            # External RSS backstop: the MEMLIMIT env in `env` is only honored by
-            # ay-pb-lineage binaries; the main ay binary's `pb` subcommand and
-            # roundingsat ignore it, so without this watchdog the envelope would be
-            # an unenforced claim (the 2026-07-11 panic class).
-            guard = rss_watchdog(p, memlimit_mb, label=f"pb_sweep.py[{name}]",
-                                 grace_mb=0)
-            try:
-                try:
-                    p.wait(timeout=timeout_s)
-                except subprocess.TimeoutExpired:
-                    killed = True
-                    try: os.killpg(p.pid, signal.SIGKILL)
-                    except ProcessLookupError: pass
-                    p.wait()
-            finally:
-                # A solver wrapper can exit while leaving descendants behind.
-                # Clean the whole group before disarming its memory guard.
-                try: os.killpg(p.pid, signal.SIGKILL)
-                except ProcessLookupError: pass
-                try: p.wait(timeout=5)
-                except (subprocess.TimeoutExpired, OSError): pass
-                guard.stop()
-            stdout_file.seek(0)
-            status, obj = parse_pb(stdout_file)
+        captured = run_captured(
+            cmd, memlimit_mb, timeout_s,
+            label=f"pb_sweep.py[{name}]", env=env,
+        )
+        status, obj = parse_pb(captured.stdout)
+        if captured.memout:
+            status = "memout"
+        elif captured.timed_out:
+            status = "timeout"
+        elif captured.cancelled or captured.output_truncated:
+            status = "error"
     except Exception as e:
         if tmp_path:
             try: os.remove(tmp_path)
@@ -117,11 +96,7 @@ def run_one(name, cmd_tmpl, f, timeout_s, env=None, memlimit_mb=0,
         if tmp_path:
             try: os.remove(tmp_path)
             except OSError: pass
-    el = time.monotonic() - start
-    if guard.breached:
-        status = "memout"
-    elif killed or el > timeout_s + 0.05:
-        status = "timeout"
+    el = captured.wall_sec
     return result(status=status, obj=obj, time=round(el, 2))
 
 def solved(s): return s in ("sat", "unsat", "optimum")

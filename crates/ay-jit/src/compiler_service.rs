@@ -374,6 +374,10 @@ pub(crate) enum SolverProgramEnqueueRejection {
 }
 
 /// Native code owned by a compiled solver-program artifact.
+// Compiled artifacts move by value from the backend into an already boxed
+// service result and then into solver caches. Boxing individual variants would
+// add another allocation and indirection to that ownership-transfer path.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum SolverProgramNativeCode {
     /// Synthetic native code used by deterministic service unit tests.
     #[cfg(test)]
@@ -517,6 +521,10 @@ enum SolverProgramCompilerMessage {
     Shutdown,
 }
 
+// This short-lived value transfers backend-owned code directly into the boxed
+// service artifact. Boxing its compiled variant would add a second allocation
+// solely for the handoff.
+#[allow(clippy::large_enum_variant)]
 enum BackendCompileOutcome {
     Compiled(SolverProgramNativeCode),
     Unsupported(DeoptReason),
@@ -1101,11 +1109,19 @@ fn settle_budget(budget_remaining_us: &AtomicU64, reserved_us: u64, elapsed_us: 
         refund_budget(budget_remaining_us, reserved_us - elapsed_us);
     } else if elapsed_us > reserved_us {
         let overage = elapsed_us - reserved_us;
-        budget_remaining_us
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_sub(overage))
-            })
-            .ok();
+        let mut current = budget_remaining_us.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(overage);
+            match budget_remaining_us.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 
@@ -1455,6 +1471,24 @@ mod tests {
         );
         assert_eq!(service.budget_remaining_us(), 10);
         service.shutdown();
+    }
+
+    #[test]
+    fn settling_budget_refunds_unused_reservation() {
+        let budget_remaining_us = AtomicU64::new(90);
+
+        settle_budget(&budget_remaining_us, 10, 4);
+
+        assert_eq!(budget_remaining_us.load(Ordering::Relaxed), 96);
+    }
+
+    #[test]
+    fn settling_budget_charges_overage_without_underflow() {
+        let budget_remaining_us = AtomicU64::new(5);
+
+        settle_budget(&budget_remaining_us, 10, 20);
+
+        assert_eq!(budget_remaining_us.load(Ordering::Relaxed), 0);
     }
 
     #[test]

@@ -160,10 +160,14 @@ fn test_observer_conflict_restarts_on_hard_formula() {
     let num_pigeons = 7;
     let num_holes = 6;
     let mut vars = vec![vec![Variable(0); num_holes]; num_pigeons];
+    let mut vars_by_hole: Vec<Vec<Variable>> = (0..num_holes)
+        .map(|_| Vec::with_capacity(num_pigeons))
+        .collect();
 
-    for i in 0..num_pigeons {
-        for j in 0..num_holes {
-            vars[i][j] = solver.new_var();
+    for pigeon_vars in &mut vars {
+        for (hole, var) in pigeon_vars.iter_mut().enumerate() {
+            *var = solver.new_var();
+            vars_by_hole[hole].push(*var);
         }
     }
 
@@ -174,13 +178,10 @@ fn test_observer_conflict_restarts_on_hard_formula() {
     }
 
     // No two pigeons in the same hole.
-    for j in 0..num_holes {
-        for i1 in 0..num_pigeons {
-            for i2 in (i1 + 1)..num_pigeons {
-                solver.add_clause(vec![
-                    Literal::negative(vars[i1][j]),
-                    Literal::negative(vars[i2][j]),
-                ]);
+    for hole_vars in &vars_by_hole {
+        for (i1, &var1) in hole_vars.iter().enumerate() {
+            for &var2 in &hole_vars[i1 + 1..] {
+                solver.add_clause(vec![Literal::negative(var1), Literal::negative(var2)]);
             }
         }
     }
@@ -211,10 +212,14 @@ fn test_observer_restart_callbacks() {
     let num_pigeons = 9;
     let num_holes = 8;
     let mut vars = vec![vec![Variable(0); num_holes]; num_pigeons];
+    let mut vars_by_hole: Vec<Vec<Variable>> = (0..num_holes)
+        .map(|_| Vec::with_capacity(num_pigeons))
+        .collect();
 
-    for i in 0..num_pigeons {
-        for j in 0..num_holes {
-            vars[i][j] = solver.new_var();
+    for pigeon_vars in &mut vars {
+        for (hole, var) in pigeon_vars.iter_mut().enumerate() {
+            *var = solver.new_var();
+            vars_by_hole[hole].push(*var);
         }
     }
 
@@ -223,13 +228,10 @@ fn test_observer_restart_callbacks() {
         solver.add_clause(clause);
     }
 
-    for j in 0..num_holes {
-        for i1 in 0..num_pigeons {
-            for i2 in (i1 + 1)..num_pigeons {
-                solver.add_clause(vec![
-                    Literal::negative(vars[i1][j]),
-                    Literal::negative(vars[i2][j]),
-                ]);
+    for hole_vars in &vars_by_hole {
+        for (i1, &var1) in hole_vars.iter().enumerate() {
+            for &var2 in &hole_vars[i1 + 1..] {
+                solver.add_clause(vec![Literal::negative(var1), Literal::negative(var2)]);
             }
         }
     }

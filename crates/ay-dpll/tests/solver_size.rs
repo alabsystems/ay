@@ -5,9 +5,11 @@
 // default 2 MiB threads. Solver must stay pointer-sized-ish (Executor boxed).
 // If this fires, something re-inlined a large field into Solver.
 
+use std::mem::size_of;
+
 #[test]
 fn solver_stays_small_executor_boxed() {
-    let size = std::mem::size_of::<ay_dpll::api::Solver>();
+    let size = size_of::<ay_dpll::api::Solver>();
     assert!(
         size <= 4096,
         "Solver is {size} bytes; it must stay small (Executor boxed) so \

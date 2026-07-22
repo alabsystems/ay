@@ -1491,6 +1491,7 @@ fn test_strict_not_ite2_valid() {
     .expect("valid not_ite2 should pass");
 }
 
+mod array_chain_axiom_tests;
 mod boolean_coverage_tests;
 mod boolean_negation_coverage_tests;
 mod datatype_axiom_tests;

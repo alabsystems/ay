@@ -90,7 +90,7 @@ fn mk_tuple_sort_roundtrip() {
             2,
             field_names.as_ptr(),
             field_sorts.as_ptr(),
-            &mut mk_decl,
+            &raw mut mk_decl,
             proj.as_mut_ptr(),
         );
         assert!(!tup.is_null());

@@ -3205,10 +3205,7 @@ impl Executor {
                 let mut sel_a = lhs;
                 let mut sel_b = rhs;
                 let mut level = 0usize;
-                loop {
-                    let Sort::Array(arr) = self.ctx.terms.sort(sel_a).clone() else {
-                        break;
-                    };
+                while let Sort::Array(arr) = self.ctx.terms.sort(sel_a).clone() {
                     let skolem_name = format!(
                         "__ext_diff_deep_{}_{}_{}",
                         pair_key.0 .0, pair_key.1 .0, level

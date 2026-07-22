@@ -14,7 +14,7 @@ Exit code 2 if any FLIP (soundness) is detected.
 import json, os, sys, subprocess, signal, random, argparse, concurrent.futures as cf, tempfile, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _oom_guard import plan_solver_resources, rss_watchdog, warn_concurrent_build  # noqa: E402
+from _oom_guard import plan_solver_resources, run_captured, warn_concurrent_build  # noqa: E402
 
 ORACLE = "evals/results/rewrite-oracle/golden_verdicts.jsonl"
 BENCH_ROOT = "benchmarks/chc"
@@ -51,56 +51,28 @@ def run_one(binary, smt2, timeout, memlimit_mb, env):
     # sibling-blind across jobs (scripts/_oom_guard.py).
     argv += ["--memory", str(memlimit_mb)]
     argv.append(smt2)
-    started = time.monotonic()
-    with tempfile.TemporaryFile(mode="w+b") as stdout_file:
-        try:
-            p = subprocess.Popen(argv, stdout=stdout_file,
-                                 stderr=subprocess.DEVNULL, start_new_session=True,
-                                 env=env)
-        except Exception as e:
-            return {"status": "error", "wall_s": 0.0, "exit_code": None,
-                    "error": str(e)}
-        guard = rss_watchdog(p, memlimit_mb, label="rewrite_oracle_check.py",
-                             grace_mb=0)
-        timed_out = False
-        try:
-            try:
-                p.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                try:
-                    os.killpg(p.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                p.wait()
-        except Exception as e:
-            return {"status": "error", "wall_s": time.monotonic() - started,
-                    "exit_code": p.poll(), "error": str(e)}
-        finally:
-            # Reap on timeout/error and remove descendants left by a clean wrapper.
-            try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                p.wait(timeout=5)
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-            guard.stop()
-        if guard.breached:
-            status = "memout"
-        elif timed_out:
-            status = "timeout"
-        else:
-            status = "none"
-            stdout_file.seek(0)
-            for raw_line in stdout_file:
-                value = raw_line.decode("utf-8", errors="replace").strip().lower()
-                if value in ("sat", "unsat", "unknown"):
-                    status = value
-                    break
-    return {"status": status, "wall_s": time.monotonic() - started,
-            "exit_code": p.returncode}
+    try:
+        captured = run_captured(
+            argv, memlimit_mb, timeout, label="rewrite_oracle_check.py", env=env,
+        )
+    except Exception as e:
+        return {"status": "error", "wall_s": 0.0, "exit_code": None,
+                "error": str(e)}
+    if captured.memout:
+        status = "memout"
+    elif captured.timed_out:
+        status = "timeout"
+    elif captured.cancelled or captured.output_truncated:
+        status = "error"
+    else:
+        status = "none"
+        for raw_line in captured.stdout.splitlines():
+            value = raw_line.strip().lower()
+            if value in ("sat", "unsat", "unknown"):
+                status = value
+                break
+    return {"status": status, "wall_s": captured.wall_sec,
+            "exit_code": captured.returncode}
 
 
 def main():

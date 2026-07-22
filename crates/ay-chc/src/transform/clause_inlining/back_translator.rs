@@ -2642,7 +2642,7 @@ impl InliningBackTranslator {
             }
         }
         let env = &env;
-        let mut surviving = premise_targets.iter().copied().collect::<Vec<_>>();
+        let mut surviving = premise_targets.to_vec();
         surviving.reverse(); // pop() consumes them in body order
 
         let mut scratch: Vec<GroundScratchStep> = Vec::new();

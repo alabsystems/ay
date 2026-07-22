@@ -321,7 +321,7 @@ mod tests {
     fn oversized_problem_skips_collapse() {
         let mut problem = ChcProblem::new();
         let p = problem.declare_predicate("P", vec![]);
-        for _ in 0..(MAX_COLLAPSE_CLAUSES + 1) {
+        for _ in 0..=MAX_COLLAPSE_CLAUSES {
             problem.add_clause(crate::HornClause::new(
                 crate::ClauseBody::predicates_only(vec![(p, vec![])]),
                 crate::ClauseHead::Predicate(p, vec![]),

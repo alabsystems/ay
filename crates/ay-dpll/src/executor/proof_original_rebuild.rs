@@ -549,7 +549,20 @@ impl Executor {
         // false proof: it only exists when the complementary pair is really
         // asserted. Runs dead last so every previously-working backbone keeps
         // producing byte-identical output.
-        self.try_rebuild_with_complementary_literals(proof, &originals);
+        if self.try_rebuild_with_complementary_literals(proof, &originals) {
+            return;
+        }
+
+        // THEORY-AGNOSTIC last pass (the substitution-derived `assume` class):
+        // every backbone above re-proves the contradiction with an ARITHMETIC
+        // certificate, so a non-arithmetic refutation whose only defect is a
+        // preprocessing-substituted `assume` leaf (the whole QF_S "sink"
+        // family: `(str.in_re literal_5 R)` exported as
+        // `(str.in_re "/mod/forum/" R)` after constant propagation) reaches
+        // here untouched. Keep the exported resolution SKELETON and replace
+        // just those leaves with an `eq_congruent_pred` bridge from the
+        // AUTHORED assertion plus the defining equalities. Fail-closed.
+        self.try_rebuild_with_substitution_bridge(proof, &originals);
     }
 
     /// Recognize an original assertion as a linear-arithmetic disequality
@@ -2372,4 +2385,559 @@ impl Executor {
         self.last_proof_term_overrides = Some(overrides);
         true
     }
+
+    // -----------------------------------------------------------------------
+    // Substitution-derived `assume` bridge (theory-agnostic).
+    // -----------------------------------------------------------------------
+
+    /// Replace every preprocessing-substituted `assume` leaf with a certified
+    /// derivation from the AUTHORED assertion it came from, keeping the rest
+    /// of the exported proof byte-identical in structure.
+    ///
+    /// Constant/definition propagation rewrites `(str.in_re literal_5 R)` into
+    /// `(str.in_re "/mod/forum/" R)` before clausification, so the exported
+    /// proof assumes a formula that is NOT a problem premise — the Alethe
+    /// printer refuses it (`NonProblemAssume`) and `--self-check` degrades the
+    /// UNSAT to `unknown`. The link back to the problem is exactly the
+    /// congruence axiom: from the authored predicate `P(a1..an)` and the
+    /// authored defining equalities `(= ai bi)`, `eq_congruent_pred` yields
+    /// `P(b1..bn)`.
+    ///
+    /// This pass is deliberately THEORY-AGNOSTIC: it never inspects the
+    /// predicate's theory, only its congruence structure, so it repairs the
+    /// same defect for strings, EUF, datatypes, or anything else. Every rule
+    /// it emits (`refl`, `symm`, `eq_congruent`, `eq_congruent_pred`,
+    /// `th_resolution`) is validated by the UNCHANGED strict checker, and the
+    /// whole rebuilt proof must pass `check_proof_collecting_trust` carrying
+    /// NO trust obligation the proof it replaces did not already carry — so
+    /// this can only make MORE proofs genuinely checkable, never fewer.
+    ///
+    /// Fail-closed: any leaf that cannot be derived, any dangling premise, or
+    /// a rebuilt proof the checker likes less than the original leaves the
+    /// proof untouched.
+    fn try_rebuild_with_substitution_bridge(
+        &mut self,
+        proof: &mut Proof,
+        originals: &[(TermId, FrontendTerm)],
+    ) -> bool {
+        let original_terms: Vec<TermId> = originals.iter().map(|(c, _)| *c).collect();
+
+        // (1) Which assume leaves are defective?
+        let mut defective: Vec<TermId> = Vec::new();
+        for step in &proof.steps {
+            if let ProofStep::Assume(term) = step {
+                if !original_terms.contains(term) && !defective.contains(term) {
+                    defective.push(*term);
+                }
+            }
+        }
+        if defective.is_empty() {
+            return false;
+        }
+
+        // (2) Plan a congruence bridge for each defective leaf. Planning is
+        // pure w.r.t. the proof (it only interns the equality/lemma terms the
+        // emission will need), so a failure costs nothing.
+        let mut plans: Vec<BridgePlan> = Vec::with_capacity(defective.len());
+        for &goal in &defective {
+            let Some(plan) = self.plan_substitution_bridge(goal, &original_terms) else {
+                return false;
+            };
+            plans.push(plan);
+        }
+
+        // (3) Originals the rebuilt proof will assume: the ones the surviving
+        // skeleton already assumed, plus every premise the bridges need.
+        let mut needed: Vec<TermId> = Vec::new();
+        let push_needed = |t: TermId, needed: &mut Vec<TermId>| {
+            if !needed.contains(&t) {
+                needed.push(t);
+            }
+        };
+        for step in &proof.steps {
+            if let ProofStep::Assume(term) = step {
+                if original_terms.contains(term) {
+                    push_needed(*term, &mut needed);
+                }
+            }
+        }
+        for plan in &plans {
+            push_needed(plan.source, &mut needed);
+            for kid in &plan.kids {
+                kid.collect_assumed(&mut needed);
+            }
+        }
+        // Every assumed term must genuinely be an original premise.
+        if needed.iter().any(|t| !original_terms.contains(t)) {
+            return false;
+        }
+
+        // (4) Assemble: assumes first (Alethe ordering), then the bridge
+        // derivations, then the surviving skeleton with premises remapped.
+        let mut new_proof = Proof::new();
+        let mut assume_ids: HashMap<TermId, ProofId> = HashMap::default();
+        for &term in &needed {
+            let id = new_proof.add_assume(term, None);
+            assume_ids.insert(term, id);
+        }
+
+        let mut bridge_unit: HashMap<TermId, ProofId> = HashMap::default();
+        for plan in &plans {
+            let Some(unit) = Self::emit_substitution_bridge(
+                &mut self.ctx.terms,
+                &mut new_proof,
+                plan,
+                &assume_ids,
+            ) else {
+                return false;
+            };
+            bridge_unit.insert(plan.goal, unit);
+        }
+
+        let mut remap: Vec<Option<ProofId>> = vec![None; proof.steps.len()];
+        for (idx, step) in proof.steps.iter().enumerate() {
+            let new_id = match step {
+                ProofStep::Assume(term) => match assume_ids.get(term) {
+                    Some(&id) => id,
+                    None => match bridge_unit.get(term) {
+                        Some(&id) => id,
+                        None => return false,
+                    },
+                },
+                ProofStep::Resolution {
+                    clause,
+                    pivot,
+                    clause1,
+                    clause2,
+                } => {
+                    let (Some(c1), Some(c2)) = (
+                        remap.get(clause1.0 as usize).copied().flatten(),
+                        remap.get(clause2.0 as usize).copied().flatten(),
+                    ) else {
+                        return false;
+                    };
+                    new_proof.add_resolution(clause.clone(), *pivot, c1, c2)
+                }
+                ProofStep::TheoryLemma {
+                    theory,
+                    clause,
+                    farkas,
+                    kind,
+                    lia,
+                } => new_proof.add_step(ProofStep::TheoryLemma {
+                    theory: theory.clone(),
+                    clause: clause.clone(),
+                    farkas: farkas.clone(),
+                    kind: *kind,
+                    lia: lia.clone(),
+                }),
+                ProofStep::Step {
+                    rule,
+                    clause,
+                    premises,
+                    args,
+                } => {
+                    let mut mapped = Vec::with_capacity(premises.len());
+                    for p in premises {
+                        match remap.get(p.0 as usize).copied().flatten() {
+                            Some(id) => mapped.push(id),
+                            None => return false,
+                        }
+                    }
+                    new_proof.add_rule_step(rule.clone(), clause.clone(), mapped, args.clone())
+                }
+                // Anchors and any other step shape carry scoped structure this
+                // pass does not model; refuse rather than reorder them.
+                _ => return false,
+            };
+            remap[idx] = Some(new_id);
+        }
+
+        // (5) Whole-proof gate: the rebuilt derivation must be at least as
+        // checkable as the one it replaces. DEFERRED-trust mode is the right
+        // yardstick here — this pass runs BEFORE the Generic-lemma promotion
+        // passes, so the surviving skeleton legitimately still carries
+        // trust-kind lemmas that a later pass promotes (the string
+        // ground-evaluation lemma is exactly one). Every OTHER step, including
+        // every step this pass emits, must validate strictly, and the rebuilt
+        // proof must not introduce a trust obligation the original did not
+        // already carry.
+        let before = ay_proof::check_proof_collecting_trust(proof, &self.ctx.terms)
+            .ok()
+            .map(|collected| {
+                collected
+                    .into_iter()
+                    .map(|(_, clause)| clause)
+                    .collect::<Vec<_>>()
+            });
+        let after: Vec<Vec<TermId>> =
+            match ay_proof::check_proof_collecting_trust(&new_proof, &self.ctx.terms) {
+                Ok(collected) => collected.into_iter().map(|(_, clause)| clause).collect(),
+                Err(_) => return false,
+            };
+        let Some(before) = before else {
+            // The original did not even pass deferred-trust validation; this
+            // pass is not the one to reason about what it was doing.
+            return false;
+        };
+        if after.len() > before.len() || after.iter().any(|clause| !before.contains(clause)) {
+            return false;
+        }
+
+        *proof = new_proof;
+        let mut overrides = self.last_proof_term_overrides.take().unwrap_or_default();
+        // A substituted leaf carries a STALE surface override: the ordinary
+        // export registered "print the substituted form the way the AUTHORED
+        // assertion is spelled" so the (indefensible) `assume` at least looked
+        // like a premise. Now that the leaf is DERIVED, that override would
+        // print the derived term and its source identically — collapsing the
+        // `eq_congruent_pred` conclusion onto its own premise and producing a
+        // certificate no external checker can follow. Drop it.
+        for plan in &plans {
+            overrides.remove(&plan.goal);
+            let (atom, _) = strip_not_polarity(&self.ctx.terms, plan.goal);
+            overrides.remove(&atom);
+        }
+        let mut registered: Vec<TermId> = Vec::new();
+        for &term in &needed {
+            if registered.contains(&term) {
+                continue;
+            }
+            registered.push(term);
+            let Some(idx) = original_terms.iter().position(|&t| t == term) else {
+                continue;
+            };
+            let parsed = originals[idx].1.clone();
+            // Placeholder (native-API) surfaces register NO override — the
+            // sentinel string is not a printable spelling.
+            if is_api_placeholder(&parsed) {
+                continue;
+            }
+            collect_surface_term_overrides(&mut self.ctx, term, &parsed, &mut overrides);
+        }
+        self.last_proof_term_overrides = Some(overrides);
+        true
+    }
+
+    /// Plan the congruence bridge deriving the substituted leaf `goal` from an
+    /// authored predicate assertion plus authored defining equalities, or
+    /// `None` when no such derivation exists.
+    fn plan_substitution_bridge(
+        &mut self,
+        goal: TermId,
+        original_terms: &[TermId],
+    ) -> Option<BridgePlan> {
+        let (goal_atom, goal_negated) = strip_not_polarity(&self.ctx.terms, goal);
+        let TermData::App(goal_sym, goal_args) = self.ctx.terms.get(goal_atom) else {
+            return None;
+        };
+        let (goal_sym, goal_args) = (goal_sym.clone(), goal_args.clone());
+        if goal_args.is_empty() {
+            return None;
+        }
+
+        for &source in original_terms {
+            let (src_atom, src_negated) = strip_not_polarity(&self.ctx.terms, source);
+            if src_negated != goal_negated || src_atom == goal_atom {
+                continue;
+            }
+            let TermData::App(src_sym, src_args) = self.ctx.terms.get(src_atom) else {
+                continue;
+            };
+            if *src_sym != goal_sym || src_args.len() != goal_args.len() {
+                continue;
+            }
+            let src_args = src_args.clone();
+            let mut kids: Vec<EqPlan> = Vec::with_capacity(src_args.len());
+            let mut ok = true;
+            for (&a, &b) in src_args.iter().zip(goal_args.iter()) {
+                match self.plan_eq(a, b, original_terms, 0) {
+                    Some(plan) => kids.push(plan),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok {
+                continue;
+            }
+            // `eq_congruent_pred ⊢ (cl ¬(= a1 b1) .. ¬(= an bn) ¬P(a..) P(b..))`.
+            // For a NEGATED leaf the roles swap: the derivation runs from the
+            // asserted `(not P(a..))` to `(not P(b..))`, which is the same
+            // rule with `P(b..)` in the negated slot. The strict checker
+            // accepts either premise orientation at each argument position, so
+            // the SAME equality terms serve both directions.
+            let mut lemma: Vec<TermId> = kids.iter().map(|k| k.neg_eq).collect();
+            if goal_negated {
+                lemma.push(self.ctx.terms.mk_not_raw(goal_atom));
+                lemma.push(src_atom);
+            } else {
+                lemma.push(self.ctx.terms.mk_not_raw(src_atom));
+                lemma.push(goal_atom);
+            }
+            return Some(BridgePlan {
+                goal,
+                goal_negated,
+                source,
+                source_atom: src_atom,
+                lemma,
+                kids,
+            });
+        }
+        None
+    }
+
+    /// Plan a derivation of `(= a b)` from the original assertions:
+    /// reflexivity, an authored equality (either orientation, bridged by
+    /// `symm`), or congruence over a shared function symbol.
+    fn plan_eq(
+        &mut self,
+        a: TermId,
+        b: TermId,
+        original_terms: &[TermId],
+        depth: u32,
+    ) -> Option<EqPlan> {
+        const MAX_DEPTH: u32 = 8;
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        let eq = self
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), [a, b], Sort::Bool);
+        // `mk_app` raw-interns, but a constant-folding surprise would break
+        // the rigid `refl`/`eq_congruent` shapes; fail closed on one.
+        if !matches!(
+            self.ctx.terms.get(eq),
+            TermData::App(Symbol::Named(name), args) if name == "=" && args.len() == 2
+        ) {
+            return None;
+        }
+        let neg_eq = self.ctx.terms.mk_not_raw(eq);
+        if a == b {
+            return Some(EqPlan {
+                eq,
+                neg_eq,
+                kind: EqPlanKind::Refl,
+            });
+        }
+        if original_terms.contains(&eq) {
+            return Some(EqPlan {
+                eq,
+                neg_eq,
+                kind: EqPlanKind::Assumed,
+            });
+        }
+        let flipped = self
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), [b, a], Sort::Bool);
+        if original_terms.contains(&flipped) {
+            return Some(EqPlan {
+                eq,
+                neg_eq,
+                kind: EqPlanKind::Symm { assumed: flipped },
+            });
+        }
+        // Congruence: `a` and `b` are the same function applied to pairwise
+        // derivably-equal arguments.
+        let TermData::App(a_sym, a_args) = self.ctx.terms.get(a) else {
+            return None;
+        };
+        let (a_sym, a_args) = (a_sym.clone(), a_args.clone());
+        let TermData::App(b_sym, b_args) = self.ctx.terms.get(b) else {
+            return None;
+        };
+        if *b_sym != a_sym || b_args.len() != a_args.len() || a_args.is_empty() {
+            return None;
+        }
+        let b_args = b_args.clone();
+        let mut kids = Vec::with_capacity(a_args.len());
+        for (&x, &y) in a_args.iter().zip(b_args.iter()) {
+            kids.push(self.plan_eq(x, y, original_terms, depth + 1)?);
+        }
+        // `eq_congruent ⊢ (cl ¬(= a1 b1) .. ¬(= an bn) (= f(a..) f(b..)))`.
+        let mut lemma: Vec<TermId> = kids.iter().map(|k| k.neg_eq).collect();
+        lemma.push(eq);
+        Some(EqPlan {
+            eq,
+            neg_eq,
+            kind: EqPlanKind::Cong { lemma, kids },
+        })
+    }
+
+    /// Emit a planned bridge, returning the id of the unit `(cl goal)` step.
+    fn emit_substitution_bridge(
+        terms: &mut TermStore,
+        proof: &mut Proof,
+        plan: &BridgePlan,
+        assume_ids: &HashMap<TermId, ProofId>,
+    ) -> Option<ProofId> {
+        let mut kid_units: Vec<(TermId, TermId, ProofId)> = Vec::with_capacity(plan.kids.len());
+        for kid in &plan.kids {
+            let id = Self::emit_eq_plan(proof, kid, assume_ids)?;
+            kid_units.push((kid.eq, kid.neg_eq, id));
+        }
+        let mut clause = plan.lemma.clone();
+        let mut current = proof.add_step(ProofStep::TheoryLemma {
+            theory: "EUF".to_string(),
+            clause: clause.clone(),
+            farkas: None,
+            kind: TheoryLemmaKind::EufCongruentPred,
+            lia: None,
+        });
+        for (eq, neg_eq, unit) in &kid_units {
+            let resolvent: Vec<TermId> = clause.iter().copied().filter(|&l| l != *neg_eq).collect();
+            if resolvent.len() == clause.len() {
+                return None;
+            }
+            current = proof.add_resolution(resolvent.clone(), *eq, current, *unit);
+            clause = resolvent;
+        }
+        // Resolve the asserted predicate away, leaving the unit `(cl goal)`.
+        let (source_lit, pivot) = if plan.goal_negated {
+            (plan.source_atom, plan.source_atom)
+        } else {
+            (terms.mk_not_raw(plan.source_atom), plan.source_atom)
+        };
+        let resolvent: Vec<TermId> = clause
+            .iter()
+            .copied()
+            .filter(|&l| l != source_lit)
+            .collect();
+        if resolvent.len() != 1 || resolvent[0] != plan.goal {
+            return None;
+        }
+        let &source_assume = assume_ids.get(&plan.source)?;
+        Some(proof.add_resolution(resolvent, pivot, current, source_assume))
+    }
+
+    /// Emit a planned equality derivation, returning the id of the unit
+    /// `(cl (= a b))` step.
+    fn emit_eq_plan(
+        proof: &mut Proof,
+        plan: &EqPlan,
+        assume_ids: &HashMap<TermId, ProofId>,
+    ) -> Option<ProofId> {
+        match &plan.kind {
+            EqPlanKind::Refl => {
+                Some(proof.add_rule_step(AletheRule::Refl, vec![plan.eq], Vec::new(), Vec::new()))
+            }
+            EqPlanKind::Assumed => assume_ids.get(&plan.eq).copied(),
+            EqPlanKind::Symm { assumed } => {
+                let &premise = assume_ids.get(assumed)?;
+                Some(proof.add_rule_step(
+                    AletheRule::Symm,
+                    vec![plan.eq],
+                    vec![premise],
+                    Vec::new(),
+                ))
+            }
+            EqPlanKind::Cong { lemma, kids } => {
+                let mut kid_units: Vec<(TermId, TermId, ProofId)> = Vec::with_capacity(kids.len());
+                for kid in kids {
+                    let id = Self::emit_eq_plan(proof, kid, assume_ids)?;
+                    kid_units.push((kid.eq, kid.neg_eq, id));
+                }
+                let mut clause = lemma.clone();
+                let mut current = proof.add_step(ProofStep::TheoryLemma {
+                    theory: "EUF".to_string(),
+                    clause: clause.clone(),
+                    farkas: None,
+                    kind: TheoryLemmaKind::EufCongruent,
+                    lia: None,
+                });
+                for (kid_eq, kid_neg, unit) in &kid_units {
+                    let resolvent: Vec<TermId> =
+                        clause.iter().copied().filter(|&l| l != *kid_neg).collect();
+                    if resolvent.len() == clause.len() {
+                        return None;
+                    }
+                    current = proof.add_resolution(resolvent.clone(), *kid_eq, current, *unit);
+                    clause = resolvent;
+                }
+                if clause.len() != 1 || clause[0] != plan.eq {
+                    return None;
+                }
+                Some(current)
+            }
+        }
+    }
+}
+
+/// Split a literal into its atom and polarity (a doubly-negated literal is
+/// normalized, matching the strict checker's `strip_not`).
+fn strip_not_polarity(terms: &TermStore, mut lit: TermId) -> (TermId, bool) {
+    let mut negated = false;
+    while let TermData::Not(inner) = terms.get(lit) {
+        lit = *inner;
+        negated = !negated;
+    }
+    (lit, negated)
+}
+
+/// A planned derivation of `(= a b)` from the original problem assertions.
+///
+/// `eq` is the goal equality and `neg_eq` its negation — both interned during
+/// planning, so emission needs no fresh terms and cannot surprise the rigid
+/// `refl` / `eq_congruent` clause shapes.
+struct EqPlan {
+    eq: TermId,
+    neg_eq: TermId,
+    kind: EqPlanKind,
+}
+
+enum EqPlanKind {
+    /// `refl ⊢ (cl (= a a))`.
+    Refl,
+    /// The equality IS an original assertion: `assume`.
+    Assumed,
+    /// The FLIPPED equality is an original assertion; `symm` reorients it.
+    Symm { assumed: TermId },
+    /// `eq_congruent` over a shared function symbol.
+    Cong {
+        lemma: Vec<TermId>,
+        kids: Vec<EqPlan>,
+    },
+}
+
+impl EqPlan {
+    fn collect_assumed(&self, out: &mut Vec<TermId>) {
+        match &self.kind {
+            EqPlanKind::Refl => {}
+            EqPlanKind::Assumed => {
+                if !out.contains(&self.eq) {
+                    out.push(self.eq);
+                }
+            }
+            EqPlanKind::Symm { assumed } => {
+                if !out.contains(assumed) {
+                    out.push(*assumed);
+                }
+            }
+            EqPlanKind::Cong { kids, .. } => {
+                for kid in kids {
+                    kid.collect_assumed(out);
+                }
+            }
+        }
+    }
+}
+
+/// A planned bridge from an authored predicate assertion to the
+/// preprocessing-substituted form the exported proof assumed.
+struct BridgePlan {
+    /// The substituted leaf to derive (possibly negated).
+    goal: TermId,
+    /// Whether `goal` is the negated form.
+    goal_negated: bool,
+    /// The authored assertion the leaf came from (same polarity as `goal`).
+    source: TermId,
+    /// `source` with its `not` wrapper stripped.
+    source_atom: TermId,
+    /// The `eq_congruent_pred` clause.
+    lemma: Vec<TermId>,
+    /// Per-argument equality derivations, aligned with the predicate's args.
+    kids: Vec<EqPlan>,
 }

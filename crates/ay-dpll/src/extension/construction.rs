@@ -328,6 +328,7 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             verify_mixed_cache: None,
             verify_array_memo: HashMap::default(),
             verify_array_sem_counter: 0,
+            verify_prop_memo: None,
             // Set post-construction by `with_solve_deadline` on the paths that
             // carry the executor's wall-clock budget (CHC/PDR, CLI `:timeout`).
             solve_deadline: None,
@@ -894,6 +895,7 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             verify_mixed_cache: None,
             verify_array_memo: HashMap::default(),
             verify_array_sem_counter: 0,
+            verify_prop_memo: None,
             // Set post-construction by `with_solve_deadline` on the paths that
             // carry the executor's wall-clock budget (CHC/PDR, CLI `:timeout`).
             solve_deadline: None,
@@ -1079,6 +1081,20 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
         memo: &'a mut crate::verification::ConflictSemanticVerifyMemo,
     ) -> Self {
         self.verify_memo = Some(memo);
+        self
+    }
+
+    /// Wire the Executor-owned sampled propagation-verification memo
+    /// (#verify-memo, `AY_VERIFY_MEMO=1`) into this eager extension.
+    ///
+    /// See the `verify_prop_memo` field doc for the trust-true-only policy.
+    /// The memo is inert unless the env flag is armed; `None` (the default)
+    /// keeps the eager path memo-free either way.
+    pub(crate) fn with_verify_prop_memo(
+        mut self,
+        memo: &'a mut crate::verification::PropSemanticVerifyMemo,
+    ) -> Self {
+        self.verify_prop_memo = Some(memo);
         self
     }
 }

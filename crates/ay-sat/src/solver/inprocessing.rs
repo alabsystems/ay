@@ -348,6 +348,12 @@ impl Solver {
         // does a single cleanup pass at the end.
         self.defer_stale_reason_cleanup = true;
 
+        // #array-deadline-forward: set when the sweep below is truncated by
+        // the whole-solve deadline / interrupt. Skips the fixpoint-guard
+        // update (next call resumes) and the debug post-conditions (a
+        // truncated pass legitimately leaves satisfied clauses behind).
+        let mut deadline_truncated = false;
+
         loop {
             self.ensure_reason_clause_marks_current();
 
@@ -487,7 +493,28 @@ impl Solver {
             let mut pass_mutated = false;
             let trail_len_before = self.trail.len();
 
+            let mut sweep_tick: u32 = 0;
             for clause_idx in active {
+                // #array-deadline-forward: amortized whole-solve deadline /
+                // interrupt poll. Each iteration deletes or strengthens one
+                // clause with O(watchlist) `remove_watch` cost — on a grown
+                // clause DB this sweep was measured running 12+s past the
+                // caller's wall budget (QF_AX subset re-solves; the caller's
+                // `should_stop` never reaches this pre-search phase).
+                // FAIL-CLOSED truncation: L0 GC is an inprocessing
+                // OPTIMIZATION, not a correctness step (see the
+                // inc_engine_reset_mode skip above) — stopping between
+                // clause mutations leaves inert satisfied clauses / stale
+                // false literals that the two-watch invariant handles.
+                // `last_collect_fixed` is NOT updated on truncation so the
+                // next call resumes the sweep, and the satisfied/false
+                // post-conditions are skipped for the truncated pass.
+                sweep_tick = sweep_tick.wrapping_add(1);
+                if sweep_tick & 15 == 0 && (self.solve_deadline_expired() || self.is_interrupted())
+                {
+                    deadline_truncated = true;
+                    break;
+                }
                 let clause_len = self.arena.len_of(clause_idx);
                 if clause_len < 2 {
                     continue;
@@ -625,6 +652,12 @@ impl Solver {
                 return true;
             }
 
+            // #array-deadline-forward: a truncated sweep must not iterate
+            // the fixpoint — exit after the (sound) propagate check above.
+            if deadline_truncated {
+                break;
+            }
+
             let trail_grew = self.trail.len() > trail_len_before;
             if !pass_mutated && !trail_grew {
                 break;
@@ -643,7 +676,11 @@ impl Solver {
         // The authoritative verification point is in bve_body() after
         // refresh_incremental/rebuild_with_vals.
 
-        self.cold.last_collect_fixed = self.fixed_count;
+        // #array-deadline-forward: only arm the fixpoint guard after a
+        // COMPLETE sweep — a truncated pass must be resumed by the next call.
+        if !deadline_truncated {
+            self.cold.last_collect_fixed = self.fixed_count;
+        }
 
         // Drop gc_occ after the fixpoint loop completes (#8466).
         // gc_occ is only needed DURING collect_level0_garbage's fixpoint loop
@@ -665,8 +702,10 @@ impl Solver {
         // signed unit chain is unavailable; the two-watch invariant still handles
         // those stale false literals during search (#8870).
         // Exception: LRAT-protected reason clauses may remain satisfied (#5028).
+        // #array-deadline-forward: skipped after a deadline-truncated sweep —
+        // unprocessed satisfied clauses are expected then (see the sweep poll).
         #[cfg(debug_assertions)]
-        {
+        if !deadline_truncated {
             // Arena integrity pre-check: validate all active clauses have in-range
             // literals before the GC post-condition check. If this fires, the arena
             // is corrupt (ArenaIter misalignment, stale shrink_map, etc.) and the

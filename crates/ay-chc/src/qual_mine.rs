@@ -1231,6 +1231,7 @@ fn visit_all_exprs(problem: &ChcProblem, f: &mut impl FnMut(&ChcExpr)) {
 mod tests {
     use super::*;
     use crate::{ClauseBody, ClauseHead, HornClause};
+    use ay_test_support::env::with_env_edits;
 
     fn int_var(name: &str) -> ChcVar {
         ChcVar::new(name, ChcSort::Int)
@@ -1535,20 +1536,24 @@ mod tests {
     /// The mixed-class kill switch is honored by the env probe.
     #[test]
     fn mixed_kill_switch_env_var() {
-        // SAFETY: test-local env mutation; no other test reads this var.
-        std::env::set_var("AY_CHC_DISABLE_QUAL_MIXED", "1");
-        assert!(!qual_mixed_enabled());
-        std::env::remove_var("AY_CHC_DISABLE_QUAL_MIXED");
-        assert!(qual_mixed_enabled());
+        // Serialized + restore-on-exit via the workspace env choke point.
+        with_env_edits(|env| {
+            env.set("AY_CHC_DISABLE_QUAL_MIXED", "1");
+            assert!(!qual_mixed_enabled());
+            env.remove("AY_CHC_DISABLE_QUAL_MIXED");
+            assert!(qual_mixed_enabled());
+        });
     }
 
     /// Kill switch is honored by the env probe.
     #[test]
     fn kill_switch_env_var() {
-        // SAFETY: test-local env mutation; no other test reads this var.
-        std::env::set_var("AY_CHC_DISABLE_QUAL_MINE", "1");
-        assert!(!qual_mine_enabled());
-        std::env::remove_var("AY_CHC_DISABLE_QUAL_MINE");
-        assert!(qual_mine_enabled());
+        // Serialized + restore-on-exit via the workspace env choke point.
+        with_env_edits(|env| {
+            env.set("AY_CHC_DISABLE_QUAL_MINE", "1");
+            assert!(!qual_mine_enabled());
+            env.remove("AY_CHC_DISABLE_QUAL_MINE");
+            assert!(qual_mine_enabled());
+        });
     }
 }

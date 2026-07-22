@@ -5,8 +5,8 @@
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as HashMap;
 
-use crate::command::{self, Term as ParsedTerm};
-use ay_core::{Symbol, TermId};
+use crate::command::{self, QualifiedIdentifier, Term as ParsedTerm};
+use ay_core::{Sort, Symbol, TermId};
 
 use super::{Context, ElaborateError, Result};
 
@@ -18,19 +18,41 @@ impl Context {
     /// legacy `App` nodes with stringified qualified names.
     pub(super) fn elaborate_qualified_app(
         &mut self,
-        name: &str,
+        identifier: &QualifiedIdentifier,
         parsed_sort: &command::Sort,
         args: &[ParsedTerm],
         env: &HashMap<String, TermId>,
     ) -> Result<TermId> {
+        let name = match identifier {
+            QualifiedIdentifier::Symbol(name) => name.as_str(),
+            QualifiedIdentifier::Indexed(name, indices) => {
+                return Err(ElaborateError::Unsupported(format!(
+                    "qualified indexed identifier is unsupported: (_ {name} {})",
+                    indices
+                        .iter()
+                        .map(command::Index::text)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )));
+            }
+        };
         let sort = self.elaborate_sort(parsed_sort)?;
-        let arg_ids: Vec<TermId> = args
+        let mut arg_ids: Vec<TermId> = args
             .iter()
             .map(|a| self.elaborate_term(a, env))
             .collect::<Result<Vec<_>>>()?;
 
         match name {
-            "seq.empty" => Ok(self.terms.mk_app(Symbol::named("seq.empty"), vec![], sort)),
+            "seq.empty" => {
+                self.expect_exact_arity("seq.empty", &arg_ids, 0)?;
+                if !matches!(sort, Sort::Seq(_)) {
+                    return Err(ElaborateError::SortMismatch {
+                        expected: "(Seq _)".to_string(),
+                        actual: sort.to_string(),
+                    });
+                }
+                Ok(self.terms.mk_app(Symbol::named("seq.empty"), vec![], sort))
+            }
             // `(as set.empty (Set T))` is the empty set over the membership
             // carrier `Array(T -> Bool)`: the constant-false array. This is
             // sound and array-decidable: `select(empty, e) = false` for all `e`
@@ -42,6 +64,12 @@ impl Context {
                         "set.empty requires a (Set T) / Array sort annotation, got: {sort:?}"
                     ))
                 })?;
+                if sort.array_element() != Some(&Sort::Bool) {
+                    return Err(ElaborateError::SortMismatch {
+                        expected: "(Set _) carried as (Array _ Bool)".to_string(),
+                        actual: sort.to_string(),
+                    });
+                }
                 let false_t = self.terms.false_term();
                 Ok(self.terms.mk_const_array(index_sort, false_t))
             }
@@ -56,6 +84,12 @@ impl Context {
                         "multiset.empty requires a (Multiset T) / Array sort annotation, got: {sort:?}"
                     ))
                 })?;
+                if sort.array_element() != Some(&Sort::Int) {
+                    return Err(ElaborateError::SortMismatch {
+                        expected: "(Multiset _) carried as (Array _ Int)".to_string(),
+                        actual: sort.to_string(),
+                    });
+                }
                 let zero = self.terms.mk_int(num_bigint::BigInt::from(0));
                 Ok(self.terms.mk_const_array(index_sort, zero))
             }
@@ -110,42 +144,66 @@ impl Context {
                         "expected Array sort in const, got: {sort:?}"
                     ))
                 })?;
+                let expected = sort.array_element().cloned().ok_or_else(|| {
+                    ElaborateError::InvalidConstant(format!(
+                        "expected Array sort in const, got: {sort:?}"
+                    ))
+                })?;
+                let actual = self.terms.sort(arg_ids[0]).clone();
+                if actual == Sort::Int && expected == Sort::Real {
+                    arg_ids[0] = self.coerce_int_to_real(arg_ids[0]);
+                } else if actual != expected {
+                    return Err(ElaborateError::SortMismatch {
+                        expected: expected.to_string(),
+                        actual: actual.to_string(),
+                    });
+                }
                 Ok(self.terms.mk_const_array(index_sort, arg_ids[0]))
             }
             _ => {
-                // A qualified nullary application `(as <name> <sort>)` with no
-                // arguments must elaborate to the SAME term as the bare
-                // identifier `<name>`. In particular a nullary datatype
-                // constructor is stored as a `Var` term, not a 0-ary `App`
-                // (#1745); emitting `App(name, [])` here yields a term the DT
-                // axiom machinery does not recognize as that constructor, leaving
-                // construct/select/equality goals `unknown` (e.g. the Rust
-                // unit-variant pattern `(as A E)`). Reuse the declared symbol's
-                // bound term when it exists and matches the ascribed sort.
+                // Definitions are macros, not free declarations. A generic
+                // qualified application must still expand the body, after
+                // checking that the result ascription selects that definition.
+                if let Some((_params, result_sort, _body)) = self.fun_defs.get(name) {
+                    if result_sort != &sort {
+                        return Err(ElaborateError::SortMismatch {
+                            expected: result_sort.to_string(),
+                            actual: sort.to_string(),
+                        });
+                    }
+                    return self.elaborate_app(name, args, env);
+                }
+
+                // Resolve the whole signature, including the result ascription.
+                // This covers ordinary declarations and datatype members. It is
+                // also what preserves the selected private identity for native
+                // aliases and instance-mangled parametric constructors.
+                let info = self
+                    .resolve_qualified_declared_symbol(name, &sort, &arg_ids)?
+                    .ok_or_else(|| {
+                        ElaborateError::InvalidConstant(format!(
+                            "no declaration of '{name}' matches qualified result {sort} and the supplied arguments"
+                        ))
+                    })?;
+                self.validate_application_signature(name, &info.arg_sorts, &mut arg_ids)?;
+
+                // A qualified nullary constructor/constant denotes the exact
+                // same bound term as its bare spelling. In particular, datatype
+                // axiom recognition depends on the TermId identity here.
                 if arg_ids.is_empty() {
-                    // A nullary symbol may be overloaded across datatype instances
-                    // (e.g. `nil` for both `(Lst Int)` and `(Lst Bool)`); pick the
-                    // overload whose result sort matches the ascription so two
-                    // parametric instantiations coexist.
-                    if let Some(term) = self.nullary_overload_with_sort(name, &sort) {
+                    if let Some(term) = info.term {
                         return Ok(term);
                     }
-                    if let Some(term) = self.symbols.get(name).and_then(|info| info.term) {
-                        if *self.terms.sort(term) == sort {
-                            return Ok(term);
-                        }
-                    }
                 }
-                // A non-nullary parametric-datatype constructor ascribed with its
-                // instance sort (`((as osome (Opt Bool)) x)`) must build the
-                // instance-internal (mangled) symbol so the DT theory recognizes
-                // it as that instance's constructor. The ascribed result sort
-                // selects the instance.
-                let internal = self
-                    .ctor_internal_for_result_sort(name, &sort)
-                    .unwrap_or_else(|| name.to_string());
-                // Generic qualified identifier: use sort as return type
-                Ok(self.terms.mk_app(Symbol::named(&internal), arg_ids, sort))
+
+                if name == "to_real" {
+                    self.terms.mark_to_real_shadowed();
+                }
+                if name == "is_int" {
+                    self.terms.mark_is_int_shadowed();
+                }
+                let internal = info.internal_name.as_deref().unwrap_or(name);
+                Ok(self.terms.mk_app(Symbol::named(internal), arg_ids, sort))
             }
         }
     }

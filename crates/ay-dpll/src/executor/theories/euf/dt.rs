@@ -1197,7 +1197,7 @@ impl Executor {
         }
         // Shadow-first: default OFF keeps the incremental gate clamped exactly
         // as before (byte-identical when `AY_DT_LAZY_AUFLIA_INCR` is unset/0).
-        if !std::env::var_os("AY_DT_LAZY_AUFLIA_INCR").is_some_and(|v| v != "0") {
+        if std::env::var_os("AY_DT_LAZY_AUFLIA_INCR").is_none_or(|v| v == "0") {
             return Ok(None);
         }
         // Fail-closed on proof production: the pure-oracle term rollback below
@@ -1381,7 +1381,7 @@ impl Executor {
                 .map(|(c, _)| {
                     self.ctx
                         .terms
-                        .mk_app(Symbol::named(&format!("is-{c}")), [t], Sort::Bool)
+                        .mk_app(Symbol::named(format!("is-{c}")), [t], Sort::Bool)
                 })
                 .collect();
             // Exhaustiveness + pairwise exclusivity (multi-constructor only).

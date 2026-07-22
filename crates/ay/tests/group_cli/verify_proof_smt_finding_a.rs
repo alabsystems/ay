@@ -11,15 +11,14 @@
 //! every raw SMT invocation under `cargo test` exited with code 1 and
 //! the error "SMT-LIB mode requires Alethe output".
 //!
-//! The SMT-LIB path rewrites synthesized non-Alethe temporary configs to
-//! Alethe so the debug `--verify-proof` default does not break ordinary SMT
-//! invocation.
+//! The fix drops verify-only temporary configs on the SMT-LIB route: AY's
+//! built-in post-checker supports DIMACS DRAT/LRAT, not Alethe, so writing and
+//! deleting an unchecked temporary Alethe file only spent memory while giving
+//! a false impression that verification occurred.
 //!
-//! This test exercises the debug binary `CARGO_BIN_EXE_ay` on a trivial
-//! `QF_LIA` SMT input, both with and without the explicit `--verify-proof`
-//! flag. Under the bug, both invocations (debug build, implicit verify)
-//! returned exit code 1 with the "requires Alethe" error. After the fix,
-//! both succeed with `sat` on stdout.
+//! Implicit default verification therefore leaves ordinary SMT solving usable,
+//! while an explicit `--verify-proof` request fails closed with a qualified
+//! error instead of silently skipping the requested check.
 
 use ntest::timeout;
 use std::path::PathBuf;
@@ -109,11 +108,11 @@ fn test_smt_default_verify_proof_debug_does_not_reject() {
     );
 }
 
-/// Explicit `--verify-proof` on SMT input must also succeed without the
-/// pre-fix "SMT-LIB mode requires Alethe" error.
+/// Explicit `--verify-proof` on SMT input must fail closed: the built-in
+/// checker cannot verify Alethe.
 #[test]
 #[timeout(60_000)]
-fn test_smt_explicit_verify_proof_does_not_reject() {
+fn test_smt_explicit_verify_proof_rejects_sat_before_solving() {
     let (input, _c) = write_temp_smt(TRIVIAL_SAT_SMT);
 
     let output = Command::new(ay_binary())
@@ -126,27 +125,25 @@ fn test_smt_explicit_verify_proof_does_not_reject() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
-        !stderr.contains("SMT-LIB mode requires Alethe"),
-        "--verify-proof on SMT must not reject synthesized proof; stderr={stderr}"
+        stdout.trim().is_empty(),
+        "must not emit a verdict; stdout={stdout}"
     );
     assert!(
-        stdout.contains("sat"),
-        "expected sat output; stdout={stdout}; stderr={stderr}"
+        stderr.contains("--verify-proof cannot verify SMT-LIB Alethe certificates"),
+        "missing qualified Alethe rejection; stderr={stderr}"
     );
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "expected exit 0 on trivial SAT; stdout={stdout}; stderr={stderr}"
+        Some(1),
+        "explicit unsupported verification must exit 1; stdout={stdout}; stderr={stderr}"
     );
 }
 
-/// Explicit `--verify-proof` + UNSAT on SMT also succeeds: the synthesized
-/// config is rewritten to Alethe, `write_alethe_proof` writes the Alethe
-/// certificate, the temp file is cleaned up. Pre-fix, this path errored out
-/// before solving.
+/// Rejection is independent of the latent solver result: an UNSAT instance is
+/// also refused before its unchecked verdict or certificate can be emitted.
 #[test]
 #[timeout(60_000)]
-fn test_smt_explicit_verify_proof_unsat_does_not_reject() {
+fn test_smt_explicit_verify_proof_rejects_unsat_before_solving() {
     let (input, _c) = write_temp_smt(TRIVIAL_UNSAT_SMT);
 
     let output = Command::new(ay_binary())
@@ -159,19 +156,17 @@ fn test_smt_explicit_verify_proof_unsat_does_not_reject() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(
-        !stderr.contains("SMT-LIB mode requires Alethe"),
-        "--verify-proof on SMT UNSAT must not reject synthesized proof; stderr={stderr}"
+        stdout.trim().is_empty(),
+        "must not emit a verdict; stdout={stdout}"
     );
     assert!(
-        stdout.contains("unsat"),
-        "expected unsat output; stdout={stdout}; stderr={stderr}"
+        stderr.contains("--verify-proof cannot verify SMT-LIB Alethe certificates"),
+        "missing qualified Alethe rejection; stderr={stderr}"
     );
-    // SMT unsat exits 0 via the print-and-return path — UNSAT here is
-    // the expected result, not a solver error.
     assert_eq!(
         output.status.code(),
-        Some(0),
-        "expected exit 0 on SMT UNSAT; stdout={stdout}; stderr={stderr}"
+        Some(1),
+        "explicit unsupported verification must exit 1; stdout={stdout}; stderr={stderr}"
     );
 }
 

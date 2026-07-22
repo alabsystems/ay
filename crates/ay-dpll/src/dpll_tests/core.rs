@@ -553,7 +553,7 @@ fn test_from_tseitin_disables_reorder_for_large_instances() {
     // conjunction of propositional variables.
     let num_vars = 60_000;
     let vars: Vec<TermId> = (0..num_vars)
-        .map(|i| terms.mk_var(&format!("v{i}"), Sort::Bool))
+        .map(|i| terms.mk_var(format!("v{i}"), Sort::Bool))
         .collect();
     let formula = terms.mk_and(vars);
 

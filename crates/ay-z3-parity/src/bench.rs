@@ -1663,7 +1663,7 @@ mod tests {
         };
         let slow = BenchOutcome {
             kind: OutcomeKind::Verdicts(vec![Verdict::Sat]),
-            wall: Duration::from_nanos(20_000),
+            wall: Duration::from_micros(20),
         };
         // Both below the floor: ratio clamps to 1 rather than 100x.
         assert!((ratio_of(&slow, &fast) - 1.0).abs() < 1e-9);

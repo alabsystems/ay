@@ -156,6 +156,41 @@ impl VerificationError {
     }
 }
 
+/// #verify-memo (`AY_VERIFY_MEMO=1`, default off = byte-identical): arms the
+/// verify-lane obligation memo in the extension's sampled propagation
+/// verification (see `extension/propagate.rs`). The verification TAX is never
+/// weakened — same obligations selected for verification (sampling policy
+/// untouched), same fail-closed outcomes; a memo hit replays the recorded
+/// verdict of a FULL verification of the byte-identical obligation
+/// (canonical sorted literal-set signature), and only ACCEPT verdicts are
+/// memoized (trust-true-only — the `verify_conflict_semantic_memo` /
+/// `verify_array_memo` discipline), so every rejection re-runs the complete
+/// verification with its exact error kind.
+///
+/// Read once per process (same pattern as `AY_PROP_DEBUG` /
+/// `AY_LIA_INSTRUMENT`): when unset, every call is a single load and the
+/// solver's control flow is byte-for-byte the unflagged build.
+pub(crate) fn verify_memo_armed() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| std::env::var_os("AY_VERIFY_MEMO").is_some_and(|v| v != "0"))
+}
+
+/// #verify-memo: Executor-owned memo for sampled semantic PROPAGATION
+/// verification verdicts (the propagation analogue of
+/// [`ConflictSemanticVerifyMemo`], #4535). Key: canonical obligation
+/// signature — sorted reason literals then the propagated literal, as
+/// (term id, value) pairs (the `verify_array_memo` key discipline). Value is
+/// always `true`: only ACCEPT verdicts are recorded (trust-true-only), so a
+/// hit can only replay an accept already proven by a FULL verification of
+/// the byte-identical obligation, and every rejection re-runs the complete
+/// fail-closed check. Executor-owned so the memo survives the eager arm's
+/// per-iteration extension rebuilds (the reason the conflict memo moved to
+/// the Executor); joins the same lifecycle contract — cleared at
+/// `check_sat_internal` entry and on support-set rebuild, and
+/// snapshot/restored by the #detour-snapshot-extend speculation (its term
+/// rollback invalidates TermId-keyed entries minted during speculation).
+pub(crate) type PropSemanticVerifyMemo = ay_core::kani_compat::DetHashMap<Vec<(u32, bool)>, bool>;
+
 // Re-export all public items from submodules so that `crate::verification::X` paths
 // continue to work unchanged at all import sites.
 pub(crate) use dispatch::{

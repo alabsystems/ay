@@ -34,10 +34,10 @@ fn numeral_numerator_denominator() {
         assert_ne!(den, 0);
         let ns = CStr::from_ptr(Z3_get_numeral_string(c, num))
             .to_str()
-            .unwrap();
+            .expect("numerator numeral string must be valid UTF-8");
         let ds = CStr::from_ptr(Z3_get_numeral_string(c, den))
             .to_str()
-            .unwrap();
+            .expect("denominator numeral string must be valid UTF-8");
         assert_eq!(ns, "22");
         assert_eq!(ds, "7");
 
@@ -47,7 +47,7 @@ fn numeral_numerator_denominator() {
         let iden = Z3_get_denominator(c, i);
         let ids = CStr::from_ptr(Z3_get_numeral_string(c, iden))
             .to_str()
-            .unwrap();
+            .expect("integer denominator string must be valid UTF-8");
         assert_eq!(ids, "1");
 
         Z3_del_context(c);
@@ -64,18 +64,18 @@ fn numeral_double_and_small() {
 
         let mut n: i64 = 0;
         let mut d: i64 = 0;
-        assert!(Z3_get_numeral_rational_int64(c, r, &mut n, &mut d));
+        assert!(Z3_get_numeral_rational_int64(c, r, &raw mut n, &raw mut d));
         assert_eq!((n, d), (3, 4));
 
         let mut n2: i64 = 0;
         let mut d2: i64 = 0;
-        assert!(Z3_get_numeral_small(c, r, &mut n2, &mut d2));
+        assert!(Z3_get_numeral_small(c, r, &raw mut n2, &raw mut d2));
         assert_eq!((n2, d2), (3, 4));
 
         // Non-numeral: false, error set for _small.
         let int = Z3_mk_int_sort(c);
         let x = Z3_mk_const(c, Z3_mk_string_symbol(c, c"x".as_ptr()), int);
-        assert!(!Z3_get_numeral_small(c, x, &mut n2, &mut d2));
+        assert!(!Z3_get_numeral_small(c, x, &raw mut n2, &raw mut d2));
         assert_eq!(Z3_get_error_code(c), Z3_INVALID_ARG);
 
         Z3_del_context(c);
@@ -90,7 +90,9 @@ fn numeral_binary_string_for_bv() {
         let v = Z3_mk_int(c, 5, bv8);
         let s = Z3_get_numeral_binary_string(c, v);
         assert!(!s.is_null());
-        let bits = CStr::from_ptr(s).to_str().unwrap();
+        let bits = CStr::from_ptr(s)
+            .to_str()
+            .expect("bit-vector numeral string must be valid UTF-8");
         // libz3 renders the VALUE in minimal binary — it does NOT zero-pad to
         // the bit-vector width (measured: `bv8 5` → "101", not "00000101").
         assert_eq!(bits, "101");
@@ -101,7 +103,12 @@ fn numeral_binary_string_for_bv() {
         let i = Z3_mk_int(c, 5, int);
         let s = Z3_get_numeral_binary_string(c, i);
         assert!(!s.is_null());
-        assert_eq!(CStr::from_ptr(s).to_str().unwrap(), "101");
+        assert_eq!(
+            CStr::from_ptr(s)
+                .to_str()
+                .expect("integer binary numeral string must be valid UTF-8"),
+            "101"
+        );
 
         // A negative value has no binary rendering → null + INVALID_ARG.
         let neg = Z3_mk_int(c, -5, int);
@@ -191,7 +198,7 @@ fn array_arity_divergences() {
         // (measured against libz3, which writes 0 rather than leaving the
         // caller's value in place). Relation sorts do not exist → sound sentinel.
         let mut sz: u64 = 123;
-        assert!(!Z3_get_finite_domain_sort_size(c, int, &mut sz));
+        assert!(!Z3_get_finite_domain_sort_size(c, int, &raw mut sz));
         assert_eq!(sz, 0);
         assert_eq!(Z3_get_relation_arity(c, int), 0);
 
@@ -205,7 +212,9 @@ fn registry_enumerators() {
         let c = ctx();
         let nt = Z3_get_num_tactics(c);
         assert!(nt >= 12, "expected the curated tactic set, got {nt}");
-        let name0 = CStr::from_ptr(Z3_get_tactic_name(c, 0)).to_str().unwrap();
+        let name0 = CStr::from_ptr(Z3_get_tactic_name(c, 0))
+            .to_str()
+            .expect("registered tactic name must be valid UTF-8");
         assert!(!name0.is_empty());
         // out of range → null + IOB
         assert!(Z3_get_tactic_name(c, nt).is_null());

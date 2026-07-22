@@ -117,7 +117,7 @@ fn parse_script(content: &str) -> Option<Script> {
             None => break,
         };
         let cmd = match item {
-            CommandStreamItem::Command(c) => c,
+            CommandStreamItem::Command(c) => *c,
             // A parse error means the standard lane's `(error …)` recovery
             // behavior must be preserved — not ours.
             _ => return None,

@@ -433,9 +433,7 @@ impl BucketSelector {
         match self.epoch.checked_add(1) {
             Some(next) => self.epoch = next,
             None => {
-                for s in &mut self.dirty_stamp {
-                    *s = 0;
-                }
+                self.dirty_stamp.fill(0);
                 self.epoch = 1;
             }
         }

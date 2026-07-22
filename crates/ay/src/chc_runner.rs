@@ -8,7 +8,8 @@
 
 use super::{
     exit_if_timed_out, mark_verdict_printed, print_chc_stats, stats_output, ProofConfig,
-    GLOBAL_TIMEOUT_MS, PROGRESS_ENABLED, START_TIME, STRICT_PROOFS_ENABLED, Z3_MODE_ENABLED,
+    GLOBAL_TIMEOUT_MS, PROGRESS_ENABLED, SELF_CHECK_ENABLED, START_TIME, STRICT_PROOFS_ENABLED,
+    Z3_MODE_ENABLED,
 };
 use ay::chc::{
     engines, ChcExpr, ChcPdrProofRun, ChcProblem, ChcProofArtifactDigest, ChcProofEvidenceManifest,
@@ -18,7 +19,7 @@ use ay::chc::{
 };
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 
@@ -33,6 +34,136 @@ use ay_core::time::Instant;
 struct ChcCliReplayArtifacts {
     proof: Option<ChcProofArtifactDigest>,
     replay_obligations: Vec<ChcReplayObligationArtifact>,
+    retained_files: Vec<ChcPublishedFile>,
+    // Keep the per-destination publication lease through verdict and stats
+    // emission. Otherwise a second AY invocation could acquire the lease and
+    // replace the just-validated certificate in the validation/print gap.
+    _publication_lock: Option<ChcPublicationLock>,
+}
+
+struct ChcPublishedFile {
+    path: PathBuf,
+    file: fs::File,
+    sha256: String,
+    bytes: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn ensure_authenticated_chc_publication_supported() -> io::Result<()> {
+    if cfg!(unix) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "authenticated CHC artifact publication requires Unix descriptor identity and no-follow support",
+        ))
+    }
+}
+
+impl ChcPublishedFile {
+    fn validate(&mut self) -> io::Result<()> {
+        ensure_authenticated_chc_publication_supported()?;
+        let path_metadata = fs::symlink_metadata(&self.path)?;
+        if !path_metadata.file_type().is_file() || path_metadata.len() != self.bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "published CHC artifact '{}' changed type or size",
+                    self.path.display()
+                ),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if path_metadata.dev() != self.device
+                || path_metadata.ino() != self.inode
+                || path_metadata.nlink() != 1
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "published CHC artifact '{}' changed identity",
+                        self.path.display()
+                    ),
+                ));
+            }
+        }
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut hasher = Sha256::new();
+        let mut bytes = 0u64;
+        let mut buffer = [0u8; 8192];
+        loop {
+            let read = self.file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            bytes = bytes
+                .checked_add(read as u64)
+                .ok_or_else(|| io::Error::other("CHC artifact size overflow"))?;
+        }
+        if bytes != self.bytes || hex_lower(&hasher.finalize()) != self.sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "published CHC artifact '{}' changed content",
+                    self.path.display()
+                ),
+            ));
+        }
+        // Re-authenticate the visible name after reading the descriptor. A
+        // replacement between the initial identity check and the digest read
+        // must not make an unrelated pathname appear covered by that digest.
+        let final_path_metadata = fs::symlink_metadata(&self.path)?;
+        if !final_path_metadata.file_type().is_file() || final_path_metadata.len() != self.bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "published CHC artifact '{}' changed type or size while it was validated",
+                    self.path.display()
+                ),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if final_path_metadata.dev() != self.device
+                || final_path_metadata.ino() != self.inode
+                || final_path_metadata.nlink() != 1
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "published CHC artifact '{}' changed identity while it was validated",
+                        self.path.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ChcCliReplayArtifacts {
+    fn validate(&mut self) -> io::Result<()> {
+        if let Some(lock) = &self._publication_lock {
+            lock.validate()?;
+        }
+        for artifact in &mut self.retained_files {
+            artifact.validate()?;
+        }
+        // Recheck the lock name after hashing the artifacts. An unlink/recreate
+        // during the descriptor reads must not leave this run believing it
+        // still owns the destination authority.
+        if let Some(lock) = &self._publication_lock {
+            lock.validate()?;
+        }
+        Ok(())
+    }
 }
 
 fn emit_chc_build_provenance_to_stderr() {
@@ -603,158 +734,584 @@ fn chccert_sibling_path(path: &str) -> String {
     p.to_string_lossy().into_owned()
 }
 
-fn write_chc_certificate_artifact(
-    proof_config: Option<&ProofConfig>,
-    certificate: &str,
-) -> Option<ChcProofArtifactDigest> {
-    let proof = effective_chc_proof_config(proof_config)?;
-    let path = Path::new(&proof.path);
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        if let Err(error) = fs::create_dir_all(parent) {
+fn validate_chc_proof_request(proof_config: Option<&ProofConfig>) {
+    let Some(proof) = effective_chc_proof_config(proof_config) else {
+        if let Some(gate) = required_chc_certificate_gate_name() {
             safe_eprintln!(
-                "Error: failed to create CHC certificate directory {}: {error}",
-                parent.display()
+                "Error: {gate} requires a persistent native CHC certificate; pass --proof FILE.chccert and do not suppress proof output with --no-proof, --z3-mode, or --competition"
             );
             std::process::exit(1);
         }
+        return;
+    };
+    if proof.artifact_path.is_some() {
+        safe_eprintln!(
+            "Error: --proof-artifact is unsupported for CHC certificates; no authenticated proof-artifact-v1 CHC envelope is available"
+        );
+        std::process::exit(1);
     }
     if proof.binary {
         safe_eprintln!(
-            "c warning: CHC certificates are emitted as text; ignoring --proof-binary for {}",
-            proof.path
-        );
-    }
-    if let Err(error) = fs::write(path, certificate) {
-        safe_eprintln!(
-            "Error: failed to write CHC certificate {}: {error}",
-            path.display()
+            "Error: --proof-binary is unsupported for CHC text certificates; omit the flag"
         );
         std::process::exit(1);
     }
-    if !crate::quiet_enabled() {
-        // Proof-write announcement only; the certificate file is already written.
-        safe_eprintln!("c wrote CHC certificate to {}", path.display());
-    }
-    Some(
-        ChcProofArtifactDigest::from_bytes("proof-certificate", certificate.as_bytes())
-            .with_path(path.display().to_string()),
-    )
-}
-
-fn write_chc_replay_obligation_artifacts(
-    proof_path: &str,
-    obligations: Vec<ChcReplayObligation>,
-) -> Vec<ChcReplayObligationArtifact> {
-    let obligations_dir = chc_obligations_dir(proof_path);
-    if let Err(error) = fs::create_dir_all(&obligations_dir) {
-        safe_eprintln!(
-            "Error: failed to create CHC replay obligations directory {}: {error}",
-            obligations_dir.display()
-        );
-        std::process::exit(1);
-    }
-
-    let mut replay_obligations = Vec::new();
-    for obligation in obligations {
-        let kind = obligation.kind;
-        let path = obligations_dir.join(format!(
-            "{:03}-{}.smt2",
-            obligation.clause_index,
-            kind.as_str()
-        ));
-        if let Err(error) = fs::write(&path, &obligation.smtlib) {
+    if !proof.synthesized_default {
+        if proof.format_was_explicit {
             safe_eprintln!(
-                "Error: failed to write CHC replay obligation {}: {error}",
-                path.display()
+                "Error: --proof-format and legacy DIMACS proof flags are incompatible with CHC certificates; use --proof FILE.chccert without --proof-format"
             );
             std::process::exit(1);
         }
-        let query =
-            ChcProofArtifactDigest::from_bytes("replay-obligation", obligation.smtlib.as_bytes())
+        let native_extension = Path::new(&proof.path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("chccert"));
+        if proof.format != super::ProofFormat::Alethe || !native_extension {
+            safe_eprintln!(
+                "Error: CHC proof output uses the native ay-chc-cert text format; request --proof FILE.chccert (DRAT, LRAT, Lean4, and Alethe output formats are incompatible)"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+fn required_chc_certificate_gate_name() -> Option<&'static str> {
+    let strict = STRICT_PROOFS_ENABLED.load(Ordering::SeqCst);
+    let self_check = SELF_CHECK_ENABLED.load(Ordering::SeqCst);
+    match (strict, self_check) {
+        (true, true) => Some("--strict-proofs/--self-check"),
+        (true, false) => Some("--strict-proofs"),
+        (false, true) => Some("--self-check"),
+        (false, false) => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChcCertificateFailureDisposition {
+    Optional,
+    Required,
+    Fatal,
+}
+
+fn chc_certificate_failure_disposition(
+    synthesized_default: bool,
+    required_gate: Option<&str>,
+) -> ChcCertificateFailureDisposition {
+    match (synthesized_default, required_gate.is_some()) {
+        (true, false) => ChcCertificateFailureDisposition::Optional,
+        (true, true) => ChcCertificateFailureDisposition::Required,
+        (false, _) => ChcCertificateFailureDisposition::Fatal,
+    }
+}
+
+enum ChcCertificatePublication {
+    Available(ChcCliReplayArtifacts),
+    OptionalUnavailable,
+    RequiredUnavailable(String),
+}
+
+fn handle_chc_certificate_publication_failure(
+    proof: &ProofConfig,
+    reason: impl std::fmt::Display,
+) -> ChcCertificatePublication {
+    let required_gate = required_chc_certificate_gate_name();
+    match chc_certificate_failure_disposition(proof.synthesized_default, required_gate) {
+        ChcCertificateFailureDisposition::Optional => {
+            safe_eprintln!(
+                "c Warning: optional synthesized CHC certificate {} was not published: {reason}; solver verdict remains authoritative",
+                proof.path
+            );
+            ChcCertificatePublication::OptionalUnavailable
+        }
+        ChcCertificateFailureDisposition::Required => {
+            let gate = required_gate.unwrap_or("required proof gate");
+            ChcCertificatePublication::RequiredUnavailable(format!(
+                "{gate} rejected the definitive CHC result because required synthesized certificate generation/publication failed: {reason}"
+            ))
+        }
+        ChcCertificateFailureDisposition::Fatal => {
+            safe_eprintln!(
+                "Error: failed to publish explicitly requested CHC certificate {}: {reason}",
+                proof.path
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+struct ChcPublicationLock {
+    file: fs::File,
+    path: PathBuf,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl ChcPublicationLock {
+    fn acquire(proof_path: &Path) -> io::Result<Self> {
+        ensure_authenticated_chc_publication_supported()?;
+        let parent = proof_path
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proof has no parent"))?;
+        let file_name = proof_path.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "proof path has no file name")
+        })?;
+        let lock_path = parent.join(format!(".{}.ay-chc.lock", file_name.to_string_lossy()));
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options
+                .create(true)
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+        }
+        #[cfg(not(unix))]
+        options.create_new(true);
+        let file = options.open(&lock_path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CHC publication lock is not a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            #[allow(deprecated)]
+            nix::fcntl::flock(
+                file.as_raw_fd(),
+                nix::fcntl::FlockArg::LockExclusiveNonblock,
+            )
+            .map_err(|error| io::Error::from_raw_os_error(error as i32))?;
+        }
+        let metadata = file.metadata()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if metadata.nlink() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CHC publication lock has unexpected hard links",
+                ));
+            }
+        }
+        let lock = Self {
+            file,
+            path: lock_path,
+            #[cfg(unix)]
+            device: {
+                use std::os::unix::fs::MetadataExt as _;
+                metadata.dev()
+            },
+            #[cfg(unix)]
+            inode: {
+                use std::os::unix::fs::MetadataExt as _;
+                metadata.ino()
+            },
+        };
+        lock.validate()?;
+        Ok(lock)
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        ensure_authenticated_chc_publication_supported()?;
+        let descriptor_metadata = self.file.metadata()?;
+        if !descriptor_metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CHC publication lock descriptor is not a regular file",
+            ));
+        }
+        let path_metadata = fs::symlink_metadata(&self.path)?;
+        if !path_metadata.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CHC publication lock path is not a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if descriptor_metadata.dev() != self.device
+                || descriptor_metadata.ino() != self.inode
+                || descriptor_metadata.nlink() != 1
+                || path_metadata.dev() != self.device
+                || path_metadata.ino() != self.inode
+                || path_metadata.nlink() != 1
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CHC publication lock authority changed",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ChcPublicationLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            #[allow(deprecated)]
+            let _ = nix::fcntl::flock(self.file.as_raw_fd(), nix::fcntl::FlockArg::Unlock);
+        }
+        // Unsupported platforms never construct this guard. In particular,
+        // do not add a pathname-only fallback here: it could unlink a
+        // same-name replacement that this process does not own.
+    }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    hex_lower(&Sha256::digest(bytes))
+}
+
+fn open_chc_regular_file(path: &Path) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        if !fs::symlink_metadata(path)?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CHC artifact is not a regular file",
+            ));
+        }
+        fs::File::open(path)?
+    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CHC artifact is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn seal_chc_published_file(path: &Path, expected_sha256: &str) -> io::Result<ChcPublishedFile> {
+    ensure_authenticated_chc_publication_supported()?;
+    let mut file = open_chc_regular_file(path)?;
+    let metadata = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "published CHC artifact has unexpected hard links",
+            ));
+        }
+    }
+    let mut hasher = Sha256::new();
+    let mut bytes = 0u64;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("CHC artifact size overflow"))?;
+    }
+    let actual = hex_lower(&hasher.finalize());
+    if actual != expected_sha256 || bytes != metadata.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "published CHC artifact does not match staged bytes",
+        ));
+    }
+    let sealed = ChcPublishedFile {
+        path: path.to_path_buf(),
+        file,
+        sha256: actual,
+        bytes,
+        #[cfg(unix)]
+        device: {
+            use std::os::unix::fs::MetadataExt as _;
+            metadata.dev()
+        },
+        #[cfg(unix)]
+        inode: {
+            use std::os::unix::fs::MetadataExt as _;
+            metadata.ino()
+        },
+    };
+    let path_metadata = fs::symlink_metadata(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if path_metadata.dev() != sealed.device || path_metadata.ino() != sealed.inode {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "published CHC artifact path changed during sealing",
+            ));
+        }
+    }
+    Ok(sealed)
+}
+
+fn create_chc_obligations_dir(proof_path: &Path) -> io::Result<PathBuf> {
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let parent = proof_path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proof has no parent"))?;
+    let proof_name = proof_path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "proof has no file name"))?
+        .to_string_lossy();
+    for _ in 0..32 {
+        let nonce = NONCE.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            "{proof_name}.chc-obligations-{}-{nonce}",
+            std::process::id()
+        ));
+        #[cfg(unix)]
+        let create_result = {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700).create(&path)
+        };
+        #[cfg(not(unix))]
+        let create_result = fs::create_dir(&path);
+        match create_result {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not reserve a unique CHC obligations directory",
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChcArtifactScope {
+    CertificateOnly,
+    StatsEvidence,
+}
+
+impl ChcArtifactScope {
+    fn for_stats(stats_cfg: stats_output::StatsConfig) -> Self {
+        if stats_cfg.any() {
+            Self::StatsEvidence
+        } else {
+            Self::CertificateOnly
+        }
+    }
+
+    fn includes_replay_obligations(self) -> bool {
+        self == Self::StatsEvidence
+    }
+}
+
+fn publish_chc_certificate_artifacts(
+    proof: &ProofConfig,
+    certificate: &str,
+    obligations: Vec<ChcReplayObligation>,
+) -> io::Result<ChcCliReplayArtifacts> {
+    let resolved_proof = crate::run::resolve_artifact_target(Path::new(&proof.path))?;
+    let publication_lock = ChcPublicationLock::acquire(&resolved_proof)?;
+    let result = (|| {
+        let mut replay_obligations = Vec::with_capacity(obligations.len());
+        let mut retained_files = Vec::with_capacity(obligations.len() + 1);
+        if !obligations.is_empty() {
+            let obligations_dir = create_chc_obligations_dir(&resolved_proof)?;
+            for obligation in obligations {
+                let kind = obligation.kind;
+                let path = obligations_dir.join(format!(
+                    "{:03}-{}.smt2",
+                    obligation.clause_index,
+                    kind.as_str()
+                ));
+                let mut options = fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt as _;
+                    options.mode(0o600).custom_flags(nix::libc::O_NOFOLLOW);
+                }
+                let mut file = options.open(&path)?;
+                file.write_all(obligation.smtlib.as_bytes())?;
+                file.sync_all()?;
+                drop(file);
+                let digest = sha256_bytes(obligation.smtlib.as_bytes());
+                retained_files.push(seal_chc_published_file(&path, &digest)?);
+                let query = ChcProofArtifactDigest::from_sha256(
+                    "replay-obligation",
+                    digest,
+                    obligation.smtlib.len() as u64,
+                )
                 .with_path(path.display().to_string());
-        replay_obligations.push(ChcReplayObligationArtifact::new(kind, query));
-    }
-    if !crate::quiet_enabled() {
-        // Proof-write announcement only; obligations are already on disk.
-        safe_eprintln!(
-            "c wrote CHC replay obligations to {}",
-            obligations_dir.display()
-        );
-    }
-    replay_obligations
+                replay_obligations.push(ChcReplayObligationArtifact::new(kind, query));
+            }
+            #[cfg(unix)]
+            fs::File::open(&obligations_dir)?.sync_all()?;
+        }
+
+        crate::run::write_artifact_atomically(&resolved_proof, |file| {
+            file.write_all(certificate.as_bytes())
+        })?;
+        let proof_digest = sha256_bytes(certificate.as_bytes());
+        retained_files.push(seal_chc_published_file(&resolved_proof, &proof_digest)?);
+        let proof_artifact = ChcProofArtifactDigest::from_sha256(
+            "proof-certificate",
+            proof_digest,
+            certificate.len() as u64,
+        )
+        .with_path(resolved_proof.display().to_string());
+        #[cfg(unix)]
+        if let Some(parent) = resolved_proof.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(ChcCliReplayArtifacts {
+            proof: Some(proof_artifact),
+            replay_obligations,
+            retained_files,
+            _publication_lock: Some(publication_lock),
+        })
+    })();
+    // Never delete this pathname after a fallible publication: a concurrent
+    // replacement could make it name someone else's tree. Failed transactions
+    // retain their private, uniquely named partial directory for diagnosis.
+    result
 }
 
 fn write_chc_safe_certificate_artifacts<F>(
     proof_config: Option<&ProofConfig>,
     certificate: &str,
+    artifact_scope: ChcArtifactScope,
     obligations: F,
-) -> ChcCliReplayArtifacts
+) -> ChcCertificatePublication
 where
     F: FnOnce() -> ChcResult<Vec<ChcReplayObligation>>,
 {
     let Some(proof) = effective_chc_proof_config(proof_config) else {
-        return ChcCliReplayArtifacts::default();
+        return ChcCertificatePublication::Available(ChcCliReplayArtifacts::default());
     };
-    let proof_artifact = write_chc_certificate_artifact(Some(&proof), certificate);
-
-    let obligations = match obligations() {
-        Ok(obligations) => obligations,
-        Err(error) => {
-            safe_eprintln!("Error: failed to generate CHC replay obligations: {error}");
-            std::process::exit(1);
+    let obligations = if artifact_scope.includes_replay_obligations() {
+        match obligations() {
+            Ok(obligations) => obligations,
+            Err(error) => {
+                return handle_chc_certificate_publication_failure(
+                    &proof,
+                    format_args!("failed to generate CHC replay obligations: {error}"),
+                );
+            }
         }
+    } else {
+        Vec::new()
     };
-
-    let replay_obligations = write_chc_replay_obligation_artifacts(&proof.path, obligations);
-    ChcCliReplayArtifacts {
-        proof: proof_artifact,
-        replay_obligations,
+    match publish_chc_certificate_artifacts(&proof, certificate, obligations) {
+        Ok(artifacts) => {
+            if !crate::quiet_enabled() {
+                // Proof-write announcement only; the retained transaction is
+                // already published regardless of `-q`/`--quiet`.
+                safe_eprintln!("c wrote CHC certificate to {}", proof.path);
+            }
+            ChcCertificatePublication::Available(artifacts)
+        }
+        Err(error) => handle_chc_certificate_publication_failure(
+            &proof,
+            format_args!("certificate transaction failed: {error}"),
+        ),
     }
 }
 
 fn write_chc_unsafe_certificate_artifacts<F>(
     proof_config: Option<&ProofConfig>,
     certificate: &str,
+    artifact_scope: ChcArtifactScope,
     obligations: F,
-) -> ChcCliReplayArtifacts
+) -> ChcCertificatePublication
 where
     F: FnOnce() -> ChcResult<Vec<ChcReplayObligation>>,
 {
     let Some(proof) = effective_chc_proof_config(proof_config) else {
-        return ChcCliReplayArtifacts::default();
+        return ChcCertificatePublication::Available(ChcCliReplayArtifacts::default());
     };
-    let proof_artifact = write_chc_certificate_artifact(Some(&proof), certificate);
-
-    let obligations = match obligations() {
-        Ok(obligations) => obligations,
-        Err(error) => {
-            safe_eprintln!(
-                "c warning: failed to generate CHC unsafe trace-validity replay obligation: {error}"
-            );
-            return ChcCliReplayArtifacts {
-                proof: proof_artifact,
-                replay_obligations: Vec::new(),
-            };
+    let obligations = if artifact_scope.includes_replay_obligations() {
+        match obligations() {
+            Ok(obligations) => obligations,
+            Err(error) => {
+                return handle_chc_certificate_publication_failure(
+                    &proof,
+                    format_args!(
+                        "failed to generate CHC unsafe trace-validity replay obligation: {error}"
+                    ),
+                );
+            }
         }
+    } else {
+        Vec::new()
     };
-    let replay_obligations = write_chc_replay_obligation_artifacts(&proof.path, obligations);
-    ChcCliReplayArtifacts {
-        proof: proof_artifact,
-        replay_obligations,
+    match publish_chc_certificate_artifacts(&proof, certificate, obligations) {
+        Ok(artifacts) => {
+            if !crate::quiet_enabled() {
+                // Proof-write announcement only; the retained transaction is
+                // already published regardless of `-q`/`--quiet`.
+                safe_eprintln!("c wrote CHC certificate to {}", proof.path);
+            }
+            ChcCertificatePublication::Available(artifacts)
+        }
+        Err(error) => handle_chc_certificate_publication_failure(
+            &proof,
+            format_args!("certificate transaction failed: {error}"),
+        ),
     }
 }
 
-fn chc_obligations_dir(proof_path: &str) -> PathBuf {
-    Path::new(proof_path)
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .map_or_else(
-            || PathBuf::from("chc-obligations"),
-            |parent| parent.join("chc-obligations"),
-        )
+fn prepare_chc_certificate_for_verdict(
+    proof_config: Option<&ProofConfig>,
+    publication: ChcCertificatePublication,
+    stats_cfg: stats_output::StatsConfig,
+    emitted_build_provenance: bool,
+) -> Option<ChcCliReplayArtifacts> {
+    let publication = match publication {
+        ChcCertificatePublication::Available(mut artifacts) => match artifacts.validate() {
+            Ok(()) => return Some(artifacts),
+            Err(error) => {
+                let Some(proof) = effective_chc_proof_config(proof_config) else {
+                    safe_eprintln!(
+                        "Error: refusing CHC verdict with unauthenticated evidence: {error}"
+                    );
+                    std::process::exit(1);
+                };
+                handle_chc_certificate_publication_failure(
+                    &proof,
+                    format_args!("published certificate authentication failed: {error}"),
+                )
+            }
+        },
+        publication => publication,
+    };
+
+    match publication {
+        ChcCertificatePublication::Available(artifacts) => Some(artifacts),
+        ChcCertificatePublication::OptionalUnavailable => Some(ChcCliReplayArtifacts::default()),
+        ChcCertificatePublication::RequiredUnavailable(diagnostic) => {
+            emit_chc_fail_closed_unknown(
+                stats_cfg,
+                emitted_build_provenance,
+                diagnostic,
+                "required CHC certificate unavailable",
+            );
+            None
+        }
+    }
 }
 
 fn sha256_file(path: &Path) -> Option<(String, u64)> {
@@ -807,16 +1364,6 @@ fn current_solver_identity(engine: &str) -> ChcProofSolverIdentity {
     identity
 }
 
-fn trace_artifact_digest() -> Option<ChcProofArtifactDigest> {
-    let path = ay_core::trace_config().trace_file_path.as_ref()?;
-    let path = Path::new(path);
-    let (sha256, bytes) = sha256_file(path)?;
-    Some(
-        ChcProofArtifactDigest::from_sha256("solver-transcript", sha256, bytes)
-            .with_path(path.display().to_string()),
-    )
-}
-
 fn chc_cli_obligation_id(problem_hash: &str) -> String {
     format!("ay-cli:chc:{problem_hash}")
 }
@@ -833,7 +1380,7 @@ fn build_chc_manifest_parts(
     proof_run: &ChcPdrProofRun,
     time_budget: Duration,
     strict_proofs: bool,
-    artifacts: ChcCliReplayArtifacts,
+    artifacts: &ChcCliReplayArtifacts,
 ) -> ChcCliManifestParts {
     let options = ChcProofEvidenceOptions::portfolio(time_budget, strict_proofs)
         .with_memory_limit_bytes(Some(ay_sys::get_process_memory_limit() as u64));
@@ -849,14 +1396,15 @@ fn build_chc_manifest_parts(
         proof_run.metadata.proof_status.clone(),
     );
 
-    if let Some(transcript) = trace_artifact_digest() {
-        replay_evidence = replay_evidence.with_solver_transcript(transcript);
+    // The trace subsystem currently exposes only a pathname, not the retained
+    // writer descriptor or sealed bytes. Reopening that path here would let a
+    // replacement or FIFO become purported solver evidence, so omit trace
+    // evidence until the producer can transfer descriptor-bound authority.
+    if let Some(proof) = &artifacts.proof {
+        replay_evidence = replay_evidence.with_proof(proof.clone());
     }
-    if let Some(proof) = artifacts.proof {
-        replay_evidence = replay_evidence.with_proof(proof);
-    }
-    for obligation in artifacts.replay_obligations {
-        replay_evidence = replay_evidence.with_replay_obligation(obligation);
+    for obligation in &artifacts.replay_obligations {
+        replay_evidence = replay_evidence.with_replay_obligation(obligation.clone());
     }
 
     ChcCliManifestParts {
@@ -911,13 +1459,7 @@ fn try_chc_checked_replay(
             budget,
         )
     }) {
-        Ok(Ok(checked)) => {
-            safe_eprintln!(
-                "c CHC checked replay: pass ({} obligations)",
-                checked.summary.obligations.len()
-            );
-            Some((checked.manifest, checked.proof_run.metadata))
-        }
+        Ok(Ok(checked)) => Some((checked.manifest, checked.proof_run.metadata)),
         Ok(Err(error)) => {
             safe_eprintln!("c CHC checked replay unavailable (metadata-only): {error}");
             None
@@ -927,6 +1469,117 @@ fn try_chc_checked_replay(
             None
         }
     }
+}
+
+struct ChcSettledStatsEvidence {
+    proof_manifest: ChcProofEvidenceManifest,
+    proof_transcript: ay::chc::ChcProofTranscriptMetadata,
+}
+
+enum ChcStatsSettlement {
+    Ready(Option<Box<ChcSettledStatsEvidence>>),
+    RequiredCertificateUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChcCheckedReplayMode {
+    Allow,
+    Skip,
+}
+
+fn build_chc_stats_evidence(
+    problem: &ChcProblem,
+    proof_run: &ChcPdrProofRun,
+    time_budget: Duration,
+    strict_proofs: bool,
+    artifacts: &ChcCliReplayArtifacts,
+    result_str: &str,
+    checked_replay_mode: ChcCheckedReplayMode,
+) -> ChcSettledStatsEvidence {
+    let parts = build_chc_manifest_parts(problem, proof_run, time_budget, strict_proofs, artifacts);
+    let upgraded = match checked_replay_mode {
+        ChcCheckedReplayMode::Allow => {
+            try_chc_checked_replay(problem, proof_run, &parts, result_str)
+        }
+        ChcCheckedReplayMode::Skip => None,
+    };
+    let (proof_manifest, proof_transcript) = upgraded.unwrap_or_else(|| {
+        (
+            proof_run.evidence_manifest_with_replay_evidence(
+                problem,
+                parts.options,
+                parts.solver,
+                parts.obligation_id,
+                parts.evidence,
+            ),
+            proof_run.metadata.clone(),
+        )
+    });
+    ChcSettledStatsEvidence {
+        proof_manifest,
+        proof_transcript,
+    }
+}
+
+/// Finish every fallible evidence step before a definitive CHC status becomes
+/// public. The retained descriptors and publication lock stay in `artifacts`
+/// through status and stats emission; the final validation detects pathname or
+/// lock-authority replacement during manifest construction/checked replay.
+fn settle_chc_stats_before_verdict(
+    problem: &ChcProblem,
+    proof_run: &ChcPdrProofRun,
+    time_budget: Duration,
+    strict_proofs: bool,
+    proof_config: Option<&ProofConfig>,
+    stats_cfg: stats_output::StatsConfig,
+    emitted_build_provenance: bool,
+    result_str: &str,
+    artifacts: &mut ChcCliReplayArtifacts,
+) -> ChcStatsSettlement {
+    let mut stats_evidence = stats_cfg.any().then(|| {
+        Box::new(build_chc_stats_evidence(
+            problem,
+            proof_run,
+            time_budget,
+            strict_proofs,
+            artifacts,
+            result_str,
+            ChcCheckedReplayMode::Allow,
+        ))
+    });
+
+    let had_published_authority =
+        artifacts._publication_lock.is_some() || !artifacts.retained_files.is_empty();
+    let publication = ChcCertificatePublication::Available(std::mem::take(artifacts));
+    let Some(validated) = prepare_chc_certificate_for_verdict(
+        proof_config,
+        publication,
+        stats_cfg,
+        emitted_build_provenance,
+    ) else {
+        return ChcStatsSettlement::RequiredCertificateUnavailable;
+    };
+    let discarded_optional_artifacts = had_published_authority
+        && validated._publication_lock.is_none()
+        && validated.retained_files.is_empty();
+    *artifacts = validated;
+
+    if discarded_optional_artifacts && stats_cfg.any() {
+        // The first manifest was bound to evidence that failed its final gate.
+        // Rebuild a metadata-only manifest from the now-empty artifact set;
+        // never retain stale digests or rerun checked replay against them.
+        stats_evidence = Some(Box::new(build_chc_stats_evidence(
+            problem,
+            proof_run,
+            time_budget,
+            strict_proofs,
+            artifacts,
+            result_str,
+            ChcCheckedReplayMode::Skip,
+        )));
+    }
+
+    ChcStatsSettlement::Ready(stats_evidence)
 }
 
 fn z3_mode_enabled() -> bool {
@@ -974,6 +1627,7 @@ pub(crate) fn run_chc_from_content(
 ) {
     use ay::chc::{AdaptiveConfig, AdaptivePortfolio, ChcParser, VerifiedChcResult};
 
+    validate_chc_proof_request(proof_config);
     let solve_start = Instant::now();
 
     let problem = match catch_chc_boundary("parse CHC input", || ChcParser::parse(content)) {
@@ -1020,7 +1674,9 @@ pub(crate) fn run_chc_from_content(
     } else {
         AdaptiveConfig::with_budget(time_budget, verbose)
     };
-    config.strict_proofs = validate || STRICT_PROOFS_ENABLED.load(Ordering::Relaxed);
+    config.strict_proofs = validate
+        || STRICT_PROOFS_ENABLED.load(Ordering::Relaxed)
+        || SELF_CHECK_ENABLED.load(Ordering::Relaxed);
     let progress = PROGRESS_ENABLED.load(Ordering::Relaxed);
     config.progress_enabled = progress;
     let emitted_build_provenance = if progress {
@@ -1103,7 +1759,6 @@ pub(crate) fn run_chc_from_content(
         }
     };
     let proof_run = ChcPdrProofRun::new(solver.problem(), result.clone(), "portfolio");
-    let proof_transcript = proof_run.metadata.clone();
     let chc_stats = solver.statistics();
 
     // Stop progress thread before printing result. Drop joins the thread.
@@ -1113,6 +1768,7 @@ pub(crate) fn run_chc_from_content(
     }
 
     let mut replay_artifacts = ChcCliReplayArtifacts::default();
+    let mut settled_stats_evidence = None;
     let result_str = match catch_chc_boundary("emit CHC result", || match &result {
         // SOUNDNESS discharge gate: demote an unverified SAFE to unknown rather
         // than print a false-SAFE (the portfolio occasionally returns a Safe
@@ -1150,16 +1806,54 @@ pub(crate) fn run_chc_from_content(
         }
         VerifiedChcResult::Safe(inv) => {
             let cert = inv.model().to_certificate(solver.problem());
-            replay_artifacts = write_chc_safe_certificate_artifacts(proof_config, &cert, || {
-                // Acyclic-exhaustive (empty-model) SAFEs have no invariant
-                // obligations; the engines helper re-validates them via the
-                // deterministic exhaustive re-run and returns an empty set,
-                // deferring to the standard fail-closed exporter otherwise.
-                engines::chc_safe_replay_obligations(solver.problem(), inv.model())
-            });
-            let spacer_model = inv.model().to_spacer_format(solver.problem());
-            emit_safe_chc_stdout(safe_str, &cert, &spacer_model, wants_model, z3_mode);
-            safe_str
+            let publication = write_chc_safe_certificate_artifacts(
+                proof_config,
+                &cert,
+                ChcArtifactScope::for_stats(stats_cfg),
+                || {
+                    // Acyclic-exhaustive (empty-model) SAFEs have no invariant
+                    // obligations; the engines helper re-validates them via the
+                    // deterministic exhaustive re-run and returns an empty set,
+                    // deferring to the standard fail-closed exporter otherwise.
+                    engines::chc_safe_replay_obligations(solver.problem(), inv.model())
+                },
+            );
+            match prepare_chc_certificate_for_verdict(
+                proof_config,
+                publication,
+                stats_cfg,
+                emitted_build_provenance,
+            ) {
+                Some(artifacts) => {
+                    replay_artifacts = artifacts;
+                    match settle_chc_stats_before_verdict(
+                        solver.problem(),
+                        &proof_run,
+                        time_budget,
+                        strict_proofs,
+                        proof_config,
+                        stats_cfg,
+                        emitted_build_provenance,
+                        safe_str,
+                        &mut replay_artifacts,
+                    ) {
+                        ChcStatsSettlement::Ready(evidence) => {
+                            settled_stats_evidence = evidence;
+                            let spacer_model = inv.model().to_spacer_format(solver.problem());
+                            emit_safe_chc_stdout(
+                                safe_str,
+                                &cert,
+                                &spacer_model,
+                                wants_model,
+                                z3_mode,
+                            );
+                            safe_str
+                        }
+                        ChcStatsSettlement::RequiredCertificateUnavailable => "unknown",
+                    }
+                }
+                None => "unknown",
+            }
         }
         // STEP D: under --strict-proofs, an UNSAFE must not ship `unsat` unless
         // its counterexample trace is INDEPENDENTLY re-checked by native
@@ -1184,12 +1878,44 @@ pub(crate) fn run_chc_from_content(
         }
         VerifiedChcResult::Unsafe(cex) => {
             let cert = cex.counterexample().to_certificate(solver.problem());
-            replay_artifacts = write_chc_unsafe_certificate_artifacts(proof_config, &cert, || {
-                cex.counterexample()
-                    .trace_validity_replay_obligations(solver.problem())
-            });
-            emit_unsafe_chc_stdout(unsafe_str, &cert, z3_mode);
-            unsafe_str
+            let publication = write_chc_unsafe_certificate_artifacts(
+                proof_config,
+                &cert,
+                ChcArtifactScope::for_stats(stats_cfg),
+                || {
+                    cex.counterexample()
+                        .trace_validity_replay_obligations(solver.problem())
+                },
+            );
+            match prepare_chc_certificate_for_verdict(
+                proof_config,
+                publication,
+                stats_cfg,
+                emitted_build_provenance,
+            ) {
+                Some(artifacts) => {
+                    replay_artifacts = artifacts;
+                    match settle_chc_stats_before_verdict(
+                        solver.problem(),
+                        &proof_run,
+                        time_budget,
+                        strict_proofs,
+                        proof_config,
+                        stats_cfg,
+                        emitted_build_provenance,
+                        unsafe_str,
+                        &mut replay_artifacts,
+                    ) {
+                        ChcStatsSettlement::Ready(evidence) => {
+                            settled_stats_evidence = evidence;
+                            emit_unsafe_chc_stdout(unsafe_str, &cert, z3_mode);
+                            unsafe_str
+                        }
+                        ChcStatsSettlement::RequiredCertificateUnavailable => "unknown",
+                    }
+                }
+                None => "unknown",
+            }
         }
         VerifiedChcResult::Unknown(_) | _ => {
             exit_if_timed_out();
@@ -1209,42 +1935,24 @@ pub(crate) fn run_chc_from_content(
             return;
         }
     };
-    // PERF (PERF-3 residue): the evidence manifest is consumed ONLY by the
-    // stats printer below; building it unconditionally charged every CHC run
-    // the solver-identity self-hash. Construct it only when stats will print.
+    // Evidence was fully constructed and revalidated before any definitive
+    // status. This final phase only renders settled in-memory statistics while
+    // `replay_artifacts` retains all descriptors and the publication lease.
     if stats_cfg.any() {
-        let parts = build_chc_manifest_parts(
-            solver.problem(),
-            &proof_run,
-            time_budget,
-            strict_proofs,
-            replay_artifacts,
-        );
-        // Opt-in checked replay (AY_CHC_CHECKED_REPLAY): on success the
-        // manifest/transcript carry replayable checked-replay evidence; on any
-        // failure the metadata-only pair below is used unchanged (fail-closed).
-        let (proof_manifest, proof_transcript) =
-            match try_chc_checked_replay(solver.problem(), &proof_run, &parts, result_str) {
-                Some(upgraded) => upgraded,
-                None => (
-                    proof_run.evidence_manifest_with_replay_evidence(
-                        solver.problem(),
-                        parts.options,
-                        parts.solver,
-                        parts.obligation_id,
-                        parts.evidence,
-                    ),
-                    proof_transcript,
-                ),
-            };
+        let proof_transcript = settled_stats_evidence
+            .as_ref()
+            .map(|evidence| &evidence.proof_transcript);
+        let proof_manifest = settled_stats_evidence
+            .as_ref()
+            .map(|evidence| &evidence.proof_manifest);
         print_chc_stats(
             &solve_start,
             result_str,
             "portfolio",
             stats_cfg,
             Some(&chc_stats),
-            Some(&proof_transcript),
-            Some(&proof_manifest),
+            proof_transcript,
+            proof_manifest,
             num_predicates,
             num_clauses,
         );
@@ -1265,6 +1973,7 @@ pub(crate) fn run_portfolio(
 ) {
     use ay::chc::{AdaptiveConfig, AdaptivePortfolio, ChcParser, VerifiedChcResult};
 
+    validate_chc_proof_request(proof_config);
     let solve_start = Instant::now();
 
     // Read and parse CHC file
@@ -1321,7 +2030,7 @@ pub(crate) fn run_portfolio(
     } else {
         AdaptiveConfig::with_budget(time_budget, verbose)
     };
-    config.strict_proofs = validate || strict_proofs;
+    config.strict_proofs = validate || strict_proofs || SELF_CHECK_ENABLED.load(Ordering::Relaxed);
     let progress = PROGRESS_ENABLED.load(Ordering::Relaxed);
     config.progress_enabled = progress;
     let emitted_build_provenance = if progress {
@@ -1399,7 +2108,6 @@ pub(crate) fn run_portfolio(
         }
     };
     let proof_run = ChcPdrProofRun::new(solver.problem(), result.clone(), "portfolio");
-    let proof_transcript = proof_run.metadata.clone();
     let chc_stats = solver.statistics();
 
     // Stop progress thread before printing result. Drop joins the thread.
@@ -1409,6 +2117,7 @@ pub(crate) fn run_portfolio(
     }
 
     let mut replay_artifacts = ChcCliReplayArtifacts::default();
+    let mut settled_stats_evidence = None;
     let result_str = match catch_chc_boundary("emit CHC result", || match &result {
         // SOUNDNESS discharge gate: demote an unverified SAFE to unknown rather
         // than print a false-SAFE (the portfolio occasionally returns a Safe
@@ -1446,16 +2155,54 @@ pub(crate) fn run_portfolio(
         }
         VerifiedChcResult::Safe(inv) => {
             let cert = inv.model().to_certificate(solver.problem());
-            replay_artifacts = write_chc_safe_certificate_artifacts(proof_config, &cert, || {
-                // Acyclic-exhaustive (empty-model) SAFEs have no invariant
-                // obligations; the engines helper re-validates them via the
-                // deterministic exhaustive re-run and returns an empty set,
-                // deferring to the standard fail-closed exporter otherwise.
-                engines::chc_safe_replay_obligations(solver.problem(), inv.model())
-            });
-            let spacer_model = inv.model().to_spacer_format(solver.problem());
-            emit_safe_chc_stdout(safe_str, &cert, &spacer_model, wants_model, z3_mode);
-            safe_str
+            let publication = write_chc_safe_certificate_artifacts(
+                proof_config,
+                &cert,
+                ChcArtifactScope::for_stats(stats_cfg),
+                || {
+                    // Acyclic-exhaustive (empty-model) SAFEs have no invariant
+                    // obligations; the engines helper re-validates them via the
+                    // deterministic exhaustive re-run and returns an empty set,
+                    // deferring to the standard fail-closed exporter otherwise.
+                    engines::chc_safe_replay_obligations(solver.problem(), inv.model())
+                },
+            );
+            match prepare_chc_certificate_for_verdict(
+                proof_config,
+                publication,
+                stats_cfg,
+                emitted_build_provenance,
+            ) {
+                Some(artifacts) => {
+                    replay_artifacts = artifacts;
+                    match settle_chc_stats_before_verdict(
+                        solver.problem(),
+                        &proof_run,
+                        time_budget,
+                        strict_proofs,
+                        proof_config,
+                        stats_cfg,
+                        emitted_build_provenance,
+                        safe_str,
+                        &mut replay_artifacts,
+                    ) {
+                        ChcStatsSettlement::Ready(evidence) => {
+                            settled_stats_evidence = evidence;
+                            let spacer_model = inv.model().to_spacer_format(solver.problem());
+                            emit_safe_chc_stdout(
+                                safe_str,
+                                &cert,
+                                &spacer_model,
+                                wants_model,
+                                z3_mode,
+                            );
+                            safe_str
+                        }
+                        ChcStatsSettlement::RequiredCertificateUnavailable => "unknown",
+                    }
+                }
+                None => "unknown",
+            }
         }
         // STEP D: under --strict-proofs, an UNSAFE must not ship `unsat` unless
         // its counterexample trace is INDEPENDENTLY re-checked by native
@@ -1480,12 +2227,44 @@ pub(crate) fn run_portfolio(
         }
         VerifiedChcResult::Unsafe(cex) => {
             let cert = cex.counterexample().to_certificate(solver.problem());
-            replay_artifacts = write_chc_unsafe_certificate_artifacts(proof_config, &cert, || {
-                cex.counterexample()
-                    .trace_validity_replay_obligations(solver.problem())
-            });
-            emit_unsafe_chc_stdout(unsafe_str, &cert, z3_mode);
-            unsafe_str
+            let publication = write_chc_unsafe_certificate_artifacts(
+                proof_config,
+                &cert,
+                ChcArtifactScope::for_stats(stats_cfg),
+                || {
+                    cex.counterexample()
+                        .trace_validity_replay_obligations(solver.problem())
+                },
+            );
+            match prepare_chc_certificate_for_verdict(
+                proof_config,
+                publication,
+                stats_cfg,
+                emitted_build_provenance,
+            ) {
+                Some(artifacts) => {
+                    replay_artifacts = artifacts;
+                    match settle_chc_stats_before_verdict(
+                        solver.problem(),
+                        &proof_run,
+                        time_budget,
+                        strict_proofs,
+                        proof_config,
+                        stats_cfg,
+                        emitted_build_provenance,
+                        unsafe_str,
+                        &mut replay_artifacts,
+                    ) {
+                        ChcStatsSettlement::Ready(evidence) => {
+                            settled_stats_evidence = evidence;
+                            emit_unsafe_chc_stdout(unsafe_str, &cert, z3_mode);
+                            unsafe_str
+                        }
+                        ChcStatsSettlement::RequiredCertificateUnavailable => "unknown",
+                    }
+                }
+                None => "unknown",
+            }
         }
         VerifiedChcResult::Unknown(_) | _ => {
             exit_if_timed_out();
@@ -1505,42 +2284,24 @@ pub(crate) fn run_portfolio(
             return;
         }
     };
-    // PERF (PERF-3 residue): the evidence manifest is consumed ONLY by the
-    // stats printer below; building it unconditionally charged every CHC run
-    // the solver-identity self-hash. Construct it only when stats will print.
+    // Evidence was fully constructed and revalidated before any definitive
+    // status. This final phase only renders settled in-memory statistics while
+    // `replay_artifacts` retains all descriptors and the publication lease.
     if stats_cfg.any() {
-        let parts = build_chc_manifest_parts(
-            solver.problem(),
-            &proof_run,
-            time_budget,
-            strict_proofs,
-            replay_artifacts,
-        );
-        // Opt-in checked replay (AY_CHC_CHECKED_REPLAY): on success the
-        // manifest/transcript carry replayable checked-replay evidence; on any
-        // failure the metadata-only pair below is used unchanged (fail-closed).
-        let (proof_manifest, proof_transcript) =
-            match try_chc_checked_replay(solver.problem(), &proof_run, &parts, result_str) {
-                Some(upgraded) => upgraded,
-                None => (
-                    proof_run.evidence_manifest_with_replay_evidence(
-                        solver.problem(),
-                        parts.options,
-                        parts.solver,
-                        parts.obligation_id,
-                        parts.evidence,
-                    ),
-                    proof_transcript,
-                ),
-            };
+        let proof_transcript = settled_stats_evidence
+            .as_ref()
+            .map(|evidence| &evidence.proof_transcript);
+        let proof_manifest = settled_stats_evidence
+            .as_ref()
+            .map(|evidence| &evidence.proof_manifest);
         print_chc_stats(
             &solve_start,
             result_str,
             "portfolio",
             stats_cfg,
             Some(&chc_stats),
-            Some(&proof_transcript),
-            Some(&proof_manifest),
+            proof_transcript,
+            proof_manifest,
             num_predicates,
             num_clauses,
         );
@@ -1628,10 +2389,238 @@ fn spawn_chc_progress_thread_rich(
             let elapsed = start.elapsed().as_secs_f64();
             let report = snapshot.snapshot();
             let line = format!("{}\n", report.format_line(elapsed));
-            let _ = Write::write_all(&mut std::io::stderr(), line.as_bytes());
+            let _ = Write::write_all(&mut io::stderr(), line.as_bytes());
         })
         .ok();
     ProgressHandle { stop, handle }
+}
+
+#[cfg(test)]
+mod certificate_failure_tests {
+    use super::{
+        chc_certificate_failure_disposition, ensure_authenticated_chc_publication_supported,
+        ChcCertificateFailureDisposition as Disposition,
+    };
+
+    #[test]
+    fn authenticated_publication_platform_posture_is_explicit() {
+        let support = ensure_authenticated_chc_publication_supported();
+        if cfg!(unix) {
+            support.expect("Unix descriptor identity should support CHC publication");
+        } else {
+            assert_eq!(
+                support
+                    .expect_err("non-Unix publication must fail closed")
+                    .kind(),
+                std::io::ErrorKind::Unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn synthesized_certificate_failure_is_optional_without_a_gate() {
+        assert_eq!(
+            chc_certificate_failure_disposition(true, None),
+            Disposition::Optional
+        );
+    }
+
+    #[test]
+    fn synthesized_certificate_failure_is_required_under_either_gate() {
+        for gate in ["--strict-proofs", "--self-check"] {
+            assert_eq!(
+                chc_certificate_failure_disposition(true, Some(gate)),
+                Disposition::Required
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_certificate_failure_is_always_fatal() {
+        assert_eq!(
+            chc_certificate_failure_disposition(false, None),
+            Disposition::Fatal
+        );
+        assert_eq!(
+            chc_certificate_failure_disposition(false, Some("--strict-proofs")),
+            Disposition::Fatal
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod publication_tests {
+    use super::*;
+    use ay::chc::ChcReplayObligationKind;
+
+    fn proof_config(path: &Path) -> ProofConfig {
+        ProofConfig {
+            path: path.display().to_string(),
+            format: super::super::ProofFormat::Alethe,
+            binary: false,
+            artifact_path: None,
+            is_temp: false,
+            synthesized_default: false,
+            format_was_explicit: false,
+        }
+    }
+
+    fn available_artifacts(publication: ChcCertificatePublication) -> ChcCliReplayArtifacts {
+        match publication {
+            ChcCertificatePublication::Available(artifacts) => artifacts,
+            ChcCertificatePublication::OptionalUnavailable => {
+                panic!("certificate unexpectedly became optional-unavailable")
+            }
+            ChcCertificatePublication::RequiredUnavailable(diagnostic) => {
+                panic!("certificate unexpectedly became required-unavailable: {diagnostic}")
+            }
+        }
+    }
+
+    fn obligation_directories(parent: &Path) -> Vec<PathBuf> {
+        fs::read_dir(parent)
+            .expect("read publication directory")
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.contains(".chc-obligations-"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn chc_publication_lock_excludes_a_concurrent_publisher() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let proof = temp.path().join("proof.chccert");
+        let first = ChcPublicationLock::acquire(&proof).expect("first publication lock");
+        assert!(
+            ChcPublicationLock::acquire(&proof).is_err(),
+            "a second publisher acquired the same certificate lock"
+        );
+        drop(first);
+        ChcPublicationLock::acquire(&proof).expect("lock after first publisher exits");
+    }
+
+    #[test]
+    fn chc_publication_lock_refuses_a_symlink_without_touching_its_target() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let proof = temp.path().join("proof.chccert");
+        let target = temp.path().join("unrelated");
+        fs::write(&target, b"unrelated").expect("plant lock target");
+        std::os::unix::fs::symlink(&target, temp.path().join(".proof.chccert.ay-chc.lock"))
+            .expect("plant lock symlink");
+
+        assert!(ChcPublicationLock::acquire(&proof).is_err());
+        assert_eq!(fs::read(target).expect("read target"), b"unrelated");
+    }
+
+    #[test]
+    fn chc_publication_final_gate_rejects_lock_unlink_and_recreate() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let proof = temp.path().join("proof.chccert");
+        let mut artifacts =
+            publish_chc_certificate_artifacts(&proof_config(&proof), "certificate\n", Vec::new())
+                .expect("publish CHC certificate");
+        let lock_path = temp.path().join(".proof.chccert.ay-chc.lock");
+
+        fs::remove_file(&lock_path).expect("unlink active publication lock");
+        let replacement = ChcPublicationLock::acquire(&proof)
+            .expect("replacement inode demonstrates why identity validation is required");
+
+        let error = artifacts
+            .validate()
+            .expect_err("final gate accepted an unlinked/recreated lock authority");
+        assert!(
+            error.to_string().contains("lock authority changed"),
+            "unexpected final-gate error: {error}"
+        );
+        drop(replacement);
+    }
+
+    #[test]
+    fn certificate_only_scope_skips_safe_and_unsafe_obligation_trees() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let proof = temp.path().join("proof.chccert");
+        let config = proof_config(&proof);
+
+        let safe_artifacts = available_artifacts(write_chc_safe_certificate_artifacts(
+            Some(&config),
+            "safe certificate\n",
+            ChcArtifactScope::CertificateOnly,
+            || -> ChcResult<Vec<ChcReplayObligation>> {
+                panic!("stats-off SAFE generated replay obligations")
+            },
+        ));
+        assert!(safe_artifacts.replay_obligations.is_empty());
+        assert!(obligation_directories(temp.path()).is_empty());
+        drop(safe_artifacts);
+
+        let unsafe_artifacts = available_artifacts(write_chc_unsafe_certificate_artifacts(
+            Some(&config),
+            "unsafe certificate\n",
+            ChcArtifactScope::CertificateOnly,
+            || -> ChcResult<Vec<ChcReplayObligation>> {
+                panic!("stats-off UNSAFE generated replay obligations")
+            },
+        ));
+        assert!(unsafe_artifacts.replay_obligations.is_empty());
+        assert!(obligation_directories(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn chc_publication_seals_certificate_and_unique_obligations() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let proof = temp.path().join("proof.chccert");
+        let obligation = ChcReplayObligation {
+            name: "trace".to_string(),
+            kind: ChcReplayObligationKind::TraceValidity,
+            clause_index: 7,
+            smtlib: "(set-logic QF_LIA)\n(check-sat)\n".to_string(),
+        };
+        let mut artifacts = publish_chc_certificate_artifacts(
+            &proof_config(&proof),
+            "certificate\n",
+            vec![obligation],
+        )
+        .expect("publish CHC transaction");
+
+        assert_eq!(
+            fs::read_to_string(&proof).expect("certificate"),
+            "certificate\n"
+        );
+        assert_eq!(artifacts.replay_obligations.len(), 1);
+        assert!(
+            ChcPublicationLock::acquire(&proof).is_err(),
+            "the publication lease was released before the artifacts"
+        );
+        let obligation_path = Path::new(
+            artifacts.replay_obligations[0]
+                .query
+                .path
+                .as_deref()
+                .expect("obligation path"),
+        );
+        assert!(obligation_path.starts_with(temp.path()));
+        assert_ne!(obligation_path.parent(), proof.parent());
+        for artifact in &mut artifacts.retained_files {
+            artifact
+                .validate()
+                .expect("same-run artifact remains sealed");
+        }
+
+        fs::write(&proof, b"tampered\n").expect("tamper certificate");
+        assert!(
+            artifacts
+                .retained_files
+                .iter_mut()
+                .any(|artifact| artifact.path == proof && artifact.validate().is_err()),
+            "certificate replacement was not detected before verdict publication"
+        );
+        drop(artifacts);
+        ChcPublicationLock::acquire(&proof)
+            .expect("publication lease should be released with the artifacts");
+    }
 }
 
 #[cfg(test)]

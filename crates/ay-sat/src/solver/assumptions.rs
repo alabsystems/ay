@@ -542,6 +542,14 @@ impl Solver {
                             .declare_assume_unknown_with_reason(SatUnknownReason::Interrupted);
                     }
                 }
+                // #array-deadline-forward: the whole-solve deadline covers
+                // callers of the NON-interruptible `solve_with_assumptions`
+                // entry (should_stop = None) — e.g. the DPLL(T) assume
+                // split-loop pipeline, whose per-iteration budgets bound the
+                // search but not wall time. Same amortization as above.
+                if self.solve_deadline_expired() {
+                    return self.declare_assume_unknown_with_reason(SatUnknownReason::Interrupted);
+                }
             }
 
             // Inprocessing/theory lemmas can discover UNSAT at decision level 0

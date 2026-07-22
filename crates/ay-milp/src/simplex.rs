@@ -233,6 +233,65 @@ pub(crate) static PX_AROW_NANOS: std::sync::atomic::AtomicU64 =
 pub(crate) static PX_ALPHA_NANOS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// PER-SOLVE FIXED-OVERHEAD PROFILER (`AY_MILP_ITER_PROFILE`, trace-gated). The
+// RT/UPD/PX profilers all normalise by PIVOT count; they say nothing about the
+// per-SOLVE fixed cost that a tiny-basis huge-tree instance (mas74's 13-row LP,
+// pk1's 45-row) pays on EVERY `solve_bounded` regardless of how few pivots the
+// warm re-solve then takes. This splits `solve_bounded`'s wall into SETUP (pool
+// adopt + `reset` + LU-install decision + `warm_start` refactor — everything
+// before `sx.run`) and EXTRACT (`extract` + farkas unscale + `Candidate` build
+// with its basis/at clones + the three cache write-backs). `run` itself is the
+// residual (SOLVE_NANOS − setup − extract) and is what the per-pivot profilers
+// already dissect. Normalised by SB_SOLVES (this profiler's own solve count, so
+// it is independent of whether `probe_duals` also ran). Every read is
+// flag-guarded: zero cost off.
+pub(crate) static SB_SETUP_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static SB_EXTRACT_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static SB_TOTAL_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static SB_SOLVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// Setup sub-split (part of SBPROFILE): POOL = pool adopt + `reset`; WARM =
+// `warm_start` (basis adopt + conditional refactor). The residual of setup is
+// the LU-install / crash decision block between them.
+pub(crate) static SB_POOL_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static SB_WARM_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Machine-readable one-liner for the per-solve fixed-overhead profiler
+/// (`AY_MILP_ITER_PROFILE`). Empty when no `solve_bounded` calls were sampled.
+/// `setup`/`extract` are us/solve; `run` is the residual per-solve wall the
+/// per-pivot profilers cover. `total` is the full entry-to-return solve wall
+/// (a superset of `stats::SOLVE_NANOS`, which stops before the `Candidate`
+/// build's basis/at clones).
+pub fn sb_profile_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = SB_SOLVES.load(Relaxed);
+    if s == 0 {
+        return String::new();
+    }
+    let sf = s as f64;
+    let setup = SB_SETUP_NANOS.load(Relaxed) as f64;
+    let extract = SB_EXTRACT_NANOS.load(Relaxed) as f64;
+    let total = SB_TOTAL_NANOS.load(Relaxed) as f64;
+    let pool = SB_POOL_NANOS.load(Relaxed) as f64;
+    let warm = SB_WARM_NANOS.load(Relaxed) as f64;
+    let run = (total - setup - extract).max(0.0);
+    format!(
+        "SBPROFILE sb_solves={s} setup={:.3}us (pool={:.3}us warm={:.3}us) run={:.3}us extract={:.3}us total={:.3}us (setup {:.1}% extract {:.1}%)",
+        setup / sf / 1e3,
+        pool / sf / 1e3,
+        warm / sf / 1e3,
+        run / sf / 1e3,
+        extract / sf / 1e3,
+        total / sf / 1e3,
+        100.0 * setup / total.max(1.0),
+        100.0 * extract / total.max(1.0),
+    )
+}
+
 /// Machine-readable one-liner for the pivot-extra (price + alpha-FTRAN) census
 /// profiler (`AY_MILP_ITER_PROFILE`). Empty when no pivots were sampled. Averages
 /// are cumulative us/pivot over the process, normalised by `RT_PIVOTS`.
@@ -2069,6 +2128,33 @@ impl FloatLp {
         self.sscale = sscale;
     }
 
+    /// STAGE-0 PARALLEL PoC ONLY (inert on the serial path): a deterministic
+    /// estimate of this engine's heap footprint — the byte capacity of every
+    /// owned matrix / bound / cost / scaling vector. On a FRESH clone every
+    /// interior cache is empty, so this is the per-worker `FloatLp::clone()` cost
+    /// the parallel plan flags for wide instances (air05: ~7195 cols). Never
+    /// called by `solve_milp_in`, the node driver, or the simplex hot loop.
+    pub(crate) fn approx_bytes(&self) -> usize {
+        use std::mem::size_of;
+        self.col_ptr.capacity() * size_of::<usize>()
+            + self.col_idx.capacity() * size_of::<usize>()
+            + self.col_val.capacity() * size_of::<f64>()
+            + self.row_ptr.capacity() * size_of::<usize>()
+            + self.row_idx.capacity() * size_of::<u32>()
+            + self.row_val.capacity() * size_of::<f64>()
+            + self.dense_rows.capacity() * size_of::<f64>()
+            + self.lower.capacity() * size_of::<f64>()
+            + self.upper.capacity() * size_of::<f64>()
+            + self.cost.capacity() * size_of::<f64>()
+            + self.rexp.capacity() * size_of::<i16>()
+            + self.cexp.capacity() * size_of::<i16>()
+            + self.bnd_mul.capacity() * size_of::<f64>()
+            + self.val_mul.capacity() * size_of::<f64>()
+            + self.scol_val.capacity() * size_of::<f64>()
+            + self.srow_val.capacity() * size_of::<f64>()
+            + self.sdense_rows.capacity() * size_of::<f64>()
+    }
+
     /// Is the pivot lane running on scaled data?
     #[inline]
     pub(crate) fn scaled(&self) -> bool {
@@ -2395,7 +2481,7 @@ impl FloatLp {
                 return None;
             }
             sx.y_is_duals = false;
-            sx.y.iter_mut().for_each(|v| *v = 0.0);
+            sx.y.fill(0.0);
             sx.y[i] = 1.0;
             sx.btran();
             let mut row = sx.y.clone();
@@ -2432,6 +2518,12 @@ impl FloatLp {
             }
             _ => Box::new(Simplex::new(self, lower, upper)),
         };
+        if iter_profile_enabled() {
+            SB_POOL_NANOS.fetch_add(
+                _t_solve.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         // DSE weights CAN survive across solves the way the LU operator does — and it
         // is a mirage. The "16.1 -> 8.1 it/solve, Gurobi's level" this once measured
         // was an overflow artifact: persisted weights compounded to +inf, an infinite
@@ -2621,7 +2713,14 @@ impl FloatLp {
         // It used to sit here, after it, and the `sx.lu.is_none()` gate then
         // silently skipped the crash on cold tall-LU solves.)
         if let Some((basis, at)) = warm {
+            let _tw = iter_profile_enabled().then(std::time::Instant::now);
             sx.warm_start(self, basis, at, lower, upper);
+            if let Some(tw) = _tw {
+                SB_WARM_NANOS.fetch_add(
+                    tw.elapsed().as_nanos() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
         }
         let iters_before = DUAL_ITERS.load(std::sync::atomic::Ordering::Relaxed);
         // CHAIN DISTRESS PROBE: the bundle is a RESCUE, not an optimization.
@@ -2651,6 +2750,14 @@ impl FloatLp {
             sx.probe_iters_left = chain_probe_iters();
         }
         let primal_before = stats::get(&stats::PRIMAL_ITERS);
+        // SBPROFILE: everything above (pool adopt + `reset` + LU-install +
+        // `warm_start`) is the per-solve SETUP; charge it before `run`.
+        if iter_profile_enabled() {
+            SB_SETUP_NANOS.fetch_add(
+                _t_solve.elapsed().as_nanos() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         let mut status = sx.run(self, warm_started, deadline);
         if chain_probe {
             sx.probe_iters_left = u64::MAX;
@@ -2693,6 +2800,10 @@ impl FloatLp {
             s.fetch_add(1, Relaxed);
             i.fetch_add(spent, Relaxed);
         }
+        // SBPROFILE: from here to return is EXTRACT (values/duals build, farkas
+        // unscale, `Candidate` build with its basis/at clones, cache writes).
+        // Gated so the timer read is not paid when the profiler is off.
+        let _t_extract = iter_profile_enabled().then(std::time::Instant::now);
         let (values, duals) = sx.extract(self);
         let mut farkas = sx.farkas.take().unwrap_or_default();
         // The phase-I ray is per-row like the duals: y_r = R_r·y'_r. (Rigorous
@@ -2730,6 +2841,12 @@ impl FloatLp {
             record_lane(lane_bucket, eta_delta);
         }
         *self.sx_cache.0.borrow_mut() = Some(sx);
+        if let Some(te) = _t_extract {
+            use std::sync::atomic::Ordering::Relaxed;
+            SB_EXTRACT_NANOS.fetch_add(te.elapsed().as_nanos() as u64, Relaxed);
+            SB_TOTAL_NANOS.fetch_add(_t_solve.elapsed().as_nanos() as u64, Relaxed);
+            SB_SOLVES.fetch_add(1, Relaxed);
+        }
         out
     }
 
@@ -4103,7 +4220,7 @@ impl Simplex {
         let wq = self.w[q];
         // rho = B^{-T} e_p, borrowing `y`: pricing has already run this iteration, and the next
         // one rebuilds it from the basic costs.
-        self.y.iter_mut().for_each(|v| *v = 0.0);
+        self.y.fill(0.0);
         self.y[p] = 1.0;
         self.btran();
 
@@ -4135,7 +4252,7 @@ impl Simplex {
 
         // The estimates drift upward; past a point they say nothing, so start over.
         if self.w[leaving] > DEVEX_RESET || wq > DEVEX_RESET {
-            self.w.iter_mut().for_each(|v| *v = 1.0);
+            self.w.fill(1.0);
         }
     }
 
@@ -4388,7 +4505,7 @@ impl Simplex {
             } {
                 let _tf = std::time::Instant::now();
                 let mut buf = std::mem::take(&mut self.wflip); // m-length, zeroed scratch
-                buf.iter_mut().for_each(|v| *v = 0.0);
+                buf.fill(0.0);
                 let mut nz: Vec<usize> = Vec::with_capacity(32);
                 // Pending slots, swept in slot order; a slot whose entering
                 // column is still held by another pending slot (a replacement
@@ -5354,22 +5471,32 @@ impl Simplex {
         // deadlock journal there); the cap also bounds cross-solve drift to the
         // same eta-age every WITHIN-solve pivot run already tolerates.
         let same = self.factor_live && !no_eta_reuse() && basis == self.basis.as_slice();
-        self.y_is_duals = false; // the basis is about to change under `y`
+        // The basis is about to change under `y`.
+        self.y_is_duals = false;
+        // A CHANGED basis: install it and rebuild the row map. When `same`, the
+        // pooled `self.basis`/`self.basic_row` ALREADY are this hint — carried
+        // across the pool boundary by `reset(keep_factor)`, and `same` implies
+        // `factor_live`, so they were validated when last set — making the
+        // copy_from_slice and the O(cols+m) clear+rebuild (and its validity
+        // scan) pure redundant work that reproduces the state already in hand.
+        // Byte-identical: both exits below (the reuse early-return and the
+        // refactorize fall-through) read the same `self.basis`/`self.basic_row`
+        // whether or not this block runs.
         if !same {
             self.factor_live = false; // adopting a basis the file does not represent
-        }
-        self.basis.copy_from_slice(basis);
-        for slot in self.basic_row.iter_mut() {
-            *slot = None;
-        }
-        for r in 0..self.m {
-            let b = self.basis[r];
-            if b >= self.cols || self.basic_row[b].is_some() {
-                // Duplicate or out-of-range: fall back to the crash basis.
-                self.crash_basis(lp);
-                return;
+            self.basis.copy_from_slice(basis);
+            for slot in self.basic_row.iter_mut() {
+                *slot = None;
             }
-            self.basic_row[b] = Some(r);
+            for r in 0..self.m {
+                let b = self.basis[r];
+                if b >= self.cols || self.basic_row[b].is_some() {
+                    // Duplicate or out-of-range: fall back to the crash basis.
+                    self.crash_basis(lp);
+                    return;
+                }
+                self.basic_row[b] = Some(r);
+            }
         }
         for j in 0..self.cols {
             self.at[j] = match at[j] {
@@ -6188,7 +6315,7 @@ impl Simplex {
             } else {
                 None
             };
-            self.y.iter_mut().for_each(|v| *v = 0.0);
+            self.y.fill(0.0);
             self.y[row] = 1.0;
             if let Some(cache) = self.lu.as_mut() {
                 // Unit-vector BTRAN: the reachability-sparse solve touches tens
@@ -6220,7 +6347,7 @@ impl Simplex {
             // The pivot row, ROW-WISE: `alpha = Σ_r rho[r] · A[r, ·]`. One sequential pass
             // over the rows `rho` actually touches, instead of a scattered gather of `rho`
             // once per column.
-            self.arow.iter_mut().for_each(|v| *v = 0.0);
+            self.arow.fill(0.0);
             // Unchecked under the CSR invariants (`row_idx` entries `< n`,
             // `row_ptr` monotone within bounds), asserted in debug builds.
             debug_assert!(self.arow.len() == self.cols && self.rho.len() == self.m);
@@ -6770,7 +6897,7 @@ impl Simplex {
                 None
             };
             if !self.flips.is_empty() {
-                self.wflip.iter_mut().for_each(|v| *v = 0.0);
+                self.wflip.fill(0.0);
                 // Track wflip's matrix-row support during the scatter ONLY when
                 // the sparse solve is armed (opt-in, a measured dead-end here):
                 // the pushes are dead on the default dense/eta paths, so those
@@ -8004,7 +8131,7 @@ impl Simplex {
                 // that is stuck too, Bland — which always terminates and always crawls.
                 if stall > stalled_at && !devex {
                     devex = true;
-                    self.w.iter_mut().for_each(|v| *v = 1.0); // fresh reference framework
+                    self.w.fill(1.0); // fresh reference framework
                 }
                 if stall > bland_after {
                     bland = true;

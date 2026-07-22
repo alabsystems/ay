@@ -36,7 +36,7 @@ fn test_incremental_proof_certificate_survives_push_pop() {
         Ok(SolveResult::Unsat(_cert)) => {
             // Certificate present in pushed scope -- good
         }
-        other => panic!("Expected Unsat in pushed scope, got {:?}", other),
+        other => panic!("Expected Unsat in pushed scope, got {other:?}"),
     }
 
     solver.pop();
@@ -97,7 +97,7 @@ fn test_incremental_sat_then_unsat() {
         Ok(SolveResult::Unsat(_cert)) => {
             // Certificate present after SAT->UNSAT transition -- good
         }
-        other => panic!("Expected Unsat in pushed scope, got {:?}", other),
+        other => panic!("Expected Unsat in pushed scope, got {other:?}"),
     }
 
     solver.pop();

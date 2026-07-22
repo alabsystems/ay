@@ -65,8 +65,10 @@ pub(crate) enum TrailEntry {
     /// A proof edge was added to the proof forest.
     ProofEdge,
     /// An integer constant cache entry was set/updated.
-    /// Stores (rep, old_value) for rollback.
-    IntConstCache(TermId, Option<i64>),
+    /// Stores (rep, old_value) for rollback. The cached value carries the
+    /// concrete integer constant `TermId` alongside the value so derived
+    /// facts can be EXPLAINED through the proof forest (NF-engine closure 2).
+    IntConstCache(TermId, Option<(i64, TermId)>),
 }
 
 /// Central state shared by all string sub-solvers.
@@ -136,12 +138,16 @@ pub(crate) struct SolverState {
     /// returns TheoryResult::Unknown to prevent incorrect results based on
     /// corrupted union-find / EQC state.
     pub(crate) poisoned: bool,
-    /// Cache: EQC representative → integer constant value.
+    /// Cache: EQC representative → (integer constant value, constant TermId).
     ///
     /// Populated when an integer constant is registered or merged into an EQC.
     /// Avoids O(N) scan over all parent keys in `resolve_int_constant()`.
-    /// Trail-based: changes recorded via `TrailEntry::IntConstCache`.
-    pub(crate) int_const_cache: HashMap<TermId, i64>,
+    /// The constant `TermId` records WHICH concrete literal justified the
+    /// value, so length-driven inferences can build proof-forest explanations
+    /// (`explain(len_term, const_tid)`) instead of unexplained facts
+    /// (NF-engine closure 2). Trail-based: changes recorded via
+    /// `TrailEntry::IntConstCache`.
+    pub(crate) int_const_cache: HashMap<TermId, (i64, TermId)>,
 }
 
 impl SolverState {
@@ -195,7 +201,7 @@ impl SolverState {
             if let Ok(val) = n.try_into() {
                 let val: i64 = val;
                 let rep = self.find(t);
-                let old = self.int_const_cache.insert(rep, val);
+                let old = self.int_const_cache.insert(rep, (val, t));
                 self.trail.push(TrailEntry::IntConstCache(rep, old));
             }
         }
@@ -265,6 +271,27 @@ impl SolverState {
                 self.trail.push(TrailEntry::EqcConcatAdded(t));
             }
             _ => {}
+        }
+
+        // Closure 4 (`AY_STR_NF=1`, sub-flag 4): eager length-fact
+        // registration. A `str.len(t)` application that already EXISTS in the
+        // term store (every reduction axiom builds them: `len(sk_pre) = n`,
+        // `len(skt) <= m`, ...) is linked to `t`'s EQC right now, instead of
+        // only when the SAT solver happens to decide a literal mentioning it.
+        // Without this the guarded length couplings of a reduction skolem web
+        // stay invisible to `are_lengths_equal_with_entail` / `has_length_info`
+        // until N-O bridging propagates an integer equality, so the deq pass
+        // cannot triage and the NF pass cannot unify.
+        //
+        // Purely a VISIBILITY change: it records which `str.len` term measures
+        // this EQC. It asserts no value and merges nothing, so no fact enters
+        // the proof forest unexplained.
+        if crate::str_nf_closure_enabled(4) {
+            if let Some(len_t) = terms.find_app_named("str.len", &[t]) {
+                if !self.parent.contains_key(&len_t) {
+                    self.register_term(terms, len_t);
+                }
+            }
         }
     }
 

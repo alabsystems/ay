@@ -696,11 +696,12 @@ mod tests {
 
         // Spot-check Δ values against the row: the incumbent itself has Δ = 0,
         // so x1 - x2 + x3 = 1 + 0 + 1 = 2 ≥ 1 (inside the ball, as expected).
-        let inc_lhs = 1 - 0 + 1;
+        let row_lhs = |x1: i128, x2: i128, x3: i128| x1 - x2 + x3;
+        let inc_lhs = row_lhs(1, 0, 1);
         assert!(inc_lhs >= row.rhs);
         // A point at Hamming distance 2 (flip x1 and x3 -> false,false,false):
         // x1 - x2 + x3 = 0 - 0 + 0 = 0 < 1, correctly OUTSIDE the radius-1 ball.
-        let far_lhs = 0 - 0 + 0;
+        let far_lhs = row_lhs(0, 0, 0);
         assert!(far_lhs < row.rhs);
     }
 

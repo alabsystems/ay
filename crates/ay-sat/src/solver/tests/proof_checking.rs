@@ -647,16 +647,15 @@ fn test_lrat_io_failed_sentinel_bve_does_not_corrupt_clause_ids() {
 
 // ── #4564 Unified forward checker contract tests ─────────────────
 
-/// Verify that a solver with proof output (but no explicit
-/// `enable_forward_checker()` call) auto-enables the forward checker
-/// in debug builds and correctly validates derived clauses.
-#[test]
-#[cfg(debug_assertions)]
-
 // ========================================================================
 // Proof Mode Auto + Proof Emit Tests
 // ========================================================================
 
+/// Verify that a solver with proof output (but no explicit
+/// `enable_forward_checker()` call) auto-enables the forward checker
+/// in debug builds and correctly validates derived clauses.
+#[cfg(debug_assertions)]
+#[test]
 fn test_proof_mode_auto_enables_forward_checker() {
     use crate::proof::ProofOutput;
 

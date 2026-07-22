@@ -35,8 +35,16 @@
 mod bab;
 #[doc(hidden)]
 pub use bab::{
-    diag_dump_root_basis, diag_exact_probe, diag_float_lp, diag_pin_probe, diag_presolve,
+    diag_dump_root_basis,
+    diag_exact_probe,
+    diag_float_lp,
+    diag_pin_probe,
+    diag_presolve,
     diag_refine_probe,
+    // STAGE-0 COLD-CLONE READINESS PoC (inert to the serial path; see bab.rs):
+    // driven only by tests/parallel_ready.rs.
+    NodeBound,
+    NodeLpProbe,
 };
 mod cert;
 mod certify;
@@ -72,5 +80,5 @@ pub use mps::{read_mps, MpsError, MpsProblem};
 pub use opts::SolveOpts;
 pub use outcome::{Outcome, UnknownReason};
 pub use session::{BabSession, LpSession, ObbtOpts, ObbtReport};
-pub use simplex::{px_profile_line, rt_profile_line, upd_profile_line};
+pub use simplex::{px_profile_line, rt_profile_line, sb_profile_line, upd_profile_line};
 pub use tree_cert::{MilpInfeasibilityCertificate, TreeNode};

@@ -9,13 +9,20 @@ disagreement (gate G0), printed and counted separately from mere OTHER/unknown.
 """
 import argparse
 import glob
+import json
+import math
 import os
 import re
-import subprocess
 import sys
 import time
+from pathlib import Path
 
 import milp2mps  # local
+from _oom_guard import (  # noqa: E402
+    plan_solver_resources,
+    run_captured,
+    warn_concurrent_build,
+)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -28,6 +35,7 @@ _ap.add_argument("--ay-bin",
                      "AY_BIN",
                      os.path.join(REPO, "target/release/examples/mps_solve")),
                  help="ay mps_solve binary (env: AY_BIN)")
+_ap.add_argument("--out", default="evals/results/milp-compare/latest.json")
 _args = _ap.parse_args()
 
 AY = _args.ay_bin
@@ -35,6 +43,7 @@ TMO = _args.timeout
 CORPUS = _args.corpus
 TMP = "/tmp/cmp_mps"
 os.makedirs(TMP, exist_ok=True)
+PLAN = None
 
 
 def classify_ay(line):
@@ -50,9 +59,20 @@ def classify_ay(line):
 def run_ay(mps):
     t0 = time.monotonic()
     try:
-        r = subprocess.run([AY, mps, str(TMO)], capture_output=True, text=True, timeout=TMO + 30)
-    except subprocess.TimeoutExpired:
+        r = run_captured(
+            [AY, mps, str(TMO)], PLAN.memlimit_mb, TMO + 30,
+            label="compare.py[ay]",
+            env=dict(os.environ, MEMLIMIT=str(PLAN.memlimit_mb),
+                     NBCORE=str(PLAN.nbcore)),
+        )
+    except OSError:
+        return "OTHER:CRASH", None, 0.0
+    if r.memout:
+        return "OTHER:MEMOUT", None, r.wall_sec
+    if r.timed_out:
         return "OTHER:TIMEOUT", None, TMO + 30
+    if r.output_truncated:
+        return "OTHER:TRUNCATED", None, r.wall_sec
     dt = time.monotonic() - t0
     out = (r.stdout or "").strip().splitlines()
     if not out:
@@ -64,10 +84,20 @@ def run_ay(mps):
 def run_highs(mps):
     t0 = time.monotonic()
     try:
-        r = subprocess.run(["highs", "--time_limit", str(TMO), mps],
-                           capture_output=True, text=True, timeout=TMO + 30)
-    except subprocess.TimeoutExpired:
+        r = run_captured(
+            ["highs", "--time_limit", str(TMO), mps],
+            PLAN.memlimit_mb, TMO + 30, label="compare.py[highs]",
+            env=dict(os.environ, MEMLIMIT=str(PLAN.memlimit_mb),
+                     NBCORE=str(PLAN.nbcore), OMP_NUM_THREADS=str(PLAN.nbcore)),
+        )
+    except OSError:
+        return "OTHER:CRASH", None, 0.0
+    if r.memout:
+        return "OTHER:MEMOUT", None, r.wall_sec
+    if r.timed_out:
         return "OTHER:TIMEOUT", None, TMO + 30
+    if r.output_truncated:
+        return "OTHER:TRUNCATED", None, r.wall_sec
     dt = time.monotonic() - t0
     txt = r.stdout or ""
     m = re.search(r"^\s*Model status\s*:?\s*(.+)$", txt, re.M) or re.search(r"^\s*Status\s+(.+)$", txt, re.M)
@@ -89,12 +119,25 @@ def run_highs(mps):
 
 
 def main():
+    global PLAN
+    if not math.isfinite(TMO) or TMO <= 0:
+        _ap.error("timeout must be finite and positive")
+    warn_concurrent_build()
+    PLAN = plan_solver_resources(1, label="compare.py")
+    resource_plan = {
+        "requested_jobs": 1, "jobs": PLAN.jobs,
+        "memlimit_mb_per_child": PLAN.memlimit_mb,
+        "nbcore_per_child": PLAN.nbcore,
+        "headroom_mb": PLAN.headroom_mb,
+        "enforcement": "process-group rss_watchdog; MEMLIMIT/NBCORE environment",
+    }
     files = sorted(glob.glob(os.path.join(CORPUS, "*.milp")))
     agree_sat = agree_unsat = 0
     disagree = []
     other = []
     ay_t = hi_t = 0.0
     n = 0
+    records = []
     for f in files:
         n += 1
         stem = os.path.splitext(os.path.basename(f))[0]
@@ -108,6 +151,10 @@ def main():
             continue
         a_v, a_val, a_t = run_ay(mps)
         h_v, h_val, h_t = run_highs(mps)
+        records.append({"instance": stem, "ay": a_v,
+                        "ay_objective": a_val, "ay_time_sec": a_t,
+                        "highs": h_v, "highs_objective": h_val,
+                        "highs_time_sec": h_t})
         ay_t += a_t
         hi_t += h_t
         base_a = a_v.split(":")[0]
@@ -132,6 +179,16 @@ def main():
         for stem, a, h in other[:20]:
             print(f"   ? {stem}: ay={a} highs={h}")
     print("=" * 72)
+    out = Path(_args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({
+        "timeout_sec": TMO,
+        "resource_plan": resource_plan,
+        "records": records,
+        "disagreements": disagree,
+        "non_verdict_rows": other,
+    }, indent=2) + "\n")
+    print(f"wrote {out}")
     return 1 if disagree else 0
 
 

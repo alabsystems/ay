@@ -200,3 +200,70 @@ fn regexes_default_empty_so_flags_off_checks_are_noops() {
     assert!(c.regexes.is_empty());
     assert!(Executor::value_satisfies_constraints("aaa", Some(3), &c));
 }
+
+// ---------------------------------------------------------------------------
+// NF-engine closure 6 (`AY_STR_NF=1`): hard `(not (str.contains v c))`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn forbidden_defaults_empty_so_flags_off_checks_are_noops() {
+    let c = cons();
+    assert!(c.forbidden.is_empty());
+    // The default fill is 'a'; with no forbidden needle it must stay accepted,
+    // so the flags-off materializer is byte-identical.
+    assert!(Executor::value_satisfies_constraints("aaa", Some(3), &c));
+    assert_eq!(
+        Executor::build_witness(3, &c).expect("pad witness"),
+        FILL_CHAR.to_string().repeat(3)
+    );
+}
+
+/// The check is the LITERAL negation of `str.contains`, so it must reject
+/// exactly the values carrying the needle — including as an interior window,
+/// not only as a prefix.
+#[test]
+fn forbidden_rejects_exactly_the_values_containing_the_needle() {
+    let mut c = cons();
+    c.forbidden.push(",".to_string());
+    assert!(!Executor::value_satisfies_constraints("a,b", Some(3), &c));
+    assert!(!Executor::value_satisfies_constraints(",aa", Some(3), &c));
+    assert!(Executor::value_satisfies_constraints("abc", Some(3), &c));
+
+    let mut c2 = cons();
+    c2.forbidden.push("ab".to_string());
+    assert!(!Executor::value_satisfies_constraints("xaby", Some(4), &c2));
+    assert!(Executor::value_satisfies_constraints("xayb", Some(4), &c2));
+}
+
+/// The default pad character IS the needle here, so the pre-existing uniform
+/// fill would build a value the gates must retract. Closure 6 widens the
+/// candidate fill search, and every candidate is still accepted only through
+/// `value_satisfies_constraints`.
+#[test]
+fn build_witness_avoids_a_forbidden_pad_character() {
+    let mut c = cons();
+    c.forbidden.push(FILL_CHAR.to_string());
+    let w = Executor::build_witness(4, &c).expect("witness avoiding the pad char");
+    assert_eq!(w.chars().count(), 4);
+    assert!(
+        !w.contains(FILL_CHAR),
+        "constructed witness must avoid the forbidden needle, got {w:?}"
+    );
+    assert!(Executor::value_satisfies_constraints(&w, Some(4), &c));
+}
+
+/// A forbidden needle that no uniform fill can dodge (it is not a repetition
+/// of one character) must NOT fabricate an answer: the pre-existing pad path
+/// runs and the strict substitution re-validation stays the gate.
+#[test]
+fn build_witness_falls_through_when_no_uniform_fill_works() {
+    let mut c = cons();
+    c.forbidden.push("ab".to_string());
+    c.forced.insert(0, 'a');
+    c.forced.insert(1, 'b');
+    let w = Executor::build_witness(3, &c).expect("fallback witness");
+    assert_eq!(w.chars().count(), 3);
+    // The forced pins make every candidate violate the constraint; the
+    // materializer returns the pad value and lets the gate reject it.
+    assert!(!Executor::value_satisfies_constraints(&w, Some(3), &c));
+}

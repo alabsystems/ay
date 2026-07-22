@@ -13,7 +13,7 @@ import subprocess, sys, os, time, json, glob, concurrent.futures as cf, math, si
 
 # scripts/ dir (this file lives in scripts/sat_bench/)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from _oom_guard import plan_solver_resources, rss_watchdog, warn_concurrent_build  # noqa: E402
+from _oom_guard import plan_solver_resources, run_captured, warn_concurrent_build  # noqa: E402
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 AY = os.environ.get("AY_BIN", os.path.join(_REPO, "target/release/ay"))
@@ -39,52 +39,23 @@ def parse_verdict(stdout):
 
 def run_solver(cmd, timeout, label):
     """Run a solver under the exact process-group RSS envelope."""
-    t0 = time.monotonic()
-    with tempfile.TemporaryFile(mode="w+b") as stdout_file:
-        try:
-            proc = subprocess.Popen(
-                cmd, stdout=stdout_file, stderr=subprocess.DEVNULL,
-                start_new_session=True, env=CHILD_ENV,
-            )
-        except Exception as exc:
-            return {"verdict": "ERROR", "time": time.monotonic() - t0,
-                    "rc": None, "err": str(exc)}
-        guard = rss_watchdog(proc, AY_MEMLIMIT_MB, label=label, grace_mb=0)
-        timed_out = False
-        try:
-            try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                proc.wait()
-        except Exception as exc:
-            return {"verdict": "ERROR", "time": time.monotonic() - t0,
-                    "rc": proc.poll(), "err": str(exc)}
-        finally:
-            # Remove descendants left behind by a clean wrapper before the memory
-            # guard is disarmed, and always reap the group leader.
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-            guard.stop()
-        if guard.breached:
-            verdict = "MEMOUT"
-        elif timed_out:
-            verdict = "TIMEOUT"
-        else:
-            stdout_file.seek(0)
-            verdict = parse_verdict(stdout_file)
-    return {"verdict": verdict, "time": time.monotonic() - t0,
-            "rc": proc.returncode}
+    try:
+        captured = run_captured(
+            cmd, AY_MEMLIMIT_MB, timeout, label=label, env=CHILD_ENV,
+        )
+    except Exception as exc:
+        return {"verdict": "ERROR", "time": 0.0, "rc": None,
+                "err": str(exc)}
+    if captured.memout:
+        verdict = "MEMOUT"
+    elif captured.timed_out:
+        verdict = "TIMEOUT"
+    elif captured.cancelled or captured.output_truncated:
+        verdict = "ERROR"
+    else:
+        verdict = parse_verdict(captured.stdout)
+    return {"verdict": verdict, "time": captured.wall_sec,
+            "rc": captured.returncode}
 
 
 def run_ay(cnf, timeout):

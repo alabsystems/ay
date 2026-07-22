@@ -13,8 +13,8 @@ use std::ffi::c_uint;
 use ay_dpll::api::Sort;
 
 use super::{
-    alloc_sort, ast_to_term, ffi_guard_ast, ffi_guard_ptr, lookup_ast_sort, record_ast_sort,
-    term_to_ast, Z3_ast, Z3_context, Z3_sort,
+    alloc_sort, ast_to_term, ffi_count_within_limit, ffi_guard_ast, ffi_guard_ptr, lookup_ast_sort,
+    record_ast_sort, term_to_ast, Z3_ast, Z3_context, Z3_sort,
 };
 
 // ---- Arithmetic operations ----
@@ -30,6 +30,11 @@ macro_rules! arith_nary_op {
             num_args: c_uint,
             args: *const Z3_ast,
         ) -> Z3_ast {
+            // SAFETY: this public entry point requires `c` to be null or a live,
+            // exclusively borrowed context; the bound checker only updates its error state.
+            if !unsafe { ffi_count_within_limit(c, stringify!($name), num_args) } {
+                return 0;
+            }
             if num_args == 0 || args.is_null() {
                 return 0;
             }
@@ -72,6 +77,11 @@ arith_nary_op!(Z3_mk_mul, mul_many);
 /// All pointers must be valid.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_sub(c: Z3_context, num_args: c_uint, args: *const Z3_ast) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_sub", num_args) } {
+        return 0;
+    }
     if num_args < 2 || args.is_null() {
         return 0;
     }

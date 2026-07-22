@@ -44,7 +44,7 @@ unsafe fn mk_ctx() -> Z3_context {
 unsafe fn int_var(c: Z3_context, n: &str) -> Z3_ast {
     // SAFETY: `c` valid; the symbol string is a valid C string for the call.
     unsafe {
-        let name = CString::new(n).unwrap();
+        let name = CString::new(n).expect("integer variable name must not contain an interior NUL");
         Z3_mk_const(c, Z3_mk_string_symbol(c, name.as_ptr()), Z3_mk_int_sort(c))
     }
 }
@@ -56,7 +56,7 @@ unsafe fn int_var(c: Z3_context, n: &str) -> Z3_ast {
 unsafe fn bool_var(c: Z3_context, n: &str) -> Z3_ast {
     // SAFETY: `c` valid; the symbol string is a valid C string for the call.
     unsafe {
-        let name = CString::new(n).unwrap();
+        let name = CString::new(n).expect("Boolean variable name must not contain an interior NUL");
         Z3_mk_const(c, Z3_mk_string_symbol(c, name.as_ptr()), Z3_mk_bool_sort(c))
     }
 }
@@ -69,7 +69,7 @@ unsafe fn numeral(c: Z3_context, a: Z3_ast) -> Option<i32> {
     // SAFETY: `c`/`a` valid; `v` is a live stack slot for the out-param.
     unsafe {
         let mut v: c_int = 0;
-        if a != 0 && Z3_get_numeral_int(c, a, &mut v) {
+        if a != 0 && Z3_get_numeral_int(c, a, &raw mut v) {
             Some(v)
         } else {
             None
@@ -243,7 +243,7 @@ fn from_string_minimize() {
              (assert (<= y 100))\n\
              (minimize y)\n",
         )
-        .unwrap();
+        .expect("optimization script must not contain an interior NUL");
         Z3_optimize_from_string(c, o, script.as_ptr());
         assert_eq!(Z3_get_error_code(c), Z3_OK);
         assert_eq!(Z3_ast_vector_size(c, Z3_optimize_get_objectives(c, o)), 1);
@@ -268,7 +268,7 @@ fn assumptions_are_rejected() {
         let objective = Z3_optimize_maximize(c, o, x);
 
         // Establish real outcome artefacts before exercising the early reject.
-        assert_eq!(Z3_optimize_check(c, o, 0, std::ptr::null()), Z3_L_TRUE);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
         assert!(!Z3_optimize_get_model(c, o).is_null());
         assert_eq!(numeral(c, Z3_optimize_get_upper(c, o, objective)), Some(9));
 
@@ -324,7 +324,7 @@ fn successful_mutations_retire_optimize_outcomes() {
         Z3_optimize_assert(c, o, Z3_mk_lt(c, x, ten));
         let maximize_x = Z3_optimize_maximize(c, o, x);
 
-        assert_eq!(Z3_optimize_check(c, o, 0, std::ptr::null()), Z3_L_TRUE);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
         assert!(!Z3_optimize_get_model(c, o).is_null());
         assert_eq!(numeral(c, Z3_optimize_get_upper(c, o, maximize_x)), Some(9));
 
@@ -338,7 +338,7 @@ fn successful_mutations_retire_optimize_outcomes() {
             .to_bytes()
             .is_empty());
 
-        assert_eq!(Z3_optimize_check(c, o, 0, std::ptr::null()), Z3_L_TRUE);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
         assert!(!Z3_optimize_get_model(c, o).is_null());
 
         // Objective registration is a mutation too; bounds/model are not
@@ -365,7 +365,7 @@ fn transitive_closure_downgrade_revokes_backend_sat_outcomes() {
         Z3_optimize_assert(c, o, Z3_mk_lt(c, x, ten));
         let objective = Z3_optimize_maximize(c, o, x);
 
-        assert_eq!(Z3_optimize_check(c, o, 0, std::ptr::null()), Z3_L_TRUE);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
         assert!(!Z3_optimize_get_model(c, o).is_null());
         assert_eq!(numeral(c, Z3_optimize_get_upper(c, o, objective)), Some(9));
 
@@ -373,7 +373,8 @@ fn transitive_closure_downgrade_revokes_backend_sat_outcomes() {
         // backend can still find/capture SAT and its objective value, but the
         // FFI must downgrade it and revoke both outcome surfaces.
         let bool_sort = Z3_mk_bool_sort(c);
-        let relation_name = CString::new("R").unwrap();
+        let relation_name =
+            CString::new("R").expect("relation name must not contain an interior NUL");
         let relation = Z3_mk_func_decl(
             c,
             Z3_mk_string_symbol(c, relation_name.as_ptr()),
@@ -382,7 +383,7 @@ fn transitive_closure_downgrade_revokes_backend_sat_outcomes() {
             bool_sort,
         );
         assert!(!Z3_mk_transitive_closure(c, relation).is_null());
-        assert_eq!(Z3_optimize_check(c, o, 0, std::ptr::null()), Z3_L_UNDEF);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_UNDEF);
 
         let reason = CStr::from_ptr(Z3_optimize_get_reason_unknown(c, o)).to_string_lossy();
         assert!(
@@ -436,37 +437,39 @@ fn global_parser_cannot_mutate_an_optimize_owned_engine() {
         let o = Z3_mk_optimize(c);
         Z3_optimize_assert(c, o, Z3_mk_true(c));
 
-        let script = CString::new("(assert false)").unwrap();
+        let script = CString::new("(assert false)")
+            .expect("SMT-LIB script must not contain an interior NUL");
         let parsed = Z3_parse_smtlib2_string(
             c,
             script.as_ptr(),
             0,
-            std::ptr::null(),
-            std::ptr::null(),
+            ptr::null(),
+            ptr::null(),
             0,
-            std::ptr::null(),
-            std::ptr::null(),
+            ptr::null(),
+            ptr::null(),
         );
         assert_eq!(Z3_get_error_code(c), Z3_INVALID_USAGE);
         // Successful accessor calls reset the context error, so inspect the
         // parser error before asking for the returned vector's size.
         assert_eq!(Z3_ast_vector_size(c, parsed), 0);
-        assert_eq!(Z3_optimize_check(c, o, 0, std::ptr::null()), Z3_L_TRUE);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
         Z3_del_context(c);
 
         // A semantic global parse claims the ordinary solver family even when
         // no explicit solver handle has been created.
         let c = mk_ctx();
-        let script = CString::new("(assert true)").unwrap();
+        let script =
+            CString::new("(assert true)").expect("SMT-LIB script must not contain an interior NUL");
         let _ = Z3_parse_smtlib2_string(
             c,
             script.as_ptr(),
             0,
-            std::ptr::null(),
-            std::ptr::null(),
+            ptr::null(),
+            ptr::null(),
             0,
-            std::ptr::null(),
-            std::ptr::null(),
+            ptr::null(),
+            ptr::null(),
         );
         assert_eq!(Z3_get_error_code(c), Z3_OK);
         assert!(Z3_mk_optimize(c).is_null());
@@ -488,7 +491,7 @@ fn optimize_parse_late_error_rolls_back_and_permanently_fails_closed() {
         Z3_optimize_assert(c, o, Z3_mk_ge(c, x, zero));
         Z3_optimize_assert(c, o, Z3_mk_lt(c, x, ten));
         let objective = Z3_optimize_maximize(c, o, x);
-        assert_eq!(Z3_optimize_check(c, o, 0, std::ptr::null()), Z3_L_TRUE);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
 
         let hard_before = Z3_ast_vector_size(c, Z3_optimize_get_assertions(c, o));
         let objectives_before = Z3_ast_vector_size(c, Z3_optimize_get_objectives(c, o));
@@ -503,7 +506,7 @@ fn optimize_parse_late_error_rolls_back_and_permanently_fails_closed() {
              (maximize y)\n\
              (assert 1)\n",
         )
-        .unwrap();
+        .expect("optimization script must not contain an interior NUL");
         Z3_optimize_from_string(c, o, script.as_ptr());
         assert_eq!(Z3_get_error_code(c), Z3_EXCEPTION);
         assert_eq!(
@@ -524,7 +527,7 @@ fn optimize_parse_late_error_rolls_back_and_permanently_fails_closed() {
         // Unscoped options could have executed before the late failure, so the
         // handle is terminally UNKNOWN rather than risking a partially changed
         // optimization on a later check.
-        assert_eq!(Z3_optimize_check(c, o, 0, std::ptr::null()), Z3_L_UNDEF);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_UNDEF);
         assert_eq!(Z3_get_error_code(c), Z3_INVALID_USAGE);
         let reason = CStr::from_ptr(Z3_optimize_get_reason_unknown(c, o)).to_string_lossy();
         assert!(reason.contains("parse execution failed"), "{reason}");
@@ -560,7 +563,7 @@ fn optimize_parse_rejects_context_poison_and_open_user_scope() {
         assert_eq!((*o).scope_markers.len(), 1);
         Z3_optimize_pop(c, o);
         assert_eq!(Z3_get_error_code(c), Z3_OK);
-        assert_eq!(Z3_optimize_check(c, o, 0, std::ptr::null()), Z3_L_TRUE);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
         Z3_del_context(c);
     }
 }
@@ -576,7 +579,7 @@ fn optimize_priority_param_is_validated_wired_and_retires_artifacts() {
         Z3_optimize_assert(c, o, Z3_mk_le(c, x, Z3_mk_int(c, 10, int_sort)));
         let maximize_x = Z3_optimize_maximize(c, o, x);
         let minimize_x = Z3_optimize_minimize(c, o, x);
-        assert_eq!(Z3_optimize_check(c, o, 0, std::ptr::null()), Z3_L_TRUE);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
         assert_eq!(
             numeral(c, Z3_optimize_get_upper(c, o, maximize_x)),
             Some(10)
@@ -613,7 +616,7 @@ fn optimize_priority_param_is_validated_wired_and_retires_artifacts() {
         assert_eq!(Z3_get_error_code(c), Z3_OK);
         assert!(Z3_optimize_get_model(c, o).is_null());
         assert_eq!(Z3_optimize_get_upper(c, o, maximize_x), 0);
-        assert_eq!(Z3_optimize_check(c, o, 0, std::ptr::null()), Z3_L_TRUE);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
         assert_eq!(
             numeral(c, Z3_optimize_get_upper(c, o, maximize_x)),
             Some(10)
@@ -625,7 +628,7 @@ fn optimize_priority_param_is_validated_wired_and_retires_artifacts() {
         Z3_update_param_value(c, c"opt.priority".as_ptr(), c"lex".as_ptr());
         assert_eq!(Z3_get_error_code(c), Z3_OK);
         assert!(Z3_optimize_get_model(c, o).is_null());
-        assert_eq!(Z3_optimize_check(c, o, 0, std::ptr::null()), Z3_L_TRUE);
+        assert_eq!(Z3_optimize_check(c, o, 0, ptr::null()), Z3_L_TRUE);
         assert_eq!(
             numeral(c, Z3_optimize_get_lower(c, o, minimize_x)),
             Some(10)
@@ -643,8 +646,9 @@ fn optimize_translate_is_exclusive_and_preserves_soft_groups() {
         let source_opt = Z3_mk_optimize(source);
         let a = bool_var(source, "a");
         Z3_optimize_assert(source, source_opt, Z3_mk_true(source));
-        let weight = CString::new("3").unwrap();
-        let group_name = CString::new("group_a").unwrap();
+        let weight = CString::new("3").expect("soft weight must not contain an interior NUL");
+        let group_name =
+            CString::new("group_a").expect("group name must not contain an interior NUL");
         let group = Z3_mk_string_symbol(source, group_name.as_ptr());
         Z3_optimize_assert_soft(source, source_opt, a, weight.as_ptr(), group);
 
@@ -660,7 +664,7 @@ fn optimize_translate_is_exclusive_and_preserves_soft_groups() {
         // translation, but the current flat MaxSMT result cannot represent
         // group semantics and therefore honestly refuses to solve it.
         assert_eq!(
-            Z3_optimize_check(target, translated, 0, std::ptr::null()),
+            Z3_optimize_check(target, translated, 0, ptr::null()),
             Z3_L_UNDEF
         );
 
@@ -686,12 +690,12 @@ fn params_help_and_descrs() {
         let c = mk_ctx();
         let o = Z3_mk_optimize(c);
 
-        assert!(Z3_optimize_get_statistics(c, std::ptr::null_mut()).is_null());
+        assert!(Z3_optimize_get_statistics(c, ptr::null_mut()).is_null());
         assert_eq!(Z3_get_error_code(c), Z3_INVALID_ARG);
 
         // set_params honors `timeout`.
         let p = Z3_mk_params(c);
-        let key = CString::new("timeout").unwrap();
+        let key = CString::new("timeout").expect("parameter name must not contain an interior NUL");
         Z3_params_set_uint(c, p, Z3_mk_string_symbol(c, key.as_ptr()), 5000);
         Z3_optimize_set_params(c, o, p);
         assert_eq!(Z3_get_error_code(c), Z3_OK);

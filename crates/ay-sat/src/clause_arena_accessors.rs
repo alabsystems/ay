@@ -88,6 +88,7 @@ impl ClauseArena {
     /// dereference pointers that lie within the `self.words` allocation and
     /// are properly aligned (raw `Vec<u32>` storage). The fn is marked
     /// `unsafe` so the bounds / validity contract is surfaced to callers.
+    #[cfg(feature = "raw-pointer-bcp")]
     #[inline(always)]
     #[allow(unsafe_code)]
     pub(crate) unsafe fn bcp_header_unchecked(

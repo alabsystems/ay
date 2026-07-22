@@ -71,6 +71,7 @@ mod strings_regex_len;
 mod strings_w4;
 mod strings_w5;
 mod strings_w6;
+mod strings_w7;
 mod strings_word_eq;
 
 pub(crate) use split_incremental::BoundRefinementReplayKey;

@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+use ay_core::Sort;
 
 impl Default for Executor {
     fn default() -> Self {
@@ -11,12 +12,79 @@ impl Default for Executor {
 }
 
 impl Executor {
-    /// Commands that mutate the assertion/objective stack invalidate
-    /// any cached check-sat artefacts (model/proof/unsat-assumptions).
+    /// Execute a native-API declaration outside SMT-LIB assertion scoping.
+    ///
+    /// Native declaration handles belong to the solver context rather than an
+    /// assertion frame. The frontend helper updates existing scope snapshots
+    /// without changing either spelling of the public global-declarations
+    /// option; the executor then retires artifacts from the preceding decision
+    /// just as [`Executor::execute`] does for an ordinary declaration command.
+    pub(crate) fn execute_native_global_declaration(&mut self, cmd: &Command) -> Result<()> {
+        self.ctx.execute_native_global_declaration(cmd)?;
+        self.invalidate_last_check_result();
+        Ok(())
+    }
+
+    /// Register a native constant globally and retire the preceding decision.
+    pub(crate) fn register_native_global_symbol(&mut self, name: String, term: TermId, sort: Sort) {
+        self.ctx.register_native_global_symbol(name, term, sort);
+        self.invalidate_last_check_result();
+    }
+
+    /// Register a native function's surface alias globally and retire the
+    /// preceding decision if the registration succeeds.
+    pub(crate) fn register_native_global_function_alias(
+        &mut self,
+        surface_name: String,
+        internal_name: String,
+        arg_sorts: Vec<Sort>,
+        ret_sort: Sort,
+    ) -> Result<()> {
+        let changed = self.ctx.register_native_global_function_alias(
+            surface_name,
+            internal_name,
+            arg_sorts,
+            ret_sort,
+        )?;
+        if changed {
+            self.invalidate_last_check_result();
+        }
+        Ok(())
+    }
+
+    /// Retire a completed decision after a native API mutation that is held in
+    /// the API layer rather than represented by a frontend command.
+    pub(crate) fn invalidate_for_native_api_mutation(&mut self) {
+        self.invalidate_last_check_result();
+    }
+
+    /// Every command that changes the problem signature, semantics, assertion
+    /// stack, Horn/SyGuS problem, or objectives invalidates cached check-sat
+    /// artefacts (model/proof/core/unsat-assumptions). Pure options and queries
+    /// deliberately do not: changing presentation settings or asking for an
+    /// artefact cannot make the preceding decision stale.
     pub(super) fn command_invalidates_last_check_result(cmd: &Command) -> bool {
         matches!(
             cmd,
-            Command::Assert(_)
+            Command::SetLogic(_)
+                | Command::DeclareSort(..)
+                | Command::DefineSort(..)
+                | Command::DeclareDatatype(..)
+                | Command::DeclareDatatypes(..)
+                | Command::DeclareFun(..)
+                | Command::DeclareConst(..)
+                | Command::DeclareVar(..)
+                | Command::DeclareRel(..)
+                | Command::Rule(..)
+                | Command::Query(..)
+                | Command::DefineFun(..)
+                | Command::DefineFunRec(..)
+                | Command::DefineFunsRec(..)
+                | Command::SynthFun(..)
+                | Command::SynthInv(..)
+                | Command::SygusConstraint(..)
+                | Command::InvConstraint(..)
+                | Command::Assert(_)
                 | Command::AssertSoft { .. }
                 | Command::Push(_)
                 | Command::Pop(_)
@@ -73,6 +141,69 @@ impl Executor {
         // front can never contaminate a different problem or corrupt lex / box /
         // single-objective / plain check-sat (none of which read this field).
         self.pareto_state = None;
+    }
+
+    /// Close every decision-trace writer retained by an incremental SAT lane.
+    ///
+    /// Persistent solvers keep their buffered writer across `check-sat` calls.
+    /// A CLI-level fail-closed result must detach those file descriptors before
+    /// removing the now-non-authoritative trace; reopening or truncating the
+    /// path while an old writer remains live can corrupt or re-expose it.
+    fn detach_persistent_decision_trace_writers(&mut self) {
+        if let Some(state) = self.incr_bv_state.as_mut() {
+            if let Some(sat) = state.persistent_sat.as_mut() {
+                sat.disable_decision_trace();
+            }
+        }
+        if let Some(state) = self.incr_theory_state.as_mut() {
+            if let Some(sat) = state.persistent_sat.as_mut() {
+                sat.disable_decision_trace();
+            }
+            if let Some(sat) = state.lia_persistent_sat.as_mut() {
+                sat.disable_decision_trace();
+            }
+        }
+        if ay_core::trace_config().decision_trace_path.is_some() {
+            // Once a public/raw mismatch occurs, a later partial trace cannot
+            // replay the full session honestly. Leave tracing disabled for the
+            // rest of this process instead of silently starting a forged stream.
+            ay_sat::suppress_decision_trace_after_public_mismatch();
+        }
+    }
+
+    /// Install an externally synthesized `Unknown` result and revoke every
+    /// artifact belonging to an older or partially completed decision.
+    ///
+    /// CLI preflight rejection and panic containment can decide to fail closed
+    /// without receiving a normal `Unknown` from the solver. This canonical
+    /// transition prevents subsequent model/proof/core queries from observing
+    /// a stale result. Decision tracing is also detached and permanently
+    /// suppressed when configured, because replay would reproduce the solver's
+    /// raw result rather than the external boundary's synthesized result.
+    pub fn replace_last_result_with_unknown(&mut self, reason: UnknownReason) {
+        self.detach_persistent_decision_trace_writers();
+        self.invalidate_last_check_result();
+        self.last_result = Some(SolveResult::Unknown);
+        self.last_unknown_reason = Some(reason);
+    }
+
+    /// Reject the current internal UNSAT at a mandatory certification boundary.
+    ///
+    /// This is the canonical fail-closed transition used after a post-solve
+    /// checker refuses an UNSAT result. It clears every UNSAT-derived model,
+    /// proof, core, assumption, optimization, and certificate cache before
+    /// installing `Unknown`, so all later SMT-LIB queries and EOF consumers see
+    /// the public verdict rather than the rejected internal one.
+    ///
+    /// Returns `false` without changing state unless the current result is
+    /// UNSAT. That precondition keeps result gates from accidentally upgrading
+    /// a missing, SAT, or already-unknown result.
+    pub fn reject_last_unsat_as_unknown(&mut self) -> bool {
+        if !self.last_result_is_unsat() {
+            return false;
+        }
+        self.replace_last_result_with_unknown(UnknownReason::Incomplete);
+        true
     }
 
     /// Revoke every user-visible artefact at the start of a public decision
@@ -174,6 +305,8 @@ impl Executor {
         }
         Self {
             ctx: Context::new(),
+            // No string lemma lowered yet — vacuously all-valid.
+            string_lemma_kinds_all_valid: true,
             qfax_budget_multiplier: 1,
             qfax_refinement_clause: None,
             last_rejected_array_assertion: None,
@@ -201,9 +334,11 @@ impl Executor {
             last_model: None,
             active_support_axioms: Vec::new(),
             conflict_semantic_verify_memo: Default::default(),
+            prop_semantic_verify_memo: Default::default(),
             last_assumptions: None,
             last_assumption_core: None,
             last_core_term_to_name: None,
+            named_assert_rewrites: Default::default(),
             last_proof: None,
             last_lrat_certificate: None,
             last_proof_term_overrides: None,
@@ -260,6 +395,7 @@ impl Executor {
             pending_sat_unknown_reason: None,
             verification_level: VerificationLevel::from_state(false),
             self_check: false,
+            last_bv_drat_self_cert: false,
             dt_array_injectivity_gate_bypass: false,
             last_degrade_was_datatype_array: false,
             dt_pre_lift_assertions: Vec::new(),
@@ -280,12 +416,15 @@ impl Executor {
             dt_theory_model: None,
             dt_validation_wants_egraph: false,
             dt_egraph_assignment: std::cell::RefCell::new(None),
-            dt_egraph_building: std::cell::Cell::new(false),
+            dt_egraph_building: Cell::new(false),
             recorded_var_substitutions: HashMap::default(),
             original_problem_had_quantifiers: false,
             sat_validated_by_mod_div_or_branch: false,
             bypass_string_tautology_guard: false,
             slia_accepted_unknown: false,
+            w7_defs: None,
+            w7_int_defs: HashMap::default(),
+            w4_work_deadline: Cell::new(None),
             self_check_authored_assertions: None,
             array_axiom_scope: None,
             row_seeded_terms: HashSet::default(),
@@ -467,6 +606,17 @@ impl Executor {
     #[must_use]
     pub fn self_check(&self) -> bool {
         self.self_check
+    }
+
+    /// Whether the last `check_sat` produced a pure-QF_BV UNSAT under
+    /// `--self-check` that emitted a native-checkable bit-blast DRAT to the
+    /// self-cert temp files and whose finalized (CNF, DRAT) pair the executor
+    /// verified with AY's native checker before returning `Unsat`. The CLI uses
+    /// this only to print the certification diagnostic. Fail-closed: `false`
+    /// unless both emission and verification succeeded for this solve.
+    #[must_use]
+    pub fn bv_drat_self_cert_pending(&self) -> bool {
+        self.last_bv_drat_self_cert
     }
 
     /// Access the internal context (for API module)
@@ -907,5 +1057,203 @@ impl Executor {
         self.objective_certificates.clear();
         self.lemma_cache.clear();
         for_each_incremental_subsystem!(reset self);
+    }
+}
+
+#[cfg(test)]
+mod result_rejection_tests {
+    use super::*;
+    use crate::incremental_state::IncrementalTheoryState;
+    use ay_sat::Solver as SatSolver;
+
+    #[test]
+    fn rejecting_unsat_clears_certificates_and_canonicalizes_followup_queries() {
+        let mut executor = Executor::new();
+        executor
+            .execute(&Command::SetOption(
+                ":produce-proofs".to_string(),
+                ay_frontend::SExpr::True,
+            ))
+            .expect("enable proof production");
+        executor.last_result = Some(SolveResult::unsat());
+        executor.last_proof = Some(Proof::new());
+        executor.last_assumptions = Some(Vec::new());
+        executor.last_assumption_core = Some(Vec::new());
+
+        assert!(executor.reject_last_unsat_as_unknown());
+        assert!(executor.last_result_is_unknown());
+        assert_eq!(
+            executor.get_reason_unknown(),
+            Some(UnknownReason::Incomplete)
+        );
+        assert!(executor.last_proof().is_none());
+        assert!(executor.last_assumptions.is_none());
+        assert!(executor.last_assumption_core.is_none());
+
+        let proof = executor
+            .execute(&Command::GetProof)
+            .expect("get-proof remains a recoverable query")
+            .expect("get-proof has an error response");
+        assert_eq!(
+            proof,
+            "(error \"proof is not available, last result was unknown\")"
+        );
+        let reason = executor
+            .execute(&Command::GetInfo(":reason-unknown".to_string()))
+            .expect("get-info remains available")
+            .expect("get-info has a response");
+        assert_eq!(reason, "(:reason-unknown incomplete)");
+
+        // A later decision replaces the rejected result normally; rejection is
+        // scoped to exactly the failed certification, not the whole session.
+        assert_eq!(
+            executor
+                .execute(&Command::CheckSat)
+                .expect("next check-sat"),
+            Some("sat".to_string())
+        );
+        assert!(executor.last_result_is_sat());
+    }
+
+    #[test]
+    fn rejecting_unsat_is_a_narrow_noop_for_other_states() {
+        let mut executor = Executor::new();
+        assert!(!executor.reject_last_unsat_as_unknown());
+        executor.last_result = Some(SolveResult::Sat);
+        assert!(!executor.reject_last_unsat_as_unknown());
+        assert!(executor.last_result_is_sat());
+    }
+
+    #[test]
+    fn externally_synthesized_unknown_revokes_every_prior_result() {
+        let mut executor = Executor::new();
+        executor
+            .execute(&Command::SetOption(
+                ":produce-proofs".to_string(),
+                ay_frontend::SExpr::True,
+            ))
+            .expect("enable proof production");
+        executor.last_result = Some(SolveResult::Sat);
+        executor.replace_last_result_with_unknown(UnknownReason::InternalError);
+        assert!(executor.last_result_is_unknown());
+        assert_eq!(
+            executor.get_reason_unknown(),
+            Some(UnknownReason::InternalError)
+        );
+        let model = executor
+            .execute(&Command::GetModel)
+            .expect("get-model remains recoverable")
+            .expect("get-model has an error response");
+        assert_eq!(model, "(error \"model is not available\")");
+
+        executor.last_result = Some(SolveResult::unsat());
+        executor.last_proof = Some(Proof::new());
+        executor.replace_last_result_with_unknown(UnknownReason::Incomplete);
+        assert!(executor.last_proof().is_none());
+        let proof = executor
+            .execute(&Command::GetProof)
+            .expect("get-proof remains recoverable")
+            .expect("get-proof has an error response");
+        assert_eq!(
+            proof,
+            "(error \"proof is not available, last result was unknown\")"
+        );
+
+        assert_eq!(
+            executor
+                .execute(&Command::CheckSat)
+                .expect("later decision remains usable"),
+            Some("sat".to_string())
+        );
+    }
+
+    #[test]
+    fn synthesized_unknown_detaches_persistent_trace_writer() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let trace = temp.path().join("decision.trace");
+        let trace_text = trace.to_str().expect("UTF-8 trace path");
+
+        let mut sat = SatSolver::new(0);
+        sat.enable_decision_trace(trace_text)
+            .expect("enable decision trace");
+        let mut state = IncrementalTheoryState::new();
+        state.persistent_sat = Some(sat);
+
+        let mut executor = Executor::new();
+        executor.incr_theory_state = Some(state);
+        executor.last_result = Some(SolveResult::unsat());
+        executor.replace_last_result_with_unknown(UnknownReason::Incomplete);
+
+        let retained = executor
+            .incr_theory_state
+            .as_mut()
+            .and_then(|state| state.persistent_sat.as_mut())
+            .expect("persistent SAT state remains reusable");
+        assert!(
+            !retained.disable_decision_trace(),
+            "the stale buffered writer must already be detached"
+        );
+        assert!(retained.solve().into_inner().is_sat());
+    }
+
+    #[test]
+    fn signature_mutation_retires_a_direct_executor_result() {
+        let mut executor = Executor::new();
+        assert_eq!(
+            executor.execute(&Command::CheckSat).expect("initial check"),
+            Some("sat".to_string())
+        );
+        assert!(executor.last_result_is_sat());
+
+        executor
+            .execute(&Command::DeclareConst(
+                "after_check".to_string(),
+                ay_frontend::Sort::Simple("Int".to_string()),
+            ))
+            .expect("declaration after check");
+        assert!(executor.last_result.is_none());
+
+        let model = executor
+            .execute(&Command::GetModel)
+            .expect("get-model stays recoverable")
+            .expect("get-model emits an error");
+        assert_eq!(model, "(error \"model is not available\")");
+    }
+
+    #[test]
+    fn every_parsed_problem_mutation_is_classified_for_invalidation() {
+        let commands = ay_frontend::parse(
+            r#"
+            (set-logic ALL)
+            (declare-sort S 0)
+            (declare-const x Int)
+            (declare-fun f (Int) Int)
+            (define-fun g ((x Int)) Int x)
+            (declare-var v Int)
+            (declare-rel p (Int))
+            (rule (p v))
+            (query (p 0))
+            (synth-fun sf ((x Int)) Int)
+            (constraint (= (sf 0) 0))
+            (push 1)
+            (pop 1)
+            (reset-assertions)
+            "#,
+        )
+        .expect("representative mutation commands parse");
+        assert!(
+            commands
+                .iter()
+                .all(Executor::command_invalidates_last_check_result),
+            "every semantics/signature mutation must revoke stale results: {commands:?}"
+        );
+
+        let queries = ay_frontend::parse(
+            "(set-option :print-success true)\n(get-info :name)\n(echo \"ok\")\n",
+        )
+        .expect("non-mutating commands parse");
+        assert!(queries
+            .iter()
+            .all(|cmd| !Executor::command_invalidates_last_check_result(cmd)));
     }
 }

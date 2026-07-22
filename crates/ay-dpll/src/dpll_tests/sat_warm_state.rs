@@ -165,9 +165,7 @@ fn sat_warm_state_preserves_vsids_activities() {
     let act1 = solver2.activity(Variable::new(1));
     assert!(
         act0 > act1,
-        "var 0 (bumped) should have higher activity than var 1 (not bumped): {} vs {}",
-        act0,
-        act1,
+        "var 0 (bumped) should have higher activity than var 1 (not bumped): {act0} vs {act1}",
     );
 }
 

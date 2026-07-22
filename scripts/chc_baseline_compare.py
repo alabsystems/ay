@@ -15,11 +15,18 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _oom_guard import (  # noqa: E402
+    plan_solver_resources,
+    run_captured,
+    warn_concurrent_build,
+)
 
 SOLVED = {"sat", "unsat"}
 STATUS_ORDER = ("sat", "unsat", "unknown")
@@ -50,19 +57,23 @@ def first_status(stdout: str) -> str:
 
 
 def run_text(args: list[str], cwd: Path, timeout: float = 10.0) -> str:
-    try:
-        proc = subprocess.run(
-            args,
-            cwd=cwd,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return f"unavailable: {exc}"
-    return proc.stdout.strip()
+    with tempfile.TemporaryFile(mode="w+b") as output:
+        try:
+            subprocess.run(
+                args,
+                cwd=cwd,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                timeout=timeout,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"unavailable: {exc}"
+        output.seek(0)
+        captured = output.read(1024 * 1024 + 1)
+    if len(captured) > 1024 * 1024:
+        return "unavailable: metadata output exceeded 1 MiB"
+    return captured.decode("utf-8", errors="replace").strip()
 
 
 def resolve_bench_dir(root: Path, baseline_path: Path, baseline: dict[str, Any], override: str | None) -> Path:
@@ -79,21 +90,29 @@ def resolve_bench_dir(root: Path, baseline_path: Path, baseline: dict[str, Any],
     return candidates[0]
 
 
-def run_case(ay: Path, bench_file: Path, timeout_sec: int) -> dict[str, Any]:
+def run_case(ay: Path, bench_file: Path, timeout_sec: int, plan) -> dict[str, Any]:
     start = time.monotonic()
     timeout_ms = str(max(timeout_sec, 0) * 1000)
-    args = [str(ay), "--chc", "--timeout", timeout_ms, str(bench_file)]
+    args = [str(ay), "--chc", "--memory", str(plan.memlimit_mb),
+            "--timeout", timeout_ms, str(bench_file)]
     try:
-        proc = subprocess.run(
+        proc = run_captured(
             args,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=max(timeout_sec, 0) + 4,
-            check=False,
+            plan.memlimit_mb,
+            max(timeout_sec, 0) + 4,
+            label="chc_baseline_compare.py",
+            env=dict(os.environ, MEMLIMIT=str(plan.memlimit_mb),
+                     NBCORE=str(plan.nbcore)),
         )
         elapsed_ms = int(round((time.monotonic() - start) * 1000))
-        status = first_status(proc.stdout)
+        if proc.memout:
+            status = "memout"
+        elif proc.timed_out:
+            status = "timeout"
+        elif proc.output_truncated:
+            status = "error"
+        else:
+            status = first_status(proc.stdout)
         if proc.returncode == 124 and status in {"no-status", "unknown"}:
             status = "timeout"
         return {
@@ -103,18 +122,7 @@ def run_case(ay: Path, bench_file: Path, timeout_sec: int) -> dict[str, Any]:
             "stdout": proc.stdout[-4096:],
             "stderr": proc.stderr[-4096:],
         }
-    except subprocess.TimeoutExpired as exc:
-        elapsed_ms = int(round((time.monotonic() - start) * 1000))
-        stdout = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        stderr = exc.stderr.decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        return {
-            "status": "timeout",
-            "elapsed_ms": elapsed_ms,
-            "exit_code": None,
-            "stdout": stdout[-4096:],
-            "stderr": stderr[-4096:],
-        }
-    except OSError as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         elapsed_ms = int(round((time.monotonic() - start) * 1000))
         return {
             "status": "error",
@@ -138,13 +146,44 @@ def compare(args: argparse.Namespace) -> int:
     if not ay.is_file():
         raise SystemExit(f"ay binary not found: {ay}")
 
+    warn_concurrent_build()
+    plan = plan_solver_resources(1, label="chc_baseline_compare.py")
+    resource_plan = {
+        "requested_jobs": 1,
+        "jobs": plan.jobs,
+        "memlimit_mb_per_child": plan.memlimit_mb,
+        "nbcore_per_child": plan.nbcore,
+        "headroom_mb": plan.headroom_mb,
+        "enforcement": "ay --memory + process-group rss_watchdog; MEMLIMIT/NBCORE environment",
+    }
+
     profile = args.profile or ("fast-proxy" if args.timeout is not None else "same-timeout")
     run_type = "fast-proxy-warning-only" if profile == "fast-proxy" else "same-timeout-gate"
     timeout_relation = "shorter-than-baseline" if args.timeout is not None else "same-as-baseline"
     if args.timeout is not None and args.timeout >= int(baseline.get("timeout_sec", timeout_sec)):
         timeout_relation = "not-shorter-than-baseline"
 
-    version = run_text([str(ay), "--version"], root)
+    try:
+        version_run = run_captured(
+            [str(ay), "--version"], plan.memlimit_mb, 10,
+            label="chc_baseline_compare.py[version]",
+            env=dict(os.environ, MEMLIMIT=str(plan.memlimit_mb),
+                     NBCORE=str(plan.nbcore)),
+        )
+        if (
+            version_run.memout
+            or version_run.timed_out
+            or version_run.cancelled
+            or version_run.output_truncated
+            or version_run.returncode != 0
+        ):
+            version = "unavailable: guarded version probe failed"
+        else:
+            version = (version_run.stdout or version_run.stderr).strip()
+            if not version:
+                version = "unavailable: empty version output"
+    except (OSError, RuntimeError, ValueError) as exc:
+        version = f"unavailable: {exc}"
     rows: list[dict[str, Any]] = []
     summary = {
         "checked": 0,
@@ -155,8 +194,19 @@ def compare(args: argparse.Namespace) -> int:
         "wrong_answers": 0,
         "invalid_answers": 0,
         "missing_benchmarks": 0,
+        "non_comparable_baseline": 0,
         "current_status_counts": {},
     }
+
+    baseline_plan = baseline.get("resource_plan")
+    comparable_fields = ("jobs", "memlimit_mb_per_child", "nbcore_per_child",
+                         "headroom_mb", "enforcement")
+    baseline_comparable = isinstance(baseline_plan, dict) and all(
+        baseline_plan.get(field) == resource_plan[field]
+        for field in comparable_fields
+    )
+    if not baseline_comparable:
+        summary["non_comparable_baseline"] = 1
 
     for case in baseline.get("benchmarks", []):
         rel = str(case.get("file", ""))
@@ -178,7 +228,7 @@ def compare(args: argparse.Namespace) -> int:
             }
             summary["missing_benchmarks"] += 1
         else:
-            result = run_case(ay, bench_file, timeout_sec)
+            result = run_case(ay, bench_file, timeout_sec, plan)
 
         current = result["status"]
         if current in SOLVED:
@@ -235,6 +285,9 @@ def compare(args: argparse.Namespace) -> int:
             "timeout_relation": timeout_relation,
             "timeout_sec": timeout_sec,
         },
+        "resource_plan": resource_plan,
+        "baseline_resource_plan": baseline_plan,
+        "baseline_comparable": baseline_comparable,
         "provenance": {
             "ay": str(ay),
             "ay_sha256": sha256_file(ay),
@@ -268,6 +321,7 @@ def compare(args: argparse.Namespace) -> int:
             or summary["wrong_answers"] > 0
             or summary["invalid_answers"] > 0
             or summary["missing_benchmarks"] > 0
+            or not baseline_comparable
         )
     )
     return 1 if fail else 0

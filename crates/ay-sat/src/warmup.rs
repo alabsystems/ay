@@ -75,9 +75,7 @@ impl Warmup {
 
     /// Reset state for new warmup round
     pub(crate) fn reset(&mut self) {
-        for val in &mut self.assignment {
-            *val = None;
-        }
+        self.assignment.fill(None);
         self.trail.clear();
         self.propagated = 0;
         for watch in &mut self.watches {

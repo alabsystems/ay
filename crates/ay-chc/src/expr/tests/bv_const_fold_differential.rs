@@ -347,3 +347,32 @@ fn bv_width_mismatch_inside_eq_stays_symbolic() {
         "ill-typed BV equality must not fold to a Bool constant, got {simplified:?}"
     );
 }
+
+/// Constants wider than the `u128` backing store have implicit zero bits above
+/// bit 127. Extracting that region must fold to zero without a host-language
+/// oversized-shift panic.
+#[test]
+fn bv_extract_above_u128_backing_store_folds_to_zero() {
+    let extract = ChcExpr::Op(
+        ChcOp::BvExtract(255, 128),
+        vec![Arc::new(ChcExpr::BitVec(u128::MAX, 256))],
+    );
+
+    assert_eq!(extract.simplify_constants(), ChcExpr::BitVec(0, 128));
+}
+
+/// A wide constant's unrepresented sign bit is zero. Sign extension must keep
+/// the represented low bits unchanged and must not shift a `u128` by 128 or
+/// more while reading that sign bit.
+#[test]
+fn bv_sign_extend_above_u128_backing_store_uses_zero_sign_bit() {
+    let sign_extend = ChcExpr::Op(
+        ChcOp::BvSignExtend(7),
+        vec![Arc::new(ChcExpr::BitVec(u128::MAX, 129))],
+    );
+
+    assert_eq!(
+        sign_extend.simplify_constants(),
+        ChcExpr::BitVec(u128::MAX, 136)
+    );
+}

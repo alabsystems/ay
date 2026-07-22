@@ -288,13 +288,13 @@ impl Executor {
     ) -> Vec<TermId> {
         /// Recursion bound for datatype-valued field projection paths.
         const MAX_PROJ_DT_DEPTH: usize = 3;
-        /// Cap on emitted axioms (fresh arrays × observed indices). Env-tunable
-        /// (#dt-array-fc-lazy): a huge datatype-array instance (many arrays ×
-        /// reads) can exceed the default and leave datatype-VALUE select
-        /// congruence uncovered, so the base solve returns a congruence-violating
-        /// model the census then rejects. Raising the cap covers more pairs
-        /// eagerly (O(reads) via fresh scalar arrays) so the base model is
-        /// congruent. Sound at any value: these are select-congruence tautologies.
+        // Cap on emitted axioms (fresh arrays × observed indices). Env-tunable
+        // (#dt-array-fc-lazy): a huge datatype-array instance (many arrays ×
+        // reads) can exceed the default and leave datatype-VALUE select
+        // congruence uncovered, so the base solve returns a congruence-violating
+        // model the census then rejects. Raising the cap covers more pairs
+        // eagerly (O(reads) via fresh scalar arrays) so the base model is
+        // congruent. Sound at any value: these are select-congruence tautologies.
         let max_proj_axioms: usize = std::env::var("AY_PROJ_AXIOM_BUDGET")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())

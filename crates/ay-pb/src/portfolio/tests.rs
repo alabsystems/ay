@@ -5,6 +5,7 @@ use super::*;
 use crate::cdcl::objective_lower_bound_from_constraints;
 use crate::parse_opb;
 use crate::types::{PbConstraint, PbLit, PbRel, PbTerm};
+use ay_test_support::env::{lock_env, ScopedEnvVar};
 use std::path::PathBuf;
 
 // Small synthetic OPB used to exercise the general incumbent/solution
@@ -2481,7 +2482,7 @@ fn test_optimization_worker_specs_route_primal_workers_verdict_incapable() {
 fn test_optimization_worker_specs_wbo_route_appends_wbo_sls_arm() {
     // Serialize with the env-flag test so a mid-test AY_PB_WBO_SLS override
     // cannot flip the default-on worker gate under this test's feet.
-    let _guard = WBO_SLS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_env();
     let instance = worker_split_instance();
     let profile = InstanceProfile::from_instance(&instance);
     let specs = optimization_worker_specs(&profile, OptimizationPortfolioRoute::WboReduced);
@@ -2531,7 +2532,7 @@ fn test_optimization_worker_specs_wbo_route_appends_wbo_sls_arm() {
 /// reductions with zero incumbent-capable workers.
 #[test]
 fn test_optimization_worker_specs_wbo_route_budget_8_includes_wbo_sls_arm() {
-    let _guard = WBO_SLS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_env();
     let instance = worker_split_instance();
     let profile = InstanceProfile::from_instance(&instance);
     let specs = optimization_worker_specs(&profile, OptimizationPortfolioRoute::WboReduced);
@@ -3352,7 +3353,11 @@ fn test_backfill_respects_memory_pressure_deadline_and_budget() {
     backfill.try_backfill(
         &mut controls,
         &outer_term,
-        Some(Instant::now() - Duration::from_millis(1)),
+        Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("the monotonic clock has advanced by at least one millisecond"),
+        ),
     );
     assert_eq!(controls.spawned(), 1, "no backfill after the hard deadline");
     assert!(
@@ -5387,9 +5392,8 @@ fn nonlinear_objective_optimum_downgraded_to_satisfiable() {
 
 // ---- AY_PB_LNS2 (stronger LNS) soundness gate --------------------------
 //
-// Process-global env-var toggling must be serialized so concurrent tests do
-// not race on `AY_PB_LNS2`.
-static LNS2_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// Process-global env-var toggling is serialized on the one workspace-wide env
+// lock (`lock_env`) so concurrent tests do not race on `AY_PB_LNS2`.
 
 /// Exhaustive 0/1 optimum of a tiny linear instance.
 fn brute_force_optimum_small(instance: &PbInstance, objective: &PbObjective) -> Option<i128> {
@@ -5431,8 +5435,8 @@ fn vc_opb(num_vertices: u32, edges: &[(u32, u32)]) -> (PbInstance, PbObjective) 
 /// `bnb_matches_bruteforce_optimum`, but specifically with LNS2 enabled.
 #[test]
 fn lns2_portfolio_matches_bruteforce_optimum_and_reports_only_sound_incumbents() {
-    let _guard = LNS2_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("AY_PB_LNS2", "1");
+    let _guard = lock_env();
+    let _lns2 = ScopedEnvVar::set("AY_PB_LNS2", "1");
 
     let cases: Vec<(PbInstance, PbObjective)> = vec![
         vc_opb(6, &[(1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]),
@@ -5495,15 +5499,13 @@ fn lns2_portfolio_matches_bruteforce_optimum_and_reports_only_sound_incumbents()
             );
         }
     }
-
-    std::env::remove_var("AY_PB_LNS2");
 }
 
 /// Control: the SAME instances must declare the SAME OPTIMUM value with LNS2
 /// ON vs OFF — enabling the stronger LNS must never change a proven optimum.
 #[test]
 fn lns2_does_not_change_declared_optimum_vs_off() {
-    let _guard = LNS2_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_env();
 
     let cases: Vec<(PbInstance, PbObjective)> = vec![
         vc_opb(6, &[(1, 2), (2, 3), (3, 4), (4, 5), (5, 6)]),
@@ -5527,12 +5529,16 @@ fn lns2_does_not_change_declared_optimum_vs_off() {
         };
 
         // LNS2 now defaults ON; model the old default-off path explicitly
-        // with `AY_PB_LNS2=0` so this control still compares OFF vs ON.
-        std::env::set_var("AY_PB_LNS2", "0");
-        let off = solve_once();
-        std::env::set_var("AY_PB_LNS2", "1");
-        let on = solve_once();
-        std::env::remove_var("AY_PB_LNS2");
+        // with `AY_PB_LNS2=0` so this control still compares OFF vs ON. Each
+        // solve is scoped + restore-on-exit via the workspace env choke point.
+        let off = {
+            let _lns2 = ScopedEnvVar::set("AY_PB_LNS2", "0");
+            solve_once()
+        };
+        let on = {
+            let _lns2 = ScopedEnvVar::set("AY_PB_LNS2", "1");
+            solve_once()
+        };
 
         // Whatever OFF proved as OPTIMUM, ON must prove the same value (and it
         // must equal the brute-force optimum); ON must never claim a different
@@ -5559,46 +5565,47 @@ fn lns2_does_not_change_declared_optimum_vs_off() {
     }
 }
 
-// Process-global env-var toggling must be serialized so concurrent tests do
-// not observe a mid-test AY_PB_WBO_SLS value (see LNS2_ENV_LOCK).
-static WBO_SLS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// Process-global env-var toggling is serialized on the one workspace-wide env
+// lock (`lock_env`) so concurrent tests do not observe a mid-test
+// AY_PB_WBO_SLS value.
 
 #[test]
 fn wbo_sls_enabled_reads_env_flag() {
-    let _guard = WBO_SLS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("AY_PB_WBO_SLS");
+    let _guard = lock_env();
+    // Baseline unset for the whole body; each per-iteration guard below
+    // restores to this state. Restore-on-exit via the workspace env choke point.
+    let _wbo_baseline = ScopedEnvVar::unset("AY_PB_WBO_SLS");
     // Sequential tail fallback: opt-IN (default OFF). Parallel WBO-route
     // worker: batteries-included (default ON) — the SAME env var only serves
     // as an explicit override in either direction.
     assert!(!wbo_sls_enabled());
     assert!(wbo_sls_worker_enabled());
     for v in ["1", "true", "yes", "on", "ON", " On "] {
-        std::env::set_var("AY_PB_WBO_SLS", v);
+        let _wbo = ScopedEnvVar::set("AY_PB_WBO_SLS", v);
         assert!(wbo_sls_enabled(), "expected enabled for {v:?}");
         assert!(wbo_sls_worker_enabled(), "worker must stay on for {v:?}");
     }
     for v in ["0", "false", "no", "off", ""] {
-        std::env::set_var("AY_PB_WBO_SLS", v);
+        let _wbo = ScopedEnvVar::set("AY_PB_WBO_SLS", v);
         assert!(!wbo_sls_enabled(), "expected disabled for {v:?}");
     }
     for v in ["0", "false", "no", "off", " OFF ", ""] {
-        std::env::set_var("AY_PB_WBO_SLS", v);
+        let _wbo = ScopedEnvVar::set("AY_PB_WBO_SLS", v);
         assert!(
             !wbo_sls_worker_enabled(),
             "explicit off must disable the worker for {v:?}"
         );
     }
-    std::env::remove_var("AY_PB_WBO_SLS");
-    // ... and the WBO-route spec set follows the worker gate.
+    // ... and the WBO-route spec set follows the worker gate. (The baseline
+    // guard has restored the var to unset after the loops above.)
     let instance = worker_split_instance();
     let profile = InstanceProfile::from_instance(&instance);
-    std::env::set_var("AY_PB_WBO_SLS", "0");
+    let _wbo = ScopedEnvVar::set("AY_PB_WBO_SLS", "0");
     let disabled = optimization_worker_specs(&profile, OptimizationPortfolioRoute::WboReduced);
     assert!(
         disabled.iter().all(|spec| spec.label != "wbo-sls-opt"),
         "AY_PB_WBO_SLS=0 must remove the WBO-route worker"
     );
-    std::env::remove_var("AY_PB_WBO_SLS");
 }
 
 #[test]

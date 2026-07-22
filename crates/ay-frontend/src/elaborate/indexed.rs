@@ -5,10 +5,11 @@
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::DetHashMap as HashMap;
 
+use crate::command::Index as ParsedIndex;
 use crate::command::Sort as CmdSort;
 use crate::command::Term as ParsedTerm;
 use ay_core::{Sort, Symbol, TermId};
-use num_bigint::BigInt;
+use num_bigint::{BigInt, Sign};
 
 use super::{Context, ElaborateError, Result, SymbolInfo};
 
@@ -53,13 +54,18 @@ impl Context {
     pub(super) fn elaborate_indexed_app(
         &mut self,
         name: &str,
-        str_indices: &[String],
+        parsed_indices: &[ParsedIndex],
         args: &[ParsedTerm],
         env: &HashMap<String, TermId>,
     ) -> Result<TermId> {
         // SMT-LIB datatype tester: (_ is Constructor) → normalize to "is-Ctor"
         // and delegate to elaborate_app which handles function defs and symbol lookup.
-        if name == "is" && str_indices.len() == 1 {
+        if name == "is" {
+            let [ParsedIndex::Symbol(ctor_name)] = parsed_indices else {
+                return Err(ElaborateError::InvalidConstant(
+                    "datatype tester requires exactly one constructor-symbol index".to_string(),
+                ));
+            };
             // Sole-constructor fold: `((_ is C) x)` is DEFINITIONALLY `true` when C
             // is the unique constructor of x's datatype — every value of a
             // single-constructor type satisfies its only recognizer. Folding it
@@ -77,13 +83,13 @@ impl Context {
                 let is_sole_ctor = dt_name.as_deref().is_some_and(|dt| {
                     self.datatypes
                         .get(dt)
-                        .is_some_and(|ctors| ctors.len() == 1 && ctors[0] == str_indices[0])
+                        .is_some_and(|ctors| ctors.len() == 1 && ctors[0] == *ctor_name)
                 });
                 if is_sole_ctor {
                     return Ok(self.terms.true_term());
                 }
             }
-            let tester_name = format!("is-{}", str_indices[0]);
+            let tester_name = format!("is-{ctor_name}");
             return self.elaborate_app(&tester_name, args, env);
         }
 
@@ -92,7 +98,10 @@ impl Context {
             .map(|a| self.elaborate_term(a, env))
             .collect::<Result<Vec<_>>>()?;
 
-        let indices: Vec<u32> = str_indices.iter().filter_map(|s| s.parse().ok()).collect();
+        let indices: Vec<u32> = parsed_indices
+            .iter()
+            .filter_map(|index| index.as_numeral()?.parse().ok())
+            .collect();
 
         // Arms below that consume `indices` require every index to be a u32
         // numeral. Reject unparseable/overflowing indices up front so the user
@@ -102,10 +111,109 @@ impl Context {
         // fallback) or BigInt numerals (the PB/cardinality operators) are
         // deliberately excluded.
         if NUMERAL_INDEXED.contains(&name) {
-            if let Some(bad) = str_indices.iter().find(|s| s.parse::<u32>().is_err()) {
+            if let Some(bad) = parsed_indices.iter().find(|index| {
+                index
+                    .as_numeral()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .is_none()
+            }) {
                 return Err(ElaborateError::InvalidConstant(format!(
-                    "index '{bad}' of (_ {name} ...) must be a numeral fitting in u32"
+                    "index '{}' of (_ {name} ...) must be a numeral fitting in u32",
+                    bad.text()
                 )));
+            }
+        }
+
+        // Standalone indexed constants have no arguments. Keep this dispatch
+        // on the structured parse variant so their spelling cannot alias a
+        // legal quoted symbol such as `|(_ bv0 8)|`.
+        if arg_ids.is_empty() {
+            match name {
+                "+zero" | "-zero" | "+oo" | "-oo" | "NaN" => {
+                    if parsed_indices.len() != 2 {
+                        return Err(ElaborateError::InvalidConstant(format!(
+                            "FloatingPoint literal (_ {name} ...) requires exponent and significand widths"
+                        )));
+                    }
+                    let eb_text = parsed_indices[0].as_numeral().ok_or_else(|| {
+                        ElaborateError::InvalidConstant(format!(
+                            "FloatingPoint exponent width `{}` must be a numeral",
+                            parsed_indices[0].text()
+                        ))
+                    })?;
+                    let eb = eb_text.parse::<u32>().map_err(|_| {
+                        ElaborateError::InvalidConstant(format!(
+                            "invalid FloatingPoint exponent width `{eb_text}`"
+                        ))
+                    })?;
+                    let sb_text = parsed_indices[1].as_numeral().ok_or_else(|| {
+                        ElaborateError::InvalidConstant(format!(
+                            "FloatingPoint significand width `{}` must be a numeral",
+                            parsed_indices[1].text()
+                        ))
+                    })?;
+                    let sb = sb_text.parse::<u32>().map_err(|_| {
+                        ElaborateError::InvalidConstant(format!(
+                            "invalid FloatingPoint significand width `{sb_text}`"
+                        ))
+                    })?;
+                    let fp_sort = Self::checked_floating_point_sort(eb, sb)?;
+                    return Ok(self.terms.mk_app(
+                        Symbol::indexed(name, vec![eb, sb]),
+                        vec![],
+                        fp_sort,
+                    ));
+                }
+                _ => {}
+            }
+
+            if let Some(value_text) = name.strip_prefix("bv") {
+                if value_text.is_empty()
+                    || !value_text.chars().all(|c| c.is_ascii_digit())
+                    || parsed_indices.len() != 1
+                {
+                    return Err(ElaborateError::InvalidConstant(format!(
+                        "malformed bitvector numeral: (_ {name} {})",
+                        parsed_indices
+                            .iter()
+                            .map(ParsedIndex::text)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    )));
+                }
+                let value = value_text
+                    .parse::<BigInt>()
+                    .map_err(|_| ElaborateError::InvalidConstant(name.to_string()))?;
+                let width = parsed_indices[0]
+                    .as_numeral()
+                    .and_then(|width| width.parse::<u32>().ok())
+                    .ok_or_else(|| ElaborateError::InvalidConstant(name.to_string()))?;
+                Self::checked_bitvector_sort(width)?;
+                return Ok(self.terms.mk_bitvec(value, width));
+            }
+
+            if name == "Char" || name == "char" {
+                if parsed_indices.len() != 1 {
+                    return Err(ElaborateError::InvalidConstant(format!(
+                        "character literal requires exactly one index, got {}",
+                        parsed_indices.len()
+                    )));
+                }
+                let raw = parsed_indices[0].text();
+                let code = match &parsed_indices[0] {
+                    ParsedIndex::Numeral(decimal) => decimal.parse::<BigInt>().ok(),
+                    ParsedIndex::Hexadecimal(hexadecimal) => hexadecimal
+                        .strip_prefix("#x")
+                        .and_then(|hex| BigInt::parse_bytes(hex.as_bytes(), 16)),
+                    _ => None,
+                }
+                .ok_or_else(|| ElaborateError::InvalidConstant(format!("(_ {name} {raw})")))?;
+                if code.sign() == Sign::Minus || code > BigInt::from(0x2_FFFFu32) {
+                    return Err(ElaborateError::InvalidConstant(format!(
+                        "character code point `{raw}` is outside 0..=196607"
+                    )));
+                }
+                return Ok(self.terms.mk_int(code));
             }
         }
 
@@ -124,12 +232,16 @@ impl Context {
             // never a wrong reconstruction. Verified EXACT vs z3. (was: hard
             // "unknown indexed identifier" error → unknown.)
             "update-field" => {
-                if str_indices.len() != 1 || arg_ids.len() != 2 {
+                if parsed_indices.len() != 1 || arg_ids.len() != 2 {
                     return Err(ElaborateError::Unsupported(
                         "update-field requires 1 selector index and 2 arguments".to_string(),
                     ));
                 }
-                let sel = str_indices[0].as_str();
+                let sel = parsed_indices[0].as_symbol().ok_or_else(|| {
+                    ElaborateError::Unsupported(
+                        "update-field selector index must be a symbol".to_string(),
+                    )
+                })?;
                 let (record, value) = (arg_ids[0], arg_ids[1]);
                 let record_sort = self.terms.sort(record).clone();
                 let dt_name = match &record_sort {
@@ -219,12 +331,27 @@ impl Context {
             // The "index" is the function name f (a symbol, not a numeral).
             // Z3 ref: array_decl_plugin.cpp:458-463, OP_ARRAY_MAP
             "map" => {
-                if str_indices.len() != 1 {
+                if parsed_indices.len() != 1 {
                     return Err(ElaborateError::InvalidConstant(
                         "map requires exactly 1 index (the function name)".to_string(),
                     ));
                 }
-                let func_name = &str_indices[0];
+                let func_name = parsed_indices[0].as_symbol().ok_or_else(|| {
+                    ElaborateError::InvalidConstant(
+                        "map index must be a function symbol".to_string(),
+                    )
+                })?;
+
+                // `define-fun` is represented as an elaboration-time macro.
+                // Encoding it here as an array-map function symbol would lose
+                // its body and turn a fixed interpretation into a free UF.
+                // Higher-order macro expansion is not represented, so fail
+                // closed instead of changing the formula's semantics.
+                if self.fun_defs.contains_key(func_name) {
+                    return Err(ElaborateError::Unsupported(format!(
+                        "array map over defined function '{func_name}' is unsupported"
+                    )));
+                }
 
                 if arg_ids.is_empty() {
                     return Err(ElaborateError::InvalidConstant(
@@ -232,24 +359,9 @@ impl Context {
                     ));
                 }
 
-                // Look up the function in the symbol table to get its signature
-                let func_info = self.symbols.get(func_name).cloned().ok_or_else(|| {
-                    ElaborateError::UndefinedSymbol(format!(
-                        "function '{func_name}' used in (_ map {func_name}) is not declared"
-                    ))
-                })?;
-
-                // Validate: function arity must match number of array arguments
-                if !func_info.arg_sorts.is_empty() && func_info.arg_sorts.len() != arg_ids.len() {
-                    return Err(ElaborateError::InvalidConstant(format!(
-                        "map[{func_name}] expects {} array arguments (matching function arity), got {}",
-                        func_info.arg_sorts.len(),
-                        arg_ids.len()
-                    )));
-                }
-
                 // Validate: all arguments must be arrays
                 let mut index_sort: Option<Sort> = None;
+                let mut element_sorts = Vec::with_capacity(arg_ids.len());
                 for (i, &arg) in arg_ids.iter().enumerate() {
                     let arg_sort = self.terms.sort(arg).clone();
                     match &arg_sort {
@@ -265,16 +377,7 @@ impl Context {
                             } else {
                                 index_sort = Some(arr.index_sort.clone());
                             }
-
-                            // Validate element sort matches function argument sort
-                            if !func_info.arg_sorts.is_empty()
-                                && arr.element_sort != func_info.arg_sorts[i]
-                            {
-                                return Err(ElaborateError::SortMismatch {
-                                    expected: func_info.arg_sorts[i].to_string(),
-                                    actual: arr.element_sort.to_string(),
-                                });
-                            }
+                            element_sorts.push(arr.element_sort.clone());
                         }
                         _ => {
                             return Err(ElaborateError::InvalidConstant(format!(
@@ -284,10 +387,24 @@ impl Context {
                     }
                 }
 
+                let func_info = self
+                    .resolve_declared_symbol_for_domain(func_name, &element_sorts)?
+                    .ok_or_else(|| {
+                        ElaborateError::InvalidConstant(format!(
+                            "function '{func_name}' has no declaration matching array-map domain ({})",
+                            element_sorts
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ))
+                    })?;
+
                 let idx_sort = index_sort.expect("at least one array arg validated above");
                 let result_sort = Sort::array(idx_sort, func_info.sort);
+                let internal_name = func_info.internal_name.as_deref().unwrap_or(func_name);
 
-                Ok(self.terms.mk_array_map(func_name, arg_ids, result_sort))
+                Ok(self.terms.mk_array_map(internal_name, arg_ids, result_sort))
             }
             // as-array: (_ as-array f)
             // Converts a declared function to an array value.
@@ -295,7 +412,7 @@ impl Context {
             // select(as-array(f), i) = f(i)
             // Z3 ref: array_decl_plugin.cpp:531 (OP_AS_ARRAY)
             "as-array" => {
-                if str_indices.len() != 1 {
+                if parsed_indices.len() != 1 {
                     return Err(ElaborateError::InvalidConstant(
                         "as-array requires exactly 1 index (the function name)".to_string(),
                     ));
@@ -305,29 +422,34 @@ impl Context {
                         "as-array takes no arguments".to_string(),
                     ));
                 }
-                let func_name = &str_indices[0];
-
-                // Look up the function in the symbol table to determine the array sort
-                let func_info = self.symbols.get(func_name).cloned().ok_or_else(|| {
-                    ElaborateError::UndefinedSymbol(format!(
-                        "function '{func_name}' used in (_ as-array {func_name}) is not declared"
-                    ))
+                let func_name = parsed_indices[0].as_symbol().ok_or_else(|| {
+                    ElaborateError::InvalidConstant(
+                        "as-array index must be a function symbol".to_string(),
+                    )
                 })?;
 
-                // Function must have exactly 1 argument (index sort) to form an array
-                if func_info.arg_sorts.len() != 1 {
-                    return Err(ElaborateError::InvalidConstant(format!(
-                        "as-array requires a unary function, '{}' has {} arguments",
-                        func_name,
-                        func_info.arg_sorts.len()
+                // See the corresponding array-map gate above: an as-array of a
+                // macro cannot be represented as a free function symbol.
+                if self.fun_defs.contains_key(func_name) {
+                    return Err(ElaborateError::Unsupported(format!(
+                        "as-array over defined function '{func_name}' is unsupported"
                     )));
                 }
+
+                let func_info = self
+                    .resolve_declared_symbol_with_arity(func_name, 1)?
+                    .ok_or_else(|| {
+                        ElaborateError::UndefinedSymbol(format!(
+                            "function '{func_name}' used in (_ as-array {func_name}) has no unary declaration"
+                        ))
+                    })?;
 
                 let index_sort = func_info.arg_sorts[0].clone();
                 let element_sort = func_info.sort;
                 let array_sort = Sort::array(index_sort, element_sort);
+                let internal_name = func_info.internal_name.as_deref().unwrap_or(func_name);
 
-                Ok(self.terms.mk_as_array(func_name, array_sort))
+                Ok(self.terms.mk_as_array(internal_name, array_sort))
             }
             "extract" => {
                 if indices.len() != 2 || arg_ids.len() != 1 {
@@ -398,6 +520,13 @@ impl Context {
                         "re.loop requires 2 indices and 1 argument".to_string(),
                     ));
                 }
+                if indices[0] > indices[1] {
+                    return Err(ElaborateError::InvalidConstant(format!(
+                        "re.loop lower bound {} exceeds upper bound {}",
+                        indices[0], indices[1]
+                    )));
+                }
+                self.expect_arg_sort(arg_ids[0], &Sort::RegLan)?;
                 Ok(self.terms.mk_app(
                     Symbol::indexed("re.loop", indices),
                     vec![arg_ids[0]],
@@ -410,6 +539,7 @@ impl Context {
                         "re.^ requires 1 index and 1 argument".to_string(),
                     ));
                 }
+                self.expect_arg_sort(arg_ids[0], &Sort::RegLan)?;
                 let n = indices[0];
                 Ok(self.terms.mk_app(
                     Symbol::indexed("re.loop", vec![n, n]),
@@ -445,7 +575,7 @@ impl Context {
             // constructed parse tree reuses the audited `mod`/`=` elaboration and
             // keeps this purely definitional (no soundness surface of its own).
             "divisible" => {
-                if str_indices.len() != 1 || indices.len() != 1 {
+                if parsed_indices.len() != 1 || indices.len() != 1 {
                     return Err(ElaborateError::InvalidConstant(
                         "divisible requires exactly 1 numeral index (the divisor)".to_string(),
                     ));
@@ -462,7 +592,7 @@ impl Context {
                     PTerm::App("=".to_string(), vec![args[0].clone(), zero])
                 } else {
                     // (_ divisible n) t  ===  (= (mod t n) 0)
-                    let n = PTerm::Const(PConst::Numeral(str_indices[0].clone()));
+                    let n = PTerm::Const(PConst::Numeral(parsed_indices[0].text().to_string()));
                     let modt = PTerm::App("mod".to_string(), vec![args[0].clone(), n]);
                     PTerm::App("=".to_string(), vec![modt, zero])
                 };
@@ -476,12 +606,12 @@ impl Context {
             // the audited LIA path (equisatisfiable, purely definitional).
             // Z3 ref: pb_decl_plugin.cpp (OP_AT_MOST_K / OP_AT_LEAST_K).
             "at-most" | "at-least" => {
-                if str_indices.len() != 1 {
+                if parsed_indices.len() != 1 {
                     return Err(ElaborateError::InvalidConstant(format!(
                         "{name} requires exactly 1 index (the bound k)"
                     )));
                 }
-                let k = parse_pb_numeral(&str_indices[0], name)?;
+                let k = parse_pb_index(&parsed_indices[0], name)?;
                 let coeffs = vec![BigInt::from(1); arg_ids.len()];
                 let cmp = if name == "at-most" {
                     PbCmp::Le
@@ -499,19 +629,20 @@ impl Context {
             // pb_decl_plugin.cpp (OP_PB_LE / OP_PB_GE / OP_PB_EQ).
             "pble" | "pbge" | "pbeq" => {
                 // One threshold index + one coefficient per Bool argument.
-                if str_indices.len() != arg_ids.len() + 1 {
+                if parsed_indices.len() != arg_ids.len() + 1 {
                     return Err(ElaborateError::InvalidConstant(format!(
                         "{name} requires {} indices (threshold k followed by one \
-                         coefficient per argument), got {}",
+                        coefficient per argument), got {}",
                         arg_ids.len() + 1,
-                        str_indices.len()
+                        parsed_indices.len()
                     )));
                 }
-                let k = parse_pb_numeral(&str_indices[0], name)?;
-                let coeffs = str_indices[1..]
+                let parsed_integers = parsed_indices
                     .iter()
-                    .map(|s| parse_pb_numeral(s, name))
+                    .map(|index| parse_pb_index(index, name))
                     .collect::<Result<Vec<_>>>()?;
+                let k = parsed_integers[0].clone();
+                let coeffs = parsed_integers[1..].to_vec();
                 let cmp = match name {
                     "pble" => PbCmp::Le,
                     "pbge" => PbCmp::Ge,
@@ -532,21 +663,18 @@ impl Context {
             // semantics mirror ay's own libz3-4.16.0-verified FFI constructors
             // (`Z3_mk_partial_order` &c., `build_order_axioms` in ay-ffi).
             "partial-order" | "linear-order" | "tree-order" | "piecewise-linear-order" => {
-                self.elaborate_special_order(name, str_indices, &arg_ids)
+                self.elaborate_special_order(name, parsed_indices, &arg_ids)
             }
             _ => {
-                // Unknown indexed identifier — reconstruct stringified name
-                // for symbol table lookup (legacy path).
-                let stringified = format!("(_ {} {})", name, str_indices.join(" "));
-                let sym = Symbol::indexed(name, indices);
-                let result_sort = if let Some(info) = self.symbols.get(&stringified) {
-                    info.sort.clone()
-                } else {
-                    return Err(ElaborateError::Unsupported(format!(
-                        "unknown indexed identifier: {name}"
-                    )));
-                };
-                Ok(self.terms.mk_app(sym, arg_ids, result_sort))
+                // There is no sound generic declaration model for an indexed
+                // identifier here. The legacy fallback looked up the string
+                // spelling only for a result sort, silently dropped nonnumeric
+                // indices, ignored arity/domain/internal identity, and then
+                // built a different `Symbol::Indexed`. A quoted symbol whose
+                // text resembles `(_ f i)` is not that indexed identifier.
+                Err(ElaborateError::Unsupported(format!(
+                    "unknown indexed identifier: {name}"
+                )))
             }
         }
     }
@@ -561,19 +689,24 @@ impl Context {
     fn elaborate_special_order(
         &mut self,
         kind: &str,
-        str_indices: &[String],
+        parsed_indices: &[ParsedIndex],
         arg_ids: &[TermId],
     ) -> Result<TermId> {
-        if str_indices.len() != 1 {
+        if parsed_indices.len() != 1 {
             return Err(ElaborateError::InvalidConstant(format!(
                 "(_ {kind} ..) requires exactly 1 index (the relation id), got {}",
-                str_indices.len()
+                parsed_indices.len()
             )));
         }
+        let relation_id = parsed_indices[0].as_numeral().ok_or_else(|| {
+            ElaborateError::InvalidConstant(format!(
+                "(_ {kind} ..) relation id must be a numeral token"
+            ))
+        })?;
         if arg_ids.len() != 2 {
             return Err(ElaborateError::InvalidConstant(format!(
                 "(_ {kind} {}) is a binary relation and requires exactly 2 arguments, got {}",
-                str_indices[0],
+                relation_id,
                 arg_ids.len()
             )));
         }
@@ -581,11 +714,10 @@ impl Context {
         let sort_rhs = self.terms.sort(arg_ids[1]).clone();
         if sort != sort_rhs {
             return Err(ElaborateError::InvalidConstant(format!(
-                "(_ {kind} {}) arguments must share a sort, got {sort} and {sort_rhs}",
-                str_indices[0]
+                "(_ {kind} {relation_id}) arguments must share a sort, got {sort} and {sort_rhs}"
             )));
         }
-        let pred = self.special_order_predicate(kind, &sort, &str_indices[0])?;
+        let pred = self.special_order_predicate(kind, &sort, relation_id)?;
         Ok(self
             .terms
             .mk_app(Symbol::named(&pred), [arg_ids[0], arg_ids[1]], Sort::Bool))
@@ -611,6 +743,7 @@ impl Context {
         // `__ay_`-prefixed symbol by table lookup; only *declaring* such a name
         // from user input is rejected, so using one here is safe.
         let pred = self.terms.mk_internal_symbol("order");
+        self.track_scoped_symbol(&pred);
         self.symbols.insert(
             pred.clone(),
             SymbolInfo {
@@ -620,7 +753,6 @@ impl Context {
                 internal_name: None,
             },
         );
-        self.track_scoped_symbol(pred.clone());
         // Assert the property axioms through the surface path so `assertions` and
         // `assertions_parsed` stay aligned and the axioms are push/pop-scoped
         // exactly like the predicate symbol.
@@ -671,13 +803,30 @@ impl Context {
     }
 }
 
-/// Parse a pseudo-boolean threshold/coefficient index as a non-negative integer.
+/// Parse a pseudo-boolean threshold/coefficient index as an integer.
 ///
-/// SMT-LIB numeral indices are non-negative; anything else (e.g. a symbol index
-/// mistakenly routed here) is a malformed PB term.
-fn parse_pb_numeral(s: &str, op: &str) -> Result<BigInt> {
-    s.parse::<BigInt>().map_err(|_| {
-        ElaborateError::InvalidConstant(format!("{op}: expected a numeral index, got '{s}'"))
+/// Z3's PB extension mirrors its C API's signed `int` coefficients and bound,
+/// so a negative decimal is lexed as a symbol token. Positive values must be
+/// numeral tokens: a quoted symbol such as `|8|` is not a numeric index.
+fn parse_pb_index(index: &ParsedIndex, op: &str) -> Result<BigInt> {
+    let text = match index {
+        ParsedIndex::Numeral(text) => text.as_str(),
+        ParsedIndex::Symbol(text)
+            if text.strip_prefix('-').is_some_and(|magnitude| {
+                !magnitude.is_empty() && magnitude.bytes().all(|byte| byte.is_ascii_digit())
+            }) =>
+        {
+            text.as_str()
+        }
+        _ => {
+            return Err(ElaborateError::InvalidConstant(format!(
+                "{op}: expected an integer index, got '{}'",
+                index.text()
+            )));
+        }
+    };
+    text.parse::<BigInt>().map_err(|_| {
+        ElaborateError::InvalidConstant(format!("{op}: invalid integer index '{text}'"))
     })
 }
 

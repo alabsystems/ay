@@ -74,6 +74,63 @@ fn case_split_infeasibility_emits_verifying_tree_certificate() {
     );
 }
 
+#[test]
+fn live_binary_hint_breaks_the_root_score_tie_only() {
+    let mut m = Model::new();
+    let x0 = m.add_binary_col();
+    let x1 = m.add_binary_col();
+    let x2 = m.add_binary_col();
+    let y0 = m.add_binary_col();
+    let y1 = m.add_binary_col();
+    let y2 = m.add_binary_col();
+    let fixed = m.add_binary_col();
+    let continuous = m.add_col(0.0, 0.0);
+    let general_integer = m.add_int_col(0.0, 0.0);
+    m.fix_col(fixed, 0.0);
+    // Two independent three-binary half-integral equations leave two
+    // fractional candidates in the root LP without triggering the simple
+    // two-column parity presolve. Each equation is integer-infeasible, so the
+    // whole model still closes only through case splits.
+    m.add_row(1.5, 1.5, &[(x0, 1.0), (x1, 1.0), (x2, 1.0)]);
+    m.add_row(1.5, 1.5, &[(y0, 1.0), (y1, 1.0), (y2, 1.0)]);
+    let mut foreign = Model::new();
+    let mut stale = foreign.add_binary_col();
+    for _ in 0..m.num_cols() {
+        stale = foreign.add_binary_col();
+    }
+
+    let mut session = BabSession::new(m.clone(), &SolveOpts::new()).unwrap();
+    // Every entry before `x1` is ineligible: stale, continuous, general
+    // integer, or fixed. The two independent fractional candidates have equal
+    // scores, so the first live preference among them must own the root split.
+    session.hint_branch_order(&[
+        stale,
+        general_integer,
+        continuous,
+        fixed,
+        x1,
+        y1,
+        y0,
+        y2,
+        x0,
+        x2,
+        x1,
+    ]);
+    match session.check().unwrap() {
+        Outcome::Infeasible {
+            tree_cert: Some(cert),
+            ..
+        } => {
+            cert.verify(&m).unwrap();
+            let TreeNode::Split { col, .. } = cert.root else {
+                panic!("case-split-only model must have a split root");
+            };
+            assert_eq!(col, x1, "the first eligible equal-score hint must win");
+        }
+        other => panic!("expected certified Infeasible, got {other:?}"),
+    }
+}
+
 /// The certificate is evidence about ONE model: against a feasible variant
 /// (rhs 3/2 -> 1) it must refute. This is the live soundness probe — a tree
 /// certificate that verified here would prove a feasible model infeasible.

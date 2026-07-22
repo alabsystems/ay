@@ -1556,13 +1556,7 @@ fn sp_binary(op: &str, a: u128, b: u128, w: u32) -> u128 {
                 sp_from_signed(sa >> b, w)
             }
         }
-        "bvudiv" => {
-            if b == 0 {
-                m
-            } else {
-                a / b
-            }
-        }
+        "bvudiv" => a.checked_div(b).unwrap_or(m),
         "bvurem" => {
             if b == 0 {
                 a
@@ -1796,7 +1790,8 @@ fn bv_checker_self_proves_width_changing_ops() {
     }
 
     // Unary indexed ops: each maps input `a` to a width-`leaf_w` result (all <= 4).
-    let unary_indexed: [(&str, Vec<u32>, u32, Box<dyn Fn(u128) -> u128>); 7] = [
+    type UnaryIndexedOp = (&'static str, Vec<u32>, u32, Box<dyn Fn(u128) -> u128>);
+    let unary_indexed: [UnaryIndexedOp; 7] = [
         ("zero_extend", vec![2], w + 2, Box::new(move |a| a)),
         (
             "sign_extend",

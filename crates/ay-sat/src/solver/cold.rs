@@ -1129,6 +1129,16 @@ pub(crate) struct ColdState {
     /// the time budget (e.g., Circuit_multiplier22: XOR detection + gate
     /// extraction + BVE stalls for 30s while CaDiCaL solves in 19s).
     pub(super) preprocess_deadline: Option<ay_core::time::Instant>,
+    /// Hard wall-clock deadline for the WHOLE solve call
+    /// (#array-deadline-forward). Unlike `preprocess_deadline` (scoped to
+    /// `preprocess()`), this covers the phases that the caller's
+    /// `should_stop` closure cannot reach: incremental inprocessing and the
+    /// level-0 garbage collection sweep, whose per-clause watch-removal loop
+    /// was measured running 12+s past the caller's wall budget on a grown
+    /// clause DB (QF_AX subset re-solves), and the non-interruptible
+    /// `solve_with_assumptions` entry. Polled amortized — never per BCP
+    /// step. Fail-closed: an expired deadline can only produce Unknown.
+    pub(super) solve_deadline: Option<ay_core::time::Instant>,
     /// When `Some(offset)`, watches from the previous solve are still valid
     /// for all clauses below `offset` in the arena. Only clauses at or after
     /// `offset` need watch attachment. Set by `reset_search_state()` case (b)
@@ -1924,6 +1934,7 @@ impl ColdState {
             preprocess_enabled: true,
             preprocess_watches_valid: false,
             preprocess_deadline: None,
+            solve_deadline: None,
             incremental_watch_boundary: None,
             symmetry_enabled: false, // #8190: CaDiCaL has no symmetry detection; adaptive re-enables for small structured formulas
             symmetry_stats: crate::symmetry::SymmetryStats::default(),

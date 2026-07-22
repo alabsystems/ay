@@ -478,6 +478,23 @@ pub(crate) struct TheoryExtension<'a, T: TheorySolver> {
     /// memo — drives the warmup-then-sample policy (#12-restore mirror for
     /// arrays; see the Array arm in `propagate_impl`).
     pub(super) verify_array_sem_counter: u64,
+    /// #verify-memo (`AY_VERIFY_MEMO=1`, default off = byte-identical):
+    /// memoized ACCEPT verdicts for the remaining sampled semantic
+    /// propagation-verification arms — the cached mixed-domain Nelson-Oppen
+    /// verifier (Unknown domain) and the fresh-solver dispatch
+    /// (Arithmetic/BitVec/String). Same key discipline as
+    /// `verify_array_memo`: (sorted reason literals, propagated literal) as
+    /// (term id, value) pairs — the canonical signature of the exact
+    /// verified obligation `reason ∧ ¬propagated`. Trust-TRUE-only (the
+    /// `verify_conflict_semantic_memo` discipline): a hit replays a verdict
+    /// recorded from a FULL verification of the byte-identical obligation;
+    /// rejections are never memoized, so every failure re-runs the complete
+    /// fail-closed check. Executor-owned (wired like `verify_memo` above) so
+    /// verdicts survive per-iteration extension rebuilds — an extension-owned
+    /// memo measured only a 31% hit rate on hash_sat_08_04 because CDCL
+    /// re-derives the same propagations across split-loop iterations.
+    /// Probed/populated only when the env flag is armed; inert otherwise.
+    pub(super) verify_prop_memo: Option<&'a mut crate::verification::PropSemanticVerifyMemo>,
     /// Wall-clock deadline for the whole DPLL(T) solve, forwarded from the
     /// `DpllT`/`Executor` `solve_deadline` at construction (see
     /// [`TheoryExtension::with_solve_deadline`]).

@@ -243,8 +243,28 @@ impl Solver {
         }
 
         if self.proof_manager.is_some() || self.cold.forward_checker.is_some() {
+            let mut prior_visible_empty_lrat_id = None;
             if let Some(ref mut manager) = self.proof_manager {
-                manager.clear_last_add();
+                // A successfully emitted empty clause is already the terminal
+                // addition for this solve. Preserve that record so the
+                // always-on LRAT structural check below can authenticate it.
+                // If a later incremental proof addition followed an earlier
+                // still-valid empty clause, re-emit an empty clause below so
+                // this solve also ends at a checker-visible contradiction. In
+                // LRAT mode the earlier empty clause itself is the strongest
+                // possible one-step hint when it remains live.
+                let terminal_empty =
+                    self.cold.empty_clause_in_proof && manager.has_file_visible_terminal_empty();
+                if !terminal_empty {
+                    if self.cold.empty_clause_in_proof && manager.is_lrat() {
+                        prior_visible_empty_lrat_id = self
+                            .cold
+                            .empty_clause_lrat_id
+                            .filter(|&id| manager.lrat_id_visible_in_file(id));
+                    }
+                    manager.clear_last_add();
+                    self.cold.empty_clause_in_proof = false;
+                }
             }
             // Write empty clause to indicate final derivation of contradiction,
             // unless mark_empty_clause already wrote it (#4123).
@@ -254,8 +274,12 @@ impl Solver {
                 // checkers reject the empty clause derivation.
                 #[allow(unused_mut)] // mut needed in debug builds for assumption hint prepend
                 let mut hints = if self.cold.lrat_enabled {
-                    self.ensure_level0_unit_proof_ids();
-                    self.build_finalize_empty_clause_hints()
+                    if let Some(empty_id) = prior_visible_empty_lrat_id {
+                        vec![empty_id]
+                    } else {
+                        self.ensure_level0_unit_proof_ids();
+                        self.build_finalize_empty_clause_hints()
+                    }
                 } else {
                     Vec::new()
                 };
@@ -803,30 +827,8 @@ impl Solver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ay_test_support::env::ScopedEnvVar;
     use serde_json::json;
-
-    struct EnvGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvGuard {
-        fn capture(key: &'static str) -> Self {
-            let previous = std::env::var_os(key);
-            std::env::remove_var(key);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = self.previous.take() {
-                std::env::set_var(self.key, previous);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
 
     fn fmla_authority_replay_payload(
         dir: &std::path::Path,
@@ -878,9 +880,6 @@ mod tests {
         let _lock = crate::fmla_runtime_ledger::FMLA_LEARNED_LRAT_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _replay_guard =
-            EnvGuard::capture(FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV);
-        let _proof_guard = EnvGuard::capture(FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV);
         let dir = tempfile::tempdir().expect("tempdir");
         let proof_out_path = dir.path().join("proof.out");
         let proof_out = b"c checked proof\n9 1 0 1 0\n0 9 0\n";
@@ -893,13 +892,13 @@ mod tests {
             fmla_authority_replay_payload(dir.path(), &proof_out_path, proof_out, 2).to_string(),
         )
         .expect("write replay");
-        std::env::set_var(
+        let _replay_env = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV,
-            &replay_path,
+            replay_path.to_str().expect("replay path utf8"),
         );
-        std::env::set_var(
+        let _proof_out_env = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV,
-            &proof_out_path,
+            proof_out_path.to_str().expect("proof out path utf8"),
         );
 
         assert!(Solver::fmla_learned_lrat_main_proof_authority_replay_admits());
@@ -910,9 +909,6 @@ mod tests {
         let _lock = crate::fmla_runtime_ledger::FMLA_LEARNED_LRAT_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _replay_guard =
-            EnvGuard::capture(FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV);
-        let _proof_guard = EnvGuard::capture(FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV);
         let dir = tempfile::tempdir().expect("tempdir");
         let proof_out_path = dir.path().join("proof.out");
         let proof_out = b"c checked proof\n9 1 0 1 0\n0 9 0\n";
@@ -926,13 +922,13 @@ mod tests {
         )
         .expect("write replay");
         std::fs::write(&proof_out_path, b"c stale proof\n").expect("rewrite proof.out");
-        std::env::set_var(
+        let _replay_env = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV,
-            &replay_path,
+            replay_path.to_str().expect("replay path utf8"),
         );
-        std::env::set_var(
+        let _proof_out_env = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV,
-            &proof_out_path,
+            proof_out_path.to_str().expect("proof out path utf8"),
         );
 
         assert!(!Solver::fmla_learned_lrat_main_proof_authority_replay_admits());
@@ -943,9 +939,6 @@ mod tests {
         let _lock = crate::fmla_runtime_ledger::FMLA_LEARNED_LRAT_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _replay_guard =
-            EnvGuard::capture(FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV);
-        let _proof_guard = EnvGuard::capture(FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV);
         let dir = tempfile::tempdir().expect("tempdir");
         let proof_out_path = dir.path().join("proof.out");
         let proof_out = b"c checked proof\n";
@@ -958,13 +951,13 @@ mod tests {
             fmla_authority_replay_payload(dir.path(), &proof_out_path, proof_out, 0).to_string(),
         )
         .expect("write replay");
-        std::env::set_var(
+        let _replay_env = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV,
-            &replay_path,
+            replay_path.to_str().expect("replay path utf8"),
         );
-        std::env::set_var(
+        let _proof_out_env = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV,
-            &proof_out_path,
+            proof_out_path.to_str().expect("proof out path utf8"),
         );
 
         assert!(!Solver::fmla_learned_lrat_main_proof_authority_replay_admits());
@@ -975,9 +968,6 @@ mod tests {
         let _lock = crate::fmla_runtime_ledger::FMLA_LEARNED_LRAT_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _replay_guard =
-            EnvGuard::capture(FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV);
-        let _proof_guard = EnvGuard::capture(FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV);
         let dir = tempfile::tempdir().expect("tempdir");
         let proof_out_path = dir.path().join("proof.out");
         let proof_out = b"c checked proof\n9 1 0 1 0\n0 9 0\n";
@@ -995,13 +985,13 @@ mod tests {
                 .join("fmla-main-lrat-external-checker-verdict.json"),
         )
         .expect("remove retained checker verdict artifact");
-        std::env::set_var(
+        let _replay_env = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV,
-            &replay_path,
+            replay_path.to_str().expect("replay path utf8"),
         );
-        std::env::set_var(
+        let _proof_out_env = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV,
-            &proof_out_path,
+            proof_out_path.to_str().expect("proof out path utf8"),
         );
 
         assert!(!Solver::fmla_learned_lrat_main_proof_authority_replay_admits());
@@ -1012,9 +1002,6 @@ mod tests {
         let _lock = crate::fmla_runtime_ledger::FMLA_LEARNED_LRAT_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _replay_guard =
-            EnvGuard::capture(FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV);
-        let _proof_guard = EnvGuard::capture(FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV);
         let dir = tempfile::tempdir().expect("tempdir");
         let proof_out_path = dir.path().join("proof.out");
         let other_proof_out_path = dir.path().join("other-proof.out");
@@ -1029,13 +1016,15 @@ mod tests {
             fmla_authority_replay_payload(dir.path(), &proof_out_path, proof_out, 2).to_string(),
         )
         .expect("write replay");
-        std::env::set_var(
+        let _replay_env = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_MAIN_PROOF_AUTHORITY_REPLAY_PATH_ENV,
-            &replay_path,
+            replay_path.to_str().expect("replay path utf8"),
         );
-        std::env::set_var(
+        let _proof_out_env = ScopedEnvVar::set(
             FMLA_LEARNED_LRAT_CURRENT_PROOF_OUT_PATH_ENV,
-            &other_proof_out_path,
+            other_proof_out_path
+                .to_str()
+                .expect("other proof out path utf8"),
         );
 
         assert!(!Solver::fmla_learned_lrat_main_proof_authority_replay_admits());

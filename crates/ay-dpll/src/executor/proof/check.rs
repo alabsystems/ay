@@ -26,6 +26,50 @@ pub(super) const PROOF_CHECKER_CHECKED_STEPS_KEY: &str = "proof_checker_checked_
 #[cfg(feature = "proof-checker")]
 pub(super) const PROOF_CHECKER_TOTAL_STEPS_KEY: &str = "proof_checker_total_steps";
 
+/// Allocation-aware collector used by the runtime firewall diagnostic.
+///
+/// Each emitter still owns the one `String` it is currently constructing, but
+/// the collector never retains enough completed artifacts to cross either
+/// caller-supplied bound. This prevents repeated renderings of a large query
+/// from accumulating into an unbounded `Vec<String>`.
+struct BoundedFirewallArtifacts {
+    artifacts: Vec<String>,
+    total_bytes: usize,
+    max_files: usize,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+impl BoundedFirewallArtifacts {
+    fn new(max_files: usize, max_bytes: usize) -> Self {
+        Self {
+            artifacts: Vec::new(),
+            total_bytes: 0,
+            max_files,
+            max_bytes,
+            exceeded: false,
+        }
+    }
+
+    fn push(&mut self, artifact: String) -> bool {
+        let Some(next_bytes) = self.total_bytes.checked_add(artifact.len()) else {
+            self.exceeded = true;
+            return false;
+        };
+        if self.artifacts.len() >= self.max_files || next_bytes > self.max_bytes {
+            self.exceeded = true;
+            return false;
+        }
+        self.total_bytes = next_bytes;
+        self.artifacts.push(artifact);
+        true
+    }
+
+    fn finish(self) -> Option<Vec<String>> {
+        (!self.exceeded).then_some(self.artifacts)
+    }
+}
+
 impl Executor {
     /// Populate statistics extra map with proof quality metrics.
     pub(super) fn populate_proof_quality_stats(&mut self, quality: &ProofQuality) {
@@ -66,125 +110,118 @@ impl Executor {
             .collect()
     }
 
-    /// Emit verified-firewall Lean proofs — one per theory lemma in `proof` that
-    /// a per-theory emitter supports — grounding each in the verified
-    /// `AySoundness.firewall_combined_unsat` theorem (half (1) of the
-    /// formal-verification goal).
+    /// Emit diagnostic firewall artifacts without retaining more than the
+    /// supplied number of files or aggregate raw-source bytes.
     ///
-    /// Supported so far: datatype constructor-distinctness (`dt_distinct`) and
-    /// linear-arithmetic conflicts (`la_generic` / `lia_generic`, all-negated
-    /// comparison lemmas). Each returned string is a self-contained Lean 4 file
-    /// that imports the verified `AySoundness` theorems and kernel-checks (axioms
-    /// ⊆ {propext, Classical.choice, Quot.sound}); see `lean_firewall.rs` and the
-    /// `AySoundness.CombinedDatatype` proof-of-concept. This is the runtime
-    /// counterpart that automatically emits the import-the-verified-theorem shape
-    /// instead of a hand-written instance.
-    pub fn emit_datatype_firewall_lean(&self, proof: &Proof) -> Vec<String> {
+    /// Returns `None` if either limit would be crossed. The currently rendered
+    /// `String` may momentarily exceed `max_bytes`, but it is dropped instead of
+    /// joining the retained artifact vector.
+    pub fn emit_datatype_firewall_lean_bounded(
+        &self,
+        proof: &Proof,
+        max_files: usize,
+        max_bytes: usize,
+    ) -> Option<Vec<String>> {
         use ay_core::TheoryLemmaKind as K;
         let decls = self.datatype_decls_for_strict_proof();
-        let mut out: Vec<String> = proof
-            .steps
-            .iter()
-            .filter_map(|step| {
-                let ProofStep::TheoryLemma { kind, clause, .. } = step else {
-                    return None;
-                };
-                match kind {
-                    K::DatatypeDistinct if !decls.is_empty() => {
-                        crate::executor::lean_firewall::emit_datatype_distinct_firewall_lean(
-                            &self.ctx.terms,
-                            &decls,
-                            clause,
-                        )
-                    }
-                    K::LraFarkas | K::LiaGeneric => {
-                        // Farkas / bound conflicts go through the LIA emitter; a
-                        // single-variable LINEAR IDENTITY (e.g. `(* x 0) = 0`,
-                        // the `LinearIdentity` annotation) is a different shape —
-                        // the LIA emitter declines it, so fall through to the
-                        // identity emitter.
-                        crate::executor::lean_firewall::emit_lia_firewall_lean(
-                            &self.ctx.terms,
-                            clause,
-                        )
+        let mut out = BoundedFirewallArtifacts::new(max_files, max_bytes);
+        for artifact in proof.steps.iter().filter_map(|step| {
+            let ProofStep::TheoryLemma { kind, clause, .. } = step else {
+                return None;
+            };
+            match kind {
+                K::DatatypeDistinct if !decls.is_empty() => {
+                    crate::executor::lean_firewall::emit_datatype_distinct_firewall_lean(
+                        &self.ctx.terms,
+                        &decls,
+                        clause,
+                    )
+                }
+                K::LraFarkas | K::LiaGeneric => {
+                    // Farkas / bound conflicts go through the LIA emitter; a
+                    // single-variable LINEAR IDENTITY (e.g. `(* x 0) = 0`,
+                    // the `LinearIdentity` annotation) is a different shape —
+                    // the LIA emitter declines it, so fall through to the
+                    // identity emitter.
+                    crate::executor::lean_firewall::emit_lia_firewall_lean(&self.ctx.terms, clause)
                         .or_else(|| {
                             crate::executor::lean_firewall::emit_nia_identity_firewall_lean(
                                 &self.ctx.terms,
                                 clause,
                             )
                         })
-                    }
-                    K::EufTransitive => crate::executor::lean_firewall::emit_euf_firewall_lean(
-                        &self.ctx.terms,
-                        clause,
-                    ),
-                    K::EufCongruent => {
-                        crate::executor::lean_firewall::emit_euf_congruence_firewall_lean(
-                            &self.ctx.terms,
-                            clause,
-                        )
-                    }
-                    K::EufCongruentPred => {
-                        crate::executor::lean_firewall::emit_euf_pred_congruence_firewall_lean(
-                            &self.ctx.terms,
-                            clause,
-                        )
-                    }
-                    // Array read-over-write-NEG: the proof carries the
-                    // self-contained guarded theorem
-                    // `(i = j) ∨ (= (select (store a i v) j) (select a j))`.
-                    // The emitter independently recognizes that exact clause
-                    // and grounds the generic ROW2 theorem (a/i/j/v modeled as
-                    // opaque components). Guard-less contextual units are
-                    // declined.
-                    K::ArraySelectStore { index_eq: false } => {
-                        crate::executor::lean_firewall::emit_array_row2_firewall_lean(
-                            &self.ctx.terms,
-                            clause,
-                        )
-                    }
-                    // If-then-else identical branches `(= (ite c x x) x)`: holds
-                    // for any condition and any branch sort; ground via `ite_self`
-                    // over `Val = branch_sort × Bool`.
-                    K::IteSame => crate::executor::lean_firewall::emit_ite_same_firewall_lean(
-                        &self.ctx.terms,
-                        clause,
-                    ),
-                    // FP sign-bit identities (`fp.abs` idempotence / `fp.neg`
-                    // involution). Classification EXCLUSIVITY is a different shape
-                    // handled by the from-parsed FP emitter below — this declines
-                    // it (returns None), so the two are complementary.
-                    K::FpClassification { .. } => {
-                        crate::executor::lean_firewall::emit_fp_identity_firewall_lean(
-                            &self.ctx.terms,
-                            clause,
-                        )
-                    }
-                    // Small-width BV IDENTITY lemma `(= L R)` over BV variables
-                    // (e.g. `(= (bvand x x) x)`) — refuted by `decide` over the
-                    // `BitVec w` model (width from the variable's sort).
-                    K::BvBitBlast => {
-                        crate::executor::lean_firewall::emit_bv_identity_firewall_lean(
-                            &self.ctx.terms,
-                            clause,
-                        )
-                    }
-                    // Datatype selector projection `(= (sel_i (C f0 f1)) f_i)`:
-                    // model the datatype as a product, the selector as `.1`/`.2`.
-                    K::DatatypeSelectorProject => {
-                        crate::executor::lean_firewall::emit_dt_selector_projection_firewall_lean(
-                            &self.ctx.terms,
-                            clause,
-                        )
-                    }
-                    // Remaining: array ROW-same (bare-trust reconstruction),
-                    // strings/BV/FP (surface-rewrite-trivialized / non-tautology
-                    // lemmas) — need lemma reconstruction first. See memory
-                    // `project_formally_verifying_ay`.
-                    _ => None,
                 }
-            })
-            .collect();
+                K::EufTransitive => {
+                    crate::executor::lean_firewall::emit_euf_firewall_lean(&self.ctx.terms, clause)
+                }
+                K::EufCongruent => {
+                    crate::executor::lean_firewall::emit_euf_congruence_firewall_lean(
+                        &self.ctx.terms,
+                        clause,
+                    )
+                }
+                K::EufCongruentPred => {
+                    crate::executor::lean_firewall::emit_euf_pred_congruence_firewall_lean(
+                        &self.ctx.terms,
+                        clause,
+                    )
+                }
+                // Array read-over-write-NEG: the proof carries the
+                // self-contained guarded theorem
+                // `(i = j) ∨ (= (select (store a i v) j) (select a j))`.
+                // The emitter independently recognizes that exact clause
+                // and grounds the generic ROW2 theorem (a/i/j/v modeled as
+                // opaque components). Guard-less contextual units are
+                // declined.
+                K::ArraySelectStore { index_eq: false } => {
+                    crate::executor::lean_firewall::emit_array_row2_firewall_lean(
+                        &self.ctx.terms,
+                        clause,
+                    )
+                }
+                // If-then-else identical branches `(= (ite c x x) x)`: holds
+                // for any condition and any branch sort; ground via `ite_self`
+                // over `Val = branch_sort × Bool`.
+                K::IteSame => crate::executor::lean_firewall::emit_ite_same_firewall_lean(
+                    &self.ctx.terms,
+                    clause,
+                ),
+                // FP sign-bit identities (`fp.abs` idempotence / `fp.neg`
+                // involution). Classification EXCLUSIVITY is a different shape
+                // handled by the from-parsed FP emitter below — this declines
+                // it (returns None), so the two are complementary.
+                K::FpClassification { .. } => {
+                    crate::executor::lean_firewall::emit_fp_identity_firewall_lean(
+                        &self.ctx.terms,
+                        clause,
+                    )
+                }
+                // Small-width BV IDENTITY lemma `(= L R)` over BV variables
+                // (e.g. `(= (bvand x x) x)`) — refuted by `decide` over the
+                // `BitVec w` model (width from the variable's sort).
+                K::BvBitBlast => crate::executor::lean_firewall::emit_bv_identity_firewall_lean(
+                    &self.ctx.terms,
+                    clause,
+                ),
+                // Datatype selector projection `(= (sel_i (C f0 f1)) f_i)`:
+                // model the datatype as a product, the selector as `.1`/`.2`.
+                K::DatatypeSelectorProject => {
+                    crate::executor::lean_firewall::emit_dt_selector_projection_firewall_lean(
+                        &self.ctx.terms,
+                        clause,
+                    )
+                }
+                // Remaining: array ROW-same (bare-trust reconstruction),
+                // strings/BV/FP (surface-rewrite-trivialized / non-tautology
+                // lemmas) — need lemma reconstruction first. See memory
+                // `project_formally_verifying_ay`.
+                _ => None,
+            }
+        }) {
+            if !out.push(artifact) {
+                return None;
+            }
+        }
 
         // String length-vs-literal conflicts: ay's lemma AND the TermId-level
         // assertions are surface-rewrite-trivialized before emit, so reconstruct
@@ -196,7 +233,9 @@ impl Executor {
                 self.ctx.assertions_parsed(),
             )
         {
-            out.push(lean);
+            if !out.push(lean) {
+                return None;
+            }
         }
 
         // Sequence length-over-concat conflicts: `seq.len (seq.++ X Y) =
@@ -244,7 +283,9 @@ impl Executor {
         if let Some(lean) = crate::executor::lean_firewall::emit_bv_firewall_lean_from_parsed(
             self.ctx.assertions_parsed(),
         ) {
-            out.push(lean);
+            if !out.push(lean) {
+                return None;
+            }
         }
 
         // Propositional contradictions (e.g. `(not (= (not (not p)) p))`,
@@ -256,7 +297,9 @@ impl Executor {
                 self.ctx.assertions_parsed(),
             )
         {
-            out.push(lean);
+            if !out.push(lean) {
+                return None;
+            }
         }
 
         // Array read-over-write-same: `select (store a i v) i ≠ v` is bare-trust
@@ -264,6 +307,23 @@ impl Executor {
         // and ground the generic McCarthy ROW-same theorem.
         if let Some(lean) =
             crate::executor::lean_firewall::emit_array_row1_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            if !out.push(lean) {
+                return None;
+            }
+        }
+
+        // Nested / multi-store array read-over-write: `select` over a `store`-chain
+        // (e.g. `select (store (store a i v1) i v2) j` vs `select (store a i v2) j`)
+        // reduces, by the McCarthy axioms, to a value that contradicts the asserted
+        // disequality. ay refutes arrays eagerly (bare-trust), so reconstruct from
+        // the frontend assertions and ground the composed ROW conflict; declines
+        // unless a single base array, backed guards, and matching normal forms make
+        // the guarded clause valid.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_nested_store_row_firewall_lean_from_parsed(
                 self.ctx.assertions_parsed(),
             )
         {
@@ -279,7 +339,9 @@ impl Executor {
                 self.ctx.assertions_parsed(),
             )
         {
-            out.push(lean);
+            if !out.push(lean) {
+                return None;
+            }
         }
 
         // Set subset ground-witness refutation: ay decides set.subset via member
@@ -291,7 +353,9 @@ impl Executor {
                 self.ctx.assertions_parsed(),
             )
         {
-            out.push(lean);
+            if !out.push(lean) {
+                return None;
+            }
         }
 
         // Set subset transitivity `(set.subset A B) (set.subset B C)
@@ -302,7 +366,9 @@ impl Executor {
                 self.ctx.assertions_parsed(),
             )
         {
-            out.push(lean);
+            if !out.push(lean) {
+                return None;
+            }
         }
 
         // Datatype selector congruence: ay's QF_DT pipeline refutes eagerly and
@@ -314,7 +380,9 @@ impl Executor {
                 self.ctx.assertions_parsed(),
             )
         {
-            out.push(lean);
+            if !out.push(lean) {
+                return None;
+            }
         }
 
         // Datatype constructor injectivity: `(= (C a …) (C c …)) (not (= a c))`
@@ -332,7 +400,54 @@ impl Executor {
                     &ctor_names,
                 )
             {
-                out.push(lean);
+                if !out.push(lean) {
+                    return None;
+                }
+            }
+
+            // Datatype ACYCLICITY / occurs-check: `t = C(… t …)` where the
+            // variable `t` occurs as a proper subterm under ≥1 constructor layer.
+            // Beyond the pure-constructor path, sound UNCONDITIONAL rewrites also
+            // reduce (B) selector-mediated occurrences `x = C(… (sel x) …)` and
+            // (C) tautological-tester `ite` + selector-self-eq under an asserted
+            // tester to the same occurs-check. Unsatisfiable by the auto-derived
+            // `sizeOf` strictly increasing across constructors; reconstruct from
+            // the frontend assertions and ground the generic acyclicity conflict
+            // (`AySoundness.Datatype.acyclic_conflict_generic`). Sound only for
+            // real constructors, so pass the constructor names, the datatype
+            // registry (single-ctor tester tautology), and the constructor→
+            // selector map (projection / tester-form reconstruction).
+            let ctor_selectors = self.ctor_selector_decls_for_strict_proof();
+            if let Some(lean) =
+                crate::executor::lean_firewall::emit_dt_occurs_check_firewall_lean_from_parsed(
+                    self.ctx.assertions_parsed(),
+                    &ctor_names,
+                    &decls,
+                    &ctor_selectors,
+                )
+            {
+                if !out.push(lean) {
+                    return None;
+                }
+            }
+
+            // Datatype CASE-SPLIT: a residual `C(… t …) = ite g B_true B_false`
+            // (boolean-ite-guard) or `((_ is nd) x) ∧ (not (distinct nd(y,x) lf x))`
+            // (finite distinct-disjunction). The split is carried as a bounded
+            // `by_cases` inside the theory-lemma validity obligation, each branch
+            // discharged by a verified Datatype lemma (acyclicity / distinctness /
+            // tester mutual-exclusion). Reconstructed from the frontend assertions;
+            // fail-closed on any shape not soundly reducible to a bounded split.
+            if let Some(lean) =
+                crate::executor::lean_firewall::emit_dt_case_split_firewall_lean_from_parsed(
+                    self.ctx.assertions_parsed(),
+                    &ctor_names,
+                    &decls,
+                )
+            {
+                if !out.push(lean) {
+                    return None;
+                }
             }
         }
 
@@ -347,7 +462,9 @@ impl Executor {
                 self.ctx.assertions_parsed(),
             )
         {
-            out.push(lean);
+            if !out.push(lean) {
+                return None;
+            }
         }
 
         // NIA conflict that becomes a single linear equality after substituting
@@ -356,6 +473,107 @@ impl Executor {
         // ground the linear conflict by `omega`.
         if let Some(lean) =
             crate::executor::lean_firewall::emit_nia_linear_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            if !out.push(lean) {
+                return None;
+            }
+        }
+
+        // Word-equation length conflicts: a string equation `A = B` over
+        // `str.++`/literals/variables (with optional `str.len v = c` pins) whose
+        // LENGTH projection is ℕ-infeasible (e.g. `x·x = "aba"` ⟹ `2·len x = 3`).
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_str_word_eq_len_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            out.push(lean);
+        }
+
+        // Structural ground-set subset conflict, VALID subset asserted NEGATED:
+        // `(not (set.subset S T))` over concrete finite sets with eval(S) ⊆ eval(T).
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_set_subset_structural_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            out.push(lean);
+        }
+
+        // Structural ground-set equality conflict: `(= S T)` over concrete finite
+        // sets with eval(S) != eval(T).
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_set_eq_structural_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            out.push(lean);
+        }
+
+        // Structural ground-set subset conflict, FALSE subset asserted POSITIVELY:
+        // `(set.subset S T)` with eval(S) not-⊆ eval(T).
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_set_subset_structural_false_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            out.push(lean);
+        }
+
+        // Array read-over-write-SAME positive MISMATCH: `select (store a i v) ridx
+        // = w` with `ridx ≡ i` (arith-normalized) and `v ≠ w` distinct literals.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_row_mismatch_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            out.push(lean);
+        }
+
+        // Nested read-over-write hidden behind an ARRAY-LET `(= b (store …))`
+        // (e.g. an element swap): inline the array definition and ground the
+        // composed ROW conflict.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_inlined_nested_store_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            out.push(lean);
+        }
+
+        // Array read-over-write hidden behind nullary `define-fun` MACROS (QF_AX
+        // store-commute: `(define-fun fwd () _ (store … ))`,
+        // `(not (= (select fwd i0) (select rev i0)))` with `(distinct i0 …)`).
+        // `assertions_parsed()` keeps macros unexpanded, so substitute their
+        // (definitionally-equal) bodies and ground the composed ROW conflict.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_defexpanded_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+                &self.ctx.nullary_defined_terms(),
+            )
+        {
+            out.push(lean);
+        }
+
+        // Linear-integer conflicts: ay refutes a jointly integer-UNSAT conjunction
+        // of linear (in)equalities with a bare `:rule trust` integer step (no
+        // `la_generic` lemma clause to ground), so reconstruct from the frontend
+        // assertions and discharge the all-negated blocking clause by `omega`.
+        if let Some(lean) = crate::executor::lean_firewall::emit_lia_firewall_lean_from_parsed(
+            self.ctx.assertions_parsed(),
+        ) {
+            out.push(lean);
+        }
+
+        // EUF + LINEAR-INTEGER fused congruence-value conflict (bucket
+        // "euf_uflia"): LIA atoms pin Int vars to a common value and
+        // single-application UF value atoms `(= (f x) c1)`, `(= (f y) c2)` (or
+        // one negated) contradict via the congruence conclusion `f x = f y`. MUST
+        // be inserted BEFORE the emit_general_firewall_lean call.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_euf_lia_congruence_firewall_lean_from_parsed(
                 self.ctx.assertions_parsed(),
             )
         {
@@ -372,9 +590,11 @@ impl Executor {
         if let Some(lean) =
             crate::executor::lean_firewall::emit_general_firewall_lean(&self.ctx.terms, proof)
         {
-            out.push(lean);
+            if !out.push(lean) {
+                return None;
+            }
         }
-        out
+        out.finish()
     }
 
     /// Strict proof check that also validates datatype constructor-distinctness
@@ -597,6 +817,46 @@ impl Executor {
                 )
             });
             if has_untrusted_step {
+                return false;
+            }
+            // Fail-closed re-validation of the ground string/regex lane. The
+            // self-check gate consults the PARTIAL (non-strict) checker, so a
+            // `StringGroundEval` lemma would otherwise be admitted on the
+            // strength of the classifier alone. Re-run the checker's own
+            // independent evaluator here: a lemma whose clause has no literal
+            // the evaluator proves TRUE is not a tautology, and the UNSAT must
+            // degrade to `unknown` rather than ship on a mislabelled step.
+            let unvalidated_string_lemma = proof.steps.iter().any(|s| {
+                matches!(
+                    s,
+                    ProofStep::TheoryLemma {
+                        kind: ay_core::TheoryLemmaKind::StringGroundEval,
+                        clause,
+                        ..
+                    } if !ay_proof::recognize_string_ground_eval(&self.ctx.terms, clause)
+                )
+            });
+            if unvalidated_string_lemma {
+                return false;
+            }
+            // Same fail-closed re-validation for the SYMBOLIC regex lane
+            // (#regex-cert). `--self-check` consults the PARTIAL checker, so a
+            // `RegexIntersectEmpty` lemma would otherwise ship on the strength
+            // of the classifier alone. Re-run the checker's own independent
+            // derivative-product emptiness decision here: a lemma whose clause
+            // has no `str.in_re` group the checker proves EMPTY is not a
+            // tautology, and the UNSAT must degrade to `unknown`.
+            let unvalidated_regex_lemma = proof.steps.iter().any(|s| {
+                matches!(
+                    s,
+                    ProofStep::TheoryLemma {
+                        kind: ay_core::TheoryLemmaKind::RegexIntersectEmpty,
+                        clause,
+                        ..
+                    } if !ay_proof::recognize_regex_intersect_empty(&self.ctx.terms, clause)
+                )
+            });
+            if unvalidated_regex_lemma {
                 return false;
             }
             // Leak-2: an `assume` on the empty-clause path whose term is not

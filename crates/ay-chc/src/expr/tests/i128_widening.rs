@@ -95,9 +95,8 @@ fn i128_fold_beyond_i128_stays_symbolic() {
         ChcOp::Add,
         vec![Arc::new(ChcExpr::Int(i128::MAX)), Arc::new(ChcExpr::Int(1))],
     );
-    match add.simplify_constants() {
-        ChcExpr::Int(n) => panic!("must not fold beyond-i128 sum, got Int({n})"),
-        _ => {}
+    if let ChcExpr::Int(n) = add.simplify_constants() {
+        panic!("must not fold beyond-i128 sum, got Int({n})");
     }
 
     // i128::MAX * 2 likewise.
@@ -105,9 +104,8 @@ fn i128_fold_beyond_i128_stays_symbolic() {
         ChcOp::Mul,
         vec![Arc::new(ChcExpr::Int(i128::MAX)), Arc::new(ChcExpr::Int(2))],
     );
-    match mul.simplify_constants() {
-        ChcExpr::Int(n) => panic!("must not fold beyond-i128 product, got Int({n})"),
-        _ => {}
+    if let ChcExpr::Int(n) = mul.simplify_constants() {
+        panic!("must not fold beyond-i128 product, got Int({n})");
     }
 
     // And the evaluator abstains (None), never wraps.

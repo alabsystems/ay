@@ -36,6 +36,42 @@ use super::{EXECUTOR_STACK_RED_ZONE, EXECUTOR_STACK_SIZE};
 /// by the solve pipeline + independent model gate.
 const MGR_ROW_PEEL_CLAUSE_CAP: usize = 20_000;
 
+/// Verify the finalized private CNF/DRAT pair emitted for a `--self-check`
+/// QF_BV solve. This runs at the executor boundary, before any API caller can
+/// observe `Unsat`; the CLI may report the certification but is not trusted to
+/// repair an unverified library result afterward.
+fn verify_bv_drat_self_cert() -> std::result::Result<(), String> {
+    let config = ay_core::trace_config();
+    let cnf_path = config
+        .bv_drat_self_cert_cnf_path
+        .as_deref()
+        .ok_or_else(|| "self-cert CNF path not configured".to_string())?;
+    let drat_path = config
+        .bv_drat_self_cert_drat_path
+        .as_deref()
+        .ok_or_else(|| "self-cert DRAT path not configured".to_string())?;
+
+    let cnf_data = std::fs::read(cnf_path).map_err(|e| format!("cannot read CNF: {e}"))?;
+    let cnf = ay_drat_check::cnf_parser::parse_cnf(&cnf_data[..])
+        .map_err(|e| format!("cannot parse CNF: {e}"))?;
+    if cnf.num_vars > ay_drat_check::checker::MAX_DENSE_VARS {
+        return Err(format!(
+            "formula variable count {} exceeds native DRAT checker maximum {}",
+            cnf.num_vars,
+            ay_drat_check::checker::MAX_DENSE_VARS
+        ));
+    }
+
+    let drat_data = std::fs::read(drat_path).map_err(|e| format!("cannot read DRAT: {e}"))?;
+    let steps = ay_drat_check::drat_parser::parse_drat(&drat_data)
+        .map_err(|e| format!("cannot parse DRAT: {e}"))?;
+    let mut checker =
+        ay_drat_check::checker::DratChecker::new(cnf.num_vars, /*check_rat=*/ true);
+    checker
+        .verify(&cnf.clauses, &steps)
+        .map_err(|e| format!("native DRAT check rejected the proof: {e}"))
+}
+
 fn has_only_uf_lia_theories(features: &StaticFeatures) -> bool {
     !features.has_arrays
         && !features.has_real
@@ -1090,6 +1126,17 @@ impl Executor {
         // Internal probes share this entry point, so retain their surrounding
         // state but never let an earlier certificate survive a new-solve error.
         self.last_sat_certificate = None;
+        // Reset the BV-DRAT self-cert flag: it is (re)armed below only for an
+        // eligible top-level pure-QF_BV check-sat and set true by the BV solver
+        // when it actually emits a native-checkable UNSAT DRAT for this solve.
+        self.last_bv_drat_self_cert = false;
+        // `--self-check` BV DRAT self-certification: arm the eager bit-blast
+        // CNF+DRAT export at the self-cert temp paths for a top-level pure-QF_BV
+        // query. The arm is a thread-local RAII guard, so all export gating
+        // (`requested`/`enabled`/`configured_path`) sees the temp files ONLY
+        // inside this scope; any non-BV / probe / optimization solve leaves it
+        // disarmed and behaves exactly as before.
+        let _self_cert_arm = self.maybe_arm_bv_drat_self_cert();
         let dump_roots = if bv_cnf_dump::requested() {
             self.ctx.assertions.clone()
         } else {
@@ -1108,10 +1155,31 @@ impl Executor {
         });
         self.restore_timeout_deadline_after_call(previous_deadline);
         self.record_z3_resource_statistics(solve_started_at);
-        let result = result.and_then(|result| {
+        let mut result = result.and_then(|result| {
             bv_cnf_dump::finish_check(dump_transaction, &self.ctx.terms, &dump_roots)?;
             Ok(result)
         });
+        // The eager BV solver finishes its DRAT before returning, while
+        // `finish_check` above seals the matching CNF. Verify that finalized
+        // pair HERE, before `check_sat` returns to either the public API or the
+        // CLI. A failed/missing check revokes every UNSAT-derived artifact and
+        // degrades to `Unknown`; no caller can observe a merely pending UNSAT.
+        if self.self_check
+            && self.last_bv_drat_self_cert
+            && matches!(result, Ok(ref solve_result) if solve_result.is_unsat())
+        {
+            if let Err(reason) = verify_bv_drat_self_cert() {
+                self.last_bv_drat_self_cert = false;
+                self.replace_last_result_with_unknown(UnknownReason::Incomplete);
+                self.record_model_validation_unknown_diagnostic(format!(
+                    "self-check: BV DRAT verification failed: {reason}"
+                ));
+                tracing::warn!(
+                    "self-check: BV DRAT verification failed, degrading to Unknown: {reason}"
+                );
+                result = Ok(SolveResult::Unknown);
+            }
+        }
         // #quantifier-determinism diagnostics: opt-in per-solve budget trace
         // for calibrating the deterministic quantifier budgets against real
         // workloads (e.g. the deductive-checks calc.rs boundary chain). Zero overhead
@@ -1141,6 +1209,82 @@ impl Executor {
             );
         }
         result
+    }
+
+    /// Arm the `--self-check` BV DRAT self-cert export for the current check-sat
+    /// when eligible, returning the RAII disarm guard (or `None`).
+    ///
+    /// Eligible iff: self-check is on; the CLI populated the self-cert temp paths
+    /// (only when the user did NOT request an explicit `--dump-bv-cnf`); and the
+    /// current assertion set is exactly the fragment the single-invocation DRAT
+    /// certificate covers — pure QF_BV, quantifier-free, no named-assertion
+    /// unsat-core redirection ([`bv_cnf_export_supported`]). For anything else the
+    /// export stays disarmed and the solve degrades to `unknown` as before —
+    /// fail-closed. Deliberately NOT armed for `check_sat_assuming`: an
+    /// assumption-augmented bit-blast has no standalone-refutation DRAT.
+    fn maybe_arm_bv_drat_self_cert(&self) -> Option<bv_cnf_dump::SelfCertArm> {
+        if !self.self_check {
+            return None;
+        }
+        let config = ay_core::trace_config();
+        // An explicit user `--dump-bv-cnf` owns the export transaction itself;
+        // never shadow it with the auto self-cert paths.
+        if config.dump_bv_cnf_path.is_some()
+            || config.bv_drat_self_cert_cnf_path.is_none()
+            || config.bv_drat_self_cert_drat_path.is_none()
+        {
+            return None;
+        }
+        if !self.bv_cnf_export_supported(&self.ctx.assertions) {
+            return None;
+        }
+        Some(bv_cnf_dump::arm_self_cert())
+    }
+
+    /// Whether `roots` are in the fragment the single-invocation BV DRAT
+    /// certificate soundly covers. This is the boolean twin of the acceptance
+    /// conditions in [`validate_bv_cnf_export_roots`]: pure QF_BV, no quantifier,
+    /// no non-BV theory, and no named-assertion unsat-core redirection. A
+    /// trivially-{true,false} conjunction is exportable (the writer emits the
+    /// canonical trivial CNF/DRAT). Kept in lockstep with the validator so the
+    /// self-cert arm can only ever expose the temp paths for an input the export
+    /// machinery would accept.
+    pub(in crate::executor) fn bv_cnf_export_supported(&self, roots: &[TermId]) -> bool {
+        if bv_cnf_dump::trivial_conjunction(&self.ctx.terms, roots).is_some() {
+            return true;
+        }
+        if self.produce_unsat_cores_enabled()
+            && self
+                .ctx
+                .named_terms_iter()
+                .any(|(_, term)| self.ctx.assertions.contains(&term))
+        {
+            return false;
+        }
+        if roots
+            .iter()
+            .copied()
+            .any(|root| contains_quantifier(&self.ctx.terms, root))
+        {
+            return false;
+        }
+        let (category, features) = self.detect_logic_category(roots);
+        let has_non_bv_theory = features.has_int
+            || features.has_real
+            || features.has_arrays
+            || features.has_strings
+            || features.has_seq
+            || features.has_seq_ops
+            || features.has_set_ops
+            || features.has_multiset_ops
+            || features.has_map_ops
+            || features.has_regex
+            || features.has_fpa
+            || features.has_uf
+            || features.has_quantifiers
+            || features.has_bv_int_conversion
+            || self.terms_contain_datatype_terms(roots);
+        category == LogicCategory::QfBv && !has_non_bv_theory
     }
 
     /// Reject certificate export outside the deliberately supported fragment.
@@ -1886,7 +2030,17 @@ impl Executor {
         // model-certification gate above (independent model gate is SAT-only),
         // no `sat`/`unsat` AY emits under `--self-check` is unverified by AY
         // itself. (#self-check-unsat)
-        let result = if self.self_check && result.is_unsat() && !self.unsat_proof_self_certified() {
+        // BV DRAT self-cert exception: a pure-QF_BV UNSAT that emitted a
+        // native-checkable bit-blast DRAT for THIS solve may pass this Alethe
+        // gate. The outer `check_sat` boundary finalizes the matching CNF and
+        // runs AY's native DRAT checker before returning the result to ANY
+        // caller; a failed check is revoked and degraded to `Unknown` there.
+        let bv_drat_self_cert = self.last_bv_drat_self_cert;
+        let result = if self.self_check
+            && result.is_unsat()
+            && !self.unsat_proof_self_certified()
+            && !bv_drat_self_cert
+        {
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
             self.record_model_validation_unknown_diagnostic(
                 "self-check: UNSAT is not backed by a fully-checked refutation proof",
@@ -2363,6 +2517,8 @@ impl Executor {
         // must not outlive the assertion/support state they were computed
         // against.
         self.conflict_semantic_verify_memo.clear();
+        // Same lifecycle for the propagation-verification memo (#verify-memo).
+        self.prop_semantic_verify_memo.clear();
         // Clear NRA algebraic witnesses per check-sat so stale values from a
         // prior solve cannot leak into a later model in an incremental session.
         self.nra_algebraic_model.clear();
@@ -2480,6 +2636,12 @@ impl Executor {
     /// assertion vector around this call, so no in-place residue can survive
     /// into a later `(pop)`/`(check-sat)` (#incremental-pushpop-soundness).
     fn check_sat_internal_preprocess_and_solve(&mut self) -> Result<SolveResult> {
+        // Named-assert rewrite provenance is strictly per-preprocessing-run
+        // (#uc-named-provenance): entries recorded by THIS call's passes are
+        // consumed by THIS call's named-core redirect and never leak into a
+        // later check.
+        self.named_assert_rewrites.clear();
+
         if !self.produce_proofs_enabled() {
             self.rewrite_dense_bv_array_initializer_selects();
         }
@@ -2653,6 +2815,39 @@ impl Executor {
                 .collect();
 
             if !term_to_name.is_empty() {
+                // Parse-time named TermIds, snapshotted BEFORE the rewrite-
+                // provenance extension below (the coverage guard reasons in
+                // parse-key space).
+                let parse_named_keys: std::collections::HashSet<TermId> =
+                    term_to_name.keys().copied().collect();
+
+                // Rewrite-provenance extension (#uc-named-provenance): a
+                // named assert rewritten in place by an equivalence-exact
+                // preprocessing pass of THIS call (Bool-ITE and
+                // select-over-array-ite rewrites; see
+                // `named_assert_rewrites`) is still assumption-trackable —
+                // its rewritten form carries the label. Without this, every
+                // such assert landed in the unnamed base, the coverage guard
+                // tripped, and the core padded to ALL named assertions
+                // (reduction 0 across 2018-Goel-hwbench, whose named asserts
+                // are Bool ITEs). Printing the label for the rewritten form
+                // is sound because the rewrite preserves per-assertion
+                // equivalence: the original named formula set the validator
+                // re-checks is logically interchangeable with the solved set.
+                let mut term_to_name = term_to_name;
+                if !self.named_assert_rewrites.is_empty() {
+                    for &assertion in &self.ctx.assertions {
+                        if term_to_name.contains_key(&assertion) {
+                            continue;
+                        }
+                        if let Some(&root) = self.named_assert_rewrites.get(&assertion) {
+                            if let Some(name) = term_to_name.get(&root).cloned() {
+                                term_to_name.insert(assertion, name);
+                            }
+                        }
+                    }
+                }
+
                 // Split assertions: named become assumptions, unnamed stay as base
                 let mut named_assumptions = Vec::new();
                 let mut unnamed_assertions = Vec::new();
@@ -2700,14 +2895,30 @@ impl Executor {
                     // never eligible for the assumption core — so ANY
                     // minimized core under-covers them and the reduced
                     // benchmark can be SAT (an invalidated core, e=1 under
-                    // 2025 UC scoring). Detect the breakage by coverage
-                    // count and, on UNSAT, drop the minimized core so
-                    // `unsat_core()` falls back to ALL named assertions
-                    // (valid by construction, reduction 0).
+                    // 2025 UC scoring). Coverage is counted in PARSE-KEY
+                    // space: an assumption-tracked assertion covers a parse
+                    // key either verbatim or through this call's
+                    // equivalence-exact rewrite chain (#uc-named-provenance).
+                    // Anything unaccounted trips the guard and, on UNSAT,
+                    // drops the minimized core so `unsat_core()` falls back
+                    // to ALL named assertions (valid by construction,
+                    // reduction 0). With no recorded rewrites this reduces
+                    // byte-identically to the historical distinct-count
+                    // check.
                     let provenance_broken = {
-                        let distinct_named_assumptions: std::collections::HashSet<TermId> =
-                            named_assumptions.iter().copied().collect();
-                        distinct_named_assumptions.len() < term_to_name.len()
+                        let covered_parse_keys: std::collections::HashSet<TermId> =
+                            named_assumptions
+                                .iter()
+                                .map(|&a| {
+                                    if parse_named_keys.contains(&a) {
+                                        a
+                                    } else {
+                                        self.named_assert_rewrites.get(&a).copied().unwrap_or(a)
+                                    }
+                                })
+                                .filter(|t| parse_named_keys.contains(t))
+                                .collect();
+                        covered_parse_keys.len() < parse_named_keys.len()
                     };
 
                     // Temporarily replace assertions with unnamed-only
@@ -2729,11 +2940,31 @@ impl Executor {
                     // stripped. A rescue UNSAT records the all-named core
                     // (reduction 0, sound by construction). See
                     // `rescue_named_core_redirect_unknown`.
-                    let result = match result {
+                    let (result, rescue_elapsed) = match result {
                         Ok(SolveResult::Unknown) => {
-                            self.rescue_named_core_redirect_unknown(&named_assumptions)
+                            let rescue_started = Instant::now();
+                            let rescued =
+                                self.rescue_named_core_redirect_unknown(&named_assumptions);
+                            (rescued, Some(rescue_started.elapsed()))
                         }
-                        other => other,
+                        other => (other, None),
+                    };
+
+                    // Deletion-based EUF/ArrayEuf core minimization while the
+                    // base is still stripped (#uc-core-minimize): shrinks the
+                    // certified core — including the empty-harvest→pad-all
+                    // theory-refutation case AND the rescue's conservative
+                    // all-assumptions core — by re-solving subsets, budget-
+                    // aware and fail-closed (only solve-verified subsets are
+                    // adopted). Runs AFTER the rescue: the measured
+                    // reduction-0 families (QG-classification, storecomm)
+                    // reach unsat through it. Skipped when provenance is
+                    // broken: the minimized core would be discarded below
+                    // anyway.
+                    let result = if provenance_broken {
+                        result
+                    } else {
+                        self.minimize_assumption_core(&named_assumptions, result, rescue_elapsed)
                     };
 
                     // Restore original assertions
@@ -3597,7 +3828,34 @@ impl Executor {
             })
             .collect();
         if changed {
+            self.record_named_assert_rewrites(&asserts, &new_asserts);
             self.ctx.assertions = new_asserts;
+        }
+    }
+
+    /// Record positional rewrite provenance for the named-core machinery
+    /// (#uc-named-provenance). ONLY per-assertion semantically-EXACT passes
+    /// may call this (see the `named_assert_rewrites` field docs): the label
+    /// of a named assert rides its rewritten form, and the printed core
+    /// denotes the ORIGINAL formulas that external validators re-check —
+    /// equivalence is what makes that sound. Chained through earlier
+    /// rewrites of the same run so values stay parse-time roots. Gated on
+    /// produce-unsat-cores: plain solving pays nothing.
+    fn record_named_assert_rewrites(&mut self, before: &[TermId], after: &[TermId]) {
+        if !self.produce_unsat_cores_enabled() {
+            return;
+        }
+        debug_assert_eq!(
+            before.len(),
+            after.len(),
+            "BUG: positional rewrite provenance requires equal-length assertion vectors"
+        );
+        for (&old, &new) in before.iter().zip(after.iter()) {
+            if old == new {
+                continue;
+            }
+            let root = self.named_assert_rewrites.get(&old).copied().unwrap_or(old);
+            self.named_assert_rewrites.insert(new, root);
         }
     }
 
@@ -3631,6 +3889,9 @@ impl Executor {
             .iter()
             .map(|&a| self.push_select_store_through_ite(a, &mut cache))
             .collect();
+        // Semantics-preserving per assertion (see the doc above) — eligible
+        // for named-core rewrite provenance (#uc-named-provenance).
+        self.record_named_assert_rewrites(&asserts, &new_asserts);
         self.ctx.assertions = new_asserts;
     }
 
@@ -3838,7 +4099,9 @@ mod quantifier_determinism_tests {
     fn quantifier_deadline_backstop_leaves_expired_or_absent_deadline() {
         // Already expired: immediate-stop semantics (set_timeout(ZERO)) kept.
         let mut exec = Executor::new();
-        let past = Instant::now() - Duration::from_millis(50);
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(50))
+            .expect("50 milliseconds must fit before the current test instant");
         exec.set_deadline(Some(past));
         exec.install_quantifier_deadline_backstop();
         assert_eq!(exec.solve_deadline.get(), Some(past));
@@ -3890,7 +4153,10 @@ mod quantifier_determinism_tests {
         // Tight sub-deadline already expired: a live-reading closure must stop
         // immediately (the 300ms alternation windows rely on this).
         let saved = exec.solve_deadline.get();
-        exec.set_deadline(Some(Instant::now() - Duration::from_millis(5)));
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(5))
+            .expect("5 milliseconds must fit before the current test instant");
+        exec.set_deadline(Some(past));
         assert!(
             stop(),
             "closures must observe a tightened (sub-solve) deadline live"
@@ -3918,7 +4184,10 @@ mod quantifier_determinism_tests {
         let mut exec = Executor::new();
         exec.last_result = Some(SolveResult::Unknown);
         exec.last_unknown_reason = Some(UnknownReason::QuantifierRoundLimit);
-        exec.set_deadline(Some(Instant::now() - Duration::from_millis(10)));
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(10))
+            .expect("10 milliseconds must fit before the current test instant");
+        exec.set_deadline(Some(past));
         exec.finalize_unknown_diagnostics();
         assert_eq!(exec.last_unknown_reason, Some(UnknownReason::Timeout));
     }
@@ -4088,7 +4357,10 @@ mod quantifier_determinism_tests {
     fn refine_attributes_mid_nia_expired_deadline_as_timeout() {
         let mut exec = Executor::new();
         exec.last_unknown_reason = None;
-        exec.set_deadline(Some(Instant::now() - Duration::from_millis(10)));
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(10))
+            .expect("10 milliseconds must fit before the current test instant");
+        exec.set_deadline(Some(past));
         exec.refine_unsupported_fragment_unknown_reason(&div_mod_features());
         assert_eq!(exec.last_unknown_reason, Some(UnknownReason::Timeout));
     }

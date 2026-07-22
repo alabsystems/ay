@@ -104,13 +104,18 @@ impl Executor {
         // DFS scan for str.substr, str.replace, and str.at terms.
         let mut stack: Vec<TermId> = assertions.to_vec();
         let mut visited: HashSet<TermId> = HashSet::default();
-        let mut substr_terms: Vec<(TermId, TermId, TermId, TermId)> = Vec::new(); // (substr_term, s, n, m)
-        let mut replace_terms: Vec<(TermId, TermId, TermId, TermId)> = Vec::new(); // (replace_term, x, y, z)
-        let mut at_terms: Vec<(TermId, TermId, TermId)> = Vec::new(); // (at_term, s, n)
-        let mut replace_re_terms: Vec<(TermId, TermId, TermId)> = Vec::new(); // (replace_re[_all]_term, s, regex)
-        let mut indexof_terms: Vec<(TermId, TermId, TermId, TermId)> = Vec::new(); // (indexof_term, s, w, n) — P2 only
-                                                                                   // Effort flags are owned by the pre-P2 passes; the P2 escalation pass
-                                                                                   // collects exactly its own two classes.
+        // Entries are `(substr_term, s, n, m)`.
+        let mut substr_terms: Vec<(TermId, TermId, TermId, TermId)> = Vec::new();
+        // Entries are `(replace_term, x, y, z)`.
+        let mut replace_terms: Vec<(TermId, TermId, TermId, TermId)> = Vec::new();
+        // Entries are `(at_term, s, n)`.
+        let mut at_terms: Vec<(TermId, TermId, TermId)> = Vec::new();
+        // Entries are `(replace_re[_all]_term, s, regex)`.
+        let mut replace_re_terms: Vec<(TermId, TermId, TermId)> = Vec::new();
+        // Entries are `(indexof_term, s, w, n)`; this class is P2-only.
+        let mut indexof_terms: Vec<(TermId, TermId, TermId, TermId)> = Vec::new();
+        // Effort flags are owned by the pre-P2 passes; the P2 escalation pass
+        // collects exactly its own two classes.
         let enable_substr_and_at = enable_substr_and_at && !p2_symbolic_only;
         let enable_replace = enable_replace && !p2_symbolic_only;
 

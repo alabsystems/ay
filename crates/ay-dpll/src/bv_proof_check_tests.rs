@@ -561,41 +561,49 @@ fn mixed_int_bv_alloc_oom_is_never_valid() {
     use num_bigint::BigInt;
     let mut terms = TermStore::new();
     let int_var = |t: &mut TermStore, n: &str| t.mk_var(n, Sort::Int);
-    let _2 = int_var(&mut terms, "_2");
-    let _3 = int_var(&mut terms, "_3");
-    let _4 = terms.mk_var("_4", Sort::Bool);
+    let element_count = int_var(&mut terms, "_2");
+    let shift_amount = int_var(&mut terms, "_3");
+    let shift_in_range = terms.mk_var("_4", Sort::Bool);
 
     // _3 == 28  ;  _4 == (_3 < 64)  ;  assert _4
     let c28 = terms.mk_int(BigInt::from(28));
     let c64 = terms.mk_int(BigInt::from(64));
-    let eq_3 = terms.mk_eq(_3, c28);
-    let lt_3_64 = terms.mk_app(Symbol::named("<"), vec![_3, c64], Sort::Bool);
-    let eq_4 = terms.mk_eq(_4, lt_3_64);
+    let eq_3 = terms.mk_eq(shift_amount, c28);
+    let lt_3_64 = terms.mk_app(Symbol::named("<"), vec![shift_amount, c64], Sort::Bool);
+    let eq_4 = terms.mk_eq(shift_in_range, lt_3_64);
 
     // 0 <= _2 <= u64::MAX  (the unsigned-range bounds — note u64::MAX, which a
     // *signed* BV coercion turns into -1 and silently corrupts).
     let c0 = terms.mk_int(BigInt::from(0));
     let umax = terms.mk_int(BigInt::from(18_446_744_073_709_551_615u64));
-    let le_0_2 = terms.mk_app(Symbol::named("<="), vec![c0, _2], Sort::Bool);
-    let le_2_umax = terms.mk_app(Symbol::named("<="), vec![_2, umax], Sort::Bool);
+    let le_0_2 = terms.mk_app(Symbol::named("<="), vec![c0, element_count], Sort::Bool);
+    let le_2_umax = terms.mk_app(Symbol::named("<="), vec![element_count, umax], Sort::Bool);
 
     // _2 == bv2nat(bvshl(int2bv_64(1), int2bv_64(_3)))  [== 1 << 28 == 268435456]
     let one = terms.mk_int(BigInt::from(1));
     let one_bv = terms.mk_int2bv(64, one);
-    let shift_bv = terms.mk_int2bv(64, _3);
+    let shift_bv = terms.mk_int2bv(64, shift_amount);
     let shifted = terms.mk_bvshl(vec![one_bv, shift_bv]);
     let count_val = terms.mk_bv2nat(shifted); // Int
-    let def_2 = terms.mk_eq(_2, count_val);
+    let def_2 = terms.mk_eq(element_count, count_val);
 
     // _2 <= 268435456  (upper-bounds _2 so the violation forces _2 == ceiling).
     let ceiling = terms.mk_int(BigInt::from(268_435_456));
-    let le_2_ceil = terms.mk_app(Symbol::named("<="), vec![_2, ceiling], Sort::Bool);
+    let le_2_ceil = terms.mk_app(
+        Symbol::named("<="),
+        vec![element_count, ceiling],
+        Sort::Bool,
+    );
 
     // Violation: _2 >= ceiling  OR  2*_2 >= ceiling  OR  2*_2 >= i64::MAX.
     let two = terms.mk_int(BigInt::from(2));
-    let two_2 = terms.mk_app(Symbol::named("*"), vec![two, _2], Sort::Int);
+    let two_2 = terms.mk_app(Symbol::named("*"), vec![two, element_count], Sort::Int);
     let imax = terms.mk_int(BigInt::from(9_223_372_036_854_775_807i64));
-    let ge_2_ceil = terms.mk_app(Symbol::named(">="), vec![_2, ceiling], Sort::Bool);
+    let ge_2_ceil = terms.mk_app(
+        Symbol::named(">="),
+        vec![element_count, ceiling],
+        Sort::Bool,
+    );
     let ge_2two_ceil = terms.mk_app(Symbol::named(">="), vec![two_2, ceiling], Sort::Bool);
     let ge_2two_imax = terms.mk_app(Symbol::named(">="), vec![two_2, imax], Sort::Bool);
     let viol = terms.mk_or(vec![ge_2_ceil, ge_2two_ceil, ge_2two_imax]);
@@ -604,7 +612,16 @@ fn mixed_int_bv_alloc_oom_is_never_valid() {
     // model), so the only sound discharge verdicts are Invalid (a model exists) or
     // Unchecked (declined). A `Valid` here is a forged UNSAT — the OOM mutant would
     // then verify instead of failing.
-    let assertions = [eq_3, eq_4, _4, le_0_2, le_2_umax, def_2, le_2_ceil, viol];
+    let assertions = [
+        eq_3,
+        eq_4,
+        shift_in_range,
+        le_0_2,
+        le_2_umax,
+        def_2,
+        le_2_ceil,
+        viol,
+    ];
     let verdict = check_bv_assertions_unsat(&terms, &assertions);
     assert!(
         !verdict.is_valid(),

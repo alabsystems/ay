@@ -11,13 +11,11 @@
 //! 2. The flag is gated on `--proof FILE` (clap `requires = "proof"`) and
 //!    `--lean-path` is gated on `--lean-verify`.
 //! 3. End-to-end on a trivial UNSAT DIMACS with a `.lean4` proof path, ay
-//!    emits `s UNSATISFIABLE`, invokes the Lean verifier, and exits with a
-//!    contract-defined code: 20 (Lean accepted) or accepts graceful
-//!    "unavailable" degradation when the `lean` binary is not installed.
+//!    invokes the Lean verifier and exits with a contract-defined code: 20
+//!    only when Lean accepts, otherwise 2 without publishing UNSAT.
 //! 4. Rejection path: when `--lean-path` points at a bogus binary, the
-//!    verifier reports `Unavailable` (not a soundness failure) and ay still
-//!    exits 20. This guards against CI environments without Lean installed
-//!    from flagging a correct UNSAT as a soundness failure.
+//!    verifier reports `Unavailable` and the explicit verification promise
+//!    fails closed with exit 2 and no UNSAT verdict.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -70,6 +68,10 @@ fn test_lean_verify_flag_in_help() {
     assert!(
         help.contains("--lean-path"),
         "--lean-path must appear in ay solve --help; help={help}"
+    );
+    assert!(
+        help.contains("20 only when Lean accepts") && help.contains("never publishes UNSAT"),
+        "--lean-verify help must document the fail-closed unavailable contract; help={help}"
     );
 }
 
@@ -124,15 +126,11 @@ fn test_lean_path_without_lean_verify_errors() {
 
 /// End-to-end: run ay on a trivial UNSAT DIMACS with `--lean-verify` and a
 /// `.lean4` proof path, pointing `--lean-path` at a definitely-missing
-/// binary. The verifier MUST report `Unavailable` (not Rejected), and
-/// because Unavailable is NOT a soundness failure, ay MUST still exit 20.
-///
-/// This is the contract from the development design notes:
-/// Unavailable means "we could not run Lean" (missing / timed out / IO
-/// error), which is distinct from Rejected ("Lean ran and said NO"). CI
-/// environments without `lean` installed still get a valid UNSAT result.
+/// binary. The verifier MUST report `Unavailable`; because an explicitly
+/// requested kernel check did not run, AY must exit 2 without publishing
+/// UNSAT.
 #[test]
-fn test_lean_verify_unavailable_bogus_binary_still_accepts_unsat() {
+fn test_lean_verify_unavailable_bogus_binary_fails_closed() {
     let (cnf, proof, _guard) = temp_paths("unavailable");
     let output = Command::new(ay_binary())
         .arg("--lean-verify")
@@ -145,26 +143,100 @@ fn test_lean_verify_unavailable_bogus_binary_still_accepts_unsat() {
         .expect("spawn ay");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stdout.contains("s UNSATISFIABLE"),
-        "expected UNSATISFIABLE on stdout; stdout={stdout}; stderr={stderr}"
-    );
     assert_eq!(
         output.status.code(),
-        Some(20),
-        "missing lean binary MUST degrade gracefully (exit 20), \
-         not falsely report soundness failure; stderr={stderr}"
+        Some(2),
+        "an unavailable explicitly requested Lean check must exit 2; stdout={stdout}; stderr={stderr}"
+    );
+    assert!(
+        !stdout.contains("s UNSATISFIABLE"),
+        "unavailable Lean verification leaked UNSAT: {stdout}"
     );
     assert!(
         stderr.contains("Lean verification unavailable"),
         "expected 'Lean verification unavailable' note on stderr; stderr={stderr}"
     );
-    // Crucially: the Unavailable path must NOT print a soundness-failure
-    // message. Only genuine Rejected outcomes should mention SOUNDNESS.
+    // Unavailable is an unfulfilled verification request, not a kernel
+    // rejection, so it should not be mislabeled as a soundness failure.
     assert!(
         !stderr.contains("SOUNDNESS FAILURE"),
         "Unavailable path must not claim soundness failure; stderr={stderr}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn lean_verifier_reads_authenticated_snapshot_while_public_proof_is_swapped() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let cnf = temp.path().join("input.cnf");
+    let proof = temp.path().join("proof.lean4");
+    let replacement = temp.path().join("replacement.lean4");
+    let observed_path = temp.path().join("observed-path.txt");
+    let observed_bytes = temp.path().join("observed-bytes.lean4");
+    let fake_lean = temp.path().join("fake-lean.sh");
+    std::fs::write(&cnf, TRIVIAL_UNSAT).expect("write CNF");
+    std::fs::write(&replacement, "-- MUTABLE_PUBLIC_REPLACEMENT\n")
+        .expect("write replacement proof");
+    std::fs::write(
+        &fake_lean,
+        r#"#!/bin/sh
+set -eu
+snapshot=$1
+saved="${AY_TEST_PUBLIC_PROOF}.saved"
+restore_public() {
+  rm -f "$AY_TEST_PUBLIC_PROOF"
+  if [ -e "$saved" ]; then
+    mv "$saved" "$AY_TEST_PUBLIC_PROOF"
+  fi
+}
+trap restore_public EXIT HUP INT TERM
+test "$snapshot" != "$AY_TEST_PUBLIC_PROOF"
+mv "$AY_TEST_PUBLIC_PROOF" "$saved"
+cp "$AY_TEST_REPLACEMENT" "$AY_TEST_PUBLIC_PROOF"
+printf '%s\n' "$snapshot" > "$AY_TEST_OBSERVED_PATH"
+cp "$snapshot" "$AY_TEST_OBSERVED_BYTES"
+grep -q 'theorem proof_valid' "$snapshot"
+! grep -q 'MUTABLE_PUBLIC_REPLACEMENT' "$snapshot"
+"#,
+    )
+    .expect("write fake Lean");
+    let mut permissions = std::fs::metadata(&fake_lean)
+        .expect("fake Lean metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&fake_lean, permissions).expect("make fake Lean executable");
+
+    let output = Command::new(ay_binary())
+        .arg("--lean-verify")
+        .arg("--lean-path")
+        .arg(&fake_lean)
+        .arg("--proof")
+        .arg(&proof)
+        .arg(&cnf)
+        .env("AY_TEST_PUBLIC_PROOF", &proof)
+        .env("AY_TEST_REPLACEMENT", &replacement)
+        .env("AY_TEST_OBSERVED_PATH", &observed_path)
+        .env("AY_TEST_OBSERVED_BYTES", &observed_bytes)
+        .output()
+        .expect("spawn ay with swap-capable fake Lean");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(20),
+        "authenticated snapshot verification failed: stdout={stdout}; stderr={stderr}"
+    );
+    let verifier_path = std::fs::read_to_string(&observed_path).expect("read verifier argv");
+    assert_ne!(verifier_path.trim(), proof.to_string_lossy());
+    let checked = std::fs::read_to_string(&observed_bytes).expect("read checked snapshot bytes");
+    assert!(checked.contains("theorem proof_valid"));
+    assert!(!checked.contains("MUTABLE_PUBLIC_REPLACEMENT"));
+    let retained = std::fs::read_to_string(&proof).expect("read restored public proof");
+    assert!(retained.contains("theorem proof_valid"));
+    assert!(!retained.contains("MUTABLE_PUBLIC_REPLACEMENT"));
 }
 
 /// `--proof file.lean4` must emit a kernel-checkable proof artifact, not the
@@ -211,12 +283,11 @@ fn test_lean4_proof_output_contains_kernel_checker_boundary() {
 }
 
 /// `--lean-verify` only runs when the emitted proof is Lean4. If the user
-/// combines `--lean-verify` with a `.drat` proof path, ay emits a warning
-/// and treats the flag as a no-op — the DRAT proof is still validated by
-/// `--verify-proof` (when enabled) via the internal checker. This test
-/// ensures the flag does not accidentally reject valid DRAT proofs.
+/// combines `--lean-verify` with a `.drat` proof path, the explicit Lean
+/// verification contract cannot be fulfilled. AY must fail closed with exit 2
+/// before publishing UNSAT, even though the DRAT checker accepts the file.
 #[test]
-fn test_lean_verify_with_drat_proof_warns_and_accepts() {
+fn test_lean_verify_with_drat_proof_fails_closed() {
     static FILE_ID: AtomicUsize = AtomicUsize::new(0);
     let id = FILE_ID.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
@@ -234,18 +305,17 @@ fn test_lean_verify_with_drat_proof_warns_and_accepts() {
         .expect("spawn ay");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stdout.contains("s UNSATISFIABLE"),
-        "expected UNSATISFIABLE on stdout; stdout={stdout}; stderr={stderr}"
-    );
     assert_eq!(
         output.status.code(),
-        Some(20),
-        "DRAT proof with --lean-verify should still exit 20 (flag becomes no-op); stderr={stderr}"
+        Some(2),
+        "non-Lean4 output cannot fulfill --lean-verify; stdout={stdout}; stderr={stderr}"
     );
-    // The warning is emitted by `verify_lean_proof()` when format != Lean4.
+    assert!(
+        !stdout.contains("s UNSATISFIABLE"),
+        "non-Lean4 --lean-verify leaked UNSAT: {stdout}"
+    );
     assert!(
         stderr.contains("--lean-verify requires a Lean4 proof"),
-        "expected format-mismatch warning on stderr; stderr={stderr}"
+        "expected format-mismatch error on stderr; stderr={stderr}"
     );
 }

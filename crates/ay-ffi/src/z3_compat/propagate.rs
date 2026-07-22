@@ -77,11 +77,12 @@ use ay_dpll::api::{Sort, Term, TermKind};
 use super::model_params::Z3_model_eval;
 use super::solver::{check_solver_handle, is_unit_literal, DimacsEncoder, Z3_solver_get_model};
 use super::{
-    ast_to_term, cache_ast_vector, cache_func_decl_with_symbol, ffi_function_semantic_name,
-    ffi_guard_ast, ffi_guard_int, ffi_guard_ptr, ffi_guard_void, record_ast_sort, term_to_ast,
-    ParamDescr, ParamDescrsHandle, SymbolKey, Z3Context, Z3_ast, Z3_ast_vector, Z3_context,
-    Z3_func_decl, Z3_param_descrs, Z3_solver, Z3_sort, Z3_symbol, Z3_EXCEPTION, Z3_INVALID_ARG,
-    Z3_INVALID_USAGE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK, Z3_PK_UINT, Z3_SORT_ERROR,
+    ast_to_term, cache_ast_vector, cache_func_decl_with_symbol, ffi_count_within_limit,
+    ffi_counts_within_limit, ffi_guard_ast, ffi_guard_int, ffi_guard_ptr, ffi_guard_void,
+    ffi_try_declare_function, record_ast_sort, term_to_ast, ParamDescr, ParamDescrsHandle,
+    SymbolKey, Z3Context, Z3_ast, Z3_ast_vector, Z3_context, Z3_func_decl, Z3_param_descrs,
+    Z3_solver, Z3_sort, Z3_symbol, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_TRUE,
+    Z3_L_UNDEF, Z3_OK, Z3_PK_UINT, Z3_SORT_ERROR,
 };
 
 // ============================================================================
@@ -763,6 +764,11 @@ pub unsafe extern "C" fn Z3_solver_propagate_declare(
     domain: *const Z3_sort,
     range: Z3_sort,
 ) -> Z3_func_decl {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_solver_propagate_declare domain", n) } {
+        return ptr::null_mut();
+    }
     if name.is_null() || range.is_null() {
         return ptr::null_mut();
     }
@@ -805,11 +811,7 @@ pub unsafe extern "C" fn Z3_solver_propagate_declare(
                     return ptr::null_mut();
                 }
             }
-            let semantic_name = ffi_function_semantic_name(ctx, &symbol, &dom_sorts, &range_sort);
-            match ctx
-                .solver
-                .try_declare_fun(&semantic_name, &dom_sorts, range_sort)
-            {
+            match ffi_try_declare_function(ctx, &symbol, &dom_sorts, &range_sort) {
                 Ok(decl) => {
                     ctx.ffi_used_decl_names.insert(display_name.clone());
                     cache_func_decl_with_symbol(ctx, decl, symbol.clone())
@@ -1136,6 +1138,11 @@ pub unsafe extern "C" fn Z3_solver_get_levels(
     sz: c_uint,
     levels: *mut c_uint,
 ) {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_solver_get_levels output", sz) } {
+        return;
+    }
     // Pre-extract the queried literals and the handle's assertions outside the
     // guard (raw derefs).
     // SAFETY: caller contract: `literals` is a valid vector handle (or null).
@@ -1698,6 +1705,19 @@ pub unsafe extern "C" fn Z3_solver_propagate_consequence(
     eq_rhs: *const Z3_ast,
     conseq: Z3_ast,
 ) -> bool {
+    // Equality justifications traverse two arrays (lhs and rhs), so account
+    // for both rather than counting each pair as one element.
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "Z3_solver_propagate_consequence justifications",
+            &[num_fixed, num_eqs, num_eqs],
+        )
+    } {
+        return false;
+    }
     if cb.is_null() {
         // Outside a callback: honest usage error, consequence NOT accepted.
         // SAFETY: no callback is running (null `cb`), so the context borrow

@@ -375,10 +375,13 @@ fn test_simplifier_registry_enumeration() {
         for (i, want) in SUPPORTED_SIMPLIFIER_NAMES.iter().enumerate() {
             let name = Z3_get_simplifier_name(ctx, i as c_uint);
             assert!(!name.is_null(), "simplifier name {i} must be non-null");
-            let got = CStr::from_ptr(name).to_str().unwrap();
+            let got = CStr::from_ptr(name)
+                .to_str()
+                .expect("enumerated simplifier name must be valid UTF-8");
             assert_eq!(got, *want, "name {i} must match the registry");
             // Every enumerated name is REAL: Z3_mk_simplifier accepts it.
-            let cname = CString::new(*want).unwrap();
+            let cname = CString::new(*want)
+                .expect("registered simplifier name must not contain an interior NUL");
             let s = Z3_mk_simplifier(ctx, cname.as_ptr());
             assert!(
                 !s.is_null(),

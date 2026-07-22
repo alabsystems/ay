@@ -26,9 +26,12 @@
 //! | `dispute`  | Two solvers returned different definite answers.             |
 //! | `partial`  | At least one solver returned `unknown`/`timeout`/`error`.    |
 //! | `missing`  | One of the requested solvers has no row for this benchmark.  |
+//! | `non_comparable` | Input identity is missing, legacy, or differs.         |
 //!
 //! A `dispute` is the Phase 3 `ref_wrong` signal — the caller (CLI layer)
-//! is responsible for mapping it to a non-zero exit code.
+//! is responsible for mapping it to a non-zero exit code. Resource
+//! comparability is reported independently: a same-input `sat`/`unsat`
+//! contradiction remains a dispute even when its performance envelopes differ.
 
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -65,6 +68,9 @@ pub enum CrossClass {
     /// One of the requested solvers has no row for this benchmark in the
     /// baseline store.
     Missing,
+    /// Every solver has a row, but they were not run on identical benchmark
+    /// bytes under the same enforced resource envelope.
+    NonComparable,
 }
 
 impl CrossClass {
@@ -75,6 +81,7 @@ impl CrossClass {
             Self::Dispute => "dispute",
             Self::Partial => "partial",
             Self::Missing => "missing",
+            Self::NonComparable => "non_comparable",
         }
     }
 }
@@ -89,6 +96,11 @@ pub struct CrossEntry {
     pub answers: BTreeMap<String, Option<String>>,
     /// Classification bucket.
     pub classification: String,
+    /// Whether input identity and effective enforced resource limits match.
+    pub comparable: bool,
+    /// Why otherwise-present rows cannot be compared, if applicable. This is
+    /// orthogonal to logical classification when input bytes are identical.
+    pub non_comparable_reason: Option<String>,
 }
 
 /// Aggregate report from `cmd_cross_verify`.
@@ -101,6 +113,7 @@ pub struct CrossReport {
     pub dispute: usize,
     pub partial: usize,
     pub missing: usize,
+    pub non_comparable: usize,
     pub entries: Vec<CrossEntry>,
 }
 
@@ -109,6 +122,15 @@ impl CrossReport {
     #[must_use]
     pub fn has_disputes(&self) -> bool {
         self.dispute > 0
+    }
+
+    /// Cross-solver disagreement, missing requested evidence, and
+    /// non-comparable evidence are all fail-closed outcomes for the CLI gate.
+    /// Partial (`unknown`/timeout) rows remain visible but are not, by
+    /// themselves, a soundness failure.
+    #[must_use]
+    pub fn has_failures(&self) -> bool {
+        self.has_disputes() || self.missing > 0 || self.non_comparable > 0
     }
 }
 
@@ -121,6 +143,9 @@ impl CrossReport {
 /// is non-definite.
 #[must_use]
 pub fn classify_answers(answers: &[Option<&str>]) -> CrossClass {
+    if answers.is_empty() {
+        return CrossClass::Partial;
+    }
     // Any solver missing a row -> Missing.
     if answers.iter().any(Option::is_none) {
         return CrossClass::Missing;
@@ -158,8 +183,8 @@ pub fn classify_answers(answers: &[Option<&str>]) -> CrossClass {
 /// Run the cross-verify subcommand.
 ///
 /// The caller (CLI layer) is responsible for printing `render_cross_table`
-/// (or the JSON form) and mapping `report.has_disputes()` to a non-zero
-/// exit code.
+/// (or the JSON form) and mapping `report.has_failures()` to a non-zero exit
+/// code.
 pub fn cmd_cross_verify(args: CrossVerifyArgs) -> Result<CrossReport> {
     if args.solvers.len() < 2 {
         return Err(BenchError::InvalidArgs {
@@ -220,6 +245,16 @@ pub fn build_report(
     corpus: &str,
     solvers: &[String],
 ) -> Result<CrossReport> {
+    let distinct = solvers
+        .iter()
+        .map(|solver| solver.trim())
+        .filter(|solver| !solver.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    if distinct.len() < 2 || distinct.len() != solvers.len() {
+        return Err(BenchError::InvalidArgs {
+            reason: "cross-verify requires at least 2 distinct non-empty solver names".to_string(),
+        });
+    }
     let rows = store
         .rows_for_corpus(corpus)
         .with_bench_context(|| format!("fetching baselines for corpus '{corpus}'"))?;
@@ -228,7 +263,9 @@ pub fn build_report(
             "no baseline rows for corpus '{corpus}'"
         )));
     }
-
+    // The harvest publication validator is intentionally not used here:
+    // migrated or incomplete rows must remain visible as non-comparable
+    // evidence instead of aborting the entire report.
     // Index: benchmark_path -> solver_name -> row.
     let mut by_bench: BTreeMap<String, BTreeMap<String, &BaselineRow>> = BTreeMap::new();
     for row in &rows {
@@ -255,8 +292,26 @@ pub fn build_report(
             .iter()
             .map(|s| solver_rows.get(s).map(|r| r.answer.as_str()))
             .collect();
-        let class = classify_answers(&answers_vec);
+        let comparison = if answers_vec.iter().all(Option::is_some) {
+            comparison_status(solvers, &solver_rows)
+        } else {
+            ComparisonStatus::missing()
+        };
+        // A logical contradiction only has meaning when every answer concerns
+        // exactly the same bytes. Once content identity is established, retain
+        // that classification even if timing/throughput evidence is not
+        // comparable because the resource envelopes differ.
+        let class = if comparison.content_identity_proven {
+            classify_answers(&answers_vec)
+        } else if answers_vec.iter().any(Option::is_none) {
+            CrossClass::Missing
+        } else {
+            CrossClass::NonComparable
+        };
         counts.add(class);
+        if comparison.reason.is_some() {
+            counts.non_comparable += 1;
+        }
 
         let mut answers = BTreeMap::new();
         for s in solvers {
@@ -266,6 +321,8 @@ pub fn build_report(
             benchmark_path: bench_path,
             answers,
             classification: class.as_str().to_string(),
+            comparable: comparison.content_identity_proven && comparison.reason.is_none(),
+            non_comparable_reason: comparison.reason,
         });
     }
 
@@ -277,8 +334,165 @@ pub fn build_report(
         dispute: counts.dispute,
         partial: counts.partial,
         missing: counts.missing,
+        non_comparable: counts.non_comparable,
         entries,
     })
+}
+
+struct ComparisonStatus {
+    content_identity_proven: bool,
+    reason: Option<String>,
+}
+
+impl ComparisonStatus {
+    fn missing() -> Self {
+        Self {
+            content_identity_proven: false,
+            // Missing evidence has its own aggregate/classification and is
+            // deliberately not double-counted as `non_comparable`.
+            reason: None,
+        }
+    }
+}
+
+fn comparison_status(
+    solvers: &[String],
+    rows: &BTreeMap<String, &BaselineRow>,
+) -> ComparisonStatus {
+    let selected: Vec<(&str, &BaselineRow)> = solvers
+        .iter()
+        .filter_map(|solver| rows.get(solver).map(|row| (solver.as_str(), *row)))
+        .collect();
+
+    let content_hashes: Vec<(&str, &str)> = selected
+        .iter()
+        .map(|(solver, row)| (*solver, row.content_hash.trim()))
+        .collect();
+    if content_hashes.iter().any(|(_, hash)| hash.is_empty()) {
+        return ComparisonStatus {
+            content_identity_proven: false,
+            reason: Some("one or more benchmark content hashes are missing".to_string()),
+        };
+    }
+    let unsupported: Vec<String> = content_hashes
+        .iter()
+        .filter(|(_, hash)| !is_stable_sha256(hash))
+        .map(|(solver, hash)| format!("{solver}={hash}"))
+        .collect();
+    if !unsupported.is_empty() {
+        return ComparisonStatus {
+            content_identity_proven: false,
+            reason: Some(format!(
+                "legacy or unsupported content hash; re-harvest with sha256: {}",
+                unsupported.join(", ")
+            )),
+        };
+    }
+    if let Some((_, first)) = content_hashes.first() {
+        if content_hashes
+            .iter()
+            .any(|(_, hash)| !hash.eq_ignore_ascii_case(first))
+        {
+            return ComparisonStatus {
+                content_identity_proven: false,
+                reason: Some(format!(
+                    "benchmark content differs: {}",
+                    content_hashes
+                        .iter()
+                        .map(|(solver, hash)| format!("{solver}={hash}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            };
+        }
+    }
+
+    let envelopes: Vec<(&str, Result<String, &'static str>)> = selected
+        .iter()
+        .map(|(solver, row)| (*solver, execution_envelope(row)))
+        .collect();
+    let invalid: Vec<String> = envelopes
+        .iter()
+        .filter_map(|(solver, envelope)| {
+            envelope
+                .as_ref()
+                .err()
+                .map(|reason| format!("{solver}={reason}"))
+        })
+        .collect();
+    if !invalid.is_empty() {
+        return ComparisonStatus {
+            content_identity_proven: true,
+            reason: Some(format!(
+                "one or more resource envelopes are missing or unenforced: {}",
+                invalid.join(", ")
+            )),
+        };
+    }
+    let first = envelopes.first().and_then(|(_, value)| value.as_ref().ok());
+    if envelopes
+        .iter()
+        .any(|(_, envelope)| envelope.as_ref().ok() != first)
+    {
+        return ComparisonStatus {
+            content_identity_proven: true,
+            reason: Some(format!(
+                "resource envelopes differ: {}",
+                envelopes
+                    .iter()
+                    .map(|(solver, envelope)| format!(
+                        "{solver}={}",
+                        envelope
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_else(|_| "<invalid>".to_string())
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        };
+    }
+    ComparisonStatus {
+        content_identity_proven: true,
+        reason: None,
+    }
+}
+
+fn is_stable_sha256(hash: &str) -> bool {
+    let Some(digest) = hash.trim().strip_prefix("sha256:") else {
+        return false;
+    };
+    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn execution_envelope(row: &BaselineRow) -> Result<String, &'static str> {
+    if row.solver_path.trim().is_empty()
+        || row.solver_size_bytes <= 0
+        || !is_stable_sha256(&row.solver_sha256)
+    {
+        return Err("missing stable solver binary provenance");
+    }
+    if row.resource_jobs <= 0
+        || row.resource_memlimit_mb <= 0
+        || row.resource_nbcore <= 0
+        || row.resource_headroom_mb < 0
+    {
+        return Err("invalid numeric limits");
+    }
+    let plan = crate::resource::ResourcePlan {
+        requested_jobs: usize::try_from(row.resource_requested_jobs)
+            .map_err(|_| "invalid numeric limits")?,
+        jobs: usize::try_from(row.resource_jobs).map_err(|_| "invalid numeric limits")?,
+        memlimit_mb_per_child: usize::try_from(row.resource_memlimit_mb)
+            .map_err(|_| "invalid numeric limits")?,
+        nbcore_per_child: usize::try_from(row.resource_nbcore)
+            .map_err(|_| "invalid numeric limits")?,
+        headroom_mb: usize::try_from(row.resource_headroom_mb)
+            .map_err(|_| "invalid numeric limits")?,
+        planner: "persisted-baseline".to_string(),
+    };
+    crate::resource::effective_execution_envelope(&plan, &row.resource_enforcement, row.timeout_s)
+        .map_err(|_| "no recognized complete enforced execution envelope")
 }
 
 #[derive(Default)]
@@ -287,6 +501,7 @@ struct CrossCounts {
     dispute: usize,
     partial: usize,
     missing: usize,
+    non_comparable: usize,
 }
 
 impl CrossCounts {
@@ -296,6 +511,7 @@ impl CrossCounts {
             CrossClass::Dispute => self.dispute += 1,
             CrossClass::Partial => self.partial += 1,
             CrossClass::Missing => self.missing += 1,
+            CrossClass::NonComparable => {}
         }
     }
 }
@@ -317,6 +533,27 @@ pub fn render_cross_table(report: &CrossReport) -> String {
         s.push_str(&format!(
             "  missing (solver has no row for benchmark): {}\n",
             report.missing
+        ));
+    }
+    if report.non_comparable > 0 {
+        s.push_str(&format!(
+            "  non-comparable (input/resources differ): {}\n",
+            report.non_comparable
+        ));
+    }
+
+    for entry in report
+        .entries
+        .iter()
+        .filter(|entry| entry.non_comparable_reason.is_some())
+    {
+        s.push_str(&format!(
+            "  NON-COMPARABLE {} : {}\n",
+            entry.benchmark_path,
+            entry
+                .non_comparable_reason
+                .as_deref()
+                .unwrap_or("unknown reason")
         ));
     }
 

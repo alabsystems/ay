@@ -508,8 +508,8 @@ fn test_bve_e2e_implication_chain() {
             assert!(model.len() >= num_vars, "model too small");
             verify_model_against_clauses(&model, &clauses);
             // All variables must be true due to the implication chain
-            for v in 0..num_vars {
-                assert!(model[v], "x{v} must be true in implication chain");
+            for (v, &value) in model.iter().enumerate().take(num_vars) {
+                assert!(value, "x{v} must be true in implication chain");
             }
         }
         other => panic!("expected SAT, got {other:?}"),
@@ -791,8 +791,8 @@ fn test_bve_e2e_cascading_five_variable_chain() {
             assert!(model.len() >= num_vars, "model too small");
             verify_model_against_clauses(&model, &clauses);
             // All variables must be true
-            for v in 0..num_vars {
-                assert!(model[v], "x{v} must be true in chain");
+            for (v, &value) in model.iter().enumerate().take(num_vars) {
+                assert!(value, "x{v} must be true in chain");
             }
         }
         other => panic!("expected SAT, got {other:?}"),
@@ -828,8 +828,8 @@ fn test_bve_e2e_diamond_dependency() {
             assert!(model.len() >= num_vars, "model too small");
             verify_model_against_clauses(&model, &clauses);
             // All should be true due to the implication structure
-            for v in 0..num_vars {
-                assert!(model[v], "x{v} must be true in diamond");
+            for (v, &value) in model.iter().enumerate().take(num_vars) {
+                assert!(value, "x{v} must be true in diamond");
             }
         }
         other => panic!("expected SAT, got {other:?}"),

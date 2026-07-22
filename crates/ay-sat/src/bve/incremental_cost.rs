@@ -184,9 +184,7 @@ impl IncrementalCostTracker {
         // `new_level` is recorded for Phase 2's per-level rollback; Phase 1
         // only needs to ensure no stale cost is used for triggering.
         let _ = new_level;
-        for d in &mut self.dirty {
-            *d = true;
-        }
+        self.dirty.fill(true);
     }
 
     /// Return every variable whose recorded cost is strictly below `k`.
@@ -219,12 +217,8 @@ impl IncrementalCostTracker {
     /// Drop all state and reset counters. Intended for incremental-solver
     /// restarts where the clause database is rebuilt from scratch.
     pub(crate) fn clear(&mut self) {
-        for slot in &mut self.cost_by_var {
-            *slot = Self::DEFAULT_COST;
-        }
-        for d in &mut self.dirty {
-            *d = false;
-        }
+        self.cost_by_var.fill(Self::DEFAULT_COST);
+        self.dirty.fill(false);
         self.events_processed = 0;
     }
 }

@@ -285,12 +285,15 @@ pub trait SortExt {
 
 impl SortExt for Sort {
     fn to_command_sort(&self) -> ay_frontend::command::Sort {
-        use ay_frontend::command::Sort as CmdSort;
+        use ay_frontend::command::{Index as CmdIndex, Sort as CmdSort};
         match self {
             Self::Bool => CmdSort::Simple("Bool".to_string()),
             Self::Int => CmdSort::Simple("Int".to_string()),
             Self::Real => CmdSort::Simple("Real".to_string()),
-            Self::BitVec(bv) => CmdSort::Indexed("BitVec".to_string(), vec![bv.width.to_string()]),
+            Self::BitVec(bv) => CmdSort::Indexed(
+                "BitVec".to_string(),
+                vec![CmdIndex::Numeral(bv.width.to_string())],
+            ),
             Self::Array(arr) => CmdSort::Parameterized(
                 "Array".to_string(),
                 vec![
@@ -302,7 +305,10 @@ impl SortExt for Sort {
             Self::RegLan => CmdSort::Simple("RegLan".to_string()),
             Self::FloatingPoint(e, s) => CmdSort::Indexed(
                 "FloatingPoint".to_string(),
-                vec![e.to_string(), s.to_string()],
+                vec![
+                    CmdIndex::Numeral(e.to_string()),
+                    CmdIndex::Numeral(s.to_string()),
+                ],
             ),
             Self::Uninterpreted(name) => CmdSort::Simple(name.clone()),
             Self::Datatype(dt) => CmdSort::Simple(dt.name.clone()),

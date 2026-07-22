@@ -599,9 +599,7 @@ fn winner_ref_name(winner: &str) -> Option<String> {
         }
     }
     let s = s.trim_start();
-    let end = s
-        .find(|c: char| matches!(c, ',' | '(' | ';' | '—'))
-        .unwrap_or(s.len());
+    let end = s.find([',', '(', ';', '—']).unwrap_or(s.len());
     let head = s[..end].trim();
     let token = head.split_whitespace().next()?;
     let token = token.trim_matches(|c: char| {
@@ -827,6 +825,53 @@ fn sysctl(name: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Extract a stable Linux CPU identity without guessing marketing names.
+/// x86 commonly exposes `model name`; ARM systems may expose only numeric
+/// implementer/part IDs, so retain every distinct pair in sorted order.
+#[cfg(any(feature = "bench", test))]
+fn linux_cpu_model(cpuinfo: &str, arch: &str) -> String {
+    if let Some(model) = cpuinfo.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case("model name")
+            .then(|| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    }) {
+        return model;
+    }
+
+    let mut identities = BTreeSet::new();
+    for record in cpuinfo.split("\n\n") {
+        let mut implementer = None;
+        let mut part = None;
+        for line in record.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            match key.trim() {
+                "CPU implementer" => implementer = Some(value.trim()),
+                "CPU part" => part = Some(value.trim()),
+                _ => {}
+            }
+        }
+        if let (Some(implementer), Some(part)) = (implementer, part) {
+            if !implementer.is_empty() && !part.is_empty() {
+                identities.insert(format!("implementer {implementer} part {part}"));
+            }
+        }
+    }
+
+    if identities.is_empty() {
+        arch.to_string()
+    } else {
+        format!(
+            "{arch} [{}]",
+            identities.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    }
+}
+
 /// Read this machine's specs: macOS via `sysctl hw.model
 /// machdep.cpu.brand_string hw.memsize hw.ncpu`, Linux via /proc/cpuinfo +
 /// /proc/meminfo. Missing values stay 0/"" and print as unverifiable.
@@ -851,13 +896,13 @@ fn read_local_host() -> LocalHost {
                 .lines()
                 .filter(|l| l.starts_with("processor"))
                 .count() as u32;
-            host.cpu_model = cpuinfo
-                .lines()
-                .find(|l| l.starts_with("model name"))
-                .and_then(|l| l.split(':').nth(1))
-                .map(|v| v.trim().to_string())
-                .unwrap_or_default();
+            host.cpu_model = linux_cpu_model(&cpuinfo, &host.arch);
         }
+        host.hw_model = fs::read_to_string("/sys/devices/virtual/dmi/id/product_name")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default();
         if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
             if let Some(kb) = meminfo
                 .lines()
@@ -1639,6 +1684,32 @@ citations   = ["https://example.org"]
     // ---------- host capture + verdict ----------
 
     #[test]
+    fn linux_cpu_model_prefers_marketing_model_when_present() {
+        let cpuinfo = "processor : 0\nmodel name : Example CPU 123\n";
+        assert_eq!(linux_cpu_model(cpuinfo, "x86_64"), "Example CPU 123");
+    }
+
+    #[test]
+    fn linux_cpu_model_falls_back_to_sorted_distinct_arm_ids() {
+        let cpuinfo = "\
+processor : 0\n\
+CPU implementer : 0x41\n\
+CPU part : 0xd87\n\
+\n\
+processor : 1\n\
+CPU implementer : 0x41\n\
+CPU part : 0xd87\n\
+\n\
+processor : 2\n\
+CPU implementer : 0x41\n\
+CPU part : 0xd4f\n";
+        assert_eq!(
+            linux_cpu_model(cpuinfo, "aarch64"),
+            "aarch64 [implementer 0x41 part 0xd4f, implementer 0x41 part 0xd87]"
+        );
+    }
+
+    #[test]
     fn local_host_parse_smoke() {
         let host = read_local_host();
         assert!(host.cores > 0, "cores should be detected");
@@ -1777,7 +1848,7 @@ citations   = ["https://example.org"]
 
     #[test]
     fn help_matches_design_drafts() {
-        let cmd = <BenchCompareArgs as clap::Args>::augment_args(clap::Command::new("compare"));
+        let cmd = <BenchCompareArgs as Args>::augment_args(clap::Command::new("compare"));
         let group = cmd.clone().render_long_help().to_string();
         assert!(group.contains("Every number produced here carries exactly one run class"));
         assert!(group.contains("official  imported published results"));

@@ -15,7 +15,7 @@ mod term;
 pub use datatype::{ConstructorDec, DatatypeDec, SelectorDec, SortDec};
 pub use sygus::{SygusGrammar, SygusGrammarRule};
 pub use tactic::{ApplyTactic, ParamValue, Probe, ProbeCmp, SUPPORTED_TACTIC_NAMES};
-pub use term::{Constant, MatchPattern, ParsedConstant, Term};
+pub use term::{Constant, Index, MatchPattern, ParsedConstant, QualifiedIdentifier, Term};
 
 use crate::sexp::{ParseError, SExpr, PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE};
 
@@ -35,7 +35,7 @@ pub enum Sort {
     /// A parameterized sort (Array Int Int, BitVec 32, etc.)
     Parameterized(String, Vec<Self>),
     /// An indexed sort (_ BitVec 32)
-    Indexed(String, Vec<String>),
+    Indexed(String, Vec<Index>),
 }
 
 /// Compatibility alias for [`Sort`] that makes the parser/native distinction
@@ -61,18 +61,21 @@ impl Sort {
             SExpr::Symbol(name) => Ok(Self::Simple(name.clone())),
             SExpr::List(items) if !items.is_empty() => {
                 // Check for indexed identifier (_ name index+)
-                if items[0].is_symbol("_") && items.len() >= 2 {
+                if items[0].is_symbol("_") {
+                    if items.len() < 3 {
+                        return Err(ParseError::new(
+                            "indexed sort requires a name and at least one index",
+                        ));
+                    }
                     let name = items[1]
                         .as_symbol()
                         .ok_or_else(|| ParseError::new("Expected symbol in indexed sort"))?;
                     let indices: Result<Vec<_>, _> = items[2..]
                         .iter()
-                        .map(|s| match s {
-                            SExpr::Numeral(n) => Ok(n.clone()),
-                            SExpr::Symbol(s) => Ok(s.clone()),
-                            _ => Err(ParseError::new(
-                                "Expected numeral or symbol in indexed sort",
-                            )),
+                        .map(|sexp| {
+                            Index::from_sexp(sexp).ok_or_else(|| {
+                                ParseError::new("Expected an index token in indexed sort")
+                            })
                         })
                         .collect();
                     Ok(Self::Indexed(name.to_string(), indices?))

@@ -12,16 +12,34 @@
 #   Int arithmetic ONLY in the *LIA logics. In QF_DT/QF_UFDT we use enums,
 #   uninterpreted sorts (E), Bool, and nested datatypes -- all interpreted
 #   consistently by both solvers.
-import argparse, os, random, subprocess, sys, tempfile
+import argparse, json, os, random, sys, tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _oom_guard import (  # noqa: E402
+    plan_solver_resources,
+    run_captured,
+    warn_concurrent_build,
+)
+
+RESOURCE_PLAN = None
 
 
 def run(cmd, timeout):
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
+        p = run_captured(
+            cmd, RESOURCE_PLAN.memlimit_mb, timeout,
+            label="diff_fuzz_dt.py",
+            env=dict(os.environ, MEMLIMIT=str(RESOURCE_PLAN.memlimit_mb),
+                     NBCORE=str(RESOURCE_PLAN.nbcore)),
+        )
+    except OSError as error:
+        return f"error:{error}"
+    if p.memout:
+        return "memout"
+    if p.timed_out:
         return "timeout"
-    except Exception as e:
-        return f"error:{e}"
+    if p.output_truncated:
+        return "error:output-truncated"
     for line in p.stdout.splitlines():
         t = line.strip()
         if t in ("sat", "unsat", "unknown"):
@@ -407,6 +425,7 @@ def minimize(header_lines, asserts, ay_bin, z3_bin, timeout, target_ay, target_z
 
 
 def main():
+    global RESOURCE_PLAN
     ap = argparse.ArgumentParser()
     ap.add_argument("--logics", default="QF_DT,QF_UFDT,QF_UFDTLIA,AUFDTLIA")
     ap.add_argument("--n", type=int, default=2500)
@@ -416,8 +435,23 @@ def main():
     ap.add_argument("--timeout", type=float, default=5.0)
     ap.add_argument("--out-dir", default="/tmp/fuzz_dt_witnesses")
     args = ap.parse_args()
+    if args.n <= 0 or args.timeout <= 0:
+        ap.error("--n and --timeout must be positive")
+
+    warn_concurrent_build()
+    RESOURCE_PLAN = plan_solver_resources(1, label="diff_fuzz_dt.py")
+    envelope = {
+        "requested_jobs": 1, "jobs": RESOURCE_PLAN.jobs,
+        "memlimit_mb_per_child": RESOURCE_PLAN.memlimit_mb,
+        "nbcore_per_child": RESOURCE_PLAN.nbcore,
+        "headroom_mb": RESOURCE_PLAN.headroom_mb,
+        "enforcement": "process-group rss_watchdog; MEMLIMIT/NBCORE environment",
+    }
 
     os.makedirs(args.out_dir, exist_ok=True)
+    with open(os.path.join(args.out_dir, "resource-envelope.json"), "w") as fh:
+        json.dump(envelope, fh, indent=2)
+        fh.write("\n")
     rng = random.Random(args.seed)
     logics = args.logics.split(",")
     conflicts = 0
@@ -461,6 +495,17 @@ def main():
     for L in logics:
         c, bd = per_logic[L]
         print(f"   {L}: {c} cases, both-def={bd} ({100*bd/max(1,c):.0f}%)")
+    with open(os.path.join(args.out_dir, "summary.json"), "w") as fh:
+        json.dump({
+            "logics": logics,
+            "seed": args.seed,
+            "cases": args.n,
+            "both_definite": both_def,
+            "conflicts": conflicts,
+            "per_logic": per_logic,
+            "resource_plan": envelope,
+        }, fh, indent=2)
+        fh.write("\n")
     sys.exit(1 if conflicts else 0)
 
 

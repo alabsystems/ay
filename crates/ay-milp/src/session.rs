@@ -1042,7 +1042,10 @@ impl BabSession {
         self.incumbent_seed = Some(values.to_vec());
     }
 
-    /// Suggest a branching order. Advice only.
+    /// Suggest a branching order for binary columns. Advice only: valid,
+    /// currently branchable hints break ties between equally-scored native
+    /// branch candidates; stronger measured/structural choices still win.
+    /// Stale, fixed, non-binary, and duplicate handles are ignored.
     pub fn hint_branch_order(&mut self, cols: &[Col]) {
         self.branch_hints = cols.to_vec();
     }
@@ -1122,8 +1125,18 @@ impl BabSession {
                 // A session-supplied incumbent seed (advice only — exactly re-checked
                 // inside; a bad seed is dropped, never believed) reaches the tree here.
                 let mut raw = match self.incumbent_seed.as_deref() {
-                    Some(seed) => crate::bab::solve_milp_seeded(&self.model, &self.opts, seed),
-                    None => crate::bab::solve_milp(&self.model, &self.opts),
+                    Some(seed) => crate::bab::solve_milp_seeded(
+                        &self.model,
+                        &self.opts,
+                        seed,
+                        &self.branch_hints,
+                    ),
+                    None if self.branch_hints.is_empty() => {
+                        crate::bab::solve_milp(&self.model, &self.opts)
+                    }
+                    None => {
+                        crate::bab::solve_milp_hinted(&self.model, &self.opts, &self.branch_hints)
+                    }
                 };
                 #[cfg(feature = "smt")]
                 if raw.is_unknown() && !expired(&self.opts) && self.smt_fallback_within_reach() {
@@ -1442,7 +1455,7 @@ mod tests {
     /// Small model, ample remaining budget: the fallback stays reachable.
     #[test]
     fn smt_fallback_entered_with_ample_budget() {
-        let opts = SolveOpts::new().with_deadline(Instant::now() + Duration::from_secs(3_600));
+        let opts = SolveOpts::new().with_deadline(Instant::now() + Duration::from_hours(1));
         let s = BabSession::new(binary_model(1), &opts).unwrap();
         assert!(s.smt_fallback_within_reach());
     }
@@ -1462,7 +1475,10 @@ mod tests {
     /// likewise below the floor.
     #[test]
     fn smt_fallback_declined_past_deadline() {
-        let opts = SolveOpts::new().with_deadline(Instant::now() - Duration::from_secs(1));
+        let expired_at = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the monotonic clock must be at least one second old");
+        let opts = SolveOpts::new().with_deadline(expired_at);
         let s = BabSession::new(binary_model(1), &opts).unwrap();
         assert!(!s.smt_fallback_within_reach());
     }
@@ -1471,7 +1487,7 @@ mod tests {
     /// declines on its own even with ample budget remaining.
     #[test]
     fn smt_fallback_declined_above_int_ceiling_with_ample_budget() {
-        let opts = SolveOpts::new().with_deadline(Instant::now() + Duration::from_secs(3_600));
+        let opts = SolveOpts::new().with_deadline(Instant::now() + Duration::from_hours(1));
         let s = BabSession::new(binary_model(1_025), &opts).unwrap();
         assert!(!s.smt_fallback_within_reach());
     }

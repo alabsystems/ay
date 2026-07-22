@@ -980,7 +980,7 @@ fn fmla_postcheck_admission_omits_unretained_learned_lrat_artifact() {
     fs::create_dir_all(&outside_dir).unwrap();
     let outside = outside_dir.join("learned-lrat-dry-run-proof-artifact.json");
     write_fmla_learned_lrat_dry_run_artifact(&outside);
-    let candidates = vec![outside];
+    let candidates = [outside];
     let retained =
         retained_fmla_learned_lrat_dry_run_artifact(&fixture.case_dir, candidates.iter()).unwrap();
     assert!(retained.is_none());

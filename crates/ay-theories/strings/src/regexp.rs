@@ -20,6 +20,106 @@ use ay_core::{Symbol, TheoryLit};
 
 use crate::infer::{InferenceKind, InferenceManager};
 use crate::state::SolverState;
+use crate::RegexWorkLimitExceeded;
+
+/// One memoised sub-problem of the concrete-membership evaluator.
+///
+/// The evaluator is a pure function of `(TermStore, s, node)`, and `TermStore`
+/// is immutable for the whole call, so a `(node, s)` pair has ONE answer. The
+/// backtracking split loops in `eval_concat` / `eval_star` / `eval_loop` ask
+/// for the same pair over and over — that is exactly what makes an unmemoised
+/// recursive-descent matcher exponential (catastrophic backtracking). Caching
+/// the five recursion entry points makes the evaluator polynomial without
+/// changing a single answer it returns.
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+enum ReKey {
+    /// `evaluate(s, node)`.
+    Eval(TermId),
+    /// `eval_star(s, body)` — "s is a concatenation of `body` matches".
+    Star(TermId),
+    /// `eval_concat(s, args_of(node), idx)`.
+    Concat(TermId, u32),
+    /// `eval_loop(s, body, lo, hi)`.
+    Loop(TermId, u32, u32),
+    /// `delta(node)` — "node accepts the empty string".
+    Delta(TermId),
+}
+
+/// Memo for ONE top-level [`RegExpSolver::evaluate`] call. The `&'a str` keys
+/// are sub-slices of that call's input, so they cost nothing to store.
+type ReMemo<'a> = ay_core::kani_compat::DetHashMap<(ReKey, &'a str), Option<bool>>;
+
+/// Memo entry cap. Bounds memory on a pathological (long string × large regex)
+/// pair; a new miss at the cap fails closed instead of resuming potentially
+/// exponential uncached recursion.
+const RE_MEMO_CAP: usize = 1 << 20;
+
+/// Shared cooperative budget for one bounded regex operation.
+///
+/// `str.replace_re_all` deliberately carries one of these through every
+/// successive match search. Resetting it for each candidate substring or
+/// replacement would turn a per-operation bound into an unbounded multiplier.
+pub(crate) struct RegexWorkBudget {
+    remaining: Option<u64>,
+    memo_cap: usize,
+    exhausted: bool,
+}
+
+impl RegexWorkBudget {
+    pub(crate) fn unlimited() -> Self {
+        Self {
+            remaining: None,
+            memo_cap: RE_MEMO_CAP,
+            exhausted: false,
+        }
+    }
+
+    pub(crate) fn limited(limit: u64) -> Self {
+        Self {
+            remaining: Some(limit),
+            memo_cap: RE_MEMO_CAP,
+            exhausted: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn limited_with_memo_cap(limit: u64, memo_cap: usize) -> Self {
+        Self {
+            remaining: Some(limit),
+            memo_cap,
+            exhausted: false,
+        }
+    }
+
+    /// Charge one matcher consultation before its memo lookup or computation.
+    fn charge(&mut self) -> bool {
+        if let Some(remaining) = &mut self.remaining {
+            if *remaining == 0 {
+                self.exhausted = true;
+                return false;
+            }
+            *remaining -= 1;
+        }
+        RE_WORK.with(|c| c.set(c.get().saturating_add(1)));
+        true
+    }
+}
+
+thread_local! {
+    /// Monotone count of membership sub-problem CONSULTATIONS on this thread.
+    /// The regex matcher's whole cost lives inside one
+    /// `evaluate_term` frame, so the evaluator's own node-visit clock cannot
+    /// see it — a single `str.in_re` atom over an industrial regex can be
+    /// four orders of magnitude more expensive than a whole `str.substr` nest.
+    /// Callers that budget work by counting (the W4 witness search) add this to
+    /// their clock so both shapes are bounded by one number.
+    static RE_WORK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread's regex membership work counter (see `RE_WORK`).
+pub(crate) fn eval_work() -> u64 {
+    RE_WORK.with(std::cell::Cell::get)
+}
 
 /// Result of searching for the first regex match in a string.
 #[derive(Debug)]
@@ -129,6 +229,92 @@ impl RegExpSolver {
     /// This is a recursive descent evaluator that works directly on the
     /// term representation without creating intermediate terms.
     pub(crate) fn evaluate(terms: &TermStore, s: &str, r: TermId) -> Option<bool> {
+        let mut memo = ReMemo::default();
+        let mut budget = RegexWorkBudget::unlimited();
+        Self::eval_memo(terms, s, r, &mut memo, &mut budget)
+    }
+
+    /// Bounded counterpart of [`Self::evaluate`].
+    pub(crate) fn evaluate_with_work_limit(
+        terms: &TermStore,
+        s: &str,
+        r: TermId,
+        limit: u64,
+    ) -> Result<Option<bool>, RegexWorkLimitExceeded> {
+        let mut budget = RegexWorkBudget::limited(limit);
+        Self::evaluate_with_budget(terms, s, r, &mut budget)
+    }
+
+    fn evaluate_with_budget(
+        terms: &TermStore,
+        s: &str,
+        r: TermId,
+        budget: &mut RegexWorkBudget,
+    ) -> Result<Option<bool>, RegexWorkLimitExceeded> {
+        if budget.exhausted {
+            return Err(RegexWorkLimitExceeded);
+        }
+        let mut memo = ReMemo::default();
+        let out = Self::eval_memo(terms, s, r, &mut memo, budget);
+        if budget.exhausted {
+            Err(RegexWorkLimitExceeded)
+        } else {
+            Ok(out)
+        }
+    }
+
+    /// Memo lookup/insert wrapper shared by the four recursion entry points.
+    #[inline]
+    fn memoised<'a>(
+        memo: &mut ReMemo<'a>,
+        key: (ReKey, &'a str),
+        budget: &mut RegexWorkBudget,
+        compute: impl FnOnce(&mut ReMemo<'a>, &mut RegexWorkBudget) -> Option<bool>,
+    ) -> Option<bool> {
+        // Charged on every CONSULTATION, hit or miss: a cached hit still costs
+        // a key hash over the substring, and the backtracking split loops are
+        // overwhelmingly hits — counting only misses under-reports the
+        // matcher's real cost by one to two orders of magnitude.
+        if !budget.charge() {
+            return None;
+        }
+        if let Some(&hit) = memo.get(&key) {
+            return hit;
+        }
+        if memo.len() >= budget.memo_cap {
+            return None;
+        }
+        let out = compute(memo, budget);
+        // Never memoize a budget-aborted `None`: that is not a semantic answer
+        // and must not poison another lookup if this context is inspected.
+        if !budget.exhausted && memo.len() < budget.memo_cap {
+            memo.insert(key, out);
+        }
+        out
+    }
+
+    /// The memoised body of [`Self::evaluate`]. Every recursive call in this
+    /// module goes through here (or through the memoised `eval_*` helpers), so
+    /// each `(node, substring)` pair is decided at most once per top-level call.
+    fn eval_memo<'a>(
+        terms: &TermStore,
+        s: &'a str,
+        r: TermId,
+        memo: &mut ReMemo<'a>,
+        budget: &mut RegexWorkBudget,
+    ) -> Option<bool> {
+        Self::memoised(memo, (ReKey::Eval(r), s), budget, |memo, budget| {
+            Self::eval_uncached(terms, s, r, memo, budget)
+        })
+    }
+
+    fn eval_uncached<'a>(
+        terms: &TermStore,
+        s: &'a str,
+        r: TermId,
+        memo: &mut ReMemo<'a>,
+        budget: &mut RegexWorkBudget,
+    ) -> Option<bool> {
         let TermData::App(sym, args) = terms.get(r) else {
             return None;
         };
@@ -178,13 +364,13 @@ impl RegExpSolver {
             // s matches iff s can be split into s1.s2...sn where si matches Ri.
             "re.++" if !args.is_empty() => {
                 let children: Vec<_> = args.clone();
-                Self::eval_concat(terms, s, &children, 0)
+                Self::eval_concat(terms, s, r, &children, 0, memo, budget)
             }
 
             // re.union(R1, R2, ...): s matches iff s matches any Ri.
             "re.union" if !args.is_empty() => {
                 for &child in args {
-                    if Self::evaluate(terms, s, child)? {
+                    if Self::eval_memo(terms, s, child, memo, budget)? {
                         return Some(true);
                     }
                 }
@@ -194,7 +380,7 @@ impl RegExpSolver {
             // re.inter(R1, R2, ...): s matches iff s matches all Ri.
             "re.inter" if !args.is_empty() => {
                 for &child in args {
-                    if !Self::evaluate(terms, s, child)? {
+                    if !Self::eval_memo(terms, s, child, memo, budget)? {
                         return Some(false);
                     }
                 }
@@ -207,16 +393,16 @@ impl RegExpSolver {
                 if s.is_empty() {
                     return Some(true);
                 }
-                Self::eval_star(terms, s, args[0])
+                Self::eval_star(terms, s, args[0], memo, budget)
             }
 
             // re.+(R): one or more. s matches iff s is non-empty and can be
             // split into parts each matching R.
             "re.+" if args.len() == 1 => {
                 if s.is_empty() {
-                    return Self::delta(terms, args[0]);
+                    return Self::delta_memo(terms, args[0], memo, budget);
                 }
-                Self::eval_star(terms, s, args[0])
+                Self::eval_star(terms, s, args[0], memo, budget)
             }
 
             // re.opt(R): zero or one. s matches iff s = "" or s matches R.
@@ -224,19 +410,21 @@ impl RegExpSolver {
                 if s.is_empty() {
                     return Some(true);
                 }
-                Self::evaluate(terms, s, args[0])
+                Self::eval_memo(terms, s, args[0], memo, budget)
             }
 
             // re.comp(R): complement. s matches iff s does NOT match R.
-            "re.comp" if args.len() == 1 => Self::evaluate(terms, s, args[0]).map(|b| !b),
+            "re.comp" if args.len() == 1 => {
+                Self::eval_memo(terms, s, args[0], memo, budget).map(|b| !b)
+            }
 
             // re.diff(R1, R2): difference. s matches iff s matches R1 and not R2.
             "re.diff" if args.len() == 2 => {
-                let m1 = Self::evaluate(terms, s, args[0])?;
+                let m1 = Self::eval_memo(terms, s, args[0], memo, budget)?;
                 if !m1 {
                     return Some(false);
                 }
-                let m2 = Self::evaluate(terms, s, args[1])?;
+                let m2 = Self::eval_memo(terms, s, args[1], memo, budget)?;
                 Some(!m2)
             }
 
@@ -254,7 +442,7 @@ impl RegExpSolver {
                 if lo > hi {
                     return Some(false);
                 }
-                Self::eval_loop(terms, s, args[0], lo, hi)
+                Self::eval_loop(terms, s, args[0], lo, hi, memo, budget)
             }
 
             _ => None,
@@ -265,21 +453,56 @@ impl RegExpSolver {
     ///
     /// Tries all possible split points for the first child's match length.
     /// Uses backtracking to find a valid decomposition.
-    fn eval_concat(terms: &TermStore, s: &str, children: &[TermId], idx: usize) -> Option<bool> {
+    fn eval_concat<'a>(
+        terms: &TermStore,
+        s: &'a str,
+        node: TermId,
+        children: &[TermId],
+        idx: usize,
+        memo: &mut ReMemo<'a>,
+        budget: &mut RegexWorkBudget,
+    ) -> Option<bool> {
+        // `node` identifies the `re.++` term, so `(node, idx, s)` names this
+        // sub-problem uniquely — `children` is exactly `args_of(node)`.
+        Self::memoised(
+            memo,
+            (ReKey::Concat(node, idx as u32), s),
+            budget,
+            |memo, budget| Self::eval_concat_uncached(terms, s, node, children, idx, memo, budget),
+        )
+    }
+
+    fn eval_concat_uncached<'a>(
+        terms: &TermStore,
+        s: &'a str,
+        node: TermId,
+        children: &[TermId],
+        idx: usize,
+        memo: &mut ReMemo<'a>,
+        budget: &mut RegexWorkBudget,
+    ) -> Option<bool> {
         if idx >= children.len() {
             return Some(s.is_empty());
         }
 
         if idx == children.len() - 1 {
             // Last child must match the entire remaining string.
-            return Self::evaluate(terms, s, children[idx]);
+            return Self::eval_memo(terms, s, children[idx], memo, budget);
         }
 
         // Optimization: if current child is str.to_re(constant), only one
         // split point is valid (the constant must be a prefix).
         if let Some(prefix) = Self::fixed_string(terms, children[idx]) {
             if s.starts_with(prefix.as_str()) {
-                return Self::eval_concat(terms, &s[prefix.len()..], children, idx + 1);
+                return Self::eval_concat(
+                    terms,
+                    &s[prefix.len()..],
+                    node,
+                    children,
+                    idx + 1,
+                    memo,
+                    budget,
+                );
             } else {
                 return Some(false);
             }
@@ -293,8 +516,8 @@ impl RegExpSolver {
             let prefix = &s[..byte_offset];
             let suffix = &s[byte_offset..];
 
-            if Self::evaluate(terms, prefix, children[idx])?
-                && Self::eval_concat(terms, suffix, children, idx + 1)?
+            if Self::eval_memo(terms, prefix, children[idx], memo, budget)?
+                && Self::eval_concat(terms, suffix, node, children, idx + 1, memo, budget)?
             {
                 return Some(true);
             }
@@ -307,7 +530,25 @@ impl RegExpSolver {
     ///
     /// Tries all non-empty prefixes of `s` that match `R`, then recursively
     /// checks the remainder against `R*`.
-    fn eval_star(terms: &TermStore, s: &str, r: TermId) -> Option<bool> {
+    fn eval_star<'a>(
+        terms: &TermStore,
+        s: &'a str,
+        r: TermId,
+        memo: &mut ReMemo<'a>,
+        budget: &mut RegexWorkBudget,
+    ) -> Option<bool> {
+        Self::memoised(memo, (ReKey::Star(r), s), budget, |memo, budget| {
+            Self::eval_star_uncached(terms, s, r, memo, budget)
+        })
+    }
+
+    fn eval_star_uncached<'a>(
+        terms: &TermStore,
+        s: &'a str,
+        r: TermId,
+        memo: &mut ReMemo<'a>,
+        budget: &mut RegexWorkBudget,
+    ) -> Option<bool> {
         if s.is_empty() {
             return Some(true);
         }
@@ -338,7 +579,9 @@ impl RegExpSolver {
             let prefix = &s[..byte_offset];
             let suffix = &s[byte_offset..];
 
-            if Self::evaluate(terms, prefix, r)? && Self::eval_star(terms, suffix, r)? {
+            if Self::eval_memo(terms, prefix, r, memo, budget)?
+                && Self::eval_star(terms, suffix, r, memo, budget)?
+            {
                 return Some(true);
             }
         }
@@ -347,7 +590,39 @@ impl RegExpSolver {
     }
 
     /// Evaluate bounded repetition: does `s` match `R` repeated between `lo` and `hi` times?
-    fn eval_loop(terms: &TermStore, s: &str, r: TermId, lo: usize, hi: usize) -> Option<bool> {
+    fn eval_loop<'a>(
+        terms: &TermStore,
+        s: &'a str,
+        r: TermId,
+        lo: usize,
+        hi: usize,
+        memo: &mut ReMemo<'a>,
+        budget: &mut RegexWorkBudget,
+    ) -> Option<bool> {
+        Self::memoised(
+            memo,
+            (
+                ReKey::Loop(
+                    r,
+                    lo.min(u32::MAX as usize) as u32,
+                    hi.min(u32::MAX as usize) as u32,
+                ),
+                s,
+            ),
+            budget,
+            |memo, budget| Self::eval_loop_uncached(terms, s, r, lo, hi, memo, budget),
+        )
+    }
+
+    fn eval_loop_uncached<'a>(
+        terms: &TermStore,
+        s: &'a str,
+        r: TermId,
+        lo: usize,
+        hi: usize,
+        memo: &mut ReMemo<'a>,
+        budget: &mut RegexWorkBudget,
+    ) -> Option<bool> {
         if hi == 0 {
             return Some(s.is_empty());
         }
@@ -362,7 +637,7 @@ impl RegExpSolver {
             if lo == 0 {
                 return Some(true);
             }
-            return Self::is_nullable(terms, r);
+            return Self::delta_memo(terms, r, memo, budget);
         }
         let char_count = s.chars().count();
         for len in 1..=char_count {
@@ -370,9 +645,9 @@ impl RegExpSolver {
             let prefix = &s[..byte_offset];
             let suffix = &s[byte_offset..];
 
-            if Self::evaluate(terms, prefix, r)? {
+            if Self::eval_memo(terms, prefix, r, memo, budget)? {
                 let new_lo = lo.saturating_sub(1);
-                if Self::eval_loop(terms, suffix, r, new_lo, hi - 1)? {
+                if Self::eval_loop(terms, suffix, r, new_lo, hi - 1, memo, budget)? {
                     return Some(true);
                 }
             }
@@ -399,6 +674,28 @@ impl RegExpSolver {
     ///
     /// Reference: CVC5 `regexp_operation.cpp:124-264`.
     fn delta(terms: &TermStore, r: TermId) -> Option<bool> {
+        let mut memo = ReMemo::default();
+        let mut budget = RegexWorkBudget::unlimited();
+        Self::delta_memo(terms, r, &mut memo, &mut budget)
+    }
+
+    fn delta_memo(
+        terms: &TermStore,
+        r: TermId,
+        memo: &mut ReMemo<'_>,
+        budget: &mut RegexWorkBudget,
+    ) -> Option<bool> {
+        Self::memoised(memo, (ReKey::Delta(r), ""), budget, |memo, budget| {
+            Self::delta_uncached(terms, r, memo, budget)
+        })
+    }
+
+    fn delta_uncached(
+        terms: &TermStore,
+        r: TermId,
+        memo: &mut ReMemo<'_>,
+        budget: &mut RegexWorkBudget,
+    ) -> Option<bool> {
         let TermData::App(sym, args) = terms.get(r) else {
             return None;
         };
@@ -416,7 +713,7 @@ impl RegExpSolver {
 
             "re.++" if !args.is_empty() => {
                 for &child in args {
-                    if !Self::delta(terms, child)? {
+                    if !Self::delta_memo(terms, child, memo, budget)? {
                         return Some(false);
                     }
                 }
@@ -425,7 +722,7 @@ impl RegExpSolver {
 
             "re.union" if !args.is_empty() => {
                 for &child in args {
-                    if Self::delta(terms, child)? {
+                    if Self::delta_memo(terms, child, memo, budget)? {
                         return Some(true);
                     }
                 }
@@ -434,7 +731,7 @@ impl RegExpSolver {
 
             "re.inter" if !args.is_empty() => {
                 for &child in args {
-                    if !Self::delta(terms, child)? {
+                    if !Self::delta_memo(terms, child, memo, budget)? {
                         return Some(false);
                     }
                 }
@@ -442,16 +739,33 @@ impl RegExpSolver {
             }
 
             "re.*" | "re.opt" if args.len() == 1 => Some(true),
-            "re.+" if args.len() == 1 => Self::delta(terms, args[0]),
-            "re.comp" if args.len() == 1 => Self::delta(terms, args[0]).map(|b| !b),
+            "re.+" if args.len() == 1 => Self::delta_memo(terms, args[0], memo, budget),
+            "re.comp" if args.len() == 1 => {
+                Self::delta_memo(terms, args[0], memo, budget).map(|b| !b)
+            }
 
             "re.diff" if args.len() == 2 => {
-                let d1 = Self::delta(terms, args[0])?;
-                let d2 = Self::delta(terms, args[1])?;
+                let d1 = Self::delta_memo(terms, args[0], memo, budget)?;
+                let d2 = Self::delta_memo(terms, args[1], memo, budget)?;
                 Some(d1 && !d2)
             }
 
-            // (_ re.loop n m) R: nullable iff n == 0 or R is nullable.
+            // (_ re.loop n m) R: `⋃_{k=n}^{m} L(R)^k`, so nullable iff the union
+            // is non-degenerate AND (n == 0 or R is nullable).
+            //
+            // SMT-LIB: `n > m` makes the index set EMPTY, so the regex denotes
+            // the EMPTY language, which is NOT nullable. Missing that check made
+            // `delta` answer `true` for `""` in the empty language, which is
+            // unsound in BOTH directions on the UNSAT path:
+            //   * `evaluate` uses it for `re.+`/`re.loop` over `""`, so a
+            //     `(not (str.in_re "" R))` assertion was refuted by a bogus
+            //     "yes it matches" — a wrong theory conflict;
+            //   * `is_nullable` is the core solver's positive-length guard, and
+            //     a complemented degenerate loop (`(re.comp ((_ re.loop 4 2) R))`
+            //     = `Σ*`) was reported NON-nullable, i.e. a bogus `|x| > 0`.
+            // `evaluate`, `accepted_lengths` and `WeRegex::loop_bounded` all
+            // already fold `n > m` to the empty language; only `delta` did not
+            // (#regex-loop-degenerate-bounds).
             "re.loop" if args.len() == 1 => {
                 let Symbol::Indexed(_, indices) = sym else {
                     return None;
@@ -459,10 +773,13 @@ impl RegExpSolver {
                 if indices.len() != 2 {
                     return None;
                 }
+                if indices[0] > indices[1] {
+                    return Some(false);
+                }
                 if indices[0] == 0 {
                     Some(true)
                 } else {
-                    Self::delta(terms, args[0])
+                    Self::delta_memo(terms, args[0], memo, budget)
                 }
             }
 
@@ -757,20 +1074,33 @@ impl RegExpSolver {
     /// leftmost position. Returns `Incomplete` if the regex contains
     /// constructs that `evaluate()` cannot handle.
     pub(crate) fn find_first_match(terms: &TermStore, s: &str, r: TermId) -> MatchResult {
+        let mut budget = RegexWorkBudget::unlimited();
+        match Self::find_first_match_with_budget(terms, s, r, &mut budget) {
+            Ok(result) => result,
+            Err(_) => MatchResult::Incomplete,
+        }
+    }
+
+    pub(crate) fn find_first_match_with_budget(
+        terms: &TermStore,
+        s: &str,
+        r: TermId,
+        budget: &mut RegexWorkBudget,
+    ) -> Result<MatchResult, RegexWorkLimitExceeded> {
         let chars: Vec<char> = s.chars().collect();
         for start in 0..=chars.len() {
             let start_byte = chars[..start].iter().map(|c| c.len_utf8()).sum::<usize>();
             for end in start..=chars.len() {
                 let end_byte = chars[..end].iter().map(|c| c.len_utf8()).sum::<usize>();
                 let substr = &s[start_byte..end_byte];
-                match Self::evaluate(terms, substr, r) {
-                    Some(true) => return MatchResult::Found(start_byte, end_byte),
+                match Self::evaluate_with_budget(terms, substr, r, budget)? {
+                    Some(true) => return Ok(MatchResult::Found(start_byte, end_byte)),
                     Some(false) => {}
-                    None => return MatchResult::Incomplete,
+                    None => return Ok(MatchResult::Incomplete),
                 }
             }
         }
-        MatchResult::NoMatch
+        Ok(MatchResult::NoMatch)
     }
 }
 

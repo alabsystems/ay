@@ -54,7 +54,7 @@
 //! verification consumer. Every divergence carries a `DIVERGENCE:` doc line
 //! explaining why the ignore/refusal is sound.
 
-use std::ffi::{c_int, c_uint, c_void, CStr};
+use std::ffi::{c_int, c_uint, c_void};
 
 use ay_chc::{ChcExpr, ChcOp, ChcSort, ChcStatistics};
 use ay_dpll::api::{Solver, Sort, Term, TermKind};
@@ -62,12 +62,13 @@ use ay_dpll::api::{Solver, Sort, Term, TermKind};
 use super::fixedpoint::build_lemma_hint;
 use super::statistics::StatEntry;
 use super::{
-    apply_supported_params, ast_to_term, cache_ast_vector, cache_string, ffi_guard_ast,
-    ffi_guard_const_ptr, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, record_ast_sort,
-    term_to_ast, ParamDescr, ParamDescrsHandle, StatsHandle, Z3Context, Z3_ast, Z3_ast_vector,
-    Z3_context, Z3_fixedpoint, Z3_fixedpoint_query, Z3_func_decl, Z3_param_descrs, Z3_params,
-    Z3_stats, Z3_string, Z3_symbol, Z3_EXCEPTION, Z3_FILE_ACCESS_ERROR, Z3_INVALID_ARG,
-    Z3_INVALID_USAGE, Z3_OK, Z3_PK_BOOL, Z3_PK_STRING, Z3_PK_UINT, Z3_SORT_ERROR,
+    apply_supported_params, ast_to_term, cache_ast_vector, cache_string, ffi_count_within_limit,
+    ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
+    ffi_read_bounded_text, record_ast_sort, term_to_ast, ParamDescr, ParamDescrsHandle,
+    StatsHandle, Z3Context, Z3_ast, Z3_ast_vector, Z3_context, Z3_fixedpoint, Z3_fixedpoint_query,
+    Z3_func_decl, Z3_param_descrs, Z3_params, Z3_stats, Z3_string, Z3_symbol, Z3_EXCEPTION,
+    Z3_FILE_ACCESS_ERROR, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_OK, Z3_PK_BOOL, Z3_PK_STRING,
+    Z3_PK_UINT, Z3_SORT_ERROR,
 };
 
 // ============================================================================
@@ -263,6 +264,11 @@ pub unsafe extern "C" fn Z3_fixedpoint_add_fact(
     num_args: c_uint,
     args: *const c_uint,
 ) {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_fixedpoint_add_fact arguments", num_args) } {
+        return;
+    }
     if d.is_null() || r.is_null() {
         return;
     }
@@ -388,10 +394,7 @@ pub unsafe extern "C" fn Z3_fixedpoint_from_file(
         None
     } else {
         // SAFETY: caller guarantees a valid null-terminated C string when non-null.
-        match unsafe { CStr::from_ptr(s) }.to_str() {
-            Ok(v) => Some(v.to_string()),
-            Err(_) => None,
-        }
+        unsafe { ffi_read_bounded_text(s) }.ok()
     };
     // SAFETY: `ffi_guard_ptr` handles null `c` and catches panics; `f` is
     // null-checked below.
@@ -407,9 +410,10 @@ pub unsafe extern "C" fn Z3_fixedpoint_from_file(
                 ctx.error_msg = Some("Z3_fixedpoint_from_file: null/invalid path".to_string());
                 return cache_ast_vector(ctx, Vec::new());
             };
-            // Real file read (honors Z3_FILE_ACCESS_ERROR on failure).
-            let _contents = match std::fs::read_to_string(path) {
-                Ok(v) => v,
+            // The dialect is unsupported, so verify access without allocating
+            // and reading an arbitrarily large source that will be rejected.
+            let _file = match std::fs::File::open(path) {
+                Ok(file) => file,
                 Err(e) => {
                     ctx.last_error = Z3_FILE_ACCESS_ERROR;
                     ctx.error_msg = Some(format!("Z3_fixedpoint_from_file: {e}"));
@@ -421,7 +425,7 @@ pub unsafe extern "C" fn Z3_fixedpoint_from_file(
             ctx.last_error = Z3_EXCEPTION;
             ctx.error_msg = Some(
                 "Z3_fixedpoint_from_file: fixedpoint-script parsing is not yet supported \
-                 (pending Z3_fixedpoint_from_string); the file was read but no rules were added"
+                 (pending Z3_fixedpoint_from_string); the file was opened but no rules were added"
                     .to_string(),
             );
             cache_ast_vector(ctx, Vec::new())

@@ -24,32 +24,41 @@
 //!    (`f(n)==4 ∧ false` must be `unsat`, not a 30-112s `unknown`).
 
 use std::ptr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::*;
 
 unsafe fn mk_ctx() -> Z3_context {
-    let cfg = Z3_mk_config();
-    let ctx = Z3_mk_context(cfg);
-    Z3_del_config(cfg);
-    ctx
+    // SAFETY: the configuration is live while the context is constructed and
+    // is deleted only after `Z3_mk_context` has finished consuming it.
+    unsafe {
+        let cfg = Z3_mk_config();
+        let ctx = Z3_mk_context(cfg);
+        Z3_del_config(cfg);
+        ctx
+    }
 }
 
 /// Declare `name : Int^arity -> Int` through `Z3_mk_rec_func_decl`.
 unsafe fn rec_decl_int(ctx: Z3_context, name: &std::ffi::CStr, arity: usize) -> Z3_func_decl {
-    let int_sort = Z3_mk_int_sort(ctx);
-    let domain: Vec<Z3_sort> = vec![int_sort; arity];
-    Z3_mk_rec_func_decl(
-        ctx,
-        Z3_mk_string_symbol(ctx, name.as_ptr()),
-        arity as std::ffi::c_uint,
-        if arity == 0 {
-            ptr::null()
-        } else {
-            domain.as_ptr()
-        },
-        int_sort,
-    )
+    // SAFETY: callers provide a live context; `name` is NUL-terminated, the
+    // domain pointer is either null for arity zero or references exactly
+    // `arity` live sort handles for the duration of the call.
+    unsafe {
+        let int_sort = Z3_mk_int_sort(ctx);
+        let domain: Vec<Z3_sort> = vec![int_sort; arity];
+        Z3_mk_rec_func_decl(
+            ctx,
+            Z3_mk_string_symbol(ctx, name.as_ptr()),
+            arity as c_uint,
+            if arity == 0 {
+                ptr::null()
+            } else {
+                domain.as_ptr()
+            },
+            int_sort,
+        )
+    }
 }
 
 /// Finding 1 (skeptic #2): a rec def named `+` must be rejected, builtin
@@ -217,7 +226,7 @@ fn test_stale_model_refuses_rec_eval_after_registry_growth() {
         // Same epoch: eval f(3) == 4 works.
         let mut out: Z3_ast = 0;
         assert!(
-            Z3_model_eval(ctx, model, f3, true, &mut out),
+            Z3_model_eval(ctx, model, f3, true, &raw mut out),
             "same-epoch eval of f(3) must succeed"
         );
 
@@ -231,7 +240,7 @@ fn test_stale_model_refuses_rec_eval_after_registry_growth() {
 
         let mut out2: Z3_ast = 0;
         assert!(
-            !Z3_model_eval(ctx, model, f3, true, &mut out2),
+            !Z3_model_eval(ctx, model, f3, true, &raw mut out2),
             "stale-epoch eval of a rec-mentioning term must be refused"
         );
         Z3_del_context(ctx);
@@ -285,7 +294,7 @@ fn test_symbolic_recursion_fails_closed_fast_and_ground_false_is_unsat() {
             "symbolic-argument recursion must fail closed"
         );
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(30),
+            start.elapsed() < Duration::from_secs(30),
             "the grind class must fail closed in seconds (was 98-112s), took {:?}",
             start.elapsed()
         );

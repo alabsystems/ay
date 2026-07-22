@@ -354,5 +354,5 @@ fn render_alethe_contains_rule_and_rhs() {
     assert!(s.contains(":rhs -1"));
     assert!(s.contains("(cl)"));
     // A rational multiplier renders as (/ n d).
-    assert!(render_rat(&rf(1, 2)) == "(/ 1 2)");
+    assert_eq!(render_rat(&rf(1, 2)), "(/ 1 2)");
 }

@@ -67,8 +67,8 @@ from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _oom_guard import (  # noqa: E402
+    guarded_popen,
     plan_solver_resources,
-    rss_watchdog,
     warn_concurrent_build,
 )
 
@@ -441,6 +441,8 @@ class Result:
 
 
 VERIFY_LOCK = threading.Lock()
+SOLVER_CAPTURE_LIMIT_BYTES = 64 * 1024 * 1024
+CHECKER_CAPTURE_LIMIT_BYTES = 1024 * 1024
 
 
 def parse_solver_output_stream(stream):
@@ -472,6 +474,13 @@ def stream_tail(stream, limit: int = 200) -> str:
         if not chunk:
             return tail
         tail = (tail + chunk)[-limit:]
+
+
+def stream_reached_limit(stream, limit_bytes: int) -> bool:
+    """Return whether an RLIMIT_FSIZE-bounded capture reached its hard cap."""
+    stream.flush()
+    stream.seek(0, os.SEEK_END)
+    return stream.tell() >= limit_bytes
 
 
 def kill_process_group(proc: subprocess.Popen) -> None:
@@ -660,14 +669,14 @@ def run_one(bin_path: str, inst_path: Path, timeout_s: float, checker: str,
         with tempfile.TemporaryFile(mode="w+t", encoding="utf-8",
                                     errors="replace") as stderr:
             try:
-                proc = subprocess.Popen(
-                    cmd,
+                proc, guard = guarded_popen(
+                    cmd, memlimit_mb, label="pbcomp_harness.py", grace_mb=0,
                     stdin=subprocess.DEVNULL,
                     stdout=stdout,
                     stderr=stderr,
                     text=True,
-                    start_new_session=True,
                     env=child_env,
+                    fsize_bytes=SOLVER_CAPTURE_LIMIT_BYTES,
                 )
             except OSError as exc:
                 return Result(
@@ -678,8 +687,6 @@ def run_one(bin_path: str, inst_path: Path, timeout_s: float, checker: str,
                 )
             # The main `ay pb` path ignores MEMLIMIT, so exact process-group
             # RSS enforcement is mandatory even when the environment is set.
-            guard = rss_watchdog(proc, memlimit_mb,
-                                 label="pbcomp_harness.py", grace_mb=0)
             try:
                 try:
                     rc = proc.wait(timeout=timeout_s + grace_s)
@@ -700,13 +707,24 @@ def run_one(bin_path: str, inst_path: Path, timeout_s: float, checker: str,
             incomplete = False
             note = ""
             with VERIFY_LOCK:
-                status, best_obj, v_tokens = parse_solver_output_stream(stdout)
+                capture_full = (
+                    stream_reached_limit(stdout, SOLVER_CAPTURE_LIMIT_BYTES) or
+                    stream_reached_limit(stderr, SOLVER_CAPTURE_LIMIT_BYTES)
+                )
+                if capture_full:
+                    status, best_obj, v_tokens = "ERROR", None, []
+                    note = "solver output reached fixed 64 MiB capture limit"
+                else:
+                    status, best_obj, v_tokens = parse_solver_output_stream(stdout)
                 if guard.breached:
                     status = "MEMOUT"
                 elif timed_out:
                     # The run exceeded the envelope even if it streamed an
                     # incumbent.
                     status = "TIMEOUT"
+                elif rc != 0:
+                    status = "ERROR"
+                    note = f"solver exited with incompatible status {rc}"
                 if status in ("SATISFIABLE", "OPTIMUM FOUND"):
                     (category, status, verified, wrong, incomplete,
                      note) = verify_solver_answer(
@@ -749,24 +767,20 @@ def check_solution_via_ay(bin_path, inst_path, v_tokens, env, memlimit_mb):
             with tempfile.TemporaryFile(mode="w+t", encoding="utf-8",
                                         errors="replace") as stderr:
                 try:
-                    proc = subprocess.Popen(
+                    proc, guard = guarded_popen(
                         [bin_path, "pb", "verify", str(inst_path),
                          "--solution", "-"],
+                        memlimit_mb, label="pbcomp_harness.py[verify]",
+                        grace_mb=0,
                         stdin=solution,
                         stdout=stdout,
                         stderr=stderr,
                         text=True,
-                        start_new_session=True,
                         env=env,
+                        fsize_bytes=CHECKER_CAPTURE_LIMIT_BYTES,
                     )
                 except OSError as exc:
                     return False, None, f"ay verify spawn failed: {exc}"
-                guard = rss_watchdog(
-                    proc,
-                    memlimit_mb,
-                    label="pbcomp_harness.py[verify]",
-                    grace_mb=0,
-                )
                 timed_out = False
                 try:
                     try:
@@ -784,6 +798,9 @@ def check_solution_via_ay(bin_path, inst_path, v_tokens, env, memlimit_mb):
                     return False, None, "ay verify exceeded memory envelope"
                 if timed_out:
                     return False, None, "ay verify timed out"
+                if (stream_reached_limit(stdout, CHECKER_CAPTURE_LIMIT_BYTES) or
+                        stream_reached_limit(stderr, CHECKER_CAPTURE_LIMIT_BYTES)):
+                    return False, None, "ay verify output reached fixed capture limit"
                 stdout.flush()
                 stdout.seek(0)
                 objective = None

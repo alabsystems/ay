@@ -164,6 +164,6 @@ fn audit_part2_fails_on_opaque_objective_parse() {
     // must prevent callers from trusting.
     assert!(matches!(
         solver.optimize(&obj, OptimizationSense::Maximize),
-        crate::OptimizationResult::Unbounded
+        OptimizationResult::Unbounded
     ));
 }

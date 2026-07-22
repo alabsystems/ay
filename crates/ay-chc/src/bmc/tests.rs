@@ -7,6 +7,7 @@ use super::*;
 use crate::pdr::counterexample::{DerivationWitness, DerivationWitnessEntry};
 use crate::pdr::{CexVerificationResult, PdrConfig, PdrSolver};
 use crate::{ClauseBody, ClauseHead, HornClause};
+use ay_test_support::env::{lock_env, ScopedEnvVar};
 use ntest::timeout;
 
 fn create_large_acyclic_int_chain_for_exact_first_9004(pred_count: usize) -> ChcProblem {
@@ -2388,8 +2389,10 @@ fn test_verify_without_witness_disable_cex_replay_returns_unknown() {
 
     let problem = create_multipred_cyclic_unsafe_problem();
     let preds: Vec<PredicateId> = problem.predicates().iter().map(|p| p.id).collect();
-    let mut config = PdrConfig::default();
-    config.disable_cex_replay = true;
+    let config = PdrConfig {
+        disable_cex_replay: true,
+        ..PdrConfig::default()
+    };
     let mut verifier = PdrSolver::new(problem, config);
     let cex = Counterexample {
         steps: vec![
@@ -2443,11 +2446,13 @@ fn test_adversarial_axiom_only_witness_rejected_on_safe_problem() {
     );
 
     // Mirror the adaptive/final validation solver config.
-    let mut config = PdrConfig::default();
-    config.strict_proofs = true;
-    config.preserve_original_clauses = true;
-    config.disable_array_scalarization = true;
-    config.disable_cex_replay = true;
+    let config = PdrConfig {
+        strict_proofs: true,
+        preserve_original_clauses: true,
+        disable_array_scalarization: true,
+        disable_cex_replay: true,
+        ..PdrConfig::default()
+    };
     let mut verifier = PdrSolver::new(problem, config);
     let result = verifier.verify_counterexample(&cex);
     assert!(
@@ -2511,11 +2516,13 @@ fn test_adversarial_cyclic_witness_rejected_on_safe_problem() {
         witness,
     );
 
-    let mut config = PdrConfig::default();
-    config.strict_proofs = true;
-    config.preserve_original_clauses = true;
-    config.disable_array_scalarization = true;
-    config.disable_cex_replay = true;
+    let config = PdrConfig {
+        strict_proofs: true,
+        preserve_original_clauses: true,
+        disable_array_scalarization: true,
+        disable_cex_replay: true,
+        ..PdrConfig::default()
+    };
     let mut verifier = PdrSolver::new(problem, config);
     let result = verifier.verify_counterexample(&cex);
     assert!(
@@ -2592,7 +2599,7 @@ fn bounded_tree_refutation_no_false_unsafe_on_safe() {
 // `AY_DIAG_ADT_FILE=<path>` (and optionally `AY_DIAG_SECS`, `AY_DIAG_DEPTH`,
 // `AY_DT_BMC_TRACE=1`); with no file set it is a no-op.
 #[test]
-#[ignore]
+#[ignore = "manual corpus diagnostic; set AY_DIAG_ADT_FILE and run explicitly"]
 fn diag_datatype_refutation_on_corpus_instance() {
     let Ok(path) = std::env::var("AY_DIAG_ADT_FILE") else {
         eprintln!("DIAG: set AY_DIAG_ADT_FILE=<path> to run; skipping");
@@ -2651,7 +2658,7 @@ fn diag_datatype_refutation_on_corpus_instance() {
 // `AY_DIAG_ADAPTIVE=1` to enable adaptive stepping). Prints the verdict and BMC
 // stats (max_depth_reached, num_checks, budget_exhausted, time). Not CI.
 #[test]
-#[ignore]
+#[ignore = "manual isolated corpus diagnostic; set AY_DIAG_BMC_FILE and run explicitly"]
 fn diag_bmc_solve_on_file() {
     let Ok(path) = std::env::var("AY_DIAG_BMC_FILE") else {
         eprintln!("DIAG: set AY_DIAG_BMC_FILE=<path> to run; skipping");
@@ -2718,7 +2725,7 @@ fn diag_bmc_solve_on_file() {
 // the diagnostic records current capability rather than asserting an obsolete
 // incompleteness boundary. Not part of CI.
 #[test]
-#[ignore]
+#[ignore = "manual datatype-BMC formula-form diagnostic; run explicitly"]
 fn diag_dt_bmc_formula_forms() {
     let input = r#"
 (set-logic HORN)
@@ -2794,10 +2801,10 @@ fn diag_dt_bmc_formula_forms() {
 
 /// Serialize the env-var kill-switch test with the other DT-BMC tests so the
 /// process-global `AY_CHC_DISABLE_DT_BMC` cannot race a concurrent solve.
+/// Routed through the one workspace-wide env lock so it also serializes against
+/// every other env-touching test in this binary.
 fn dt_bmc_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    lock_env()
 }
 
 // A genuine multi-step ADT refutation over a recursive datatype: P holds for
@@ -2810,7 +2817,7 @@ fn dt_bmc_env_lock() -> std::sync::MutexGuard<'static, ()> {
 #[timeout(60000)]
 fn datatype_bounded_refutation_finds_nat_counterexample() {
     let _guard = dt_bmc_env_lock();
-    std::env::remove_var("AY_CHC_DISABLE_DT_BMC");
+    let _dt_bmc = ScopedEnvVar::unset("AY_CHC_DISABLE_DT_BMC");
     let input = r#"
 (set-logic HORN)
 (declare-datatypes ((Nat 0)) (((zero) (succ (pred Nat)))))
@@ -2849,7 +2856,7 @@ fn datatype_bounded_refutation_finds_nat_counterexample() {
 #[timeout(60000)]
 fn datatype_bounded_refutation_no_false_unsafe_on_safe() {
     let _guard = dt_bmc_env_lock();
-    std::env::remove_var("AY_CHC_DISABLE_DT_BMC");
+    let _dt_bmc = ScopedEnvVar::unset("AY_CHC_DISABLE_DT_BMC");
     let input = r#"
 (set-logic HORN)
 (declare-datatypes ((Nat 0)) (((zero) (succ (pred Nat)))))
@@ -2899,10 +2906,10 @@ fn datatype_bounded_refutation_kill_switch_returns_unknown() {
             ..BmcConfig::default()
         },
     );
-    std::env::set_var("AY_CHC_DISABLE_DT_BMC", "1");
+    let dt_bmc_disable = ScopedEnvVar::set("AY_CHC_DISABLE_DT_BMC", "1");
     let disabled =
         solver.solve_datatype_bounded_refutation(6, std::time::Duration::from_secs(10), 6000);
-    std::env::remove_var("AY_CHC_DISABLE_DT_BMC");
+    drop(dt_bmc_disable);
     assert!(
         matches!(disabled, ChcEngineResult::Unknown),
         "kill switch must suppress the lane (Unknown), got {disabled:?}"
@@ -2936,7 +2943,7 @@ fn datatype_bounded_refutation_kill_switch_returns_unknown() {
 #[timeout(90000)]
 fn datatype_bounded_refutation_elimination_round_trips_drop_inj1() {
     let _guard = dt_bmc_env_lock();
-    std::env::remove_var("AY_CHC_DISABLE_DT_BMC");
+    let _dt_bmc = ScopedEnvVar::unset("AY_CHC_DISABLE_DT_BMC");
     let input = r#"
 (set-logic HORN)
 (declare-datatypes ((list_298 0)) (((nil_331 ) (cons_296  (head_592 Int) (tail_594 list_298)))))
@@ -2951,7 +2958,7 @@ fn datatype_bounded_refutation_elimination_round_trips_drop_inj1() {
   (=> (and (drop_59 A C D) (drop_59 A B D) (not (= B C))) false)))
 (check-sat)
 "#;
-    std::env::remove_var("AY_DT_BMC_NO_ELIM");
+    let _dt_bmc_no_elim = ScopedEnvVar::unset("AY_DT_BMC_NO_ELIM");
     let problem = crate::parser::ChcParser::parse(input).expect("parse");
     assert!(
         problem.has_datatype_sorts(),
@@ -3044,7 +3051,7 @@ fn intdualyzer_committed_chain(name: &str) -> Option<ChcEngineResult> {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires the non-vendored CHC-COMP-26 IntDualyzer corpus"]
 fn committed_chain_refutes_intdualyzer_unsafe_targets() {
     // expected_verdict:false (unsat / UNSAFE) — must be refuted with a
     // VALIDATED counterexample.
@@ -3061,7 +3068,7 @@ fn committed_chain_refutes_intdualyzer_unsafe_targets() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "requires the non-vendored CHC-COMP-26 IntDualyzer corpus"]
 fn committed_chain_leaves_intdualyzer_safe_guards_not_unsafe() {
     // expected_verdict:true (sat / SAFE) — the sound gate must NEVER fabricate
     // an Unsafe here; only Unknown is acceptable (the chain check either finds

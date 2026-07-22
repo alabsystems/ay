@@ -20,11 +20,35 @@ use super::{
 const BUILTIN_FP_SIMPLE_SORT_NAMES: &[&str] =
     &["RoundingMode", "Float16", "Float32", "Float64", "Float128"];
 
+/// A compact `(push N)` command must not amplify a few input bytes into an
+/// effectively unbounded loop and allocation.  This still permits far deeper
+/// incremental use than practical solver workloads while bounding one
+/// context's empty-frame storage.
+const MAX_INCREMENTAL_SCOPE_DEPTH: usize = 1 << 16;
+
 fn is_builtin_fp_simple_sort(name: &str) -> bool {
     BUILTIN_FP_SIMPLE_SORT_NAMES.contains(&name)
 }
 
 impl Context {
+    /// Reject a sort declaration/definition before it can overwrite any live
+    /// sort binding.  Sort aliases and datatype carriers share one SMT-LIB
+    /// namespace even though their implementation metadata lives in four
+    /// maps.
+    fn ensure_sort_name_available(&self, name: &str) -> Result<()> {
+        if is_builtin_fp_simple_sort(name) {
+            return Err(ElaborateError::ReservedSymbol(name.to_string()));
+        }
+        if self.sort_defs.contains_key(name)
+            || self.parametric_sort_defs.contains_key(name)
+            || self.datatypes.contains_key(name)
+            || self.parametric_datatypes.contains_key(name)
+        {
+            return Err(ElaborateError::SortRedeclaration(name.to_string()));
+        }
+        Ok(())
+    }
+
     /// Add an assertion
     pub(crate) fn assert(&mut self, term: &ParsedTerm) -> Result<()> {
         // #quantprod-g3: a pure definitional forall over a never-yet-used
@@ -32,10 +56,39 @@ impl Context {
         // method). On adoption the elaboration below expands every
         // `f`-application, turning this assertion into the reflexive
         // tautology while `(get-model)` gains the definitional entry.
-        self.try_adopt_definitional_forall(term);
-        let id = self.elaborate_term(term, &HashMap::default())?;
-        let sort = self.terms.sort(id);
-        if *sort != Sort::Bool {
+        let adopted = self.try_adopt_definitional_forall(term);
+        #[cfg(test)]
+        if adopted.is_some() && std::mem::take(&mut self.fail_next_assert_after_macro_adoption) {
+            if let Some(name) = adopted.as_deref() {
+                self.rollback_adopted_macro(name);
+            }
+            return Err(ElaborateError::Unsupported(
+                "test-injected failure after macro adoption".to_string(),
+            ));
+        }
+        let elaborated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.elaborate_term(term, &HashMap::default())
+        }));
+        let id = match elaborated {
+            Ok(Ok(id)) => id,
+            Ok(Err(error)) => {
+                if let Some(name) = adopted.as_deref() {
+                    self.rollback_adopted_macro(name);
+                }
+                return Err(error);
+            }
+            Err(payload) => {
+                if let Some(name) = adopted.as_deref() {
+                    self.rollback_adopted_macro(name);
+                }
+                std::panic::resume_unwind(payload);
+            }
+        };
+        let sort = self.terms.sort(id).clone();
+        if sort != Sort::Bool {
+            if let Some(name) = adopted.as_deref() {
+                self.rollback_adopted_macro(name);
+            }
             return Err(ElaborateError::SortMismatch {
                 expected: "Bool".to_string(),
                 actual: format!("{sort:?}"),
@@ -53,7 +106,7 @@ impl Context {
     /// Push a scope
     pub(crate) fn push(&mut self) {
         self.scopes.push(ScopeFrame {
-            symbols: Vec::new(),
+            symbols: HashMap::default(),
             assertion_count: self.assertions.len(),
             objective_count: self.objectives.len(),
             soft_constraint_count: self.soft_constraints.len(),
@@ -69,11 +122,26 @@ impl Context {
     /// Pop a scope. Returns `true` on success, `false` on underflow (no scopes).
     pub(crate) fn pop(&mut self) -> bool {
         if let Some(frame) = self.scopes.pop() {
-            // Remove symbols defined in this scope
-            for name in frame.symbols {
-                self.symbols.remove(&name);
-                self.overloaded_symbols.remove(&name);
-                self.internal_symbols.remove(&name);
+            // Restore the exact outer binding state. A scoped overload shares
+            // its surface name with an outer declaration, so deleting by name
+            // would incorrectly destroy the surviving declaration on pop.
+            for state in frame.symbols.into_values() {
+                if let Some(primary) = state.primary {
+                    self.symbols.insert(state.name.clone(), primary);
+                } else {
+                    self.symbols.remove(&state.name);
+                }
+                if let Some(overloads) = state.overloads {
+                    self.overloaded_symbols
+                        .insert(state.name.clone(), overloads);
+                } else {
+                    self.overloaded_symbols.remove(&state.name);
+                }
+                if state.was_internal {
+                    self.internal_symbols.insert(state.name);
+                } else {
+                    self.internal_symbols.remove(&state.name);
+                }
             }
             // Remove assertions from this scope
             self.assertions.truncate(frame.assertion_count);
@@ -154,9 +222,39 @@ impl Context {
         self.internal_symbols.contains(name)
     }
 
-    /// Iterate over all declared symbols
+    /// Iterate over all declared symbol signatures. An overloaded surface name
+    /// appears once per signature; non-overloaded names appear once.
     pub fn symbol_iter(&self) -> impl Iterator<Item = (&String, &SymbolInfo)> {
-        self.symbols.iter()
+        self.symbols
+            .iter()
+            .filter(|(name, _)| !self.overloaded_symbols.contains_key(*name))
+            .chain(
+                self.overloaded_symbols
+                    .iter()
+                    .flat_map(|(name, infos)| infos.iter().map(move |info| (name, info))),
+            )
+    }
+
+    /// Core term/model identity for one declared signature. Public renderers
+    /// should continue to print `surface_name`; solver tables and occurrence
+    /// sets must key by this identity or distinct overloads conflate.
+    pub fn symbol_identity_name<'a>(&self, surface_name: &'a str, info: &'a SymbolInfo) -> &'a str {
+        info.internal_name.as_deref().unwrap_or(surface_name)
+    }
+
+    /// Return the public surface name when `identity` denotes one signature of
+    /// an overloaded declaration. Serializers use this to add the result-sort
+    /// ascription required to select the same signature when replayed.
+    pub fn overloaded_surface_name<'a>(&'a self, identity: &'a str) -> Option<&'a str> {
+        let surface_name = self.dt_surface_name(identity).unwrap_or(identity);
+        self.overloaded_symbols
+            .get(surface_name)
+            .is_some_and(|infos| {
+                infos
+                    .iter()
+                    .any(|info| self.symbol_identity_name(surface_name, info) == identity)
+            })
+            .then_some(surface_name)
     }
 
     /// True when `name` was bound by a problem-level `define-fun` /
@@ -262,31 +360,31 @@ impl Context {
     /// On adoption the caller re-elaborates the assertion, which the fresh
     /// macro turns into the reflexive tautology — the constraint stays on
     /// the stack with its meaning discharged by construction.
-    fn try_adopt_definitional_forall(&mut self, term: &ParsedTerm) {
+    fn try_adopt_definitional_forall(&mut self, term: &ParsedTerm) -> Option<String> {
         use crate::command::Term as PT;
         if !self.scopes.is_empty() {
-            return;
+            return None;
         }
         let PT::Forall(pvars, pbody) = term else {
-            return;
+            return None;
         };
         if pvars.is_empty() {
-            return;
+            return None;
         }
         // Distinct binder names (duplicate binders make the "applied exactly
         // in order" reading ambiguous).
         for i in 0..pvars.len() {
             for j in (i + 1)..pvars.len() {
                 if pvars[i].0 == pvars[j].0 {
-                    return;
+                    return None;
                 }
             }
         }
         let PT::App(eq, pargs) = pbody.as_ref() else {
-            return;
+            return None;
         };
         if eq != "=" || pargs.len() != 2 {
-            return;
+            return None;
         }
         // The `f`-application side at the parsed level: `(f x1 … xk)` with
         // the binders in order.
@@ -310,7 +408,7 @@ impl Context {
         let (fname, parsed_rhs) = match (side_f(&pargs[0]), side_f(&pargs[1])) {
             (Some(f), None) => (f, pargs[1].clone()),
             (None, Some(f)) => (f, pargs[0].clone()),
-            _ => return,
+            _ => return None,
         };
         if self.fun_defs.contains_key(&fname)
             || self.recursive_fun_names.contains(&fname)
@@ -319,19 +417,17 @@ impl Context {
             // outside the macro expansion — refuse (fail-closed).
             || self.overloaded_symbols.contains_key(&fname)
         {
-            return;
+            return None;
         }
-        let Some(info) = self.symbols.get(&fname) else {
-            return;
-        };
+        let info = self.symbols.get(&fname)?;
         if info.arg_sorts.len() != pvars.len() {
-            return;
+            return None;
         }
         // A pre-adoption raw occurrence of `f` in any existing constraint
         // would stay a disconnected uninterpreted symbol while later
         // occurrences expand — refuse (wrong-verdict source).
         if self.constraints_mention_symbol(&fname) {
-            return;
+            return None;
         }
         let ret_sort = info.sort.clone();
         let arg_sorts = info.arg_sorts.clone();
@@ -339,10 +435,10 @@ impl Context {
         let mut params: Vec<(String, Sort)> = Vec::with_capacity(pvars.len());
         for ((vname, vsort), decl) in pvars.iter().zip(arg_sorts.iter()) {
             let Ok(s) = self.elaborate_sort(vsort) else {
-                return;
+                return None;
             };
             if s != *decl {
-                return;
+                return None;
             }
             params.push((vname.clone(), s));
         }
@@ -352,19 +448,19 @@ impl Context {
         // sort. Elaboration errors refuse adoption; the caller's normal
         // elaboration then surfaces the same error.
         let Ok(eid) = self.elaborate_term(term, &HashMap::default()) else {
-            return;
+            return None;
         };
         let ay_core::TermData::Forall(evars, ebody, _) = self.terms.get(eid).clone() else {
-            return;
+            return None;
         };
         if evars.len() != params.len() {
-            return;
+            return None;
         }
         let ay_core::TermData::App(esym, eargs) = self.terms.get(ebody).clone() else {
-            return;
+            return None;
         };
         if !matches!(&esym, ay_core::term::Symbol::Named(n) if n == "=") || eargs.len() != 2 {
-            return;
+            return None;
         }
         let is_f_app = |t: TermId| -> bool {
             let ay_core::TermData::App(sym, fargs) = self.terms.get(t) else {
@@ -382,17 +478,30 @@ impl Context {
         let def_body = match (is_f_app(eargs[0]), is_f_app(eargs[1])) {
             (true, false) => eargs[1],
             (false, true) => eargs[0],
-            _ => return,
+            _ => return None,
         };
         if self.term_mentions_symbol(def_body, &fname) {
-            return;
+            return None;
         }
         if *self.terms.sort(def_body) != ret_sort {
-            return;
+            return None;
         }
         // Adopt: future (re-)elaborations expand every `f`-application.
-        self.fun_defs.insert(fname.clone(), (params, parsed_rhs));
-        self.adopted_macro_interps.insert(fname, (evars, def_body));
+        self.fun_defs
+            .insert(fname.clone(), (params, ret_sort, parsed_rhs));
+        self.adopted_macro_interps
+            .insert(fname.clone(), (evars, def_body));
+        Some(fname)
+    }
+
+    fn rollback_adopted_macro(&mut self, name: &str) {
+        self.fun_defs.remove(name);
+        self.adopted_macro_interps.remove(name);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_assert_after_macro_adoption(&mut self) {
+        self.fail_next_assert_after_macro_adoption = true;
     }
 
     /// True when `name` was bound by `define-fun-rec` / `define-funs-rec` (a
@@ -404,21 +513,43 @@ impl Context {
         self.recursive_fun_names.contains(name)
     }
 
+    /// Whether a user-visible declaration/definition already occupies `name`.
+    /// The CLI queries this before an accepted `define-*` overload: definitions
+    /// remain name-keyed in [`Context::fun_defs`], so retaining a definitive
+    /// verdict after such an overload would misrepresent z3's per-signature
+    /// binding semantics.
+    pub fn has_symbol_binding(&self, name: &str) -> bool {
+        self.symbols.contains_key(name)
+            || self.overloaded_symbols.contains_key(name)
+            || self.fun_defs.contains_key(name)
+    }
+
     /// Register a symbol directly (for native API use)
     ///
     /// This is used by the native Rust API to register constants created
     /// via `mk_var` so they appear in models.
     pub fn register_symbol(&mut self, name: String, term: TermId, sort: Sort) {
-        self.symbols.insert(
-            name.clone(),
-            SymbolInfo {
-                term: Some(term),
-                sort,
-                arg_sorts: vec![],
-                internal_name: None,
-            },
-        );
-        self.track_scoped_symbol(name);
+        let info = SymbolInfo {
+            term: Some(term),
+            sort,
+            arg_sorts: vec![],
+            internal_name: None,
+        };
+        if self.global_declarations_enabled() {
+            self.propagate_global_symbol_replacement_to_snapshots(&name, &info);
+        } else {
+            self.track_scoped_symbol(&name);
+        }
+        self.symbols.insert(name, info);
+    }
+
+    /// Register a native constant independently of the current SMT-LIB
+    /// assertion scope, without changing `:global-declarations`.
+    #[doc(hidden)]
+    pub fn register_native_global_symbol(&mut self, name: String, term: TermId, sort: Sort) {
+        self.with_native_global_declaration_tracking(|ctx| {
+            ctx.register_symbol(name, term, sort);
+        });
     }
 
     /// Register a trusted surface-name alias for a native function identity.
@@ -434,7 +565,24 @@ impl Context {
         internal_name: String,
         arg_sorts: Vec<Sort>,
         ret_sort: Sort,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        let is_same_alias = |info: &SymbolInfo| {
+            self.symbol_identity_name(&surface_name, info) == internal_name
+                && info.arg_sorts == arg_sorts
+                && info.sort == ret_sort
+        };
+        // Exact re-registration is an identity operation, including for a
+        // trusted alias of a datatype member. Check it before the collision
+        // gates: after first registration, metadata intentionally classifies a
+        // custom recognizer alias as a datatype-member surface name.
+        if self.symbols.get(&surface_name).is_some_and(is_same_alias)
+            || self
+                .overloaded_symbols
+                .get(&surface_name)
+                .is_some_and(|aliases| aliases.iter().any(is_same_alias))
+        {
+            return Ok(false);
+        }
         // Reserved structural operators are safe only through their dedicated
         // builders. A textual alias could be intercepted by a specialized
         // elaboration path before ordinary function resolution.
@@ -444,19 +592,7 @@ impl Context {
         if self.is_datatype_member_name(&surface_name) {
             return Err(ElaborateError::DatatypeMemberCollision(surface_name));
         }
-        let is_same_alias = |info: &SymbolInfo| {
-            info.internal_name.as_deref() == Some(internal_name.as_str())
-                && info.arg_sorts == arg_sorts
-                && info.sort == ret_sort
-        };
-        if self.symbols.get(&surface_name).is_some_and(is_same_alias)
-            || self
-                .overloaded_symbols
-                .get(&surface_name)
-                .is_some_and(|aliases| aliases.iter().any(is_same_alias))
-        {
-            return Ok(());
-        }
+        self.track_internal_surface(internal_name.clone(), surface_name.clone());
         self.register_overloadable_symbol(
             surface_name,
             SymbolInfo {
@@ -466,10 +602,30 @@ impl Context {
                 internal_name: Some(internal_name),
             },
         );
-        Ok(())
+        Ok(true)
+    }
+
+    /// Register a native function alias independently of the current SMT-LIB
+    /// assertion scope, without changing `:global-declarations`.
+    #[doc(hidden)]
+    pub fn register_native_global_function_alias(
+        &mut self,
+        surface_name: String,
+        internal_name: String,
+        arg_sorts: Vec<Sort>,
+        ret_sort: Sort,
+    ) -> Result<bool> {
+        self.with_native_global_declaration_tracking(|ctx| {
+            ctx.register_native_function_alias(surface_name, internal_name, arg_sorts, ret_sort)
+        })
     }
 
     pub(super) fn register_overloadable_symbol(&mut self, name: String, info: SymbolInfo) {
+        if self.global_declarations_enabled() {
+            self.propagate_global_overload_to_snapshots(&name, &info);
+        } else {
+            self.track_scoped_symbol(&name);
+        }
         if let Some(existing) = self.symbols.get(&name).cloned() {
             self.overloaded_symbols
                 .entry(name.clone())
@@ -480,49 +636,71 @@ impl Context {
         }
 
         self.symbols.insert(name.clone(), info);
-        self.track_scoped_symbol(name);
     }
 
-    /// Resolve a nullary overloaded symbol (e.g. a parametric datatype's
-    /// nullary constructor `nil`) to the bound term whose result sort matches
-    /// `sort`. Used by `(as <name> <sort>)` so distinct datatype instantiations
-    /// that share a constructor name resolve to the correct instance.
-    pub(super) fn nullary_overload_with_sort(&self, name: &str, sort: &Sort) -> Option<TermId> {
-        let candidates = self.overloaded_symbols.get(name)?;
-        for info in candidates {
-            if info.arg_sorts.is_empty() {
-                if let Some(term) = info.term {
-                    if self.terms.sort(term) == sort {
-                        return Some(term);
-                    }
+    fn propagate_global_symbol_replacement_to_snapshots(&mut self, name: &str, info: &SymbolInfo) {
+        for frame in &mut self.scopes {
+            if let Some(state) = frame.symbols.get_mut(name) {
+                state.primary = Some(info.clone());
+                state.overloads = None;
+                state.was_internal = false;
+            }
+        }
+    }
+
+    fn propagate_global_overload_to_snapshots(&mut self, name: &str, info: &SymbolInfo) {
+        for frame in &mut self.scopes {
+            if let Some(state) = frame.symbols.get_mut(name) {
+                if let Some(existing) = state.primary.clone() {
+                    state
+                        .overloads
+                        .get_or_insert_with(|| vec![existing])
+                        .push(info.clone());
+                } else if let Some(overloads) = state.overloads.as_mut() {
+                    overloads.push(info.clone());
                 }
+                state.primary = Some(info.clone());
+                state.was_internal = false;
             }
         }
-        None
     }
 
-    /// The instance-internal (mangled) name of constructor `name` whose RESULT
-    /// sort equals `result_sort` — used to resolve an `(as <ctor> <instance>)`
-    /// ascription to the correct parametric instance. `None` for monomorphic
-    /// constructors / non-datatype symbols (no mangling).
-    pub(super) fn ctor_internal_for_result_sort(
-        &self,
-        name: &str,
-        result_sort: &Sort,
-    ) -> Option<String> {
-        let matches = |info: &SymbolInfo| {
-            if &info.sort == result_sort {
-                info.internal_name.clone()
-            } else {
-                None
-            }
-        };
-        if let Some(candidates) = self.overloaded_symbols.get(name) {
-            if let Some(internal) = candidates.iter().find_map(matches) {
-                return Some(internal);
+    pub(crate) fn with_native_global_declaration_tracking<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let prior = std::mem::replace(&mut self.native_global_declaration, true);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(self)));
+        self.native_global_declaration = prior;
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// Allocate a private core identity for an incoming ordinary declaration
+    /// when its surface name is already occupied. The first declaration keeps
+    /// the surface identity for compatibility; every later overload is
+    /// disjoint even when only its result sort differs.
+    pub(super) fn ordinary_declaration_internal_name(&mut self, name: &str) -> Option<String> {
+        if !self.symbols.contains_key(name) && !self.overloaded_symbols.contains_key(name) {
+            return None;
+        }
+        loop {
+            let candidate = format!(
+                "{}overload_{}",
+                super::INTERNAL_SYMBOL_PREFIX,
+                self.next_overload_identity
+            );
+            self.next_overload_identity = self.next_overload_identity.wrapping_add(1);
+            let already_used = self.symbols.contains_key(&candidate)
+                || self.overloaded_symbols.contains_key(&candidate)
+                || self.dt_internal_surface.contains_key(&candidate);
+            if !already_used {
+                self.track_internal_surface(candidate.clone(), name.to_string());
+                return Some(candidate);
             }
         }
-        self.symbols.get(name).and_then(matches)
     }
 
     /// The internal symbol name to use when BUILDING an application of `name`
@@ -570,15 +748,39 @@ impl Context {
             return Ok(None);
         };
 
-        let mut matches = candidates.iter().filter(|info| {
+        let signature_matches = |info: &&SymbolInfo, allow_int_to_real: bool| {
             info.arg_sorts.len() == args.len()
                 && info
                     .arg_sorts
                     .iter()
                     .zip(args.iter())
-                    .all(|(expected, arg)| expected == self.terms.sort(*arg))
-        });
+                    .all(|(expected, arg)| {
+                        let actual = self.terms.sort(*arg);
+                        expected == actual
+                            || (allow_int_to_real
+                                && expected == &Sort::Real
+                                && actual == &Sort::Int)
+                    })
+        };
 
+        // Prefer an exact overload over one that needs the SMT-LIB Int-to-Real
+        // coercion. For example, `f(Int)` wins over `f(Real)` at an Int term.
+        let mut matches = candidates
+            .iter()
+            .filter(|info| signature_matches(info, false));
+
+        if let Some(first) = matches.next().cloned() {
+            if matches.next().is_some() {
+                return Err(ElaborateError::Unsupported(format!(
+                    "ambiguous overloaded symbol '{name}'"
+                )));
+            }
+            return Ok(Some(first));
+        }
+
+        let mut matches = candidates
+            .iter()
+            .filter(|info| signature_matches(info, true));
         let Some(first) = matches.next().cloned() else {
             return Ok(None);
         };
@@ -589,6 +791,144 @@ impl Context {
             )));
         }
 
+        Ok(Some(first))
+    }
+
+    fn symbol_candidates(&self, name: &str) -> Option<&[SymbolInfo]> {
+        self.overloaded_symbols
+            .get(name)
+            .map(Vec::as_slice)
+            .or_else(|| self.symbols.get(name).map(std::slice::from_ref))
+    }
+
+    /// Resolve a bare identifier to one nullary declaration.
+    ///
+    /// SMT-LIB permits declarations that differ only in result sort. Without
+    /// an expected-sort-directed elaborator a bare use of two such constants is
+    /// ambiguous; selecting the most recently registered entry is unsound.
+    /// Likewise, a non-nullary function name is not a value by itself.
+    pub(super) fn resolve_bare_declared_symbol(&self, name: &str) -> Result<Option<SymbolInfo>> {
+        let Some(candidates) = self.symbol_candidates(name) else {
+            return Ok(None);
+        };
+        let mut matches = candidates.iter().filter(|info| info.arg_sorts.is_empty());
+        let Some(first) = matches.next().cloned() else {
+            return Err(ElaborateError::InvalidConstant(format!(
+                "function '{name}' requires arguments"
+            )));
+        };
+        if matches.next().is_some() {
+            return Err(ElaborateError::Unsupported(format!(
+                "ambiguous nullary symbol '{name}'"
+            )));
+        }
+        Ok(Some(first))
+    }
+
+    /// Resolve an indexed higher-order reference such as `(_ as-array f)` by
+    /// arity when no operand supplies the function's domain sorts.
+    pub(super) fn resolve_declared_symbol_with_arity(
+        &self,
+        name: &str,
+        arity: usize,
+    ) -> Result<Option<SymbolInfo>> {
+        let Some(candidates) = self.symbol_candidates(name) else {
+            return Ok(None);
+        };
+        let mut matches = candidates
+            .iter()
+            .filter(|info| info.arg_sorts.len() == arity);
+        let Some(first) = matches.next().cloned() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(ElaborateError::Unsupported(format!(
+                "ambiguous {arity}-argument symbol '{name}'"
+            )));
+        }
+        Ok(Some(first))
+    }
+
+    /// Resolve `(_ map f)` against the exact element sorts of its array
+    /// operands. Coercive matches are deliberately excluded: the array-map
+    /// term/rewrite layer cannot materialize pointwise Int-to-Real coercions.
+    pub(super) fn resolve_declared_symbol_for_domain(
+        &self,
+        name: &str,
+        actual_sorts: &[Sort],
+    ) -> Result<Option<SymbolInfo>> {
+        let Some(candidates) = self.symbol_candidates(name) else {
+            return Ok(None);
+        };
+        let mut matches = candidates
+            .iter()
+            .filter(|info| info.arg_sorts == actual_sorts);
+        let Some(first) = matches.next().cloned() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(ElaborateError::Unsupported(format!(
+                "ambiguous overloaded symbol '{name}' for array-map domain"
+            )));
+        }
+        Ok(Some(first))
+    }
+
+    /// Resolve a qualified identifier `((as name Result) args...)` against its
+    /// complete declared signature.  The result ascription participates in
+    /// overload selection; arguments must match exactly or through SMT-LIB's
+    /// sole implicit application coercion, Int to Real.  Selecting by the
+    /// result sort alone would admit ill-sorted applications, while selecting
+    /// the last declaration would conflate overloaded identities.
+    pub(super) fn resolve_qualified_declared_symbol(
+        &self,
+        name: &str,
+        result_sort: &Sort,
+        args: &[TermId],
+    ) -> Result<Option<SymbolInfo>> {
+        let Some(candidates) = self.symbol_candidates(name) else {
+            return Ok(None);
+        };
+
+        let signature_matches = |info: &&SymbolInfo, allow_int_to_real: bool| {
+            &info.sort == result_sort
+                && info.arg_sorts.len() == args.len()
+                && info
+                    .arg_sorts
+                    .iter()
+                    .zip(args.iter())
+                    .all(|(expected, arg)| {
+                        let actual = self.terms.sort(*arg);
+                        expected == actual
+                            || (allow_int_to_real
+                                && expected == &Sort::Real
+                                && actual == &Sort::Int)
+                    })
+        };
+
+        let mut exact = candidates
+            .iter()
+            .filter(|info| signature_matches(info, false));
+        if let Some(first) = exact.next().cloned() {
+            if exact.next().is_some() {
+                return Err(ElaborateError::Unsupported(format!(
+                    "ambiguous qualified symbol '(as {name} {result_sort})'"
+                )));
+            }
+            return Ok(Some(first));
+        }
+
+        let mut coercive = candidates
+            .iter()
+            .filter(|info| signature_matches(info, true));
+        let Some(first) = coercive.next().cloned() else {
+            return Ok(None);
+        };
+        if coercive.next().is_some() {
+            return Err(ElaborateError::Unsupported(format!(
+                "ambiguous qualified symbol '(as {name} {result_sort})'"
+            )));
+        }
         Ok(Some(first))
     }
 
@@ -686,16 +1026,43 @@ impl Context {
                 Ok(None)
             }
             Command::Push(n) => {
-                for _ in 0..*n {
+                let count = usize::try_from(*n).map_err(|_| {
+                    ElaborateError::Unsupported("push count does not fit this target".to_string())
+                })?;
+                let Some(new_depth) = self.scopes.len().checked_add(count) else {
+                    return Err(ElaborateError::Unsupported(
+                        "incremental scope depth overflow".to_string(),
+                    ));
+                };
+                if new_depth > MAX_INCREMENTAL_SCOPE_DEPTH {
+                    return Err(ElaborateError::Unsupported(format!(
+                        "incremental scope depth {new_depth} exceeds the supported maximum \
+                         {MAX_INCREMENTAL_SCOPE_DEPTH}"
+                    )));
+                }
+                // Reserve before changing the depth so allocation failure is
+                // reported without leaving a partially pushed prefix.
+                self.scopes.try_reserve(count).map_err(|_| {
+                    ElaborateError::Unsupported(
+                        "unable to allocate incremental scope frames".to_string(),
+                    )
+                })?;
+                for _ in 0..count {
                     self.push();
                 }
                 Ok(None)
             }
             Command::Pop(n) => {
-                for _ in 0..*n {
-                    if !self.pop() {
-                        return Err(ElaborateError::ScopeUnderflow);
-                    }
+                let count = usize::try_from(*n).map_err(|_| ElaborateError::ScopeUnderflow)?;
+                // Preflight the whole request.  Popping a valid prefix and
+                // then reporting underflow would leave assertions,
+                // declarations, and objectives partially rolled back.
+                if count > self.scopes.len() {
+                    return Err(ElaborateError::ScopeUnderflow);
+                }
+                for _ in 0..count {
+                    let popped = self.pop();
+                    debug_assert!(popped, "pop count was preflighted against scope depth");
                 }
                 Ok(None)
             }
@@ -781,7 +1148,7 @@ impl Context {
                 Ok(None)
             }
             // Declare/define sort are stored but don't produce output
-            Command::DeclareSort(name, _arity) => {
+            Command::DeclareSort(name, arity) => {
                 // `RoundingMode` and Float16/32/64/128 are builtin FP sorts.
                 // In particular, RM literals (`RNE` … `roundTowardZero`)
                 // elaborate to `Sort::Uninterpreted("RoundingMode")`, and the
@@ -789,8 +1156,16 @@ impl Context {
                 // redeclaration would either conflate that fixed domain or be
                 // silently ignored by the abbreviation matcher; z3 rejects all
                 // of them as already defined. (#P0.2 symbolic RoundingMode)
-                if is_builtin_fp_simple_sort(name) {
-                    return Err(ElaborateError::ReservedSymbol(name.clone()));
+                self.ensure_sort_name_available(name)?;
+                // A non-zero-arity uninterpreted sort constructor needs an
+                // identity that includes its instantiated arguments.  The
+                // core currently has no faithful representation for that;
+                // treating it as a monomorphic `Uninterpreted(name)` silently
+                // accepts ill-sorted scripts, so fail closed.
+                if *arity != 0 {
+                    return Err(ElaborateError::Unsupported(format!(
+                        "non-zero-arity declare-sort '{name}' (arity {arity})"
+                    )));
                 }
                 // Store as uninterpreted sort
                 self.sort_defs
@@ -799,8 +1174,15 @@ impl Context {
                 Ok(None)
             }
             Command::DefineSort(name, params, sort) => {
-                if is_builtin_fp_simple_sort(name) {
-                    return Err(ElaborateError::ReservedSymbol(name.clone()));
+                self.ensure_sort_name_available(name)?;
+                let mut unique_params = ay_core::kani_compat::DetHashSet::default();
+                if let Some(duplicate) = params
+                    .iter()
+                    .find(|param| !unique_params.insert(param.as_str()))
+                {
+                    return Err(ElaborateError::InvalidConstant(format!(
+                        "duplicate define-sort parameter: {duplicate}"
+                    )));
                 }
                 if params.is_empty() {
                     // Monomorphic synonym: eagerly elaborate and store the sort.
@@ -865,6 +1247,33 @@ impl Context {
                 ))
             }
         }
+    }
+
+    /// Process one native-API declaration as global to assertion scopes while
+    /// leaving both spellings of the public global-declarations option exactly
+    /// unchanged. Callers still own executor-level result invalidation.
+    #[doc(hidden)]
+    pub fn execute_native_global_declaration(
+        &mut self,
+        cmd: &Command,
+    ) -> Result<Option<CommandResult>> {
+        if !matches!(
+            cmd,
+            Command::DeclareSort(..)
+                | Command::DefineSort(..)
+                | Command::DeclareDatatype(..)
+                | Command::DeclareDatatypes(..)
+                | Command::DeclareFun(..)
+                | Command::DeclareConst(..)
+                | Command::DefineFun(..)
+                | Command::DefineFunRec(..)
+                | Command::DefineFunsRec(..)
+        ) {
+            return Err(ElaborateError::Unsupported(
+                "native global-declaration execution accepts only declaration commands".to_string(),
+            ));
+        }
+        self.with_native_global_declaration_tracking(|ctx| ctx.process_command(cmd))
     }
 
     /// Set a solver option
@@ -989,5 +1398,15 @@ impl Context {
     /// constructor/selector/tester usage.
     pub fn symbol_info(&self, name: &str) -> Option<&SymbolInfo> {
         self.symbols.get(name)
+    }
+
+    /// Resolve one core term identity to its exact declaration signature.
+    /// Unlike [`Self::symbol_info`], this accepts private overload/datatype
+    /// identities and never substitutes the most recently declared signature.
+    pub fn symbol_info_by_identity(&self, identity: &str) -> Option<&SymbolInfo> {
+        let surface_name = self.dt_surface_name(identity).unwrap_or(identity);
+        self.symbol_candidates(surface_name)?
+            .iter()
+            .find(|info| self.symbol_identity_name(surface_name, info) == identity)
     }
 }

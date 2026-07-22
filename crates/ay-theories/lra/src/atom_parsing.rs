@@ -55,9 +55,7 @@ impl LraSolver {
     /// Counts ALL atoms (single + compound) per variable (#4919 Phase D).
     pub(crate) fn recount_unassigned_atoms(&mut self) {
         // Zero out all counts
-        for c in &mut self.unassigned_atom_count {
-            *c = 0;
-        }
+        self.unassigned_atom_count.fill(0);
         // Count unasserted atoms from var_to_atoms (covers both single + compound).
         // Each unasserted atom contributes +1 to every variable it references.
         //

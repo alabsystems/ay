@@ -14,7 +14,7 @@ pub(crate) use ay_sat::Solver as SatSolver;
 pub(crate) fn get_numeral_stat(stats: &str, key: &str) -> Option<u64> {
     let stats_sexp = parse_sexp(stats).ok()?;
     let entries = stats_sexp.as_list()?;
-    for pair in entries.chunks_exact(2) {
+    for pair in entries.as_chunks::<2>().0 {
         let [SExpr::Keyword(entry_key), SExpr::Numeral(numeral)] = pair else {
             continue;
         };
@@ -48,4 +48,5 @@ mod check_sat_assuming;
 mod info_options;
 mod regression;
 mod unsat_assumptions;
+mod unsat_core_minimize;
 mod unsat_core_pigeonhole;

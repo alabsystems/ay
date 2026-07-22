@@ -8,6 +8,109 @@ use crate::sexp::{ParseError, SExpr, PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE};
 
 use super::Sort;
 
+/// A token used as an SMT-LIB indexed-identifier index.
+///
+/// Token kind is semantic here: the numeral `8` and the quoted symbol `|8|`
+/// are distinct indices and must not collapse to the same string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Index {
+    /// A decimal numeral token.
+    Numeral(String),
+    /// A symbol token, including a quoted symbol.
+    Symbol(String),
+    /// A hexadecimal bitvector token such as `#x41`.
+    Hexadecimal(String),
+    /// A binary bitvector token such as `#b0100_0001`.
+    Binary(String),
+}
+
+impl Index {
+    pub(super) fn from_sexp(sexp: &SExpr) -> Option<Self> {
+        match sexp {
+            SExpr::Numeral(value) => Some(Self::Numeral(value.clone())),
+            SExpr::Symbol(value) => Some(Self::Symbol(value.clone())),
+            SExpr::Hexadecimal(value) => Some(Self::Hexadecimal(value.clone())),
+            SExpr::Binary(value) => Some(Self::Binary(value.clone())),
+            _ => None,
+        }
+    }
+
+    /// Return the token text without changing its token kind.
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Numeral(value)
+            | Self::Symbol(value)
+            | Self::Hexadecimal(value)
+            | Self::Binary(value) => value,
+        }
+    }
+
+    /// Return the decimal text only when this is a numeral token.
+    pub fn as_numeral(&self) -> Option<&str> {
+        match self {
+            Self::Numeral(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Return the identifier text only when this is a symbol token.
+    pub fn as_symbol(&self) -> Option<&str> {
+        match self {
+            Self::Symbol(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+/// Identifier carried by an SMT-LIB `(as <identifier> <sort>)` qualification.
+///
+/// A simple symbol and an indexed identifier have distinct structure even
+/// when the symbol's quoted spelling resembles the indexed form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum QualifiedIdentifier {
+    /// A simple or quoted symbol.
+    Symbol(String),
+    /// An indexed identifier `(_ name index+)`.
+    Indexed(String, Vec<Index>),
+}
+
+impl QualifiedIdentifier {
+    fn from_sexp(sexp: &SExpr) -> Result<Self, ParseError> {
+        match sexp {
+            SExpr::Symbol(name) => Ok(Self::Symbol(name.clone())),
+            SExpr::List(items)
+                if items.len() >= 3 && items.first().is_some_and(|head| head.is_symbol("_")) =>
+            {
+                let name = items[1]
+                    .as_symbol()
+                    .ok_or_else(|| ParseError::new("indexed identifier name must be symbol"))?;
+                let indices = items[2..]
+                    .iter()
+                    .map(|index| {
+                        Index::from_sexp(index).ok_or_else(|| {
+                            ParseError::new("qualified indexed identifier has an invalid index")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Self::Indexed(name.to_string(), indices))
+            }
+            _ => Err(ParseError::new(
+                "qualified identifier must be a symbol or indexed identifier",
+            )),
+        }
+    }
+
+    /// Return the identifier only when this is a simple or quoted symbol.
+    pub fn as_symbol(&self) -> Option<&str> {
+        match self {
+            Self::Symbol(name) => Some(name),
+            Self::Indexed(_, _) => None,
+        }
+    }
+}
+
 /// An SMT-LIB term
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -18,15 +121,16 @@ pub enum Term {
     Symbol(String),
     /// Function application: (f arg1 arg2 ...)
     App(String, Vec<Self>),
-    /// Indexed function application: ((_ name idx1 idx2 ...) arg1 arg2 ...)
+    /// Indexed identifier or function application:
+    /// `(_ name idx1 idx2 ...)` or `((_ name idx1 idx2 ...) arg1 arg2 ...)`.
     /// Carries the name and indices as structured data instead of
     /// stringifying `(_ extract 7 0)` into `App("(_ extract 7 0)", args)`.
-    IndexedApp(String, Vec<String>, Vec<Self>),
+    IndexedApp(String, Vec<Index>, Vec<Self>),
     /// Qualified function application: ((as \<id\> \<sort\>) arg1 arg2 ...)
     /// Carries the identifier name and sort annotation as structured data,
     /// avoiding the stringify-then-reparse anti-pattern of encoding the
     /// entire `(as ...)` expression as a string in `App`.
-    QualifiedApp(String, Sort, Vec<Self>),
+    QualifiedApp(QualifiedIdentifier, Sort, Vec<Self>),
     /// Let binding: (let ((x e1) (y e2)) body)
     Let(Vec<(String, Self)>, Box<Self>),
     /// Quantifier: (forall ((x Int)) body)
@@ -183,12 +287,7 @@ impl Term {
                         // Carries the identifier and sort as structured data.
                         // <id> can be a symbol or an indexed identifier (_ sym idx...).
                         "as" if items.len() == 3 => {
-                            let id = if let Some(sym) = items[1].as_symbol() {
-                                sym.to_string()
-                            } else {
-                                // Indexed identifier: (_ name idx...) → stringify
-                                items[1].to_raw_string()
-                            };
+                            let id = QualifiedIdentifier::from_sexp(&items[1])?;
                             let sort = Sort::from_sexp(&items[2])?;
                             Ok(Self::QualifiedApp(id, sort, vec![]))
                         }
@@ -378,30 +477,26 @@ impl Term {
 
     fn parse_indexed_identifier(items: &[SExpr]) -> Result<Self, ParseError> {
         // (_ symbol index+) - indexed identifier as a term
-        if items.len() < 2 {
-            return Err(ParseError::new("indexed identifier requires name"));
+        if items.len() < 3 {
+            return Err(ParseError::new(
+                "indexed identifier requires a name and at least one index",
+            ));
         }
         let name = items[1]
             .as_symbol()
             .ok_or_else(|| ParseError::new("indexed identifier name must be symbol"))?;
 
-        let indices: Vec<String> = items[2..]
+        let indices: Vec<Index> = items[2..]
             .iter()
-            .filter_map(|s| match s {
-                SExpr::Numeral(n) => Some(n.clone()),
-                SExpr::Symbol(s) => Some(s.clone()),
-                // Preserve `#x..`/`#b..` indices (e.g. z3's char literal
-                // `(_ char #x61)`) — dropping them mangled the reconstructed name
-                // to `(_ char )`.
-                SExpr::Hexadecimal(h) => Some(h.clone()),
-                SExpr::Binary(b) => Some(b.clone()),
-                _ => None,
+            .map(|sexp| {
+                Index::from_sexp(sexp)
+                    .ok_or_else(|| ParseError::new("indexed identifier has an invalid index"))
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
 
-        // Return as a symbol with the full indexed name
-        let full_name = format!("(_ {} {})", name, indices.join(" "));
-        Ok(Self::Symbol(full_name))
+        // Keep the indexed origin structural. Stringifying this as a `Symbol`
+        // aliases it with a legal quoted symbol having the same spelling.
+        Ok(Self::IndexedApp(name.to_string(), indices, Vec::new()))
     }
 
     fn parse_application(items: &[SExpr]) -> Result<Self, ParseError> {
@@ -411,21 +506,31 @@ impl Term {
 
         // Handle indexed function names like (_ extract 7 0)
         let (func_name, args_start) = if let SExpr::List(head_items) = &items[0] {
+            if items.len() == 1 {
+                return Err(ParseError::new(
+                    "qualified or indexed application requires at least one argument",
+                ));
+            }
             if !head_items.is_empty() && head_items[0].is_symbol("_") {
+                if head_items.len() < 3 {
+                    return Err(ParseError::new(
+                        "indexed application requires a name and at least one index",
+                    ));
+                }
                 // Indexed function: produce IndexedApp directly
                 let name = head_items
                     .get(1)
                     .and_then(|s| s.as_symbol())
                     .ok_or_else(|| ParseError::new("indexed identifier name must be symbol"))?
                     .to_string();
-                let indices: Vec<String> = head_items[2..]
+                let indices: Vec<Index> = head_items[2..]
                     .iter()
-                    .filter_map(|s| match s {
-                        SExpr::Numeral(n) => Some(n.clone()),
-                        SExpr::Symbol(s) => Some(s.clone()),
-                        _ => None,
+                    .map(|sexp| {
+                        Index::from_sexp(sexp).ok_or_else(|| {
+                            ParseError::new("indexed application has an invalid index")
+                        })
                     })
-                    .collect();
+                    .collect::<Result<_, _>>()?;
                 let args: Result<Vec<_>, _> = items[1..].iter().map(Self::from_sexp).collect();
                 return Ok(Self::IndexedApp(name, indices, args?));
             } else if !head_items.is_empty() && head_items[0].is_symbol("as") {
@@ -436,12 +541,7 @@ impl Term {
                         "qualified identifier requires (as <id> <sort>)",
                     ));
                 }
-                let id = if let Some(sym) = head_items[1].as_symbol() {
-                    sym.to_string()
-                } else {
-                    // Indexed identifier: (_ name idx...) → stringify
-                    head_items[1].to_raw_string()
-                };
+                let id = QualifiedIdentifier::from_sexp(&head_items[1])?;
                 let sort = Sort::from_sexp(&head_items[2])?;
                 let args: Result<Vec<_>, _> = items[1..].iter().map(Self::from_sexp).collect();
                 return Ok(Self::QualifiedApp(id, sort, args?));

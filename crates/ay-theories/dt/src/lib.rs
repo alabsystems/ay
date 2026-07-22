@@ -93,7 +93,6 @@ pub struct DtModel {
 
 impl DtModel {
     /// Fully-resolved class representative of `term` (itself when untracked).
-    #[must_use]
     pub fn rep(&self, term: TermId) -> TermId {
         self.rep_of.get(&term).copied().unwrap_or(term)
     }

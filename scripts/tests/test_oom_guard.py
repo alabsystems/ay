@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -81,13 +82,18 @@ class PlanSolverResourcesTest(unittest.TestCase):
         self.assertEqual(plan.headroom_mb, 4096)
         self.assertEqual(plan.memlimit_mb, (24576 - 4096) // 6)
 
-    def test_unknown_ram_is_safe_noop(self):
-        # RAM undetectable: don't second-guess the caller; memlimit 0 means
-        # "don't set" (module's safe-no-op philosophy).
-        plan = og.plan_solver_resources(6, ram_mb=0, cores=14)
-        self.assertEqual(plan.jobs, 6)
-        self.assertEqual(plan.memlimit_mb, 0)
-        self.assertEqual(plan.nbcore, 2)
+    def test_explicit_unknown_ram_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "ram_mb must be positive"):
+            og.plan_solver_resources(6, ram_mb=0, cores=14)
+
+    def test_invalid_planner_inputs_fail_closed(self):
+        for kwargs in (
+                {"headroom_mb": -1},
+                {"mem_floor_mb": 0},
+                {"cores": 0},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                og.plan_solver_resources(1, ram_mb=8192, **kwargs)
 
     def test_automatic_unknown_ram_fails_closed(self):
         with mock.patch.object(og, "physical_ram_mb", return_value=0), \
@@ -99,7 +105,7 @@ class PlanSolverResourcesTest(unittest.TestCase):
         cgroup = og.CgroupMemory(limit_mb=8192, current_mb=2048)
         with mock.patch.object(og, "physical_ram_mb", return_value=8192), \
              mock.patch.object(og, "cgroup_memory_mb", return_value=cgroup):
-            plan = og.plan_solver_resources(2, cores=4)
+            plan = og.plan_solver_resources(2, cores=4, acquire_lease=False)
         self.assertEqual(plan.headroom_mb, 1024)
         self.assertEqual(plan.jobs, 2)
         self.assertEqual(plan.memlimit_mb, 2560)
@@ -145,9 +151,141 @@ class PlanSolverResourcesTest(unittest.TestCase):
         plan = og.plan_solver_resources(8, ram_mb=262144, cores=4)
         self.assertEqual(plan.nbcore, 1)
 
+    def test_second_independent_plan_cannot_reuse_active_lease(self):
+        with mock.patch.object(og, "_ACTIVE_HARNESS_LEASE", object()):
+            with self.assertRaisesRegex(RuntimeError, "already active"):
+                og.plan_solver_resources(
+                    1,
+                    ram_mb=8192,
+                    cores=1,
+                    headroom_mb=1024,
+                    acquire_lease=True,
+                )
+
+    @unittest.skipUnless(hasattr(os, "getuid"), "POSIX user lease")
+    def test_production_lease_path_is_tmpdir_independent(self):
+        with mock.patch.dict(os.environ, {"TMPDIR": "/tmp/first-campaign"}):
+            first = og._host_harness_lease_path()
+        with mock.patch.dict(os.environ, {"TMPDIR": "/tmp/second-campaign"}):
+            second = og._host_harness_lease_path()
+        expected = f"/tmp/ay-oom-guard-{os.getuid()}.lock"
+        self.assertEqual(first, expected)
+        self.assertEqual(second, expected)
+
+    @unittest.skipUnless(hasattr(os, "getuid"), "POSIX user lease")
+    def test_hidden_lease_path_requires_absolute_path(self):
+        with self.assertRaisesRegex(ValueError, "must be absolute"):
+            og.acquire_harness_lease("relative test lease", _lock_path="lease.lock")
+
+    @unittest.skipUnless(hasattr(os, "getuid"), "POSIX user lease")
+    def test_hidden_lease_path_coordinates_sidecars_with_distinct_tmpdirs(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            first_tmp = root / "first-tmp"
+            second_tmp = root / "second-tmp"
+            first_tmp.mkdir()
+            second_tmp.mkdir()
+            lock_path = root / "isolated-host-lease.lock"
+            command = [
+                sys.executable,
+                og.__file__,
+                "lease",
+                "--test-lock-path",
+                str(lock_path),
+            ]
+            first_env = dict(os.environ, TMPDIR=str(first_tmp))
+            second_env = dict(os.environ, TMPDIR=str(second_tmp))
+            first = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=first_env,
+            )
+            try:
+                ready = []
+                reader = threading.Thread(
+                    target=lambda: ready.append(first.stdout.readline()),
+                    daemon=True,
+                )
+                reader.start()
+                reader.join(timeout=10)
+                self.assertFalse(reader.is_alive(), "first lease sidecar did not arm")
+                self.assertEqual(ready, [b"AY_OOM_HARNESS_LEASE_READY_V1\n"])
+
+                blocked = subprocess.run(
+                    command,
+                    input=b"",
+                    capture_output=True,
+                    timeout=10,
+                    env=second_env,
+                    check=False,
+                )
+                self.assertNotEqual(blocked.returncode, 0)
+                self.assertNotIn(
+                    b"AY_OOM_HARNESS_LEASE_READY_V1", blocked.stdout
+                )
+
+                first.stdin.close()
+                self.assertEqual(first.wait(timeout=10), 0)
+                replacement = subprocess.run(
+                    command,
+                    input=b"",
+                    capture_output=True,
+                    timeout=10,
+                    env=second_env,
+                    check=False,
+                )
+                self.assertEqual(replacement.returncode, 0, replacement.stderr)
+                self.assertEqual(
+                    replacement.stdout, b"AY_OOM_HARNESS_LEASE_READY_V1\n"
+                )
+            finally:
+                if first.poll() is None:
+                    first.kill()
+                    first.wait(timeout=5)
+                for stream in (first.stdin, first.stdout, first.stderr):
+                    if stream is not None:
+                        stream.close()
+
     def test_count_active_rustc_returns_count(self):
         self.assertIsInstance(og.count_active_rustc(), int)
         self.assertGreaterEqual(og.count_active_rustc(), 0)
+
+    def test_build_detection_includes_targo_and_trustc_and_excludes_ancestor(self):
+        with tempfile.TemporaryDirectory() as td:
+            proc = Path(td)
+
+            def process(pid, name, command, state="S"):
+                directory = proc / str(pid)
+                directory.mkdir()
+                (directory / "comm").write_text(name + "\n")
+                (directory / "stat").write_text(
+                    f"{pid} ({name}) {state} 1 0 0 0 0\n"
+                )
+                (directory / "cmdline").write_bytes(
+                    b"\0".join(token.encode() for token in command) + b"\0"
+                )
+
+            process(100, "compiler_consumer", ["compiler_consumer", "crate.rs"])
+            process(101, "targo", ["targo", "build"])
+            process(102, "targo", ["targo", "metadata"])
+            process(103, "cargo", ["cargo", "test"])
+            process(104, "rustc", ["rustc", "done.rs"], state="Z")
+            process(105, "compiler_consumer", ["compiler_consumer", "paused.rs"], state="T")
+            process(106, "targo", ["targo", "test"], state="T")
+
+            self.assertEqual(
+                og.count_active_rustc(proc_root=td, ancestor_pids={103}),
+                2,
+            )
+
+    def test_build_process_walk_is_bounded(self):
+        with tempfile.TemporaryDirectory() as td:
+            Path(td, "1").mkdir()
+            Path(td, "2").mkdir()
+            with self.assertRaisesRegex(RuntimeError, "inspection cap"):
+                og._named_build_processes(td, max_entries=1)
 
 
 class WindTunnelEnvMergeTest(unittest.TestCase):
@@ -191,13 +329,11 @@ class ChcEnvelopeRecordingTest(unittest.TestCase):
         self.assertEqual(rec["memlimit_mb"], 777)
         self.assertEqual(rec["status"], "unknown")
 
-    def test_track_sweep_record_zero_means_solver_default(self):
-        # RAM undetectable => plan memlimit 0 => no --memory flag; the record
-        # still says so explicitly (0 = solver default envelope).
+    def test_track_sweep_rejects_missing_memory_envelope(self):
         task = types.SimpleNamespace(smt2=os.devnull, verdict=None,
                                      rel_id="fam/x.smt2")
-        rec = chccomp_track_sweep.run_one(task, 5, "/usr/bin/true")
-        self.assertEqual(rec["memlimit_mb"], 0)
+        with self.assertRaises(ValueError):
+            chccomp_track_sweep.run_one(task, 5, "/usr/bin/true")
 
     def test_regression_record_carries_memlimit(self):
         entry = {"year": "2025", "track": "LIA-Lin", "instance": "i.yml",
@@ -248,6 +384,84 @@ class RssWatchdogTest(unittest.TestCase):
         self.assertFalse(guard.breached)
         self.assertEqual(rc, 0)
 
+    def test_rss_watchdog_refuses_non_group_leader(self):
+        proc = mock.Mock(pid=1234)
+        with mock.patch.object(og.os, "getpgid", return_value=4321), \
+             mock.patch.object(og, "_RssWatchdog") as watchdog:
+            with self.assertRaisesRegex(RuntimeError, "not its process-group leader"):
+                og.rss_watchdog(proc, 128, label="wrong-group")
+        watchdog.assert_not_called()
+
+    def test_rss_watchdog_rejects_invalid_poll_intervals(self):
+        proc = mock.Mock(pid=1234)
+        with mock.patch.object(og.os, "getpgid", return_value=1234):
+            for poll_s in (0, -0.1, float("nan"), float("inf")):
+                with self.subTest(poll_s=poll_s), self.assertRaises(ValueError):
+                    og.rss_watchdog(proc, 128, poll_s=poll_s, grace_mb=0)
+
+    def test_identity_loss_is_terminal_and_never_kills_reused_group(self):
+        proc = mock.Mock(pid=4242)
+        with mock.patch.object(
+            og, "_watch_process_identity", return_value=(4242, "replacement")
+        ), mock.patch.object(
+            og, "_safe_getpgid", return_value=4242
+        ), mock.patch.object(
+            og, "_terminate_process_group"
+        ) as terminate:
+            guard = og._RssWatchdog(
+                proc,
+                4242,
+                128,
+                0.001,
+                "identity-loss-test",
+                (4242, "original"),
+            )
+            try:
+                self.assertTrue(
+                    guard.wait_terminal(1),
+                    "identity loss must terminate the monitor instead of polling a raw PGID",
+                )
+                self.assertTrue(guard.identity_lost)
+                self.assertFalse(guard.breached)
+                self.assertFalse(guard.terminate_if_authenticated())
+            finally:
+                guard.stop()
+        terminate.assert_not_called()
+
+    def test_watch_server_shutdown_uses_authenticated_cleanup(self):
+        class FakeGuard:
+            armed = True
+            breached = False
+            breach_time_ns = None
+
+            def __init__(self):
+                self.cleanup_calls = 0
+
+            def wait_terminal(self, timeout=None):
+                time.sleep(min(timeout or 0, 0.001))
+                return False
+
+            def terminate_if_authenticated(self):
+                self.cleanup_calls += 1
+                return False
+
+            def stop(self):
+                pass
+
+        guard = FakeGuard()
+        proc = types.SimpleNamespace(pid=4242, pgid=4242)
+        input_stream = io.BytesIO(b"WATCH 1 4242 128 74657374\n")
+        output_stream = io.BytesIO()
+        with mock.patch.object(og, "_AttachedProcess", return_value=proc), \
+             mock.patch.object(
+                 og, "_group_watch_identity", return_value=(4242, "original")
+             ), \
+             mock.patch.object(og, "rss_watchdog", return_value=guard), \
+             mock.patch.object(og, "_terminate_process_group") as terminate:
+            og.serve_watchdog_requests(input_stream, output_stream)
+        self.assertGreaterEqual(guard.cleanup_calls, 1)
+        terminate.assert_not_called()
+
     def test_watch_existing_process_uses_same_enforcement(self):
         proc = self._spawn(
             "import time; b = bytearray(64 * 1024 * 1024); time.sleep(60)"
@@ -259,8 +473,177 @@ class RssWatchdogTest(unittest.TestCase):
         self.assertTrue(breached)
         self.assertEqual(rc, -signal.SIGKILL)
 
+    def test_watch_existing_process_fails_closed_if_child_is_gone(self):
+        with mock.patch.object(
+            og, "_AttachedProcess", side_effect=ProcessLookupError("gone")
+        ):
+            self.assertTrue(og.watch_existing_process(999999, 128))
+
+    def test_watch_existing_process_signals_ready_after_arming(self):
+        proc = self._spawn("import time; time.sleep(0.2)")
+        reaper = threading.Thread(target=proc.wait)
+        reaper.start()
+        with tempfile.TemporaryDirectory() as td:
+            ready = Path(td, "ready")
+            breached = og.watch_existing_process(
+                proc.pid,
+                10000,
+                label="ready-test",
+                poll_s=0.01,
+                grace_mb=0,
+                ready_file=str(ready),
+            )
+            self.assertFalse(breached)
+            self.assertEqual(ready.read_text(), "ready\n")
+        reaper.join(timeout=5)
+        self.assertFalse(reaper.is_alive())
+        self.assertEqual(proc.returncode, 0)
+
+    def test_watch_existing_process_refuses_ready_when_watchdog_is_unarmed(self):
+        proc = self._spawn("import time; time.sleep(60)")
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(
+            og, "rss_watchdog", return_value=og._NoopWatchdog()
+        ):
+            ready = Path(td, "ready")
+            self.assertTrue(
+                og.watch_existing_process(
+                    proc.pid,
+                    10000,
+                    label="unarmed-ready-test",
+                    ready_file=str(ready),
+                )
+            )
+            self.assertFalse(ready.exists())
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=5)
+
+    def test_terminating_watch_sidecar_kills_target_group(self):
+        with tempfile.TemporaryDirectory() as td:
+            ready = Path(td, "ready")
+            descendant_pid = Path(td, "descendant.pid")
+            target_code = (
+                "import pathlib,subprocess,sys,time; "
+                "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']); "
+                f"pathlib.Path({str(descendant_pid)!r}).write_text(str(child.pid)); "
+                "time.sleep(60)"
+            )
+            target = subprocess.Popen(
+                [sys.executable, "-c", target_code], start_new_session=True
+            )
+            sidecar = subprocess.Popen(
+                [
+                    sys.executable,
+                    og.__file__,
+                    "watch",
+                    "--pid",
+                    str(target.pid),
+                    "--limit-mb",
+                    "10000",
+                    "--ready-file",
+                    str(ready),
+                    "--label",
+                    "sidecar-signal-test",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while (not ready.exists() or not descendant_pid.exists()) and \
+                        time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), "watch sidecar never armed")
+                self.assertTrue(descendant_pid.exists(), "target descendant never started")
+                sidecar.send_signal(signal.SIGTERM)
+                sidecar.wait(timeout=10)
+                target.wait(timeout=10)
+                deadline = time.monotonic() + 5
+                while og._process_group_exists(target.pid) and \
+                        time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(
+                    og._process_group_exists(target.pid),
+                    "abnormal sidecar exit left target descendants alive",
+                )
+            finally:
+                try:
+                    os.killpg(target.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                if target.poll() is None:
+                    target.wait(timeout=5)
+                if sidecar.poll() is None:
+                    sidecar.kill()
+                    sidecar.wait(timeout=5)
+                if sidecar.stderr is not None:
+                    sidecar.stderr.close()
+                if sidecar.poll() is None:
+                    sidecar.kill()
+                    sidecar.wait(timeout=5)
+
+    def test_terminating_campaign_watch_server_kills_all_target_descendants(self):
+        with tempfile.TemporaryDirectory() as td:
+            descendant_pid = Path(td, "server-descendant.pid")
+            target_code = (
+                "import pathlib,subprocess,sys,time; "
+                "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']); "
+                f"pathlib.Path({str(descendant_pid)!r}).write_text(str(child.pid)); "
+                "time.sleep(60)"
+            )
+            target = subprocess.Popen(
+                [sys.executable, "-c", target_code], start_new_session=True
+            )
+            server = subprocess.Popen(
+                [sys.executable, og.__file__, "watch-server"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                self.assertEqual(server.stdout.readline(), og.WATCH_SERVER_READY)
+                server.stdin.write(
+                    f"WATCH 1 {target.pid} 10000 7365727665722d74657374\n".encode()
+                )
+                server.stdin.flush()
+                while True:
+                    response = server.stdout.readline()
+                    if response.startswith(b"HEARTBEAT "):
+                        continue
+                    self.assertEqual(response, b"READY 1\n")
+                    break
+                deadline = time.monotonic() + 10
+                while not descendant_pid.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(descendant_pid.exists(), "target descendant never started")
+                server.send_signal(signal.SIGTERM)
+                server.wait(timeout=10)
+                target.wait(timeout=10)
+                deadline = time.monotonic() + 5
+                while og._process_group_exists(target.pid) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertFalse(
+                    og._process_group_exists(target.pid),
+                    "campaign server exit left target descendants alive",
+                )
+            finally:
+                try:
+                    os.killpg(target.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                if target.poll() is None:
+                    target.wait(timeout=5)
+                if server.poll() is None:
+                    server.kill()
+                    server.wait(timeout=5)
+                for stream in (server.stdin, server.stdout, server.stderr):
+                    if stream is not None:
+                        stream.close()
+
     def test_watch_cli_has_distinct_memout_exit(self):
-        with mock.patch.object(og, "watch_existing_process", return_value=True):
+        with mock.patch.object(
+            og, "watch_existing_process", return_value=(True, 123)
+        ):
             rc = og._cli(["watch", "--pid", "123", "--limit-mb", "456"])
         self.assertEqual(rc, og.WATCHDOG_BREACH_EXIT)
 
@@ -272,6 +655,154 @@ class RssWatchdogTest(unittest.TestCase):
             label="run-timeout-test",
         )
         self.assertEqual(rc, og.WATCHDOG_TIMEOUT_EXIT)
+
+    def test_guarded_popen_refuses_noop_watchdog_and_reaps_child(self):
+        spawned = []
+        real_popen = og.subprocess.Popen
+
+        def capture_spawn(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        with mock.patch.object(og.subprocess, "Popen", side_effect=capture_spawn), \
+             mock.patch.object(og, "rss_watchdog", return_value=og._NoopWatchdog()):
+            with self.assertRaisesRegex(RuntimeError, "did not arm"):
+                og.guarded_popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    10000,
+                    label="noop-arm-test",
+                )
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(spawned[0].returncode)
+
+    def test_guarded_popen_resume_failure_reaps_child_and_stops_guard(self):
+        spawned = []
+        real_popen = og.subprocess.Popen
+        real_killpg = og.os.killpg
+
+        def capture_spawn(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        def fail_resume(pgid, signum):
+            if signum == signal.SIGCONT:
+                raise OSError("simulated resume failure")
+            return real_killpg(pgid, signum)
+
+        with mock.patch.object(og.subprocess, "Popen", side_effect=capture_spawn), \
+             mock.patch.object(og.os, "killpg", side_effect=fail_resume):
+            with self.assertRaisesRegex(OSError, "simulated resume failure"):
+                og.guarded_popen(
+                    [sys.executable, "-c", "import time; time.sleep(60)"],
+                    10000,
+                    label="resume-failure-test",
+                )
+        self.assertEqual(len(spawned), 1)
+        self.assertIsNotNone(spawned[0].returncode)
+
+    def test_group_anchor_leases_pgid_after_leader_is_reaped(self):
+        proc, guard = og.guarded_popen(
+            [sys.executable, "-c", "pass"],
+            10000,
+            label="pgid-anchor-test",
+        )
+        pgid = os.getpgid(proc.pid)
+        try:
+            self.assertEqual(proc.wait(timeout=5), 0)
+            # The leader is reaped, but the anchor keeps this exact group ID
+            # live until cleanup; killpg cannot hit a newly recycled group.
+            os.killpg(pgid, 0)
+        finally:
+            og._terminate_process_group(proc, pgid)
+            guard.stop()
+
+    def test_watchdog_tracks_descendant_after_group_leader_exits(self):
+        descendant = (
+            "import time; time.sleep(0.2); "
+            "b=bytearray(96*1024*1024); time.sleep(60)"
+        )
+        leader = (
+            "import subprocess,sys; "
+            f"subprocess.Popen([sys.executable,'-c',{descendant!r}])"
+        )
+        proc, guard = og.guarded_popen(
+            [sys.executable, "-c", leader],
+            32,
+            label="post-leader-descendant-test",
+            poll_s=0.01,
+        )
+        pgid = os.getpgid(proc.pid)
+        try:
+            self.assertEqual(proc.wait(timeout=5), 0)
+            deadline = time.monotonic() + 10
+            while not guard.breached and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(
+                guard.breached,
+                "watchdog disarmed when the leader exited but a descendant remained",
+            )
+        finally:
+            og._terminate_process_group(proc, pgid)
+            guard.stop()
+
+    def test_run_captured_returns_output_and_forwards_env_and_input(self):
+        result = og.run_captured(
+            [
+                sys.executable,
+                "-c",
+                "import os,sys; print(os.environ['AY_CAPTURE_TEST']); "
+                "print(sys.stdin.read(), end='')",
+            ],
+            10000,
+            timeout_s=5,
+            label="captured-success-test",
+            env=dict(os.environ, AY_CAPTURE_TEST="envelope"),
+            input_text="payload\n",
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "envelope\npayload\n")
+        self.assertFalse(result.timed_out)
+        self.assertFalse(result.memout)
+        self.assertFalse(result.output_truncated)
+        self.assertGreaterEqual(result.wall_sec, 0)
+
+    def test_run_captured_bounds_noisy_child_output(self):
+        result = og.run_captured(
+            [
+                sys.executable,
+                "-c",
+                "import os; os.write(1, b'x' * (3 * 1024 * 1024)); "
+                "os.write(2, b'y' * (3 * 1024 * 1024))",
+            ],
+            10000,
+            timeout_s=10,
+            label="captured-output-cap-test",
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(result.stdout_truncated)
+        self.assertTrue(result.stderr_truncated)
+        self.assertTrue(result.output_truncated)
+        self.assertLessEqual(len(result.stdout.encode()), og.CAPTURE_LIMIT_BYTES)
+        self.assertLessEqual(len(result.stderr.encode()), og.CAPTURE_LIMIT_BYTES)
+
+    def test_run_captured_timeout_kills_the_process_group(self):
+        result = og.run_captured(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            10000,
+            timeout_s=0.1,
+            label="captured-timeout-test",
+        )
+        self.assertTrue(result.timed_out)
+        self.assertFalse(result.memout)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_run_captured_rejects_unbounded_runs(self):
+        with self.assertRaises(ValueError):
+            og.run_captured(["solver"], 0, timeout_s=1)
+        with self.assertRaises(ValueError):
+            og.run_captured(["solver"], 100, timeout_s=None)
 
     def test_run_cli_forwards_command_after_separator(self):
         with mock.patch.object(og, "run_guarded", return_value=17) as run:
@@ -291,6 +822,19 @@ class RssWatchdogTest(unittest.TestCase):
                 og._cli(["watch", "--pid", "123", "--limit-mb", "0"])
             with self.assertRaises(SystemExit):
                 og._cli(["run", "--limit-mb", "0", "--", "solver"])
+
+    def test_cli_rejects_invalid_timing_and_planner_values(self):
+        invalid_commands = [
+            ["watch", "--pid", "123", "--limit-mb", "1", "--poll-s", "nan"],
+            ["run", "--limit-mb", "1", "--timeout-s", "0", "--", "true"],
+            ["plan", "--jobs", "1", "--headroom-mb", "-1"],
+            ["plan", "--jobs", "1", "--mem-floor-mb", "0"],
+        ]
+        for command in invalid_commands:
+            with self.subTest(command=command), \
+                    contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit):
+                og._cli(command)
 
     def test_run_guarded_kills_descendants_after_clean_wrapper_exit(self):
         with tempfile.TemporaryDirectory() as td:
@@ -322,6 +866,80 @@ class RssWatchdogTest(unittest.TestCase):
 
     def test_process_group_rss_nonnegative(self):
         self.assertGreaterEqual(og.process_group_rss_mb(os.getpgid(0)), 0)
+
+    def test_concurrent_watchdogs_share_one_bounded_proc_scan(self):
+        workers = 16
+        barrier = threading.Barrier(workers)
+        results = []
+        errors = []
+        with og._RSS_SNAPSHOT_LOCK:
+            og._RSS_SNAPSHOT_AT = 0.0
+            og._RSS_SNAPSHOT = None
+            og._RSS_SNAPSHOT_READY = False
+            before = og._RSS_SNAPSHOT_SCAN_COUNT
+
+        def inspect():
+            try:
+                barrier.wait(timeout=5)
+                results.append(og.process_group_rss_mb(os.getpgid(0)))
+            except Exception as error:
+                errors.append(error)
+
+        with mock.patch.object(og, "_RSS_SNAPSHOT_TTL_S", 60.0):
+            threads = [threading.Thread(target=inspect) for _ in range(workers)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), workers)
+        self.assertTrue(all(result is not None for result in results))
+        self.assertEqual(
+            og._RSS_SNAPSHOT_SCAN_COUNT - before,
+            1,
+            "all watchdog threads in one campaign server must share one /proc scan",
+        )
+
+    def test_slow_proc_scan_does_not_trigger_one_rescan_per_waiter(self):
+        workers = 16
+        barrier = threading.Barrier(workers)
+        results = []
+        errors = []
+        with og._RSS_SNAPSHOT_LOCK:
+            og._RSS_SNAPSHOT_AT = 0.0
+            og._RSS_SNAPSHOT = None
+            og._RSS_SNAPSHOT_READY = False
+            before = og._RSS_SNAPSHOT_SCAN_COUNT
+
+        def slow_empty_proc(_path):
+            time.sleep(0.1)
+            return ["not-a-pid"]
+
+        def inspect(index):
+            try:
+                barrier.wait(timeout=5)
+                # Stagger arrivals across several TTLs while the first thread
+                # holds the scan lock. Freshness must be measured after that
+                # wait, not from each thread's stale pre-lock timestamp.
+                time.sleep(index * 0.004)
+                results.append(og.process_group_rss_mb(os.getpgid(0)))
+            except Exception as error:
+                errors.append(error)
+
+        with mock.patch.object(og.os, "listdir", side_effect=slow_empty_proc):
+            threads = [
+                threading.Thread(target=inspect, args=(index,))
+                for index in range(workers)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [None] * workers)
+        self.assertEqual(og._RSS_SNAPSHOT_SCAN_COUNT - before, 1)
 
     def test_measurement_failure_is_none_not_zero(self):
         """A failed measurement must be UNKNOWN, never 0.
@@ -371,6 +989,53 @@ class RssWatchdogTest(unittest.TestCase):
         missed_mb = og.POLL_DEFAULT * 20.2 * 1024
         self.assertLess(missed_mb, 500)
 
+    def test_failed_spawn_cleanup_kills_group_after_leader_was_reaped(self):
+        proc = mock.Mock(pid=4242, returncode=1)
+        with mock.patch.object(og, "_kill_and_reap_group") as cleanup:
+            og._kill_reap_failed_spawn(proc, 4242)
+        cleanup.assert_called_once_with(proc, 4242, "failed guarded spawn")
+
+    def test_run_guarded_preserves_wait_error_after_cleanup(self):
+        proc = mock.Mock(pid=4242, returncode=None)
+        proc.wait.side_effect = OSError("simulated wait failure")
+        guard = mock.Mock(breach_time_ns=None)
+        with mock.patch.object(og, "guarded_popen", return_value=(proc, guard)), \
+             mock.patch.object(og, "_kill_and_reap_group"):
+            with self.assertRaisesRegex(OSError, "simulated wait failure"):
+                og.run_guarded(["solver"], 128, timeout_s=1)
+        guard.stop.assert_called_once_with()
+
+    def test_first_terminal_cause_uses_monotonic_trigger_order(self):
+        self.assertEqual(
+            og._first_termination_cause(
+                breach_time_ns=100, timeout_time_ns=101, cancel_time_ns=None
+            ),
+            "memout",
+        )
+        self.assertEqual(
+            og._first_termination_cause(
+                breach_time_ns=101, timeout_time_ns=100, cancel_time_ns=None
+            ),
+            "timeout",
+        )
+        self.assertEqual(
+            og._first_termination_cause(
+                breach_time_ns=102, timeout_time_ns=None, cancel_time_ns=100
+            ),
+            "cancel",
+        )
+
+    def test_watchdog_stop_fails_if_thread_does_not_terminate(self):
+        guard = object.__new__(og._RssWatchdog)
+        guard._stop_evt = mock.Mock()
+        guard._thread = mock.Mock()
+        guard._thread.is_alive.return_value = True
+        guard._label = "stuck-watchdog-test"
+        with self.assertRaisesRegex(RuntimeError, "did not stop"):
+            guard.stop()
+        guard._stop_evt.set.assert_called_once_with()
+        guard._thread.join.assert_called_once_with(timeout=10)
+
 
 @unittest.skipUnless(hasattr(os, "getpgid"), "needs POSIX process groups")
 class SmtcompEnvelopeTest(unittest.TestCase):
@@ -393,15 +1058,12 @@ class SmtcompEnvelopeTest(unittest.TestCase):
         self.assertFalse(res.timed_out)      # 60s budget was nowhere near spent
         self.assertLess(res.wall_sec, 30)
 
-    def test_run_process_without_envelope_is_unbounded(self):
-        """memlimit_mb=0 keeps the pre-2026-07-15 behaviour (no backstop), so a
-        caller that forgets the envelope gets no memout — which is exactly why
-        cmd_run computes it from plan_solver_resources rather than the CLI."""
+    def test_run_process_without_envelope_fails_closed(self):
+        """A caller that forgets the envelope cannot launch an unbounded child."""
         inv = smtcomp_harness.Invocation([sys.executable, "-c",
                                           "import time; time.sleep(0.2)"])
-        res = smtcomp_harness.run_process(inv, timeout_s=30, memlimit_mb=0)
-        self.assertFalse(res.memout)
-        self.assertEqual(res.exit_code, 0)
+        with self.assertRaises(ValueError):
+            smtcomp_harness.run_process(inv, timeout_s=30, memlimit_mb=0)
 
     def test_record_carries_envelope(self):
         """Results taken under different envelopes are not comparable, so the

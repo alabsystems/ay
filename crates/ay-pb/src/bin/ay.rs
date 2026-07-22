@@ -4533,6 +4533,7 @@ fn pb_exit_code(status: PbStatus) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ay_test_support::env::{lock_env, ScopedEnvVar};
     use std::fs;
 
     #[test]
@@ -5165,11 +5166,9 @@ mod tests {
     fn proof_mode_clique_writes_solver_owned_conflict_row_map_sidecar() {
         // The sidecar is a §4.3-sensitive extra file, OFF by default in
         // competition runs; this test opts in explicitly. Serialized with the
-        // off-by-default test below via CERT_ENV_LOCK (shared process env).
-        let _serial = CERT_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::set_var("AY_PB_CLIQUE_ROW_MAP_SIDECAR", "1");
+        // off-by-default test below via the shared process-environment lock.
+        let _serial = lock_env();
+        let _sidecar_env = ScopedEnvVar::set("AY_PB_CLIQUE_ROW_MAP_SIDECAR", "1");
         let file_path = write_temp_pb(
             "proof-mode-clique-row-map",
             "opb",
@@ -5202,7 +5201,6 @@ mod tests {
             "2,4,2,2,3,0,1,c15e224da5943ff11a3c8ea9524d4b2bf6c456d7b8a63e3ab6c795409be2bc25,-1 x2 -1 x3 >= -1 ;"
         ));
 
-        std::env::remove_var("AY_PB_CLIQUE_ROW_MAP_SIDECAR");
         remove_temp_files(&[&file_path, &proof_path, &sidecar_path]);
     }
 
@@ -5211,11 +5209,9 @@ mod tests {
         // Competition compliance (requirements §4.3): without the explicit
         // opt-in, a clique-shaped certified solve must write NOTHING next to
         // PROOFFILE except the proof itself. Serialized with the opt-in test
-        // above via CERT_ENV_LOCK (shared process env).
-        let _serial = CERT_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::env::remove_var("AY_PB_CLIQUE_ROW_MAP_SIDECAR");
+        // above via the shared process-environment lock.
+        let _serial = lock_env();
+        let _sidecar_env = ScopedEnvVar::unset("AY_PB_CLIQUE_ROW_MAP_SIDECAR");
         let file_path = write_temp_pb(
             "proof-mode-clique-row-map-off",
             "opb",
@@ -5643,13 +5639,13 @@ mod tests {
 
     #[test]
     fn test_dec_cert_pipeline_certifies_sat_via_solution_proof() {
-        let _serial = CERT_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        clear_cert_env();
+        let _serial = lock_env();
+        // Reset both cert knobs for the test body; restored on scope exit.
+        let _cert_portfolio = ScopedEnvVar::unset("AY_PB_OPT_CERT_PORTFOLIO");
+        let _cert_native_cap = ScopedEnvVar::unset("AY_PB_CERT_NATIVE_CAP_MS");
         // Kill N1: the plain-speed phase must produce the model and the
         // solution-only proof must be committed.
-        std::env::set_var("AY_PB_CERT_NATIVE_CAP_MS", "0");
+        let _cert_native_cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
         let instance = parse_instance_interruptible(
             PbInputFormat::Opb,
             "* #variable= 2 #constraint= 1\n+1 x1 +1 x2 >= 1 ;\n",
@@ -5676,7 +5672,6 @@ mod tests {
             None,
         )
         .expect("solve");
-        clear_cert_env();
         assert_eq!(outcome.solution.status, PbStatus::Satisfiable);
         let text = std::fs::read_to_string(&proof_path).expect("proof committed");
         assert!(
@@ -5688,11 +5683,11 @@ mod tests {
 
     #[test]
     fn test_dec_cert_pipeline_unsat_via_native_tail() {
-        let _serial = CERT_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        clear_cert_env();
-        std::env::set_var("AY_PB_CERT_NATIVE_CAP_MS", "0");
+        let _serial = lock_env();
+        // Reset both cert knobs for the test body; restored on scope exit.
+        let _cert_portfolio = ScopedEnvVar::unset("AY_PB_OPT_CERT_PORTFOLIO");
+        let _cert_native_cap = ScopedEnvVar::unset("AY_PB_CERT_NATIVE_CAP_MS");
+        let _cert_native_cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
         let instance = parse_instance_interruptible(
             PbInputFormat::Opb,
             "* #variable= 1 #constraint= 2\n+1 x1 >= 1 ;\n-1 x1 >= 0 ;\n",
@@ -5719,7 +5714,6 @@ mod tests {
             None,
         )
         .expect("solve");
-        clear_cert_env();
         assert_eq!(outcome.solution.status, PbStatus::Unsatisfiable);
         assert!(
             proof_path.exists(),
@@ -5890,15 +5884,6 @@ mod tests {
         assert_eq!(solution.objective, Some(2));
     }
 
-    /// Serializes tests that touch the AY_PB_OPT_CERT_PORTFOLIO /
-    /// AY_PB_CERT_NATIVE_CAP_MS process-global environment.
-    static CERT_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn clear_cert_env() {
-        std::env::remove_var("AY_PB_OPT_CERT_PORTFOLIO");
-        std::env::remove_var("AY_PB_CERT_NATIVE_CAP_MS");
-    }
-
     fn solve_opb_text_with_proof(input: &str, proof_path: &Path) -> (PbSolution, String) {
         let instance = parse_instance_interruptible(PbInputFormat::Opb, input, || false)
             .expect("OPB text should parse");
@@ -5927,10 +5912,10 @@ mod tests {
 
     #[test]
     fn test_cert_opt_budget_split_tiers_and_gates() {
-        let _serial = CERT_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        clear_cert_env();
+        let _serial = lock_env();
+        // Reset both cert knobs for the test body; restored on scope exit.
+        let _cert_portfolio = ScopedEnvVar::unset("AY_PB_OPT_CERT_PORTFOLIO");
+        let _cert_native_cap = ScopedEnvVar::unset("AY_PB_CERT_NATIVE_CAP_MS");
 
         let small = ay_pb::parse_opb(
             "* #variable= 2 #constraint= 1\nmin: +1 x1 +1 x2 ;\n+1 x1 +1 x2 >= 1 ;\n",
@@ -6002,7 +5987,7 @@ mod tests {
             Duration::from_secs(100)
         );
         assert_eq!(
-            certify_reserve(Duration::from_secs(3000)),
+            certify_reserve(Duration::from_mins(50)),
             Duration::from_secs(300)
         );
     }
@@ -6036,13 +6021,13 @@ mod tests {
 
     #[test]
     fn test_cert_fallback_certifies_portfolio_optimum() {
-        let _serial = CERT_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        clear_cert_env();
+        let _serial = lock_env();
+        // Reset both cert knobs for the test body; restored on scope exit.
+        let _cert_portfolio = ScopedEnvVar::unset("AY_PB_OPT_CERT_PORTFOLIO");
+        let _cert_native_cap = ScopedEnvVar::unset("AY_PB_CERT_NATIVE_CAP_MS");
         // Kill N1 outright: the portfolio must prove the optimum and the
         // out-of-band helpers must certify it.
-        std::env::set_var("AY_PB_CERT_NATIVE_CAP_MS", "0");
+        let _cert_native_cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
         let proof_dir =
             std::env::temp_dir().join(format!("ay-cert-fallback-test-{}", std::process::id()));
         std::fs::create_dir_all(&proof_dir).expect("proof dir should create");
@@ -6052,7 +6037,6 @@ mod tests {
             "* #variable= 2 #constraint= 2\nmin: +1 x1 +1 x2 ;\n+1 x1 +1 x2 >= 1 ;\n-1 x1 -1 x2 >= -2 ;\n",
             &proof_path,
         );
-        clear_cert_env();
 
         assert_eq!(solution.status, PbStatus::OptimumFound);
         let proof = std::fs::read_to_string(&proof_path).expect("proof must be committed");
@@ -6073,14 +6057,14 @@ mod tests {
 
     #[test]
     fn test_cert_kill_switch_restores_native_only() {
-        let _serial = CERT_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        clear_cert_env();
+        let _serial = lock_env();
+        // Reset both cert knobs for the test body; restored on scope exit.
+        let _cert_portfolio = ScopedEnvVar::unset("AY_PB_OPT_CERT_PORTFOLIO");
+        let _cert_native_cap = ScopedEnvVar::unset("AY_PB_CERT_NATIVE_CAP_MS");
         // Kill switch off => the CAP override must be ignored and the native
         // full-budget path must still prove + commit.
-        std::env::set_var("AY_PB_OPT_CERT_PORTFOLIO", "0");
-        std::env::set_var("AY_PB_CERT_NATIVE_CAP_MS", "0");
+        let _cert_portfolio = ScopedEnvVar::set("AY_PB_OPT_CERT_PORTFOLIO", "0");
+        let _cert_native_cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
         let proof_dir =
             std::env::temp_dir().join(format!("ay-cert-killswitch-test-{}", std::process::id()));
         std::fs::create_dir_all(&proof_dir).expect("proof dir should create");
@@ -6090,7 +6074,6 @@ mod tests {
             "* #variable= 2 #constraint= 2\nmin: +1 x1 +1 x2 ;\n+1 x1 +1 x2 >= 1 ;\n-1 x1 -1 x2 >= -2 ;\n",
             &proof_path,
         );
-        clear_cert_env();
 
         assert_eq!(solution.status, PbStatus::OptimumFound);
         assert!(proof_path.exists(), "native proof must be committed");
@@ -6099,13 +6082,13 @@ mod tests {
 
     #[test]
     fn test_cert_opt_unsat_proved_by_native_tail() {
-        let _serial = CERT_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        clear_cert_env();
+        let _serial = lock_env();
+        // Reset both cert knobs for the test body; restored on scope exit.
+        let _cert_portfolio = ScopedEnvVar::unset("AY_PB_OPT_CERT_PORTFOLIO");
+        let _cert_native_cap = ScopedEnvVar::unset("AY_PB_CERT_NATIVE_CAP_MS");
         // N1 disabled; the portfolio's UNSAT is uncertified and must NOT be
         // emitted — the native tail is the only compliant INF INF source.
-        std::env::set_var("AY_PB_CERT_NATIVE_CAP_MS", "0");
+        let _cert_native_cap = ScopedEnvVar::set("AY_PB_CERT_NATIVE_CAP_MS", "0");
         let proof_dir =
             std::env::temp_dir().join(format!("ay-cert-tail-test-{}", std::process::id()));
         std::fs::create_dir_all(&proof_dir).expect("proof dir should create");
@@ -6115,7 +6098,6 @@ mod tests {
             "* #variable= 2 #constraint= 2\nmin: +1 x1 +1 x2 ;\n+1 x1 >= 1 ;\n-1 x1 >= 0 ;\n",
             &proof_path,
         );
-        clear_cert_env();
 
         assert_eq!(solution.status, PbStatus::Unsatisfiable);
         let proof = std::fs::read_to_string(&proof_path).expect("proof must be committed");

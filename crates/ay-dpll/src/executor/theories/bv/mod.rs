@@ -1554,21 +1554,20 @@ impl Executor {
             ));
         }
 
-        let mut solver = if let Some((drat_path, binary)) = bv_drat {
-            let file = std::fs::File::create(drat_path).map_err(|error| {
-                crate::executor_types::ExecutorError::ArtifactExport(format!(
-                    "cannot create --proof DRAT output '{drat_path}': {error}"
-                ))
-            })?;
+        let (mut solver, bv_drat_artifact) = if let Some((drat_path, binary)) = bv_drat.as_ref() {
+            let (file, artifact) = bv_cnf_dump::create_bv_drat(drat_path)?;
             let writer = std::io::BufWriter::new(file);
-            let output = if binary {
+            let output = if *binary {
                 ProofOutput::drat_binary(writer)
             } else {
                 ProofOutput::drat_text(writer)
             };
-            SatSolver::with_proof_output(total_vars as usize, output)
+            (
+                SatSolver::with_proof_output(total_vars as usize, output),
+                Some(artifact),
+            )
         } else {
-            SatSolver::new(total_vars as usize)
+            (SatSolver::new(total_vars as usize), None)
         };
         self.apply_random_seed_to_sat(&mut solver);
         self.apply_progress_to_sat(&mut solver);
@@ -2211,13 +2210,27 @@ impl Executor {
         // non-refuting proof. `solve_result` is final here for the export path
         // (pure QF_BV has no delayed-op re-solve, array CEGAR, or congruence
         // bail; the assumption path returned earlier and never installs a DRAT).
-        if let Some((drat_path, _)) = bv_drat {
+        if let Some((drat_path, _)) = bv_drat.as_ref() {
             let proof = solver.take_proof_writer();
-            bv_cnf_dump::finish_bv_drat(
-                proof,
-                drat_path,
-                matches!(solve_result, SatResult::Unsat(_)),
-            )?;
+            // origin's refactor: finish through the retained artifact descriptor
+            // created alongside the DRAT writer (`create_bv_drat`), not the raw
+            // path.
+            let artifact = bv_drat_artifact.ok_or_else(|| {
+                crate::executor_types::ExecutorError::ArtifactExport(format!(
+                    "BV DRAT target '{drat_path}' has no retained artifact descriptor"
+                ))
+            })?;
+            let is_unsat = matches!(solve_result, SatResult::Unsat(_));
+            bv_cnf_dump::finish_bv_drat(proof, artifact, is_unsat)?;
+            // `--self-check` BV DRAT self-cert: record that this pure-QF_BV UNSAT
+            // emitted a native-checkable, empty-clause-terminated DRAT beside its
+            // CNF for THIS solve. `self_cert_armed()` is true only inside the
+            // self-cert arm (not for a user `--proof`+`--dump-bv-cnf` run), so
+            // the flag never fires outside `--self-check`. The CLI verifies the
+            // DRAT with AY's native checker before keeping the `unsat`.
+            if is_unsat && bv_cnf_dump::self_cert_armed() {
+                self.last_bv_drat_self_cert = true;
+            }
         }
 
         // --- Phase 11: Model extraction ---

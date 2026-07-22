@@ -59,10 +59,7 @@ fn test_cert_leaf_equality_shape_diseq_on_b() {
     .expect("equality-shape certificate leaf must interpolate");
 
     let expected = terms.mk_eq(x, five);
-    assert_eq!(
-        itp, expected,
-        "A projection onto shared {{x}} must be x = 5"
-    );
+    assert_eq!(itp, expected, "A projection onto shared {x} must be x = 5");
     let stats = last_cert_leaf_stats();
     assert_eq!(stats.attempted, 1);
     assert_eq!(stats.verified, 1);

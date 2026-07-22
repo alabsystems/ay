@@ -18,17 +18,13 @@ import json
 import os
 import re
 import shutil
-import signal
-import subprocess
 import sys
-import tempfile
-import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "scripts"))
-from _oom_guard import plan_solver_resources, rss_watchdog, warn_concurrent_build  # noqa: E402
+from _oom_guard import plan_solver_resources, run_captured, warn_concurrent_build  # noqa: E402
 
 DATA = os.environ.get("MZN_CH_DATA", f"{REPO}/benchmarks/minizinc/challenge-2025/data")
 RESULTS = os.environ.get("MZN_CH_RESULTS", f"{REPO}/benchmarks/minizinc/challenge-2025/results-2025.json")
@@ -44,14 +40,6 @@ SOL_RE = re.compile(r"^_objective\s*=\s*(-?\d+)\s*;")
 def find_model(prob_dir):
     mzns = sorted(f for f in os.listdir(prob_dir) if f.endswith(".mzn"))
     return os.path.join(prob_dir, mzns[0]) if mzns else None
-
-
-def kill_process_group(proc):
-    """Kill an isolated MiniZinc/solver tree; tolerate a dead leader."""
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
 
 
 def executable_provenance(command):
@@ -75,15 +63,22 @@ def executable_provenance(command):
                 "runnable": False}
 
 
-def parse_output(stream):
-    """Extract scoring fields from a seekable binary stream in bounded RAM."""
-    stream.flush()
-    stream.seek(0)
+def parse_output(output):
+    """Extract scoring fields from bounded solver output."""
+    if hasattr(output, "read"):
+        output.flush()
+        output.seek(0)
+        lines = (
+            raw.decode("utf-8", errors="replace")
+            if isinstance(raw, bytes) else raw
+            for raw in output
+        )
+    else:
+        lines = output.splitlines()
     sols = 0
     complete = unsat = err_marker = False
     best = None
-    for raw in stream:
-        line = raw.decode("utf-8", errors="replace")
+    for line in lines:
         token = line.strip()
         if token == "----------":
             sols += 1
@@ -97,15 +92,6 @@ def parse_output(stream):
         if match:
             best = int(match.group(1))
     return sols, complete, unsat, err_marker, best
-
-
-def stream_tail(stream, limit=200):
-    """Return at most the last `limit` decoded bytes of a binary stream."""
-    stream.flush()
-    stream.seek(0, os.SEEK_END)
-    size = stream.tell()
-    stream.seek(max(0, size - limit))
-    return stream.read(limit).decode("utf-8", errors="replace")
 
 
 def run_instance(problem, model, data, budget_ms, search, memlimit_mb, nbcore,
@@ -128,57 +114,36 @@ def run_instance(problem, model, data, budget_ms, search, memlimit_mb, nbcore,
     # 'fixed' => respect the model's search annotation (no -f)
     cmd = [TIMEOUT_BIN, str(budget_ms // 1000 + 90), MZN, "--solver", "org.ay.ay",
            *flags, model, data]
-    t0 = time.monotonic()
     child_env = dict(ENV, MEMLIMIT=str(memlimit_mb), NBCORE=str(nbcore))
-    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                env=child_env,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout,
-                stderr=stderr,
-                start_new_session=True,
-            )
-        except OSError as exc:
-            return {"problem": problem, "data": os.path.basename(data),
-                    "status": "ERR", "objective": None,
-                    "time_ms": int((time.monotonic() - t0) * 1000), "n_sols": 0,
-                    "rc": None, "err": f"spawn: {exc}"[:200],
-                    "memout": False, "timed_out": False,
-                    "nbcore": nbcore, "parallelism": parallelism}
-
-        # MiniZinc and its AY wrapper have no trusted footprint knob on this
-        # path. Enforce the exact plan externally over the entire process group.
-        guard = rss_watchdog(proc, memlimit_mb, label=f"mzn {problem}",
-                             grace_mb=0)
-        timed_out = False
-        try:
-            try:
-                rc = proc.wait(timeout=budget_ms / 1000 + 120)
-            except subprocess.TimeoutExpired:
-                timed_out = True
-                kill_process_group(proc)
-                rc = proc.wait()
-        finally:
-            # Reap descendants left behind by gtimeout/minizinc wrappers before
-            # the watchdog is disarmed.
-            kill_process_group(proc)
-            if proc.poll() is None:
-                proc.wait()
-            guard.stop()
-
-        sols, complete, unsat, err_marker, best = parse_output(stdout)
-        err = stream_tail(stderr)
-
-    wall_ms = int((time.monotonic() - t0) * 1000)
-    if guard.breached:
+    try:
+        captured = run_captured(
+            cmd,
+            memlimit_mb,
+            budget_ms / 1000 + 120,
+            label=f"mzn {problem}",
+            env=child_env,
+        )
+    except Exception as exc:
+        return {"problem": problem, "data": os.path.basename(data),
+                "status": "ERR", "objective": None, "time_ms": 0,
+                "n_sols": 0, "rc": None, "err": f"spawn: {exc}"[:200],
+                "memout": False, "timed_out": False,
+                "nbcore": nbcore, "parallelism": parallelism}
+    sols, complete, unsat, err_marker, best = parse_output(captured.stdout)
+    err = captured.stderr[-200:]
+    rc = captured.returncode
+    timed_out = captured.timed_out
+    wall_ms = int(captured.wall_sec * 1000)
+    if captured.memout:
         status = "MEMOUT"
         err = "MEM_BREACH" + (f": {err.strip()}" if err.strip() else "")
     elif timed_out or rc == 124:
         status = "TIMEOUT"
         if timed_out:
             err = "TIMEOUT_HARD" + (f": {err.strip()}" if err.strip() else "")
+    elif captured.cancelled or captured.output_truncated:
+        status = "ERR"
+        err = "solver output truncated or capture cancelled"
     elif err_marker or (rc != 0 and not sols and not unsat):
         status = "ERR"
     elif unsat:
@@ -191,7 +156,7 @@ def run_instance(problem, model, data, budget_ms, search, memlimit_mb, nbcore,
         status = "UNK"
     return {"problem": problem, "data": os.path.basename(data), "status": status,
             "objective": best, "time_ms": wall_ms, "n_sols": sols, "rc": rc,
-            "err": (err or "").strip()[:200], "memout": guard.breached,
+            "err": (err or "").strip()[:200], "memout": captured.memout,
             "timed_out": timed_out or rc == 124, "nbcore": nbcore,
             "parallelism": parallelism}
 

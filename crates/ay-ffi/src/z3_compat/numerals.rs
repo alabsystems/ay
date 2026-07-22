@@ -8,14 +8,14 @@
 //! the `ffi_guard_*` helpers (#6192) to prevent undefined behavior from panics
 //! unwinding across the `extern "C"` boundary.
 
-use std::ffi::{c_char, c_int, c_uint, CStr};
+use std::ffi::{c_char, c_int, c_uint};
 
 use ay_dpll::api::Sort;
 use num_bigint::BigInt;
 
 use super::{
-    ffi_guard_ast, record_ast_sort, term_to_ast, Z3Context, Z3_ast, Z3_context, Z3_sort,
-    Z3_INVALID_ARG,
+    ffi_guard_ast, ffi_read_bounded_numeral_text, record_ast_sort, term_to_ast, Z3Context, Z3_ast,
+    Z3_context, Z3_sort, Z3_INVALID_ARG,
 };
 
 // ---- Numerals ----
@@ -55,25 +55,21 @@ pub unsafe extern "C" fn Z3_mk_numeral(
     if numeral.is_null() || ty.is_null() {
         return 0;
     }
-    // SAFETY: The caller's `# Safety` contract requires the C string pointer to be non-null
-    // and to point to a valid, null-terminated sequence of bytes owned by the caller for the
-    // duration of this call. The pointer was null-checked before entering this block.
-    let num_str = match unsafe { CStr::from_ptr(numeral).to_str() } {
-        Ok(s) => s.to_string(),
-        Err(_) => return 0,
-    };
-    // SAFETY: `ty` was null-checked above and originates from a prior AY FFI allocation whose
-    // handle is kept alive by the owning `Z3Context` (see handle caches in `mod.rs`). Reading
-    // `.sort` is a shared-read with no concurrent mutation because the Z3 C API is
-    // single-threaded per context.
-    let sort = unsafe { (*ty).sort.clone() };
-
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            // SAFETY: `numeral` was null-checked and the caller guarantees a
+            // live NUL-terminated string for this call.
+            let num_str = match ffi_read_bounded_numeral_text(ctx, "Z3_mk_numeral", numeral) {
+                Some(text) => text,
+                None => return 0,
+            };
+            // SAFETY: `ty` was null-checked above and originates from a live AY
+            // sort allocation owned by this context.
+            let sort = (*ty).sort.clone();
             let term = match &sort {
                 Sort::Int => match num_str.parse::<BigInt>() {
                     Ok(v) => ctx.solver.int_const_bigint(&v),
@@ -138,7 +134,7 @@ pub unsafe extern "C" fn Z3_mk_int(c: Z3_context, v: c_int, ty: Z3_sort) -> Z3_a
                 Sort::Real => ctx.solver.real_const(f64::from(v)),
                 Sort::BitVec(bvs) => ctx.solver.bv_const(i64::from(v), bvs.width),
                 Sort::FiniteDomain(_, _) => {
-                    return mk_finite_domain_numeral(ctx, &BigInt::from(v), &sort)
+                    return mk_finite_domain_numeral(ctx, &BigInt::from(v), &sort);
                 }
                 _ => return 0,
             };
@@ -175,7 +171,7 @@ pub unsafe extern "C" fn Z3_mk_unsigned_int(c: Z3_context, v: c_uint, ty: Z3_sor
                 Sort::Real => ctx.solver.real_const(f64::from(v)),
                 Sort::BitVec(bvs) => ctx.solver.bv_const(i64::from(v), bvs.width),
                 Sort::FiniteDomain(_, _) => {
-                    return mk_finite_domain_numeral(ctx, &BigInt::from(v), &sort)
+                    return mk_finite_domain_numeral(ctx, &BigInt::from(v), &sort);
                 }
                 _ => return 0,
             };
@@ -215,7 +211,7 @@ pub unsafe extern "C" fn Z3_mk_int64(c: Z3_context, v: i64, ty: Z3_sort) -> Z3_a
                 }
                 Sort::BitVec(bvs) => ctx.solver.bv_const(v, bvs.width),
                 Sort::FiniteDomain(_, _) => {
-                    return mk_finite_domain_numeral(ctx, &BigInt::from(v), &sort)
+                    return mk_finite_domain_numeral(ctx, &BigInt::from(v), &sort);
                 }
                 _ => return 0,
             };

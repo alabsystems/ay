@@ -185,8 +185,8 @@ pub(crate) fn is_reserved_op_name(name: &str) -> bool {
 ///
 /// * `"indexed-only"` — identifiers recognized solely inside `(_ …)` indexed
 ///   forms (`(_ map f)`, `(_ is C)`, `(_ divisible n)`, `(_ at-most k)`, …,
-///   and the FP special literals `(_ +zero eb sb)`/`(_ NaN eb sb)`/… matched
-///   in `term.rs` only after a `(_ ` prefix strip). A plain
+///   and the structured Char/FP special literals `(_ Char n)`/
+///   `(_ +zero eb sb)`/`(_ NaN eb sb)`/… matched in `indexed.rs`. A plain
 ///   `App(Named(name), ..)` of the bare name is never theory-matched, so a
 ///   user declaration cannot conflate with the builtin (adversarially
 ///   verified for `map`/`at-most`/`at-least`/`pble`/`pbge`/`pbeq`/`divisible`/
@@ -248,7 +248,7 @@ pub(crate) const EXCLUDED_DECLARABLE_OP_NAMES: &[(&str, &str)] = &[
     ("<", "map-target"), ("<=", "map-target"), (">", "map-target"),
     (">=", "map-target"),
     ("to_int", "map-target"), ("to_real", "map-target"), ("is_int", "map-target"),
-    // Indexed-form-only identifiers (elaborate/indexed.rs, app/mod.rs)
+    // Indexed-form-only identifiers (elaborate/indexed.rs)
     ("map", "indexed-only"), ("is", "indexed-only"), ("divisible", "indexed-only"),
     ("at-most", "indexed-only"), ("at-least", "indexed-only"),
     ("pble", "indexed-only"), ("pbge", "indexed-only"), ("pbeq", "indexed-only"),
@@ -264,7 +264,8 @@ pub(crate) const EXCLUDED_DECLARABLE_OP_NAMES: &[(&str, &str)] = &[
     // (Height Height) Bool)` — so these must stay declarable, not reserved.
     ("partial-order", "indexed-only"), ("linear-order", "indexed-only"),
     ("tree-order", "indexed-only"), ("piecewise-linear-order", "indexed-only"),
-    // FP special literals, matched in term.rs only inside a `(_ …)` form
+    // Char and FP special literals, matched only inside a structured `(_ …)` form
+    ("Char", "indexed-only"), ("char", "indexed-only"),
     ("+zero", "indexed-only"), ("-zero", "indexed-only"),
     ("+oo", "indexed-only"), ("-oo", "indexed-only"), ("NaN", "indexed-only"),
     // Match-case wildcard binder (term.rs), not an operator
@@ -387,6 +388,16 @@ pub enum ElaborateError {
     /// Invalid constant
     #[error("invalid constant: {0}")]
     InvalidConstant(String),
+    /// A declaration or definition collides with an existing symbol under
+    /// SMT-LIB/z3's signature and namespace rules.
+    #[error("{0}")]
+    Redefinition(String),
+    /// z3 accepts this name as an overload, but AY's definition expansion is
+    /// keyed only by surface name and cannot preserve both meanings soundly.
+    #[error(
+        "symbol '{0}' uses a definition overload that this frontend cannot represent without conflating signatures"
+    )]
+    UnrepresentableOverload(String),
     /// Unsupported feature
     #[error("unsupported: {0}")]
     Unsupported(String),
@@ -446,7 +457,7 @@ pub enum ElaborateError {
 pub(crate) type Result<T> = std::result::Result<T, ElaborateError>;
 
 /// Symbol information
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SymbolInfo {
     /// The term ID if it's a constant
@@ -456,12 +467,12 @@ pub struct SymbolInfo {
     /// Argument sorts (empty for constants)
     pub arg_sorts: Vec<Sort>,
     /// Instance-specific INTERNAL symbol name to use when building the term,
-    /// when it differs from the user-facing surface name. Set only for
-    /// monomorphized parametric-datatype constructors/selectors/testers, whose
-    /// surface names are shared across instantiations: the term carries a
-    /// name-disjoint mangled symbol (e.g. `osome@Opt!{Bool}`) so the DT theory
-    /// treats each instance as its own datatype. `None` everywhere else (the
-    /// surface name is used directly).
+    /// when it differs from the user-facing surface name. This is set for
+    /// monomorphized parametric-datatype members and for every ordinary
+    /// declaration after the first overload of a surface name. The term then
+    /// carries a name-disjoint symbol, preventing distinct SMT-LIB signatures
+    /// from collapsing onto one core UF identity. The first ordinary
+    /// declaration keeps `None`, preserving its historical surface identity.
     pub internal_name: Option<String>,
 }
 
@@ -506,6 +517,8 @@ const MAX_FUN_EXPANSION_DEPTH: usize = 1000;
 const OPTION_GLOBAL_DECLARATIONS: &str = "global-declarations";
 const OPTION_GLOBAL_DECLS: &str = "global-decls";
 
+type FunctionDefinition = (Vec<(String, Sort)>, Sort, ParsedTerm);
+
 /// Elaboration context
 // Trust: `Clone` lets an independent UNSAT re-discharge rebuild a fresh `Executor`
 // over a COPY of the full solving context (terms, assertions, logic, options) — the
@@ -533,6 +546,10 @@ pub struct Context {
     /// Datatype selectors may legally reuse the same surface name across
     /// different datatypes, so elaboration must resolve them by argument sort.
     overloaded_symbols: HashMap<String, Vec<SymbolInfo>>,
+    /// Monotonic source of collision-proof identities for ordinary overloads.
+    /// Never rewound by `pop`: an internal name cannot be reused while an old
+    /// term bearing it may still exist in the term store.
+    next_overload_identity: u64,
     /// Sort definitions: name -> sort
     sort_defs: HashMap<String, Sort>,
     /// Parameterized sort synonyms (`(define-sort Name (T..) body)`, arity > 0):
@@ -547,7 +564,10 @@ pub struct Context {
     /// template expansion — re-entry errors instead of overflowing the stack.
     expanding_sort_synonyms: Vec<String>,
     /// Function definitions: name -> (params, body)
-    fun_defs: HashMap<String, (Vec<(String, Sort)>, ParsedTerm)>,
+    /// Macro/recursive definitions keyed by surface name. The declared result
+    /// sort travels with the body so expansion never consults a later
+    /// overloaded symbol-table entry for its type.
+    fun_defs: HashMap<String, FunctionDefinition>,
     /// #quantprod-g3: DECLARED functions adopted as macros from a
     /// definitional forall `(assert (forall X. (= (f X) body)))` with `f`
     /// not (transitively) in `body` and not used by any earlier assertion:
@@ -558,6 +578,10 @@ pub struct Context {
     /// OUTERMOST scope so `pop` can never remove the justifying assertion
     /// while the macro lives on; `reset-assertions` un-adopts explicitly.
     adopted_macro_interps: HashMap<String, (Vec<(String, Sort)>, TermId)>,
+    /// Test-only fault injection for the transaction boundary between macro
+    /// adoption and assertion re-elaboration.
+    #[cfg(test)]
+    fail_next_assert_after_macro_adoption: bool,
     /// Names bound by `define-fun-rec` / `define-funs-rec` (a strict subset of
     /// `fun_defs`, which also holds plain `define-fun` macros). z3 treats a
     /// recursive-function declaration and a plain macro differently for
@@ -598,10 +622,9 @@ pub struct Context {
     /// (e.g. unify the template field `(Lst T)` against an argument of sort
     /// `Lst!{Int}` to learn `T = Int`).
     parametric_instance_args: HashMap<String, (String, Vec<Sort>)>,
-    /// Internal (instance-mangled) datatype member name -> user-facing surface
-    /// name. Used to UN-mangle constructor/selector/tester names when rendering
-    /// models and `(get-value ...)` so output prints `osome`, not the internal
-    /// `osome@Opt!{Bool}`.
+    /// Internal term symbol name -> user-facing surface name. Covers both
+    /// instance-mangled datatype members and ordinary declaration overloads,
+    /// so serialization/model output never leaks private identities.
     dt_internal_surface: HashMap<String, String>,
     /// Current logic
     logic: Option<String>,
@@ -638,6 +661,10 @@ pub struct Context {
     soft_constraints: Vec<SoftAssertion>,
     /// Scope stack for push/pop
     scopes: Vec<ScopeFrame>,
+    /// Internal one-command override for native solver declarations whose
+    /// handles outlive SMT-LIB assertion scopes. Kept separate from the public
+    /// global-declarations option so native calls never mutate session options.
+    native_global_declaration: bool,
     /// Solver options (keyword -> value)
     options: HashMap<String, OptionValue>,
     /// Named formulas: name -> term_id (for get-assignment and get-unsat-core)
@@ -708,8 +735,10 @@ pub enum OptionValue {
 /// A scope frame for push/pop
 #[derive(Debug, Clone, Default)]
 struct ScopeFrame {
-    /// Symbols defined in this scope
-    symbols: Vec<String>,
+    /// Lazily captured pre-scope state for every symbol name changed here.
+    /// Restoring snapshots (rather than deleting by surface name) preserves an
+    /// outer declaration when an overload of the same name is scoped.
+    symbols: HashMap<String, ScopedSymbolState>,
     /// Number of assertions before this scope
     assertion_count: usize,
     /// Number of objectives before this scope
@@ -730,6 +759,14 @@ struct ScopeFrame {
     parametric_datatypes: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+struct ScopedSymbolState {
+    name: String,
+    primary: Option<SymbolInfo>,
+    overloads: Option<Vec<SymbolInfo>>,
+    was_internal: bool,
+}
+
 impl Default for Context {
     fn default() -> Self {
         Self::new()
@@ -740,7 +777,7 @@ impl Context {
     /// Iterate declared symbols (name -> info). Used by problem-dump
     /// debugging facilities (e.g. the LIA eager-probe benchmark extractor).
     pub fn symbols_iter(&self) -> impl Iterator<Item = (&String, &SymbolInfo)> {
-        self.symbols.iter()
+        self.symbol_iter()
     }
 
     /// Whether a declared symbol named `name` exists with EXACTLY this
@@ -808,11 +845,14 @@ impl Context {
             symbols: HashMap::default(),
             internal_symbols: ay_core::kani_compat::DetHashSet::default(),
             overloaded_symbols: HashMap::default(),
+            next_overload_identity: 0,
             sort_defs: HashMap::default(),
             parametric_sort_defs: HashMap::default(),
             expanding_sort_synonyms: Vec::new(),
             fun_defs: HashMap::default(),
             adopted_macro_interps: HashMap::default(),
+            #[cfg(test)]
+            fail_next_assert_after_macro_adoption: false,
             recursive_fun_names: ay_core::kani_compat::DetHashSet::default(),
             datatypes: HashMap::default(),
             constructors: HashMap::default(),
@@ -829,6 +869,7 @@ impl Context {
             objectives: Vec::new(),
             soft_constraints: Vec::new(),
             scopes: Vec::new(),
+            native_global_declaration: false,
             options,
             named_terms: HashMap::default(),
             fun_expansion_depth: 0,
@@ -892,6 +933,23 @@ impl Context {
     /// Get the parsed assertions (original surface syntax).
     pub fn assertions_parsed(&self) -> &[ParsedTerm] {
         &self.assertions_parsed
+    }
+
+    /// Nullary (`()`-parameter) `define-fun` macro bodies as `(name, body)`
+    /// pairs, in arbitrary order. `assertions_parsed()` retains the ORIGINAL
+    /// surface syntax with such macros UNEXPANDED (e.g. `(select fwd i0)` where
+    /// `fwd` is a `define-fun`), so a proof/lean-export consumer that needs the
+    /// expanded structure can substitute these definitionally-equal bodies. Only
+    /// parameter-less macros are returned — a macro with parameters would require
+    /// beta-reduction at each application, which the surface-syntax consumers do
+    /// not perform. This is a diagnostic export surface; it does not affect the
+    /// solver's own (already fully-elaborated) reasoning.
+    pub fn nullary_defined_terms(&self) -> Vec<(String, ParsedTerm)> {
+        self.fun_defs
+            .iter()
+            .filter(|(_, (params, _, _))| params.is_empty())
+            .map(|(name, (_, _, body))| (name.clone(), body.clone()))
+            .collect()
     }
 
     /// Re-elaborate a parsed (surface-syntax) subterm into the term store.
@@ -1020,19 +1078,35 @@ impl Context {
     }
 
     pub(crate) fn global_declarations_enabled(&self) -> bool {
-        matches!(
-            self.get_option(OPTION_GLOBAL_DECLARATIONS)
-                .or_else(|| self.get_option(OPTION_GLOBAL_DECLS)),
-            Some(OptionValue::Bool(true))
-        )
+        self.native_global_declaration
+            || matches!(
+                self.get_option(OPTION_GLOBAL_DECLARATIONS)
+                    .or_else(|| self.get_option(OPTION_GLOBAL_DECLS)),
+                Some(OptionValue::Bool(true))
+            )
     }
 
-    pub(crate) fn track_scoped_symbol(&mut self, name: String) {
+    /// Capture a symbol name's state before its first mutation in the current
+    /// scope. Callers must invoke this before changing `symbols`,
+    /// `overloaded_symbols`, or `internal_symbols` for `name`.
+    pub(crate) fn track_scoped_symbol(&mut self, name: &str) {
         if self.global_declarations_enabled() {
             return;
         }
+        let Some(frame) = self.scopes.last() else {
+            return;
+        };
+        if frame.symbols.contains_key(name) {
+            return;
+        }
+        let state = ScopedSymbolState {
+            name: name.to_string(),
+            primary: self.symbols.get(name).cloned(),
+            overloads: self.overloaded_symbols.get(name).cloned(),
+            was_internal: self.internal_symbols.contains(name),
+        };
         if let Some(frame) = self.scopes.last_mut() {
-            frame.symbols.push(name);
+            frame.symbols.insert(name.to_string(), state);
         }
     }
 
@@ -1081,15 +1155,14 @@ impl Context {
         }
     }
 
-    /// Record an internal (instance-mangled) datatype member name and its
-    /// user-facing surface name, for un-mangling on model output.
+    /// Record an internal term name and its user-facing surface name for
+    /// serialization/model output.
     pub(crate) fn track_internal_surface(&mut self, internal: String, surface: String) {
         self.dt_internal_surface.insert(internal, surface);
     }
 
-    /// Map an internal (instance-mangled) constructor/selector/tester name back
-    /// to its user-facing surface name. Returns `None` for ordinary symbols
-    /// (monomorphic datatypes and non-datatype symbols), which are not mangled.
+    /// Map an internal datatype-member or ordinary-overload name back to its
+    /// user-facing surface name.
     pub fn dt_surface_name(&self, internal: &str) -> Option<&str> {
         self.dt_internal_surface.get(internal).map(String::as_str)
     }

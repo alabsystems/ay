@@ -131,7 +131,7 @@ fn eq_rows_direct_are_handled() {
     let objective = obj(vec![term(1, 1), term(1, 3)]);
     let sol = run(&instance, &objective).expect("recognized");
     assert_eq!(sol.status, PbStatus::OptimumFound);
-    assert_eq!(sol.objective, brute(&instance, &objective).map(|v| v));
+    assert_eq!(sol.objective, brute(&instance, &objective));
     assert!(crate::eval::verify_all_constraints(
         &instance.constraints,
         &sol.assignment

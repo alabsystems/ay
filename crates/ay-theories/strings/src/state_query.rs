@@ -341,14 +341,27 @@ impl SolverState {
     /// O(1) via `int_const_cache` (#4061). Previously scanned all parent
     /// keys in O(N).
     pub(crate) fn resolve_int_constant(&self, terms: &TermStore, t: TermId) -> Option<i64> {
+        self.resolve_int_constant_with_term(terms, t)
+            .map(|(v, _)| v)
+    }
+
+    /// Like [`Self::resolve_int_constant`], but also returns the `TermId` of
+    /// the concrete integer constant that justifies the value. Used by
+    /// NF-engine closure 2 to explain length-driven inferences through the
+    /// proof forest (`explain(len_term, const_tid)`).
+    pub(crate) fn resolve_int_constant_with_term(
+        &self,
+        terms: &TermStore,
+        t: TermId,
+    ) -> Option<(i64, TermId)> {
         // Fast path 1: direct syntactic check on term itself.
         if let TermData::Const(Constant::Int(n)) = terms.get(t) {
-            return n.try_into().ok();
+            return n.try_into().ok().map(|v: i64| (v, t));
         }
         // Fast path 2: direct syntactic check on representative.
         let rep = self.find(t);
         if let TermData::Const(Constant::Int(n)) = terms.get(rep) {
-            return n.try_into().ok();
+            return n.try_into().ok().map(|v: i64| (v, rep));
         }
         // O(1) cache lookup: covers the case where an int constant was
         // merged into the EQC via assert_literal.

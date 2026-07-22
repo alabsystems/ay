@@ -20,6 +20,10 @@ thiserror.workspace = true
 serde_json.workspace = true
 proptest.workspace = true
 ay-lrat-check.workspace = true
+# Differential-fuzz ORACLES ONLY (tests/string_ground_diff_fuzz.rs). The
+# checker's ground string/regex evaluator must stay independent of the solver,
+# so this is a dev-dependency and must never become a real dependency.
+ay-strings.workspace = true
 
 [lints]
 workspace = true

@@ -337,7 +337,11 @@ macro_rules! pipeline_build_eager_extension {
         // #uflia-verify-memo: wire the Executor's #4535 semantic-verification
         // memo into the eager conflict verifiers (trust-true-only; failures
         // always re-verify — see TheoryExtension::verify_conflict_semantic_memo).
-        .with_verify_memo(&mut $self.conflict_semantic_verify_memo);
+        .with_verify_memo(&mut $self.conflict_semantic_verify_memo)
+        // #verify-memo (AY_VERIFY_MEMO=1): the sampled propagation-verification
+        // memo — Executor-owned so accepts survive per-iteration extension
+        // rebuilds; inert unless the env flag is armed.
+        .with_verify_prop_memo(&mut $self.prop_semantic_verify_memo);
         if $proof_enabled {
             _pbe_ext = _pbe_ext.with_proof_tracking(
                 &mut $self.proof_tracker, $negations.as_map(),
@@ -468,7 +472,11 @@ macro_rules! pipeline_build_eager_extension {
         // #uflia-verify-memo: wire the Executor's #4535 semantic-verification
         // memo into the eager conflict verifiers (trust-true-only; failures
         // always re-verify — see TheoryExtension::verify_conflict_semantic_memo).
-        .with_verify_memo(&mut $self.conflict_semantic_verify_memo);
+        .with_verify_memo(&mut $self.conflict_semantic_verify_memo)
+        // #verify-memo (AY_VERIFY_MEMO=1): the sampled propagation-verification
+        // memo — Executor-owned so accepts survive per-iteration extension
+        // rebuilds; inert unless the env flag is armed.
+        .with_verify_prop_memo(&mut $self.prop_semantic_verify_memo);
         // #8256: When continuing after a budget-exhausted iteration, the theory
         // solver already has all assertions from the previous iteration (because
         // soft_reset_warm was skipped). Set the trail position to the current

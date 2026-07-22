@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -37,7 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import chccomp_harness as H  # noqa: E402
-from _oom_guard import plan_solver_resources, warn_concurrent_build  # noqa: E402
+from _oom_guard import plan_solver_resources, run_captured, warn_concurrent_build  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 BASELINE = REPO / "the development design notes"
@@ -122,47 +123,29 @@ def run(entry, timeout_s, ay_bin, memlimit_mb=0, nbcore=1,
     memout = False
     timed_out = False
     child_env = dict(os.environ, MEMLIMIT=str(memlimit_mb), NBCORE=str(nbcore))
-    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8",
-                                errors="replace") as stdout:
-        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8",
-                                    errors="replace") as stderr:
-            try:
-                proc = subprocess.Popen(
-                    argv,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout,
-                    stderr=stderr,
-                    text=True,
-                    env=child_env,
-                    start_new_session=True,
-                )
-            except OSError as exc:
-                error = str(exc)[:200]
-            else:
-                error = ""
-                guard = H.rss_watchdog(
-                    proc,
-                    memlimit_mb,
-                    label="chccomp_regression.py",
-                    grace_mb=0,
-                )
-                try:
-                    try:
-                        exit_code = proc.wait(timeout=inst_budget + 15)
-                    except subprocess.TimeoutExpired:
-                        timed_out = True
-                        H.kill_process_tree(proc)
-                        exit_code = proc.wait()
-                finally:
-                    H.kill_process_tree(proc)
-                    if proc.poll() is None:
-                        proc.wait()
-                    guard.stop()
-                memout = guard.breached
-                status = H.parse_status_stream(stdout)
-                if status == "no-status":
-                    status = "unknown" if exit_code == 0 else "error"
-                error = H.stream_tail(stderr) if status == "error" else ""
+    try:
+        captured = run_captured(
+            argv,
+            memlimit_mb,
+            inst_budget + 15,
+            label="chccomp_regression.py",
+            env=child_env,
+        )
+    except Exception as exc:
+        captured = None
+        error = str(exc)[:200]
+    if captured is not None:
+        exit_code = captured.returncode
+        memout = captured.memout
+        timed_out = captured.timed_out
+        if captured.cancelled or captured.output_truncated:
+            status = "error"
+            error = "solver output truncated or capture cancelled"
+        else:
+            status = H.parse_status_stream(io.StringIO(captured.stdout))
+            if status == "no-status":
+                status = "unknown" if exit_code == 0 else "error"
+            error = captured.stderr[-500:] if status == "error" else ""
     if memout:
         status = "memout"
     elif timed_out:
@@ -178,7 +161,11 @@ def run(entry, timeout_s, ay_bin, memlimit_mb=0, nbcore=1,
         "timed_out": timed_out,
         "exit_code": exit_code,
         "error": error,
-        "wall_sec": round(time.monotonic() - started, 3),
+        "wall_sec": round(
+            captured.wall_sec if captured is not None
+            else time.monotonic() - started,
+            3,
+        ),
     }
 
 

@@ -28,6 +28,7 @@ pub(crate) use incremental::IncrementalSolver;
 use satisfaction::build_output_get_value;
 
 /// Configuration for the in-process SMT solver.
+#[derive(Default)]
 pub struct SolverConfig {
     /// Timeout per check-sat call in milliseconds (None = no timeout).
     pub timeout_ms: Option<u64>,
@@ -38,16 +39,6 @@ pub struct SolverConfig {
     /// When set, optimization loops check remaining time before each probe
     /// and stop when the deadline is reached.
     pub global_deadline: Option<Instant>,
-}
-
-impl Default for SolverConfig {
-    fn default() -> Self {
-        Self {
-            timeout_ms: None,
-            all_solutions: false,
-            global_deadline: None,
-        }
-    }
 }
 
 impl SolverConfig {

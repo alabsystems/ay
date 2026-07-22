@@ -6,6 +6,7 @@
 
 use ay_dpll::api::{Logic, Solver, SolverError, Sort, Tactic};
 use ay_dpll::ExecutorError;
+use ay_test_support::env::{lock_env, ScopedEnvVar};
 
 fn assert_artifact_error<T>(result: Result<T, SolverError>, operation: &str) {
     match result {
@@ -19,8 +20,11 @@ fn assert_artifact_error<T>(result: Result<T, SolverError>, operation: &str) {
 fn fallible_solves_and_composite_operations_preserve_the_single_query_contract() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let dump = temp.path().join("native.cnf");
-    std::env::set_var("AY_DUMP_BV_CNF", &dump);
-    std::env::remove_var("AY_DUMP_BV_DIMACS");
+    // Serialized + restore-on-exit via the workspace env choke point; the
+    // guards below hold for the whole test body.
+    let _env_lock = lock_env();
+    let _dump_cnf = ScopedEnvVar::set("AY_DUMP_BV_CNF", dump.to_str().expect("temp path is UTF-8"));
+    let _dump_dimacs = ScopedEnvVar::unset("AY_DUMP_BV_DIMACS");
 
     // Fallible entrypoints must preserve the typed export failure instead of
     // reporting a successful `Ok(Unknown)` for an unsupported query.

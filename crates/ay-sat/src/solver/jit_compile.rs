@@ -92,18 +92,11 @@ impl Solver {
     /// No-op: BCP JIT recompilation after inprocessing removed (#8517).
     #[inline]
     pub(crate) fn jit_recompile_after_inprocessing(&mut self, _had_compiled_formula: bool) {}
-
-    /// No-op: BCP JIT watch reattachment removed (#8517).
-    #[inline]
-    pub(crate) fn reattach_jit_watches(&mut self) -> usize {
-        0
-    }
 }
 
 fn sat_native_helpers_current_mode_requested() -> bool {
     std::env::var("AY_COMPETITION_JIT_MODE")
-        .ok()
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("current"))
+        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("current"))
 }
 
 fn sat_native_helper_competition_metadata_present() -> bool {

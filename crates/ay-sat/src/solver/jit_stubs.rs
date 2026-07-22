@@ -21,9 +21,4 @@ impl Solver {
 
     #[inline]
     pub(crate) fn jit_recompile_after_inprocessing(&mut self, _had_compiled_formula: bool) {}
-
-    #[inline]
-    pub(crate) fn reattach_jit_watches(&mut self) -> usize {
-        0
-    }
 }

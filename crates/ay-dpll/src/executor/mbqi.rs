@@ -81,11 +81,11 @@ enum LiRole {
     /// `Box` of a `forall x:S. Unbox(Box x) = x` axiom. Materialized as the
     /// TOTAL INJECTIVE embedding `a ↦ BoxPoint(box_sym, a)` of the binder
     /// domain into the (uninterpreted, enlargeable) result sort's universe.
-    BoxHead,
+    Box,
     /// `Unbox` of a left-inverse axiom. Materialized as the inverse of its
     /// partner `Box` on the `BoxPoint` family, and as the designated
     /// per-sort fallback value everywhere else (see `left_inverse_fallback`).
-    UnboxHead {
+    Unbox {
         /// The partner `Box` symbol whose `BoxPoint`s this head inverts.
         box_sym: String,
         /// The axiom's binder sort `S` = this head's result sort (fixed by
@@ -94,7 +94,7 @@ enum LiRole {
     },
     /// Head `f` of a unary identity definition `forall x:T. f(x) = x`.
     /// Materialized as the identity function on `T` (over ANY universe).
-    IdentityHead,
+    Identity,
 }
 
 /// An element of an uninterpreted sort's universe in the EXPLICITLY
@@ -3453,10 +3453,10 @@ impl Executor {
         // declines.
         let mut roles: HashMap<String, LiRole> = HashMap::default();
         for (box_sym, unbox_sym, binder_sort) in &pairs {
-            if roles.insert(box_sym.clone(), LiRole::BoxHead).is_some() {
+            if roles.insert(box_sym.clone(), LiRole::Box).is_some() {
                 return false;
             }
-            let unbox_role = LiRole::UnboxHead {
+            let unbox_role = LiRole::Unbox {
                 box_sym: box_sym.clone(),
                 result_sort: binder_sort.clone(),
             };
@@ -3465,7 +3465,7 @@ impl Executor {
             }
         }
         for f in &identity_heads {
-            if roles.insert(f.clone(), LiRole::IdentityHead).is_some() {
+            if roles.insert(f.clone(), LiRole::Identity).is_some() {
                 return false;
             }
         }
@@ -3476,7 +3476,7 @@ impl Executor {
         let declared: HashSet<String> = self
             .ctx
             .symbols_iter()
-            .map(|(name, _)| name.clone())
+            .map(|(name, info)| self.ctx.symbol_identity_name(name, info).to_string())
             .collect();
         // Step 4 — UF-GRAPH ADOPTION: construct a FUNCTIONAL table for every
         // unconstrained user-declared UF over the ground application graph.
@@ -4135,12 +4135,12 @@ impl Executor {
                 // Box: total injective embedding, one universe element per
                 // definite argument value. Structural equality of `BoxPoint`s
                 // IS both injectivity and congruence.
-                LiRole::BoxHead => Some(LiValue::Elem(LiElem::BoxPoint(name, Box::new(value)))),
+                LiRole::Box => Some(LiValue::Elem(LiElem::BoxPoint(name, Box::new(value)))),
                 // Identity head: f := id.
-                LiRole::IdentityHead => Some(value),
+                LiRole::Identity => Some(value),
                 // Unbox: inverse of the partner Box on its BoxPoint family,
                 // designated fallback everywhere else (total by construction).
-                LiRole::UnboxHead {
+                LiRole::Unbox {
                     box_sym,
                     result_sort,
                 } => match value {
@@ -7006,7 +7006,13 @@ impl Executor {
         let mut f3_pairs: Vec<(String, String)> = Vec::new();
         // F4 bodies, for the bridge-freeness soundness gate below.
         let mut f4_bodies: Vec<TermId> = Vec::new();
-        for &q in &foralls {
+        // W1 bridge-route structural claims (forall index, bridge-UF name,
+        // constructor, field index) — certified ONLY by the mandatory
+        // selector-bridge-premise gate in step 2c below (`AY_DT_CERT_BRIDGE_ROUTE`,
+        // SHADOW-ONLY in this increment: a claim can never reach a grant).
+        let bridge_route = dt_cert_bridge_route_enabled();
+        let mut bridge_claims: Vec<(usize, String, String, usize)> = Vec::new();
+        for (qi, &q) in foralls.iter().enumerate() {
             if self.ctx.terms.is_no_mbqi(q) {
                 dt_cert_note(mode, "decline: no_mbqi forall");
                 return None;
@@ -7020,6 +7026,19 @@ impl Executor {
             // Route F2: DT-selector tautology (model-independent).
             if self.dt_cert_classify_f2(&var_names, body).is_some() {
                 continue;
+            }
+            // Route W1 (`AY_DT_CERT_BRIDGE_ROUTE`): bridge-UF-over-constructor
+            // tautology `bridge(C(v0..vk)) = v_i` — the F2 analog over a FREE
+            // bridge UF. The structural match alone is NOT sound; the claim is
+            // DEFERRED to the mandatory selector-bridge-premise gate (step 2c),
+            // because the certifying F3 pin forall may appear anywhere in the
+            // snapshot (before or after this one).
+            if bridge_route {
+                if let Some((bridge, ctor, idx)) = self.dt_cert_classify_f2_bridge(&var_names, body)
+                {
+                    bridge_claims.push((qi, bridge, ctor, idx));
+                    continue;
+                }
             }
             // Route F3: bridge symbolic-default closure.
             if let Some((bridge, sel)) = self.dt_cert_classify_f3(&var_names, body) {
@@ -7093,6 +7112,39 @@ impl Executor {
                 }
             }
         }
+        // ---- 2c. W1 bridge-route MANDATORY selector-bridge-premise gate. ----
+        // A claimed bridge tautology `forall v0..vk. bridge(C(v..)) = v_i` is
+        // certified ONLY by COMPOSITION: the completed model M' interprets
+        // `bridge` AS its F3-pinned selector (bridge_rewrite), under which the
+        // body IS the native selector tautology `sel_i(C(v..)) = v_i` — an F2
+        // theory tautology — iff the pinned selector is EXACTLY `C`'s declared
+        // field-`i` selector. A bridge with NO in-snapshot F3 pin is genuinely
+        // free: its "tautology" is an unverified constraint and claiming it
+        // would be a wrong-grant (the wrong-SAT vector) — DECLINE, fail-closed.
+        // Same for a pin to a different selector (the rewritten body would not
+        // be a tautology).
+        let bridge_route_used = !bridge_claims.is_empty();
+        for (qi, bridge, ctor, idx) in &bridge_claims {
+            match self.dt_cert_bridge_claim_check(&bridge_rewrite, bridge, ctor, *idx) {
+                Err(reason) => {
+                    dt_cert_note(
+                        mode,
+                        &format!("[BRIDGE-ROUTE] decline: forall {qi} {reason}"),
+                    );
+                    return None;
+                }
+                Ok(pinned_sel) => {
+                    dt_cert_note(
+                        mode,
+                        &format!(
+                            "[BRIDGE-ROUTE] would-claim forall {qi} \
+                             (`{bridge}`(({ctor} ..)) = field {idx}) via bridge pin \
+                             `{bridge}`=`{pinned_sel}`"
+                        ),
+                    );
+                }
+            }
+        }
         // A bridge UF must NOT also be an F4 finite-table symbol (a completion
         // conflict — one symbol, two completions).
         for b in bridge_rewrite.keys() {
@@ -7117,10 +7169,100 @@ impl Executor {
         let (tester_idx, sel_idx) = self.dt_cert_index_ground_facts(&grounds);
 
         // ---- 3. STAGE-5 ground re-verification UNDER M' (bridge-rewritten). ----
-        for &g in &grounds {
+        // W2 (bridge route) lazily-built argument-value congruence index over
+        // the ground core's committed UF applications; see
+        // `dt_cert_build_uf_value_index`.
+        let mut uf_value_index: Option<HashMap<(String, Vec<String>), Option<(TermId, String)>>> =
+            None;
+        for (gi, &g) in grounds.iter().enumerate() {
             let mut memo: HashMap<TermId, TermId> = HashMap::default();
             let g2 = self.dt_cert_bridge_rewrite(g, &bridge_rewrite, &mut memo);
-            if !matches!(self.evaluate_term(&model, g2), EvalValue::Bool(true)) {
+            let mut g_final = g2;
+            let mut definite_true = matches!(self.evaluate_term(&model, g2), EvalValue::Bool(true))
+                // W2a (bridge route, gated on an ACTIVE bridge claim so it can
+                // only ever feed the shadow-withheld verdict): Kleene retry of
+                // the boolean skeleton. `evaluate_term`'s `or`/`and` scans
+                // bail to Unknown on the FIRST non-definite operand, so
+                // `(or <selector-over-mismatched-ctor …> <true guard>)` reads
+                // Unknown even though the guard decides it. Kleene semantics
+                // are strictly sound (true iff a disjunct is true / all
+                // conjuncts true), so this only RECOVERS definite verdicts —
+                // it never manufactures one.
+                || (bridge_route_used
+                    && self.dt_cert_eval_ground_kleene(&model, g2) == Some(true));
+            if !definite_true && bridge_route_used {
+                // W2b (bridge route, same shadow containment): the bridge
+                // rewrite MINTS fresh applications `uf(sel(t))` whose TermId
+                // has no committed model value, while the pre-rewrite app
+                // `uf(bridge(t))` HAS one and both arguments evaluate to the
+                // SAME committed element. Under the ONE completed model M',
+                // `eval(a) = eval(a')` (definite) implies `f(a) = f(a')` for
+                // ANY function symbol `f` (function congruence) — so
+                // substituting the committed pre-rewrite application for the
+                // indefinite minted one preserves the M'-value exactly.
+                // Conflicting committed rows for one (symbol, arg-values) key
+                // poison that key (never used) — fail-closed.
+                let index = uf_value_index
+                    .get_or_insert_with(|| self.dt_cert_build_uf_value_index(&model, &grounds));
+                let mut cmemo: HashMap<TermId, TermId> = HashMap::default();
+                let g3 = self.dt_cert_congruence_rewrite(&model, g2, index, &mut cmemo);
+                g_final = g3;
+                definite_true = matches!(self.evaluate_term(&model, g3), EvalValue::Bool(true))
+                    || self.dt_cert_eval_ground_kleene(&model, g3) == Some(true);
+            }
+            if !definite_true {
+                if bridge_route {
+                    // W2 measurement detail (additive, bridge-route-gated):
+                    // WHICH ground failed and HOW (definite-false vs
+                    // non-definite), so the model-completion gap is localized
+                    // by index instead of re-derived by bisection.
+                    let ev = self.evaluate_term(&model, g_final);
+                    let kleene = if bridge_route_used {
+                        self.dt_cert_eval_ground_kleene(&model, g_final)
+                    } else {
+                        None
+                    };
+                    dt_cert_note(
+                        mode,
+                        &format!(
+                            "[BRIDGE-ROUTE] ground {gi} not definite-true under M': \
+                             eval={ev:?} kleene={kleene:?}"
+                        ),
+                    );
+                    // W2 residual diagnostic (decline path only, bounded):
+                    // dump the failing ground's subterm evaluations so the
+                    // exact indefinite leaf is visible without bisection —
+                    // this is how the ground-5 congruence gap was localized,
+                    // and it is the measurement tool for the next residual.
+                    let mut stack = vec![(g_final, 0usize)];
+                    let mut printed = 0usize;
+                    while let Some((t, d)) = stack.pop() {
+                        if printed > 60 {
+                            break;
+                        }
+                        printed += 1;
+                        let (kind, children): (String, Vec<TermId>) =
+                            match self.ctx.terms.get(t).clone() {
+                                TermData::App(sym, args) => {
+                                    (format!("App({})", sym.name()), args.clone())
+                                }
+                                TermData::Var(n, _) => (format!("Var({n})"), vec![]),
+                                TermData::Const(c) => (format!("Const({c:?})"), vec![]),
+                                TermData::Not(i) => ("Not".to_string(), vec![i]),
+                                TermData::Ite(c, a, b) => ("Ite".to_string(), vec![c, a, b]),
+                                other => (format!("{other:?}"), vec![]),
+                            };
+                        let ev = self.evaluate_term(&model, t);
+                        eprintln!(
+                            "c CERT/dt-mbqi-sat [BRIDGE-ROUTE][W2-DBG] {:indent$}{kind} eval={ev:?}",
+                            "",
+                            indent = d * 2
+                        );
+                        for c in children.into_iter().rev() {
+                            stack.push((c, d + 1));
+                        }
+                    }
+                }
                 dt_cert_note(
                     mode,
                     "decline: a ground assertion is not definite-true under M'",
@@ -7410,6 +7552,20 @@ impl Executor {
                         sym_names.len()
                     ),
                 );
+                // W1 bridge route is SHADOW-ONLY in this increment: a grant
+                // that depends on ANY bridge-route claim is logged and then
+                // WITHHELD (verdict byte-identical to the route being absent).
+                // Authoritative grant is gated on the W3 vehicle-gate
+                // reconcile + the EUF-extraction faithfulness guarantee
+                // (SAT-side campaign blocking pin #5) — deliberately not
+                // implemented here.
+                if bridge_route_used {
+                    dt_cert_note(
+                        mode,
+                        "[BRIDGE-ROUTE] would-grant base (shadow-only: grant withheld, verdict unchanged)",
+                    );
+                    return None;
+                }
                 // SHADOW: log only, never flip the verdict. ON: grant.
                 return match mode {
                     DtCertMode::On => Some(()),
@@ -7762,6 +7918,11 @@ impl Executor {
         &self,
         snapshot: &[TermId],
     ) -> bool {
+        // W1 bridge-route precheck leg (`AY_DT_CERT_BRIDGE_ROUTE`): the
+        // snapshot's F3 selector-bridge pins, collected lazily — ONLY when a
+        // forall fails every existing route while the route flag is on, so the
+        // flag-off path is byte-identical. `None` = not yet collected.
+        let mut bridge_pins: Option<HashMap<String, String>> = None;
         for &a in snapshot {
             let (vars, body) = match self.ctx.terms.get(a) {
                 TermData::Forall(vars, body, _) => (vars.clone(), *body),
@@ -7776,10 +7937,53 @@ impl Executor {
                 || self.dt_cert_classify_g(&var_names, body).is_some()
                 || (vars.len() == 1 && self.dt_cert_sort_name(&vars[0].1).is_some());
             if !claimable {
-                return false;
+                // W1 leg: a bridge-UF-over-constructor tautology is claimable
+                // iff its selector-bridge premise (an F3 pin to EXACTLY the
+                // constructor's field-idx selector) is ALSO in the snapshot —
+                // the same mandatory gate the full certificate applies, so
+                // this leg is EXACT for W1 (no over-approximation) and
+                // decline-only (it can never suppress a grant).
+                if !dt_cert_bridge_route_enabled() {
+                    return false;
+                }
+                let Some((bridge, ctor, idx)) = self.dt_cert_classify_f2_bridge(&var_names, body)
+                else {
+                    return false;
+                };
+                let pins =
+                    bridge_pins.get_or_insert_with(|| self.dt_cert_collect_f3_pins(snapshot));
+                let Some(pinned_sel) = pins.get(&bridge) else {
+                    return false;
+                };
+                let Some(selectors) = self.ctx.constructor_selectors(&ctor) else {
+                    return false;
+                };
+                if selectors.get(idx) != Some(pinned_sel) {
+                    return false;
+                }
             }
         }
         true
+    }
+
+    /// The snapshot's F3 selector-bridge pins (bridge-UF name → pinned
+    /// declared-selector name), for the precheck's W1 bridge-route leg.
+    /// First-pin-wins on a doubly-pinned bridge — an over-approximation the
+    /// full certificate declines ("bridge UF mapped to two selectors"), which
+    /// is safe because the precheck is decline-only.
+    fn dt_cert_collect_f3_pins(&self, snapshot: &[TermId]) -> HashMap<String, String> {
+        let mut pins: HashMap<String, String> = HashMap::default();
+        for &a in snapshot {
+            let (vars, body) = match self.ctx.terms.get(a) {
+                TermData::Forall(vars, body, _) => (vars.clone(), *body),
+                _ => continue,
+            };
+            let var_names: Vec<String> = vars.iter().map(|(n, _)| n.clone()).collect();
+            if let Some((bridge, sel)) = self.dt_cert_classify_f3(&var_names, body) {
+                pins.entry(bridge).or_insert(sel);
+            }
+        }
+        pins
     }
 
     /// Datatype sort name of `sort` (either a `Sort::Datatype` or a
@@ -8106,6 +8310,100 @@ impl Executor {
         None
     }
 
+    /// W1 (bridge-route) recognizer — bridge-UF-over-constructor tautology
+    /// `bridge(C(v0..vk)) = v_i` (either equality orientation), where `bridge`
+    /// is a FREE completable UF (NOT a declared selector/constructor/tester —
+    /// those are F2's), applied to a constructor over EXACTLY the binders in
+    /// declaration order, and the equated side is the bare `i`-th binder.
+    /// Returns `(bridge_name, ctor_name, i)`.
+    ///
+    /// STRUCTURAL ONLY — this match alone is NOT sound (over a genuinely free
+    /// UF the body is an unverified constraint, not a tautology). The claim is
+    /// certified solely by COMPOSITION with an in-snapshot F3 selector-bridge
+    /// pin `is-C(x) => bridge(x) = sel_i(x)`: under the completed model M'
+    /// (which interprets `bridge` AS the pinned selector) the body rewrites to
+    /// the native selector tautology `sel_i(C(v0..vk)) = v_i`. The MANDATORY
+    /// premise gate in `try_dt_model_sat_certificate` (step 2c) declines any
+    /// claim whose bridge is unpinned or pinned to a different selector.
+    fn dt_cert_classify_f2_bridge(
+        &self,
+        var_names: &[String],
+        body: TermId,
+    ) -> Option<(String, String, usize)> {
+        let (a, b) = self.dt_cert_match_eq(body)?;
+        for (uf_side, var_side) in [(a, b), (b, a)] {
+            let TermData::App(usym, uargs) = self.ctx.terms.get(uf_side) else {
+                continue;
+            };
+            if uargs.len() != 1 {
+                continue;
+            }
+            let bridge_name = usym.name().to_string();
+            let cons_app = uargs[0];
+            // The head must be a FREE completable UF — not a declared
+            // selector/constructor (F2's territory) and not a tester.
+            if !is_mbqi_completable_uf_symbol(&bridge_name)
+                || self.symbol_is_datatype_selector_or_constructor(&bridge_name)
+                || bridge_name
+                    .strip_prefix("is-")
+                    .is_some_and(|c| self.ctx.is_constructor(c).is_some())
+            {
+                continue;
+            }
+            let TermData::App(csym, cargs) = self.ctx.terms.get(cons_app) else {
+                continue;
+            };
+            let cargs = cargs.clone();
+            let Some((_, ctor)) = self.ctx.is_constructor(csym.name()) else {
+                continue;
+            };
+            if !self.dt_cert_args_are_binders(&cargs, var_names) {
+                continue;
+            }
+            // The equated side must be exactly ONE bare binder; its position
+            // in the binder list is the claimed field index.
+            if let TermData::Var(n, _) = self.ctx.terms.get(var_side) {
+                if let Some(idx) = var_names.iter().position(|vn| vn == n) {
+                    return Some((bridge_name, ctor, idx));
+                }
+            }
+        }
+        None
+    }
+
+    /// The W1 MANDATORY selector-bridge-premise gate for ONE structural claim
+    /// `(bridge, ctor, idx)`: certified iff `bridge` is F3-pinned
+    /// (`bridge_rewrite`) and the pinned selector IS `ctor`'s declared
+    /// field-`idx` selector — then, under the completed M' (bridge ≡ pinned
+    /// selector), the claimed body is exactly the native F2 selector
+    /// tautology. `Ok(pinned selector)` on pass; `Err(decline reason)`
+    /// fail-closed otherwise (unpinned = genuinely free bridge, or a pin to a
+    /// different selector — either claim would be a wrong-grant).
+    fn dt_cert_bridge_claim_check(
+        &self,
+        bridge_rewrite: &HashMap<String, (String, Sort)>,
+        bridge: &str,
+        ctor: &str,
+        idx: usize,
+    ) -> std::result::Result<String, String> {
+        let Some((pinned_sel, _)) = bridge_rewrite.get(bridge) else {
+            return Err(format!(
+                "bridge UF `{bridge}` has no in-snapshot selector-bridge pin (genuinely free \
+                 bridge)"
+            ));
+        };
+        let Some(selectors) = self.ctx.constructor_selectors(ctor) else {
+            return Err(format!("constructor `{ctor}` has no declared selectors"));
+        };
+        if selectors.get(idx) != Some(pinned_sel) {
+            return Err(format!(
+                "bridge UF `{bridge}` is pinned to `{pinned_sel}`, not `{ctor}`'s field-{idx} \
+                 selector"
+            ));
+        }
+        Ok(pinned_sel.clone())
+    }
+
     /// F3 recognizer — bridge symbolic-default closure
     /// `(or (= (bridge x) (sel_i x)) (not (is-C x)))` (single binder `x`), where
     /// `bridge` is a free completable UF, `sel_i` is `C`'s declared selector, and
@@ -8172,10 +8470,10 @@ impl Executor {
     /// binder `x`. Returns `name`.
     fn dt_cert_unary_binder_app(&self, t: TermId, x: &str) -> Option<String> {
         if let TermData::App(sym, args) = self.ctx.terms.get(t) {
-            if args.len() == 1 {
-                if matches!(self.ctx.terms.get(args[0]), TermData::Var(n, _) if n == x) {
-                    return Some(sym.name().to_string());
-                }
+            if args.len() == 1
+                && matches!(self.ctx.terms.get(args[0]), TermData::Var(n, _) if n == x)
+            {
+                return Some(sym.name().to_string());
             }
         }
         None
@@ -8295,16 +8593,8 @@ impl Executor {
             return None;
         }
         // Is `t` a `ctor` under M'?
-        match self.dt_cert_tester_value(
-            model,
-            gi.t,
-            &gi.ctor,
-            bridge_rewrite,
-            tester_idx,
-            sel_idx,
-        )? {
-            false => return Some(true), // guard false for all binders — vacuous
-            true => {}
+        if !self.dt_cert_tester_value(model, gi.t, &gi.ctor, bridge_rewrite, tester_idx, sel_idx)? {
+            return Some(true); // guard false for all binders — vacuous
         }
         // Pin each binder v_i := (sel_i t) (declared selector on the ground t).
         let mut subst: HashMap<String, TermId> = HashMap::default();
@@ -8327,6 +8617,226 @@ impl Executor {
             EvalValue::Bool(b) => Some(b),
             _ => None,
         }
+    }
+
+    /// W2 (bridge route) — cert-local three-valued (Kleene) evaluation of a
+    /// ground assertion's BOOLEAN SKELETON under the completed model M'.
+    ///
+    /// `evaluate_term`'s `or`/`and` loops return `Unknown` on the FIRST
+    /// non-definite operand without scanning the rest, so a guarded ground like
+    /// `(or (= (sel_j (sel_k t)) …) (not (is-C (sel_k t))))` — where the inner
+    /// selector lands on a NON-MATCHING constructor (SMT-LIB leaves that value
+    /// underspecified ⇒ `Unknown`) but the guard disjunct is definitely true —
+    /// reads `Unknown` even though the assertion is definitely true in EVERY
+    /// completion of M'. Kleene semantics are strictly sound and complete-safe:
+    /// `or` is true iff SOME operand is true, false iff ALL are false;
+    /// `and` dually; `not`/`=>`/Bool-`ite` lifted pointwise; every leaf
+    /// delegates to `evaluate_term` and stays fail-closed (`None`) unless
+    /// definite. This only RECOVERS definite verdicts the two-valued scan
+    /// abandoned — it can never manufacture one, because a `Some(b)` here is
+    /// witnessed by definite leaf evaluations under the same single M'.
+    ///
+    /// Used ONLY by the certificate's ground re-verification, gated on an
+    /// active bridge-route claim (`bridge_route_used`) — i.e. exclusively on
+    /// the shadow-withheld path in this increment.
+    fn dt_cert_eval_ground_kleene(&self, model: &Model, t: TermId) -> Option<bool> {
+        match self.ctx.terms.get(t).clone() {
+            TermData::Not(i) => self.dt_cert_eval_ground_kleene(model, i).map(|b| !b),
+            TermData::Ite(c, a, b) => {
+                // Bool-sorted ite only (scalar ites are leaves for the leaf
+                // evaluator below — reached only via `=`/atoms, which
+                // `evaluate_term` owns).
+                match self.dt_cert_eval_ground_kleene(model, c) {
+                    Some(true) => self.dt_cert_eval_ground_kleene(model, a),
+                    Some(false) => self.dt_cert_eval_ground_kleene(model, b),
+                    None => {
+                        // Condition indefinite: definite only if BOTH branches
+                        // agree definitely.
+                        let va = self.dt_cert_eval_ground_kleene(model, a)?;
+                        let vb = self.dt_cert_eval_ground_kleene(model, b)?;
+                        (va == vb).then_some(va)
+                    }
+                }
+            }
+            TermData::App(sym, args) => match sym.name() {
+                "or" => {
+                    let mut all_false = true;
+                    for &a in &args {
+                        match self.dt_cert_eval_ground_kleene(model, a) {
+                            Some(true) => return Some(true),
+                            Some(false) => {}
+                            None => all_false = false,
+                        }
+                    }
+                    all_false.then_some(false)
+                }
+                "and" => {
+                    let mut all_true = true;
+                    for &a in &args {
+                        match self.dt_cert_eval_ground_kleene(model, a) {
+                            Some(false) => return Some(false),
+                            Some(true) => {}
+                            None => all_true = false,
+                        }
+                    }
+                    all_true.then_some(true)
+                }
+                "not" if args.len() == 1 => {
+                    self.dt_cert_eval_ground_kleene(model, args[0]).map(|b| !b)
+                }
+                "=>" if args.len() == 2 => {
+                    match (
+                        self.dt_cert_eval_ground_kleene(model, args[0]),
+                        self.dt_cert_eval_ground_kleene(model, args[1]),
+                    ) {
+                        (Some(false), _) | (_, Some(true)) => Some(true),
+                        (Some(true), Some(false)) => Some(false),
+                        _ => None,
+                    }
+                }
+                // Leaf atom (equality, tester, arithmetic relation, …):
+                // delegate to the single-authority evaluator, fail-closed.
+                _ => match self.evaluate_term(model, t) {
+                    EvalValue::Bool(b) => Some(b),
+                    _ => None,
+                },
+            },
+            _ => match self.evaluate_term(model, t) {
+                EvalValue::Bool(b) => Some(b),
+                _ => None,
+            },
+        }
+    }
+
+    /// W2b (bridge route) — argument-VALUE congruence index over the ground
+    /// core's committed UF applications: `(symbol, [definite arg atoms]) →
+    /// (application TermId, definite result atom)`. Built from the ORIGINAL
+    /// (pre-rewrite) ground assertions, whose application TermIds carry the
+    /// candidate model's committed per-application values.
+    ///
+    /// SOUNDNESS: reading the index is only ever used to substitute one
+    /// application for another whose arguments have the SAME definite values
+    /// under the ONE completed model M' — function congruence makes the two
+    /// applications denote the same object in M', for ANY function symbol.
+    /// A key whose committed rows disagree (two apps, same arg values,
+    /// different result values) is POISONED (`None`) and never used —
+    /// fail-closed against an inconsistent-model surprise.
+    fn dt_cert_build_uf_value_index(
+        &self,
+        model: &Model,
+        grounds: &[TermId],
+    ) -> HashMap<(String, Vec<String>), Option<(TermId, String)>> {
+        let mut index: HashMap<(String, Vec<String>), Option<(TermId, String)>> =
+            HashMap::default();
+        let mut visited: HashSet<TermId> = HashSet::default();
+        let mut stack: Vec<TermId> = grounds.to_vec();
+        while let Some(t) = stack.pop() {
+            if !visited.insert(t) {
+                continue;
+            }
+            match self.ctx.terms.get(t).clone() {
+                TermData::Not(i) => stack.push(i),
+                TermData::Ite(c, a, b) => {
+                    stack.push(c);
+                    stack.push(a);
+                    stack.push(b);
+                }
+                TermData::App(sym, args) => {
+                    stack.extend(args.iter().copied());
+                    if args.is_empty() || !is_mbqi_completable_uf_symbol(sym.name()) {
+                        continue;
+                    }
+                    let Some(arg_atoms) = args
+                        .iter()
+                        .map(|&a| self.dt_cert_scalar_atom(&self.evaluate_term(model, a)))
+                        .collect::<Option<Vec<String>>>()
+                    else {
+                        continue;
+                    };
+                    let Some(result_atom) = self.dt_cert_scalar_atom(&self.evaluate_term(model, t))
+                    else {
+                        continue;
+                    };
+                    let key = (sym.name().to_string(), arg_atoms);
+                    match index.get_mut(&key) {
+                        None => {
+                            index.insert(key, Some((t, result_atom)));
+                        }
+                        Some(slot) => {
+                            if let Some((_, prev)) = slot {
+                                if *prev != result_atom {
+                                    // Conflicting committed rows: poison.
+                                    *slot = None;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        index
+    }
+
+    /// W2b (bridge route) — rewrite every INDEFINITE application in `t` whose
+    /// (symbol, definite argument values) key matches a committed ground-core
+    /// application (`dt_cert_build_uf_value_index`) to THAT application's
+    /// TermId, so `evaluate_term` resolves it through the committed model
+    /// value. Definite applications are left untouched (the single-authority
+    /// evaluator already owns them); an unmatched indefinite application stays
+    /// as-is (and the ground stays fail-closed indefinite). Sound by function
+    /// congruence under the one completed model M' — see the index builder.
+    fn dt_cert_congruence_rewrite(
+        &mut self,
+        model: &Model,
+        t: TermId,
+        index: &HashMap<(String, Vec<String>), Option<(TermId, String)>>,
+        memo: &mut HashMap<TermId, TermId>,
+    ) -> TermId {
+        if let Some(&r) = memo.get(&t) {
+            return r;
+        }
+        let result = match self.ctx.terms.get(t).clone() {
+            TermData::Not(i) => {
+                let ri = self.dt_cert_congruence_rewrite(model, i, index, memo);
+                self.ctx.terms.mk_not(ri)
+            }
+            TermData::Ite(c, a, b) => {
+                let rc = self.dt_cert_congruence_rewrite(model, c, index, memo);
+                let ra = self.dt_cert_congruence_rewrite(model, a, index, memo);
+                let rb = self.dt_cert_congruence_rewrite(model, b, index, memo);
+                self.ctx.terms.mk_ite(rc, ra, rb)
+            }
+            TermData::App(sym, args) => {
+                let mut new_args: Vec<TermId> = Vec::with_capacity(args.len());
+                for a in &args {
+                    new_args.push(self.dt_cert_congruence_rewrite(model, *a, index, memo));
+                }
+                let sort = self.ctx.terms.sort(t).clone();
+                let rebuilt = self.ctx.terms.mk_app(sym.clone(), new_args.clone(), sort);
+                if !new_args.is_empty()
+                    && is_mbqi_completable_uf_symbol(sym.name())
+                    && matches!(self.evaluate_term(model, rebuilt), EvalValue::Unknown)
+                {
+                    if let Some(arg_atoms) = new_args
+                        .iter()
+                        .map(|&a| self.dt_cert_scalar_atom(&self.evaluate_term(model, a)))
+                        .collect::<Option<Vec<String>>>()
+                    {
+                        if let Some(Some((committed, _))) =
+                            index.get(&(sym.name().to_string(), arg_atoms))
+                        {
+                            memo.insert(t, *committed);
+                            return *committed;
+                        }
+                    }
+                }
+                rebuilt
+            }
+            _ => t,
+        };
+        memo.insert(t, result);
+        result
     }
 
     /// Rewrite every F3 bridge-UF application `bridge(a)` in `t` to its declared
@@ -8557,7 +9067,6 @@ fn is_finite_table_interpreted_symbol(name: &str) -> bool {
 }
 
 /// Maximum concrete Int refutation-witness candidates synthesized by
-/// [`synthesize_int_refutation_candidates`]. Callers additionally cap the
 /// [`synthesize_int_refutation_candidates`]. Callers additionally cap the
 /// number of isolated solves they run and share a tight deadline, so this
 /// bounds list construction, not solve time.
@@ -8942,6 +9451,22 @@ pub(crate) fn dt_cert_mode() -> DtCertMode {
     }
 }
 
+/// `AY_DT_CERT_BRIDGE_ROUTE` gate for the W1 bridge-UF-over-constructor cert
+/// route (SAT-side base-recheck campaign). SHADOW-ONLY in this increment:
+/// enabling it lets classification claim bridge tautologies (with the
+/// mandatory selector-bridge-premise gate) and logs `[BRIDGE-ROUTE]`
+/// would-claim / would-grant decisions, but any grant that depends on a
+/// bridge claim is WITHHELD — the verdict is byte-identical to the route
+/// being absent. Authoritative grant is deferred to the W3 vehicle gate +
+/// the EUF-extraction faithfulness guarantee. Unset/off ⇒ byte-identical
+/// everywhere (every read is lazily guarded).
+pub(crate) fn dt_cert_bridge_route_enabled() -> bool {
+    matches!(
+        std::env::var("AY_DT_CERT_BRIDGE_ROUTE").ok().as_deref(),
+        Some("1") | Some("on") | Some("shadow") | Some("log")
+    )
+}
+
 /// Shadow-log a DT-certificate decision (reuse of the `reject_instrument`
 /// env-gated telemetry pattern). Silent when the gate is `Off`.
 fn dt_cert_note(mode: DtCertMode, msg: &str) {
@@ -8949,3 +9474,6 @@ fn dt_cert_note(mode: DtCertMode, msg: &str) {
         eprintln!("c CERT/dt-mbqi-sat {msg}");
     }
 }
+
+#[cfg(test)]
+mod bridge_route_tests;

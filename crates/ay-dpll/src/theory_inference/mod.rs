@@ -48,7 +48,9 @@ pub(crate) fn record_theory_conflict_unsat(
     let (kind, ordered_clause) = if let Some(terms) = terms {
         let result = euf::infer_euf_lemma(terms, negations, conflict)
             .or_else(|| infer_arith_farkas(terms, conflict, &clause))
-            .or_else(|| infer_array_lemma(terms, &clause));
+            .or_else(|| infer_array_lemma(terms, &clause))
+            .or_else(|| infer_string_ground_eval_lemma(terms, &clause))
+            .or_else(|| infer_regex_intersect_empty_lemma(terms, &clause));
         result.unwrap_or((TheoryLemmaKind::Generic, clause))
     } else {
         (TheoryLemmaKind::Generic, clause)
@@ -104,13 +106,34 @@ pub(crate) fn infer_theory_lemma_kind_from_clause_terms_and_farkas(
         }
     }
 
-    // Array read-over-write axiom instances: classify into the strict-checkable
-    // `ArraySelectStore` kind (the checker already validates it — `ay-proof`
-    // `validate_array_select_store`), so they no longer fall back to the
-    // `Generic`/trust kind. Recognition reuses the checker's own schema matcher
-    // (no drift). Drives `ProofQuality::trust_count` down for QF_AX problems.
-    if let Some(index_eq) = ay_proof::recognize_array_select_store(terms, clause) {
-        return TheoryLemmaKind::ArraySelectStore { index_eq };
+    // Array axiom instances (read-over-write, n-ary store permutation, chain
+    // read-over-write): classify into the strict-checkable kinds the checker
+    // validates (`ay-proof` `validate_array_*`), so they no longer fall back to
+    // the `Generic`/trust kind. Recognition reuses the checker's own schema
+    // matcher (no drift). Drives `ProofQuality::trust_count` down for QF_AX.
+    if let Some(kind) = ay_proof::recognize_array_theory_lemma(terms, clause) {
+        return kind;
+    }
+
+    // Ground string/regex refutations: the QF_S "sink" family reduces to
+    // "this CONSTANT is not in the language of this ground regex", a closed
+    // form the checker decides outright. Classify into the strict-checkable
+    // `StringGroundEval` kind so it stops exporting as `trust`. Recognition is
+    // the checker's own evaluator (`ay_proof::recognize_string_ground_eval`),
+    // so classifier and validator cannot drift.
+    if ay_proof::recognize_string_ground_eval(terms, clause) {
+        return TheoryLemmaKind::StringGroundEval;
+    }
+
+    // Symbolic regex intersection-emptiness (#regex-cert): the automatark
+    // family refutes `x ∈ R₁ ∧ … ∧ x ∈ Rₖ` on a SYMBOLIC `x`, which the ground
+    // evaluator above cannot touch. Classify into the strict-checkable
+    // `RegexIntersectEmpty` kind so it stops exporting as `trust`. Recognition
+    // is the checker's own independent derivative-product emptiness decision
+    // (`ay_proof::recognize_regex_intersect_empty`), so classifier and
+    // validator cannot drift.
+    if ay_proof::recognize_regex_intersect_empty(terms, clause) {
+        return TheoryLemmaKind::RegexIntersectEmpty;
     }
 
     if arith_conflict_is_integer(terms, &conflict) {
@@ -197,22 +220,45 @@ fn opaque_arith_farkas_valid(
     ay_core::proof_validation::verify_farkas_conflict_lits_linear(terms, conflict, farkas).is_ok()
 }
 
-/// Classify a clause as the strict-checkable array read-over-write kind
-/// `ArraySelectStore { index_eq }` when it matches the exact schema, else
-/// `None`. Recognition is delegated to the checker's own matcher
-/// (`ay_proof::recognize_array_select_store`) so the classifier and validator
-/// cannot drift. Extensionality is intentionally excluded (not yet
-/// strict-validatable, #8073), so it stays `Generic` rather than be mislabelled.
+/// Classify a clause as one of the strict-checkable array kinds
+/// (`ArraySelectStore { index_eq }`, `ArrayStorePermutation`, `ArrayRowChain`)
+/// when it matches an exact schema, else `None`. Recognition is delegated to
+/// the checker's own matcher (`ay_proof::recognize_array_theory_lemma`) so the
+/// classifier and validator cannot drift. Extensionality is intentionally
+/// excluded (not yet strict-validatable, #8073), so it stays `Generic` rather
+/// than be mislabelled a kind strict mode would reject.
 fn infer_array_lemma(
     terms: &TermStore,
     clause: &[TermId],
 ) -> Option<(TheoryLemmaKind, Vec<TermId>)> {
-    ay_proof::recognize_array_select_store(terms, clause).map(|index_eq| {
-        (
-            TheoryLemmaKind::ArraySelectStore { index_eq },
-            clause.to_vec(),
-        )
-    })
+    ay_proof::recognize_array_theory_lemma(terms, clause).map(|kind| (kind, clause.to_vec()))
+}
+
+/// Classify a clause as the strict-checkable ground string/regex kind
+/// `StringGroundEval` when the checker's own independent evaluator proves one
+/// of its literals TRUE, else `None`. Delegating to
+/// `ay_proof::recognize_string_ground_eval` keeps the classifier and the strict
+/// validator from drifting.
+fn infer_string_ground_eval_lemma(
+    terms: &TermStore,
+    clause: &[TermId],
+) -> Option<(TheoryLemmaKind, Vec<TermId>)> {
+    ay_proof::recognize_string_ground_eval(terms, clause)
+        .then(|| (TheoryLemmaKind::StringGroundEval, clause.to_vec()))
+}
+
+/// Classify a clause as the strict-checkable SYMBOLIC regex kind
+/// `RegexIntersectEmpty` when the checker's own independent derivative-product
+/// emptiness decision proves that some `str.in_re` literal group over a common
+/// subject denies an EMPTY intersection, else `None`. Delegating to
+/// `ay_proof::recognize_regex_intersect_empty` keeps the classifier and the
+/// strict validator from drifting.
+fn infer_regex_intersect_empty_lemma(
+    terms: &TermStore,
+    clause: &[TermId],
+) -> Option<(TheoryLemmaKind, Vec<TermId>)> {
+    ay_proof::recognize_regex_intersect_empty(terms, clause)
+        .then(|| (TheoryLemmaKind::RegexIntersectEmpty, clause.to_vec()))
 }
 
 /// Infer the proof kind for a theory conflict that will be materialized as an

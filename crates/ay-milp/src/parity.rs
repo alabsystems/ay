@@ -95,19 +95,11 @@ struct Deadline<'a> {
     polls_left: Option<&'a Cell<usize>>,
 }
 
-impl<'a> Deadline<'a> {
+impl Deadline<'_> {
     fn new(at: Option<Instant>) -> Self {
         Self {
             at,
             polls_left: None,
-        }
-    }
-
-    #[cfg(test)]
-    fn with_poll_budget(polls_left: &'a Cell<usize>) -> Self {
-        Self {
-            at: None,
-            polls_left: Some(polls_left),
         }
     }
 
@@ -130,6 +122,16 @@ impl<'a> Deadline<'a> {
             self.check()
         } else {
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+impl<'a> Deadline<'a> {
+    fn with_poll_budget(polls_left: &'a Cell<usize>) -> Self {
+        Self {
+            at: None,
+            polls_left: Some(polls_left),
         }
     }
 }
@@ -195,12 +197,7 @@ impl Bits {
     /// Index of the lowest set bit strictly ≥ `from`, if any.
     fn first_set_from(&self, from: usize) -> Option<usize> {
         let n = self.w.len() * 64;
-        for i in from..n {
-            if self.get(i) {
-                return Some(i);
-            }
-        }
-        None
+        (from..n).find(|&i| self.get(i))
     }
 }
 
@@ -865,7 +862,9 @@ mod tests {
         // It has two feasible points, so every verdict shape is available to
         // catch an accidental late Optimal/Feasible result.
         let m = parity_model(&[vec![1, 1, 0], vec![0, 1, 1]], &[0, -1]);
-        let expired_at = Instant::now() - Duration::from_secs(1);
+        let expired_at = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the monotonic clock must be at least one second old");
         let expired = Deadline::new(Some(expired_at));
 
         assert!(matches!(

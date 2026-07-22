@@ -3025,7 +3025,13 @@ impl Executor {
                 // confirmation (there is nothing to attain), so like
                 // `Unbounded` it is only meaningful if the standalone tableau
                 // provably saw the WHOLE problem (same audits, same reason).
-                if !(lra.all_asserted_atoms_parsed() && lra.all_interned_vars_are_declared_vars()) {
+                let incomplete_problem =
+                    !(lra.all_asserted_atoms_parsed() && lra.all_interned_vars_are_declared_vars());
+                let contains_integer_var = lra
+                    .term_to_var()
+                    .keys()
+                    .any(|term| matches!(self.ctx.terms.sort(*term), Sort::Int));
+                if incomplete_problem || contains_integer_var {
                     SimplexOpt::NotApplicable
                 }
                 // Int guard: a strict bound over an integer-valued quantity
@@ -3034,13 +3040,6 @@ impl Executor {
                 // x < i, i < 3` reads 3−2ε where the truth is 2−ε). The LP
                 // relaxation proves nothing here; fail closed to the
                 // iterative fallback.
-                else if lra
-                    .term_to_var()
-                    .keys()
-                    .any(|term| matches!(self.ctx.terms.sort(*term), Sort::Int))
-                {
-                    SimplexOpt::NotApplicable
-                }
                 // Sign guard (theorem: minimize ⇒ k > 0, maximize ⇒ k < 0;
                 // the LRA already fail-closes on violation, re-checked here so
                 // this lane never trusts a wrong-signed shape).

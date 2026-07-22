@@ -41,9 +41,10 @@ use num_bigint::{BigInt, Sign};
 use num_rational::BigRational;
 
 use super::{
-    ast_to_term, cache_ast_vector, ffi_guard_ast, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint,
-    record_ast_sort, term_to_ast, Z3Context, Z3_ast, Z3_ast_vector, Z3_context, ALGEBRAIC_AST_TAG,
-    MAX_FFI_ALGEBRAIC_EXPONENT, PROOF_AST_TAG, Z3_INVALID_ARG,
+    ast_to_term, cache_ast_vector, ffi_count_within_limit, ffi_guard_ast, ffi_guard_int,
+    ffi_guard_ptr, ffi_guard_uint, record_ast_sort, term_to_ast, Z3Context, Z3_ast, Z3_ast_vector,
+    Z3_context, ALGEBRAIC_AST_TAG, MAX_FFI_ALGEBRAIC_EXPONENT, MAX_FFI_CONTAINER_ELEMENTS,
+    PROOF_AST_TAG, Z3_INVALID_ARG,
 };
 
 // ============================================================================
@@ -475,6 +476,54 @@ pub unsafe extern "C" fn Z3_algebraic_neq(c: Z3_context, a: Z3_ast, b: Z3_ast) -
 /// fails CLOSED (`Z3_INVALID_ARG`) — never an approximated polynomial.
 const MAX_POLY_DEGREE: usize = 4096;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PscResourceLimit {
+    MatrixEntries,
+    AggregateEntries,
+    EliminationWork,
+}
+
+/// Preflight every Sylvester–Habicht matrix in a PSC chain.
+///
+/// `rational_det` stores `size²` exact rationals and performs O(`size³`)
+/// elimination work for each coefficient. Degree alone does not bound either
+/// resource: a degree-4096 pair would try to allocate tens of millions of
+/// `BigRational`s for its first matrix and repeat that work thousands of times.
+/// Keep both the largest/aggregate matrix footprint and an overflow-safe cubic
+/// work estimate within explicit limits before constructing any matrix.
+fn psc_resource_preflight(
+    m: usize,
+    n: usize,
+    entry_limit: usize,
+    work_limit: usize,
+) -> Result<(), PscResourceLimit> {
+    let mut aggregate_entries = 0usize;
+    let mut aggregate_work = 0usize;
+    for j in 0..n {
+        let twice_j = j.checked_mul(2).ok_or(PscResourceLimit::MatrixEntries)?;
+        let size = m
+            .checked_add(n)
+            .and_then(|sum| sum.checked_sub(twice_j))
+            .ok_or(PscResourceLimit::MatrixEntries)?;
+        let entries = size
+            .checked_mul(size)
+            .filter(|entries| *entries <= entry_limit)
+            .ok_or(PscResourceLimit::MatrixEntries)?;
+        aggregate_entries = aggregate_entries
+            .checked_add(entries)
+            .filter(|entries| *entries <= entry_limit)
+            .ok_or(PscResourceLimit::AggregateEntries)?;
+        let work = entries
+            .checked_mul(size)
+            .ok_or(PscResourceLimit::EliminationWork)?;
+        aggregate_work = aggregate_work
+            .checked_add(work)
+            .filter(|work| *work <= work_limit)
+            .ok_or(PscResourceLimit::EliminationWork)?;
+    }
+    Ok(())
+}
+
 /// Trim trailing zero coefficients (the zero polynomial becomes `[]`).
 fn poly_trim(mut p: Vec<BigRational>) -> Vec<BigRational> {
     while p.last().is_some_and(num_traits::Zero::is_zero) {
@@ -773,6 +822,11 @@ pub unsafe extern "C" fn Z3_algebraic_roots(
     n: c_uint,
     a: *const Z3_ast,
 ) -> Z3_ast_vector {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_algebraic_roots", n) } {
+        return std::ptr::null_mut();
+    }
     let n_usize = n as usize;
     if p == 0 || (n_usize > 0 && a.is_null()) {
         // SAFETY: `ffi_guard_ptr` null-checks `c` and catches panics.
@@ -837,7 +891,10 @@ pub unsafe extern "C" fn Z3_algebraic_roots(
                 );
             };
             let Some(coeffs) = term_to_poly(ctx, simplified, *x) else {
-                return fail(ctx, "the expression is not a polynomial with numeral coefficients (or exceeds the degree cap)");
+                return fail(
+                    ctx,
+                    "the expression is not a polynomial with numeral coefficients (or exceeds the degree cap)",
+                );
             };
             if coeffs.len() < 2 {
                 // Constant / zero polynomial: Z3 rejects these too.
@@ -879,6 +936,11 @@ pub unsafe extern "C" fn Z3_algebraic_eval(
     n: c_uint,
     a: *const Z3_ast,
 ) -> c_int {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_algebraic_eval", n) } {
+        return 0;
+    }
     let n_usize = n as usize;
     if p == 0 || (n_usize > 0 && a.is_null()) {
         // SAFETY: `ffi_guard_int` null-checks `c` and catches panics.
@@ -1070,10 +1132,16 @@ pub unsafe extern "C" fn Z3_polynomial_subresultants(
             }
             let (mut pp, mut qq) = (ast_to_term(p), ast_to_term(q));
             let Some(mut pc) = term_to_poly(ctx, pp, x_term) else {
-                return fail(ctx, "p is not a univariate polynomial in x with numeral coefficients (parametric subresultants are an honest divergence)");
+                return fail(
+                    ctx,
+                    "p is not a univariate polynomial in x with numeral coefficients (parametric subresultants are an honest divergence)",
+                );
             };
             let Some(mut qc) = term_to_poly(ctx, qq, x_term) else {
-                return fail(ctx, "q is not a univariate polynomial in x with numeral coefficients (parametric subresultants are an honest divergence)");
+                return fail(
+                    ctx,
+                    "q is not a univariate polynomial in x with numeral coefficients (parametric subresultants are an honest divergence)",
+                );
             };
             // libz3 canonicalizes so the FIRST operand has the LARGER degree
             // (equal degrees keep the given order; no sign adjustment) —
@@ -1083,11 +1151,27 @@ pub unsafe extern "C" fn Z3_polynomial_subresultants(
                 std::mem::swap(&mut pp, &mut qq);
             }
             let _ = (pp, qq);
-            let chain_len = match (poly_degree(&pc), poly_degree(&qc)) {
+            let degrees = (poly_degree(&pc), poly_degree(&qc));
+            let chain_len = match degrees {
                 // min(deg p, deg q), with constant/zero operands → empty chain.
                 (Some(_), Some(n)) if n >= 1 => n,
                 _ => 0,
             };
+            if let (Some(m), Some(n)) = degrees {
+                let limit = MAX_FFI_CONTAINER_ELEMENTS as usize;
+                if let Err(limit_kind) = psc_resource_preflight(m, n, limit, limit) {
+                    let detail = match limit_kind {
+                        PscResourceLimit::MatrixEntries => "matrix allocation budget exceeded",
+                        PscResourceLimit::AggregateEntries => {
+                            "aggregate matrix allocation budget exceeded"
+                        }
+                        PscResourceLimit::EliminationWork => {
+                            "exact determinant work budget exceeded"
+                        }
+                    };
+                    return fail(ctx, detail);
+                }
+            }
             let mut values: Vec<BigRational> = Vec::with_capacity(chain_len);
             for j in 0..chain_len {
                 let v = psc_coefficient(&pc, &qc, j);
@@ -1110,5 +1194,32 @@ pub unsafe extern "C" fn Z3_polynomial_subresultants(
                 .collect();
             cache_ast_vector(ctx, asts)
         })
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn psc_resource_preflight_bounds_matrix_and_cubic_work() {
+        // A single 10×10 matrix consumes exactly 100 entries / 1000 abstract
+        // elimination-work units.
+        assert_eq!(psc_resource_preflight(9, 1, 100, 1000), Ok(()));
+        assert_eq!(
+            psc_resource_preflight(10, 1, 100, usize::MAX),
+            Err(PscResourceLimit::MatrixEntries)
+        );
+        assert_eq!(
+            psc_resource_preflight(9, 1, usize::MAX, 999),
+            Err(PscResourceLimit::EliminationWork)
+        );
+
+        // Repeated matrices are charged cumulatively, not one-at-a-time.
+        assert_eq!(
+            psc_resource_preflight(5, 2, 50, usize::MAX),
+            Err(PscResourceLimit::AggregateEntries)
+        );
+        assert!(psc_resource_preflight(usize::MAX, 1, usize::MAX, usize::MAX).is_err());
     }
 }

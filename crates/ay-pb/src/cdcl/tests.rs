@@ -3466,9 +3466,9 @@ fn test_at_root_lp_bound_never_exceeds_true_optimum() {
         for _ in 0..num_constraints {
             let mut terms = Vec::new();
             for var in 1..=num_vars {
-                if xorshift_next(&mut rng) % 2 == 0 {
+                if xorshift_next(&mut rng).is_multiple_of(2) {
                     let coeff = 1 + (xorshift_next(&mut rng) % 5) as i128;
-                    let negated = xorshift_next(&mut rng) % 2 == 0;
+                    let negated = xorshift_next(&mut rng).is_multiple_of(2);
                     terms.push(linear_term(coeff, PbLit { var, negated }));
                 }
             }
@@ -7118,7 +7118,10 @@ fn root_lp_budget_is_deadline_proportional() {
     assert_eq!(solver.root_lp_budget(now), ROOT_LP_BOUND_TIME_BUDGET);
     solver.set_solve_deadline(Some(now + Duration::from_secs(10)));
     assert_eq!(solver.root_lp_budget(now), Duration::from_millis(2_500));
-    solver.set_solve_deadline(Some(now - Duration::from_secs(1)));
+    let expired = now
+        .checked_sub(Duration::from_secs(1))
+        .expect("the monotonic clock has advanced by at least one second");
+    solver.set_solve_deadline(Some(expired));
     assert_eq!(solver.root_lp_budget(now), Duration::ZERO);
     solver.set_solve_deadline(None);
     assert_eq!(solver.root_lp_budget(now), ROOT_LP_BOUND_TIME_BUDGET);

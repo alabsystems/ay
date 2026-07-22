@@ -175,9 +175,9 @@ fn solve_and_verify_drat(cnf_path: &Path, drat_trim: Option<&Path>) -> DratResul
     // Step 2: External verification using drat-trim (when available)
     let (external_ok, external_err) = if let Some(dt) = drat_trim {
         let cnf_tmp =
-            std::env::temp_dir().join(format!("ay_drat_cov_{}_{}.cnf", std::process::id(), &name));
+            std::env::temp_dir().join(format!("ay_drat_cov_{}_{}.cnf", std::process::id(), name));
         let proof_tmp =
-            std::env::temp_dir().join(format!("ay_drat_cov_{}_{}.drat", std::process::id(), &name));
+            std::env::temp_dir().join(format!("ay_drat_cov_{}_{}.drat", std::process::id(), name));
         std::fs::write(&cnf_tmp, &cnf_text).expect("write CNF temp");
         std::fs::write(&proof_tmp, &proof_bytes).expect("write DRAT temp");
 

@@ -626,8 +626,7 @@ mod tests {
                         for e in &edges {
                             assert!(
                                 recorded.contains(&(e.a, e.b)) || recorded.contains(&(e.b, e.a)),
-                                "explain returned a non-recorded edge {:?}",
-                                e
+                                "explain returned a non-recorded edge {e:?}"
                             );
                         }
                         // (b) the edges connect x to y.

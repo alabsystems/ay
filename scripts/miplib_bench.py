@@ -14,24 +14,41 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+import math
+import os
 import pathlib
 import re
-import subprocess
 import sys
 import time
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _oom_guard import (  # noqa: E402
+    plan_solver_resources,
+    run_captured,
+    warn_concurrent_build,
+)
 
 AY = "./target/release/examples/mps_solve"
 
 
-def run_ay(path: pathlib.Path, timeout: float):
+def run_ay(path: pathlib.Path, timeout: float, plan):
     t0 = time.monotonic()
     try:
-        r = subprocess.run(
+        r = run_captured(
             [AY, str(path), str(timeout)],
-            capture_output=True, text=True, timeout=timeout + 60,
+            plan.memlimit_mb, timeout + 60, label="miplib_bench.py[ay]",
+            env=dict(os.environ, MEMLIMIT=str(plan.memlimit_mb),
+                     NBCORE=str(plan.nbcore)),
         )
-    except subprocess.TimeoutExpired:
+    except OSError:
+        return ("CRASH", None, 0.0)
+    if r.memout:
+        return ("MEMOUT", None, r.wall_sec)
+    if r.timed_out:
         return ("TIMEOUT", None, timeout + 60)
+    if r.output_truncated:
+        return ("CRASH", None, r.wall_sec)
     dt = time.monotonic() - t0
     out = (r.stdout or "").strip().splitlines()
     if not out:
@@ -47,15 +64,23 @@ def run_ay(path: pathlib.Path, timeout: float):
     return (status, val, dt)
 
 
-def run_highs(path: pathlib.Path, timeout: float):
+def run_highs(path: pathlib.Path, timeout: float, plan):
     t0 = time.monotonic()
     try:
-        r = subprocess.run(
+        r = run_captured(
             ["highs", "--time_limit", str(timeout), str(path)],
-            capture_output=True, text=True, timeout=timeout + 60,
+            plan.memlimit_mb, timeout + 60, label="miplib_bench.py[highs]",
+            env=dict(os.environ, MEMLIMIT=str(plan.memlimit_mb),
+                     NBCORE=str(plan.nbcore), OMP_NUM_THREADS=str(plan.nbcore)),
         )
-    except subprocess.TimeoutExpired:
+    except OSError:
+        return ("CRASH", None, 0.0)
+    if r.memout:
+        return ("MEMOUT", None, r.wall_sec)
+    if r.timed_out:
         return ("TIMEOUT", None, timeout + 60)
+    if r.output_truncated:
+        return ("CRASH", None, r.wall_sec)
     dt = time.monotonic() - t0
     txt = r.stdout or ""
     status = re.search(r"^\s*Status\s+(.+)$", txt, re.M)
@@ -80,16 +105,31 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", required=True)
     ap.add_argument("--timeout", type=float, default=60.0)
+    ap.add_argument("--out", type=pathlib.Path,
+                    default=pathlib.Path("evals/results/miplib-bench/latest.json"))
     args = ap.parse_args()
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        ap.error("--timeout must be finite and positive")
+
+    warn_concurrent_build()
+    plan = plan_solver_resources(1, label="miplib_bench.py")
+    resource_plan = {
+        "requested_jobs": 1, "jobs": plan.jobs,
+        "memlimit_mb_per_child": plan.memlimit_mb,
+        "nbcore_per_child": plan.nbcore,
+        "headroom_mb": plan.headroom_mb,
+        "enforcement": "process-group rss_watchdog; MEMLIMIT/NBCORE environment",
+    }
 
     files = sorted(pathlib.Path(args.dir).glob("*.mps"))
     print(f"{'instance':<12} {'ay':>10} {'ay t':>8} {'highs':>12} {'hi t':>8}  verdict")
     print("-" * 68)
 
     wrong, ay_opt, hi_opt, ay_better, hi_better = [], 0, 0, [], []
+    records = []
     for f in files:
-        a_st, a_v, a_t = run_ay(f, args.timeout)
-        h_st, h_v, h_t = run_highs(f, args.timeout)
+        a_st, a_v, a_t = run_ay(f, args.timeout, plan)
+        h_st, h_v, h_t = run_highs(f, args.timeout, plan)
         note = ""
 
         # A disagreement on a PROVEN optimum is a correctness bug in one of them.
@@ -117,9 +157,21 @@ def main() -> int:
         av = "-" if a_v is None else f"{a_v:.6g}"
         hv = "-" if h_v is None else f"{h_v:.6g}"
         print(f"{f.stem:<12} {av:>10} {a_t:>7.1f}s {hv:>12} {h_t:>7.1f}s  {a_st}/{h_st} {note}")
+        records.append({"file": str(f), "ay_status": a_st,
+                        "ay_objective": a_v, "ay_time_sec": a_t,
+                        "highs_status": h_st, "highs_objective": h_v,
+                        "highs_time_sec": h_t, "note": note})
 
     print("-" * 68)
     print(f"proved optimal: ay {ay_opt}/{len(files)}   highs {hi_opt}/{len(files)}")
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps({
+        "timeout_sec": args.timeout,
+        "resource_plan": resource_plan,
+        "records": records,
+        "wrong": wrong,
+    }, indent=2) + "\n")
+    print(f"wrote {args.out}")
     if wrong:
         print("\nCORRECTNESS FAILURES (these are bugs, not slowness):")
         for nm, a, h in wrong:

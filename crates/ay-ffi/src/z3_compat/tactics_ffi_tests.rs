@@ -14,7 +14,7 @@
 //! - The tactic actually flattens the goal before solving.
 
 use super::super::*;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::os::raw::c_uint;
 use std::ptr::{addr_of_mut, null, null_mut};
 
@@ -1212,7 +1212,8 @@ fn test_tactic_get_descr() {
         // (the two surfaces cannot drift): `Z3_mk_tactic` accepts it ⇒
         // `Z3_tactic_get_descr` describes it.
         for want in ay_frontend::SUPPORTED_TACTIC_NAMES {
-            let cname = std::ffi::CString::new(*want).unwrap();
+            let cname = CString::new(*want)
+                .expect("registered tactic name must not contain an interior NUL");
             let d = Z3_tactic_get_descr(ctx, cname.as_ptr());
             assert!(
                 !d.is_null(),
@@ -1288,10 +1289,13 @@ fn test_tactic_registry_enumeration() {
         for (i, want) in ay_frontend::SUPPORTED_TACTIC_NAMES.iter().enumerate() {
             let name = Z3_get_tactic_name(ctx, i as c_uint);
             assert!(!name.is_null(), "tactic name {i} must be non-null");
-            let got = CStr::from_ptr(name).to_str().unwrap();
+            let got = CStr::from_ptr(name)
+                .to_str()
+                .expect("enumerated tactic name must be valid UTF-8");
             assert_eq!(got, *want, "name {i} must match the registry");
             // Every enumerated name is REAL: Z3_mk_tactic accepts it.
-            let cname = CString::new(*want).unwrap();
+            let cname = CString::new(*want)
+                .expect("registered tactic name must not contain an interior NUL");
             let t = Z3_mk_tactic(ctx, cname.as_ptr());
             assert!(!t.is_null(), "enumerated tactic {got} must be buildable");
         }

@@ -551,7 +551,7 @@ fn build_split_goal(s: &mut Solver, seed: usize) {
         3 => c,
         _ => s.eq(x, one),
     };
-    if seed % 2 == 0 {
+    if seed.is_multiple_of(2) {
         s.assert_term(side);
         s.assert_term(clause);
     } else {
@@ -815,7 +815,7 @@ fn tactic_solver_verdict_matches_baseline_on_nested_ands() {
         true, true, true, true, true, false, false, false, false, false,
     ];
 
-    for which in 0..10usize {
+    for (which, should_be_sat) in expected_sat.iter().copied().enumerate() {
         // Baseline: solve the untransformed goal.
         let mut baseline = Solver::new(Logic::QfLia);
         build_goal(&mut baseline, which);
@@ -850,7 +850,7 @@ fn tactic_solver_verdict_matches_baseline_on_nested_ands() {
         // And both match the independently-known expected verdict. (SolveResult
         // cannot be constructed for comparison — Unsat carries a proof
         // certificate — so check via is_sat/is_unsat.)
-        if expected_sat[which] {
+        if should_be_sat {
             assert!(
                 tactic_result.is_sat(),
                 "shape {which} expected SAT, got {:?}",
@@ -1306,7 +1306,7 @@ fn tseitin_next(state: &mut u64) -> u64 {
 /// Build a random Boolean formula of bounded depth over `vars`.
 fn tseitin_build_formula(s: &mut Solver, vars: &[Term], state: &mut u64, depth: u32) -> Term {
     let r = tseitin_next(state);
-    if depth == 0 || r % 5 == 0 {
+    if depth == 0 || r.is_multiple_of(5) {
         match r % 8 {
             0 => s.bool_const(true),
             1 => s.bool_const(false),
@@ -1486,7 +1486,7 @@ fn build_bv_goal(s: &mut Solver, which: usize) {
 fn bit_blast_tactic_solver_verdict_matches_baseline_on_qf_bv() {
     let expected_sat = [true, true, true, true, false, false, false, false];
 
-    for which in 0..8usize {
+    for (which, should_be_sat) in expected_sat.iter().copied().enumerate() {
         // Baseline: solve the untransformed QF_BV goal.
         let mut baseline = Solver::new(Logic::QfBv);
         build_bv_goal(&mut baseline, which);
@@ -1507,7 +1507,7 @@ fn bit_blast_tactic_solver_verdict_matches_baseline_on_qf_bv() {
             base.result(),
             tactic.result(),
         );
-        if expected_sat[which] {
+        if should_be_sat {
             assert!(tactic.is_sat(), "shape {which} expected SAT");
         } else {
             assert!(tactic.is_unsat(), "shape {which} expected UNSAT");

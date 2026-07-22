@@ -1579,7 +1579,7 @@ extract_to = "a"
 "#,
         )
         .unwrap_err();
-        assert!(format!("{:#}", err).contains("sha256"));
+        assert!(format!("{err:#}").contains("sha256"));
 
         let err = load_inline(
             r#"
@@ -1594,7 +1594,7 @@ sha256 = "00"
 "#,
         )
         .unwrap_err();
-        assert!(format!("{:#}", err).contains("asset"));
+        assert!(format!("{err:#}").contains("asset"));
     }
 
     #[test]
@@ -1612,7 +1612,7 @@ extract_to = "benchmarks/g"
 "#,
         )
         .unwrap_err();
-        assert!(format!("{:#}", err).contains("manifest"));
+        assert!(format!("{err:#}").contains("manifest"));
     }
 
     #[test]
@@ -1676,7 +1676,7 @@ manifest = "benchmarks/g/manifest.csv"
         let path = dir.path().join("manifest.csv");
         fs::write(&path, "filename,size_bytes\nfoo.cnf.xz,42\n").unwrap();
         let err = parse_gbd_manifest(&path).unwrap_err();
-        assert!(format!("{:#}", err).contains("hash"));
+        assert!(format!("{err:#}").contains("hash"));
     }
 
     #[test]
@@ -1765,7 +1765,7 @@ extract_to = "a"
 "#
             );
             let err = load_inline(&body).unwrap_err();
-            assert!(format!("{:#}", err).contains("url"), "source={source}");
+            assert!(format!("{err:#}").contains("url"), "source={source}");
         }
     }
 
@@ -2019,7 +2019,7 @@ sha256 = "00"
             force: false,
         })
         .unwrap_err();
-        let msg = format!("{:#}", err);
+        let msg = format!("{err:#}");
         assert!(msg.contains("not found in registry"), "{msg}");
     }
 }

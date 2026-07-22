@@ -94,6 +94,28 @@ fn test_pble_pbge_pbeq_desugar() {
 }
 
 #[test]
+fn test_pb_signed_coefficients_preserve_the_z3_extension() {
+    let (ctx, assertion) = elaborate_one(
+        "(declare-const a Bool)(declare-const b Bool)\
+         (assert ((_ pble -1 -2 3) a b))",
+    );
+    assert_eq!(top_op(&ctx.terms, assertion).as_deref(), Some("<="));
+    assert_eq!(count_ites(&ctx.terms, assertion), 2);
+
+    let commands = parse(
+        "(declare-const a Bool)\
+         (assert ((_ pble |1| 1) a))",
+    )
+    .expect("quoted symbol index parses");
+    let mut ctx = Context::new();
+    ctx.process_command(&commands[0]).expect("declaration");
+    assert!(
+        ctx.process_command(&commands[1]).is_err(),
+        "quoted positive symbol must not become a PB numeral"
+    );
+}
+
+#[test]
 fn test_pb_over_negated_literals_elaborates() {
     // Negated literals are ordinary Bool terms; each still yields one indicator.
     let (ctx, a) = elaborate_one(

@@ -274,11 +274,24 @@ impl CoreSolver {
     ///
     /// Reference: `reference/cvc5/src/theory/strings/core_solver.cpp:2755-2787`
     pub(super) fn check_normal_forms_eq(&mut self) -> NfCheckResult {
-        if let Some(lemma) = self.buffered_lemmas.pop() {
-            NfCheckResult::NeedLemma(lemma)
-        } else {
-            NfCheckResult::Ok
+        let Some(lemma) = self.buffered_lemmas.pop() else {
+            return NfCheckResult::Ok;
+        };
+        // Closure 3 (`AY_STR_NF=1`, sub-flag 3): de-serialized emission.
+        // Every remaining DISTINCT buffered lemma rides along in the same
+        // round instead of costing one CEGAR round-trip each. Each buffered
+        // lemma is independently guarded (its own NF explanation), so
+        // emitting several at once is exactly as sound as emitting them one
+        // per round — only faster.
+        if crate::str_nf_closure_enabled(3) {
+            let rest = std::mem::take(&mut self.buffered_lemmas);
+            for extra in rest {
+                if extra != lemma && !self.extra_lemmas.contains(&extra) {
+                    self.extra_lemmas.push(extra);
+                }
+            }
         }
+        NfCheckResult::NeedLemma(lemma)
     }
 
     /// Compare a multi-component NF against a known constant value.

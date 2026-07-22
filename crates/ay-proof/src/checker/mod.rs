@@ -4,7 +4,7 @@
 
 //! Proof structure validation for premise linkage, resolution, DRUP, and terminal empty-clause derivation.
 mod array_axiom;
-pub use array_axiom::recognize_array_select_store;
+pub use array_axiom::{recognize_array_select_store, recognize_array_theory_lemma};
 mod boolean;
 mod boolean_derived;
 mod boolean_negation;
@@ -17,6 +17,9 @@ mod euf;
 mod euf_step_rules;
 mod ite_axiom;
 pub use ite_axiom::recognize_ite_same;
+mod regex_empty;
+pub use regex_empty::recognize_regex_intersect_empty;
+pub use string_ground::recognize_string_ground_eval;
 mod fp_bounded;
 pub use fp_bounded::{recognize_fp_classification, recognize_fp_classification_op};
 mod fp_to_bv;
@@ -25,6 +28,7 @@ mod lra_farkas;
 pub(crate) mod quantifier;
 mod resolution;
 mod string_axiom;
+mod string_ground;
 
 use ay_core::{
     AletheRule, FarkasAnnotation, LiaAnnotation, Proof, ProofId, ProofStep, TermId, TermStore,
@@ -448,6 +452,14 @@ fn validate_theory_lemma(
             TheoryLemmaKind::ArraySelectStore { index_eq } => {
                 array_axiom::validate_array_select_store(terms, step_id, clause, index_eq)?;
             }
+            // n-ary store-commutativity and chain read-over-write: exact
+            // schemas with fully-checked side conditions (see array_axiom.rs).
+            TheoryLemmaKind::ArrayStorePermutation => {
+                array_axiom::validate_array_store_permutation(terms, step_id, clause)?;
+            }
+            TheoryLemmaKind::ArrayRowChain => {
+                array_axiom::validate_array_row_chain(terms, step_id, clause)?;
+            }
             TheoryLemmaKind::ArrayExtensionality => {
                 array_axiom::validate_array_extensionality(terms, step_id, clause)?;
             }
@@ -471,6 +483,26 @@ fn validate_theory_lemma(
             }
             TheoryLemmaKind::StringNormalForm => {
                 string_axiom::validate_string_normal_form(terms, step_id, clause)?;
+            }
+            // Ground string/regex evaluation (#8074 ground fragment): the
+            // clause carries a literal whose leaves are all constants and
+            // which the INDEPENDENT ground evaluator proves TRUE. A clause
+            // with a true literal is a tautology, so this is a full semantic
+            // validation — not a schema check. Fail-closed on anything the
+            // evaluator cannot decide outright.
+            TheoryLemmaKind::StringGroundEval => {
+                string_ground::validate_string_ground_eval(terms, step_id, clause)?;
+            }
+            // Regex intersection-emptiness over a SYMBOLIC subject (#regex-cert):
+            // the clause carries a `str.in_re` literal group over one common
+            // term whose jointly-denied intersection is EMPTY, so no value of
+            // the term falsifies the group and the clause is a tautology. The
+            // INDEPENDENT derivative-product checker re-derives the whole
+            // reachability argument — verified total alphabet partition,
+            // closure, non-acceptance — and fails closed on anything it cannot
+            // establish outright.
+            TheoryLemmaKind::RegexIntersectEmpty => {
+                regex_empty::validate_regex_intersect_empty(terms, step_id, clause)?;
             }
             // Datatype constructor distinctness (#8419 / trust_count→0).
             //

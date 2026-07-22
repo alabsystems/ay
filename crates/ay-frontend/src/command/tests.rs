@@ -30,6 +30,70 @@ fn test_parse_maximize() {
 }
 
 #[test]
+fn indexed_identifier_stays_distinct_from_same_spelled_quoted_symbol() {
+    let sexp = parse_sexp("(assert (distinct |(_ bv0 8)| (_ bv0 8)))").unwrap();
+    let cmd = Command::from_sexp(&sexp).unwrap();
+    assert_eq!(
+        cmd,
+        Command::Assert(Term::App(
+            "distinct".to_string(),
+            vec![
+                Term::Symbol("(_ bv0 8)".to_string()),
+                Term::IndexedApp(
+                    "bv0".to_string(),
+                    vec![Index::Numeral("8".to_string())],
+                    vec![],
+                ),
+            ],
+        ))
+    );
+}
+
+#[test]
+fn indexed_identifier_preserves_index_token_kinds() {
+    let sexp = parse_sexp("(assert (= (_ f 8 #x41) (_ f |8| |#x41|)))").unwrap();
+    let cmd = Command::from_sexp(&sexp).unwrap();
+    let Command::Assert(Term::App(_, sides)) = &cmd else {
+        panic!("expected equality assertion");
+    };
+    assert!(matches!(
+        &sides[0],
+        Term::IndexedApp(_, indices, _) if indices == &[
+            Index::Numeral("8".to_string()),
+            Index::Hexadecimal("#x41".to_string()),
+        ]
+    ));
+    assert!(matches!(
+        &sides[1],
+        Term::IndexedApp(_, indices, _) if indices == &[
+            Index::Symbol("8".to_string()),
+            Index::Symbol("#x41".to_string()),
+        ]
+    ));
+}
+
+#[test]
+fn qualified_identifier_preserves_symbol_vs_indexed_structure() {
+    let sexp =
+        parse_sexp("(assert (distinct (as |(_ mystery 1)| Int) (as (_ mystery 1) Int)))").unwrap();
+    let cmd = Command::from_sexp(&sexp).unwrap();
+    let Command::Assert(Term::App(_, sides)) = &cmd else {
+        panic!("expected distinct assertion");
+    };
+    assert!(matches!(
+        &sides[0],
+        Term::QualifiedApp(QualifiedIdentifier::Symbol(name), _, _)
+            if name == "(_ mystery 1)"
+    ));
+    assert!(matches!(
+        &sides[1],
+        Term::QualifiedApp(QualifiedIdentifier::Indexed(name, indices), _, _)
+            if name == "mystery"
+                && indices == &[Index::Numeral("1".to_string())]
+    ));
+}
+
+#[test]
 fn test_parse_get_objectives() {
     let sexp = parse_sexp("(get-objectives)").unwrap();
     let cmd = Command::from_sexp(&sexp).unwrap();
@@ -346,10 +410,27 @@ fn test_parse_bitvector_sort() {
         Command::DeclareConst(name, Sort::Indexed(sort_name, indices)) => {
             assert_eq!(name, "bv");
             assert_eq!(sort_name, "BitVec");
-            assert_eq!(indices, &vec!["32".to_string()]);
+            assert_eq!(indices, &vec![Index::Numeral("32".to_string())]);
         }
         _ => panic!("Expected DeclareConst with indexed sort"),
     }
+}
+
+#[test]
+fn indexed_sort_requires_at_least_one_index() {
+    for malformed in ["(_)", "(_ BitVec)", "(_ BitVec 8.0)"] {
+        let sexp = parse_sexp(malformed).unwrap();
+        assert!(Sort::from_sexp(&sexp).is_err(), "accepted {malformed}");
+    }
+
+    let command = parse_sexp("(declare-const bv (_ BitVec))").unwrap();
+    assert!(Command::from_sexp(&command).is_err());
+
+    let quoted_index = parse_sexp("(_ BitVec |8|)").unwrap();
+    assert_eq!(
+        Sort::from_sexp(&quoted_index).unwrap(),
+        Sort::Indexed("BitVec".to_string(), vec![Index::Symbol("8".to_string())])
+    );
 }
 
 #[test]

@@ -842,7 +842,7 @@ pub(crate) fn run(command: BenchCommand) -> anyhow::Result<()> {
                 println!("{}", stats_output::BUILD_PROVENANCE.human_banner());
                 print!("{}", ay_bench::cross_verify::render_cross_table(&report));
             }
-            if report.has_disputes() {
+            if report.has_failures() {
                 std::process::exit(1);
             }
             Ok(())
@@ -1215,6 +1215,7 @@ mod tests {
         let root = tempfile::tempdir().expect("tempdir");
         let extra = root.path().join("elsewhere").join("fake-checker");
         std::fs::create_dir_all(extra.parent().unwrap()).expect("mkdir extra");
+        std::fs::create_dir_all(root.path().join("reference")).expect("mkdir manifest parent");
         std::fs::write(&extra, "#!/bin/sh\n").expect("write fake binary");
         std::fs::create_dir_all(root.path().join("reference")).expect("mkdir reference");
         std::fs::write(

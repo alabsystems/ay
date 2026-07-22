@@ -27,8 +27,9 @@ use std::ptr;
 use super::{
     ast_to_term, cache_ast_map, cache_ast_vector, cache_string,
     ensure_cross_context_translation_semantics, ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int,
-    ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, record_ast_sort, term_to_ast, Z3Context, Z3_ast,
-    Z3_ast_map, Z3_ast_vector, Z3_context, Z3_string, Z3_INVALID_ARG, Z3_OK,
+    ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, record_ast_sort, term_to_ast,
+    transfer_cross_context_ffi_metadata, Z3Context, Z3_ast, Z3_ast_map, Z3_ast_vector, Z3_context,
+    Z3_string, Z3_INVALID_ARG, Z3_OK,
 };
 use ay_dpll::api::Term;
 use std::os::raw::c_uint;
@@ -40,9 +41,11 @@ fn render_ast(ctx: &Z3Context, a: Z3_ast) -> String {
     if a == 0 {
         return "?".to_string();
     }
-    ctx.solver
+    let rendered = ctx
+        .solver
         .format_term_checked(ast_to_term(a))
-        .unwrap_or_else(|| "?".to_string())
+        .unwrap_or_else(|| "?".to_string());
+    super::ffi_surface_text(ctx, &rendered)
 }
 
 // ============================================================================
@@ -334,9 +337,18 @@ pub unsafe extern "C" fn Z3_ast_vector_translate(
             }
             let src_terms: Vec<Term> = elems.iter().map(|&a| ast_to_term(a)).collect();
             let new_terms = tgt.solver.translate_terms_from(&src.solver, &src_terms);
+            if !transfer_cross_context_ffi_metadata(
+                src,
+                tgt,
+                &src_terms,
+                &new_terms,
+                "Z3_ast_vector_translate",
+            ) {
+                return ptr::null_mut();
+            }
             let new_asts: Vec<Z3_ast> = new_terms.iter().map(|&t| term_to_ast(t)).collect();
-            for (&term, &ast) in new_terms.iter().zip(&new_asts) {
-                let sort = tgt.solver.term_sort(term);
+            for ((&source_term, &_term), &ast) in src_terms.iter().zip(&new_terms).zip(&new_asts) {
+                let sort = src.solver.term_sort(source_term);
                 record_ast_sort(tgt, ast, sort);
             }
             tgt.last_error = Z3_OK;

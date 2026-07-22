@@ -38,6 +38,20 @@ fn solve_in_subprocess(
     skip_resequence: bool,
     input: &str,
 ) -> String {
+    solve_in_subprocess_full(cert, lazy_override, skip_resequence, None, input).0
+}
+
+/// Extended isolated-child solve: additionally sets (`Some`) or removes
+/// (`None`) `AY_DT_CERT_BRIDGE_ROUTE` in the child, and returns
+/// `(result, child stderr)` so the W1 bridge-route shadow log lines
+/// (`[BRIDGE-ROUTE] would-claim/would-grant/decline`) can be pinned.
+fn solve_in_subprocess_full(
+    cert: Option<&str>,
+    lazy_override: Option<Option<&str>>,
+    skip_resequence: bool,
+    bridge_route: Option<&str>,
+    input: &str,
+) -> (String, String) {
     let mut command = Command::new(std::env::current_exe().expect("locate ay-dpll test binary"));
     command
         .arg(SUBPROCESS_WORKER_TEST)
@@ -71,6 +85,14 @@ fn solve_in_subprocess(
     } else {
         command.env_remove(SKIP_RESEQUENCE_ENV);
     }
+    match bridge_route {
+        Some(value) => {
+            command.env("AY_DT_CERT_BRIDGE_ROUTE", value);
+        }
+        None => {
+            command.env_remove("AY_DT_CERT_BRIDGE_ROUTE");
+        }
+    }
 
     let mut child = command.spawn().expect("spawn isolated DT-gate test worker");
     child
@@ -91,7 +113,7 @@ fn solve_in_subprocess(
         stdout,
         stderr
     );
-    stdout
+    let result = stdout
         .lines()
         .find_map(|line| {
             line.split_once(SUBPROCESS_RESULT_PREFIX)
@@ -100,10 +122,10 @@ fn solve_in_subprocess(
         .map(str::to_owned)
         .unwrap_or_else(|| {
             panic!(
-                "isolated DT-gate worker emitted no result marker:\nstdout:\n{}\nstderr:\n{}",
-                stdout, stderr
+                "isolated DT-gate worker emitted no result marker:\nstdout:\n{stdout}\nstderr:\n{stderr}"
             )
-        })
+        });
+    (result, stderr.into_owned())
 }
 
 /// Solve `input` with `AY_DT_CERT` set to `mode` for the duration.
@@ -492,6 +514,116 @@ fn dt_cert_postsolve_grant_survives_emission_gates() {
 fn dt_cert_mixed_all_routes_without_grant_fails_closed() {
     let verdict = solve_with_mode(None, MIXED_ALL_ROUTES_INPUT);
     assert_eq!(verdict, "unknown");
+}
+
+// ---------------------------------------------------------------------------
+// W1 bridge route (`AY_DT_CERT_BRIDGE_ROUTE`, SAT-side base-recheck campaign).
+// SHADOW-ONLY in this increment: would-claim / would-grant are logged, and any
+// grant that depends on a bridge claim is WITHHELD — never `sat`.
+// ---------------------------------------------------------------------------
+
+/// Locked wrapper for the bridge-route pins: `AY_DT_CERT` = `cert`,
+/// `AY_DT_CERT_BRIDGE_ROUTE` set (`Some`) or removed (`None`), child-isolated.
+fn solve_with_bridge_route(
+    cert: Option<&str>,
+    skip_resequence: bool,
+    bridge_route: Option<&str>,
+    input: &str,
+) -> (String, String) {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    solve_in_subprocess_full(cert, None, skip_resequence, bridge_route, input)
+}
+
+/// The `inc_some_list` base shape in miniature: an F4 nonneg lemma, the W1
+/// bridge-UF-over-constructor tautology `epg(Cons(a,b)) = b`, and its
+/// certifying F3 selector-bridge pin `is-Cons(y) => epg(y) = tl(y)`, over a
+/// satisfiable ground core.
+const BRIDGE_ROUTE_INPUT: &str = r#"
+        (set-logic ALL)
+        (declare-datatypes ((List 0)) (((Cons (hd Int) (tl List)) (Nil))))
+        (declare-const self List)
+        (declare-fun logic_sum (List) Int)
+        (declare-fun epg (List) List)
+        (assert (forall ((x List)) (<= 0 (logic_sum x))))
+        (assert (forall ((a Int) (b List)) (= b (epg (Cons a b)))))
+        (assert (forall ((y List)) (or (= (epg y) (tl y)) (not (is-Cons y)))))
+        (assert (is-Cons self))
+        (assert (= (tl self) Nil))
+        (assert (= (epg self) (tl self)))
+        (assert (= (logic_sum self) 2))
+        (check-sat)
+    "#;
+
+/// The same shape WITHOUT the selector-bridge pin: `epg` is genuinely free,
+/// so the W1 MANDATORY premise gate must decline.
+const BRIDGE_ROUTE_FREE_BRIDGE_INPUT: &str = r#"
+        (set-logic ALL)
+        (declare-datatypes ((List 0)) (((Cons (hd Int) (tl List)) (Nil))))
+        (declare-const self List)
+        (declare-fun logic_sum (List) Int)
+        (declare-fun epg (List) List)
+        (assert (forall ((x List)) (<= 0 (logic_sum x))))
+        (assert (forall ((a Int) (b List)) (= b (epg (Cons a b)))))
+        (assert (is-Cons self))
+        (assert (= (tl self) Nil))
+        (assert (= (epg self) (tl self)))
+        (assert (= (logic_sum self) 2))
+        (check-sat)
+    "#;
+
+#[test]
+fn dt_cert_bridge_route_would_grant_is_withheld() {
+    // The route claims the W1 tautology via its premise pin, the certificate
+    // reaches the grant point, LOGS would-grant — and WITHHOLDS the grant:
+    // never `sat`, even under AY_DT_CERT=on.
+    let (verdict, stderr) =
+        solve_with_bridge_route(Some("on"), false, Some("1"), BRIDGE_ROUTE_INPUT);
+    assert_ne!(verdict, "sat");
+    assert!(
+        stderr.contains("[BRIDGE-ROUTE] would-claim forall"),
+        "missing would-claim shadow log:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("[BRIDGE-ROUTE] would-grant base (shadow-only"),
+        "missing would-grant shadow log:\n{stderr}"
+    );
+}
+
+#[test]
+fn dt_cert_bridge_route_declines_free_bridge() {
+    // NO selector-bridge pin: the W1 premise gate must DECLINE (a claim on a
+    // genuinely free bridge UF is the wrong-grant vector). Post-solve arm —
+    // the re-sequence probe's precheck already declines this shape; bypassing
+    // it pins the full-certificate gate itself.
+    let (verdict, stderr) =
+        solve_with_bridge_route(Some("on"), true, Some("1"), BRIDGE_ROUTE_FREE_BRIDGE_INPUT);
+    assert_ne!(verdict, "sat");
+    assert!(
+        !stderr.contains("would-grant"),
+        "free bridge must never reach would-grant:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("has no in-snapshot selector-bridge pin"),
+        "missing premise-gate decline:\n{stderr}"
+    );
+}
+
+// NOTE: the wrong-selector-pin decline branch (`is pinned to .., not ..`) is
+// pinned at the unit level in `executor::mbqi::bridge_route_tests` — a
+// wrong-pin base is z3-UNSAT and quantifier-hard, so its full child solve
+// churns for minutes without ever reaching the post-solve certificate
+// consult; the gate itself is a pure function and is tested directly there.
+
+#[test]
+fn dt_cert_bridge_route_flag_off_byte_identical() {
+    // Flag off: the W1 shape is unclaimable exactly as today (multi-binder,
+    // not F2/G) and no bridge-route logging appears anywhere.
+    let (verdict, stderr) = solve_with_bridge_route(Some("on"), false, None, BRIDGE_ROUTE_INPUT);
+    assert_ne!(verdict, "sat");
+    assert!(
+        !stderr.contains("[BRIDGE-ROUTE]"),
+        "flag-off run must not emit bridge-route logs:\n{stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------

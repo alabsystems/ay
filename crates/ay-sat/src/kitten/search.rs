@@ -222,7 +222,10 @@ impl Kitten {
         for &idx in &self.analyzed {
             self.marks[idx as usize] = 0;
         }
-        let analyzed: Vec<u32> = self.analyzed.drain(..).collect();
+        // Keep `self.analyzed`'s allocation hot across conflicts while moving
+        // the ordered worklist into an independently owned iteration buffer.
+        let mut analyzed = Vec::with_capacity(self.analyzed.len());
+        analyzed.append(&mut self.analyzed);
         for idx in analyzed {
             self.move_to_front(idx);
         }

@@ -30,9 +30,11 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::time::Duration;
 
 use ay_core::kani_compat::DetHashMap;
 use ay_core::term::TermData;
+use ay_core::time::Instant;
 use ay_core::{Sort, TermId, TermStore};
 use ay_model_check::{ArrayValue, EvalOutcome, Evaluator, GateVerdict, ModelValue, ModelView};
 
@@ -2963,7 +2965,7 @@ impl Executor {
         // statistics describe the OUTER solve, then record this gate's own
         // verdict keys.
         let saved_deadline = self.solve_deadline.get();
-        let budget = ay_core::time::Instant::now() + std::time::Duration::from_millis(2000);
+        let budget = Instant::now() + Duration::from_secs(2);
         self.set_deadline(match saved_deadline {
             Some(d) if d < budget => Some(d),
             _ => Some(budget),
@@ -2989,7 +2991,7 @@ impl Executor {
             }
             match self.check_quantified_conjunct_against_model(conjunct) {
                 QuantifiedModelCheck::Confirmed => {}
-                QuantifiedModelCheck::Deferred(_) => deferred_any = true,
+                QuantifiedModelCheck::Deferred => deferred_any = true,
                 other => {
                     failure = Some((conjunct, other));
                     break;
@@ -3003,7 +3005,7 @@ impl Executor {
         match failure {
             None
             | Some((_, QuantifiedModelCheck::Confirmed))
-            | Some((_, QuantifiedModelCheck::Deferred(_))) => {
+            | Some((_, QuantifiedModelCheck::Deferred)) => {
                 self.last_statistics.set_string(
                     "model_check_gate.quantified",
                     if deferred_any {
@@ -3210,7 +3212,7 @@ impl Executor {
                     cur = body;
                 }
                 TermData::Exists(vars, body, _) => {
-                    if *universal.get_or_insert(!positive) != !positive {
+                    if *universal.get_or_insert(!positive) == positive {
                         break;
                     }
                     binders.extend(vars);
@@ -3390,9 +3392,7 @@ impl Executor {
                         SolveResult::Sat => QuantifiedModelCheck::Indeterminate(
                             "universal negation satisfiable under partial pins",
                         ),
-                        SolveResult::Unknown if closed => {
-                            QuantifiedModelCheck::Deferred("model-independent closed sentence")
-                        }
+                        SolveResult::Unknown if closed => QuantifiedModelCheck::Deferred,
                         SolveResult::Unknown => {
                             QuantifiedModelCheck::Indeterminate("nested solve undecided")
                         }
@@ -3407,9 +3407,7 @@ impl Executor {
                         SolveResult::Sat => QuantifiedModelCheck::Indeterminate(
                             "existential witness under partial pins",
                         ),
-                        SolveResult::Unknown if closed => {
-                            QuantifiedModelCheck::Deferred("model-independent closed sentence")
-                        }
+                        SolveResult::Unknown if closed => QuantifiedModelCheck::Deferred,
                         SolveResult::Unknown => {
                             QuantifiedModelCheck::Indeterminate("nested solve undecided")
                         }
@@ -3431,7 +3429,7 @@ impl Executor {
             // lane (exactly HEAD's trust level). Refutations above were
             // never relaxed.
             if defer_ok {
-                return QuantifiedModelCheck::Deferred("unprinted-uf");
+                return QuantifiedModelCheck::Deferred;
             }
         }
         outcome
@@ -3478,7 +3476,7 @@ impl Executor {
             .any(|&t| contains_quantifier(&self.ctx.terms, t))
         {
             if closed {
-                return QuantifiedModelCheck::Deferred("model-independent closed sentence");
+                return QuantifiedModelCheck::Deferred;
             }
             return QuantifiedModelCheck::Indeterminate("residual quantifier after QE");
         }
@@ -3493,9 +3491,7 @@ impl Executor {
             SolveResult::Sat => {
                 QuantifiedModelCheck::Indeterminate("QE residue satisfiable under partial pins")
             }
-            SolveResult::Unknown if closed => {
-                QuantifiedModelCheck::Deferred("model-independent closed sentence")
-            }
+            SolveResult::Unknown if closed => QuantifiedModelCheck::Deferred,
             SolveResult::Unknown => QuantifiedModelCheck::Indeterminate("nested solve undecided"),
         }
     }
@@ -3714,7 +3710,7 @@ impl Executor {
             .ctx
             .symbol_iter()
             .filter(|(_, info)| !info.arg_sorts.is_empty())
-            .map(|(name, _)| name.clone())
+            .map(|(name, info)| self.ctx.symbol_identity_name(name, info).to_string())
             .collect();
         let mut has_head = false;
         let mut stack = vec![conjunct];
@@ -3753,7 +3749,12 @@ impl Executor {
             .ctx
             .symbol_iter()
             .filter(|(_, info)| !info.arg_sorts.is_empty())
-            .map(|(name, info)| (name.clone(), (info.arg_sorts.clone(), info.sort.clone())))
+            .map(|(name, info)| {
+                (
+                    self.ctx.symbol_identity_name(name, info).to_string(),
+                    (info.arg_sorts.clone(), info.sort.clone()),
+                )
+            })
             .collect();
 
         // Function head names occurring in the conjunct.
@@ -4132,9 +4133,9 @@ impl Executor {
             .ctx
             .symbol_iter()
             .filter(|(_, info)| !info.arg_sorts.is_empty())
-            .map(|(name, _)| name.clone())
+            .map(|(name, info)| self.ctx.symbol_identity_name(name, info).to_string())
             .collect();
-        let complete = std::cell::Cell::new(true);
+        let complete = Cell::new(true);
         let result = self.rewrite_uf_apps(term, interps, &declared_fns, &mut memo, &complete, 0);
         (result, complete.get())
     }
@@ -4146,7 +4147,7 @@ impl Executor {
         interps: &DetHashMap<String, QuantifiedGateUfInterp>,
         declared_fns: &HashSet<String>,
         memo: &mut DetHashMap<TermId, (TermId, bool)>,
-        complete: &std::cell::Cell<bool>,
+        complete: &Cell<bool>,
         depth: u32,
     ) -> TermId {
         if let Some(&(rewritten, was_complete)) = memo.get(&term) {
@@ -4281,7 +4282,7 @@ impl Executor {
         // Slice the gate budget per nested solve: one undecidable nested
         // problem must not starve the remaining conjuncts' checks.
         let saved_deadline = self.solve_deadline.get();
-        let slice = ay_core::time::Instant::now() + std::time::Duration::from_millis(500);
+        let slice = Instant::now() + Duration::from_millis(500);
         self.set_deadline(match saved_deadline {
             Some(d) if d < slice => Some(d),
             _ => Some(slice),
@@ -4395,7 +4396,7 @@ impl Executor {
             .ctx
             .symbol_iter()
             .filter(|(_, info)| !info.arg_sorts.is_empty())
-            .map(|(name, _)| name.clone())
+            .map(|(name, info)| self.ctx.symbol_identity_name(name, info).to_string())
             .collect();
 
         let mut leaves: Vec<TermId> = Vec::new();
@@ -4699,8 +4700,8 @@ enum QuantifiedModelCheck {
     /// interpretation, or the (substituted) conjunct is CLOSED (no model
     /// symbols left) — so the verdict defers to the machinery that minted it
     /// (exactly HEAD's trust level; refutation outcomes are never converted
-    /// to this). The reason string is telemetry-only.
-    Deferred(&'static str),
+    /// to this).
+    Deferred,
 }
 
 /// The model pins for one quantified conjunct: equality terms forcing each
@@ -4749,7 +4750,7 @@ enum QmgRowVal {
 /// drops the whole function from the substitution map (fail-close direction
 /// only, #no-fabricated-model-values).
 fn qmg_row_val_to_term(
-    terms: &mut ay_core::TermStore,
+    terms: &mut TermStore,
     val: &QmgRowVal,
     sort: &Sort,
     elems: &mut QuantifiedGateElements,
@@ -4822,7 +4823,7 @@ struct QuantifiedGateElements {
 impl QuantifiedGateElements {
     /// The shared constant for `token` of uninterpreted sort `sort`
     /// (created fresh on first use).
-    fn term_for(&mut self, terms: &mut ay_core::TermStore, token: &str, sort: Sort) -> TermId {
+    fn term_for(&mut self, terms: &mut TermStore, token: &str, sort: Sort) -> TermId {
         if let Some(&t) = self.by_token.get(token) {
             return t;
         }
@@ -4842,7 +4843,7 @@ impl QuantifiedGateElements {
     }
 
     /// One `distinct` assertion per sort with two or more used elements.
-    fn distinct_assertions(&self, terms: &mut ay_core::TermStore) -> Vec<TermId> {
+    fn distinct_assertions(&self, terms: &mut TermStore) -> Vec<TermId> {
         let mut out = Vec::new();
         let mut sorts: Vec<&String> = self.by_sort.keys().collect();
         sorts.sort();
@@ -4877,7 +4878,7 @@ impl QuantifiedGateElements {
 /// Anything else — symbolic bound, width mismatch, guard on a different
 /// variable — returns `None` and the binder is kept (fail-closed as before).
 fn quantified_gate_guard_bounded_bv_domain(
-    terms: &ay_core::TermStore,
+    terms: &TermStore,
     body: TermId,
     name: &str,
     sort: &Sort,
@@ -4963,7 +4964,7 @@ fn quantified_gate_guard_bounded_bv_domain(
 /// symbol, a `Let`, an over-budget walk, or any future term kind returns
 /// `false` — the caller then fails closed to Indeterminate (never a wrong
 /// verdict, only a possible sat→unknown downgrade).
-fn quantified_gate_model_independent(terms: &ay_core::TermStore, conjunct: TermId) -> bool {
+fn quantified_gate_model_independent(terms: &TermStore, conjunct: TermId) -> bool {
     use ay_core::term::Symbol;
     /// Total, model-independent operators only.
     fn allowed_head(name: &str) -> bool {
@@ -5100,7 +5101,7 @@ fn sort_mentions_uninterpreted(sort: &Sort) -> bool {
 /// function table (`format_default_value` semantics), or `None` for sorts
 /// whose default the gate does not reconstruct (fail-close direction only).
 fn quantified_gate_default_value_term(
-    terms: &mut ay_core::TermStore,
+    terms: &mut TermStore,
     sort: &Sort,
     elems: &mut QuantifiedGateElements,
 ) -> Option<TermId> {
@@ -5132,7 +5133,7 @@ fn quantified_gate_default_value_term(
 /// clears `total`, which can only weaken a confirm into a fail-close
 /// (#no-fabricated-model-values).
 fn model_value_to_pin_term(
-    terms: &mut ay_core::TermStore,
+    terms: &mut TermStore,
     mv: &ModelValue,
     sort: &Sort,
     elems: &mut QuantifiedGateElements,
@@ -5319,7 +5320,7 @@ mod tests {
         let (category, _) = exec.detect_logic_category(&assertions);
         assert_eq!(category, LogicCategory::QfNira);
 
-        let outer_deadline = ay_core::time::Instant::now() + std::time::Duration::from_secs(10);
+        let outer_deadline = Instant::now() + Duration::from_secs(10);
         exec.set_deadline(Some(outer_deadline));
         assert_eq!(
             exec.quantified_gate_isolated_solve(assertions),

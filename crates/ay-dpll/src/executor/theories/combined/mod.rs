@@ -6076,6 +6076,13 @@ impl Executor {
                                 let _uflia_ext_snap_stats = this.last_statistics.clone();
                                 let _uflia_ext_snap_memo =
                                     this.conflict_semantic_verify_memo.clone();
+                                // #verify-memo: the prop-verification memo is
+                                // TermId-keyed like the conflict memo; the
+                                // term rollback below invalidates ids minted
+                                // during speculation, so it joins the same
+                                // save/restore contract.
+                                let _uflia_ext_snap_prop_memo =
+                                    this.prop_semantic_verify_memo.clone();
                                 // Proof-step watermark (#4534 scope machinery):
                                 // pop-on-failure truncates every step the
                                 // continuation records; commit-on-win keeps
@@ -6150,6 +6157,8 @@ impl Executor {
                                     this.last_statistics = _uflia_ext_snap_stats;
                                     this.conflict_semantic_verify_memo =
                                         _uflia_ext_snap_memo;
+                                    this.prop_semantic_verify_memo =
+                                        _uflia_ext_snap_prop_memo;
                                 }
                             }
                         }
@@ -6865,6 +6874,14 @@ impl Executor {
         // Preprocess assertions and assumptions through the full LIA normalization
         // family: variable substitution, SOM, ITE lifting, mod/div elimination (#6737).
         let artifacts = self.preprocess_mixed_arith_assumptions(assertions, assumptions);
+        // #array-deadline-forward phase-boundary poll: the ITE-lifting pass
+        // above runs through ay-core term rewriting that polls no deadline
+        // (measured 10+s on QF_AX swap shapes). Honor an expired budget at
+        // the phase boundary instead of paying the (also unpolled) eager
+        // array-axiom fixpoint + encode next.
+        if self.should_abort_theory_loop() {
+            return Ok(SolveResult::Unknown);
+        }
         let var_subst = artifacts.var_subst;
         let final_assumptions = artifacts.assumptions;
 
@@ -6885,6 +6902,11 @@ impl Executor {
             let generated_axioms: Vec<_> = self.ctx.assertions.drain(axiom_start..).collect();
             let generated_axioms = self.ctx.terms.expand_select_store_all(&generated_axioms);
             final_assertions.extend(generated_axioms);
+        }
+        // #array-deadline-forward phase-boundary poll (see above): the eager
+        // array-axiom fixpoint can be dense on deep store chains.
+        if self.should_abort_theory_loop() {
+            return Ok(SolveResult::Unknown);
         }
         let proof_provenance = ProofProblemAssertionProvenance::from_sources(
             original_problem_assertions,
@@ -7414,7 +7436,7 @@ impl Executor {
     /// exactly as before, fail-closed.
     fn restore_indep_bv_model_with_arith_graft(
         &mut self,
-        bv_model: Option<crate::executor::model::Model>,
+        bv_model: Option<Model>,
         bv_model_validated: bool,
         roots: &[TermId],
     ) {

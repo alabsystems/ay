@@ -10,14 +10,11 @@
 //! rejected proof is a soundness failure: the result is downgraded to an error
 //! and the process exits non-zero (#8771).
 //!
-//! This module owns the file-IO / format-dispatch glue between the main
-//! DIMACS solve path and the checker crates. Alethe and Lean4 formats are
-//! not supported by the internal checker; for those formats
-//! `--verify-proof` is silently a no-op and a `c Warning:` is emitted so the
-//! user is not misled into believing the proof was checked.
-
-use std::fs;
-use std::path::Path;
+//! This module owns the authenticated published-proof / format-dispatch glue
+//! between the main DIMACS solve path and the checker crates. Alethe and Lean4
+//! formats are not supported by the internal checker; automatic verification
+//! warns and skips them, while an explicit `--verify-proof` request fails
+//! closed in the caller.
 
 use super::{ProofConfig, ProofFormat};
 
@@ -42,16 +39,31 @@ pub(crate) enum VerifyOutcome {
 /// * `proof_config.path` is the proof file that the solver just finished
 ///   writing. The caller MUST flush/close the proof writer before invoking
 ///   this function.
-pub(crate) fn verify_proof_file(dimacs_content: &str, proof_config: &ProofConfig) -> VerifyOutcome {
-    let proof_path = Path::new(&proof_config.path);
-    let proof_bytes = match fs::read(proof_path) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            return VerifyOutcome::Skipped {
-                reason: format!("failed to read proof file {}: {err}", proof_config.path),
+pub(crate) fn verify_proof_file(
+    dimacs_content: &str,
+    proof_config: &ProofConfig,
+    expected_sha256: [u8; 32],
+) -> VerifyOutcome {
+    let proof_bytes =
+        match crate::dimacs::read_published_dimacs_proof(&proof_config.path, expected_sha256) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return VerifyOutcome::Rejected {
+                    reason: format!(
+                        "authenticated proof read failed for {}: {err}",
+                        proof_config.path
+                    ),
+                }
             }
-        }
-    };
+        };
+    verify_proof_bytes(dimacs_content, proof_config, &proof_bytes)
+}
+
+fn verify_proof_bytes(
+    dimacs_content: &str,
+    proof_config: &ProofConfig,
+    proof_bytes: &[u8],
+) -> VerifyOutcome {
     if proof_bytes.is_empty() {
         return VerifyOutcome::Rejected {
             reason: format!(
@@ -62,8 +74,8 @@ pub(crate) fn verify_proof_file(dimacs_content: &str, proof_config: &ProofConfig
     }
 
     match proof_config.format {
-        ProofFormat::Drat => verify_drat(dimacs_content, &proof_bytes),
-        ProofFormat::Lrat => verify_lrat(dimacs_content, &proof_bytes),
+        ProofFormat::Drat => verify_drat(dimacs_content, proof_bytes),
+        ProofFormat::Lrat => verify_lrat(dimacs_content, proof_bytes),
         ProofFormat::Alethe => VerifyOutcome::Skipped {
             reason: "Alethe proof format not supported by internal checker \
                      (use --proof-format drat or lrat to enable --verify-proof)"
@@ -212,13 +224,12 @@ mod tests {
     fn test_verify_drat_accepts_valid_proof() {
         // Valid DRAT: derive the empty clause.
         let proof = b"0\n";
-        let config = ProofConfig::new(write_temp_proof(proof, "drat"), ProofFormat::Drat, false);
-        let outcome = verify_proof_file(TRIVIAL_UNSAT_CNF, &config);
+        let config = ProofConfig::new("test.drat".to_string(), ProofFormat::Drat, false);
+        let outcome = verify_proof_bytes(TRIVIAL_UNSAT_CNF, &config, proof);
         assert!(
             matches!(outcome, VerifyOutcome::Verified),
             "expected Verified, got: {outcome:?}"
         );
-        let _ = fs::remove_file(&config.path);
     }
 
     #[test]
@@ -227,52 +238,31 @@ mod tests {
         // proof claiming to derive the empty clause MUST be rejected.
         let sat_cnf = "p cnf 1 1\n1 0\n";
         let proof = b"0\n";
-        let config = ProofConfig::new(write_temp_proof(proof, "drat"), ProofFormat::Drat, false);
-        let outcome = verify_proof_file(sat_cnf, &config);
+        let config = ProofConfig::new("test.drat".to_string(), ProofFormat::Drat, false);
+        let outcome = verify_proof_bytes(sat_cnf, &config, proof);
         assert!(
             matches!(outcome, VerifyOutcome::Rejected { .. }),
             "expected Rejected for SAT-formula proof, got: {outcome:?}"
         );
-        let _ = fs::remove_file(&config.path);
     }
 
     #[test]
     fn test_verify_drat_rejects_empty_proof() {
-        let config = ProofConfig::new(write_temp_proof(b"", "drat"), ProofFormat::Drat, false);
-        let outcome = verify_proof_file(TRIVIAL_UNSAT_CNF, &config);
+        let config = ProofConfig::new("test.drat".to_string(), ProofFormat::Drat, false);
+        let outcome = verify_proof_bytes(TRIVIAL_UNSAT_CNF, &config, b"");
         assert!(
             matches!(outcome, VerifyOutcome::Rejected { .. }),
             "expected Rejected for empty proof, got: {outcome:?}"
         );
-        let _ = fs::remove_file(&config.path);
     }
 
     #[test]
     fn test_verify_skips_alethe_format() {
-        let config = ProofConfig::new(
-            write_temp_proof(b"(anything)\n", "alethe"),
-            ProofFormat::Alethe,
-            false,
-        );
-        let outcome = verify_proof_file(TRIVIAL_UNSAT_CNF, &config);
+        let config = ProofConfig::new("test.alethe".to_string(), ProofFormat::Alethe, false);
+        let outcome = verify_proof_bytes(TRIVIAL_UNSAT_CNF, &config, b"(anything)\n");
         assert!(
             matches!(outcome, VerifyOutcome::Skipped { .. }),
             "expected Skipped for Alethe, got: {outcome:?}"
         );
-        let _ = fs::remove_file(&config.path);
-    }
-
-    fn write_temp_proof(bytes: &[u8], ext: &str) -> String {
-        use std::io::Write;
-        let mut path = std::env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        path.push(format!("ay-verify-test-{nanos}.{ext}"));
-        let mut file = fs::File::create(&path).expect("create temp proof");
-        file.write_all(bytes).expect("write temp proof");
-        file.flush().expect("flush temp proof");
-        path.to_string_lossy().into_owned()
     }
 }

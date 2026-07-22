@@ -368,7 +368,10 @@ impl Executor {
             // Canonical TermId is the declared symbol's bound term — the SAME
             // term get-value/printers evaluate, so `(get-model)` and
             // `(get-value ..)` cannot diverge.
-            let tid = self.ctx.symbol_info(&connector.name).and_then(|i| i.term)?;
+            let tid = self
+                .ctx
+                .symbol_info_by_identity(&connector.name)
+                .and_then(|i| i.term)?;
             let value = self.evaluate_term(component_model, tid);
             if value == EvalValue::Unknown {
                 return None;
@@ -419,7 +422,7 @@ impl Executor {
     /// (arity>0 UF, arrays, datatypes, sequences, uninterpreted sorts,
     /// RoundingMode, RegLan) is ineligible.
     fn connector_is_scalar_nullary_const(&self, connector: &Connector) -> bool {
-        let Some(info) = self.ctx.symbol_info(&connector.name) else {
+        let Some(info) = self.ctx.symbol_info_by_identity(&connector.name) else {
             return false;
         };
         if !info.arg_sorts.is_empty() || info.term.is_none() {

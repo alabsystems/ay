@@ -241,12 +241,8 @@ impl GaussianSolver {
         for watches in &mut self.watches {
             watches.clear();
         }
-        for row_watch in &mut self.row_watches {
-            *row_watch = [None, None];
-        }
-        for sat in &mut self.satisfied_rows {
-            *sat = false;
-        }
+        self.row_watches.fill([None, None]);
+        self.satisfied_rows.fill(false);
 
         // For each row, find first 2 non-zero columns and watch them
         for (row_idx, row) in self.rows.iter().enumerate() {

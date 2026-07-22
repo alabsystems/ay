@@ -1504,14 +1504,12 @@ pub(crate) fn circuit_multiplier22_dimacs_sat_model_authority_route(
 }
 
 fn circuit_multiplier22_dimacs_sat_model_authority_env_enabled() -> bool {
-    std::env::var(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV)
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
+    std::env::var(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn circuit_multiplier22_dimacs_sat_model_authority_run_matrix_artifacts_from_env() -> Result<

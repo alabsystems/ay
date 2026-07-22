@@ -287,9 +287,11 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
         // iteration 0 (`_iteration > 0` guard below), so the reused theory's
         // state is preserved on entry; set_terms refreshes its dangling terms
         // pointer. A None / type-mismatch falls back to a fresh solver.
-        // SOUNDNESS: develop/gate under AY_LRA_INC_ENGINE_REVERIFY=1 — a stale
-        // popped-scope bound would show as a disagreement the from-scratch
-        // re-verify catches; default AY_LRA_INC_WARM is OFF (byte-identical).
+        // SOUNDNESS: warm theory is default ON (opt out with
+        // AY_LRA_INC_WARM=0). Scoped pops and monotone selector units preserve
+        // the live constraint set, while a scope/type mismatch discards the
+        // cached solver. AY_LRA_INC_ENGINE_REVERIFY=1 remains an opt-in
+        // from-scratch disagreement backstop.
         let _islp_inc_warm = $crate::warm_theory_flag::get();
         let (mut theory, _islp_theory_reused) = if _islp_inc_warm {
             match state.persist_theory.take() {

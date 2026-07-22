@@ -1173,6 +1173,10 @@ impl Executor {
         if self.should_abort_theory_loop() {
             return Ok(SolveResult::Unknown);
         }
+        // Closure 5 bookkeeping is per-solve: a previous solve's
+        // context-dependent lemma must not disqualify this one, and vice
+        // versa. Reset before any lemma of this solve is lowered.
+        self.string_lemma_kinds_all_valid = true;
 
         if debug_auflia_enabled() {
             safe_eprintln!(
@@ -1256,6 +1260,19 @@ impl Executor {
                 || crate::term_helpers::contains_string_ops(&self.ctx.terms, a)
         });
         if !needs_slia {
+            // LANE SELECTION, traced: a QF_SLIA-declared window with no
+            // arithmetic and no string→Int bridge is handed to the PURE-STRING
+            // lane, which runs a SHORTER witness cascade than this one (no
+            // pinned-length placement, no P2, no replace_all, no pivot
+            // enumeration). A file that emits no `[W4]`/`[W6]`/`[W7]` line
+            // under `--debug auflia` while declaring QF_SLIA is almost always
+            // here, not on some third path. See `solve_strings`.
+            if debug_auflia_enabled() {
+                safe_eprintln!(
+                    "[SLIA] lane: pure-string window ({} assertion(s), no arith / no str-int bridge) -> QF_S lane",
+                    self.ctx.assertions.len()
+                );
+            }
             return self.solve_strings();
         }
 
@@ -1403,6 +1420,22 @@ impl Executor {
         // See `strings_w6.rs`.
         if self.pivot_enum_depth == 0 && super::strings_w6::str_w6_enabled() {
             if let Some(result) = self.try_regex_word_witnesses()? {
+                return Ok(result);
+            }
+        }
+
+        // W7 (`AY_STR_W7=1`, default off): chain-definition search, multi-atom
+        // placement search, and the distinct-witness enumerator — the LAST
+        // witness pre-pass, with its own budget.
+        //
+        // Ordering is load-bearing, not cosmetic: W6 measured that running a
+        // later pass's moves BEFORE an earlier pass's cost 24 pyex
+        // `httplib2-entry-disposition` conversions outright, by displacing the
+        // earlier candidates on ties and exhausting the solve budget. W7 is
+        // therefore appended after every other witness pass, and only formulas
+        // nothing else decides ever reach it. See `strings_w7.rs`.
+        if self.pivot_enum_depth == 0 && super::strings_w7::str_w7_enabled() {
+            if let Some(result) = self.try_w7_witnesses()? {
                 return Ok(result);
             }
         }

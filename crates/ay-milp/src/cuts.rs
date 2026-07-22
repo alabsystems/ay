@@ -559,7 +559,7 @@ mod modk_tests {
             let grid = [0.0f64, 0.25, 0.5, 0.75, 1.0];
             for code in 0..(1u32 << NBIN) {
                 let bvals: Vec<f64> = (0..NBIN).map(|t| f64::from((code >> t) & 1)).collect();
-                let mut idxs = vec![0usize; NCON];
+                let mut idxs = [0usize; NCON];
                 loop {
                     let mut p = vec![0.0f64; n];
                     p[..NBIN].copy_from_slice(&bvals[..NBIN]);
@@ -4034,7 +4034,7 @@ mod mir_tests {
             // cut with a positive right-hand side value is violated) and the integers fractional.
             let mut x = vec![0.0f64; ncols];
             for &yc in &y {
-                x[yc.index()] = (rnd().rem_euclid((U * 10) as i64)) as f64 / 10.0;
+                x[yc.index()] = rnd().rem_euclid(U * 10) as f64 / 10.0;
             }
             let cuts = separate_mixing(&m, &x, m.num_rows(), 8);
             total_cuts += cuts.len();
@@ -5725,7 +5725,7 @@ mod agg_flow_cover_tests {
     /// (`λ = m − d`, the switch term IS the cut).
     #[test]
     fn enriched_flow_cover_cuts_never_remove_an_integer_point() {
-        let mut seed = 0x1B05_250_u64;
+        let mut seed = 0x01B0_5250_u64;
         let mut rnd = || {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             (seed >> 33) as i64
@@ -6623,7 +6623,7 @@ fn path_mis_after_removal(l: usize, mask: u128) -> usize {
 fn lift_odd_hole(model: &Model, x: &[f64], cyc: &[usize], pack: &[usize]) -> Vec<(usize, i64)> {
     let l = cyc.len();
     // Bit masks are `u128`; `ODD_CYCLE_MAX_LEN ≤ 96 < 128` keeps every position addressable.
-    if l < 5 || l % 2 == 0 || l > 128 {
+    if l < 5 || l.is_multiple_of(2) || l > 128 {
         return Vec::new();
     }
     let k = ((l - 1) / 2) as i64;
@@ -6841,7 +6841,7 @@ pub(crate) fn separate_odd_cycle(model: &Model, x: &[f64], n_rows: usize) -> Vec
         if best < min_dist {
             min_dist = best;
         }
-        if !(best < 1.0 - MIN_VIOLATION) {
+        if best.partial_cmp(&(1.0 - MIN_VIOLATION)) != Some(std::cmp::Ordering::Less) {
             continue;
         }
         n_violated += 1;
@@ -6864,7 +6864,7 @@ pub(crate) fn separate_odd_cycle(model: &Model, x: &[f64], n_rows: usize) -> Vec
         }
         walk.pop(); // remove closing duplicate
         let len = walk.len();
-        if len < 5 || len % 2 == 0 || len > ODD_CYCLE_MAX_LEN {
+        if len < 5 || len.is_multiple_of(2) || len > ODD_CYCLE_MAX_LEN {
             continue; // need a simple ODD cycle of length ≥ 5
         }
         // Simplicity: the shortest odd walk need not be a simple cycle; only emit when it is.
@@ -7287,7 +7287,7 @@ mod clique_tests {
             let mut m = Model::new();
             let cols: Vec<Col> = (0..NB).map(|_| m.add_binary_col()).collect();
             let mut rows: Vec<(Vec<usize>, f64, f64)> = Vec::new();
-            let mut add =
+            let add =
                 |m: &mut Model, sub: &[usize], eq: bool, rows: &mut Vec<(Vec<usize>, f64, f64)>| {
                     let lo = if eq { 1.0 } else { f64::NEG_INFINITY };
                     let terms: Vec<(Col, f64)> = sub.iter().map(|&j| (cols[j], 1.0)).collect();
@@ -7770,7 +7770,7 @@ mod zero_half_tests {
 
     #[test]
     fn zero_half_cuts_never_remove_an_integer_point() {
-        let mut seed = 0x0FF1_CE_u64;
+        let mut seed = 0x000F_F1CE_u64;
         let mut rnd = || {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             (seed >> 33) as i64
@@ -8694,18 +8694,20 @@ mod lnp_tests {
                 .take(4)
                 .map(|&c| {
                     let (lo, up) = m.col_bounds(c);
-                    let mut g = Vec::new();
                     let step = if matches!(m.col_kind(c), ColKind::Continuous) {
                         0.5
                     } else {
                         1.0
                     };
-                    let mut vv = lo;
-                    while vv <= up + 1e-9 {
-                        g.push(vv);
-                        vv += step;
-                    }
-                    g
+                    assert!(
+                        lo.is_finite() && up.is_finite() && lo <= up,
+                        "enumerated columns must have finite, ordered bounds"
+                    );
+                    let last_candidate = ((up - lo) / step).ceil() as usize;
+                    (0..=last_candidate)
+                        .map(|offset| lo + offset as f64 * step)
+                        .filter(|&value| value <= up + 1e-9)
+                        .collect()
                 })
                 .collect();
             let total: usize = grids.iter().map(Vec::len).product();
@@ -8746,7 +8748,7 @@ mod lnp_tests {
     /// Standalone CGLP probe against a real MPS file (dev harness, not a gate):
     /// `AY_MILP_LNP_PROBE=<file.mps> cargo test -p ay-milp --lib lnp_probe -- --ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "requires AY_MILP_LNP_PROBE to name an external MPS file"]
     fn lnp_probe() {
         let Ok(path) = std::env::var("AY_MILP_LNP_PROBE") else {
             eprintln!("set AY_MILP_LNP_PROBE=<file.mps>");
@@ -8759,7 +8761,7 @@ mod lnp_tests {
             if let crate::presolve::Presolved::Tightened(t) =
                 crate::presolve::tighten_bounds(&owned, None)
             {
-                owned = t;
+                owned = *t;
                 eprintln!("probe: presolved");
             }
         }
@@ -8788,7 +8790,7 @@ mod lnp_tests {
             &cand.values[..m.num_cols()],
             m.num_rows(),
             budget,
-            Some(std::time::Instant::now() + std::time::Duration::from_secs(600)),
+            Some(std::time::Instant::now() + std::time::Duration::from_mins(10)),
         );
         eprintln!(
             "lnp probe: {} cuts in {:.2}s",

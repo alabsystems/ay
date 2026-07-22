@@ -1,19 +1,36 @@
 //! Unit tests for `super` (dimacs.rs).
 //! Extracted verbatim to keep the production module readable.
 
+#[cfg(target_os = "linux")]
 use super::{
-    checked_lrat_original_clause_count, cleanup_dense_clique_php_route_rejection_proof,
-    cleanup_dimacs_non_unsat_proof_sidecar, clique_n2_k10_original_order_witness,
-    configure_dimacs_solver, dense_clique_php_route_admission,
+    anonymous_dimacs_staging_is_unsupported, cleanup_dense_clique_php_route_rejection_proof,
+    cleanup_dimacs_non_unsat_proof_sidecar, create_owned_dimacs_proof_file,
+    dimacs_proof_status_lock_path, dimacs_proof_status_path,
+    inject_anonymous_dimacs_staging_error_once, inject_dimacs_proof_cleanup_failure_once,
+    inject_dimacs_proof_cleanup_replacement_once, inject_dimacs_proof_clone_failure_once,
+    inject_dimacs_proof_identity_failure_once, inject_dimacs_rename_noreplace_error_once,
+    inject_dimacs_status_lock_identity_failure_once, inject_optional_dimacs_writer_failure_once,
+    mark_synthesized_default_dimacs_proof_current, mark_synthesized_default_dimacs_proof_stale,
+    owned_dimacs_proof_write_failure_flag, proof_output_writer,
+    publish_dimacs_descriptor_noreplace, read_published_dimacs_proof, remove_owned_dimacs_proof,
+    rename_dimacs_noreplace, retain_published_dimacs_proof, seal_owned_dimacs_proof,
+    DimacsPublicationInvalidation, DimacsUnsatPublicationTransaction, RetainedDimacsPublication,
+    SolverDimacsProofWriter, DIMACS_PROOF_STAGING_PREFIX,
+};
+use super::{
+    checked_lrat_original_clause_count, clique_n2_k10_original_order_witness,
+    configure_dimacs_solver, create_configured_dimacs_proof_file, dense_clique_php_route_admission,
     dense_clique_php_route_checker_audit_counts_match, dense_clique_php_route_target_clauses,
     dimacs_clause_fingerprint, dimacs_run_stats_json, dimacs_timeout_exit_code_for_policy,
     emit_dimacs_sat_model_to_writer, insert_decompose_lrat_preflight_telemetry,
     insert_dense_clique_scout_stats, insert_multiplier_equiv_conservation_scout_stats,
     insert_preprocessing_transaction_telemetry, php_functional_5_4_original_order_witness,
-    should_enable_xor_extension, variant_input_for_dimacs, variant_input_for_dimacs_route,
-    DenseCliquePhpProofRouteAdmissionResult, DimacsInputSource, CLIQUE_N2_K10_CLAUSE_FINGERPRINT,
-    CLIQUE_N2_K10_EXPECTED_CHECKER_AUDIT_STATS, DIMACS_MODEL_LINE_LIMIT, DIMACS_TIMEOUT_EXIT_CODE,
-    PHP_FUNCTIONAL_5_4_CLAUSE_FINGERPRINT, SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENABLED_KEY,
+    read_authenticated_dimacs_source, sha256_digest, should_enable_xor_extension,
+    variant_input_for_dimacs, variant_input_for_dimacs_route, verification_skip_is_acceptable,
+    AuthenticatedLeanSnapshot, DenseCliquePhpProofRouteAdmissionResult, DimacsInputSource,
+    CLIQUE_N2_K10_CLAUSE_FINGERPRINT, CLIQUE_N2_K10_EXPECTED_CHECKER_AUDIT_STATS,
+    DIMACS_MODEL_LINE_LIMIT, DIMACS_TIMEOUT_EXIT_CODE, PHP_FUNCTIONAL_5_4_CLAUSE_FINGERPRINT,
+    SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENABLED_KEY,
     SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV,
     SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH_ENABLED_KEY,
     SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH_ENV,
@@ -167,37 +184,12 @@ use ay_sat::{
     Literal, ProofOutput, SatResult, Solver as SatSolver, SolverVariant, Variable,
     VariantRouteProfile, VariantStartupPolicy,
 };
-use std::io::BufWriter;
-use std::path::Path;
+use ay_test_support::env::{lock_env, ScopedEnvVar};
+use std::io::{BufWriter, Write as _};
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{atomic::Ordering, Mutex};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
-
-static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-struct EnvGuard(Vec<(&'static str, Option<String>)>);
-
-impl EnvGuard {
-    fn capture(keys: &[&'static str]) -> Self {
-        Self(
-            keys.iter()
-                .map(|&key| (key, std::env::var(key).ok()))
-                .collect(),
-        )
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in &self.0 {
-            if let Some(value) = value {
-                std::env::set_var(key, value);
-            } else {
-                std::env::remove_var(key);
-            }
-        }
-    }
-}
 
 fn render_dimacs_sat_model_for_test(model: &[bool]) -> String {
     let mut output = Vec::new();
@@ -293,11 +285,8 @@ fn make_clauses_mixed(
 
 #[test]
 fn test_variant_input_for_dimacs_records_dense_mutex_restart_env_request() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENV]);
-    std::env::remove_var(SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENV);
 
     let default_input =
         variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
@@ -306,7 +295,7 @@ fn test_variant_input_for_dimacs_records_dense_mutex_restart_env_request() {
         "dense-mutex focused restart route must be default-off"
     );
 
-    std::env::set_var(SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENV, "1");
+    let _guard = ScopedEnvVar::set(SAT_DENSE_MUTEX_FOCUSED_RESTART_GATE_ENV, "1");
     let requested_input =
         variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
     assert!(
@@ -317,11 +306,8 @@ fn test_variant_input_for_dimacs_records_dense_mutex_restart_env_request() {
 
 #[test]
 fn test_variant_input_for_dimacs_records_dense_clique_mab_branch_env_request() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_DENSE_CLIQUE_MAB_BRANCH_ENV]);
-    std::env::remove_var(SAT_DENSE_CLIQUE_MAB_BRANCH_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_DENSE_CLIQUE_MAB_BRANCH_ENV);
 
     let default_input =
         variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
@@ -330,7 +316,7 @@ fn test_variant_input_for_dimacs_records_dense_clique_mab_branch_env_request() {
         "dense-clique MAB branch route must be default-off"
     );
 
-    std::env::set_var(SAT_DENSE_CLIQUE_MAB_BRANCH_ENV, "1");
+    let _guard = ScopedEnvVar::set(SAT_DENSE_CLIQUE_MAB_BRANCH_ENV, "1");
     let requested_input =
         variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
     assert!(
@@ -341,12 +327,9 @@ fn test_variant_input_for_dimacs_records_dense_clique_mab_branch_env_request() {
 
 #[test]
 fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_default_off() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_BVE_LRAT_SCOUT_ROUTE_ENV, "AY_SAT_PROFILE_ID"]);
-    std::env::remove_var(SAT_BVE_LRAT_SCOUT_ROUTE_ENV);
-    std::env::set_var("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_BVE_LRAT_SCOUT_ROUTE_ENV);
+    let _guard = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
 
     let input = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
 
@@ -362,12 +345,9 @@ fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_default_off() {
 
 #[test]
 fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_official_only() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_BVE_LRAT_SCOUT_ROUTE_ENV, "AY_SAT_PROFILE_ID"]);
-    std::env::set_var(SAT_BVE_LRAT_SCOUT_ROUTE_ENV, "1");
-    std::env::set_var("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::set(SAT_BVE_LRAT_SCOUT_ROUTE_ENV, "1");
+    let _guard = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
 
     let official = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
     assert_eq!(
@@ -417,15 +397,9 @@ fn test_variant_input_for_dimacs_bve_lrat_scout_route_env_official_only() {
 
 #[test]
 fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_default_off() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[
-        SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV,
-        "AY_SAT_PROFILE_ID",
-    ]);
-    std::env::remove_var(SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV);
-    std::env::set_var("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV);
+    let _guard = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
 
     let input = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
 
@@ -441,15 +415,9 @@ fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_default_off()
 
 #[test]
 fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_official_only() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[
-        SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV,
-        "AY_SAT_PROFILE_ID",
-    ]);
-    std::env::set_var(SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV, "1");
-    std::env::set_var("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::set(SAT_FMLA_DECOMPOSE_LRAT_PREFLIGHT_ROUTE_ENV, "1");
+    let _guard = ScopedEnvVar::set("AY_SAT_PROFILE_ID", "ay-sat-regular-main");
 
     let official = variant_input_for_dimacs(SolverVariant::Default, 180, 3_160, true, true, true);
     assert_eq!(
@@ -499,11 +467,8 @@ fn test_variant_input_for_dimacs_fmla_decompose_lrat_preflight_env_official_only
 
 #[test]
 fn test_configure_dimacs_solver_search_inplace_watch_scan_default_on() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV]);
-    std::env::remove_var(SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -532,11 +497,8 @@ fn test_configure_dimacs_solver_search_inplace_watch_scan_default_on() {
 
 #[test]
 fn test_configure_dimacs_solver_search_inplace_watch_scan_env_kill_switch() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV]);
-    std::env::set_var(SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV, "0");
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::set(SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV, "0");
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -558,11 +520,8 @@ fn test_configure_dimacs_solver_search_inplace_watch_scan_env_kill_switch() {
 
 #[test]
 fn test_configure_dimacs_solver_search_inplace_watch_scan_env_gate_truthy() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV]);
-    std::env::set_var(SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV, "1");
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::set(SAT_BCP_SEARCH_INPLACE_WATCH_SCAN_ENV, "1");
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -586,11 +545,8 @@ fn test_configure_dimacs_solver_search_inplace_watch_scan_env_gate_truthy() {
 
 #[test]
 fn test_configure_dimacs_solver_scan_pressure_env_gate_default_off() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENV]);
-    std::env::remove_var(SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -609,11 +565,8 @@ fn test_configure_dimacs_solver_scan_pressure_env_gate_default_off() {
 
 #[test]
 fn test_configure_dimacs_solver_scan_pressure_env_gate_truthy() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENV]);
-    std::env::set_var(SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENV, "1");
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_NO_REPLACEMENT_SCAN_PRESSURE_ENV, "1");
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -632,11 +585,8 @@ fn test_configure_dimacs_solver_scan_pressure_env_gate_truthy() {
 
 #[test]
 fn test_configure_dimacs_solver_learned_1963_identity_env_gate() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_BCP_LEARNED_1963_IDENTITY_ENV]);
-    std::env::remove_var(SAT_BCP_LEARNED_1963_IDENTITY_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_IDENTITY_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -651,7 +601,7 @@ fn test_configure_dimacs_solver_learned_1963_identity_env_gate() {
         "learned 19-63 identity profiling must stay default-off"
     );
 
-    std::env::set_var(SAT_BCP_LEARNED_1963_IDENTITY_ENV, "1");
+    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_IDENTITY_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -668,15 +618,9 @@ fn test_configure_dimacs_solver_learned_1963_identity_env_gate() {
 
 #[test]
 fn test_configure_dimacs_solver_learned_1963_pressure_reduction_env_gate() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[
-        SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENV,
-        SAT_BCP_LEARNED_1963_IDENTITY_ENV,
-    ]);
-    std::env::remove_var(SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENV);
-    std::env::remove_var(SAT_BCP_LEARNED_1963_IDENTITY_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENV);
+    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_IDENTITY_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -695,7 +639,7 @@ fn test_configure_dimacs_solver_learned_1963_pressure_reduction_env_gate() {
         "pressure reduction default-off must not enable identity profiling"
     );
 
-    std::env::set_var(SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENV, "1");
+    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_PRESSURE_REDUCTION_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -716,15 +660,9 @@ fn test_configure_dimacs_solver_learned_1963_pressure_reduction_env_gate() {
 
 #[test]
 fn test_configure_dimacs_solver_learned_1963_pressure_retention_env_gate() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[
-        SAT_BCP_LEARNED_1963_PRESSURE_RETENTION_ENV,
-        SAT_BCP_LEARNED_1963_IDENTITY_ENV,
-    ]);
-    std::env::remove_var(SAT_BCP_LEARNED_1963_PRESSURE_RETENTION_ENV);
-    std::env::remove_var(SAT_BCP_LEARNED_1963_IDENTITY_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_PRESSURE_RETENTION_ENV);
+    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_IDENTITY_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -743,7 +681,7 @@ fn test_configure_dimacs_solver_learned_1963_pressure_retention_env_gate() {
         "pressure retention default-off must not enable identity profiling"
     );
 
-    std::env::set_var(SAT_BCP_LEARNED_1963_PRESSURE_RETENTION_ENV, "1");
+    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_PRESSURE_RETENTION_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -764,11 +702,8 @@ fn test_configure_dimacs_solver_learned_1963_pressure_retention_env_gate() {
 
 #[test]
 fn test_configure_dimacs_solver_used5_fsw_reset_env_gate() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ENV]);
-    std::env::remove_var(SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -783,7 +718,7 @@ fn test_configure_dimacs_solver_used5_fsw_reset_env_gate() {
         "learned 19-63 used5 FSW reset must stay default-off"
     );
 
-    std::env::set_var(SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ENV, "1");
+    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_USED5_FSW_SAVED_POS_RESET_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -800,11 +735,8 @@ fn test_configure_dimacs_solver_used5_fsw_reset_env_gate() {
 
 #[test]
 fn test_configure_dimacs_solver_fsw_conflict_saved_pos_reset_env_gate() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ENV]);
-    std::env::remove_var(SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -819,7 +751,7 @@ fn test_configure_dimacs_solver_fsw_conflict_saved_pos_reset_env_gate() {
         "learned 19-63 FSW conflict-only reset must stay default-off"
     );
 
-    std::env::set_var(SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ENV, "1");
+    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_FSW_CONFLICT_SAVED_POS_RESET_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -836,11 +768,8 @@ fn test_configure_dimacs_solver_fsw_conflict_saved_pos_reset_env_gate() {
 
 #[test]
 fn test_configure_dimacs_solver_fsw_gent_skip_env_gate() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENV]);
-    std::env::remove_var(SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -855,7 +784,7 @@ fn test_configure_dimacs_solver_fsw_gent_skip_env_gate() {
         "learned 19-63 FSW Gent-order skip must stay default-off"
     );
 
-    std::env::set_var(SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENV, "1");
+    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_FSW_GENT_SKIP_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -872,12 +801,9 @@ fn test_configure_dimacs_solver_fsw_gent_skip_env_gate() {
 
 #[test]
 fn test_configure_dimacs_solver_disable_1963_unit_blocker_refresh_env_gate() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _lock = lock_env();
     let _guard =
-        EnvGuard::capture(&[SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH_ENV]);
-    std::env::remove_var(SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH_ENV);
+        ScopedEnvVar::unset(SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -892,7 +818,7 @@ fn test_configure_dimacs_solver_disable_1963_unit_blocker_refresh_env_gate() {
         "learned 19-63 no-replacement unit blocker-refresh guard must stay default-off"
     );
 
-    std::env::set_var(
+    let _guard = ScopedEnvVar::set(
         SAT_BCP_DISABLE_LEARNED_1963_NO_REPLACEMENT_UNIT_BLOCKER_REFRESH_ENV,
         "1",
     );
@@ -912,11 +838,8 @@ fn test_configure_dimacs_solver_disable_1963_unit_blocker_refresh_env_gate() {
 
 #[test]
 fn test_configure_dimacs_solver_1963_tail_reorder_swap_budget_env_gate() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_ENV]);
-    std::env::remove_var(SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -932,7 +855,7 @@ fn test_configure_dimacs_solver_1963_tail_reorder_swap_budget_env_gate() {
         "learned 19-63 budgeted tail reorder must stay default-off"
     );
 
-    std::env::set_var(SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_ENV, "256");
+    let _guard = ScopedEnvVar::set(SAT_BCP_LEARNED_1963_TAIL_REORDER_SWAP_BUDGET_ENV, "256");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -950,11 +873,8 @@ fn test_configure_dimacs_solver_1963_tail_reorder_swap_budget_env_gate() {
 
 #[test]
 fn test_configure_dimacs_solver_inprocessing_yield_productivity_rescue_env_gate() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE_ENV]);
-    std::env::remove_var(SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -969,7 +889,7 @@ fn test_configure_dimacs_solver_inprocessing_yield_productivity_rescue_env_gate(
         "the #9084 yield-productivity rescue must stay default-off"
     );
 
-    std::env::set_var(SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE_ENV, "1");
+    let _guard = ScopedEnvVar::set(SAT_INPROCESSING_YIELD_PRODUCTIVITY_RESCUE_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -986,11 +906,8 @@ fn test_configure_dimacs_solver_inprocessing_yield_productivity_rescue_env_gate(
 
 #[test]
 fn test_configure_dimacs_solver_lrat_proof_clamp_probe_rescue_env_gate() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENV]);
-    std::env::remove_var(SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -1005,7 +922,7 @@ fn test_configure_dimacs_solver_lrat_proof_clamp_probe_rescue_env_gate() {
         "LRAT proof-clamp probe rescue must stay default-off"
     );
 
-    std::env::set_var(SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENV, "1");
+    let _guard = ScopedEnvVar::set(SAT_LRAT_PROOF_CLAMP_PROBE_RESCUE_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -1022,11 +939,8 @@ fn test_configure_dimacs_solver_lrat_proof_clamp_probe_rescue_env_gate() {
 
 #[test]
 fn test_configure_dimacs_solver_yield_rescue_backbone_cooldown_env_gate() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_INPROCESSING_YIELD_RESCUE_BACKBONE_COOLDOWN_ENV]);
-    std::env::remove_var(SAT_INPROCESSING_YIELD_RESCUE_BACKBONE_COOLDOWN_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_INPROCESSING_YIELD_RESCUE_BACKBONE_COOLDOWN_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -1041,7 +955,7 @@ fn test_configure_dimacs_solver_yield_rescue_backbone_cooldown_env_gate() {
         "the #9084 yield-rescue backbone cooldown must stay default-off"
     );
 
-    std::env::set_var(SAT_INPROCESSING_YIELD_RESCUE_BACKBONE_COOLDOWN_ENV, "1");
+    let _guard = ScopedEnvVar::set(SAT_INPROCESSING_YIELD_RESCUE_BACKBONE_COOLDOWN_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -1058,11 +972,8 @@ fn test_configure_dimacs_solver_yield_rescue_backbone_cooldown_env_gate() {
 
 #[test]
 fn test_configure_dimacs_solver_bounded_backbone_zero_decompose_backoff_env_gate() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_ENV]);
-    std::env::remove_var(SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -1077,7 +988,7 @@ fn test_configure_dimacs_solver_bounded_backbone_zero_decompose_backoff_env_gate
         "the #9084 bounded-backbone zero-decompose backoff must stay default-off"
     );
 
-    std::env::set_var(SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_ENV, "1");
+    let _guard = ScopedEnvVar::set(SAT_BOUNDED_BACKBONE_ZERO_DECOMPOSE_BACKOFF_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -1094,11 +1005,8 @@ fn test_configure_dimacs_solver_bounded_backbone_zero_decompose_backoff_env_gate
 
 #[test]
 fn test_configure_dimacs_solver_backbone_post_vivify_binary_admission_env_gate() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV]);
-    std::env::remove_var(SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV);
 
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
@@ -1113,7 +1021,7 @@ fn test_configure_dimacs_solver_backbone_post_vivify_binary_admission_env_gate()
         "post-vivify binary admission must stay default-on without env override"
     );
 
-    std::env::set_var(SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV, "0");
+    let _guard = ScopedEnvVar::set(SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV, "0");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -1127,7 +1035,7 @@ fn test_configure_dimacs_solver_backbone_post_vivify_binary_admission_env_gate()
         "env 0 should restore the legacy post-vivify backbone gate"
     );
 
-    std::env::set_var(SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV, "1");
+    let _guard = ScopedEnvVar::set(SAT_BACKBONE_POST_VIVIFY_BINARY_ADMISSION_ENV, "1");
     let mut solver = SatSolver::new(1);
     configure_dimacs_solver(
         &mut solver,
@@ -1163,11 +1071,8 @@ fn test_dimacs_stats_json_exports_backbone_post_vivify_binary_admission_gate() {
 
 #[test]
 fn test_dimacs_stats_json_exports_hard_tail_row_id() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_HARD_TAIL_ROW_ID_ENV]);
-    std::env::set_var(SAT_HARD_TAIL_ROW_ID_ENV, "Circuit_multiplier22");
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::set(SAT_HARD_TAIL_ROW_ID_ENV, "Circuit_multiplier22");
 
     let run_stats = stats_output::RunStatistics::new(
         stats_output::SolveMode::DimacsSat,
@@ -2032,11 +1937,8 @@ fn test_dense_clique_php_route_checker_audit_counts_fail_closed() {
 
 #[test]
 fn test_dense_clique_scout_stats_are_default_off() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_DENSE_CLIQUE_SCOUT_ENV]);
-    std::env::remove_var(SAT_DENSE_CLIQUE_SCOUT_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_DENSE_CLIQUE_SCOUT_ENV);
     let mut run_stats = stats_output::RunStatistics::new(
         stats_output::SolveMode::DimacsSat,
         "unknown",
@@ -2068,11 +1970,8 @@ fn test_dense_clique_scout_stats_are_default_off() {
 
 #[test]
 fn test_dense_clique_scout_stats_recover_strict_mutex_surface() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_DENSE_CLIQUE_SCOUT_ENV]);
-    std::env::set_var(SAT_DENSE_CLIQUE_SCOUT_ENV, "1");
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::set(SAT_DENSE_CLIQUE_SCOUT_ENV, "1");
     let content = "\
 p cnf 6 17
 1 2 3 0
@@ -2192,11 +2091,8 @@ p cnf 6 17
 
 #[test]
 fn test_dense_clique_scout_requested_mixed_formula_fails_closed() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_DENSE_CLIQUE_SCOUT_ENV]);
-    std::env::set_var(SAT_DENSE_CLIQUE_SCOUT_ENV, "1");
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::set(SAT_DENSE_CLIQUE_SCOUT_ENV, "1");
     let content = "\
 p cnf 4 3
 1 2 0
@@ -2234,11 +2130,8 @@ p cnf 4 3
 
 #[test]
 fn test_multiplier_equiv_conservation_scout_stats_are_default_off() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENV]);
-    std::env::remove_var(SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENV);
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset(SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENV);
     let mut run_stats = stats_output::RunStatistics::new(
         stats_output::SolveMode::DimacsSat,
         "unknown",
@@ -2270,11 +2163,8 @@ fn test_multiplier_equiv_conservation_scout_stats_are_default_off() {
 
 #[test]
 fn test_multiplier_equiv_conservation_scout_requested_fails_closed_without_proof() {
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&[SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENV]);
-    std::env::set_var(SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENV, "1");
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::set(SAT_MULTIPLIER_EQUIV_CONSERVATION_SCOUT_ENV, "1");
     let content = "\
 p cnf 3 3
 -3 1 0
@@ -3191,7 +3081,7 @@ fn test_dimacs_timeout_exit_flushes_buffered_proof_output_2971() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&proof_path);
-    struct Cleanup(std::path::PathBuf);
+    struct Cleanup(PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
@@ -3227,18 +3117,13 @@ fn test_dimacs_timeout_exit_retains_fmla_learned_lrat_fail_closed_diagnostic() {
         }
     }
 
-    let _env_lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _env_guard = EnvGuard::capture(&[
-        ay_sat::fmla_runtime_ledger::FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV,
-    ]);
+    let _env_lock = lock_env();
     let artifact_path = std::env::temp_dir().join(format!(
         "ay_dimacs_timeout_fmla_learned_lrat_dry_run_{}.json",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&artifact_path);
-    struct Cleanup(std::path::PathBuf);
+    struct Cleanup(PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
@@ -3246,9 +3131,9 @@ fn test_dimacs_timeout_exit_retains_fmla_learned_lrat_fail_closed_diagnostic() {
     }
     let _cleanup = Cleanup(artifact_path.clone());
 
-    std::env::set_var(
+    let _guard = ScopedEnvVar::set(
         ay_sat::fmla_runtime_ledger::FMLA_LEARNED_LRAT_DRY_RUN_PROOF_ARTIFACT_PATH_ENV,
-        &artifact_path,
+        artifact_path.to_str().expect("artifact path utf8"),
     );
     let proof_output = ProofOutput::lrat_text(Vec::new(), 1);
     let mut solver = SatSolver::with_proof_output(1, proof_output);
@@ -3278,33 +3163,25 @@ fn test_dimacs_timeout_exit_retains_fmla_learned_lrat_fail_closed_diagnostic() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
-fn test_dimacs_non_unsat_cleanup_removes_proof_sidecar() {
-    let proof_path = std::env::temp_dir().join(format!(
-        "ay_dimacs_non_unsat_cleanup_{}.lrat",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&proof_path);
-    struct Cleanup(std::path::PathBuf);
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
-    let _cleanup = Cleanup(proof_path.clone());
+fn test_synthesized_default_dimacs_non_unsat_cleanup_removes_private_staging() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_path = dir.path().join("proof.lrat");
 
-    let file = std::fs::File::create(&proof_path).expect("create proof fixture");
-    let proof_output = ProofOutput::lrat_text(BufWriter::new(file), 1);
-    let mut solver = SatSolver::with_proof_output(1, proof_output);
-    solver.add_clause(Vec::new());
     let proof = ProofConfig {
         path: proof_path.to_string_lossy().into_owned(),
         format: ProofFormat::Lrat,
         binary: false,
         artifact_path: None,
         is_temp: false,
-        synthesized_default: false,
+        synthesized_default: true,
+        format_was_explicit: false,
     };
+    let file = create_configured_dimacs_proof_file(&proof).expect("create owned proof fixture");
+    let proof_output = ProofOutput::lrat_text(BufWriter::new(file), 1);
+    let mut solver = SatSolver::with_proof_output(1, proof_output);
+    solver.add_clause(Vec::new());
 
     let telemetry =
         cleanup_dimacs_non_unsat_proof_sidecar(&mut solver, &SatResult::Unknown, Some(&proof))
@@ -3319,11 +3196,23 @@ fn test_dimacs_non_unsat_cleanup_removes_proof_sidecar() {
         "non-UNSAT cleanup must remove the proof sidecar"
     );
     assert!(
+        private_dimacs_staging_entries(dir.path()).is_empty(),
+        "synthesized-default cleanup must remove private staging"
+    );
+    assert!(
+        std::fs::read_to_string(dimacs_proof_status_path(&proof.path))
+            .expect("read non-UNSAT stale marker")
+            .contains("status=stale-not-current"),
+        "non-UNSAT cleanup must publish an explicit stale marker"
+    );
+    assert!(!dimacs_proof_status_lock_path(&dimacs_proof_status_path(&proof.path)).exists());
+    assert!(
         telemetry.additions > 0,
         "cleanup should snapshot proof telemetry before detaching the writer"
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn test_dense_clique_php_route_rejection_cleanup_removes_proof_sidecar() {
     let proof_path = std::env::temp_dir().join(format!(
@@ -3331,7 +3220,7 @@ fn test_dense_clique_php_route_rejection_cleanup_removes_proof_sidecar() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&proof_path);
-    struct Cleanup(std::path::PathBuf);
+    struct Cleanup(PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
@@ -3339,7 +3228,8 @@ fn test_dense_clique_php_route_rejection_cleanup_removes_proof_sidecar() {
     }
     let _cleanup = Cleanup(proof_path.clone());
 
-    let file = std::fs::File::create(&proof_path).expect("create proof fixture");
+    let file = create_owned_dimacs_proof_file(proof_path.to_str().expect("UTF-8 path"))
+        .expect("create owned proof fixture");
     let proof_output = ProofOutput::lrat_text(BufWriter::new(file), 3_160);
     let mut solver = SatSolver::with_proof_output(180, proof_output);
     solver.add_clause(Vec::new());
@@ -3350,6 +3240,7 @@ fn test_dense_clique_php_route_rejection_cleanup_removes_proof_sidecar() {
         artifact_path: None,
         is_temp: false,
         synthesized_default: false,
+        format_was_explicit: false,
     };
 
     let telemetry = cleanup_dense_clique_php_route_rejection_proof(&mut solver, &proof)
@@ -3554,11 +3445,8 @@ fn test_large_formula_disables_xor_extension() {
     // search on big instances (intel047/dislog regression). A mixed-size
     // distribution keeps the binary/gate-structure guards from firing first,
     // isolating the absolute-size guard.
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&["AY_XOR_ALLOW_LARGE"]);
-    std::env::remove_var("AY_XOR_ALLOW_LARGE");
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset("AY_XOR_ALLOW_LARGE");
 
     let n = XOR_EXTENSION_MAX_CLAUSES + 1;
     let bin = n / 10; // 10% binary
@@ -3572,7 +3460,7 @@ fn test_large_formula_disables_xor_extension() {
         "large formulas must skip the XOR extension regardless of density"
     );
     // The escape hatch restores GE for experimentation.
-    std::env::set_var("AY_XOR_ALLOW_LARGE", "1");
+    let _guard = ScopedEnvVar::set("AY_XOR_ALLOW_LARGE", "1");
     assert!(
         should_enable_xor_extension(&clauses, clauses.len() / 2, clauses.len() / 2, 5_000),
         "AY_XOR_ALLOW_LARGE must re-enable the XOR extension on large formulas"
@@ -3583,11 +3471,8 @@ fn test_large_formula_disables_xor_extension() {
 fn test_small_dense_xor_still_enabled_under_size_cap() {
     // inc6: a small, dense, mixed-size XOR-heavy formula (well under the cap)
     // must still route to the XOR extension -- this is the case GE helps.
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&["AY_XOR_ALLOW_LARGE"]);
-    std::env::remove_var("AY_XOR_ALLOW_LARGE");
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset("AY_XOR_ALLOW_LARGE");
 
     let clauses = make_clauses_mixed(0, 80, 20); // 100 clauses, 80% ternary
     assert!(clauses.len() <= XOR_EXTENSION_MAX_CLAUSES);
@@ -3600,13 +3485,10 @@ fn test_small_dense_xor_still_enabled_under_size_cap() {
 #[test]
 fn test_should_enable_xor_extension_crypto_benchmarks() {
     // The residual-dominance asserts below read AY_XOR_ALLOW_RESIDUAL, which the
-    // kill-switch test mutates globally under TEST_ENV_LOCK; hold the same lock
-    // and clear the var so the two tests cannot race.
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&["AY_XOR_ALLOW_RESIDUAL"]);
-    std::env::remove_var("AY_XOR_ALLOW_RESIDUAL");
+    // kill-switch test mutates globally under the shared environment lock;
+    // hold that lock and clear the var so the two tests cannot race.
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset("AY_XOR_ALLOW_RESIDUAL");
 
     // Crypto benchmarks: low binary fraction, high XOR density, mixed sizes.
     // Real crypto formulas have clauses of sizes 2-8+, not just binary+ternary.
@@ -3639,11 +3521,8 @@ fn test_residual_dominance_disables_xor_extension() {
     // s UNKNOWN@120s vs plain + full-preprocess path s UNSATISFIABLE@110s
     // (kissat-agreed, dpr-trim -> cake_lpr verified). The residual-dominance
     // guard disables XOR when residual > 85% of the clause count.
-    let _lock = TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _guard = EnvGuard::capture(&["AY_XOR_ALLOW_RESIDUAL"]);
-    std::env::remove_var("AY_XOR_ALLOW_RESIDUAL");
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::unset("AY_XOR_ALLOW_RESIDUAL");
 
     // Mirror 31e843c5's clause-size distribution (32.5% binary, 46% ternary,
     // 21.5% wide) so the binary%, gate%, and sparse-wide guards all pass and
@@ -3677,7 +3556,7 @@ fn test_residual_dominance_disables_xor_extension() {
     );
 
     // Kill switch restores the old unconditional enable byte-for-byte.
-    std::env::set_var("AY_XOR_ALLOW_RESIDUAL", "1");
+    let _kill_switch = ScopedEnvVar::set("AY_XOR_ALLOW_RESIDUAL", "1");
     assert!(
         should_enable_xor_extension(&clauses, 848, 12_560, 207),
         "AY_XOR_ALLOW_RESIDUAL=1 must restore the pre-fix XOR enable"
@@ -3763,4 +3642,1282 @@ fn test_gate_structure_disables_xor() {
         should_enable_xor_extension(&clauses, 400, 200, 100),
         "XOR should be enabled when binary+ternary is below 95%"
     );
+}
+
+#[cfg(target_os = "linux")]
+fn private_dimacs_staging_entries(parent: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(parent)
+        .expect("read DIMACS proof parent")
+        .filter_map(|entry| {
+            let entry = entry.expect("read DIMACS proof parent entry");
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(DIMACS_PROOF_STAGING_PREFIX)
+                .then(|| entry.path())
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn private_dimacs_staging_debris_bytes(parent: &Path) -> Vec<Vec<u8>> {
+    let mut debris = Vec::new();
+    for entry in private_dimacs_staging_entries(parent) {
+        if entry.is_dir() {
+            for nested in std::fs::read_dir(&entry).expect("read DIMACS quarantine directory") {
+                let nested = nested.expect("read DIMACS quarantine entry").path();
+                if nested.is_file() {
+                    debris.push(std::fs::read(nested).expect("read DIMACS quarantine tombstone"));
+                }
+            }
+        } else {
+            debris.push(std::fs::read(entry).expect("read named DIMACS staging tombstone"));
+        }
+    }
+    debris
+}
+
+#[cfg(target_os = "linux")]
+fn retained_test_transaction(
+    proof: &ProofConfig,
+    published: super::PublishedDimacsProof,
+    optional: bool,
+) -> DimacsUnsatPublicationTransaction {
+    let retained = retain_published_dimacs_proof(&proof.path, published, proof.binary)
+        .expect("retain proof authority");
+    DimacsUnsatPublicationTransaction::new(retained, None, optional)
+}
+
+#[cfg(target_os = "linux")]
+fn private_lean_snapshot_entries() -> Vec<PathBuf> {
+    let prefix = format!(".ay-lean-verify-{}-", std::process::id());
+    let mut entries: Vec<_> = std::fs::read_dir(std::env::temp_dir())
+        .expect("read temporary directory")
+        .filter_map(|entry| {
+            let entry = entry.expect("read temporary directory entry");
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&prefix)
+                .then(|| entry.path())
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn authenticated_lean_snapshot_is_anonymous_and_never_cleans_named_replacements() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let proof_dir = tempfile::tempdir().expect("proof tempdir");
+    let proof_path = proof_dir.path().join("proof.lean4");
+    let proof_path_text = proof_path.to_str().expect("UTF-8 proof path");
+    let mut proof = create_owned_dimacs_proof_file(proof_path_text).expect("reserve Lean proof");
+    std::io::Write::write_all(
+        &mut proof,
+        b"theorem ay_snapshot_test : True := by trivial\n",
+    )
+    .expect("write Lean proof");
+    drop(proof);
+    let published = seal_owned_dimacs_proof(proof_path_text).expect("seal Lean proof");
+
+    let before = private_lean_snapshot_entries();
+    let mut snapshot =
+        AuthenticatedLeanSnapshot::create(proof_path_text, published).expect("create snapshot");
+    snapshot.validate().expect("validate snapshot");
+    assert_eq!(
+        snapshot
+            .descriptor
+            .metadata()
+            .expect("snapshot metadata")
+            .nlink(),
+        0,
+        "the authenticated Lean snapshot must remain anonymous"
+    );
+    assert_eq!(
+        private_lean_snapshot_entries(),
+        before,
+        "snapshot creation must not expose a named .ay-lean-verify entry"
+    );
+
+    let replacement_prefix = format!(".ay-lean-verify-{}-replacement-", std::process::id());
+    let replacement = tempfile::Builder::new()
+        .prefix(&replacement_prefix)
+        .tempdir_in(std::env::temp_dir())
+        .expect("create replacement directory");
+    let replacement_path = replacement.path().join("proof.lean4");
+    std::fs::write(&replacement_path, b"unrelated replacement\n").expect("write replacement proof");
+
+    drop(snapshot);
+    assert_eq!(
+        std::fs::read(&replacement_path).expect("read replacement after snapshot close"),
+        b"unrelated replacement\n",
+        "closing an anonymous snapshot must not remove a named replacement"
+    );
+    drop(replacement);
+    assert_eq!(
+        private_lean_snapshot_entries(),
+        before,
+        "snapshot close must not leak a named .ay-lean-verify entry"
+    );
+
+    assert!(remove_owned_dimacs_proof(proof_path_text).expect("remove owned Lean proof"));
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn authenticated_lean_snapshot_fails_closed_without_anonymous_descriptors() {
+    let executable = std::env::current_exe().expect("current executable");
+    let metadata = std::fs::metadata(executable).expect("current executable metadata");
+    let published = super::PublishedDimacsProof {
+        identity: super::ProofFileIdentity::from_metadata(&metadata),
+        len: 0,
+        sha256: [0; 32],
+    };
+
+    let error = match AuthenticatedLeanSnapshot::create("must-not-be-opened.lean4", published) {
+        Ok(_) => panic!("unsupported platforms must reject Lean snapshot creation"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dimacs_proof_output_refuses_stale_regular_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    std::fs::write(&path, b"stale proof\n").expect("seed stale proof");
+
+    let error = create_owned_dimacs_proof_file(path.to_str().expect("UTF-8 path"))
+        .expect_err("same-run proof creation must not clobber stale output");
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        std::fs::read(&path).expect("read stale proof"),
+        b"stale proof\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_rename_noreplace_is_atomic_and_never_clobbers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source");
+    let target = dir.path().join("target");
+    std::fs::write(&source, b"source bytes\n").expect("write source");
+    std::fs::write(&target, b"target bytes\n").expect("write target");
+
+    let error = rename_dimacs_noreplace(&source, &target)
+        .expect_err("no-replace rename must reject an existing target");
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        std::fs::read(&source).expect("read source"),
+        b"source bytes\n"
+    );
+    assert_eq!(
+        std::fs::read(&target).expect("read target"),
+        b"target bytes\n"
+    );
+
+    std::fs::remove_file(&target).expect("remove target");
+    rename_dimacs_noreplace(&source, &target).expect("rename to unoccupied target");
+    assert!(!source.exists());
+    assert_eq!(
+        std::fs::read(&target).expect("read renamed file"),
+        b"source bytes\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_descriptor_publication_works_unprivileged_and_never_clobbers() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source");
+    let target = dir.path().join("target");
+    std::fs::write(&source, b"descriptor bytes\n").expect("write source");
+    let descriptor = std::fs::File::open(&source).expect("open source descriptor");
+
+    publish_dimacs_descriptor_noreplace(&descriptor, &target)
+        .expect("publish through AT_EMPTY_PATH or unprivileged proc-fd fallback");
+    assert_eq!(
+        std::fs::read(&target).expect("read published target"),
+        b"descriptor bytes\n"
+    );
+    let error = publish_dimacs_descriptor_noreplace(&descriptor, &target)
+        .expect_err("descriptor publication must never clobber an existing target");
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        std::fs::read(&target).expect("read preserved target"),
+        b"descriptor bytes\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unsupported_anonymous_staging_falls_back_to_named_sibling_stage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    let path_text = path.to_str().expect("UTF-8 path");
+    inject_anonymous_dimacs_staging_error_once(nix::libc::EOPNOTSUPP);
+
+    let mut proof = create_owned_dimacs_proof_file(path_text)
+        .expect("unsupported O_TMPFILE must use the named sibling fallback");
+    proof.write_all(b"0\n").expect("write fallback proof");
+    drop(proof);
+    assert!(
+        !path.exists(),
+        "fallback must remain private before sealing"
+    );
+    assert_eq!(private_dimacs_staging_entries(dir.path()).len(), 1);
+
+    seal_owned_dimacs_proof(path_text).expect("seal fallback proof");
+    assert_eq!(std::fs::read(&path).expect("read fallback proof"), b"0\n");
+    assert!(private_dimacs_staging_entries(dir.path()).is_empty());
+    assert!(remove_owned_dimacs_proof(path_text).expect("remove fallback proof"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn anonymous_staging_fallback_accepts_only_capability_errors() {
+    for raw_os_error in [nix::libc::EOPNOTSUPP, nix::libc::EINVAL] {
+        assert!(anonymous_dimacs_staging_is_unsupported(
+            &std::io::Error::from_raw_os_error(raw_os_error)
+        ));
+    }
+    for raw_os_error in [
+        nix::libc::EACCES,
+        nix::libc::EDQUOT,
+        nix::libc::ENOSPC,
+        nix::libc::EIO,
+        nix::libc::EMFILE,
+        nix::libc::EISDIR,
+    ] {
+        assert!(
+            !anonymous_dimacs_staging_is_unsupported(&std::io::Error::from_raw_os_error(
+                raw_os_error
+            )),
+            "operational error {raw_os_error} must remain fail closed"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn pre_o_tmpfile_kernel_signal_remains_fail_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    inject_anonymous_dimacs_staging_error_once(nix::libc::EISDIR);
+
+    let error = create_owned_dimacs_proof_file(path.to_str().expect("UTF-8 path"))
+        .expect_err("EISDIR must not enter a renameat2-dependent fallback");
+    assert_eq!(error.raw_os_error(), Some(nix::libc::EISDIR));
+    assert!(!path.exists());
+    assert!(private_dimacs_staging_entries(dir.path()).is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn anonymous_staging_non_capability_errors_remain_fail_closed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    inject_anonymous_dimacs_staging_error_once(nix::libc::EACCES);
+
+    let error = create_owned_dimacs_proof_file(path.to_str().expect("UTF-8 path"))
+        .expect_err("permission errors must not silently use a different staging route");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(!path.exists());
+    assert!(private_dimacs_staging_entries(dir.path()).is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn named_fallback_seal_collision_preserves_the_raced_target() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    let path_text = path.to_str().expect("UTF-8 path");
+    inject_anonymous_dimacs_staging_error_once(nix::libc::EINVAL);
+    let mut proof = create_owned_dimacs_proof_file(path_text).expect("reserve fallback proof");
+    proof.write_all(b"0\n").expect("write proof");
+    drop(proof);
+    std::fs::write(&path, b"raced target\n").expect("plant target");
+
+    let error = seal_owned_dimacs_proof(path_text)
+        .expect_err("fallback publication must retain no-clobber semantics");
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        std::fs::read(&path).expect("read target"),
+        b"raced target\n"
+    );
+    assert!(remove_owned_dimacs_proof(path_text).expect("discard fallback staging"));
+    assert_eq!(
+        std::fs::read(&path).expect("read target"),
+        b"raced target\n"
+    );
+    assert_eq!(
+        private_dimacs_staging_debris_bytes(dir.path()),
+        vec![b"invalidated-by-ay\n".to_vec()]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn named_fallback_cleanup_preserves_replacement_after_quarantine() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    let path_text = path.to_str().expect("UTF-8 path");
+    inject_anonymous_dimacs_staging_error_once(nix::libc::EOPNOTSUPP);
+    let mut proof = create_owned_dimacs_proof_file(path_text).expect("reserve fallback proof");
+    proof.write_all(b"0\n").expect("write proof");
+    drop(proof);
+    seal_owned_dimacs_proof(path_text).expect("publish fallback proof");
+    inject_dimacs_proof_cleanup_replacement_once();
+
+    assert!(remove_owned_dimacs_proof(path_text).expect("remove authenticated fallback proof"));
+    assert_eq!(
+        std::fs::read(&path).expect("read raced replacement"),
+        b"raced replacement\n"
+    );
+    assert_eq!(
+        private_dimacs_staging_debris_bytes(dir.path()),
+        vec![b"invalidated-by-ay\n".to_vec()]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn named_fallback_enosys_fails_before_target_exposure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    let path_text = path.to_str().expect("UTF-8 path");
+    inject_anonymous_dimacs_staging_error_once(nix::libc::EOPNOTSUPP);
+    let mut proof = create_owned_dimacs_proof_file(path_text).expect("reserve fallback proof");
+    proof.write_all(b"0\n").expect("write proof");
+    proof.flush().expect("flush proof");
+    drop(proof);
+
+    inject_dimacs_rename_noreplace_error_once(nix::libc::ENOSYS);
+    let error = seal_owned_dimacs_proof(path_text)
+        .expect_err("missing renameat2 must fail before publishing the named stage");
+    assert_eq!(error.raw_os_error(), Some(nix::libc::ENOSYS));
+    assert!(!path.exists(), "ENOSYS must precede target exposure");
+    assert_eq!(private_dimacs_staging_entries(dir.path()).len(), 1);
+    assert!(remove_owned_dimacs_proof(path_text).expect("invalidate failed named stage"));
+    assert!(!path.exists());
+    assert_eq!(
+        private_dimacs_staging_debris_bytes(dir.path()),
+        vec![b"invalidated-by-ay\n".to_vec()]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn named_fallback_never_publishes_or_deletes_a_swapped_stage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    let path_text = path.to_str().expect("UTF-8 path");
+    inject_anonymous_dimacs_staging_error_once(nix::libc::EOPNOTSUPP);
+    let mut proof = create_owned_dimacs_proof_file(path_text).expect("reserve fallback proof");
+    proof.write_all(b"0\n").expect("write proof");
+    proof.flush().expect("flush proof");
+    drop(proof);
+    let staging_path = private_dimacs_staging_entries(dir.path())
+        .into_iter()
+        .next()
+        .expect("fallback sibling stage");
+    let displaced_owned_stage = dir.path().join("displaced-owned-proof");
+    std::fs::rename(&staging_path, &displaced_owned_stage).expect("displace owned stage");
+    std::fs::write(&staging_path, b"unrelated staged replacement\n")
+        .expect("plant staged replacement");
+
+    seal_owned_dimacs_proof(path_text)
+        .expect_err("swapped named stage must fail the publication transaction");
+    assert_eq!(
+        std::fs::read(&path).expect("read preserved stage replacement"),
+        b"unrelated staged replacement\n"
+    );
+    assert_eq!(
+        std::fs::read(&displaced_owned_stage).expect("read displaced owned stage"),
+        b"0\n"
+    );
+    assert!(
+        !remove_owned_dimacs_proof(path_text).expect("preserve published replacement"),
+        "the public name was not AY's owned inode"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("read preserved stage replacement"),
+        b"unrelated staged replacement\n"
+    );
+    assert_eq!(
+        std::fs::read(&displaced_owned_stage).expect("read invalidated owned stage"),
+        b"invalidated-by-ay\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn synthesized_default_preexisting_proof_gets_explicit_stale_status() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("input.cnf.drat");
+    std::fs::write(&path, b"proof from an older run\n").expect("seed stale proof");
+    let proof = ProofConfig {
+        path: path.to_string_lossy().into_owned(),
+        format: ProofFormat::Drat,
+        binary: false,
+        artifact_path: None,
+        is_temp: false,
+        synthesized_default: true,
+        format_was_explicit: false,
+    };
+
+    let error = create_configured_dimacs_proof_file(&proof)
+        .expect_err("preexisting default proof must not be rebound to this run");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        std::fs::read(&path).expect("read old proof"),
+        b"proof from an older run\n"
+    );
+    let status = std::fs::read_to_string(dimacs_proof_status_path(&proof.path))
+        .expect("read stale status marker");
+    assert!(status.contains("status=stale-not-current"));
+    assert!(!status.contains("current-same-run"));
+    assert!(!dimacs_proof_status_lock_path(&dimacs_proof_status_path(&proof.path)).exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn synthesized_default_never_overwrites_preexisting_status_output() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_path = dir.path().join("input.cnf.drat");
+    let proof = ProofConfig {
+        path: proof_path.to_string_lossy().into_owned(),
+        format: ProofFormat::Drat,
+        binary: false,
+        artifact_path: None,
+        is_temp: false,
+        synthesized_default: true,
+        format_was_explicit: false,
+    };
+    let status_path = dimacs_proof_status_path(&proof.path);
+    std::fs::write(&status_path, b"unrelated status bytes\n").expect("seed status replacement");
+
+    let error = create_configured_dimacs_proof_file(&proof)
+        .expect_err("preexisting status must reject the proof transaction");
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        std::fs::read(&status_path).expect("read preserved status"),
+        b"unrelated status bytes\n"
+    );
+    assert!(!proof_path.exists());
+    assert!(!dimacs_proof_status_lock_path(&status_path).exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn status_lock_post_create_identity_failure_cleans_exact_owned_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_path = dir.path().join("input.cnf.drat");
+    let proof = ProofConfig {
+        path: proof_path.to_string_lossy().into_owned(),
+        format: ProofFormat::Drat,
+        binary: false,
+        artifact_path: None,
+        is_temp: false,
+        synthesized_default: true,
+        format_was_explicit: false,
+    };
+    let status_path = dimacs_proof_status_path(&proof.path);
+    let lock_path = dimacs_proof_status_lock_path(&status_path);
+    inject_dimacs_status_lock_identity_failure_once();
+
+    let error = create_configured_dimacs_proof_file(&proof)
+        .expect_err("injected status-lock identity failure must abort reservation");
+    assert!(error
+        .to_string()
+        .contains("injected DIMACS proof status lock identity"));
+    assert!(!proof_path.exists());
+    assert!(!status_path.exists());
+    assert!(!lock_path.exists(), "owned lock pathname must be removed");
+    assert_eq!(
+        private_dimacs_staging_debris_bytes(dir.path()),
+        vec![Vec::<u8>::new()]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn concurrent_synthesized_default_loser_cannot_replace_winner_status() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_path = dir.path().join("input.cnf.drat");
+    let proof = ProofConfig {
+        path: proof_path.to_string_lossy().into_owned(),
+        format: ProofFormat::Drat,
+        binary: false,
+        artifact_path: None,
+        is_temp: false,
+        synthesized_default: true,
+        format_was_explicit: false,
+    };
+    let mut winner =
+        create_configured_dimacs_proof_file(&proof).expect("winner reserves transaction");
+    let losing_proof = proof.clone();
+    let loser = std::thread::spawn(move || create_configured_dimacs_proof_file(&losing_proof));
+    let loser_error = loser
+        .join()
+        .expect("loser thread")
+        .expect_err("loser must not share the status transaction");
+    assert_eq!(loser_error.kind(), std::io::ErrorKind::AlreadyExists);
+
+    winner.write_all(b"0\n").expect("write winner proof");
+    winner.flush().expect("flush winner proof");
+    drop(winner);
+    let published = seal_owned_dimacs_proof(&proof.path).expect("seal winner proof");
+    let mut publication = retained_test_transaction(&proof, published, false);
+    mark_synthesized_default_dimacs_proof_current(&proof, published, &mut publication)
+        .expect("publish winner status");
+    publication.validate().expect("validate winner transaction");
+    publication.commit();
+    let status_path = dimacs_proof_status_path(&proof.path);
+    let winner_status = std::fs::read(&status_path).expect("read winner status");
+    assert!(String::from_utf8_lossy(&winner_status).contains("status=current-same-run"));
+
+    mark_synthesized_default_dimacs_proof_stale(&proof);
+    assert_eq!(
+        std::fs::read(&status_path).expect("read preserved winner status"),
+        winner_status,
+        "a later losing run must not relabel the winner's marker"
+    );
+    assert!(remove_owned_dimacs_proof(&proof.path).expect("remove winner proof"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn late_status_collision_removes_only_the_owned_proof_generation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_path = dir.path().join("input.cnf.drat");
+    let proof = ProofConfig {
+        path: proof_path.to_string_lossy().into_owned(),
+        format: ProofFormat::Drat,
+        binary: false,
+        artifact_path: None,
+        is_temp: false,
+        synthesized_default: true,
+        format_was_explicit: false,
+    };
+    let mut output = create_configured_dimacs_proof_file(&proof).expect("reserve proof");
+    output.write_all(b"0\n").expect("write proof");
+    drop(output);
+    let published = seal_owned_dimacs_proof(&proof.path).expect("seal proof");
+    let status_path = dimacs_proof_status_path(&proof.path);
+    std::fs::write(&status_path, b"raced unrelated status\n").expect("plant status collision");
+
+    let mut publication = retained_test_transaction(&proof, published, false);
+    mark_synthesized_default_dimacs_proof_current(&proof, published, &mut publication)
+        .expect_err("status publication must not clobber the raced file");
+    publication.invalidate_exact();
+    assert!(remove_owned_dimacs_proof(&proof.path).expect("remove only owned proof"));
+    assert!(!proof_path.exists());
+    assert_eq!(
+        std::fs::read(&status_path).expect("read status replacement"),
+        b"raced unrelated status\n"
+    );
+    assert_eq!(
+        std::fs::read(dimacs_proof_status_lock_path(&status_path))
+            .expect("read invalid status lock tombstone"),
+        b""
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn current_status_remains_absent_until_required_artifact_is_published() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_path = dir.path().join("input.cnf.drat");
+    let artifact_path = dir.path().join("proof-artifact.json");
+    let proof = ProofConfig {
+        path: proof_path.to_string_lossy().into_owned(),
+        format: ProofFormat::Drat,
+        binary: false,
+        artifact_path: Some(artifact_path.to_string_lossy().into_owned()),
+        is_temp: false,
+        synthesized_default: true,
+        format_was_explicit: false,
+    };
+    let mut output = create_configured_dimacs_proof_file(&proof).expect("reserve proof");
+    output.write_all(b"0\n").expect("write proof");
+    drop(output);
+    seal_owned_dimacs_proof(&proof.path).expect("seal proof");
+
+    let status_path = dimacs_proof_status_path(&proof.path);
+    assert!(
+        !status_path.exists(),
+        "current status must not precede the required artifact transaction"
+    );
+    assert!(
+        dimacs_proof_status_lock_path(&status_path).exists(),
+        "status ownership must remain reserved while later artifacts are pending"
+    );
+    assert!(remove_owned_dimacs_proof(&proof.path).expect("remove proof after artifact failure"));
+    let status = std::fs::read_to_string(&status_path).expect("read stale status marker");
+    assert!(status.contains("status=stale-not-current"));
+    assert!(!dimacs_proof_status_lock_path(&status_path).exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn status_failure_cleans_retained_artifact_without_touching_replacement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let problem_path = dir.path().join("input.cnf");
+    let problem = b"p cnf 0 1\n0\n";
+    std::fs::write(&problem_path, problem).expect("write problem");
+    let proof_path = dir.path().join("input.cnf.drat");
+    let artifact_path = dir.path().join("proof-artifact.json");
+    let proof = ProofConfig {
+        path: proof_path.to_string_lossy().into_owned(),
+        format: ProofFormat::Drat,
+        binary: false,
+        artifact_path: Some(artifact_path.to_string_lossy().into_owned()),
+        is_temp: false,
+        synthesized_default: true,
+        format_was_explicit: false,
+    };
+    let mut output = create_configured_dimacs_proof_file(&proof).expect("reserve proof");
+    output.write_all(b"0\n").expect("write proof");
+    drop(output);
+    let published = seal_owned_dimacs_proof(&proof.path).expect("seal proof");
+    let (artifact_descriptor, artifact_public_path) =
+        crate::proof_artifact::write_sealed_proof_artifact(
+            crate::proof_artifact::ProofArtifactProblem::AuthenticatedFilePath {
+                path: problem_path.to_str().expect("UTF-8 problem path"),
+                sha256: sha256_digest(problem),
+            },
+            &proof,
+            crate::proof_artifact::ProofArtifactTheoryMetadata::dimacs_sat(0, 1),
+            published.sha256,
+        )
+        .expect("publish retained artifact")
+        .expect("configured artifact");
+    let retained_artifact = RetainedDimacsPublication::capture(
+        artifact_descriptor,
+        artifact_public_path,
+        "DIMACS proof artifact",
+        None,
+        DimacsPublicationInvalidation::Empty,
+    )
+    .expect("retain artifact authority");
+    let retained_proof = retain_published_dimacs_proof(&proof.path, published, proof.binary)
+        .expect("retain proof authority");
+    let mut publication =
+        DimacsUnsatPublicationTransaction::new(retained_proof, Some(retained_artifact), false);
+    let status_path = dimacs_proof_status_path(&proof.path);
+    std::fs::write(&status_path, b"unrelated raced status\n").expect("plant status replacement");
+
+    mark_synthesized_default_dimacs_proof_current(&proof, published, &mut publication)
+        .expect_err("raced status must invalidate final publication");
+    publication.invalidate_exact();
+    assert!(remove_owned_dimacs_proof(&proof.path).expect("remove owned proof"));
+    assert_eq!(
+        std::fs::read(&artifact_path).expect("read invalidated artifact"),
+        b""
+    );
+    assert!(!proof_path.exists());
+    assert_eq!(
+        std::fs::read(&status_path).expect("read preserved status replacement"),
+        b"unrelated raced status\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn status_lock_cleanup_preserves_a_raced_replacement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_path = dir.path().join("input.cnf.drat");
+    let proof = ProofConfig {
+        path: proof_path.to_string_lossy().into_owned(),
+        format: ProofFormat::Drat,
+        binary: false,
+        artifact_path: None,
+        is_temp: false,
+        synthesized_default: true,
+        format_was_explicit: false,
+    };
+    let mut output = create_configured_dimacs_proof_file(&proof).expect("reserve proof");
+    output.write_all(b"partial\n").expect("write staged proof");
+    drop(output);
+    let status_path = dimacs_proof_status_path(&proof.path);
+    let lock_path = dimacs_proof_status_lock_path(&status_path);
+    let displaced_lock = dir.path().join("displaced-owned-status-lock");
+    std::fs::rename(&lock_path, &displaced_lock).expect("displace owned lock");
+    std::fs::write(&lock_path, b"unrelated lock replacement\n").expect("plant replacement");
+
+    remove_owned_dimacs_proof(&proof.path)
+        .expect_err("replaced status lock must make cleanup report failure");
+    assert!(
+        !proof_path.exists(),
+        "owned proof generation must still be removed"
+    );
+    assert_eq!(
+        std::fs::read(&lock_path).expect("read restored lock replacement"),
+        b"unrelated lock replacement\n"
+    );
+    assert_eq!(
+        std::fs::read(&displaced_lock).expect("read displaced owned lock"),
+        b""
+    );
+    std::fs::remove_file(&lock_path).expect("remove unrelated lock replacement");
+    assert!(
+        !remove_owned_dimacs_proof(&proof.path).expect("retry settled removed proof state"),
+        "the proof generation was already removed on the first cleanup attempt"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn retained_proof_replacement_invalidates_exact_inode_for_both_policies() {
+    for optional in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let proof_path = dir.path().join("proof.drat");
+        let displaced = dir.path().join("displaced-owned-proof.drat");
+        let proof = ProofConfig {
+            path: proof_path.to_string_lossy().into_owned(),
+            format: ProofFormat::Drat,
+            binary: false,
+            artifact_path: None,
+            is_temp: false,
+            synthesized_default: optional,
+            format_was_explicit: false,
+        };
+        let mut output = if optional {
+            create_configured_dimacs_proof_file(&proof).expect("reserve optional proof")
+        } else {
+            create_owned_dimacs_proof_file(&proof.path).expect("reserve required proof")
+        };
+        output.write_all(b"0\n").expect("write proof");
+        drop(output);
+        let published = seal_owned_dimacs_proof(&proof.path).expect("seal proof");
+        let transaction = retained_test_transaction(&proof, published, optional);
+        let mut authority = super::AuthorizedDimacsUnsatPublication {
+            publication: Some(transaction),
+            temp_proof_path: None,
+        };
+
+        std::fs::rename(&proof_path, &displaced).expect("displace owned proof");
+        std::fs::write(&proof_path, b"unrelated proof replacement\n")
+            .expect("plant proof replacement");
+        let (reported_optional, reason) = authority
+            .validate_before_verdict()
+            .expect_err("replacement must revoke proof authority");
+        assert_eq!(reported_optional, optional);
+        assert!(reason.contains("lost namespace authority"));
+        assert_eq!(
+            std::fs::read(&proof_path).expect("read proof replacement"),
+            b"unrelated proof replacement\n"
+        );
+        assert_eq!(
+            std::fs::read(&displaced).expect("read exact invalidated proof"),
+            b"invalidated-by-ay\n"
+        );
+        assert!(
+            !remove_owned_dimacs_proof(&proof.path).expect("settle proof registry"),
+            "the replacement must not be attributed to AY"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn retained_status_replacement_invalidates_proof_and_exact_marker() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_path = dir.path().join("proof.drat");
+    let status_path = dimacs_proof_status_path(proof_path.to_str().expect("UTF-8 path"));
+    let displaced_status = dir.path().join("displaced-owned-status");
+    let proof = ProofConfig {
+        path: proof_path.to_string_lossy().into_owned(),
+        format: ProofFormat::Drat,
+        binary: false,
+        artifact_path: None,
+        is_temp: false,
+        synthesized_default: true,
+        format_was_explicit: false,
+    };
+    let mut output = create_configured_dimacs_proof_file(&proof).expect("reserve proof");
+    output.write_all(b"0\n").expect("write proof");
+    drop(output);
+    let published = seal_owned_dimacs_proof(&proof.path).expect("seal proof");
+    let mut transaction = retained_test_transaction(&proof, published, false);
+    mark_synthesized_default_dimacs_proof_current(&proof, published, &mut transaction)
+        .expect("publish current marker");
+    let mut authority = super::AuthorizedDimacsUnsatPublication {
+        publication: Some(transaction),
+        temp_proof_path: None,
+    };
+
+    std::fs::rename(&status_path, &displaced_status).expect("displace owned status");
+    std::fs::write(&status_path, b"unrelated status replacement\n")
+        .expect("plant status replacement");
+    let (optional, _) = authority
+        .validate_before_verdict()
+        .expect_err("replacement must revoke status authority");
+    assert!(!optional);
+    assert_eq!(
+        std::fs::read(&status_path).expect("read status replacement"),
+        b"unrelated status replacement\n"
+    );
+    assert_eq!(
+        std::fs::read(&displaced_status).expect("read invalidated exact status"),
+        b""
+    );
+    assert_eq!(
+        std::fs::read(&proof_path).expect("read invalidated proof"),
+        b"invalidated-by-ay\n"
+    );
+    assert!(remove_owned_dimacs_proof(&proof.path).expect("settle proof registry"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn retained_artifact_replacement_invalidates_proof_and_exact_artifact() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let problem_path = dir.path().join("input.cnf");
+    let problem = b"p cnf 0 1\n0\n";
+    std::fs::write(&problem_path, problem).expect("write problem");
+    let proof_path = dir.path().join("proof.drat");
+    let artifact_path = dir.path().join("proof-artifact.json");
+    let displaced_artifact = dir.path().join("displaced-owned-artifact.json");
+    let proof = ProofConfig {
+        path: proof_path.to_string_lossy().into_owned(),
+        format: ProofFormat::Drat,
+        binary: false,
+        artifact_path: Some(artifact_path.to_string_lossy().into_owned()),
+        is_temp: false,
+        synthesized_default: false,
+        format_was_explicit: false,
+    };
+    let mut output = create_configured_dimacs_proof_file(&proof).expect("reserve proof");
+    output.write_all(b"0\n").expect("write proof");
+    drop(output);
+    let published = seal_owned_dimacs_proof(&proof.path).expect("seal proof");
+    let (artifact_descriptor, artifact_public_path) =
+        crate::proof_artifact::write_sealed_proof_artifact(
+            crate::proof_artifact::ProofArtifactProblem::AuthenticatedFilePath {
+                path: problem_path.to_str().expect("UTF-8 problem path"),
+                sha256: sha256_digest(problem),
+            },
+            &proof,
+            crate::proof_artifact::ProofArtifactTheoryMetadata::dimacs_sat(0, 1),
+            published.sha256,
+        )
+        .expect("publish artifact")
+        .expect("configured artifact");
+    let retained_artifact = RetainedDimacsPublication::capture(
+        artifact_descriptor,
+        artifact_public_path,
+        "DIMACS proof artifact",
+        None,
+        DimacsPublicationInvalidation::Empty,
+    )
+    .expect("retain artifact authority");
+    let retained_proof = retain_published_dimacs_proof(&proof.path, published, proof.binary)
+        .expect("retain proof authority");
+    let transaction =
+        DimacsUnsatPublicationTransaction::new(retained_proof, Some(retained_artifact), false);
+    let mut authority = super::AuthorizedDimacsUnsatPublication {
+        publication: Some(transaction),
+        temp_proof_path: None,
+    };
+
+    std::fs::rename(&artifact_path, &displaced_artifact).expect("displace owned artifact");
+    std::fs::write(&artifact_path, b"unrelated artifact replacement\n")
+        .expect("plant artifact replacement");
+    authority
+        .validate_before_verdict()
+        .expect_err("replacement must revoke artifact authority");
+    assert_eq!(
+        std::fs::read(&artifact_path).expect("read artifact replacement"),
+        b"unrelated artifact replacement\n"
+    );
+    assert_eq!(
+        std::fs::read(&displaced_artifact).expect("read invalidated exact artifact"),
+        b""
+    );
+    assert_eq!(
+        std::fs::read(&proof_path).expect("read invalidated proof"),
+        b"invalidated-by-ay\n"
+    );
+    assert!(remove_owned_dimacs_proof(&proof.path).expect("settle proof registry"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn temporary_proof_stays_valid_until_verdict_then_preserves_replacement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_path = dir.path().join("verify-only.drat");
+    let displaced = dir.path().join("displaced-verify-only.drat");
+    let proof = ProofConfig {
+        path: proof_path.to_string_lossy().into_owned(),
+        format: ProofFormat::Drat,
+        binary: false,
+        artifact_path: None,
+        is_temp: true,
+        synthesized_default: false,
+        format_was_explicit: false,
+    };
+    let mut output = create_configured_dimacs_proof_file(&proof).expect("reserve temp proof");
+    output.write_all(b"0\n").expect("write proof");
+    drop(output);
+    let published = seal_owned_dimacs_proof(&proof.path).expect("seal temp proof");
+    let transaction = retained_test_transaction(&proof, published, false);
+    let mut authority = super::AuthorizedDimacsUnsatPublication {
+        publication: Some(transaction),
+        temp_proof_path: Some(proof.path.clone()),
+    };
+
+    authority
+        .validate_before_verdict()
+        .expect("temp proof must remain valid through the verdict gate");
+    assert_eq!(
+        std::fs::read(&proof_path).expect("read live temp proof"),
+        b"0\n"
+    );
+    std::fs::rename(&proof_path, &displaced).expect("race temp proof after verdict gate");
+    std::fs::write(&proof_path, b"unrelated post-verdict replacement\n")
+        .expect("plant post-verdict replacement");
+    authority.commit_after_verdict();
+
+    assert_eq!(
+        std::fs::read(&proof_path).expect("read preserved replacement"),
+        b"unrelated post-verdict replacement\n"
+    );
+    assert_eq!(
+        std::fs::read(&displaced).expect("read exact-invalidated temp proof"),
+        b"invalidated-by-ay\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn proof_tombstones_reject_empty_clause_input_that_accepts_empty_drat() {
+    use ay_drat_check::checker::DratChecker;
+    use ay_drat_check::cnf_parser::parse_cnf;
+    use ay_drat_check::drat_parser::parse_drat;
+
+    let cnf = parse_cnf(&b"p cnf 0 1\n0\n"[..]).expect("parse empty-clause CNF");
+    let empty_steps = parse_drat(b"").expect("parse empty DRAT");
+    let mut checker = DratChecker::new(cnf.num_vars, true);
+    checker
+        .verify(&cnf.clauses, &empty_steps)
+        .expect("an initial empty clause needs no DRAT steps");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let text_path = dir.path().join("text.drat");
+    let text = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&text_path)
+        .expect("create text proof");
+    super::invalidate_dimacs_descriptor(
+        &text,
+        DimacsPublicationInvalidation::Proof { binary: false },
+    )
+    .expect("invalidate text proof");
+    let text_tombstone = std::fs::read(&text_path).expect("read text tombstone");
+    assert_eq!(text_tombstone, b"invalidated-by-ay\n");
+    assert!(parse_drat(&text_tombstone).is_err());
+    assert!(ay_lrat_check::lrat_parser::parse_text_lrat(
+        std::str::from_utf8(&text_tombstone).expect("text tombstone is UTF-8")
+    )
+    .is_err());
+
+    let binary_path = dir.path().join("binary.drat");
+    let binary = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&binary_path)
+        .expect("create binary proof");
+    super::invalidate_dimacs_descriptor(
+        &binary,
+        DimacsPublicationInvalidation::Proof { binary: true },
+    )
+    .expect("invalidate binary proof");
+    let binary_tombstone = std::fs::read(&binary_path).expect("read binary tombstone");
+    assert_eq!(binary_tombstone, b"\x80");
+    assert!(parse_drat(&binary_tombstone).is_err());
+    assert!(ay_lrat_check::lrat_parser::parse_binary_lrat(&binary_tombstone).is_err());
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn unsupported_platform_proof_gate_mutates_no_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let proof_path = dir.path().join("proof.drat");
+    let proof = ProofConfig {
+        path: proof_path.to_string_lossy().into_owned(),
+        format: ProofFormat::Drat,
+        binary: false,
+        artifact_path: None,
+        is_temp: false,
+        synthesized_default: true,
+        format_was_explicit: false,
+    };
+    let error = create_configured_dimacs_proof_file(&proof)
+        .expect_err("unsupported platform must fail before mutation");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert!(std::fs::read_dir(dir.path())
+        .expect("read untouched directory")
+        .next()
+        .is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dimacs_proof_identity_failure_cleans_descriptor_owned_staging() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    inject_dimacs_proof_identity_failure_once();
+
+    let error = create_owned_dimacs_proof_file(path.to_str().expect("UTF-8 path"))
+        .expect_err("injected identity failure must reject proof setup");
+
+    assert!(error.to_string().contains("injected DIMACS proof identity"));
+    assert!(!path.exists(), "failed setup must not publish a proof");
+    assert!(
+        private_dimacs_staging_entries(dir.path()).is_empty(),
+        "identity failure must remove descriptor-owned private staging"
+    );
+    assert!(
+        !remove_owned_dimacs_proof(path.to_str().expect("UTF-8 path"))
+            .expect("failed setup must not leave a registry entry")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dimacs_proof_clone_failure_cleans_descriptor_owned_staging() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    inject_dimacs_proof_clone_failure_once();
+
+    let error = create_owned_dimacs_proof_file(path.to_str().expect("UTF-8 path"))
+        .expect_err("injected clone failure must reject proof setup");
+
+    assert!(error.to_string().contains("injected DIMACS proof clone"));
+    assert!(!path.exists(), "failed setup must not publish a proof");
+    assert!(
+        private_dimacs_staging_entries(dir.path()).is_empty(),
+        "clone failure must remove descriptor-owned private staging"
+    );
+    assert!(
+        !remove_owned_dimacs_proof(path.to_str().expect("UTF-8 path"))
+            .expect("failed setup must not leave a registry entry")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn optional_writer_failure_is_visible_to_seal_and_never_publishes_partial_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    let path_text = path.to_str().expect("UTF-8 path");
+    let file = create_owned_dimacs_proof_file(path_text).expect("reserve proof");
+    let failed = owned_dimacs_proof_write_failure_flag(path_text).expect("failure flag");
+    let mut writer = SolverDimacsProofWriter::Optional {
+        writer: proof_output_writer(file),
+        path: path_text.to_string(),
+        failed,
+    };
+
+    inject_optional_dimacs_writer_failure_once();
+    std::io::Write::write_all(&mut writer, b"partial proof bytes\n")
+        .expect("optional solver writer must preserve verdict progress");
+    std::io::Write::flush(&mut writer).expect("failed optional writer flush is absorbed");
+    drop(writer);
+
+    let error = seal_owned_dimacs_proof(path_text)
+        .expect_err("an earlier optional writer failure must prohibit sealing");
+    assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+    assert!(
+        !path.exists(),
+        "partial proof bytes must never be published"
+    );
+    assert!(remove_owned_dimacs_proof(path_text).expect("discard failed staging"));
+    assert!(private_dimacs_staging_entries(dir.path()).is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dimacs_proof_output_does_not_follow_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let victim = dir.path().join("victim");
+    let path = dir.path().join("proof.drat");
+    std::fs::write(&victim, b"victim bytes\n").expect("seed victim");
+    symlink(&victim, &path).expect("create proof symlink");
+
+    create_owned_dimacs_proof_file(path.to_str().expect("UTF-8 path"))
+        .expect_err("proof creation must reject a pre-existing symlink");
+    assert_eq!(
+        std::fs::read(&victim).expect("read victim"),
+        b"victim bytes\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dimacs_proof_seal_never_clobbers_raced_target() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    let path_text = path.to_str().expect("UTF-8 path");
+    let mut proof = create_owned_dimacs_proof_file(path_text).expect("reserve proof");
+    std::io::Write::write_all(&mut proof, b"0\n").expect("write proof");
+    std::io::Write::flush(&mut proof).expect("flush proof");
+    drop(proof);
+
+    assert!(
+        !path.exists(),
+        "unsealed proof must remain privately staged"
+    );
+    std::fs::write(&path, b"replacement\n").expect("plant replacement");
+    seal_owned_dimacs_proof(path_text).expect_err("replacement must invalidate publication");
+    assert!(remove_owned_dimacs_proof(path_text).expect("discard private staging"));
+    assert_eq!(
+        std::fs::read(&path).expect("read replacement"),
+        b"replacement\n"
+    );
+    assert!(private_dimacs_staging_entries(dir.path()).is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dimacs_published_proof_is_bound_to_owned_generation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    let path_text = path.to_str().expect("UTF-8 path");
+    let mut proof = create_owned_dimacs_proof_file(path_text).expect("reserve proof");
+    std::io::Write::write_all(&mut proof, b"0\n").expect("write proof");
+    std::io::Write::flush(&mut proof).expect("flush proof");
+    drop(proof);
+
+    assert!(
+        !path.exists(),
+        "unsealed proof must not be publicly visible"
+    );
+    let seal = seal_owned_dimacs_proof(path_text).expect("seal proof");
+    assert!(
+        private_dimacs_staging_entries(dir.path()).is_empty(),
+        "successful publication must not leak a private staging directory"
+    );
+    assert_eq!(
+        read_published_dimacs_proof(path_text, seal.sha256).expect("authenticated read"),
+        b"0\n"
+    );
+    assert!(remove_owned_dimacs_proof(path_text).expect("remove owned proof"));
+    assert!(!path.exists());
+    assert_eq!(
+        private_dimacs_staging_debris_bytes(dir.path()),
+        vec![b"invalidated-by-ay\n".to_vec()]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dimacs_cleanup_retains_registry_authority_across_retryable_failure() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    let path_text = path.to_str().expect("UTF-8 path");
+    let mut proof = create_owned_dimacs_proof_file(path_text).expect("reserve proof");
+    std::io::Write::write_all(&mut proof, b"0\n").expect("write proof");
+    drop(proof);
+    seal_owned_dimacs_proof(path_text).expect("seal proof");
+    inject_dimacs_proof_cleanup_failure_once();
+
+    remove_owned_dimacs_proof(path_text)
+        .expect_err("injected post-quarantine cleanup failure must surface");
+    assert!(!path.exists(), "owned proof must already be quarantined");
+    assert_eq!(private_dimacs_staging_entries(dir.path()).len(), 1);
+    assert!(
+        !remove_owned_dimacs_proof(path_text).expect("registry-held cleanup retry must settle"),
+        "the public name was already quarantined on the first attempt"
+    );
+    assert_eq!(
+        private_dimacs_staging_debris_bytes(dir.path()),
+        vec![b"invalidated-by-ay\n".to_vec()]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dimacs_cleanup_preserves_replacement_raced_after_quarantine() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    let path_text = path.to_str().expect("UTF-8 path");
+    let mut proof = create_owned_dimacs_proof_file(path_text).expect("reserve proof");
+    std::io::Write::write_all(&mut proof, b"0\n").expect("write proof");
+    drop(proof);
+    seal_owned_dimacs_proof(path_text).expect("seal proof");
+    inject_dimacs_proof_cleanup_replacement_once();
+
+    assert!(remove_owned_dimacs_proof(path_text).expect("remove quarantined owned proof"));
+    assert_eq!(
+        std::fs::read(&path).expect("read raced replacement"),
+        b"raced replacement\n"
+    );
+    assert_eq!(
+        private_dimacs_staging_debris_bytes(dir.path()),
+        vec![b"invalidated-by-ay\n".to_vec()]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn dimacs_cleanup_restores_replacement_found_before_quarantine() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("proof.drat");
+    let displaced = dir.path().join("displaced-owned-proof.drat");
+    let path_text = path.to_str().expect("UTF-8 path");
+    let mut proof = create_owned_dimacs_proof_file(path_text).expect("reserve proof");
+    std::io::Write::write_all(&mut proof, b"0\n").expect("write proof");
+    drop(proof);
+    seal_owned_dimacs_proof(path_text).expect("seal proof");
+    std::fs::rename(&path, &displaced).expect("displace owned proof");
+    std::fs::write(&path, b"replacement before cleanup\n").expect("plant replacement");
+
+    assert!(!remove_owned_dimacs_proof(path_text).expect("restore unrelated replacement"));
+    assert_eq!(
+        std::fs::read(&path).expect("read restored replacement"),
+        b"replacement before cleanup\n"
+    );
+    assert_eq!(
+        std::fs::read(&displaced).expect("read displaced proof"),
+        b"invalidated-by-ay\n"
+    );
+    assert_eq!(private_dimacs_staging_entries(dir.path()).len(), 1);
+}
+
+#[test]
+fn authenticated_dimacs_source_rejects_replacement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("problem.cnf");
+    let original = b"p cnf 1 1\n1 0\n";
+    std::fs::write(&path, original).expect("write original problem");
+    let digest = sha256_digest(original);
+    let path_text = path.to_str().expect("UTF-8 path");
+    assert_eq!(
+        read_authenticated_dimacs_source(path_text, digest).expect("authenticated read"),
+        std::str::from_utf8(original).expect("ASCII")
+    );
+
+    std::fs::write(&path, b"p cnf 1 1\n-1 0\n").expect("replace problem");
+    read_authenticated_dimacs_source(path_text, digest)
+        .expect_err("replacement must not be rebound to the proof");
+}
+
+#[test]
+fn explicit_proof_verification_never_accepts_a_skipped_check() {
+    assert!(verification_skip_is_acceptable(false));
+    assert!(!verification_skip_is_acceptable(true));
 }

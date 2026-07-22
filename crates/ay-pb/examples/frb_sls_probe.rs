@@ -358,7 +358,7 @@ fn solve_clique(
     }
 
     // Build adjacency bitsets.
-    let words = (nv + 63) / 64;
+    let words = nv.div_ceil(64);
     let mut adj = vec![0u64; nv * words];
     let set_adj = |adj: &mut [u64], u: usize, w: usize| {
         adj[u * words + (w >> 6)] |= 1u64 << (w & 63);
@@ -1293,7 +1293,7 @@ fn main() {
                     }
                     other => {
                         println!("s UNKNOWN");
-                        eprintln!("c extension not SAT: {:?}", other);
+                        eprintln!("c extension not SAT: {other:?}");
                     }
                 }
             }
@@ -1362,8 +1362,7 @@ fn main() {
                     }
                 }
                 eprintln!(
-                    "c phase-seeded {} one-hot vars on clean core; finishing with CDCL ...",
-                    seeded
+                    "c phase-seeded {seeded} one-hot vars on clean core; finishing with CDCL ..."
                 );
                 match core_solver.solve().into_inner() {
                     SatResult::Sat(core_model) => {
@@ -1397,13 +1396,13 @@ fn main() {
                             }
                             other => {
                                 println!("s UNKNOWN");
-                                eprintln!("c log recovery not SAT: {:?}", other);
+                                eprintln!("c log recovery not SAT: {other:?}");
                             }
                         }
                     }
                     other => {
                         println!("s UNKNOWN");
-                        eprintln!("c phase-seeded core CDCL did not finish: {:?}", other);
+                        eprintln!("c phase-seeded core CDCL did not finish: {other:?}");
                     }
                 }
             }
@@ -1482,13 +1481,13 @@ fn main() {
                         }
                         other => {
                             println!("s UNKNOWN");
-                            eprintln!("c extend not SAT: {:?}", other);
+                            eprintln!("c extend not SAT: {other:?}");
                         }
                     }
                 }
                 other => {
                     println!("s UNKNOWN");
-                    eprintln!("c nolog core CDCL: {:?}", other);
+                    eprintln!("c nolog core CDCL: {other:?}");
                 }
             }
             return;
@@ -1531,7 +1530,7 @@ fn main() {
                     }
                     other => {
                         println!("s UNKNOWN");
-                        eprintln!("c extension did not return SAT: {:?}", other);
+                        eprintln!("c extension did not return SAT: {other:?}");
                     }
                 }
             }
@@ -1592,7 +1591,7 @@ fn main() {
                     }
                     other => {
                         println!("s UNKNOWN");
-                        eprintln!("c extension did not return SAT: {:?}", other);
+                        eprintln!("c extension did not return SAT: {other:?}");
                     }
                 }
             }

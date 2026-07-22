@@ -128,12 +128,25 @@ impl Executor {
                     // un-named equivalent (base ∧ named ∧ literals through
                     // the plain pipeline) while the base is still stripped.
                     // See `rescue_named_core_redirect_unknown`.
-                    let result = match result {
+                    let (result, rescue_elapsed) = match result {
                         Ok(SolveResult::Unknown) => {
-                            self.rescue_named_core_redirect_unknown(&combined)
+                            let rescue_started = Instant::now();
+                            let rescued = self.rescue_named_core_redirect_unknown(&combined);
+                            (rescued, Some(rescue_started.elapsed()))
                         }
-                        other => other,
+                        other => (other, None),
                     };
+
+                    // Deletion-based EUF/ArrayEuf core minimization while the
+                    // base is still stripped (#uc-core-minimize): shrinks the
+                    // certified core — including the empty-harvest→pad-all
+                    // theory-refutation case AND the rescue's conservative
+                    // all-assumptions core — by re-solving subsets, budget-
+                    // aware and fail-closed (only solve-verified subsets are
+                    // adopted). Runs AFTER the rescue: the measured
+                    // reduction-0 families (QG-classification, storecomm)
+                    // reach unsat through it.
+                    let result = self.minimize_assumption_core(&combined, result, rescue_elapsed);
 
                     // Restore original assertions BEFORE propagating any error:
                     // internal callers `?` through this path and a lost
@@ -294,10 +307,18 @@ impl Executor {
         result
     }
 
-    fn check_sat_assuming_with_controls_inner(
-        &mut self,
-        assumptions: &[TermId],
-    ) -> Result<SolveResult> {
+    /// Per-check solve-session state reset shared by the
+    /// `check-sat-assuming` entry and the unsat-core minimization pass's
+    /// scoped subset re-solves (#uc-core-minimize).
+    ///
+    /// FACTORED OUT for the minimization loop: `solve_scoped_assumptions`
+    /// assumes it runs right after this reset (the rescue calls it exactly
+    /// once per check). Repeated scoped re-solves WITHOUT the reset let
+    /// per-check scratch state (array axiom scope, ROW seeding, delegated
+    /// validation sets, ...) compound across attempts — measured as an RSS
+    /// blow-up/hang on QF_AX swap subset re-solves that are trivially cheap
+    /// in a fresh process.
+    pub(in crate::executor) fn reset_solve_session_state(&mut self) {
         self.clear_active_solve_phase();
         // Clear any previous model/proof
         self.last_model = None;
@@ -333,6 +354,13 @@ impl Executor {
         self.array_axiom_scope = None;
         self.row_seeded_terms.clear();
         self.proof_check_result = None;
+    }
+
+    fn check_sat_assuming_with_controls_inner(
+        &mut self,
+        assumptions: &[TermId],
+    ) -> Result<SolveResult> {
+        self.reset_solve_session_state();
 
         // Store assumptions for potential get-unsat-assumptions call
         self.last_assumptions = Some(assumptions.to_vec());
@@ -1119,7 +1147,10 @@ impl Executor {
         }
     }
 
-    fn solve_scoped_assumptions(
+    /// `pub(in crate::executor)`: also the subset-solve engine of the
+    /// unsat-core minimization pass (#uc-core-minimize, core_minimize.rs)
+    /// for verdicts obtained through the scoped-plain rescue.
+    pub(in crate::executor) fn solve_scoped_assumptions(
         &mut self,
         base_assertions: &[TermId],
         assumptions: &[TermId],

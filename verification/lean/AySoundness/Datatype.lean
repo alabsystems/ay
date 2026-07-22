@@ -179,4 +179,118 @@ theorem ex_acyclic_via_principle :
     ¬ (node leaf leaf = node (node leaf leaf) leaf) :=
   acyclic_conflict_unsat (node leaf leaf) leaf
 
+/-! ## Generic acyclicity via the auto-derived `sizeOf` (theory-agnostic).
+
+    The `depth`-based `acyclic_l`/`acyclic_r`/`acyclic_conflict_unsat` above are
+    hard-specialised to `Tree` and its IMMEDIATE children.  ay's occurs-check,
+    however, fires over ARBITRARY inductive datatypes and at ARBITRARY nesting
+    depth — cons-lists (`x = h :: x`), depth-≥2 nesting (`x = a :: b :: x`),
+    selector-mediated cycles (`v = tl v`), and any user datatype
+    (`x = C(.., x, ..)`).  We discharge ALL of these uniformly with Lean's
+    auto-derived structural `sizeOf`: every genuine constructor context `ctx`
+    that contains `t` as a PROPER subterm strictly increases `sizeOf`, and equal
+    terms have equal `sizeOf`, so `t = ctx t` is impossible.  No bespoke measure,
+    no per-datatype boilerplate — the hypothesis `sizeOf t < sizeOf (ctx t)` is
+    closed by `simp [C.sizeOf_spec]; omega` for the concrete `ctx` the emitter
+    sees. -/
+
+/-- **Generic acyclicity.**  If a unary context `ctx` strictly increases `sizeOf`
+    at `t`, then `t ≠ ctx t`.  Every real datatype constructor application that
+    contains `t` as a proper subterm satisfies the hypothesis, so this subsumes
+    the `Tree`-specific `acyclic_l`/`acyclic_r` for ANY inductive `α`. -/
+theorem acyclic_of_sizeOf_lt {α : Type u} [SizeOf α] {t : α} {ctx : α → α}
+    (h : sizeOf t < sizeOf (ctx t)) : t ≠ ctx t := by
+  intro heq
+  have hz : sizeOf t = sizeOf (ctx t) := congrArg sizeOf heq
+  omega
+
+/-- **Generic acyclicity conflict** — the conflict-level corollary the firewall
+    emitter grounds the occurs-check lemma in.  For the abstracted occurs-check
+    atom `t = ctx t`, the literal set `{ t = ctx t }` is unsatisfiable in every
+    model whenever `ctx` strictly increases `sizeOf` at `t`.  This is the generic
+    analog of `acyclic_conflict_unsat`, usable through
+    `AySoundness.firewall_combined_unsat` exactly as `dist_conflict_unsat` is used
+    in `CombinedDatatype` (discharge the theory lemma's `hvalid`/`lemmas_valid`
+    obligation `clauseSat _ [-k] = true` for the occurs-check atom `k` by this
+    principle, since no model of the datatype satisfies `t = ctx t`). -/
+theorem acyclic_conflict_generic {α : Type u} [SizeOf α] {t : α} {ctx : α → α}
+    (h : sizeOf t < sizeOf (ctx t)) : ¬ (t = ctx t) :=
+  fun heq => acyclic_of_sizeOf_lt h heq
+
+/-! ### Coverage witnesses — the occurs-check shapes ay actually emits.
+
+    Each closes the `sizeOf` hypothesis with `simp [C.sizeOf_spec]; omega`, the
+    uniform recipe the emitter uses for a concrete constructor context `ctx`. -/
+
+/-- Cons-list, immediate: `x ≠ h :: x`  (`ctx := (h :: ·)`). -/
+example (h : Nat) (x : List Nat) : x ≠ h :: x :=
+  acyclic_of_sizeOf_lt (ctx := (h :: ·))
+    (by simp only [List.cons.sizeOf_spec]; omega)
+
+/-- Cons-list, depth-≥2 nesting: `x ≠ a :: b :: x`  (`ctx := (a :: b :: ·)`). -/
+example (a b : Nat) (x : List Nat) : x ≠ a :: b :: x :=
+  acyclic_of_sizeOf_lt (ctx := (a :: b :: ·))
+    (by simp only [List.cons.sizeOf_spec]; omega)
+
+/-- Nested element type: `x ≠ ys :: x` over `List (List Nat)`. -/
+example (x : List (List Nat)) (ys : List Nat) : x ≠ ys :: x :=
+  acyclic_of_sizeOf_lt (ctx := (ys :: ·))
+    (by simp only [List.cons.sizeOf_spec]; omega)
+
+/-- ANY user inductive: a two-field record-like constructor. -/
+inductive Wrap (β : Type) where
+  | mk : β → Wrap β → Wrap β
+  | nil : Wrap β
+
+/-- `w ≠ .mk b w`  (`ctx := Wrap.mk b`) — arbitrary datatype occurs-check. -/
+example (b : Nat) (w : Wrap Nat) : w ≠ Wrap.mk b w :=
+  acyclic_of_sizeOf_lt (ctx := Wrap.mk b)
+    (by simp only [Wrap.mk.sizeOf_spec]; omega)
+
+/-- The `Tree` occurs-check, re-derived generically (no bespoke `depth`):
+    `t ≠ node t r` via the auto-derived `sizeOf`, subsuming `acyclic_l`. -/
+example (t r : Tree) : t ≠ node t r :=
+  acyclic_of_sizeOf_lt (ctx := (node · r))
+    (by simp only [Tree.node.sizeOf_spec]; omega)
+
+/-- Selector-mediated occurs-check `v = tl v` also fits: model the selector's
+    fixpoint as a constructor context.  `v ≠ hd v :: v` is the constraint the
+    occurs check derives once `tl v = v` is oriented against `v = hd v :: tl v`. -/
+example (v : List Nat) : v ≠ v.headD 0 :: v :=
+  acyclic_of_sizeOf_lt (ctx := (v.headD 0 :: ·))
+    (by simp only [List.cons.sizeOf_spec]; omega)
+
+/-! ## Axiom 4 — tester / `is-C` mutual exclusion.
+
+    ay's datatype solver reasons about the constructor TESTERS `((_ is C) x)`:
+    every value is headed by exactly ONE constructor, so `((_ is C) x)` and
+    `((_ is D) x)` are mutually exclusive for `C ≠ D`, and in particular
+    `((_ is C) x) = true` together with `x = D(…)` (for `C ≠ D`) is a conflict.
+    This is the ONE datatype reasoning primitive not covered by injectivity /
+    distinctness / acyclicity, needed by the case-split firewall's tester branch
+    (`benchmarks/…/qf_dt_acyclicity_casesplit_false_sat.smt2`): the disjunctive
+    lemma clause `[-1, -4]` encodes `¬is-nd(x) ∨ ¬(lf = x)`.
+
+    We model the tester as a `Bool`-valued match on `Tree` — exactly how ay
+    lowers `((_ is node) ·)` — and prove that it cannot be `true` on a `leaf`. -/
+
+/-- The `node` tester `((_ is node) ·)` as ay lowers it: `true` on `node`,
+    `false` on `leaf`. -/
+def isNode : Tree → Bool
+  | node _ _ => true
+  | leaf => false
+
+/-- **Tester mutual-exclusion conflict.**  `((_ is node) x) = true` is
+    incompatible with `x = leaf`: no value is simultaneously `node`-headed and a
+    `leaf`.  This discharges the case-split firewall's tester disjunct `[-1,-4]`
+    (`¬is-node(x) ∨ ¬(leaf = x)` holds in every model). -/
+theorem tester_node_leaf_excl {x : Tree} (h1 : isNode x = true) (h2 : x = leaf) :
+    False := by
+  subst h2; simp [isNode] at h1
+
+/-- Symmetric orientation (`leaf = x`), the form the emitter's abstracted atom
+    `4 ↦ (leaf = x)` produces. -/
+theorem tester_node_leaf_excl' {x : Tree} (h1 : isNode x = true) (h2 : leaf = x) :
+    False := tester_node_leaf_excl h1 h2.symm
+
 end AySoundness.Datatype

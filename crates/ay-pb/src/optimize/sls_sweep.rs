@@ -452,7 +452,7 @@ fn sls_feasibility_wall_sweep() {
                 totals[mi].wrong += w as usize;
             }
         }
-        print!("{:>18}", name);
+        print!("{name:>18}");
         for mi in 0..nmodes {
             print!(" {:>12}", feas[mi]);
         }

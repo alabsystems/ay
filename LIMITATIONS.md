@@ -59,3 +59,14 @@ reproducible results and independently checked evidence.
   `(get-model)`, so the theory-search model is rejected by the independent
   soundness gate. Use the emitted CHC certificate (`.chccert`) for the
   invariant. Fix tracked for 0.1.x.
+
+- **Build time and running tests.** The workspace includes one very large crate
+  (`ay-dpll`, ~430,000 lines), so a from-scratch build of the whole workspace is
+  slow and is the dominant compile cost. To *use* AY, prefer the release binary
+  or build only the solver crate: `cargo build --release -p ay`. **Run tests per
+  crate** — `cargo test -p ay-sat`, `cargo test -p ay-dpll`, etc. A blanket
+  `cargo test --workspace --features cli` does not currently link: the binary
+  crates statically link the mimalloc allocator, whose symbols are then pulled
+  into those crates' unit-test binaries and collide. Splitting `ay-dpll` for
+  faster, parallel compilation and smoothing the whole-workspace test invocation
+  are tracked for a soon release.

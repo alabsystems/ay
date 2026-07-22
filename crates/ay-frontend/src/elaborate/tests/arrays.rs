@@ -405,6 +405,43 @@ fn test_elaborate_as_array_wrong_arity() {
     );
 }
 
+#[test]
+fn as_array_rejects_ambiguous_unary_overload() {
+    let commands = parse(
+        "(declare-fun f (Int) Int) (declare-fun f (Bool) Bool) \
+         (assert (= (_ as-array f) (_ as-array f)))",
+    )
+    .unwrap();
+    let mut ctx = Context::new();
+    assert!(
+        commands
+            .iter()
+            .try_for_each(|command| ctx.process_command(command).map(|_| ()))
+            .is_err(),
+        "as-array has no operand domain with which to disambiguate two unary overloads"
+    );
+}
+
+#[test]
+fn indexed_as_array_preserves_native_alias_identity() {
+    let mut ctx = Context::new();
+    ctx.register_native_function_alias(
+        "surface".to_string(),
+        "!private-as-array".to_string(),
+        vec![Sort::Int],
+        Sort::Bool,
+    )
+    .unwrap();
+    let commands = parse("(declare-const i Int) (assert (select (_ as-array surface) i))").unwrap();
+    for command in &commands {
+        ctx.process_command(command).unwrap();
+    }
+    let TermData::App(Symbol::Named(name), _) = ctx.terms.get(ctx.assertions[0]) else {
+        panic!("select(as-array(alias), i) must rewrite to the selected function");
+    };
+    assert_eq!(name, "!private-as-array");
+}
+
 /// Test default on const-array simplifies to value (#8534)
 #[test]
 fn test_elaborate_default_const_array() {
@@ -503,6 +540,81 @@ fn test_elaborate_array_map_select_rewrite() {
                 ctx.terms.get(lhs)
             ),
         }
+    }
+}
+
+#[test]
+fn indexed_array_map_resolves_exact_overload_and_preserves_identity() {
+    let mut ctx = Context::new();
+    ctx.register_native_function_alias(
+        "surface".to_string(),
+        "!private-int-domain".to_string(),
+        vec![Sort::Int],
+        Sort::Bool,
+    )
+    .unwrap();
+    ctx.register_native_function_alias(
+        "surface".to_string(),
+        "!private-bool-domain".to_string(),
+        vec![Sort::Bool],
+        Sort::Int,
+    )
+    .unwrap();
+    let commands = parse(
+        "(declare-const a (Array Int Bool)) (declare-const i Int) \
+         (assert (= (select ((_ map surface) a) i) 0))",
+    )
+    .unwrap();
+    for command in &commands {
+        ctx.process_command(command).unwrap();
+    }
+
+    let TermData::App(Symbol::Named(eq), args) = ctx.terms.get(ctx.assertions[0]) else {
+        panic!("assertion must remain equality");
+    };
+    assert_eq!(eq, "=");
+    let TermData::App(Symbol::Named(selected), _) = ctx.terms.get(args[0]) else {
+        panic!("select(map(alias), i) must rewrite to the selected function");
+    };
+    assert_eq!(selected, "!private-bool-domain");
+}
+
+#[test]
+fn indexed_array_map_rejects_same_domain_result_ambiguity() {
+    let commands = parse(
+        "(declare-fun f (Int) Int) (declare-fun f (Int) Bool) \
+         (declare-const a (Array Int Int)) (assert (= ((_ map f) a) a))",
+    )
+    .unwrap();
+    let mut ctx = Context::new();
+    assert!(
+        commands
+            .iter()
+            .try_for_each(|command| ctx.process_command(command).map(|_| ()))
+            .is_err(),
+        "array map must not choose between overloads with the same domain"
+    );
+}
+
+#[test]
+fn array_map_and_as_array_reject_defined_function_macros() {
+    for input in [
+        "(define-fun f ((x Int)) Int (+ x 1)) \
+         (declare-const a (Array Int Int)) \
+         (assert (= ((_ map f) a) a))",
+        "(define-fun f ((x Int)) Int (+ x 1)) \
+         (declare-const i Int) \
+         (assert (= (select (_ as-array f) i) (f i)))",
+    ] {
+        let commands = parse(input).unwrap();
+        let mut ctx = Context::new();
+        assert!(
+            commands
+                .iter()
+                .try_for_each(|command| ctx.process_command(command).map(|_| ()))
+                .is_err(),
+            "higher-order use of a definition must not turn it into a free UF: {input}"
+        );
     }
 }
 

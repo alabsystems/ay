@@ -592,8 +592,8 @@ mod tests {
         // Set arg0 = 0, arg1 = 3, result = 0. This is correct: 0 * 3 = 0.
         let mut assigned: Vec<Option<bool>> = vec![None; 12];
         // arg0 = 0
-        for i in 0..4 {
-            assigned[i] = Some(false);
+        for value in &mut assigned[..4] {
+            *value = Some(false);
         }
         // arg1 = 3
         assigned[4] = Some(true);
@@ -601,8 +601,8 @@ mod tests {
         assigned[6] = Some(false);
         assigned[7] = Some(false);
         // result = 0
-        for i in 8..12 {
-            assigned[i] = Some(false);
+        for value in &mut assigned[8..12] {
+            *value = Some(false);
         }
 
         let clauses = state.check_partial(&assigned, var_offset);

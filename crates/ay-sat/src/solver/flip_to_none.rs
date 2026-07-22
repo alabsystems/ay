@@ -285,8 +285,8 @@ impl Solver {
             // clauses that just lost their last true literal (externally
             // supported by the verification above).
             self.retire_lift_assignment(var, lit);
-            for idx in s..e {
-                let dense = items[idx] as usize;
+            for item in &items[s..e] {
+                let dense = *item as usize;
                 clauses[dense].true_count -= 1;
                 if clauses[dense].true_count == 0 {
                     debug_assert!(clauses[dense].external);

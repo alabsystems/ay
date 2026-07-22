@@ -426,8 +426,7 @@ fn regression_8373_ite_deferral_false_sat_gasburner() {
         assert_eq!(
             result,
             vec!["unsat"],
-            "Run {}: gasburner-prop3-2 should be UNSAT (ITE deferral soundness, #8373)",
-            i
+            "Run {i}: gasburner-prop3-2 should be UNSAT (ITE deferral soundness, #8373)"
         );
     }
 }
@@ -503,8 +502,7 @@ fn regression_pure_arith_ite_false_sat_gasburner_prop3_5() {
         assert_eq!(
             result,
             vec!["unsat"],
-            "Run {}: gasburner-prop3-5 must be UNSAT (pure-arith ITE false-SAT soundness)",
-            i
+            "Run {i}: gasburner-prop3-5 must be UNSAT (pure-arith ITE false-SAT soundness)"
         );
     }
 }

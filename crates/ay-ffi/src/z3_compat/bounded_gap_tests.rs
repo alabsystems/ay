@@ -486,7 +486,10 @@ fn type_variable_roundtrips() {
         let name = Z3_get_sort_name(c, tv);
         assert!(!name.is_null());
         let name_str = CStr::from_ptr(Z3_get_symbol_string(c, name));
-        assert_eq!(name_str.to_str().unwrap(), "alpha");
+        assert_eq!(
+            name_str.to_str().expect("sort name must be valid UTF-8"),
+            "alpha"
+        );
         // Monomorphic use in a decl signature works like an uninterpreted sort.
         let dom = [tv];
         let f = Z3_mk_func_decl(c, sym(c, c"tvf"), 1, dom.as_ptr(), tv);
@@ -528,7 +531,8 @@ fn finite_domain_sort_roundtrip_and_pigeonhole() {
         // of a size-3 domain are a pigeonhole contradiction.
         let e: Vec<Z3_ast> = (0..4)
             .map(|i| {
-                let name = CString::new(format!("fde{i}")).unwrap();
+                let name = CString::new(format!("fde{i}"))
+                    .expect("generated finite-domain symbol must not contain an interior NUL");
                 Z3_mk_const(c, Z3_mk_string_symbol(c, name.as_ptr()), fd)
             })
             .collect();
@@ -656,7 +660,10 @@ fn ho_seq_constructors_roundtrip_and_solve_unknown() {
         assert_eq!(Z3_get_sort_kind(c, mp_sort), Z3_SEQ_SORT);
         let rendered = CStr::from_ptr(Z3_ast_to_string(c, mp));
         assert!(
-            rendered.to_str().unwrap().contains("seq.map"),
+            rendered
+                .to_str()
+                .expect("rendered sequence term must be valid UTF-8")
+                .contains("seq.map"),
             "term must round-trip"
         );
         // seq.foldl : f × acc × s → acc sort.

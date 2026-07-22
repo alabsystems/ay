@@ -274,6 +274,9 @@ mod tests {
         let (assignment, value) = got.expect("engine must prove the LP-gap toy");
         assert_eq!(value, 4);
         assert!(verify_all_constraints(&instance.constraints, &assignment));
+        let (best_value, best_assignment) = best.expect("verified incumbent callback must run");
+        assert_eq!(best_value, value);
+        assert_eq!(best_assignment, assignment);
     }
 
     /// Oversized coefficients (not exactly f64-representable) must decline.
@@ -321,7 +324,7 @@ mod lane_probe {
             let s: Vec<bool> = toks.split_whitespace().map(|t| t == "1").collect();
             assert_eq!(s.len(), inst.num_vars as usize, "seed length");
             assert!(
-                crate::eval::verify_all_constraints(&inst.constraints, &s),
+                verify_all_constraints(&inst.constraints, &s),
                 "external seed does not satisfy the instance"
             );
             eprintln!("external seed verified");
@@ -355,7 +358,7 @@ mod lane_probe {
                 .map(|i| mvals.get(i).and_then(|r| r.to_f64()).unwrap_or(0.0) > 0.5)
                 .collect()
         };
-        let seed_val = crate::solver::eval_objective(&obj, &seed);
+        let seed_val = eval_objective(&obj, &seed);
         eprintln!("seed value = {seed_val}");
         let mut streamed = vec![];
         let got = try_milp_optimum_upgrade(

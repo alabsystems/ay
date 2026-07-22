@@ -48,7 +48,7 @@ unsafe fn decl_name(ctx: Z3_context, d: Z3_func_decl) -> String {
         let sym = Z3_get_decl_name(ctx, d);
         CStr::from_ptr(Z3_get_symbol_string(ctx, sym))
             .to_str()
-            .unwrap()
+            .expect("declaration name must be valid UTF-8")
             .to_string()
     }
 }
@@ -241,12 +241,13 @@ fn test_datatype_sort_introspection_enum_and_struct() {
 
         // enum Color = red | green | blue (three nullary constructors).
         let names = [c"red", c"green", c"blue"];
+        let recognizer_names = [c"r-red", c"r-green", c"r-blue"];
         let mut ctors: [Z3_constructor; 3] = [ptr::null_mut(); 3];
         for (i, nm) in names.iter().enumerate() {
             ctors[i] = Z3_mk_constructor(
                 ctx,
                 Z3_mk_string_symbol(ctx, nm.as_ptr()),
-                Z3_mk_string_symbol(ctx, c"r".as_ptr()),
+                Z3_mk_string_symbol(ctx, recognizer_names[i].as_ptr()),
                 0,
                 ptr::null(),
                 ptr::null(),
@@ -273,7 +274,11 @@ fn test_datatype_sort_introspection_enum_and_struct() {
         for (i, nm) in names.iter().enumerate() {
             let cd = Z3_get_datatype_sort_constructor(ctx, color, i as u32);
             assert!(!cd.is_null(), "constructor decl non-null");
-            assert_eq!(decl_name(ctx, cd), nm.to_str().unwrap(), "constructor name");
+            assert_eq!(
+                decl_name(ctx, cd),
+                nm.to_str().expect("constructor name must be valid UTF-8"),
+                "constructor name"
+            );
             assert_eq!(Z3_get_arity(ctx, cd), 0, "enum constructor arity 0");
             assert_eq!(
                 Z3_get_sort_kind(ctx, Z3_get_range(ctx, cd)),
@@ -288,11 +293,14 @@ fn test_datatype_sort_introspection_enum_and_struct() {
                 Z3_BOOL_SORT,
                 "recognizer range Bool"
             );
-            // AY names recognizers `is-<ctor>` (its canonical SMT-LIB form).
+            // The C API preserves the caller-supplied recognizer symbol; it
+            // does not replace it with AY's canonical SMT-LIB tester name.
             assert_eq!(
                 decl_name(ctx, rd),
-                format!("is-{}", nm.to_str().unwrap()),
-                "AY recognizer name"
+                recognizer_names[i]
+                    .to_str()
+                    .expect("recognizer name must be valid UTF-8"),
+                "caller-supplied recognizer name"
             );
         }
 
@@ -327,6 +335,8 @@ fn test_datatype_sort_introspection_enum_and_struct() {
         let cd = Z3_get_datatype_sort_constructor(ctx, pair, 0);
         assert_eq!(decl_name(ctx, cd), "mk", "struct constructor name");
         assert_eq!(Z3_get_arity(ctx, cd), 2, "struct constructor arity 2");
+        let rd = Z3_get_datatype_sort_recognizer(ctx, pair, 0);
+        assert_eq!(decl_name(ctx, rd), "is_mk", "struct recognizer name");
         let acc0 = Z3_get_datatype_sort_constructor_accessor(ctx, pair, 0, 0);
         let acc1 = Z3_get_datatype_sort_constructor_accessor(ctx, pair, 0, 1);
         assert_eq!(decl_name(ctx, acc0), "fst", "accessor 0 name");

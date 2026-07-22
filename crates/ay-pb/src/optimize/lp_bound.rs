@@ -2079,6 +2079,7 @@ fn rational_ceil_to_i64(value: &BigRational) -> Option<i128> {
 mod tests {
     use super::*;
     use crate::types::{PbConstraint, PbLit, PbObjective, PbRel, PbTerm};
+    use ay_test_support::env::{lock_env, ScopedEnvVar};
 
     fn lit(var: u32) -> PbLit {
         PbLit {
@@ -2740,7 +2741,7 @@ mod tests {
     /// (BigRational) tier's bound, nor the brute-force integer optimum.
     #[test]
     fn f64_certified_tier_bound_never_above_exact_and_dual_verifies() {
-        let mut rng = Rng(0xCE47_1F1E_D0_D0F00D);
+        let mut rng = Rng(0xCE47_1F1E_D0D0_F00D);
         let mut certified = 0usize;
         let mut certified_huge = 0usize;
         for round in 0..1200 {
@@ -3690,19 +3691,16 @@ mod tests {
 
         // Drive ay's GATED PRODUCTION path: with AY_PB_FARKAS_CERT set, this is the
         // exact wiring `native_oll` uses — build the cert from the dual point in hand,
-        // then `check_slack` it. (Env is process-global; restored below.)
-        let prev = std::env::var_os("AY_PB_FARKAS_CERT");
-        std::env::set_var("AY_PB_FARKAS_CERT", "1");
+        // then `check_slack` it. Serialized + restore-on-exit via the workspace
+        // env choke point (env is process-global).
+        let _env_lock = lock_env();
+        let _farkas_cert = ScopedEnvVar::set("AY_PB_FARKAS_CERT", "1");
         let result = lp_lower_bound_with_cert(
             &objective,
             &instance.constraints,
             instance.num_vars,
             &never_stop,
         );
-        match prev {
-            Some(v) => std::env::set_var("AY_PB_FARKAS_CERT", v),
-            None => std::env::remove_var("AY_PB_FARKAS_CERT"),
-        }
 
         let (bound, valid, outcome) = result.expect("certified bound");
         assert_eq!(
@@ -3816,8 +3814,8 @@ mod tests {
         // End-to-end on a REAL OPT-LIN .opb instance through the gated emit path:
         // enable AY_PB_FARKAS_CERT, parse the instance, run lp_lower_bound_with_cert,
         // and confirm the checker VERIFIED the certificate for the real LP bound.
-        // (Env vars are process-global; this is the only test that sets this flag,
-        // and it restores the prior value.)
+        // (Env vars are process-global; serialized + restore-on-exit via the
+        // workspace env choke point.)
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/instances/weighted_opt.opb"
@@ -3826,8 +3824,8 @@ mod tests {
         let instance = crate::parser::parse_opb(&text).expect("parse OPB");
         let objective = instance.objective.clone().expect("instance has objective");
 
-        let prev = std::env::var_os("AY_PB_FARKAS_CERT");
-        std::env::set_var("AY_PB_FARKAS_CERT", "1");
+        let _env_lock = lock_env();
+        let _farkas_cert = ScopedEnvVar::set("AY_PB_FARKAS_CERT", "1");
 
         let result = lp_lower_bound_with_cert(
             &objective,
@@ -3835,12 +3833,6 @@ mod tests {
             instance.num_vars,
             &never_stop,
         );
-
-        // Restore the env regardless of the assertions below.
-        match prev {
-            Some(v) => std::env::set_var("AY_PB_FARKAS_CERT", v),
-            None => std::env::remove_var("AY_PB_FARKAS_CERT"),
-        }
 
         let (bound, cert, outcome) = result.expect("certified bound");
         assert_eq!(

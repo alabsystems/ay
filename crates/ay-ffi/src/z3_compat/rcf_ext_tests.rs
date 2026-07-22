@@ -126,12 +126,12 @@ fn pi_linear_form_arithmetic_is_exact_and_bounded() {
         // Symbolic rendering.
         let txt = CStr::from_ptr(Z3_rcf_num_to_string(c, pi, false, false))
             .to_str()
-            .unwrap()
+            .expect("pi rendering must be valid UTF-8")
             .to_string();
         assert_eq!(txt, "pi");
         let txt1 = CStr::from_ptr(Z3_rcf_num_to_string(c, pi1, false, false))
             .to_str()
-            .unwrap()
+            .expect("pi-plus-one rendering must be valid UTF-8")
             .to_string();
         assert_eq!(txt1, "(+ 1 pi)");
 
@@ -327,17 +327,17 @@ fn extension_names_and_indices_are_real() {
         // Names.
         let pi_name = CStr::from_ptr(Z3_get_symbol_string(c, Z3_rcf_transcendental_name(c, pi)))
             .to_str()
-            .unwrap()
+            .expect("pi symbol name must be valid UTF-8")
             .to_string();
         assert_eq!(pi_name, "pi");
         let e_name = CStr::from_ptr(Z3_get_symbol_string(c, Z3_rcf_transcendental_name(c, e)))
             .to_str()
-            .unwrap()
+            .expect("e symbol name must be valid UTF-8")
             .to_string();
         assert_eq!(e_name, "e");
         let eps_name = CStr::from_ptr(Z3_get_symbol_string(c, Z3_rcf_infinitesimal_name(c, eps_a)))
             .to_str()
-            .unwrap()
+            .expect("infinitesimal symbol name must be valid UTF-8")
             .to_string();
         assert_eq!(eps_name, "eps!3");
         // Wrong-kind name queries violate the precondition.
@@ -361,7 +361,10 @@ fn decimal_strings_match_known_digits() {
         let dec = |h: Z3_rcf_num, prec: u32| -> String {
             let p = Z3_rcf_num_to_decimal_string(c, h, prec);
             assert!(!p.is_null());
-            CStr::from_ptr(p).to_str().unwrap().to_string()
+            CStr::from_ptr(p)
+                .to_str()
+                .expect("RCF decimal rendering must be valid UTF-8")
+                .to_string()
         };
 
         // Known truncated digits, with the display-only `?` marker.
@@ -410,12 +413,12 @@ fn transcendental_interval_is_a_rigorous_enclosure() {
         let ok = Z3_rcf_interval(
             c,
             pi,
-            &mut lo_inf,
-            &mut lo_open,
-            &mut lo,
-            &mut hi_inf,
-            &mut hi_open,
-            &mut hi,
+            &raw mut lo_inf,
+            &raw mut lo_open,
+            &raw mut lo,
+            &raw mut hi_inf,
+            &raw mut hi_open,
+            &raw mut hi,
         );
         assert_eq!(ok, 1);
         assert!(!lo_inf && !hi_inf && lo_open && hi_open);

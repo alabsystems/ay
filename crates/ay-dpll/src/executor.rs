@@ -13,7 +13,6 @@ use ay_core::{ClausificationProof, Proof, TheoryLemmaProof};
 use ay_core::{TermId, TermStore};
 use ay_frontend::{Command, CommandResult, Context, OptionValue};
 use ay_sat::{ClauseTrace, SatUnknownReason};
-#[cfg(test)]
 use std::cell::Cell;
 use std::sync::{atomic::AtomicBool, Arc};
 use std::time::Duration;
@@ -75,6 +74,7 @@ mod bv_mbqi;
 mod check_sat;
 mod check_sat_assuming;
 mod commands;
+mod core_minimize;
 mod diff_logic;
 mod dt_axioms;
 pub(crate) mod ite_lift;
@@ -244,6 +244,18 @@ pub(crate) struct QuantExpansionRecord {
 pub struct Executor {
     /// Frontend context for elaboration
     pub(crate) ctx: Context,
+    /// Strings NF-engine closure 5 (`AY_STR_NF=1`) bookkeeping: whether EVERY
+    /// string lemma lowered into the SAT solver during the current solve was
+    /// of a UNIVERSALLY VALID kind (exact extended-function reduction axioms
+    /// over fresh cached skolems, or tautological splits `p ∨ ¬p`).
+    ///
+    /// Context-dependent kinds (`ConstSplit`, `VarSplit`, `ConstUnify`) and
+    /// the unconditionally-asserted `ContainsPositive` decomposition clear
+    /// this flag: their clauses are only valid relative to the NF alignment
+    /// that produced them, so a propositional UNSAT resting on them is not a
+    /// proof. Set by the single lowering chokepoint
+    /// `create_string_lemma_clauses`; consumed by the post-lemma UNSAT gate.
+    pub(crate) string_lemma_kinds_all_valid: bool,
     /// QF_AX fixpoint budget multiplier (#qfax-budget-ladder): 1 = standard;
     /// the dispatch retries a degraded-unknown solve once with a raised tier.
     pub(crate) qfax_budget_multiplier: usize,
@@ -334,7 +346,7 @@ pub struct Executor {
     /// rejection of the resume's model at ~10s), and each names a different
     /// trap; all of them are blocked. Capped small (see push sites).
     /// Env-gated at the capture sites; always empty flags-off.
-    pub(crate) uflia_repair_candidates: Vec<Model>,
+    pub(in crate::executor) uflia_repair_candidates: Vec<Model>,
     /// #uflia-model-repair: UF function tables the `uf_table_conflict`
     /// discard (model/completion.rs) found semantically inconsistent after
     /// cross-theory merging. That discard runs BEFORE the independent gate
@@ -451,6 +463,12 @@ pub struct Executor {
     /// re-admits a conflict already proven jointly-UNSAT (sound to learn); a
     /// memoized Err keeps the fail-closed bail (conservative, never learns).
     pub(crate) conflict_semantic_verify_memo: crate::verification::ConflictSemanticVerifyMemo,
+    /// #verify-memo (`AY_VERIFY_MEMO=1`): sampled semantic PROPAGATION
+    /// verification memo — see [`crate::verification::PropSemanticVerifyMemo`]
+    /// for the key/trust-true-only/lifecycle contract. Populated only while
+    /// the env flag is armed (the extension never probes or inserts
+    /// otherwise), so flag-off behavior is byte-identical.
+    pub(crate) prop_semantic_verify_memo: crate::verification::PropSemanticVerifyMemo,
     /// Last assumptions from check-sat-assuming (for get-unsat-assumptions)
     last_assumptions: Option<Vec<TermId>>,
     /// Minimal UNSAT core from last check-sat-assuming (subset of assumptions)
@@ -468,6 +486,26 @@ pub struct Executor {
     /// Populated when produce-unsat-cores redirects check-sat through
     /// check-sat-assuming with named assertions as assumptions.
     last_core_term_to_name: Option<HashMap<TermId, String>>,
+    /// Named-assert rewrite provenance for the CURRENT check-sat call
+    /// (#uc-named-provenance): `rewritten TermId -> ORIGINAL (parse-time)
+    /// TermId`, recorded ONLY by preprocessing passes that are per-assertion
+    /// semantically EXACT (`rewrite_assertion_bool_ites`,
+    /// `rewrite_select_over_array_ite`) and only under produce-unsat-cores.
+    /// The named-core redirect uses it to keep a rewritten named assertion
+    /// assumption-trackable under its label instead of tripping the
+    /// fail-closed provenance guard (which pads the core to ALL named
+    /// assertions — reduction 0 on e.g. 2018-Goel-hwbench, whose named
+    /// asserts are Bool ITEs). Cleared at every
+    /// `check_sat_internal_preprocess_and_solve` entry: entries never
+    /// outlive the preprocessing run that created them. Chained inserts keep
+    /// values parse-time ROOTS even when both passes rewrite one assertion.
+    /// SOUNDNESS: a label may only ride a rewrite that preserves
+    /// per-assertion equivalence — the printed core denotes the ORIGINAL
+    /// named formulas, and validators re-check those; equivalence makes the
+    /// two conjunction sets interchangeable. Passes that are merely globally
+    /// equisatisfiable (string var inlining, purification) MUST NOT record
+    /// here.
+    named_assert_rewrites: HashMap<TermId, TermId>,
     /// Last proof (for get-proof when UNSAT)
     last_proof: Option<Proof>,
     /// Last LRAT certificate serialized from the SAT clause trace.
@@ -496,14 +534,15 @@ pub struct Executor {
     /// external checker can match. Cleared per check-sat alongside
     /// `proof_problem_assertion_provenance`.
     pub(crate) quant_expansion_records: Vec<QuantExpansionRecord>,
-    /// Re-elaborated ORIGINAL problem-assertion terms captured by the last
-    /// proof rebuild (`rebuild_trust_leaf_proof_from_original_assertions`).
+    /// Re-elaborated or raw-reconstructed ORIGINAL problem-assertion terms
+    /// captured by the last proof rebuild.
     ///
     /// The rebuild / trust-surgery re-elaborates each parsed assertion to
     /// recover its canonical term, and re-elaborating a `forall` surface mints
     /// FRESH binder terms (alpha-renamed; the canonical id differs from the
-    /// `ctx.assertions` / `rec.original` id). The proof's surgery-inserted
-    /// `assume` steps carry these re-elaborated terms, so the leak-2
+    /// `ctx.assertions` / `rec.original` id). Fold-collapse promotion similarly
+    /// rebuilds erased source structure with raw constructors. The resulting
+    /// `assume` steps carry these reconstructed terms, so the leak-2
     /// provenance gate (`proof_legit_assume_set`) must accept them. Captured
     /// once during the rebuild (stable within the solve — no re-elaboration
     /// between capture and the gate) and cleared per check-sat.
@@ -540,7 +579,7 @@ pub struct Executor {
     pub(crate) lra_incremental_eager_override: Option<bool>,
     /// Programmatic override for the incremental QF_LRA engine lane
     /// (#lra-inc-engine, S1). `None` (default) follows the `AY_LRA_INC_ENGINE`
-    /// env flag (default OFF); `Some(true)` forces the lane on and `Some(false)`
+    /// env flag (default ON); `Some(true)` forces the lane on and `Some(false)`
     /// forces it off, both independent of the environment. Exists so regression
     /// tests can exercise the lane deterministically without mutating
     /// process-global env state. The proof-session gate applies regardless.
@@ -774,6 +813,14 @@ pub struct Executor {
     /// The principle is soundness-by-self-certification: AY never emits a
     /// `sat`/`unsat` it cannot itself verify. Off by default (completeness-first).
     self_check: bool,
+    /// Set by the last `check_sat` when it produced an UNSAT for a top-level
+    /// pure-QF_BV query under `--self-check` AND emitted the eager bit-blast CNF
+    /// plus its single-invocation DRAT to the self-cert temp files. The inner
+    /// Alethe gate lets this candidate reach the outer `check_sat` boundary,
+    /// which finalizes the CNF and runs AY's native DRAT checker before any API
+    /// caller can observe `Unsat`. Fail-closed: reset to false when emission or
+    /// verification fails.
+    last_bv_drat_self_cert: bool,
     /// When true, the datatype-carrying-array SAT soundness gate
     /// (`problem_has_datatype_carrying_array` in `finalize_sat_model_validation`
     /// and in `solve_with_dt_axioms`) is BYPASSED because the store-value
@@ -935,7 +982,7 @@ pub struct Executor {
     dt_egraph_assignment: std::cell::RefCell<Option<Arc<model::DtEgraphAssignment>>>,
     /// Reentrancy latch for the assignment builder: while building, nested
     /// evaluation must not consult the (incomplete) assignment.
-    dt_egraph_building: std::cell::Cell<bool>,
+    dt_egraph_building: Cell<bool>,
     /// Variable substitutions (`eliminated var -> replacement RHS`) recorded
     /// by preprocessing passes during the current solve call.
     ///
@@ -973,6 +1020,49 @@ pub struct Executor {
     /// deferred validation in `solve_strings_lia_preprocessed` to decide
     /// whether model validation is needed.
     pub(crate) slia_accepted_unknown: bool,
+    /// W7 (`AY_STR_W7=1`, default OFF): the DEFINING equations
+    /// (`(= v rhs)`, entailed, `v` a bare string variable) that the W7 witness
+    /// pass is currently searching under.
+    ///
+    /// `None` everywhere else, including for the whole W4/W5/W6 cascade — the
+    /// only readers are `w4_origin`, `w4_window_root`, `w4_mentions` and
+    /// `w4_violations`, each of which is byte-identical when this is `None`.
+    /// It exists as a field rather than a threaded parameter because those four
+    /// helpers are reached from a dozen W4/W5/W6 call sites; W7 sets it for the
+    /// duration of its own pass and clears it on every exit path.
+    ///
+    /// Search state ONLY: it can change which CANDIDATE assignments W7 builds,
+    /// never which of them is accepted (every candidate still rides
+    /// `finalize_sat_model_validation`).
+    pub(crate) w7_defs: Option<HashMap<TermId, TermId>>,
+    /// W7's INT defining equations (`(= v e)`, `v` an Int variable). Empty
+    /// outside W7's own pass. The `kaluza` witness needs them: its branch pins
+    /// `(= PCTEMP_LHS_1_len_0 (str.len idx_0))`, and an Int variable with no
+    /// arithmetic model in the trial model evaluates to 0, so the string
+    /// witness is scored as violating an atom it actually satisfies.
+    pub(crate) w7_int_defs: HashMap<TermId, TermId>,
+    /// W4's DETERMINISTIC search budget (`#w4-work-budget`): the value of the
+    /// evaluator's node-visit clock (`model::eval_node_visits`) at which the
+    /// per-position witness search currently in flight must stop starting new
+    /// work. `None` — the value everywhere outside
+    /// `try_per_position_witnesses` — means "unbudgeted", so W6's and W7's own
+    /// passes are untouched.
+    ///
+    /// Counted, not timed, ON PURPOSE. W4's hill-climb is an unbounded search
+    /// that can eat a whole solve budget and hand back nothing (measured:
+    /// `full_str_int/restoreIpAddresses__1800` spent 12.4 s of a 20 s solve in
+    /// `w4_repair_var` -> `evaluate_term`, and the refutation it was starving
+    /// then takes 0.2 s). A WALL-CLOCK cap would bound that too, but it would
+    /// make the search LOAD-DEPENDENT — the same file would build a witness on
+    /// an idle box and not on a loaded one, which is precisely the flakiness
+    /// this work is meant to remove. Node visits are the evaluator's own unit
+    /// of work, so the same file gets the same search on every machine.
+    ///
+    /// Search state ONLY: exhausting it stops new seeds / repair rounds /
+    /// placements from STARTING. No score is ever fabricated, no candidate is
+    /// dropped once built, and validation runs unbudgeted — so this can cost a
+    /// SAT the search had not yet found, and can never accept one.
+    pub(crate) w4_work_deadline: Cell<Option<u64>>,
     /// AUTHORED assertion window of the check-sat currently in flight, captured
     /// in `check_sat_internal` BEFORE any in-place preprocessing pass runs
     /// (#selfcert-authored).

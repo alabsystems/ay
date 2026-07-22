@@ -54,3 +54,4 @@ path = "src/bin/ay.rs"
 # Done/OptimumFound verdict.
 trybuild.workspace = true
 num-rational.workspace = true
+ay-test-support.workspace = true

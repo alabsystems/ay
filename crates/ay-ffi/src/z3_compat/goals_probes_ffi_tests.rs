@@ -120,7 +120,9 @@ fn test_goal_readback_lia() {
         assert_eq!(Z3_goal_formula(ctx, g, 3), 0);
         assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
 
-        let s = CStr::from_ptr(Z3_goal_to_string(ctx, g)).to_str().unwrap();
+        let s = CStr::from_ptr(Z3_goal_to_string(ctx, g))
+            .to_str()
+            .expect("LIA goal rendering must be valid UTF-8");
         assert_eq!(s, "(goal\n  (< 0 x)\n  (< y 10)\n  (< z (+ x y)))");
 
         Z3_del_context(ctx);
@@ -197,7 +199,9 @@ fn test_bool_goal_propositional() {
         // Propositional logic is a subset of QF_LIA / QF_BV (matches libz3).
         assert_eq!(probe(ctx, c"is-qflia", g), 1.0);
         assert_eq!(probe(ctx, c"is-qfbv", g), 1.0);
-        let s = CStr::from_ptr(Z3_goal_to_string(ctx, g)).to_str().unwrap();
+        let s = CStr::from_ptr(Z3_goal_to_string(ctx, g))
+            .to_str()
+            .expect("Boolean goal rendering must be valid UTF-8");
         assert_eq!(s, "(goal\n  (or a b)\n  a)");
 
         Z3_del_context(ctx);
@@ -216,7 +220,7 @@ fn test_empty_and_false_goals() {
         assert!(!Z3_goal_is_decided_unsat(ctx, empty));
         let es = CStr::from_ptr(Z3_goal_to_string(ctx, empty))
             .to_str()
-            .unwrap();
+            .expect("empty goal rendering must be valid UTF-8");
         assert_eq!(es, "(goal)");
 
         let gf = Z3_mk_goal(ctx, false, false, false);
@@ -225,7 +229,9 @@ fn test_empty_and_false_goals() {
         assert!(Z3_goal_inconsistent(ctx, gf));
         assert!(Z3_goal_is_decided_unsat(ctx, gf));
         assert!(!Z3_goal_is_decided_sat(ctx, gf));
-        let fs = CStr::from_ptr(Z3_goal_to_string(ctx, gf)).to_str().unwrap();
+        let fs = CStr::from_ptr(Z3_goal_to_string(ctx, gf))
+            .to_str()
+            .expect("false goal rendering must be valid UTF-8");
         assert_eq!(fs, "(goal\n  false)");
 
         Z3_del_context(ctx);
@@ -312,7 +318,9 @@ fn test_probe_introspection() {
         assert!(!name0.is_null());
         let descr = Z3_probe_get_descr(ctx, c"is-qflia".as_ptr());
         assert!(!descr.is_null());
-        let d = CStr::from_ptr(descr).to_str().unwrap();
+        let d = CStr::from_ptr(descr)
+            .to_str()
+            .expect("probe description must be valid UTF-8");
         assert_eq!(d, "true if the goal is in QF_LIA.");
         // Every enumerated probe name is buildable via Z3_mk_probe and has a
         // description (registry lock-step, both directions).
@@ -342,7 +350,9 @@ fn test_goal_translate_cross_context() {
         // Probes evaluate correctly over the re-interned goal in the new context.
         assert_eq!(probe(tgt, c"num-consts", g2), 3.0);
         assert_eq!(probe(tgt, c"is-qflia", g2), 1.0);
-        let s = CStr::from_ptr(Z3_goal_to_string(tgt, g2)).to_str().unwrap();
+        let s = CStr::from_ptr(Z3_goal_to_string(tgt, g2))
+            .to_str()
+            .expect("translated goal rendering must be valid UTF-8");
         assert_eq!(s, "(goal\n  (< 0 x)\n  (< y 10)\n  (< z (+ x y)))");
         Z3_del_context(src);
         Z3_del_context(tgt);

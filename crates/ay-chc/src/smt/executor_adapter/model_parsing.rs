@@ -127,9 +127,11 @@ pub(crate) fn term_body_to_smt_value(
             Some(SmtValue::Datatype(name.clone(), vec![]))
         }
         ay_frontend::Term::App(name, args) => term_body_app_to_smt_value(name, args, dt_ctor_names),
-        ay_frontend::Term::QualifiedApp(name, _sort, args) => {
-            term_body_app_to_smt_value(name, args, dt_ctor_names)
-        }
+        ay_frontend::Term::QualifiedApp(
+            ay_frontend::QualifiedIdentifier::Symbol(name),
+            _sort,
+            args,
+        ) => term_body_app_to_smt_value(name, args, dt_ctor_names),
         // Nullary constructor as bare symbol (parser produces Symbol for `Green` in
         // `(define-fun color () Color Green)`).
         ay_frontend::Term::Symbol(name) if dt_ctor_names.contains(name.as_str()) => {

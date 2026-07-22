@@ -38,9 +38,9 @@ use std::ptr;
 use ay_dpll::api::Sort;
 
 use super::{
-    alloc_sort, ast_to_term, cache_string, ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_ptr,
-    ffi_guard_uint, lookup_ast_sort, record_ast_sort, term_to_ast, Z3_ast, Z3_context, Z3_sort,
-    Z3_INVALID_ARG, Z3_SORT_ERROR,
+    alloc_sort, ast_to_term, cache_string, ffi_count_within_limit, ffi_guard_ast,
+    ffi_guard_const_ptr, ffi_guard_ptr, ffi_guard_uint, lookup_ast_sort, record_ast_sort,
+    term_to_ast, Z3_ast, Z3_context, Z3_sort, Z3_INVALID_ARG, Z3_SORT_ERROR,
 };
 
 // ============================================================================
@@ -402,6 +402,11 @@ pub unsafe extern "C" fn Z3_mk_re_plus(c: Z3_context, re: Z3_ast) -> Z3_ast {
 /// `c` must be a valid context pointer; `args` must point to `n` valid `Z3_ast`.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_re_union(c: Z3_context, n: c_uint, args: *const Z3_ast) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_re_union", n) } {
+        return 0;
+    }
     if n == 0 || args.is_null() {
         // SAFETY: see below; ffi_guard_ast null-checks `c`.
         unsafe {
@@ -447,6 +452,11 @@ pub unsafe extern "C" fn Z3_mk_re_union(c: Z3_context, n: c_uint, args: *const Z
 /// `c` must be a valid context pointer; `args` must point to `n` valid `Z3_ast`.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_re_concat(c: Z3_context, n: c_uint, args: *const Z3_ast) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_re_concat", n) } {
+        return 0;
+    }
     if n == 0 || args.is_null() {
         // SAFETY: ffi_guard_ast null-checks `c`.
         unsafe {
@@ -549,6 +559,11 @@ pub unsafe extern "C" fn Z3_mk_re_intersect(
     n: c_uint,
     args: *const Z3_ast,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_re_intersect", n) } {
+        return 0;
+    }
     if n == 0 || args.is_null() {
         // SAFETY: ffi_guard_ast null-checks `c`.
         unsafe {
@@ -629,6 +644,19 @@ pub unsafe extern "C" fn Z3_mk_re_loop(
     lo: c_uint,
     hi: c_uint,
 ) -> Z3_ast {
+    if lo > hi {
+        // SAFETY: `c` is governed by this entry point's context-pointer contract;
+        // the guard catches any panic while recording the invalid indexed term.
+        return unsafe {
+            ffi_guard_ast(c, |ctx| {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg = Some(format!(
+                    "Z3_mk_re_loop: lower bound {lo} exceeds upper bound {hi}"
+                ));
+                0
+            })
+        };
+    }
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it
     // and catches panics so none cross the FFI boundary.
     unsafe {

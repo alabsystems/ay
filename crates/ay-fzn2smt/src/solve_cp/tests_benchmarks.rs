@@ -8,6 +8,8 @@
 // benchmarks tree: OSS publish intentionally excludes `/benchmarks/`, and
 // these tests must still compile in the sanitized snapshot.
 
+use std::fmt::Write as _;
+
 use super::tests::solve_cp_output;
 use super::CpContext;
 
@@ -33,9 +35,10 @@ fn parse_cp_context(fzn: &str) -> CpContext {
 
 fn nqueens_array_fzn(n: usize) -> String {
     let coeffs = "array [1..2] of int: coeffs = [1,-1];\n";
-    let vars = (0..n)
-        .map(|i| format!("var 1..{n}: q{i};\n"))
-        .collect::<String>();
+    let mut vars = String::new();
+    for i in 0..n {
+        writeln!(&mut vars, "var 1..{n}: q{i};").expect("writing to a String cannot fail");
+    }
     let output = format!(
         "array [1..{n}] of var int: q :: output_array([1..{n}]) = [{}];\n",
         (0..n)

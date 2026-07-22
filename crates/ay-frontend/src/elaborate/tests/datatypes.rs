@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+use crate::command::{self, Command};
 
 #[test]
 fn test_declare_datatype_simple() {
@@ -74,6 +75,115 @@ fn test_declare_datatype_with_selectors() {
         .expect("is-mk-point tester not found");
     assert_eq!(is_mk_point.arg_sorts.len(), 1);
     assert_eq!(is_mk_point.sort, Sort::Bool);
+}
+
+#[test]
+fn failed_single_datatype_declaration_is_atomic() {
+    let mut ctx = Context::new();
+    let declaration = Command::DeclareDatatype(
+        "Broken".to_string(),
+        command::DatatypeDec {
+            constructors: vec![command::ConstructorDec {
+                name: "mk-broken".to_string(),
+                selectors: vec![command::SelectorDec {
+                    name: "broken-field".to_string(),
+                    sort: command::Sort::Indexed("BitVec".to_string(), Vec::new()),
+                }],
+            }],
+            type_params: Vec::new(),
+        },
+    );
+
+    assert!(ctx.process_command(&declaration).is_err());
+    assert!(!ctx.sort_defs.contains_key("Broken"));
+    assert!(!ctx.datatypes.contains_key("Broken"));
+    assert!(!ctx.constructors.contains_key("mk-broken"));
+    assert!(!ctx.symbols.contains_key("mk-broken"));
+    assert!(!ctx.symbols.contains_key("broken-field"));
+    assert!(!ctx.symbols.contains_key("is-mk-broken"));
+}
+
+#[test]
+fn failed_datatype_group_leaves_no_partial_declarations() {
+    let mut ctx = Context::new();
+    let commands = parse(
+        "(declare-datatypes ((Good 0) (Broken 0)) \
+         (((mk-good (value Int))) ((mk-broken (bad (Unknown Int))))))",
+    )
+    .expect("parse datatype group");
+
+    assert!(ctx.process_command(&commands[0]).is_err());
+    for name in ["Good", "Broken"] {
+        assert!(!ctx.sort_defs.contains_key(name));
+        assert!(!ctx.datatypes.contains_key(name));
+    }
+    for name in [
+        "mk-good",
+        "value",
+        "is-mk-good",
+        "mk-broken",
+        "bad",
+        "is-mk-broken",
+    ] {
+        assert!(!ctx.symbols.contains_key(name), "surviving symbol: {name}");
+    }
+}
+
+#[test]
+fn datatype_group_validates_cardinality_arity_and_duplicate_sorts_first() {
+    let datatype = command::DatatypeDec {
+        constructors: vec![command::ConstructorDec {
+            name: "unit".to_string(),
+            selectors: Vec::new(),
+        }],
+        type_params: Vec::new(),
+    };
+
+    let mut mismatched = Context::new();
+    let mismatch = Command::DeclareDatatypes(
+        vec![command::SortDec {
+            name: "OnlySort".to_string(),
+            arity: 0,
+        }],
+        Vec::new(),
+    );
+    assert!(mismatched.process_command(&mismatch).is_err());
+    assert!(!mismatched.sort_defs.contains_key("OnlySort"));
+
+    let mut duplicate = Context::new();
+    let duplicate_group = Command::DeclareDatatypes(
+        vec![
+            command::SortDec {
+                name: "Duplicate".to_string(),
+                arity: 0,
+            },
+            command::SortDec {
+                name: "Duplicate".to_string(),
+                arity: 0,
+            },
+        ],
+        vec![datatype.clone(), datatype.clone()],
+    );
+    assert!(duplicate.process_command(&duplicate_group).is_err());
+    assert!(!duplicate.sort_defs.contains_key("Duplicate"));
+
+    let mut bad_arity = Context::new();
+    let arity_group = Command::DeclareDatatypes(
+        vec![
+            command::SortDec {
+                name: "First".to_string(),
+                arity: 0,
+            },
+            command::SortDec {
+                name: "Second".to_string(),
+                arity: 1,
+            },
+        ],
+        vec![datatype.clone(), datatype],
+    );
+    assert!(bad_arity.process_command(&arity_group).is_err());
+    assert!(!bad_arity.sort_defs.contains_key("First"));
+    assert!(!bad_arity.parametric_datatypes.contains_key("Second"));
 }
 
 #[test]

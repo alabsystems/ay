@@ -2549,7 +2549,7 @@ impl Executor {
                     && !self.is_dt_internal_symbol(name)
                     && !self.ctx.is_defined_fun(name)
             })
-            .map(|(name, _)| name.clone())
+            .map(|(name, info)| self.ctx.symbol_identity_name(name, info).to_string())
             .collect();
         names.sort();
         names.dedup();
@@ -3200,7 +3200,7 @@ impl Executor {
                     && !self.is_dt_internal_symbol(name)
                     && !self.ctx.is_defined_fun(name)
             })
-            .map(|(name, _)| name.clone())
+            .map(|(name, info)| self.ctx.symbol_identity_name(name, info).to_string())
             .collect();
         fns.sort();
         fns.dedup();

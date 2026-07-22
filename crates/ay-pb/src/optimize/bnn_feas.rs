@@ -1039,7 +1039,7 @@ mod real_instance_tests {
     use super::*;
 
     #[test]
-    #[ignore]
+    #[ignore = "requires AY_BNN_GLOB with local real benchmark files"]
     fn seed_feasible_on_real_bnn_instances() {
         let glob = match std::env::var("AY_BNN_GLOB") {
             Ok(g) => g,
@@ -1090,16 +1090,19 @@ mod timing_tests {
     //! Opt-in: measures the wall-clock time for the SLS worker to reach its FIRST
     //! feasible incumbent, all-false vs the BNN seed, on real instances. Set
     //! `AY_BNN_GLOB` and run with `--ignored --nocapture`.
-
     use crate::optimize::sls::search_with_options;
+    use ay_test_support::env::{lock_env, ScopedEnvVar};
 
     #[test]
-    #[ignore]
+    #[ignore = "opt-in timing benchmark requires AY_BNN_GLOB"]
     fn time_to_first_feasible_seed_vs_allfalse() {
         let glob = match std::env::var("AY_BNN_GLOB") {
             Ok(g) => g,
             Err(_) => return,
         };
+        // Serialized + restore-on-exit via the workspace env choke point; the
+        // per-iteration guards below scope the AY_PB_BNN_FEAS toggle.
+        let _env_lock = lock_env();
         let paths: Vec<String> = if let Some(dir) = glob.strip_suffix("/*.opb") {
             let mut out = Vec::new();
             if let Ok(rd) = std::fs::read_dir(dir) {
@@ -1126,11 +1129,11 @@ mod timing_tests {
                 .replace("normalized-bnn_mnist_", "");
 
             for (label, env_on) in [("all-false", false), ("bnn-seed", true)] {
-                if env_on {
-                    std::env::set_var("AY_PB_BNN_FEAS", "1");
+                let _bnn_feas = if env_on {
+                    ScopedEnvVar::set("AY_PB_BNN_FEAS", "1")
                 } else {
-                    std::env::remove_var("AY_PB_BNN_FEAS");
-                }
+                    ScopedEnvVar::unset("AY_PB_BNN_FEAS")
+                };
                 let start = std::time::Instant::now();
                 let deadline = Some(start + std::time::Duration::from_secs(5));
                 let stop = || false;
@@ -1154,7 +1157,6 @@ mod timing_tests {
                 let fo = first_obj.map(|o| o.to_string()).unwrap_or("none".into());
                 eprintln!("TIMING {name:50} {label:10} first-feasible={ft:>10} obj={fo}");
             }
-            std::env::remove_var("AY_PB_BNN_FEAS");
         }
     }
 }

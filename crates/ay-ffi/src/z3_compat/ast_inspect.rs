@@ -186,7 +186,7 @@ pub unsafe extern "C" fn Z3_ast_to_string(c: Z3_context, a: Z3_ast) -> *const c_
                 }
                 // SAFETY: non-null handles in `sort_ast_handles` are live
                 // arena allocations owned by this context (enclosing unsafe).
-                let text = format!("{}", &(*handle).sort);
+                let text = super::ffi_surface_text(ctx, &format!("{}", (*handle).sort));
                 return cache_string(ctx, text);
             }
             // Func-decl-AST handles (from Z3_func_decl_to_ast): z3 renders the
@@ -205,7 +205,7 @@ pub unsafe extern "C" fn Z3_ast_to_string(c: Z3_context, a: Z3_ast) -> *const c_
                     .as_ref()
                     .map(super::SymbolKey::display_name)
                     .unwrap_or_else(|| decl.name().to_string());
-                let mut text = format!("(declare-fun {display_name} (");
+                let mut text = format!("(declare-fun {} (", ay_core::quote_symbol(&display_name));
                 for (i, s) in decl.domain().iter().enumerate() {
                     if i > 0 {
                         text.push(' ');
@@ -213,6 +213,7 @@ pub unsafe extern "C" fn Z3_ast_to_string(c: Z3_context, a: Z3_ast) -> *const c_
                     text.push_str(&format!("{s}"));
                 }
                 text.push_str(&format!(") {})", decl.range()));
+                let text = super::ffi_surface_text(ctx, &text);
                 return cache_string(ctx, text);
             }
             // Ordinary term: render the real s-expression via the solver's
@@ -220,7 +221,7 @@ pub unsafe extern "C" fn Z3_ast_to_string(c: Z3_context, a: Z3_ast) -> *const c_
             // A foreign/stale handle yields `None` -> null (the Python layer
             // falls back); it never panics across the FFI boundary.
             match ctx.solver.format_term_checked(ast_to_term(a)) {
-                Some(s) => cache_string(ctx, s),
+                Some(s) => cache_string(ctx, super::ffi_surface_text(ctx, &s)),
                 None => ptr::null(),
             }
         })

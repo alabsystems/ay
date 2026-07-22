@@ -47,6 +47,26 @@ impl Solver {
             .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
     }
 
+    /// Install (or clear) the whole-solve wall-clock deadline
+    /// (#array-deadline-forward, see `cold.solve_deadline`). The DPLL(T)
+    /// pipelines forward the executor's live per-solve deadline here before
+    /// each SAT call, so the phases a `should_stop` closure cannot reach
+    /// (incremental inprocessing, level-0 GC, the non-interruptible
+    /// assumption entry) still honor the caller's budget. Polled amortized;
+    /// an expired deadline can only produce Unknown — never a verdict.
+    pub fn set_solve_deadline(&mut self, deadline: Option<ay_core::time::Instant>) {
+        self.cold.solve_deadline = deadline;
+    }
+
+    /// Returns true if the whole-solve wall-clock deadline has been reached
+    /// (#array-deadline-forward). Amortize calls — this reads the clock.
+    #[inline]
+    pub(super) fn solve_deadline_expired(&self) -> bool {
+        self.cold
+            .solve_deadline
+            .is_some_and(|deadline| ay_core::time::Instant::now() >= deadline)
+    }
+
     /// Enable periodic progress line emission to stderr during solving.
     ///
     /// When enabled, the solver emits a compact one-line status summary to
@@ -1380,8 +1400,10 @@ mod tests {
     fn test_apply_feature_profile_lrat_clamps_destructive_transforms() {
         let proof = ProofOutput::lrat_text(Vec::<u8>::new(), 0);
         let mut solver = Solver::with_proof_output(4, proof);
-        let mut profile = crate::InprocessingFeatureProfile::default();
-        profile.symmetry = true;
+        let profile = crate::InprocessingFeatureProfile {
+            symmetry: true,
+            ..crate::InprocessingFeatureProfile::default()
+        };
 
         solver.apply_feature_profile(&profile);
 

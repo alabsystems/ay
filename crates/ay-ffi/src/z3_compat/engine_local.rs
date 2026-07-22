@@ -53,8 +53,9 @@ use super::solver::{
 };
 use super::{
     ast_to_term, cache_func_entry, cache_string, ensure_cross_context_translation_semantics,
-    ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_void,
-    record_ast_sort, term_to_ast, DatatypeOp, DecisionOwnerFamily, OptimizeHandle,
+    ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast, ffi_guard_const_ptr,
+    ffi_guard_int, ffi_guard_ptr, ffi_guard_void, record_ast_sort, term_to_ast,
+    transfer_cross_context_ffi_metadata, DatatypeOp, DecisionOwnerFamily, OptimizeHandle,
     ParamDescrsHandle, SoftRecord, Z3_ast, Z3_ast_map, Z3_ast_vector, Z3_context, Z3_func_decl,
     Z3_func_interp, Z3_goal, Z3_model, Z3_optimize, Z3_param_descrs, Z3_solver, Z3_string,
     MAX_FFI_REFINEMENT_PRECISION, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_FALSE, Z3_L_TRUE,
@@ -278,6 +279,17 @@ pub unsafe extern "C" fn Z3_get_implied_equalities(
     terms: *const Z3_ast,
     class_ids: *mut c_uint,
 ) -> c_int {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "Z3_get_implied_equalities input and output arrays",
+            &[num_terms, num_terms],
+        )
+    } {
+        return Z3_L_UNDEF;
+    }
     // Pre-extract the term array (raw reads) in the unsafe fn body.
     let term_asts: Vec<Z3_ast> = if num_terms == 0 || terms.is_null() {
         Vec::new()
@@ -591,6 +603,11 @@ pub unsafe extern "C" fn Z3_qe_model_project(
     bound: *const Z3_ast,
     body: Z3_ast,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_qe_model_project bounds", num_bounds) } {
+        return 0;
+    }
     // SAFETY: valid array per contract.
     let bound_asts = unsafe { read_bound_array(num_bounds, bound) };
     // SAFETY: `ffi_guard_ast` guards `c`; `m`/witness handled inside the core.
@@ -617,6 +634,11 @@ pub unsafe extern "C" fn Z3_qe_model_project_skolem(
     body: Z3_ast,
     map: Z3_ast_map,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_qe_model_project_skolem bounds", num_bounds) } {
+        return 0;
+    }
     // SAFETY: valid array per contract.
     let bound_asts = unsafe { read_bound_array(num_bounds, bound) };
     // SAFETY: `ffi_guard_ast` guards `c`; `m`/`map` handled inside the core.
@@ -641,6 +663,12 @@ pub unsafe extern "C" fn Z3_qe_model_project_with_witness(
     body: Z3_ast,
     map: Z3_ast_map,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_qe_model_project_with_witness bounds", num_bounds) }
+    {
+        return 0;
+    }
     // SAFETY: valid array per contract.
     let bound_asts = unsafe { read_bound_array(num_bounds, bound) };
     // SAFETY: `ffi_guard_ast` guards `c`; `m`/`map` handled inside the core.
@@ -1007,8 +1035,18 @@ pub unsafe extern "C" fn Z3_optimize_translate(
                 flat.push(*a);
             }
             let new_flat = tgt.solver.translate_terms_from(&src.solver, &flat);
-            let new_tracked: Vec<(Term, Term)> =
-                new_flat.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+            let mut source_roots = hard.clone();
+            source_roots.extend(soft_terms.iter().copied());
+            source_roots.extend(flat.iter().copied());
+            let mut target_roots = new_hard.clone();
+            target_roots.extend(new_soft_terms.iter().copied());
+            target_roots.extend(new_flat.iter().copied());
+            let new_tracked: Vec<(Term, Term)> = new_flat
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| (c[0], c[1]))
+                .collect();
 
             let mut install_error = None;
             for &t in &new_hard {
@@ -1036,6 +1074,28 @@ pub unsafe extern "C" fn Z3_optimize_translate(
                     }
                     Err(rollback) => tgt.poison_decision_engine(format!(
                         "Z3_optimize_translate: {detail}; rollback also failed: {rollback}"
+                    )),
+                }
+                return ptr::null_mut();
+            }
+            if !transfer_cross_context_ffi_metadata(
+                src,
+                tgt,
+                &source_roots,
+                &target_roots,
+                "Z3_optimize_translate",
+            ) {
+                let metadata_error = tgt.error_msg.clone();
+                tgt.solver.truncate_soft_constraints(base_soft_len);
+                match tgt.solver.try_pop() {
+                    Ok(()) => {
+                        tgt.decision_engine_poisoned = None;
+                        tgt.decision_owner = None;
+                        tgt.last_error = Z3_INVALID_USAGE;
+                        tgt.error_msg = metadata_error;
+                    }
+                    Err(rollback) => tgt.poison_decision_engine(format!(
+                        "Z3_optimize_translate: metadata transfer failed; rollback also failed: {rollback}"
                     )),
                 }
                 return ptr::null_mut();

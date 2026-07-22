@@ -605,7 +605,11 @@ fn test_term_body_to_smt_value_const_array() {
             ay_frontend::command::Sort::Simple("Int".to_string()),
         ],
     );
-    let term = ay_frontend::Term::QualifiedApp("const".to_string(), sort, vec![inner]);
+    let term = ay_frontend::Term::QualifiedApp(
+        ay_frontend::QualifiedIdentifier::Symbol("const".to_string()),
+        sort,
+        vec![inner],
+    );
     let result = tv(&term);
     assert_eq!(
         result,
@@ -620,11 +624,21 @@ fn test_term_body_to_smt_value_const_array_bv() {
     let sort = ay_frontend::command::Sort::Parameterized(
         "Array".to_string(),
         vec![
-            ay_frontend::command::Sort::Indexed("BitVec".to_string(), vec!["32".to_string()]),
-            ay_frontend::command::Sort::Indexed("BitVec".to_string(), vec!["8".to_string()]),
+            ay_frontend::command::Sort::Indexed(
+                "BitVec".to_string(),
+                vec![ay_frontend::Index::Numeral("32".to_string())],
+            ),
+            ay_frontend::command::Sort::Indexed(
+                "BitVec".to_string(),
+                vec![ay_frontend::Index::Numeral("8".to_string())],
+            ),
         ],
     );
-    let term = ay_frontend::Term::QualifiedApp("const".to_string(), sort, vec![inner]);
+    let term = ay_frontend::Term::QualifiedApp(
+        ay_frontend::QualifiedIdentifier::Symbol("const".to_string()),
+        sort,
+        vec![inner],
+    );
     let result = tv(&term);
     assert_eq!(
         result,
@@ -644,7 +658,7 @@ fn test_term_body_to_smt_value_store_on_const_array() {
         ],
     );
     let const_arr = ay_frontend::Term::QualifiedApp(
-        "const".to_string(),
+        ay_frontend::QualifiedIdentifier::Symbol("const".to_string()),
         sort,
         vec![ay_frontend::Term::Const(ay_frontend::Constant::Numeral(
             "0".to_string(),
@@ -680,7 +694,7 @@ fn test_term_body_to_smt_value_nested_store() {
         ],
     );
     let const_arr = ay_frontend::Term::QualifiedApp(
-        "const".to_string(),
+        ay_frontend::QualifiedIdentifier::Symbol("const".to_string()),
         sort,
         vec![ay_frontend::Term::Const(ay_frontend::Constant::Numeral(
             "0".to_string(),

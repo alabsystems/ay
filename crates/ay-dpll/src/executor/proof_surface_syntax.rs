@@ -9,8 +9,8 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::TermData;
 use ay_core::{quote_symbol, TermId};
 use ay_frontend::command::{
-    Constant as FrontendConstant, MatchPattern as FrontendMatchPattern, Sort as FrontendSort,
-    Term as FrontendTerm,
+    Constant as FrontendConstant, Index as FrontendIndex, MatchPattern as FrontendMatchPattern,
+    QualifiedIdentifier as FrontendQualifiedIdentifier, Sort as FrontendSort, Term as FrontendTerm,
 };
 use ay_frontend::Context;
 
@@ -414,14 +414,24 @@ fn format_frontend_head_application(head: &str, args: &[FrontendTerm]) -> String
     }
 }
 
-fn format_indexed_head(name: &str, indices: &[String]) -> String {
-    format!("(_ {} {})", format_frontend_symbol(name), indices.join(" "))
+fn format_indexed_head(name: &str, indices: &[FrontendIndex]) -> String {
+    let rendered_indices = indices
+        .iter()
+        .map(format_frontend_index)
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("(_ {} {})", format_frontend_symbol(name), rendered_indices)
 }
 
-fn format_qualified_head(name: &str, sort: &FrontendSort) -> String {
+fn format_qualified_head(identifier: &FrontendQualifiedIdentifier, sort: &FrontendSort) -> String {
+    let rendered_identifier = match identifier {
+        FrontendQualifiedIdentifier::Symbol(name) => format_frontend_symbol(name),
+        FrontendQualifiedIdentifier::Indexed(name, indices) => format_indexed_head(name, indices),
+        _ => "<unsupported-qualified-identifier>".to_string(),
+    };
     format!(
         "(as {} {})",
-        format_frontend_symbol(name),
+        rendered_identifier,
         format_frontend_sort(sort)
     )
 }
@@ -455,10 +465,16 @@ fn format_frontend_quantifier(
 }
 
 fn format_frontend_symbol(name: &str) -> String {
-    if name.starts_with('(') {
-        name.to_string()
-    } else {
-        quote_symbol(name)
+    quote_symbol(name)
+}
+
+fn format_frontend_index(index: &FrontendIndex) -> String {
+    match index {
+        FrontendIndex::Numeral(value)
+        | FrontendIndex::Hexadecimal(value)
+        | FrontendIndex::Binary(value) => value.clone(),
+        FrontendIndex::Symbol(value) => quote_symbol(value),
+        _ => "<unsupported-index>".to_string(),
     }
 }
 
@@ -473,9 +489,7 @@ fn format_frontend_sort(sort: &FrontendSort) -> String {
                 rendered_params.join(" ")
             )
         }
-        FrontendSort::Indexed(name, indices) => {
-            format!("(_ {} {})", format_frontend_symbol(name), indices.join(" "))
-        }
+        FrontendSort::Indexed(name, indices) => format_indexed_head(name, indices),
         other => unreachable!("unsupported frontend sort in proof export override: {other:?}"),
     }
 }
@@ -490,5 +504,42 @@ fn format_frontend_constant(constant: &FrontendConstant) -> String {
         | FrontendConstant::Binary(n) => n.clone(),
         FrontendConstant::String(s) => format!("\"{}\"", s.replace('\"', "\"\"")),
         other => unreachable!("unsupported frontend constant in proof export override: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_literal_and_same_spelled_symbol_format_distinctly() {
+        let parsed = FrontendTerm::App(
+            "distinct".to_string(),
+            vec![
+                FrontendTerm::Symbol("(_ bv0 8)".to_string()),
+                FrontendTerm::IndexedApp(
+                    "bv0".to_string(),
+                    vec![FrontendIndex::Numeral("8".to_string())],
+                    Vec::new(),
+                ),
+            ],
+        );
+        assert_eq!(
+            format_frontend_term(&parsed),
+            "(distinct |(_ bv0 8)| (_ bv0 8))"
+        );
+    }
+
+    #[test]
+    fn indexed_token_kinds_remain_distinct_when_formatted() {
+        for (index, expected) in [
+            (FrontendIndex::Numeral("8".to_string()), "8"),
+            (FrontendIndex::Symbol("8".to_string()), "|8|"),
+            (FrontendIndex::Hexadecimal("#x41".to_string()), "#x41"),
+            (FrontendIndex::Symbol("#x41".to_string()), "|#x41|"),
+        ] {
+            let term = FrontendTerm::IndexedApp("f".to_string(), vec![index], Vec::new());
+            assert_eq!(format_frontend_term(&term), format!("(_ f {expected})"));
+        }
     }
 }

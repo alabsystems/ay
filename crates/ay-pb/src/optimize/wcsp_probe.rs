@@ -972,7 +972,9 @@ mod tests {
             "[5] -1 x2 >= 0 ;\n",
         ));
         let mut view = reconstruct_wcsp_view(&instance).expect("must reconstruct");
-        let expired = Instant::now() - Duration::from_millis(1);
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("the monotonic clock has advanced by at least one millisecond");
         let outcome = run_wcsp_transfer(&mut view, Some(expired), None).expect("transfer must run");
         // No work done: c0 = 0 (still a sound floor), empty trail, no fixpoint claim.
         assert_eq!(outcome.c0, 0);

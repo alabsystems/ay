@@ -1695,7 +1695,7 @@ mod tests {
                 "trial {trial}: mc mismatch on {num_vars} vars {clauses:?}"
             );
             // Projected variant: first half of the variables.
-            let show: Vec<u32> = (1..=(num_vars as u32 + 1) / 2).collect();
+            let show: Vec<u32> = (1..=(num_vars as u32).div_ceil(2)).collect();
             let expected_p = brute_force(num_vars, &clauses, Some(&show));
             let mut engine: Engine<BigUint> = Engine::new(
                 num_vars,

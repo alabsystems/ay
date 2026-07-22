@@ -17,6 +17,7 @@ use crate::{
 };
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 use ay_core::time::Instant;
+use ay_test_support::env::{lock_env, ScopedEnvVar};
 use ntest::timeout;
 use std::time::Duration;
 
@@ -5295,12 +5296,10 @@ fn create_array_ghost_pair_unsafe_problem() -> ChcProblem {
 /// env var while the other route tests read it from parallel test threads, so
 /// without this lock a concurrently-running positive test observes the lane
 /// disabled and fails spuriously (`try_array_ghost_pair_route` returns `None`
-/// in ~0ms). Lock poisoning is ignored (`unwrap_or_else`) so one panicking
-/// test cannot cascade.
+/// in ~0ms). Routed through the one workspace-wide env lock so it also
+/// serializes against every other env-touching test in this binary.
 fn ghost_pair_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    lock_env()
 }
 
 #[test]
@@ -5310,9 +5309,9 @@ fn test_array_ghost_pair_route_kill_switch_returns_none() {
     let problem = create_array_ghost_pair_safe_problem();
     let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
 
-    std::env::set_var(ARRAY_GHOST_PAIR_DISABLE_ENV, "1");
+    let ghost_pair_disable = ScopedEnvVar::set(ARRAY_GHOST_PAIR_DISABLE_ENV, "1");
     let result = adaptive.try_array_ghost_pair_route(None);
-    std::env::remove_var(ARRAY_GHOST_PAIR_DISABLE_ENV);
+    drop(ghost_pair_disable);
 
     assert!(
         result.is_none(),
@@ -5764,7 +5763,7 @@ fn bmc_only_hub_analogue_smt(reachable: bool) -> String {
     let pads = 120usize;
     let bv = |v: usize| format!("(_ bv{v} 8)");
     let mut smt = String::from("(set-logic HORN)\n");
-    let mut decl = |smt: &mut String, name: &str| {
+    let decl = |smt: &mut String, name: &str| {
         smt.push_str(&format!(
             "(declare-fun {name} ((_ BitVec 8) (_ BitVec 8) (_ BitVec 8)) Bool)\n"
         ));
@@ -5796,7 +5795,7 @@ fn bmc_only_hub_analogue_smt(reachable: bool) -> String {
             k + 1
         ));
     }
-    let mut hub_edge = |smt: &mut String, src: &str, dst: &str, ls: usize| {
+    let hub_edge = |smt: &mut String, src: &str, dst: &str, ls: usize| {
         smt.push_str(&format!(
             "(assert (forall {vars} (=> (and ({src} n a b) (= m (bvadd n {}))) ({dst} {}))))\n",
             bv(1 + ls),

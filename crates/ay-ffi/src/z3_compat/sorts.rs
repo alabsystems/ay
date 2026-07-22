@@ -349,10 +349,14 @@ pub unsafe extern "C" fn Z3_sort_to_string(c: Z3_context, s: Z3_sort) -> *const 
     // handle is kept alive by the owning `Z3Context` (see handle caches in `mod.rs`). Reading
     // `.sort` is a shared-read with no concurrent mutation because the Z3 C API is
     // single-threaded per context.
-    let sort_str = format!("{:?}", unsafe { &(*s).sort });
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
     // `ffi_guard_const_ptr` handles the null case internally and catches any unwinding panic
     // so it cannot cross the FFI boundary.
-    unsafe { ffi_guard_const_ptr(c, |ctx| cache_string(ctx, sort_str.clone())) }
+    unsafe {
+        ffi_guard_const_ptr(c, |ctx| {
+            let sort_str = super::ffi_surface_text(ctx, &format!("{}", (*s).sort));
+            cache_string(ctx, sort_str)
+        })
+    }
 }

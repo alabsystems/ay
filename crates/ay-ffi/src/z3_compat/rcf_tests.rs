@@ -10,7 +10,7 @@
 //! defining polynomial / interval / Thom sign conditions, and confirm the
 //! transcendental / infinitesimal surface stays honest divergence.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 
 use super::super::*;
 
@@ -20,6 +20,23 @@ unsafe fn ctx() -> Z3_context {
         let c = Z3_mk_context(cfg);
         Z3_del_config(cfg);
         c
+    }
+}
+
+#[test]
+fn rcf_rational_caps_caller_text_before_bigint_parsing() {
+    unsafe {
+        let c = ctx();
+        let boundary = CString::new(format!("1{}", "0".repeat(MAX_FFI_NUMERAL_TEXT_BYTES - 1)))
+            .expect("boundary rational contains no NUL");
+        assert!(!Z3_rcf_mk_rational(c, boundary.as_ptr()).is_null());
+
+        let oversized = CString::new("1".repeat(MAX_FFI_NUMERAL_TEXT_BYTES + 1))
+            .expect("oversized rational contains no NUL");
+        assert!(Z3_rcf_mk_rational(c, oversized.as_ptr()).is_null());
+        assert_eq!(Z3_get_error_code(c), Z3_INVALID_ARG);
+
+        Z3_del_context(c);
     }
 }
 
@@ -153,14 +170,18 @@ fn rcf_sqrt2_introspection() {
         let s = Z3_rcf_num_to_string(c, sqrt2, true, false);
         assert!(!s.is_null());
         assert_eq!(
-            CStr::from_ptr(s).to_str().unwrap(),
+            CStr::from_ptr(s)
+                .to_str()
+                .expect("RCF root-object rendering must be valid UTF-8"),
             "(root-obj (+ (^ x 2) (- 2)) 2)"
         );
 
         // Decimal rendering (approximate, marked with '?').
         let d = Z3_rcf_num_to_decimal_string(c, sqrt2, 4);
         assert!(!d.is_null());
-        let dtext = CStr::from_ptr(d).to_str().unwrap();
+        let dtext = CStr::from_ptr(d)
+            .to_str()
+            .expect("RCF decimal rendering must be valid UTF-8");
         assert_eq!(dtext, "1.4142?", "got {dtext}");
 
         // Isolating interval: open, finite, lower < upper, both bracket √2.
@@ -173,12 +194,12 @@ fn rcf_sqrt2_introspection() {
         let ok = Z3_rcf_interval(
             c,
             sqrt2,
-            &mut lo_inf,
-            &mut lo_open,
-            &mut lo,
-            &mut hi_inf,
-            &mut hi_open,
-            &mut hi,
+            &raw mut lo_inf,
+            &raw mut lo_open,
+            &raw mut lo,
+            &raw mut hi_inf,
+            &raw mut hi_open,
+            &raw mut hi,
         );
         assert_eq!(ok, 1);
         assert!(!lo_inf && !hi_inf && lo_open && hi_open);
@@ -190,7 +211,7 @@ fn rcf_sqrt2_introspection() {
         let mut num: Z3_rcf_num = ptr::null_mut();
         let mut den: Z3_rcf_num = ptr::null_mut();
         let three_quarters = Z3_rcf_mk_rational(c, c"3/4".as_ptr());
-        Z3_rcf_get_numerator_denominator(c, three_quarters, &mut num, &mut den);
+        Z3_rcf_get_numerator_denominator(c, three_quarters, &raw mut num, &raw mut den);
         assert!(Z3_rcf_eq(c, num, Z3_rcf_mk_small_int(c, 3)));
         assert!(Z3_rcf_eq(c, den, Z3_rcf_mk_small_int(c, 4)));
 
@@ -278,7 +299,7 @@ fn algebraic_layer_root_and_bounds() {
             let a = Z3_ast_vector_get(c, poly, i);
             CStr::from_ptr(Z3_ast_to_string(c, a))
                 .to_str()
-                .unwrap()
+                .expect("algebraic coefficient rendering must be valid UTF-8")
                 .to_string()
         };
         assert_eq!(coeff(0), "(- 2)");

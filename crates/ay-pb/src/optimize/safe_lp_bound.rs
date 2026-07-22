@@ -304,6 +304,53 @@ pub(crate) fn safe_lp_duals_from_raw(
     }
 }
 
+/// [`safe_lp_duals_from_raw`] but ALSO returns the primal point `x* ∈ [0,1]^n`
+/// (advisory — used by cut separation; a wrong point only weakens cuts found,
+/// never soundness, since every emitted cut is re-validated combinatorially).
+#[allow(dead_code)]
+pub(crate) fn safe_lp_duals_and_primal_from_raw(
+    num_vars: usize,
+    c: Vec<f64>,
+    rows_raw: Vec<(Vec<(usize, f64)>, f64)>,
+    target: Option<f64>,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    if num_vars == 0 || num_vars > MAX_VARS || rows_raw.len() > MAX_ROWS || c.len() != num_vars {
+        return None;
+    }
+    let mut nonzeros = 0usize;
+    let mut rows = Vec::with_capacity(rows_raw.len());
+    for (coeffs, b) in rows_raw {
+        nonzeros += coeffs.len();
+        if nonzeros > MAX_NONZEROS {
+            return None;
+        }
+        rows.push(RowF64 { coeffs, b });
+    }
+    let model = LpF64 {
+        n: num_vars,
+        c,
+        offset: 0.0,
+        rows,
+    };
+    match model.solve_target(should_stop, target) {
+        Some(SimplexResult { dual, primal }) if dual.len() == model.rows.len() => {
+            let x = primal
+                .into_iter()
+                .map(|v| {
+                    if v.is_finite() {
+                        v.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            Some((clamp_dual(&dual), x))
+        }
+        _ => None,
+    }
+}
+
 /// Clamps a dual vector to `y >= 0` and replaces non-finite entries with 0; the
 /// NS bound requires `y >= 0`, and any clamped/zeroed `y` is still sound.
 fn clamp_dual(dual: &[f64]) -> Vec<f64> {
@@ -1967,7 +2014,7 @@ mod tests {
                 terms.push(term(1, lit(1)));
             }
             let rhs = rng.range(coeff_lo, coeff_hi);
-            let rel = if rng.next() % 4 == 0 {
+            let rel = if rng.next().is_multiple_of(4) {
                 PbRel::Eq
             } else {
                 PbRel::Ge

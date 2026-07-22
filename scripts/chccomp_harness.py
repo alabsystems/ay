@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
@@ -52,7 +53,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _oom_guard import (  # noqa: E402
     plan_solver_resources,
-    rss_watchdog,
+    run_captured,
     warn_concurrent_build,
 )
 
@@ -329,68 +330,43 @@ def run_one(solver: str, task: Task, timeout_s: int, memlimit_mb: int = 0,
     status = "error"
     exit_code: int | None = None
     stderr_tail = ""
-    popen_kwargs: dict = {}
-    if os.name == "nt":
-        # No POSIX process groups on Windows; timeouts are enforced with a
-        # taskkill process-tree kill instead (see below).
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        popen_kwargs["start_new_session"] = True
     memout = False
     child_env = dict(os.environ, MEMLIMIT=str(memlimit_mb), NBCORE=str(nbcore))
     timed_out = False
-    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8",
-                                errors="replace") as stdout:
-        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8",
-                                    errors="replace") as stderr:
-            try:
-                proc = subprocess.Popen(
-                    argv,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout,
-                    stderr=stderr,
-                    text=True,
-                    cwd=str(REPO),
-                    env=child_env,
-                    **popen_kwargs,
-                )
-            except OSError as exc:
-                stderr_tail = str(exc)
-            else:
-                # All solvers share the exact same externally enforced
-                # footprint, including AY (which also receives --memory).
-                guard = rss_watchdog(
-                    proc,
-                    memlimit_mb,
-                    label=f"chccomp_harness.py[{solver}]",
-                    grace_mb=0,
-                )
-                try:
-                    try:
-                        exit_code = proc.wait(timeout=timeout_s + 5)
-                    except subprocess.TimeoutExpired:
-                        timed_out = True
-                        kill_process_tree(proc)
-                        exit_code = proc.wait()
-                finally:
-                    kill_process_tree(proc)
-                    if proc.poll() is None:
-                        proc.wait()
-                    guard.stop()
-                memout = guard.breached
-                status = parse_status_stream(stdout)
-                stderr_tail = stream_tail(stderr)
-                if status == "conflicting-status":
-                    status = "error"
-                    stderr_tail = ("conflicting solver status lines; " +
-                                   stderr_tail)[-500:]
-                elif status == "no-status":
-                    status = "timeout" if (timed_out or exit_code == 124) else "error"
+    try:
+        captured = run_captured(
+            argv,
+            memlimit_mb,
+            timeout_s + 5,
+            label=f"chccomp_harness.py[{solver}]",
+            cwd=str(REPO),
+            env=child_env,
+        )
+    except Exception as exc:
+        stderr_tail = str(exc)[-500:]
+        captured = None
+    if captured is not None:
+        exit_code = captured.returncode
+        memout = captured.memout
+        timed_out = captured.timed_out
+        stderr_tail = captured.stderr[-500:]
+        if captured.cancelled or captured.output_truncated:
+            status = "error"
+            stderr_tail = ("solver output truncated or capture cancelled; " +
+                           stderr_tail)[-500:]
+        else:
+            status = parse_status_stream(io.StringIO(captured.stdout))
+            if status == "conflicting-status":
+                status = "error"
+                stderr_tail = ("conflicting solver status lines; " +
+                               stderr_tail)[-500:]
+            elif status == "no-status":
+                status = "timeout" if (timed_out or exit_code == 124) else "error"
     if memout:
         status = "memout"
     elif timed_out:
         status = "timeout"
-    wall = time.monotonic() - start
+    wall = captured.wall_sec if captured is not None else time.monotonic() - start
 
     correct = None
     if status in ("sat", "unsat") and task.verdict is not None:

@@ -1666,7 +1666,7 @@ fn test_lrat_external_binary_reason_jump_chain_canary() {
     validate_lrat_proof_binary(
         BINARY_REASON_JUMP_CHAIN_DIMACS,
         &proof_bytes,
-        &checker,
+        checker,
         "binary_reason_jump_chain_canary",
     );
 }
@@ -1679,7 +1679,7 @@ fn test_lrat_binary_external_php32() {
     solve_and_validate_lrat_binary_configured(
         PHP32_DIMACS,
         super::common::disable_all_inprocessing,
-        &checker,
+        checker,
         "binary_php32",
     );
 }
@@ -1692,7 +1692,7 @@ fn test_lrat_binary_external_php43() {
     solve_and_validate_lrat_binary_configured(
         PHP43_DIMACS,
         super::common::disable_all_inprocessing,
-        &checker,
+        checker,
         "binary_php43",
     );
 }
@@ -1709,7 +1709,7 @@ fn test_lrat_binary_external_php43_all_features() {
     solve_and_validate_lrat_binary_configured(
         PHP43_DIMACS,
         |_solver| {},
-        &checker,
+        checker,
         "binary_php43_all_features",
     );
 }
@@ -1722,7 +1722,7 @@ fn test_lrat_binary_external_random_3sat() {
     solve_and_validate_lrat_binary_configured(
         RANDOM_3SAT_DIMACS,
         super::common::disable_all_inprocessing,
-        &checker,
+        checker,
         "binary_random_3sat",
     );
 }
@@ -1763,7 +1763,7 @@ fn test_lrat_binary_external_unsat_corpus() {
         solve_and_validate_lrat_binary_configured(
             &dimacs,
             super::common::disable_all_inprocessing,
-            &checker,
+            checker,
             &format!("binary_corpus_{label}"),
         );
         verified += 1;
@@ -1796,7 +1796,7 @@ fn test_lrat_binary_vs_text_cross_validate_php43() {
     let binary_proof = solve_and_validate_lrat_binary_configured(
         PHP43_DIMACS,
         super::common::disable_all_inprocessing,
-        &ay_checker,
+        ay_checker,
         "cross_binary_php43",
     );
 

@@ -14,9 +14,9 @@ Usage:
       --solver ay=./target/release/ay [--solver kissat=/tmp/kissat/build/kissat] \
       --out results.json
 """
-import argparse, concurrent.futures as cf, json, os, signal, subprocess, sys, time, glob
+import argparse, concurrent.futures as cf, json, os, sys, time, glob
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _oom_guard import plan_solver_resources, rss_watchdog, warn_concurrent_build
+from _oom_guard import plan_solver_resources, run_captured, warn_concurrent_build
 
 def run_one(solver_name, cmd_template, cnf, timeout_s, mem_mb, nbcore=1):
     """Run one solver on one instance. Returns dict."""
@@ -29,49 +29,47 @@ def run_one(solver_name, cmd_template, cnf, timeout_s, mem_mb, nbcore=1):
         cmd = [cmd_template, cnf]
     start = time.monotonic()
     verdict = "unknown"
-    killed = False
     # External wall-clock guard = solver timeout + grace; SIGKILL the group.
     hard = timeout_s + 20
     try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             start_new_session=True, text=True,
-                             env=dict(os.environ, NBCORE=str(max(1, nbcore))))
-        guard = rss_watchdog(
-            p, mem_mb, label=f"sweep.py[{solver_name}]", grace_mb=0
+        result = run_captured(
+            cmd,
+            mem_mb,
+            timeout_s=hard,
+            label=f"sweep.py[{solver_name}]",
+            env=dict(os.environ, NBCORE=str(max(1, nbcore))),
         )
-        try:
-            out, _ = p.communicate(timeout=hard)
-        except subprocess.TimeoutExpired:
-            killed = True
-            try:
-                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            out, _ = p.communicate()
-        finally:
-            guard.stop()
-        rc = p.returncode
+        rc = result.returncode
     except Exception as e:
         return {"solver": solver_name, "cnf": os.path.basename(cnf),
                 "verdict": "error", "time": 0.0, "rc": None, "err": str(e)}
     elapsed = time.monotonic() - start
-    # Parse 's' line first; fall back to exit code 10/20.
-    for line in (out or "").splitlines():
-        ls = line.strip()
-        if ls == "s SATISFIABLE" or ls.endswith(" SATISFIABLE"):
-            verdict = "sat"; break
-        if ls == "s UNSATISFIABLE" or ls.endswith(" UNSATISFIABLE"):
-            verdict = "unsat"; break
-    if verdict == "unknown" and not killed:
-        if rc == 10: verdict = "sat"
-        elif rc == 20: verdict = "unsat"
-        elif rc == 124: verdict = "timeout"  # AY internal -t timeout exit code
-    if guard.breached:
+    if result.memout:
         verdict = "memout"
-    elif killed:
+    elif result.timed_out:
         verdict = "timeout"
+    elif result.cancelled:
+        verdict = "cancelled"
+    elif result.output_truncated:
+        verdict = "error"
+    else:
+        # Parse only a complete, non-killed stream; fall back to conventional
+        # SAT solver exit codes when no status line was emitted.
+        for line in result.stdout.splitlines():
+            ls = line.strip()
+            if ls == "s SATISFIABLE" or ls.endswith(" SATISFIABLE"):
+                verdict = "sat"; break
+            if ls == "s UNSATISFIABLE" or ls.endswith(" UNSATISFIABLE"):
+                verdict = "unsat"; break
+        if verdict == "unknown":
+            if rc == 10: verdict = "sat"
+            elif rc == 20: verdict = "unsat"
+            elif rc == 124: verdict = "timeout"
     return {"solver": solver_name, "cnf": os.path.basename(cnf),
-            "verdict": verdict, "time": round(elapsed, 2), "rc": rc}
+            "verdict": verdict, "time": round(elapsed, 2), "rc": rc,
+            "memout": result.memout, "timed_out": result.timed_out,
+            "output_truncated": result.output_truncated,
+            "cancelled": result.cancelled}
 
 def main():
     ap = argparse.ArgumentParser()
@@ -171,7 +169,8 @@ def main():
                "memlimit_mb_per_child": enforced_mem_mb,
                "nbcore_per_child": plan.nbcore,
                "headroom_mb": plan.headroom_mb,
-               "enforcement": "rss_watchdog(all solvers) + ay --memory",
+               "enforcement": "exec-stopped + rss-watchdog-zero-grace(all solvers); "
+                              "ay --memory; bounded 1MiB/stream capture",
            },
            "n_instances": len(cnfs), "summary": summary,
            "disagreements": disagreements, "results": results}

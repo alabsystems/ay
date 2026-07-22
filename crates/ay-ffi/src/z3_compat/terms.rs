@@ -9,16 +9,17 @@
 //! the `ffi_guard_*` helpers (#6192) to prevent undefined behavior from panics
 //! unwinding across the `extern "C"` boundary.
 
-use std::ffi::{c_char, c_int, c_uint, CStr};
+use std::ffi::{c_char, c_int, c_uint};
 use std::ptr;
 
 use ay_dpll::api::{Sort, Term};
 use num_bigint::BigInt;
 
 use super::{
-    ast_to_term, cache_func_decl_with_symbol, ffi_function_semantic_name, ffi_guard_ast,
-    ffi_guard_ptr, lookup_ast_sort, record_ast_sort, term_to_ast, DatatypeOp, SymbolKey, Z3_ast,
-    Z3_context, Z3_func_decl, Z3_params, Z3_sort, Z3_symbol, Z3_INVALID_ARG, Z3_SORT_ERROR,
+    ast_to_term, cache_func_decl_with_symbol, ffi_count_within_limit, ffi_counts_within_limit,
+    ffi_guard_ast, ffi_guard_ptr, ffi_read_bounded_text, ffi_try_declare_function, lookup_ast_sort,
+    record_ast_sort, term_to_ast, DatatypeOp, SymbolKey, Z3_ast, Z3_context, Z3_func_decl,
+    Z3_params, Z3_sort, Z3_symbol, Z3_INVALID_ARG, Z3_SORT_ERROR,
 };
 
 // ---- Function declarations and constants ----
@@ -35,6 +36,11 @@ pub unsafe extern "C" fn Z3_mk_func_decl(
     domain: *const Z3_sort,
     range: Z3_sort,
 ) -> Z3_func_decl {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_func_decl", domain_size) } {
+        return ptr::null_mut();
+    }
     if s.is_null() || range.is_null() {
         return ptr::null_mut();
     }
@@ -88,11 +94,7 @@ pub unsafe extern "C" fn Z3_mk_func_decl(
                 }
             }
             ctx.ffi_used_decl_names.insert(display_name.clone());
-            let semantic_name = ffi_function_semantic_name(ctx, &symbol, &dom_sorts, &range_sort);
-            match ctx
-                .solver
-                .try_declare_fun(&semantic_name, &dom_sorts, range_sort)
-            {
+            match ffi_try_declare_function(ctx, &symbol, &dom_sorts, &range_sort) {
                 Ok(decl) => cache_func_decl_with_symbol(ctx, decl, symbol.clone()),
                 Err(e) => {
                     ctx.last_error = Z3_SORT_ERROR;
@@ -179,16 +181,13 @@ pub unsafe extern "C" fn Z3_mk_fresh_const(
         return 0;
     }
     let pfx = if prefix.is_null() {
-        "fresh".to_string()
+        Ok("fresh".to_string())
     } else {
         // SAFETY: The caller's `# Safety` contract requires the C string pointer to be
         // non-null and to point to a valid, null-terminated sequence of bytes owned by the
         // caller for the duration of this call. The pointer was null-checked before entering
         // this block.
-        unsafe { CStr::from_ptr(prefix) }
-            .to_str()
-            .unwrap_or("fresh")
-            .to_string()
+        unsafe { ffi_read_bounded_text(prefix) }
     };
     // SAFETY: `ty` was null-checked above and originates from a prior AY FFI allocation whose
     // handle is kept alive by the owning `Z3Context` (see handle caches in `mod.rs`). Reading
@@ -202,9 +201,17 @@ pub unsafe extern "C" fn Z3_mk_fresh_const(
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let pfx = match &pfx {
+                Ok(pfx) => pfx,
+                Err(error) => {
+                    ctx.last_error = Z3_INVALID_ARG;
+                    ctx.error_msg = Some(format!("Z3_mk_fresh_const: {error}"));
+                    return 0;
+                }
+            };
             // Fail-close reserved-namespace capture — a `!ay.`-prefixed fresh
             // prefix could collide with an internal engine witness name.
-            if let Some(msg) = super::reserved_name_error(&pfx) {
+            if let Some(msg) = super::reserved_name_error(pfx) {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some(msg);
                 return 0;
@@ -243,6 +250,11 @@ pub unsafe extern "C" fn Z3_mk_app(
     num_args: c_uint,
     args: *const Z3_ast,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_app", num_args) } {
+        return 0;
+    }
     if d.is_null() {
         return 0;
     }
@@ -534,6 +546,11 @@ pub unsafe extern "C" fn Z3_mk_distinct(
     num_args: c_uint,
     args: *const Z3_ast,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_distinct", num_args) } {
+        return 0;
+    }
     if num_args == 0 || args.is_null() {
         return 0;
     }
@@ -668,6 +685,11 @@ pub unsafe extern "C" fn Z3_mk_xor(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> Z3_
 /// All pointers must be valid. `args` must point to `num_args` elements.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_and(c: Z3_context, num_args: c_uint, args: *const Z3_ast) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_and", num_args) } {
+        return 0;
+    }
     let terms: Vec<_> = if num_args == 0 || args.is_null() {
         Vec::new()
     } else {
@@ -704,6 +726,11 @@ pub unsafe extern "C" fn Z3_mk_and(c: Z3_context, num_args: c_uint, args: *const
 /// All pointers must be valid. `args` must point to `num_args` elements.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_or(c: Z3_context, num_args: c_uint, args: *const Z3_ast) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_or", num_args) } {
+        return 0;
+    }
     let terms: Vec<_> = if num_args == 0 || args.is_null() {
         Vec::new()
     } else {
@@ -823,6 +850,11 @@ pub unsafe extern "C" fn Z3_mk_atmost(
     args: *const Z3_ast,
     k: c_uint,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_atmost", num_args) } {
+        return 0;
+    }
     // SAFETY: caller contract on `args`/`num_args`; see `read_ast_args`.
     let terms = unsafe { read_ast_args(num_args, args) };
     let coeffs = vec![BigInt::from(1); terms.len()];
@@ -845,6 +877,11 @@ pub unsafe extern "C" fn Z3_mk_atleast(
     args: *const Z3_ast,
     k: c_uint,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_atleast", num_args) } {
+        return 0;
+    }
     // SAFETY: caller contract on `args`/`num_args`; see `read_ast_args`.
     let terms = unsafe { read_ast_args(num_args, args) };
     let coeffs = vec![BigInt::from(1); terms.len()];
@@ -884,6 +921,17 @@ pub unsafe extern "C" fn Z3_mk_pble(
     coeffs: *const c_int,
     k: c_int,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "Z3_mk_pble argument and coefficient arrays",
+            &[num_args, num_args],
+        )
+    } {
+        return 0;
+    }
     // SAFETY: caller contract on the two arrays; see the readers' contracts.
     let terms = unsafe { read_ast_args(num_args, args) };
     let cs = unsafe { read_int_coeffs(num_args, coeffs) };
@@ -910,6 +958,17 @@ pub unsafe extern "C" fn Z3_mk_pbge(
     coeffs: *const c_int,
     k: c_int,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "Z3_mk_pbge argument and coefficient arrays",
+            &[num_args, num_args],
+        )
+    } {
+        return 0;
+    }
     // SAFETY: caller contract on the two arrays; see the readers' contracts.
     let terms = unsafe { read_ast_args(num_args, args) };
     let cs = unsafe { read_int_coeffs(num_args, coeffs) };
@@ -936,6 +995,17 @@ pub unsafe extern "C" fn Z3_mk_pbeq(
     coeffs: *const c_int,
     k: c_int,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "Z3_mk_pbeq argument and coefficient arrays",
+            &[num_args, num_args],
+        )
+    } {
+        return 0;
+    }
     // SAFETY: caller contract on the two arrays; see the readers' contracts.
     let terms = unsafe { read_ast_args(num_args, args) };
     let cs = unsafe { read_int_coeffs(num_args, coeffs) };
@@ -1027,6 +1097,17 @@ pub unsafe extern "C" fn Z3_substitute(
 ) -> Z3_ast {
     // No-op guards: nothing to do → return the input unchanged.
     if a == 0 || num_exprs == 0 || from.is_null() || to.is_null() {
+        return a;
+    }
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "Z3_substitute source and replacement arrays",
+            &[num_exprs, num_exprs],
+        )
+    } {
         return a;
     }
 

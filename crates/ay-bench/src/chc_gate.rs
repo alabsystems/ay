@@ -12,19 +12,25 @@
 use crate::error::{BenchError, Result, WithContext};
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::time::Instant;
-use wait_timeout::ChildExt;
 
 const REPORT_SCHEMA: &str = "ay.chc-gate-report/v1";
 const CASES_SCHEMA: &str = "ay.chc-gate-cases/v1";
 const ROUTE_COUNTERS_SCHEMA: &str = "ay.chc-gate-route-counters/v1";
 const DEFAULT_MODE: &str = "current";
+const MAX_CHC_CASES: usize = 100_000;
+const MAX_CHC_CASE_ID_BYTES: usize = 512;
+const MAX_CHC_TRAVERSAL_ENTRIES: usize = 500_000;
+const MAX_CHC_PENDING_DIRECTORIES: usize = 50_000;
+#[cfg(not(test))]
+const MAX_CHC_INPUT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+#[cfg(test)]
+const MAX_CHC_INPUT_BYTES: u64 = 1024 * 1024;
 const DEFAULT_ROUTE_COUNTER_PREFIXES: &[&str] = &[
     "chc.",
     "chc_",
@@ -159,7 +165,12 @@ struct RouteTelemetry {
 struct CaseRecord {
     schema: &'static str,
     case_id: String,
+    /// Manifest/corpus path used to select the case.
     path: String,
+    /// Exact private, read-only snapshot supplied to AY.
+    solver_input_path: String,
+    input_sha256: String,
+    input_size_bytes: u64,
     category: String,
     family: String,
     expected_status: String,
@@ -175,6 +186,7 @@ struct CaseRecord {
     par2_s: f64,
     timed_out: bool,
     exit_code: Option<i32>,
+    process_status: String,
     stats_json_present: bool,
     stats_json_path: String,
     validation: ValidationTelemetry,
@@ -186,6 +198,7 @@ struct CaseRecord {
     stdout: String,
     stderr: String,
     command_argv: Vec<String>,
+    command_env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -232,6 +245,8 @@ struct BaselineStats {
     solved: Option<usize>,
     par2_total: Option<f64>,
     resource_plan: Option<crate::resource::ResourcePlan>,
+    timeout_sec: Option<f64>,
+    resource_enforcement: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -276,6 +291,7 @@ struct ChcGateReport {
     baseline: Option<BaselineStats>,
     artifacts: BTreeMap<String, String>,
     resource_plan: crate::resource::ResourcePlan,
+    resource_enforcement: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,11 +311,7 @@ struct ExpectedVerdict {
 /// Run the CHC gate and write `summary.json`, `cases.jsonl`,
 /// `category-summary.csv`, `route-counters.json`, and `admission.md`.
 pub fn cmd_chc_gate(args: ChcGateArgs) -> Result<()> {
-    if !args.timeout_sec.is_finite() || args.timeout_sec <= 0.0 {
-        return Err(BenchError::InvalidArgs {
-            reason: "--timeout must be finite and positive".to_string(),
-        });
-    }
+    crate::resource::checked_benchmark_timeout(args.timeout_sec, "CHC gate")?;
     if !args.max_par2_regression_pct.is_finite() || args.max_par2_regression_pct < 0.0 {
         return Err(BenchError::InvalidArgs {
             reason: "--max-par2-regression-pct must be finite and non-negative".to_string(),
@@ -324,16 +336,25 @@ pub fn cmd_chc_gate(args: ChcGateArgs) -> Result<()> {
 
     let mut cases = Vec::new();
     if args.sample {
-        cases.extend(load_sample_cases(args.category.as_deref())?);
+        extend_cases_bounded(
+            &mut cases,
+            load_sample_cases(args.category.as_deref())?,
+            "sample cases",
+        )?;
     }
     for root in &args.roots {
-        cases.extend(load_root_spec(root, args.category.as_deref())?);
+        extend_cases_bounded(
+            &mut cases,
+            load_root_spec(root, args.category.as_deref())?,
+            root,
+        )?;
     }
     if let Some(manifest) = &args.manifest {
-        cases.extend(load_manifest_spec(
+        extend_cases_bounded(
+            &mut cases,
+            load_manifest_spec(&manifest.display().to_string(), args.category.as_deref())?,
             &manifest.display().to_string(),
-            args.category.as_deref(),
-        )?);
+        )?;
     }
     if cases.is_empty() {
         return Err(BenchError::InvalidArgs {
@@ -341,8 +362,12 @@ pub fn cmd_chc_gate(args: ChcGateArgs) -> Result<()> {
         });
     }
     cases.sort_by(|a, b| a.case_id.cmp(&b.case_id));
-    cases.dedup_by(|a, b| a.case_id == b.case_id && a.path == b.path);
     validate_manifest_cases(&cases)?;
+    let ay_pinned = crate::environment::PinnedSolver::capture(
+        &args.ay,
+        &resources,
+        "ay bench chc-gate pinned AY version probe",
+    )?;
 
     fs::create_dir_all(&args.out_dir).with_bench_context(|| {
         format!("creating CHC gate output dir {}", args.out_dir.display())
@@ -353,7 +378,13 @@ pub fn cmd_chc_gate(args: ChcGateArgs) -> Result<()> {
 
     let mut records = Vec::with_capacity(cases.len());
     for case in &cases {
-        records.push(run_case(case, &args, &run_dir, &resources)?);
+        records.push(run_case(
+            case,
+            &args,
+            &run_dir,
+            &resources,
+            ay_pinned.execution_path(),
+        )?);
     }
 
     let categories = summarize_categories(&records);
@@ -382,6 +413,7 @@ pub fn cmd_chc_gate(args: ChcGateArgs) -> Result<()> {
     summary.admitted = summary.promotable && checks.iter().all(|check| check.status == "pass");
 
     let artifacts = artifact_map(&args.out_dir);
+    ay_pinned.verify_source()?;
     let report = ChcGateReport {
         schema: REPORT_SCHEMA,
         manifest: manifest_label(&args),
@@ -392,7 +424,7 @@ pub fn cmd_chc_gate(args: ChcGateArgs) -> Result<()> {
         require_all_categories: args.require_all_categories,
         require_route_counters: args.require_route_counters.clone(),
         git,
-        ay: binary_provenance(&args.ay),
+        ay: binary_provenance(&ay_pinned)?,
         evidence_warnings: evidence_warnings(&records),
         non_promotable_reasons,
         checks: std::mem::take(&mut checks),
@@ -401,6 +433,7 @@ pub fn cmd_chc_gate(args: ChcGateArgs) -> Result<()> {
         baseline,
         artifacts,
         resource_plan: resources.plan.clone(),
+        resource_enforcement: crate::resource::ENFORCEMENT_AY_MEMORY_RSS_V1,
     };
 
     write_json(&args.out_dir.join("summary.json"), &report)?;
@@ -441,6 +474,26 @@ pub fn cmd_chc_gate(args: ChcGateArgs) -> Result<()> {
         });
     }
 
+    Ok(())
+}
+
+fn extend_cases_bounded(
+    cases: &mut Vec<ManifestCase>,
+    additional: Vec<ManifestCase>,
+    source: &str,
+) -> Result<()> {
+    let total = cases
+        .len()
+        .checked_add(additional.len())
+        .ok_or_else(|| BenchError::msg("CHC case count overflow"))?;
+    if total > MAX_CHC_CASES {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "CHC inputs exceed the fixed {MAX_CHC_CASES}-case cap while adding {source}"
+            ),
+        });
+    }
+    cases.extend(additional);
     Ok(())
 }
 
@@ -540,7 +593,7 @@ fn clean_yaml_scalar(value: &str) -> String {
 }
 
 fn read_sidecar_input_file(path: &Path) -> Option<PathBuf> {
-    let text = fs::read_to_string(path).ok()?;
+    let text = crate::resource::read_bounded_text(path, 1024 * 1024, "CHC sidecar").ok()?;
     let lines = text.lines().collect::<Vec<_>>();
     for (index, raw_line) in lines.iter().enumerate() {
         let stripped = raw_line.trim();
@@ -593,8 +646,15 @@ fn read_sidecar_expected(path: &Path) -> ExpectedVerdict {
         if !sidecar.is_file() {
             continue;
         }
-        let Ok(text) = fs::read_to_string(&sidecar) else {
-            continue;
+        let text = match crate::resource::read_bounded_text(&sidecar, 1024 * 1024, "CHC sidecar") {
+            Ok(text) => text,
+            Err(_) => {
+                return ExpectedVerdict {
+                    status: None,
+                    source: format!("sidecar-invalid:{}", display_path(&sidecar)),
+                    origin: ExpectedOrigin::SidecarInvalid,
+                }
+            }
         };
         if text.contains("placeholder verdict") {
             return ExpectedVerdict {
@@ -605,17 +665,39 @@ fn read_sidecar_expected(path: &Path) -> ExpectedVerdict {
         }
         let mut majority = None;
         let mut expected = None;
+        let mut invalid = false;
         for raw_line in text.lines() {
             let mut stripped = raw_line.trim();
             if let Some(rest) = stripped.strip_prefix("- ") {
                 stripped = rest.trim();
             }
-            if let Some((_, value)) = stripped.split_once("majority_vote_verdict:") {
-                majority = normalize_expected_text(&clean_yaml_scalar(value));
-            } else if let Some((_, value)) = stripped.split_once("expected_verdict:") {
-                expected = normalize_expected_text(&clean_yaml_scalar(value));
+            let Some((raw_key, raw_value)) = stripped.split_once(':') else {
+                continue;
+            };
+            let slot = match raw_key.trim() {
+                "majority_vote_verdict" => &mut majority,
+                "expected_verdict" => &mut expected,
+                _ => continue,
+            };
+            let parsed = normalize_expected_text(&clean_yaml_scalar(raw_value));
+            if slot.is_some() || parsed.is_none() {
+                invalid = true;
+            } else {
+                *slot = parsed;
             }
         }
+        if majority.is_some() && expected.is_some() && majority != expected {
+            invalid = true;
+        }
+        if invalid {
+            return ExpectedVerdict {
+                status: None,
+                source: format!("sidecar-invalid:{}", display_path(&sidecar)),
+                origin: ExpectedOrigin::SidecarInvalid,
+            };
+        }
+        // CHC-COMP's majority vote is the preferred authoritative field when
+        // both keys are present, but the two values must agree above.
         if let Some(status) = majority.or(expected) {
             return ExpectedVerdict {
                 status: Some(status),
@@ -947,9 +1029,11 @@ fn make_case_from_json_entry(
 }
 
 fn load_json_manifest(path: &Path, explicit_category: Option<&str>) -> Result<Vec<ManifestCase>> {
-    let data: Value = serde_json::from_str(
-        &fs::read_to_string(path).with_bench_context(|| format!("reading {}", path.display()))?,
-    )?;
+    let data: Value = serde_json::from_str(&crate::resource::read_bounded_text(
+        path,
+        crate::resource::MAX_METADATA_BYTES,
+        "CHC JSON manifest",
+    )?)?;
     let (entries, manifest_category): (&[Value], Option<String>) = match &data {
         Value::Array(entries) => (
             entries,
@@ -992,13 +1076,23 @@ fn load_json_manifest(path: &Path, explicit_category: Option<&str>) -> Result<Ve
         }
     };
     let manifest_category = manifest_category.as_deref();
-    Ok(entries
-        .iter()
-        .filter_map(Value::as_object)
-        .filter_map(|entry| {
+    if entries.len() > MAX_CHC_CASES {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "JSON manifest {} exceeds the fixed {MAX_CHC_CASES}-case cap",
+                path.display()
+            ),
+        });
+    }
+    let mut cases = Vec::with_capacity(entries.len().min(MAX_CHC_CASES));
+    for entry in entries.iter().filter_map(Value::as_object) {
+        if let Some(case) =
             make_case_from_json_entry(entry, path, explicit_category, manifest_category)
-        })
-        .collect())
+        {
+            cases.push(case);
+        }
+    }
+    Ok(cases)
 }
 
 fn parse_csv_record(line: &str) -> Vec<String> {
@@ -1032,8 +1126,11 @@ fn parse_csv_record(line: &str) -> Vec<String> {
 }
 
 fn load_csv_manifest(path: &Path, explicit_category: Option<&str>) -> Result<Vec<ManifestCase>> {
-    let text = fs::read_to_string(path)
-        .with_bench_context(|| format!("reading CSV manifest {}", path.display()))?;
+    let text = crate::resource::read_bounded_text(
+        path,
+        crate::resource::MAX_METADATA_BYTES,
+        "CHC CSV manifest",
+    )?;
     let mut lines = text.lines();
     let header = lines.next().ok_or_else(|| BenchError::InvalidArgs {
         reason: format!("empty CSV manifest {}", path.display()),
@@ -1109,6 +1206,14 @@ fn load_csv_manifest(path: &Path, explicit_category: Option<&str>) -> Result<Vec
             .and_then(|idx| fields.get(idx))
             .map(|raw| split_route_counter_list(raw))
             .unwrap_or_default();
+        if cases.len() >= MAX_CHC_CASES {
+            return Err(BenchError::InvalidArgs {
+                reason: format!(
+                    "CSV manifest {} exceeds the fixed {MAX_CHC_CASES}-case cap",
+                    path.display()
+                ),
+            });
+        }
         cases.push(ManifestCase {
             case_id: id_col
                 .and_then(|idx| fields.get(idx))
@@ -1160,8 +1265,11 @@ fn load_set_manifest(path: &Path, explicit_category: Option<&str>) -> Result<Vec
                     .trim_start_matches("chc-comp26-"),
             )
         });
-    let text = fs::read_to_string(path)
-        .with_bench_context(|| format!("reading set manifest {}", path.display()))?;
+    let text = crate::resource::read_bounded_text(
+        path,
+        crate::resource::MAX_METADATA_BYTES,
+        "CHC set manifest",
+    )?;
     let mut cases = Vec::new();
     for raw_line in text.lines() {
         let line = raw_line.split('#').next().unwrap_or("").trim();
@@ -1170,6 +1278,14 @@ fn load_set_manifest(path: &Path, explicit_category: Option<&str>) -> Result<Vec
         }
         let (source, sidecar) = set_line_to_paths(line, path);
         let expected = read_sidecar_expected(sidecar.as_deref().unwrap_or(&source));
+        if cases.len() >= MAX_CHC_CASES {
+            return Err(BenchError::InvalidArgs {
+                reason: format!(
+                    "set manifest {} exceeds the fixed {MAX_CHC_CASES}-case cap",
+                    path.display()
+                ),
+            });
+        }
         cases.push(ManifestCase {
             case_id: case_id_for(&source, &category),
             family: infer_family(&source, &category),
@@ -1185,8 +1301,11 @@ fn load_set_manifest(path: &Path, explicit_category: Option<&str>) -> Result<Vec
 }
 
 fn parse_simple_eval_yaml(path: &Path) -> Result<BTreeMap<String, String>> {
-    let text = fs::read_to_string(path)
-        .with_bench_context(|| format!("reading YAML manifest {}", path.display()))?;
+    let text = crate::resource::read_bounded_text(
+        path,
+        crate::resource::MAX_METADATA_BYTES,
+        "CHC YAML manifest",
+    )?;
     let mut inputs = BTreeMap::new();
     let mut in_inputs = false;
     for raw_line in text.lines() {
@@ -1237,23 +1356,84 @@ fn collect_smt2_cases(
     explicit_category: Option<&str>,
     cases: &mut Vec<ManifestCase>,
 ) -> Result<()> {
-    for entry in fs::read_dir(root).with_bench_context(|| format!("reading {}", root.display()))? {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_smt2_cases(&path, explicit_category, cases)?;
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("smt2") {
-            let category = infer_category(&path, explicit_category);
-            let expected = read_sidecar_expected(&path);
-            cases.push(ManifestCase {
-                case_id: case_id_for(&path, &category),
-                family: infer_family(&path, &category),
-                path,
-                category,
-                expected_status: expected.status.unwrap_or_else(|| "unknown".to_string()),
-                expected_source: expected.source,
-                source: format!("root:{}", display_path(root)),
-                required_route_counters: Vec::new(),
-            });
+    collect_smt2_cases_with_limits(
+        root,
+        explicit_category,
+        cases,
+        MAX_CHC_TRAVERSAL_ENTRIES,
+        MAX_CHC_PENDING_DIRECTORIES,
+        MAX_CHC_CASES,
+    )
+}
+
+fn collect_smt2_cases_with_limits(
+    root: &Path,
+    explicit_category: Option<&str>,
+    cases: &mut Vec<ManifestCase>,
+    max_entries: usize,
+    max_pending_directories: usize,
+    max_cases: usize,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(root)
+        .with_bench_context(|| format!("statting CHC root {}", root.display()))?;
+    if !metadata.file_type().is_dir() {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "CHC root is not a non-symlink directory: {}",
+                root.display()
+            ),
+        });
+    }
+    let mut pending = vec![root.to_path_buf()];
+    let mut visited_entries = 0_usize;
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)
+            .with_bench_context(|| format!("reading {}", directory.display()))?
+        {
+            let entry = entry?;
+            visited_entries = visited_entries
+                .checked_add(1)
+                .ok_or_else(|| BenchError::msg("CHC traversal entry count overflow"))?;
+            if visited_entries > max_entries {
+                return Err(BenchError::InvalidArgs {
+                    reason: format!("CHC traversal exceeds the fixed {max_entries}-entry cap"),
+                });
+            }
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                if pending.len() >= max_pending_directories {
+                    return Err(BenchError::InvalidArgs {
+                        reason: format!(
+                            "CHC traversal exceeds the fixed {max_pending_directories}-pending-directory cap"
+                        ),
+                    });
+                }
+                pending.push(path);
+            } else if file_type.is_file()
+                && path.extension().and_then(|ext| ext.to_str()) == Some("smt2")
+            {
+                if cases.len() >= max_cases {
+                    return Err(BenchError::InvalidArgs {
+                        reason: format!(
+                            "CHC root {} exceeds the fixed {max_cases}-case cap",
+                            root.display()
+                        ),
+                    });
+                }
+                let category = infer_category(&path, explicit_category);
+                let expected = read_sidecar_expected(&path);
+                cases.push(ManifestCase {
+                    case_id: case_id_for(&path, &category),
+                    family: infer_family(&path, &category),
+                    path,
+                    category,
+                    expected_status: expected.status.unwrap_or_else(|| "unknown".to_string()),
+                    expected_source: expected.source,
+                    source: format!("root:{}", display_path(root)),
+                    required_route_counters: Vec::new(),
+                });
+            }
         }
     }
     Ok(())
@@ -1266,13 +1446,48 @@ fn validate_manifest_cases(cases: &[ManifestCase]) -> Result<()> {
         });
     }
     let mut errors = Vec::new();
+    let mut ids: BTreeMap<&str, String> = BTreeMap::new();
+    let mut output_names: BTreeMap<String, (&str, String)> = BTreeMap::new();
     for case in cases {
-        if !case.path.is_file() {
+        let location = format!("{} ({})", case.source, case.path.display());
+        if case.case_id.is_empty()
+            || case.case_id.len() > MAX_CHC_CASE_ID_BYTES
+            || case.case_id.chars().any(char::is_control)
+        {
             errors.push(format!(
-                "{} path not found: {}",
+                "invalid CHC case ID {:?} from {location}; IDs must be nonempty, control-free, and at most {MAX_CHC_CASE_ID_BYTES} bytes",
+                case.case_id
+            ));
+        }
+        if let Some(previous) = ids.insert(&case.case_id, location.clone()) {
+            errors.push(format!(
+                "duplicate CHC case ID {:?}: {previous} and {location}",
+                case.case_id
+            ));
+        }
+        let output_name = sanitize(&case.case_id);
+        if let Some((previous_id, previous_location)) =
+            output_names.insert(output_name.clone(), (&case.case_id, location.clone()))
+        {
+            if previous_id != case.case_id {
+                errors.push(format!(
+                    "CHC case IDs {previous_id:?} ({previous_location}) and {:?} ({location}) collide at output directory {output_name:?}",
+                    case.case_id
+                ));
+            }
+        }
+        match fs::symlink_metadata(&case.path) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => errors.push(format!(
+                "{} path is not a non-symlink regular file: {}",
                 case.case_id,
                 case.path.display()
-            ));
+            )),
+            Err(error) => errors.push(format!(
+                "{} path cannot be inspected: {}: {error}",
+                case.case_id,
+                case.path.display()
+            )),
         }
         if !matches!(case.expected_status.as_str(), "sat" | "unsat") {
             errors.push(format!(
@@ -1300,15 +1515,170 @@ fn validate_manifest_cases(cases: &[ManifestCase]) -> Result<()> {
     }
 }
 
+#[derive(Debug)]
+struct CaseInputSnapshot {
+    path: PathBuf,
+    sha256: String,
+    size_bytes: u64,
+}
+
+/// Copy one score-bearing input through an already-open regular-file
+/// descriptor. The solver only sees this private snapshot, so later pathname
+/// replacement cannot change the bytes represented by the case record.
+fn snapshot_case_input(source_path: &Path, case_dir: &Path) -> Result<CaseInputSnapshot> {
+    use sha2::{Digest as _, Sha256};
+
+    let mut source_options = fs::OpenOptions::new();
+    source_options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        source_options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    let mut source = source_options.open(source_path).with_bench_context(|| {
+        format!(
+            "opening CHC input snapshot source {}",
+            source_path.display()
+        )
+    })?;
+    let before = source
+        .metadata()
+        .with_bench_context(|| format!("inspecting open CHC input {}", source_path.display()))?;
+    if !before.file_type().is_file() {
+        return Err(BenchError::msg(format!(
+            "CHC input is not a non-symlink regular file: {}",
+            source_path.display()
+        )));
+    }
+    if before.len() > MAX_CHC_INPUT_BYTES {
+        return Err(BenchError::msg(format!(
+            "CHC input {} exceeds the fixed {MAX_CHC_INPUT_BYTES}-byte snapshot cap",
+            source_path.display()
+        )));
+    }
+
+    let mut snapshot = tempfile::Builder::new()
+        .prefix("solver-input-")
+        .suffix(".smt2")
+        .tempfile_in(case_dir)
+        .with_bench_context(|| {
+            format!(
+                "creating private CHC input snapshot in {}",
+                case_dir.display()
+            )
+        })?;
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer).with_bench_context(|| {
+            format!(
+                "reading CHC input snapshot source {}",
+                source_path.display()
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        size_bytes = size_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| BenchError::msg("CHC input snapshot size overflow"))?;
+        if size_bytes > MAX_CHC_INPUT_BYTES {
+            return Err(BenchError::msg(format!(
+                "CHC input {} grew beyond the fixed {MAX_CHC_INPUT_BYTES}-byte snapshot cap",
+                source_path.display()
+            )));
+        }
+        hasher.update(&buffer[..read]);
+        snapshot.write_all(&buffer[..read])?;
+    }
+    snapshot.as_file().sync_all()?;
+
+    let after = source.metadata()?;
+    let path_after = fs::symlink_metadata(source_path).with_bench_context(|| {
+        format!(
+            "revalidating CHC input snapshot source {}",
+            source_path.display()
+        )
+    })?;
+    if !same_chc_input_snapshot(&before, &after)
+        || !same_chc_input_snapshot(&after, &path_after)
+        || size_bytes != after.len()
+    {
+        return Err(BenchError::msg(format!(
+            "CHC input changed while creating its private snapshot: {}",
+            source_path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        snapshot
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o400))?;
+    }
+    let (snapshot_file, snapshot_path) = snapshot.keep().map_err(|error| {
+        BenchError::msg(format!(
+            "persisting private CHC input snapshot in {}: {error}",
+            case_dir.display()
+        ))
+    })?;
+    drop(snapshot_file);
+
+    Ok(CaseInputSnapshot {
+        path: snapshot_path,
+        sha256: format!("sha256:{:x}", hasher.finalize()),
+        size_bytes,
+    })
+}
+
+fn same_chc_input_snapshot(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        before.file_type().is_file()
+            && after.file_type().is_file()
+            && before.dev() == after.dev()
+            && before.ino() == after.ino()
+            && before.len() == after.len()
+            && before.mtime() == after.mtime()
+            && before.mtime_nsec() == after.mtime_nsec()
+            && before.ctime() == after.ctime()
+            && before.ctime_nsec() == after.ctime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        before.file_type().is_file()
+            && after.file_type().is_file()
+            && before.len() == after.len()
+            && before.modified().ok() == after.modified().ok()
+    }
+}
+
 fn run_case(
     case: &ManifestCase,
     args: &ChcGateArgs,
     run_root: &Path,
     resources: &crate::resource::PlannedResources,
+    ay_execution_path: &Path,
 ) -> Result<CaseRecord> {
     let case_dir = run_root.join(sanitize(&case.case_id));
     fs::create_dir_all(&case_dir)
         .with_bench_context(|| format!("creating case dir {}", case_dir.display()))?;
+    let case_dir_metadata = fs::symlink_metadata(&case_dir)
+        .with_bench_context(|| format!("inspecting case dir {}", case_dir.display()))?;
+    if !case_dir_metadata.file_type().is_dir() {
+        return Err(BenchError::msg(format!(
+            "CHC case output path is not a non-symlink directory: {}",
+            case_dir.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&case_dir, fs::Permissions::from_mode(0o700))?;
+    }
+    let solver_input = snapshot_case_input(&case.path, &case_dir)?;
     let stdout_path = case_dir.join("stdout.txt");
     let stderr_path = case_dir.join("stderr.txt");
     let stats_path = case_dir.join("stats.json");
@@ -1321,28 +1691,56 @@ fn run_case(
         "--stats-json".to_string(),
         "--validate".to_string(),
         "--chc".to_string(),
-        case.path.display().to_string(),
+        solver_input.path.display().to_string(),
     ];
     if resources.plan.memlimit_mb_per_child > 0 {
         solver_args.insert(1, resources.plan.memlimit_mb_per_child.to_string());
         solver_args.insert(1, "--memory".to_string());
     }
-    let mut command = Command::new(&args.ay);
+    let command_env = BTreeMap::from([
+        ("LC_ALL".to_string(), "C".to_string()),
+        ("TZ".to_string(), "UTC".to_string()),
+        (
+            "PATH".to_string(),
+            "/usr/local/bin:/usr/bin:/bin".to_string(),
+        ),
+        ("AY_CHC_GATE".to_string(), "1".to_string()),
+        (
+            "AY_CHC_TRACK_WORKBENCH_MODE".to_string(),
+            DEFAULT_MODE.to_string(),
+        ),
+        (
+            "AY_COMPETITION_JIT_MODE".to_string(),
+            DEFAULT_MODE.to_string(),
+        ),
+        (
+            "AY_COMPETITION_JIT_CANDIDATE_MODE".to_string(),
+            DEFAULT_MODE.to_string(),
+        ),
+        (
+            "AY_COMPETITION_JIT_ARTIFACT".to_string(),
+            "chc-native-code-helpers".to_string(),
+        ),
+        (
+            "MEMLIMIT".to_string(),
+            resources.plan.memlimit_mb_per_child.to_string(),
+        ),
+        (
+            "NBCORE".to_string(),
+            resources.plan.nbcore_per_child.to_string(),
+        ),
+    ]);
+    let mut command = resources.external_command(ay_execution_path);
     command.args(&solver_args);
-    command.env("AY_CHC_GATE", "1");
-    command.env("AY_CHC_TRACK_WORKBENCH_MODE", DEFAULT_MODE);
-    command.env("AY_COMPETITION_JIT_MODE", DEFAULT_MODE);
-    command.env("AY_COMPETITION_JIT_CANDIDATE_MODE", DEFAULT_MODE);
-    command.env("AY_COMPETITION_JIT_ARTIFACT", "chc-native-code-helpers");
-    command.env("NBCORE", resources.plan.nbcore_per_child.to_string());
-    command.stdout(Stdio::from(File::create(&stdout_path).with_bench_context(
-        || format!("creating {}", stdout_path.display()),
-    )?));
-    command.stderr(Stdio::from(File::create(&stderr_path).with_bench_context(
-        || format!("creating {}", stderr_path.display()),
-    )?));
-    crate::resource::isolate_process_group(&mut command);
-    let command_argv = std::iter::once(args.ay.display().to_string())
+    command.env_clear();
+    command.envs(&command_env);
+    let stdout_file = File::create(&stdout_path)
+        .with_bench_context(|| format!("creating {}", stdout_path.display()))?;
+    let stderr_file = File::create(&stderr_path)
+        .with_bench_context(|| format!("creating {}", stderr_path.display()))?;
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let command_argv = std::iter::once(ay_execution_path.display().to_string())
         .chain(solver_args.iter().cloned())
         .collect::<Vec<_>>();
     write_command_file(&command_path, &command_argv)?;
@@ -1350,64 +1748,80 @@ fn run_case(
     let start = Instant::now();
     let mut timed_out = false;
     let mut memout = false;
-    let status = match command.spawn() {
-        Ok(mut child) => {
-            let watchdog = match resources.watch_external_child(&child, "ay bench chc-gate") {
-                Ok(watchdog) => watchdog,
-                Err(error) => {
-                    crate::resource::terminate_process_group(&mut child);
-                    return Err(error);
-                }
+    let mut stdout = String::new();
+    let stderr: String;
+    let mut output_incomplete = false;
+    let status = match resources.spawn_external_child(&mut command, "ay bench chc-gate") {
+        Ok((mut child, watchdog)) => {
+            let Some(stdout_pipe) = child.stdout.take() else {
+                crate::resource::terminate_guarded_child(
+                    &mut child,
+                    watchdog,
+                    "ay bench chc-gate",
+                )?;
+                return Err(BenchError::msg("CHC gate solver stdout pipe missing"));
             };
-            let status =
-                match child.wait_timeout(std::time::Duration::from_secs_f64(args.timeout_sec)) {
-                    Ok(Some(status)) => Some(status),
-                    Ok(None) => {
-                        timed_out = true;
-                        crate::resource::terminate_process_group(&mut child);
-                        child.try_wait().ok().flatten()
-                    }
-                    Err(error) => {
-                        crate::resource::terminate_process_group(&mut child);
-                        let _ = watchdog.finish();
-                        return Err(error.into());
-                    }
-                };
-            crate::resource::terminate_process_group(&mut child);
-            memout = watchdog.finish()?;
+            let Some(stderr_pipe) = child.stderr.take() else {
+                crate::resource::terminate_guarded_child(
+                    &mut child,
+                    watchdog,
+                    "ay bench chc-gate",
+                )?;
+                return Err(BenchError::msg("CHC gate solver stderr pipe missing"));
+            };
+            let stdout_capture =
+                crate::resource::BoundedFileCapture::start(stdout_pipe, stdout_file);
+            let stderr_capture =
+                crate::resource::BoundedFileCapture::start(stderr_pipe, stderr_file);
+            let outcome = crate::resource::wait_for_guarded_child(
+                &mut child,
+                watchdog,
+                std::time::Duration::from_secs_f64(args.timeout_sec),
+                "ay bench chc-gate",
+            )?;
+            timed_out = outcome.timed_out;
+            memout = outcome.memout;
+            let stdout_output = stdout_capture.finish()?;
+            let stderr_output = stderr_capture.finish()?;
+            output_incomplete = stdout_output.incomplete || stderr_output.incomplete;
+            stdout = stdout_output.text;
+            stderr = stderr_output.text;
             if memout {
                 timed_out = false;
             }
-            status
+            outcome.status
         }
         Err(error) => {
             fs::write(&stderr_path, error.to_string())
                 .with_bench_context(|| format!("writing {}", stderr_path.display()))?;
+            stderr = error.to_string();
             None
         }
     };
     let elapsed_s = round6(start.elapsed().as_secs_f64());
-    let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
-    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
     let exit_code = status.as_ref().and_then(ExitStatus::code);
-    let (stats_json, stats_raw) = parse_stats_json(&stdout, &stderr);
+    let process_status = status
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "not-started-or-unreaped".to_string());
+    let exited_successfully = status.as_ref().is_some_and(ExitStatus::success);
+    let (stats_json, stats_raw) = if output_incomplete {
+        (None, None)
+    } else {
+        parse_stats_json(&stdout, &stderr)
+    };
     if let Some(raw) = stats_raw.as_deref() {
         fs::write(&stats_path, format!("{raw}\n"))
             .with_bench_context(|| format!("writing {}", stats_path.display()))?;
     }
 
-    let status_text = if memout {
-        "memout".to_string()
-    } else if timed_out {
-        "timeout".to_string()
-    } else {
-        let extracted = extract_solver_result(&stdout, &stderr);
-        if matches!(extracted.as_str(), "sat" | "unsat" | "unknown") {
-            extracted
-        } else {
-            "error".to_string()
-        }
-    };
+    let status_text = solver_status_from_process(
+        memout,
+        timed_out,
+        output_incomplete,
+        exited_successfully,
+        &stdout,
+    );
     let validation = stats_json
         .as_ref()
         .map_or_else(ValidationTelemetry::default, parse_validation_telemetry);
@@ -1436,6 +1850,12 @@ fn run_case(
         .collect::<Vec<_>>();
     let wrong = is_wrong(&case.expected_status, &status_text);
     let mut invalid_reasons = Vec::new();
+    if output_incomplete {
+        invalid_reasons.push("solver-output-truncated-or-unreadable".to_string());
+    }
+    if !timed_out && !memout && !exited_successfully {
+        invalid_reasons.push("solver-exit-not-successful".to_string());
+    }
     if matches!(status_text.as_str(), "sat" | "unsat")
         && !validation_valid_for_status(&validation, &status_text)
     {
@@ -1469,6 +1889,9 @@ fn run_case(
         schema: CASES_SCHEMA,
         case_id: case.case_id.clone(),
         path: display_path(&case.path),
+        solver_input_path: solver_input.path.display().to_string(),
+        input_sha256: solver_input.sha256,
+        input_size_bytes: solver_input.size_bytes,
         category: case.category.clone(),
         family: case.family.clone(),
         expected_status: case.expected_status.clone(),
@@ -1484,6 +1907,7 @@ fn run_case(
         par2_s,
         timed_out,
         exit_code,
+        process_status,
         stats_json_present: stats_json.is_some(),
         stats_json_path: if stats_json.is_some() {
             stats_path.display().to_string()
@@ -1499,7 +1923,31 @@ fn run_case(
         stdout: stdout_path.display().to_string(),
         stderr: stderr_path.display().to_string(),
         command_argv,
+        command_env,
     })
+}
+
+fn solver_status_from_process(
+    memout: bool,
+    timed_out: bool,
+    output_incomplete: bool,
+    exited_successfully: bool,
+    stdout: &str,
+) -> String {
+    if memout {
+        "memout".to_string()
+    } else if timed_out {
+        "timeout".to_string()
+    } else if output_incomplete || !exited_successfully {
+        "error".to_string()
+    } else {
+        let extracted = extract_solver_result(stdout);
+        if matches!(extracted.as_str(), "sat" | "unsat" | "unknown") {
+            extracted
+        } else {
+            "error".to_string()
+        }
+    }
 }
 
 fn write_command_file(path: &Path, argv: &[String]) -> Result<()> {
@@ -1530,29 +1978,24 @@ fn parse_stats_json(stdout: &str, stderr: &str) -> (Option<Value>, Option<String
     (None, None)
 }
 
-fn extract_solver_result(stdout: &str, stderr: &str) -> String {
-    let combined = [stdout, stderr].join("\n");
-    let mut fallback = None;
-    for raw_line in combined.lines() {
+fn extract_solver_result(stdout: &str) -> String {
+    let mut verdicts = Vec::new();
+    for raw_line in stdout.lines() {
         let line = raw_line.trim().to_ascii_lowercase();
-        match line.as_str() {
-            "sat" | "s sat" | "s satisfiable" | "satisfiable" => return "sat".to_string(),
-            "unsat" | "s unsat" | "s unsatisfiable" | "unsatisfiable" => {
-                return "unsat".to_string();
-            }
-            "unknown" | "s unknown" => return "unknown".to_string(),
-            _ => {}
-        }
-        for token in line.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_') {
-            match token {
-                "unsat" => fallback = Some("unsat"),
-                "sat" => fallback = Some("sat"),
-                "unknown" => fallback = Some("unknown"),
-                _ => {}
-            }
+        let verdict = match line.as_str() {
+            "sat" | "s sat" | "s satisfiable" | "satisfiable" => Some("sat"),
+            "unsat" | "s unsat" | "s unsatisfiable" | "unsatisfiable" => Some("unsat"),
+            "unknown" | "s unknown" => Some("unknown"),
+            _ => None,
+        };
+        if let Some(verdict) = verdict {
+            verdicts.push(verdict);
         }
     }
-    fallback.unwrap_or("error").to_string()
+    match verdicts.as_slice() {
+        [verdict] => (*verdict).to_string(),
+        _ => "error".to_string(),
+    }
 }
 
 fn classify_case(status: &str, timed_out: bool, wrong: bool, invalid: bool) -> String {
@@ -1904,24 +2347,38 @@ fn baseline_checks(
     let current_solved = records.iter().filter(|record| record.solved).count();
     let current_par2 = round6(records.iter().map(|record| record.par2_s).sum());
     let mut checks = Vec::new();
-    let comparable = baseline
+    let current_envelope = crate::resource::effective_execution_envelope(
+        resource_plan,
+        crate::resource::ENFORCEMENT_AY_MEMORY_RSS_V1,
+        args.timeout_sec,
+    );
+    let baseline_envelope = baseline
         .resource_plan
         .as_ref()
-        .is_some_and(|baseline_plan| baseline_plan.same_execution_envelope(resource_plan));
+        .zip(baseline.resource_enforcement.as_deref())
+        .zip(baseline.timeout_sec)
+        .and_then(|((plan, enforcement), timeout_sec)| {
+            crate::resource::effective_execution_envelope(plan, enforcement, timeout_sec).ok()
+        });
+    let comparable = current_envelope
+        .as_ref()
+        .ok()
+        .is_some_and(|current| baseline_envelope.as_ref() == Some(current));
     checks.push(GateCheck {
         name: "baseline-resource-envelope".to_string(),
         status: if comparable { "pass" } else { "fail" }.to_string(),
         reason: if comparable {
-            format!("matching envelope {}", resource_plan.execution_envelope())
+            format!(
+                "matching envelope {}",
+                current_envelope.as_deref().unwrap_or("<invalid>")
+            )
         } else {
             format!(
                 "non-comparable: current={} baseline={}",
-                resource_plan.execution_envelope(),
-                baseline
-                    .resource_plan
-                    .as_ref()
-                    .map(crate::resource::ResourcePlan::execution_envelope)
-                    .unwrap_or_else(|| "<missing>".to_string())
+                current_envelope.as_deref().unwrap_or("<invalid>"),
+                baseline_envelope
+                    .as_deref()
+                    .unwrap_or("<missing-or-legacy>")
             )
         },
     });
@@ -2017,16 +2474,22 @@ fn evidence_warnings(records: &[CaseRecord]) -> Vec<String> {
 }
 
 fn load_baseline(path: &Path) -> Result<BaselineStats> {
-    let data: Value = serde_json::from_str(
-        &fs::read_to_string(path)
-            .with_bench_context(|| format!("reading baseline {}", path.display()))?,
-    )?;
+    let data: Value = serde_json::from_str(&crate::resource::read_bounded_text(
+        path,
+        crate::resource::MAX_METADATA_BYTES,
+        "CHC baseline",
+    )?)?;
     let mut solved = None;
     let mut par2_total = None;
     let resource_plan = data
         .get("resource_plan")
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok());
+    let timeout_sec = data.get("timeout_sec").and_then(Value::as_f64);
+    let resource_enforcement = data
+        .get("resource_enforcement")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     if let Some(summary) = data.get("summary").and_then(Value::as_object) {
         solved = summary
             .get("solved")
@@ -2076,6 +2539,8 @@ fn load_baseline(path: &Path) -> Result<BaselineStats> {
         solved,
         par2_total,
         resource_plan,
+        timeout_sec,
+        resource_enforcement,
     })
 }
 
@@ -2229,9 +2694,15 @@ fn git_provenance() -> GitProvenance {
 }
 
 fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new(program).args(args).output().ok()?;
+    let output = crate::resource::capture_local_output(
+        program,
+        args.iter().copied(),
+        std::time::Duration::from_secs(10),
+        program,
+    )
+    .ok()?;
     if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).to_string())
+        Some(output.stdout)
     } else {
         None
     }
@@ -2244,47 +2715,22 @@ fn env_truthy(value: &str) -> bool {
     )
 }
 
-fn binary_provenance(path: &Path) -> BinaryProvenance {
-    let metadata = fs::metadata(path).ok();
-    BinaryProvenance {
-        path: path.display().to_string(),
-        exists: metadata.is_some(),
-        sha256: sha256_file(path).unwrap_or_default(),
-        size_bytes: metadata.as_ref().map(std::fs::Metadata::len),
+fn binary_provenance(pinned: &crate::environment::PinnedSolver) -> Result<BinaryProvenance> {
+    let provenance = pinned.provenance();
+    let metadata = fs::metadata(&provenance.path)
+        .with_bench_context(|| format!("reading pinned AY source metadata {}", provenance.path))?;
+    Ok(BinaryProvenance {
+        path: provenance.path.clone(),
+        exists: true,
+        sha256: provenance.sha256.clone(),
+        size_bytes: Some(provenance.size_bytes),
         mtime_epoch: metadata
-            .and_then(|metadata| metadata.modified().ok())
+            .modified()
+            .ok()
             .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
             .and_then(|duration| i64::try_from(duration.as_secs()).ok()),
-        version: solver_version(path),
-    }
-}
-
-fn solver_version(path: &Path) -> Option<String> {
-    let output = Command::new(path).arg("--version").output().ok()?;
-    if output.status.success() {
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    } else {
-        None
-    }
-}
-
-fn sha256_file(path: &Path) -> Option<String> {
-    let mut file = fs::File::open(path).ok()?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 8192];
-    loop {
-        let read = file.read(&mut buffer).ok()?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Some(format!("{:x}", hasher.finalize()))
+        version: Some(provenance.version_output.clone()),
+    })
 }
 
 fn sanitize(value: &str) -> String {
@@ -2322,6 +2768,151 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn chc_gate_executes_one_pinned_snapshot_with_exact_recorded_environment() {
+        use sha2::Digest as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        assert!(std::env::var_os("HOME").is_some());
+        let tmp = TempDir::new().expect("tempdir");
+        let input = tmp.path().join("case.smt2");
+        let original_input = "(set-logic HORN)\n; ORIGINAL_TOKEN\n(check-sat)\n";
+        fs::write(&input, original_input).expect("write input");
+        let solver = tmp.path().join("fake-ay.sh");
+        fs::write(
+            &solver,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'fake-ay 1\\n'; exit 0; fi\nif [ \"${{HOME+x}}\" = x ]; then printf 'inherited HOME\\n' >&2; exit 71; fi\nprintf '(set-logic HORN)\\n; MUTATED_SOURCE\\n(check-sat)\\n' > '{}'\nfor argument in \"$@\"; do solver_input=$argument; done\nif grep -q ORIGINAL_TOKEN \"$solver_input\"; then printf 'sat\\n'; else printf 'unsat\\n'; fi\n",
+                input.display()
+            ),
+        )
+        .expect("write solver");
+        let mut permissions = fs::metadata(&solver)
+            .expect("solver metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&solver, permissions).expect("chmod solver");
+        let resources =
+            crate::resource::PlannedResources::for_test(&crate::runner::repo_root_public(), 4096);
+        let pinned = crate::environment::PinnedSolver::capture(
+            &solver,
+            &resources,
+            "CHC pinned snapshot regression",
+        )
+        .expect("pin solver");
+        fs::write(&solver, "#!/bin/sh\nprintf 'unsat\\n'\n").expect("mutate source");
+        let args = ChcGateArgs {
+            manifest: None,
+            roots: Vec::new(),
+            sample: false,
+            out_dir: tmp.path().join("out"),
+            ay: solver,
+            timeout_sec: 5.0,
+            baseline: None,
+            category: None,
+            require_all_categories: false,
+            require_route_counters: Vec::new(),
+            allow_dirty: true,
+            fail_on_wrong: true,
+            fail_on_invalid: false,
+            min_solved_delta: 0,
+            max_par2_regression_pct: 0.0,
+        };
+        let run_root = tmp.path().join("runs");
+        fs::create_dir(&run_root).expect("run root");
+        let record = run_case(
+            &ManifestCase {
+                case_id: "case".to_string(),
+                path: input.clone(),
+                category: "LIA".to_string(),
+                family: "test".to_string(),
+                expected_status: "sat".to_string(),
+                expected_source: "sidecar".to_string(),
+                source: "test".to_string(),
+                required_route_counters: Vec::new(),
+            },
+            &args,
+            &run_root,
+            &resources,
+            pinned.execution_path(),
+        )
+        .expect("run pinned CHC solver");
+
+        assert_eq!(record.status, "sat");
+        assert!(record.command_argv[0].contains("ay-solver-pin-"));
+        assert_eq!(record.path, display_path(&input));
+        assert_ne!(record.solver_input_path, record.path);
+        assert_eq!(
+            record.command_argv.last().map(String::as_str),
+            Some(record.solver_input_path.as_str())
+        );
+        assert_eq!(record.input_size_bytes, original_input.len() as u64);
+        assert_eq!(
+            record.input_sha256,
+            format!(
+                "sha256:{:x}",
+                sha2::Sha256::digest(original_input.as_bytes())
+            )
+        );
+        assert_eq!(
+            fs::read_to_string(&record.solver_input_path).expect("read solver input snapshot"),
+            original_input
+        );
+        assert!(
+            fs::read_to_string(&input)
+                .expect("read replaced source")
+                .contains("MUTATED_SOURCE"),
+            "the solver must mutate the original pathname before reading its argument"
+        );
+        assert!(!record.command_env.contains_key("HOME"));
+        assert_eq!(
+            record.command_env.get("LC_ALL").map(String::as_str),
+            Some("C")
+        );
+        assert_eq!(
+            record.command_env.get("MEMLIMIT").map(String::as_str),
+            Some("4096")
+        );
+        assert!(pinned.verify_source().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chc_gate_rejects_symlink_input_before_snapshotting() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let target = tmp.path().join("target.smt2");
+        fs::write(&target, "(check-sat)\n").expect("write target");
+        let link = tmp.path().join("link.smt2");
+        symlink(&target, &link).expect("create input symlink");
+        let case = ManifestCase {
+            case_id: "linked".to_string(),
+            path: link.clone(),
+            category: "LIA".to_string(),
+            family: "test".to_string(),
+            expected_status: "sat".to_string(),
+            expected_source: "manifest".to_string(),
+            source: "test".to_string(),
+            required_route_counters: Vec::new(),
+        };
+        let validation_error = validate_manifest_cases(&[case])
+            .expect_err("manifest validation must reject a symlink input")
+            .to_string();
+        assert!(
+            validation_error.contains("not a non-symlink regular file"),
+            "{validation_error}"
+        );
+
+        let case_dir = tmp.path().join("run");
+        fs::create_dir(&case_dir).expect("case dir");
+        assert!(
+            snapshot_case_input(&link, &case_dir).is_err(),
+            "the authoritative snapshot open must independently reject symlinks"
+        );
+    }
+
     #[test]
     fn chc_gate_normalizes_core_categories() {
         assert_eq!(normalize_category_name("lia-lin-arrays"), "LIA-Lin-Arrays");
@@ -2335,7 +2926,7 @@ mod tests {
         let bench = write_case(
             tmp.path(),
             "family/case.smt2",
-            "properties:\n- expected_verdict: true\n  majority_vote_verdict: false\n",
+            "properties:\n- expected_verdict: false\n  majority_vote_verdict: false\n",
         );
         let manifest = tmp.path().join("manifest.json");
         fs::write(
@@ -2360,6 +2951,98 @@ mod tests {
         assert_eq!(cases[0].expected_status, "unsat");
         assert!(cases[0].expected_source.starts_with("sidecar:"));
         assert_eq!(cases[0].required_route_counters, vec!["chc.route.demo"]);
+    }
+
+    #[test]
+    fn chc_gate_sidecar_expected_keys_are_exact_unique_and_consistent() {
+        let tmp = TempDir::new().unwrap();
+        let unrelated = write_case(
+            tmp.path(),
+            "unrelated.smt2",
+            "not_expected_verdict: true\nmajority_vote_verdict_note: false\n",
+        );
+        assert_eq!(
+            read_sidecar_expected(&unrelated).origin,
+            ExpectedOrigin::None
+        );
+
+        let duplicate = write_case(
+            tmp.path(),
+            "duplicate.smt2",
+            "expected_verdict: true\n- expected_verdict: true\n",
+        );
+        assert_eq!(
+            read_sidecar_expected(&duplicate).origin,
+            ExpectedOrigin::SidecarInvalid
+        );
+
+        let conflicting = write_case(
+            tmp.path(),
+            "conflicting.smt2",
+            "expected_verdict: true\nmajority_vote_verdict: false\n",
+        );
+        assert_eq!(
+            read_sidecar_expected(&conflicting).origin,
+            ExpectedOrigin::SidecarInvalid
+        );
+    }
+
+    #[test]
+    fn chc_gate_result_parser_requires_one_authoritative_stdout_line() {
+        assert_eq!(extract_solver_result("sat\n"), "sat");
+        assert_eq!(
+            extract_solver_result("diagnostic: expected unsat\n"),
+            "error"
+        );
+        assert_eq!(extract_solver_result("sat\nsat\n"), "error");
+        assert_eq!(extract_solver_result("sat\nunsat\n"), "error");
+        assert_eq!(
+            solver_status_from_process(false, false, false, false, "sat\n"),
+            "error",
+            "a process abort after emitting a verdict is not solved"
+        );
+    }
+
+    #[test]
+    fn chc_gate_rejects_duplicate_and_colliding_case_ids() {
+        let tmp = TempDir::new().unwrap();
+        let first_path = write_case(tmp.path(), "first.smt2", "expected_verdict: true\n");
+        let second_path = write_case(tmp.path(), "second.smt2", "expected_verdict: true\n");
+        let make = |case_id: &str, path: &Path, source: &str| ManifestCase {
+            case_id: case_id.to_string(),
+            path: path.to_path_buf(),
+            category: "LIA".to_string(),
+            family: "test".to_string(),
+            expected_status: "sat".to_string(),
+            expected_source: "manifest".to_string(),
+            source: source.to_string(),
+            required_route_counters: Vec::new(),
+        };
+        let cases = vec![
+            make("a/b", &first_path, "first-source"),
+            make("a_b", &second_path, "second-source"),
+            make("a/b", &second_path, "duplicate-source"),
+        ];
+        let error = validate_manifest_cases(&cases)
+            .expect_err("duplicate and colliding IDs must be rejected")
+            .to_string();
+        assert!(error.contains("duplicate CHC case ID"), "{error}");
+        assert!(error.contains("collide at output directory"), "{error}");
+        assert!(error.contains("first-source"), "{error}");
+        assert!(error.contains("second-source"), "{error}");
+    }
+
+    #[test]
+    fn chc_gate_root_discovery_enforces_case_cap() {
+        let tmp = TempDir::new().unwrap();
+        for name in ["a.smt2", "b.smt2", "c.smt2"] {
+            fs::write(tmp.path().join(name), "(set-logic HORN)\n").unwrap();
+        }
+        let mut cases = Vec::new();
+        let error = collect_smt2_cases_with_limits(tmp.path(), None, &mut cases, 100, 100, 2)
+            .expect_err("root discovery must enforce its case cap");
+        assert!(error.to_string().contains("2-case cap"));
+        assert!(cases.len() <= 2);
     }
 
     #[test]
@@ -2390,6 +3073,9 @@ mod tests {
             schema: CASES_SCHEMA,
             case_id: "a".to_string(),
             path: "a.smt2".to_string(),
+            solver_input_path: "snapshot-a.smt2".to_string(),
+            input_sha256: "sha256:test".to_string(),
+            input_size_bytes: 1,
             category: "LIA".to_string(),
             family: "f".to_string(),
             expected_status: "sat".to_string(),
@@ -2405,6 +3091,7 @@ mod tests {
             par2_s: 0.25,
             timed_out: false,
             exit_code: Some(0),
+            process_status: "exit status: 0".to_string(),
             stats_json_present: true,
             stats_json_path: String::new(),
             validation: ValidationTelemetry::default(),
@@ -2416,6 +3103,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             command_argv: Vec::new(),
+            command_env: BTreeMap::new(),
         };
         let mut timeout = solved.clone();
         timeout.case_id = "b".to_string();
@@ -2443,6 +3131,8 @@ mod tests {
                 headroom_mb: 16000,
                 planner: "test".to_string(),
             }),
+            timeout_sec: Some(2.0),
+            resource_enforcement: Some(crate::resource::ENFORCEMENT_AY_MEMORY_RSS_V1.to_string()),
         };
         let args = ChcGateArgs {
             manifest: Some(PathBuf::from("m.json")),
@@ -2478,6 +3168,9 @@ mod tests {
             schema: CASES_SCHEMA,
             case_id: "mem".to_string(),
             path: "mem.smt2".to_string(),
+            solver_input_path: "snapshot-mem.smt2".to_string(),
+            input_sha256: "sha256:test".to_string(),
+            input_size_bytes: 1,
             category: "LIA".to_string(),
             family: "f".to_string(),
             expected_status: "sat".to_string(),
@@ -2493,6 +3186,7 @@ mod tests {
             par2_s: 4.0,
             timed_out: false,
             exit_code: None,
+            process_status: "signal: 9".to_string(),
             stats_json_present: false,
             stats_json_path: String::new(),
             validation: ValidationTelemetry::default(),
@@ -2504,6 +3198,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             command_argv: Vec::new(),
+            command_env: BTreeMap::new(),
         };
         let overall = summarize_overall(std::slice::from_ref(&row), false);
         assert_eq!(overall.memout, 1);
@@ -2522,6 +3217,8 @@ mod tests {
             solved: Some(1),
             par2_total: Some(1.0),
             resource_plan: None,
+            timeout_sec: None,
+            resource_enforcement: None,
         };
         let args = ChcGateArgs {
             manifest: None,

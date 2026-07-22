@@ -199,7 +199,6 @@ impl DietMode {
 /// etc.) with a single implementation of the check loop, equality propagation,
 /// push/pop, and assert_literal routing. Fixing a bug in the N-O loop fixes
 /// it for ALL logic combinations simultaneously.
-
 pub struct TheoryCombiner<'a> {
     /// A5 lazy arith-equality adapter (experiment, AY_A5_LAZY_ARITH=1):
     /// Int EQUALITY atoms are EUF-owned during search (congruence handles
@@ -531,6 +530,17 @@ impl<'a> TheoryCombiner<'a> {
             arrays.import_requested_interface_eqs(&requested_interface_eqs);
             arrays.import_requested_model_eqs(&requested_model_eqs);
             arrays.import_exact_select_model_eq_keys(&exact_select_model_eq_keys);
+            // Re-wire cooperative cancellation on the REBUILT solver: the
+            // fresh instance starts with `interrupt: None, deadline: None`,
+            // which would silently disable the #8615 interrupt polls and the
+            // #array-deadline-forward budget honoring for the rest of the
+            // solve after a mid-solve term-store growth rebuild.
+            if let Some(ref flag) = self.interrupt {
+                arrays.set_interrupt(flag.clone());
+            }
+            if let Some(dl) = self.deadline {
+                arrays.set_deadline(dl);
+            }
             self.arrays = Some(arrays);
             // The fresh array solver's `sent_equality_replay_log` starts empty;
             // drop the stale export cursor + pending replays that indexed the
@@ -926,6 +936,17 @@ impl<'a> TheoryCombiner<'a> {
         if let (Some(dl), Some(lia)) = (deadline, self.lia.as_mut()) {
             lia.set_deadline(dl);
         }
+        // #array-deadline-forward: push the deadline INTO the inner
+        // `ArraySolver` for the same reason as the LIA forward above — a
+        // single dense `final_check` (the O(pairs x explain-BFS) ROW2
+        // sub-checks) was measured running 40+s past the caller's wall
+        // budget on QF_AX subset re-solves, past every N-O-boundary poll.
+        // The ArraySolver polls it at sub-check boundaries and amortized
+        // inside the pair loops, exiting Unknown at the boundary —
+        // verdict-neutral by construction.
+        if let (Some(dl), Some(arrays)) = (deadline, self.arrays.as_mut()) {
+            arrays.set_deadline(dl);
+        }
     }
 
     /// #qfax-t3-atom-space: enable/disable the BCP-time arrays lanes
@@ -1155,7 +1176,8 @@ impl<'a> TheoryCombiner<'a> {
         self.rescue_pair_counter = counter;
     }
 
-    /// Check whether the interrupt flag is set or the deadline has passed.
+    /// Check whether the interrupt flag is set, the deadline has passed, or
+    /// the process-wide memory ceiling is exceeded.
     pub(super) fn is_interrupted(&self) -> bool {
         if let Some(ref flag) = self.interrupt {
             if flag.load(Ordering::Relaxed) {
@@ -1166,6 +1188,17 @@ impl<'a> TheoryCombiner<'a> {
             if Instant::now() >= deadline {
                 return true;
             }
+        }
+        // Process-wide memory ceiling (#array-deadline-forward RSS
+        // discipline): same guard `should_abort_theory_loop` polls, moved
+        // inside the N-O loop so a bulk-allocating theory round trips
+        // Unknown(MemoryLimit) at the next boundary instead of running into
+        // an external RSS watchdog SIGKILL mid-check (measured on QF_AX swap
+        // subset re-solves). Reads an atomic live-heap counter — no syscall.
+        // No-op unless a ceiling was installed from main(). Soundness-
+        // neutral: can only drive Unknown, never a wrong SAT/UNSAT.
+        if ay_sys::process_memory_exceeded() {
+            return true;
         }
         false
     }

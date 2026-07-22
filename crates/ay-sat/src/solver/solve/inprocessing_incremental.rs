@@ -65,7 +65,11 @@ impl Solver {
     /// Returns `true` if UNSAT was derived at decision level 0.
     pub(in crate::solver) fn run_incremental_inprocessing(&mut self) -> bool {
         // ── Preconditions ────────────────────────────────────────────────
-        if self.is_interrupted() {
+        // #array-deadline-forward: the whole-solve deadline is honored here
+        // too — incremental inprocessing runs BEFORE the CDCL loop's
+        // `should_stop` polls can fire, and its passes can be expensive on a
+        // grown clause DB.
+        if self.is_interrupted() || self.solve_deadline_expired() {
             return false;
         }
         debug_assert_eq!(

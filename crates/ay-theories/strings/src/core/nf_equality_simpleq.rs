@@ -200,13 +200,64 @@ impl CoreSolver {
                         // explanation. If the explanation is empty, skip the
                         // internal equality to avoid poisoning the proof forest
                         // with unjustified merges (#6273).
-                        let Some(explanation) =
+                        let Some(mut explanation) =
                             Self::build_pair_explanation_for_lemma(terms, nf1, nf2, state)
                         else {
                             return NfCheckResult::Incomplete;
                         };
+                        // Closure 2 (`AY_STR_NF=1`, sub-flag 2): the derived
+                        // equality depends on len(c1) = len(c2) — include the
+                        // guarding length literals so backtracking the length
+                        // decision retracts the merge justification too.
+                        // Reason-free entailments (pure ArithEntail) keep the
+                        // pre-closure explanation.
+                        if crate::str_nf_closure_enabled(2) {
+                            if let Some(len_reasons) =
+                                Self::length_equality_reasons(terms, state, c1, c2)
+                            {
+                                let mut seen: HashSet<TheoryLit> =
+                                    explanation.iter().copied().collect();
+                                Self::extend_dedup(&mut explanation, &mut seen, len_reasons);
+                            }
+                        }
                         infer.add_internal_equality(InferenceKind::Unify, c1, c2, explanation);
                         return NfCheckResult::Incomplete;
+                    }
+                    // Closure 2 (`AY_STR_NF=1`, sub-flag 2): prefix
+                    // component-transfer N_UNIFY. When one component has an
+                    // entailed concrete length and the other decomposes (via
+                    // an EQC concat, reduced webs included) into an
+                    // entailed-empty prefix plus a leading sub-component of
+                    // the SAME entailed length, both are the same-length
+                    // prefix of equal remainders ⇒ unify them. This is the
+                    // inference that closes nested substr/at skolem webs
+                    // (the pyex zz core) without enumerating length splits.
+                    if crate::str_nf_closure_enabled(2) {
+                        if let Some((x, y, transfer_reasons)) =
+                            Self::find_component_transfer(terms, state, c1, c2)
+                        {
+                            let Some(mut explanation) =
+                                Self::build_pair_explanation_for_lemma(terms, nf1, nf2, state)
+                            else {
+                                return NfCheckResult::Incomplete;
+                            };
+                            let mut seen: HashSet<TheoryLit> =
+                                explanation.iter().copied().collect();
+                            Self::extend_dedup(&mut explanation, &mut seen, transfer_reasons);
+                            if explanation.is_empty() {
+                                // No guards at all — never launder an empty
+                                // explanation into the proof forest (#6273).
+                                return NfCheckResult::Incomplete;
+                            }
+                            if *DEBUG_STRING_CORE {
+                                eprintln!(
+                                    "[STRING_CORE] process_simple_neq: component-transfer N_UNIFY x={x:?} y={y:?} c1={c1:?} c2={c2:?} expl_len={}",
+                                    explanation.len()
+                                );
+                            }
+                            infer.add_internal_equality(InferenceKind::Unify, x, y, explanation);
+                            return NfCheckResult::Incomplete;
+                        }
                     }
                     // Lengths not known equal — determine which split is needed.
                     let s1 = Self::component_constant_owned(terms, state, c1);

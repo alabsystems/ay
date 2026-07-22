@@ -1079,7 +1079,7 @@ fn non_empty_env_path(name: &str) -> Option<PathBuf> {
 fn env_bool(name: &str) -> Result<bool> {
     let raw = match env::var_os(name) {
         Some(raw) => raw,
-        None => match legacy_gate_env_name(name).and_then(|legacy| env::var_os(legacy)) {
+        None => match legacy_gate_env_name(name).and_then(env::var_os) {
             Some(raw) => raw,
             None => return Ok(false),
         },
@@ -5699,7 +5699,7 @@ fn proof_lean_replay_command() -> String {
 }
 
 fn proof_chc_replay_command() -> String {
-    "set -o pipefail; AY_PACKET_DIR=${AY_PACKET_DIR:-/tmp/ay-chc-replay} && mkdir -p \"${AY_PACKET_DIR}\" && ./target/release/ay solve --chc --proof \"${AY_PACKET_DIR}/chc-certificate.smt2\" benchmarks/chc/counter_safe_chccomp.smt2 2>&1 | tee \"${AY_PACKET_DIR}/chc-certificate-run.log\" && z3 \"${AY_PACKET_DIR}\"/chc-obligations/*.smt2 2>&1 | tee \"${AY_PACKET_DIR}/chc-certificate-replay.log\"".to_string()
+    "set -o pipefail; AY_PACKET_DIR=${AY_PACKET_DIR:-/tmp/ay-chc-replay} && mkdir -p \"${AY_PACKET_DIR}\" && AY_CHC_RUN_DIR=$(umask 077 && mktemp -d \"${AY_PACKET_DIR}/chc-run.XXXXXXXXXX\") && chmod 700 \"${AY_CHC_RUN_DIR}\" && AY_CHC_CERTIFICATE=\"${AY_CHC_RUN_DIR}/chc-certificate.smt2\" && ./target/release/ay solve --chc --stats-json --proof \"${AY_CHC_CERTIFICATE}\" benchmarks/chc/counter_safe_chccomp.smt2 2>&1 | tee \"${AY_CHC_RUN_DIR}/chc-certificate-run.log\" && set -- \"${AY_CHC_CERTIFICATE}\".chc-obligations-* && test \"$#\" -eq 1 && test -d \"$1\" && AY_CHC_OBLIGATIONS_DIR=$1 && set -- \"${AY_CHC_OBLIGATIONS_DIR}\"/*.smt2 && test \"$#\" -gt 0 && test -f \"$1\" && : > \"${AY_CHC_RUN_DIR}/chc-certificate-replay.log\" && (for AY_CHC_OBLIGATION in \"$@\"; do AY_CHC_REPLAY_OUTPUT=$(z3 \"${AY_CHC_OBLIGATION}\" 2>&1) || { AY_CHC_REPLAY_STATUS=$?; printf '%s\\n' \"${AY_CHC_REPLAY_OUTPUT}\" | tee -a \"${AY_CHC_RUN_DIR}/chc-certificate-replay.log\"; exit \"${AY_CHC_REPLAY_STATUS}\"; }; printf '%s\\n' \"${AY_CHC_REPLAY_OUTPUT}\" | tee -a \"${AY_CHC_RUN_DIR}/chc-certificate-replay.log\" || exit 1; AY_CHC_REPLAY_VERDICT=$(printf '%s\\n' \"${AY_CHC_REPLAY_OUTPUT}\" | awk 'NF { print; exit }') || exit 1; test \"${AY_CHC_REPLAY_VERDICT}\" = unsat || exit 1; done)".to_string()
 }
 
 fn benchmark_command() -> String {
@@ -5892,6 +5892,26 @@ mod tests {
         assert!(
             !argv.iter().any(|arg| arg == "--inventory-only"),
             "launch gate must consume executed full-replacement proof evidence, not inventory-only rows"
+        );
+    }
+
+    #[test]
+    fn chc_replay_guidance_isolates_each_emission_before_globbing() {
+        let command = proof_chc_replay_command();
+
+        assert!(command.contains("mktemp -d \"${AY_PACKET_DIR}/chc-run.XXXXXXXXXX\""));
+        assert!(command.contains("chmod 700 \"${AY_CHC_RUN_DIR}\""));
+        assert!(command.contains("solve --chc --stats-json --proof \"${AY_CHC_CERTIFICATE}\""));
+        assert!(command.contains("\"${AY_CHC_CERTIFICATE}\".chc-obligations-*"));
+        assert!(command.contains("test \"$#\" -eq 1 && test -d \"$1\""));
+        assert!(command.contains("\"${AY_CHC_OBLIGATIONS_DIR}\"/*.smt2"));
+        assert!(command.contains("for AY_CHC_OBLIGATION in \"$@\""));
+        assert!(command.contains("z3 \"${AY_CHC_OBLIGATION}\""));
+        assert!(command.contains("test \"${AY_CHC_REPLAY_VERDICT}\" = unsat || exit 1"));
+        assert!(!command.contains("z3 \"$@\""));
+        assert!(
+            !command.contains("\"${AY_PACKET_DIR}\"/chc-obligations"),
+            "replay guidance must not inspect a shared stale obligation directory: {command}"
         );
     }
 

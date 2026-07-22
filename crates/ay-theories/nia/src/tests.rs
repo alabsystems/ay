@@ -1936,17 +1936,22 @@ fn test_factor_split_verified_sat() {
 }
 
 /// AProVE flag-instance shape, zero branch (#nia-factor-split-contraction):
+///
 /// `b ∈ [0,1] ∧ b*a2 - a2 = 0 ∧ b*a5 - b*a3 >= 0 ∧ e1 >= 0 ∧ e2 >= 0 ∧
-/// e1 >= 1` with `e1 = a1 + a3*a2 - a4`, `e2 = a4 - a1 - a5*a2`, all vars
-/// >= 0. Branch b=0: the equality forces `a2 = 0` (linearized-atom
-/// contraction), zeroing both e-products, so `e1 = a1 - a4 >= 1` contradicts
-/// `e2 = a4 - a1 >= 0` + `e1 >= 0`. Branch b=1: the pins linearize
-/// `b*a5 - b*a3 >= 0` to `a3 <= a5`, and the monotonicity cut
-/// `a2*a3 <= a2*a5` (shared factor a2 >= 0) makes `e1 + e2 = a2*a3 - a2*a5
-/// <= 0` contradict `e1 >= 1 ∧ e2 >= 0`. Both branches of the complete
-/// cover refuted => factor split alone must decide UNSAT. This is the exact
-/// residue shape of aproveSMT8452270181291996905 after the DPLL(T)
-/// disequality split.
+/// e1 >= 1`, with `e1 = a1 + a3*a2 - a4` and `e2 = a4 - a1 - a5*a2`; all
+/// variables are nonnegative.
+///
+/// For `b = 0`, the equality forces `a2 = 0` (linearized-atom contraction),
+/// zeroing both e-products, so `e1 = a1 - a4 >= 1` contradicts
+/// `e2 = a4 - a1 >= 0` together with `e1 >= 0`.
+///
+/// For `b = 1`, the pins linearize `b*a5 - b*a3 >= 0` to `a3 <= a5`, and the
+/// monotonicity cut `a2*a3 <= a2*a5` (shared factor `a2 >= 0`) makes
+/// `e1 + e2 = a2*a3 - a2*a5 <= 0` contradict `e1 >= 1 ∧ e2 >= 0`.
+///
+/// Both branches of the complete cover are refuted, so factor splitting alone
+/// must decide UNSAT. This is the exact residue shape of
+/// `aproveSMT8452270181291996905` after the DPLL(T) disequality split.
 #[test]
 fn test_factor_split_aprove_flag_unsat() {
     let mut terms = TermStore::new();

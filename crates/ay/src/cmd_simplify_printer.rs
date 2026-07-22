@@ -9,42 +9,77 @@
 //! parsed script to stdout. Split out of `cmd_simplify.rs` to keep every
 //! file under the 500-line module cap.
 
+use ay_core::quote_symbol;
 use ay_frontend::command::{
-    Constant, ConstructorDec, DatatypeDec, SelectorDec, Sort, SortDec, Term,
+    Constant, ConstructorDec, DatatypeDec, Index, QualifiedIdentifier, SelectorDec, Sort, SortDec,
+    Term,
 };
-use ay_frontend::sexp::parse_sexp;
 use ay_frontend::{Command, SExpr};
 
 fn identifier_to_sexp(identifier: &str) -> SExpr {
-    parse_sexp(identifier).unwrap_or_else(|_| SExpr::Symbol(identifier.to_string()))
+    // `to_raw_string` deliberately does not quote symbols, so carry the bars
+    // in the stored spelling for user identifiers while keeping syntax tokens
+    // such as `_` and `as` raw at their construction sites.
+    SExpr::Symbol(quote_symbol(identifier))
 }
 
-fn index_to_sexp(index: &str) -> SExpr {
-    if !index.is_empty() && index.chars().all(|ch| ch.is_ascii_digit()) {
-        SExpr::Numeral(index.to_string())
-    } else {
-        SExpr::Symbol(index.to_string())
+fn opaque_value_to_sexp(value: &SExpr) -> SExpr {
+    match value {
+        SExpr::Symbol(symbol) => identifier_to_sexp(symbol),
+        _ => value.clone(),
+    }
+}
+
+fn annotation_value_to_sexp(key: &str, value: &SExpr) -> SExpr {
+    if key == ":pattern" {
+        if let SExpr::List(patterns) = value {
+            let rendered = patterns
+                .iter()
+                .map(|pattern| Term::from_sexp(pattern).map(|term| term_to_sexp(&term)))
+                .collect::<Result<Vec<_>, _>>();
+            if let Ok(rendered) = rendered {
+                return SExpr::List(rendered);
+            }
+        }
+    }
+
+    if key == ":no-pattern" {
+        if let Ok(term) = Term::from_sexp(value) {
+            return term_to_sexp(&term);
+        }
+    }
+
+    opaque_value_to_sexp(value)
+}
+
+fn index_to_sexp(index: &Index) -> SExpr {
+    match index {
+        Index::Numeral(value) => SExpr::Numeral(value.clone()),
+        Index::Symbol(value) => identifier_to_sexp(value),
+        Index::Hexadecimal(value) => SExpr::Hexadecimal(value.clone()),
+        Index::Binary(value) => SExpr::Binary(value.clone()),
+        _ => SExpr::Symbol("<unsupported-index>".to_string()),
     }
 }
 
 fn sorted_vars_to_sexp(vars: &[(String, Sort)]) -> SExpr {
     SExpr::List(
         vars.iter()
-            .map(|(name, sort)| SExpr::List(vec![SExpr::Symbol(name.clone()), sort_to_sexp(sort)]))
+            .map(|(name, sort)| SExpr::List(vec![identifier_to_sexp(name), sort_to_sexp(sort)]))
             .collect(),
     )
 }
 
 fn selector_to_sexp(selector: &SelectorDec) -> SExpr {
     SExpr::List(vec![
-        SExpr::Symbol(selector.name.clone()),
+        identifier_to_sexp(&selector.name),
         sort_to_sexp(&selector.sort),
     ])
 }
 
 fn constructor_to_sexp(constructor: &ConstructorDec) -> SExpr {
     let mut items = Vec::with_capacity(constructor.selectors.len() + 1);
-    items.push(SExpr::Symbol(constructor.name.clone()));
+    items.push(identifier_to_sexp(&constructor.name));
     items.extend(constructor.selectors.iter().map(selector_to_sexp));
     SExpr::List(items)
 }
@@ -65,7 +100,7 @@ fn datatype_to_sexp(datatype: &DatatypeDec) -> SExpr {
             datatype
                 .type_params
                 .iter()
-                .map(|p| SExpr::Symbol(p.clone()))
+                .map(|parameter| identifier_to_sexp(parameter))
                 .collect(),
         );
         SExpr::List(vec![SExpr::Symbol("par".to_string()), params, ctors])
@@ -74,7 +109,7 @@ fn datatype_to_sexp(datatype: &DatatypeDec) -> SExpr {
 
 fn sort_dec_to_sexp(sort_dec: &SortDec) -> SExpr {
     SExpr::List(vec![
-        SExpr::Symbol(sort_dec.name.clone()),
+        identifier_to_sexp(&sort_dec.name),
         SExpr::Numeral(sort_dec.arity.to_string()),
     ])
 }
@@ -82,18 +117,18 @@ fn sort_dec_to_sexp(sort_dec: &SortDec) -> SExpr {
 /// Convert a frontend sort AST into an S-expression.
 pub(crate) fn sort_to_sexp(sort: &Sort) -> SExpr {
     match sort {
-        Sort::Simple(name) => SExpr::Symbol(name.clone()),
+        Sort::Simple(name) => identifier_to_sexp(name),
         Sort::Parameterized(name, params) => {
             let mut items = Vec::with_capacity(params.len() + 1);
-            items.push(SExpr::Symbol(name.clone()));
+            items.push(identifier_to_sexp(name));
             items.extend(params.iter().map(sort_to_sexp));
             SExpr::List(items)
         }
         Sort::Indexed(name, indices) => {
             let mut items = Vec::with_capacity(indices.len() + 2);
             items.push(SExpr::Symbol("_".to_string()));
-            items.push(SExpr::Symbol(name.clone()));
-            items.extend(indices.iter().map(|index| index_to_sexp(index)));
+            items.push(identifier_to_sexp(name));
+            items.extend(indices.iter().map(index_to_sexp));
             SExpr::List(items)
         }
         // `Sort` is `#[non_exhaustive]` (see ay-frontend/src/command/mod.rs).
@@ -125,20 +160,38 @@ pub(crate) fn term_to_sexp(term: &Term) -> SExpr {
         Term::IndexedApp(name, indices, args) => {
             let mut head = Vec::with_capacity(indices.len() + 2);
             head.push(SExpr::Symbol("_".to_string()));
-            head.push(SExpr::Symbol(name.clone()));
-            head.extend(indices.iter().map(|index| index_to_sexp(index)));
+            head.push(identifier_to_sexp(name));
+            head.extend(indices.iter().map(index_to_sexp));
+
+            if args.is_empty() {
+                return SExpr::List(head);
+            }
 
             let mut items = Vec::with_capacity(args.len() + 1);
             items.push(SExpr::List(head));
             items.extend(args.iter().map(term_to_sexp));
             SExpr::List(items)
         }
-        Term::QualifiedApp(name, sort, args) => {
+        Term::QualifiedApp(identifier, sort, args) => {
+            let qualified = match identifier {
+                QualifiedIdentifier::Symbol(name) => identifier_to_sexp(name),
+                QualifiedIdentifier::Indexed(name, indices) => {
+                    let mut indexed = Vec::with_capacity(indices.len() + 2);
+                    indexed.push(SExpr::Symbol("_".to_string()));
+                    indexed.push(identifier_to_sexp(name));
+                    indexed.extend(indices.iter().map(index_to_sexp));
+                    SExpr::List(indexed)
+                }
+                _ => SExpr::Symbol("<unsupported-qualified-identifier>".to_string()),
+            };
             let head = SExpr::List(vec![
                 SExpr::Symbol("as".to_string()),
-                identifier_to_sexp(name),
+                qualified,
                 sort_to_sexp(sort),
             ]);
+            if args.is_empty() {
+                return head;
+            }
             let mut items = Vec::with_capacity(args.len() + 1);
             items.push(head);
             items.extend(args.iter().map(term_to_sexp));
@@ -150,7 +203,7 @@ pub(crate) fn term_to_sexp(term: &Term) -> SExpr {
                 bindings
                     .iter()
                     .map(|(name, value)| {
-                        SExpr::List(vec![SExpr::Symbol(name.clone()), term_to_sexp(value)])
+                        SExpr::List(vec![identifier_to_sexp(name), term_to_sexp(value)])
                     })
                     .collect(),
             ),
@@ -177,7 +230,7 @@ pub(crate) fn term_to_sexp(term: &Term) -> SExpr {
             items.push(term_to_sexp(term));
             for (key, value) in annotations {
                 items.push(SExpr::Keyword(key.clone()));
-                items.push(value.clone());
+                items.push(annotation_value_to_sexp(key, value));
             }
             SExpr::List(items)
         }
@@ -194,37 +247,37 @@ fn command_to_sexp(command: &Command) -> Option<SExpr> {
     let sexpr = match command {
         Command::SetLogic(logic) => SExpr::List(vec![
             SExpr::Symbol("set-logic".to_string()),
-            SExpr::Symbol(logic.clone()),
+            identifier_to_sexp(logic),
         ]),
         Command::SetOption(keyword, value) => SExpr::List(vec![
             SExpr::Symbol("set-option".to_string()),
             SExpr::Keyword(keyword.clone()),
-            value.clone(),
+            opaque_value_to_sexp(value),
         ]),
         Command::SetInfo(keyword, value) => SExpr::List(vec![
             SExpr::Symbol("set-info".to_string()),
             SExpr::Keyword(keyword.clone()),
-            value.clone(),
+            opaque_value_to_sexp(value),
         ]),
         Command::DeclareSort(name, arity) => SExpr::List(vec![
             SExpr::Symbol("declare-sort".to_string()),
-            SExpr::Symbol(name.clone()),
+            identifier_to_sexp(name),
             SExpr::Numeral(arity.to_string()),
         ]),
         Command::DefineSort(name, params, sort) => SExpr::List(vec![
             SExpr::Symbol("define-sort".to_string()),
-            SExpr::Symbol(name.clone()),
+            identifier_to_sexp(name),
             SExpr::List(
                 params
                     .iter()
-                    .map(|param| SExpr::Symbol(param.clone()))
+                    .map(|param| identifier_to_sexp(param))
                     .collect(),
             ),
             sort_to_sexp(sort),
         ]),
         Command::DeclareDatatype(name, datatype) => SExpr::List(vec![
             SExpr::Symbol("declare-datatype".to_string()),
-            SExpr::Symbol(name.clone()),
+            identifier_to_sexp(name),
             datatype_to_sexp(datatype),
         ]),
         Command::DeclareDatatypes(sort_decs, datatypes) => SExpr::List(vec![
@@ -234,25 +287,25 @@ fn command_to_sexp(command: &Command) -> Option<SExpr> {
         ]),
         Command::DeclareFun(name, params, sort) => SExpr::List(vec![
             SExpr::Symbol("declare-fun".to_string()),
-            SExpr::Symbol(name.clone()),
+            identifier_to_sexp(name),
             SExpr::List(params.iter().map(sort_to_sexp).collect()),
             sort_to_sexp(sort),
         ]),
         Command::DeclareConst(name, sort) => SExpr::List(vec![
             SExpr::Symbol("declare-const".to_string()),
-            SExpr::Symbol(name.clone()),
+            identifier_to_sexp(name),
             sort_to_sexp(sort),
         ]),
         Command::DefineFun(name, params, sort, body) => SExpr::List(vec![
             SExpr::Symbol("define-fun".to_string()),
-            SExpr::Symbol(name.clone()),
+            identifier_to_sexp(name),
             sorted_vars_to_sexp(params),
             sort_to_sexp(sort),
             term_to_sexp(body),
         ]),
         Command::DefineFunRec(name, params, sort, body) => SExpr::List(vec![
             SExpr::Symbol("define-fun-rec".to_string()),
-            SExpr::Symbol(name.clone()),
+            identifier_to_sexp(name),
             sorted_vars_to_sexp(params),
             sort_to_sexp(sort),
             term_to_sexp(body),
@@ -264,7 +317,7 @@ fn command_to_sexp(command: &Command) -> Option<SExpr> {
                     .iter()
                     .map(|(name, params, sort)| {
                         SExpr::List(vec![
-                            SExpr::Symbol(name.clone()),
+                            identifier_to_sexp(name),
                             sorted_vars_to_sexp(params),
                             sort_to_sexp(sort),
                         ])
@@ -365,6 +418,7 @@ pub(crate) fn command_to_smtlib(command: &Command) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ay_frontend::sexp::parse_sexp;
 
     #[test]
     fn term_and_sort_round_trip_to_smtlib() {
@@ -376,8 +430,61 @@ mod tests {
             "((as const (Array Int Int)) 0)"
         );
 
-        let sort = Sort::Indexed("BitVec".to_string(), vec!["32".to_string()]);
+        let sort = Sort::Indexed("BitVec".to_string(), vec![Index::Numeral("32".to_string())]);
         assert_eq!(sort_to_sexp(&sort).to_raw_string(), "(_ BitVec 32)");
+    }
+
+    #[test]
+    fn indexed_literals_and_same_spelled_symbols_round_trip_distinctly() {
+        let term =
+            Term::from_sexp(&parse_sexp("(distinct |(_ bv0 8)| (_ bv0 8))").expect("valid sexp"))
+                .expect("valid term");
+        assert_eq!(
+            term_to_sexp(&term).to_raw_string(),
+            "(distinct |(_ bv0 8)| (_ bv0 8))"
+        );
+
+        let let_term = Term::from_sexp(
+            &parse_sexp("(let ((|(_ bv0 8)| #x01)) (distinct |(_ bv0 8)| (_ bv0 8)))")
+                .expect("valid let expression"),
+        )
+        .expect("valid let term");
+        assert_eq!(
+            term_to_sexp(&let_term).to_raw_string(),
+            "(let ((|(_ bv0 8)| #x01)) (distinct |(_ bv0 8)| (_ bv0 8)))"
+        );
+
+        let annotated =
+            Term::from_sexp(&parse_sexp("(! p :named |(_ bv0 8)|)").expect("valid annotation"))
+                .expect("valid annotated term");
+        assert_eq!(
+            term_to_sexp(&annotated).to_raw_string(),
+            "(! p :named |(_ bv0 8)|)"
+        );
+
+        for input in [
+            "(! true :pattern ((f |(_ bv0 8)|) ((_ extract 7 0) x)))",
+            "(! true :pattern ((f |(_ bv0 8)|)) :pattern (((_ extract 7 0) |(_ bv0 8)|)))",
+            "(! true :no-pattern ((_ extract 7 0) |(_ bv0 8)|))",
+        ] {
+            let patterned = Term::from_sexp(&parse_sexp(input).expect("valid pattern annotation"))
+                .expect("valid annotated term");
+            let rendered = term_to_sexp(&patterned).to_raw_string();
+            assert_eq!(rendered, input);
+            let reparsed = Term::from_sexp(&parse_sexp(&rendered).expect("rendered S-expression"))
+                .expect("rendered annotated term");
+            assert_eq!(reparsed, patterned);
+        }
+
+        let character = Term::from_sexp(&parse_sexp("(_ char #x41)").expect("valid char literal"))
+            .expect("valid term");
+        assert_eq!(term_to_sexp(&character).to_raw_string(), "(_ char #x41)");
+
+        for input in ["(as f Int)", "(as (_ f 1) Int)"] {
+            let qualified = Term::from_sexp(&parse_sexp(input).expect("valid qualified term"))
+                .expect("valid term");
+            assert_eq!(term_to_sexp(&qualified).to_raw_string(), input);
+        }
     }
 
     /// Regression: printer must not panic on unsupported commands (#8853 / #8696).

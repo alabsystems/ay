@@ -36,8 +36,9 @@ pub mod sexp;
 pub mod stats;
 
 pub use command::{
-    ApplyTactic, Command, Constant, MatchPattern, ParamValue, ParsedConstant, ParsedSort, Probe,
-    ProbeCmp, Sort, SygusGrammar, SygusGrammarRule, Term, SUPPORTED_TACTIC_NAMES,
+    ApplyTactic, Command, Constant, Index, MatchPattern, ParamValue, ParsedConstant, ParsedSort,
+    Probe, ProbeCmp, QualifiedIdentifier, Sort, SygusGrammar, SygusGrammarRule, Term,
+    SUPPORTED_TACTIC_NAMES,
 };
 pub use elaborate::{
     is_reserved_symbol, CommandResult, Context, ElaborateError, IntroKind, Objective,

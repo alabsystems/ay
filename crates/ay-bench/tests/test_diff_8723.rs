@@ -45,6 +45,7 @@ fn row(commit: &str, bench: &str, result: &str, runtime_ms: i64, verifier_ok: i3
         proof_exists: None,
         proof_bytes: None,
         proof_hash: None,
+        proof_validation: None,
         family: None,
         clause_width_max: None,
         clause_width_mean: None,

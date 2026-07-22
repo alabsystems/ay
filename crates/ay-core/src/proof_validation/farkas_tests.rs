@@ -259,7 +259,7 @@ fn refuter_strict_cancellation_x_lt_5_x_gt_5_is_genuine_contradiction() {
     let conflict = vec![TheoryLit::new(x_lt_5, true), TheoryLit::new(x_gt_5, true)];
     let farkas = FarkasAnnotation::from_ints(&[1, 1]);
     let res = verify_farkas_conflict_lits_full(&terms, &conflict, &farkas);
-    println!("REFUTER strict-cancel {{x<5,x>5}} => {:?}", res);
+    println!("REFUTER strict-cancel {{x<5,x>5}} => {res:?}");
     assert!(
         res.is_ok(),
         "strict cancellation IS a genuine contradiction"
@@ -281,7 +281,7 @@ fn refuter_non_tautological_clause_must_be_rejected() {
     let conflict = vec![TheoryLit::new(x_lt_5, true), TheoryLit::new(x_gt_3, true)];
     let farkas = FarkasAnnotation::from_ints(&[1, 1]);
     let res = verify_farkas_conflict_lits_full(&terms, &conflict, &farkas);
-    println!("REFUTER non-taut {{x<5,x>3}} => {:?}", res);
+    println!("REFUTER non-taut {{x<5,x>3}} => {res:?}");
     assert!(
         res.is_err(),
         "non-tautological clause MUST be rejected (no hole)"

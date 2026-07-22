@@ -36,7 +36,7 @@ pub(crate) mod types;
 mod validation;
 
 use preprocess::problem_contains_recursive_bv_sorts;
-pub(crate) use preprocess::{portfolio_clause_inliner, PreprocessSummary};
+pub(crate) use preprocess::PreprocessSummary;
 #[cfg(test)]
 use schedule::panic_message;
 use types::EngineResult;

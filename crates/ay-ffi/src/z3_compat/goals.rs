@@ -39,9 +39,10 @@ use std::ptr;
 use super::{
     ast_to_term, cache_apply_result, cache_goal, cache_goal_with_depth, cache_string,
     ensure_cross_context_translation_semantics, ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int,
-    ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, record_ast_sort, term_to_ast, ModelHandle,
-    Z3_apply_result, Z3_ast, Z3_context, Z3_goal, Z3_model, Z3_params, Z3_string, Z3_tactic,
-    Z3_EXCEPTION, Z3_GOAL_PRECISE, Z3_INVALID_ARG, Z3_OK,
+    ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, record_ast_sort, term_to_ast,
+    transfer_cross_context_ffi_metadata, ModelHandle, Z3_apply_result, Z3_ast, Z3_context, Z3_goal,
+    Z3_model, Z3_params, Z3_string, Z3_tactic, Z3_EXCEPTION, Z3_GOAL_PRECISE, Z3_INVALID_ARG,
+    Z3_OK,
 };
 use ay_dpll::api::Term;
 use ay_frontend::Probe;
@@ -536,9 +537,18 @@ pub unsafe extern "C" fn Z3_goal_translate(
             }
             let src_terms: Vec<Term> = formulas.iter().map(|&a| ast_to_term(a)).collect();
             let new_terms = tgt.solver.translate_terms_from(&src.solver, &src_terms);
+            if !transfer_cross_context_ffi_metadata(
+                src,
+                tgt,
+                &src_terms,
+                &new_terms,
+                "Z3_goal_translate",
+            ) {
+                return ptr::null_mut();
+            }
             let new_asts: Vec<Z3_ast> = new_terms.iter().map(|&t| term_to_ast(t)).collect();
-            for (&term, &ast) in new_terms.iter().zip(&new_asts) {
-                let sort = tgt.solver.term_sort(term);
+            for ((&source_term, &_term), &ast) in src_terms.iter().zip(&new_terms).zip(&new_asts) {
+                let sort = src.solver.term_sort(source_term);
                 record_ast_sort(tgt, ast, sort);
             }
             tgt.last_error = Z3_OK;
@@ -619,6 +629,7 @@ pub unsafe extern "C" fn Z3_goal_to_string(c: Z3_context, g: Z3_goal) -> Z3_stri
                 }
             }
             s.push(')');
+            let s = super::ffi_surface_text(ctx, &s);
             cache_string(ctx, s)
         })
     }

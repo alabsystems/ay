@@ -45,22 +45,38 @@ use std::ptr;
 use ay_dpll::api::{DatatypeConstructor, DatatypeField, DatatypeSort, FuncDecl, Sort};
 
 use super::{
-    alloc_sort, cache_dt_func_decl, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
-    ConstructorHandle, ConstructorListHandle, DatatypeOp, Z3Context, Z3_constructor,
-    Z3_constructor_list, Z3_context, Z3_func_decl, Z3_sort, Z3_symbol, Z3_INVALID_ARG,
+    alloc_sort, cache_dt_func_decl, cache_dt_func_decl_with_symbol, ffi_count_within_limit,
+    ffi_counts_within_limit, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, ConstructorHandle,
+    ConstructorListHandle, DatatypeOp, SymbolKey, Z3Context, Z3_constructor, Z3_constructor_list,
+    Z3_context, Z3_func_decl, Z3_sort, Z3_symbol, MAX_FFI_CONTAINER_ELEMENTS, Z3_INVALID_ARG,
 };
+
+fn extend_datatype_descriptor_budget(
+    total_descriptors: &mut usize,
+    field_counts: impl IntoIterator<Item = usize>,
+    limit: usize,
+) -> Result<(), ()> {
+    for fields in field_counts {
+        *total_descriptors = (*total_descriptors)
+            .checked_add(1)
+            .and_then(|total| total.checked_add(fields))
+            .filter(|total| *total <= limit)
+            .ok_or(())?;
+    }
+    Ok(())
+}
 
 /// Read the name from a `Z3_symbol`, or `None` if null.
 ///
 /// # Safety
 /// `s` must be null or a valid symbol handle from a prior AY FFI allocation.
-unsafe fn symbol_name(s: Z3_symbol) -> Option<String> {
+unsafe fn symbol_key(s: Z3_symbol) -> Option<SymbolKey> {
     if s.is_null() {
         return None;
     }
     // SAFETY: `s` was null-checked above and originates from a prior AY FFI
     // allocation kept alive by the owning context; single-threaded per context.
-    Some(unsafe { (*s).semantic_name() })
+    Some(unsafe { (*s).key.clone() })
 }
 
 /// Create a datatype constructor descriptor.
@@ -90,6 +106,17 @@ pub unsafe extern "C" fn Z3_mk_constructor(
     sorts: *const Z3_sort,
     sort_refs: *const c_uint,
 ) -> Z3_constructor {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "Z3_mk_constructor field-name, sort, and sort-reference arrays",
+            &[num_fields, num_fields, num_fields],
+        )
+    } {
+        return ptr::null_mut();
+    }
     if name.is_null() {
         return ptr::null_mut();
     }
@@ -98,15 +125,17 @@ pub unsafe extern "C" fn Z3_mk_constructor(
     }
 
     // SAFETY: `name` null-checked above; valid AY symbol handle.
-    let Some(ctor_name) = (unsafe { symbol_name(name) }) else {
+    let Some(ctor_symbol) = (unsafe { symbol_key(name) }) else {
         return ptr::null_mut();
     };
-    // Z3 lets `recognizer` be supplied explicitly, but AY's tester is always
-    // canonically `is-<ctor>` (matching its SMT-LIB elaborator), so the supplied
-    // recognizer symbol is accepted for API compatibility and otherwise ignored.
-    let _ = recognizer;
+    let ctor_name = ctor_symbol.semantic_name();
+    // SAFETY: a non-null recognizer is a live caller-owned symbol; the helper
+    // accepts null so Z3's synthesized recognizer convention remains supported.
+    let recognizer_symbol = unsafe { symbol_key(recognizer) }
+        .unwrap_or_else(|| SymbolKey::String(format!("is-{}", ctor_symbol.display_name())));
 
     let mut field_name_vec = Vec::with_capacity(num_fields as usize);
+    let mut field_symbol_vec = Vec::with_capacity(num_fields as usize);
     let mut field_sort_vec: Vec<Option<Sort>> = Vec::with_capacity(num_fields as usize);
     let mut sort_ref_vec = Vec::with_capacity(num_fields as usize);
 
@@ -114,10 +143,11 @@ pub unsafe extern "C" fn Z3_mk_constructor(
         // SAFETY: `field_names` points to `num_fields` elems (checked above).
         let fname_sym = unsafe { *field_names.add(i) };
         // SAFETY: `fname_sym` is a valid AY symbol handle (or null -> reject).
-        let Some(fname) = (unsafe { symbol_name(fname_sym) }) else {
+        let Some(field_symbol) = (unsafe { symbol_key(fname_sym) }) else {
             return ptr::null_mut();
         };
-        field_name_vec.push(fname);
+        field_name_vec.push(field_symbol.semantic_name());
+        field_symbol_vec.push(field_symbol);
 
         // SAFETY: `sorts` points to `num_fields` elems (checked above).
         let sort_ptr = unsafe { *sorts.add(i) };
@@ -135,7 +165,10 @@ pub unsafe extern "C" fn Z3_mk_constructor(
 
     let handle = Box::into_raw(Box::new(ConstructorHandle {
         name: ctor_name,
+        name_symbol: ctor_symbol,
+        recognizer_symbol,
         field_names: field_name_vec,
+        field_symbols: field_symbol_vec,
         field_sorts: field_sort_vec,
         sort_refs: sort_ref_vec,
         constructor_decl: ptr::null_mut(),
@@ -168,6 +201,11 @@ pub unsafe extern "C" fn Z3_mk_constructor_list(
     num_constructors: c_uint,
     constructors: *const Z3_constructor,
 ) -> Z3_constructor_list {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_constructor_list", num_constructors) } {
+        return ptr::null_mut();
+    }
     if c.is_null() {
         return ptr::null_mut();
     }
@@ -246,6 +284,7 @@ unsafe fn build_datatype_sort(
 fn declare_and_fill(
     ctx: &mut Z3Context,
     dt: &DatatypeSort,
+    dt_symbol: &SymbolKey,
     ctor_handles: &[Z3_constructor],
 ) -> Z3_sort {
     if let Err(e) = ctx.solver.try_declare_datatype(dt) {
@@ -256,8 +295,11 @@ fn declare_and_fill(
     let dt_sort = Sort::Datatype(dt.clone());
 
     for (&cp, ctor) in ctor_handles.iter().zip(dt.constructors.iter()) {
+        // SAFETY: constructor handles were validated by
+        // `build_datatype_sort` and remain caller-owned for this call.
+        let ch = unsafe { &*cp };
         // Constructor func_decl: (field sorts...) -> DT.
-        let ctor_decl = cache_dt_func_decl(
+        let ctor_decl = cache_dt_func_decl_with_symbol(
             ctx,
             FuncDecl::new(
                 ctor.name.clone(),
@@ -268,9 +310,12 @@ fn declare_and_fill(
                 dt: dt.clone(),
                 ctor: ctor.name.clone(),
             },
+            ch.name_symbol.clone(),
         );
-        // Recognizer func_decl: DT -> Bool, named `is-<ctor>`.
-        let tester_decl = cache_dt_func_decl(
+        // The recognizer operation is tied to `ctor`. Its core declaration
+        // keeps the canonical tester identity used by datatype metadata, while
+        // the handle separately retains the caller's exact symbol.
+        let tester_decl = cache_dt_func_decl_with_symbol(
             ctx,
             FuncDecl::new(
                 format!("is-{}", ctor.name),
@@ -280,11 +325,12 @@ fn declare_and_fill(
             DatatypeOp::Recognizer {
                 ctor: ctor.name.clone(),
             },
+            ch.recognizer_symbol.clone(),
         );
         // Accessor func_decls: DT -> field_sort, one per field.
         let mut accessors = Vec::with_capacity(ctor.fields.len());
-        for field in &ctor.fields {
-            let acc = cache_dt_func_decl(
+        for (field, field_symbol) in ctor.fields.iter().zip(ch.field_symbols.iter()) {
+            let acc = cache_dt_func_decl_with_symbol(
                 ctx,
                 FuncDecl::new(
                     field.name.clone(),
@@ -295,6 +341,7 @@ fn declare_and_fill(
                     field: field.name.clone(),
                     result_sort: field.sort.clone(),
                 },
+                field_symbol.clone(),
             );
             accessors.push(acc);
         }
@@ -308,6 +355,8 @@ fn declare_and_fill(
         }
     }
 
+    ctx.ffi_sort_symbols
+        .insert(dt_sort.clone(), dt_symbol.clone());
     alloc_sort(ctx, dt_sort)
 }
 
@@ -330,18 +379,45 @@ pub unsafe extern "C" fn Z3_mk_datatype(
     num_constructors: c_uint,
     constructors: *mut Z3_constructor,
 ) -> Z3_sort {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_datatype constructors", num_constructors) } {
+        return ptr::null_mut();
+    }
     if name.is_null() || constructors.is_null() || num_constructors == 0 {
         return ptr::null_mut();
     }
     // SAFETY: `name` null-checked; valid AY symbol handle.
-    let Some(dt_name) = (unsafe { symbol_name(name) }) else {
+    let Some(dt_symbol) = (unsafe { symbol_key(name) }) else {
         return ptr::null_mut();
     };
+    let dt_name = dt_symbol.semantic_name();
     let mut ctor_handles = Vec::with_capacity(num_constructors as usize);
+    let mut total_descriptors = 0usize;
     for i in 0..num_constructors as usize {
         // SAFETY: `constructors` points to `num_constructors` elems (checked).
         let cp = unsafe { *constructors.add(i) };
         if cp.is_null() {
+            return ptr::null_mut();
+        }
+        // SAFETY: `cp` was null-checked and is valid per the caller contract.
+        let fields = unsafe { (*cp).field_names.len() };
+        if extend_datatype_descriptor_budget(
+            &mut total_descriptors,
+            std::iter::once(fields),
+            MAX_FFI_CONTAINER_ELEMENTS as usize,
+        )
+        .is_err()
+        {
+            // SAFETY: this public entry point requires `c` to be null or a live,
+            // exclusively borrowed context; the bound checker only updates its error state.
+            unsafe {
+                ffi_count_within_limit(
+                    c,
+                    "Z3_mk_datatype aggregate constructor and field descriptors",
+                    MAX_FFI_CONTAINER_ELEMENTS + 1,
+                );
+            }
             return ptr::null_mut();
         }
         ctor_handles.push(cp);
@@ -365,7 +441,11 @@ pub unsafe extern "C" fn Z3_mk_datatype(
     };
 
     // SAFETY: `c` valid per contract; `ffi_guard_ptr` handles null + panics.
-    unsafe { ffi_guard_ptr(c, |ctx| declare_and_fill(ctx, &dt, &ctor_handles)) }
+    unsafe {
+        ffi_guard_ptr(c, |ctx| {
+            declare_and_fill(ctx, &dt, &dt_symbol, &ctor_handles)
+        })
+    }
 }
 
 /// Read the constructor, recognizer (tester), and accessor func_decls out of a
@@ -470,8 +550,68 @@ pub unsafe extern "C" fn Z3_mk_datatypes(
     sorts: *mut Z3_sort,
     constructor_lists: *const Z3_constructor_list,
 ) {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "Z3_mk_datatypes sort-name, output, and constructor-list arrays",
+            &[num_sorts, num_sorts, num_sorts],
+        )
+    } {
+        return;
+    }
     if num_sorts == 0 || sort_names.is_null() || sorts.is_null() || constructor_lists.is_null() {
         return;
+    }
+
+    // Preflight the WHOLE call before writing an output slot or declaring a
+    // sort. A caller may reuse one large constructor list for many sort names;
+    // per-sort limits alone permit product-scale work and partially mutate the
+    // context before the aggregate budget is eventually exceeded.
+    let mut total_descriptors = (num_sorts as usize).saturating_mul(3);
+    for i in 0..num_sorts as usize {
+        // SAFETY: `constructor_lists` points to `num_sorts` elements.
+        let list_ptr = unsafe { *constructor_lists.add(i) };
+        if list_ptr.is_null() {
+            continue;
+        }
+        // SAFETY: `list_ptr` is a live constructor-list handle per the API
+        // contract. Borrow it here; do not clone its potentially large vector.
+        let constructors = unsafe { &(*list_ptr).constructors };
+        for &constructor in constructors {
+            if constructor.is_null() {
+                // SAFETY: `c` is valid per this entry point's contract.
+                unsafe {
+                    ffi_guard_void(c, |ctx| {
+                        ctx.last_error = Z3_INVALID_ARG;
+                        ctx.error_msg = Some(
+                            "Z3_mk_datatypes: null constructor in constructor list".to_string(),
+                        );
+                    });
+                }
+                return;
+            }
+            // SAFETY: constructor-list entries are live handles per contract.
+            let fields = unsafe { (*constructor).field_names.len() };
+            if extend_datatype_descriptor_budget(
+                &mut total_descriptors,
+                std::iter::once(fields),
+                MAX_FFI_CONTAINER_ELEMENTS as usize,
+            )
+            .is_err()
+            {
+                // SAFETY: `c` is valid per this entry point's contract.
+                unsafe {
+                    ffi_count_within_limit(
+                        c,
+                        "Z3_mk_datatypes aggregate arrays and datatype descriptors",
+                        MAX_FFI_CONTAINER_ELEMENTS + 1,
+                    );
+                }
+                return;
+            }
+        }
     }
 
     for i in 0..num_sorts as usize {
@@ -484,9 +624,10 @@ pub unsafe extern "C" fn Z3_mk_datatypes(
         unsafe { *out_slot = ptr::null_mut() };
 
         // SAFETY: `name_sym` is a valid symbol handle or null.
-        let Some(dt_name) = (unsafe { symbol_name(name_sym) }) else {
+        let Some(dt_symbol) = (unsafe { symbol_key(name_sym) }) else {
             continue;
         };
+        let dt_name = dt_symbol.semantic_name();
         if list_ptr.is_null() {
             continue;
         }
@@ -510,8 +651,11 @@ pub unsafe extern "C" fn Z3_mk_datatypes(
         };
 
         // SAFETY: `c` valid per contract; guard handles null + panics.
-        let sort_handle =
-            unsafe { ffi_guard_ptr(c, |ctx| declare_and_fill(ctx, &dt, &ctor_handles)) };
+        let sort_handle = unsafe {
+            ffi_guard_ptr(c, |ctx| {
+                declare_and_fill(ctx, &dt, &dt_symbol, &ctor_handles)
+            })
+        };
         // SAFETY: `out_slot` within writable `sorts`.
         unsafe { *out_slot = sort_handle };
     }
@@ -527,9 +671,8 @@ pub unsafe extern "C" fn Z3_mk_datatypes(
 // func_decl is built through the SAME path `Z3_mk_datatype` uses
 // (`cache_dt_func_decl` with the matching `DatatypeOp`), so it is REAL — usable
 // with `Z3_mk_app` — and its name/arity/domain/range agree with libz3 for the
-// same datatype. The one documented divergence is the recognizer NAME: AY names
-// recognizers canonically `is-<ctor>` (its SMT-LIB elaboration), whereas libz3
-// reports the shared decl name `is`; both are arity-1 `DT -> Bool` recognizers.
+// same datatype. Caller-supplied constructor/recognizer/accessor symbols retain
+// their exact integer-vs-string kind through these round trips.
 
 /// Number of constructors of a datatype sort (Z3's
 /// `Z3_get_datatype_sort_num_constructors`). Returns 0 for a non-datatype or
@@ -601,11 +744,10 @@ pub unsafe extern "C" fn Z3_get_datatype_sort_constructor(
     }
 }
 
-/// The `idx`-th recognizer func_decl (`is-<ctor>`: `DT -> Bool`) of a datatype
+/// The `idx`-th recognizer func_decl (`DT -> Bool`) of a datatype
 /// sort (Z3's `Z3_get_datatype_sort_recognizer`).
 ///
-/// Returns null for a non-datatype/null sort or out-of-range `idx`. See the
-/// section note on the recognizer-name divergence vs libz3.
+/// Returns null for a non-datatype/null sort or out-of-range `idx`.
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `t`, when non-null, a valid sort handle.
@@ -630,12 +772,25 @@ pub unsafe extern "C" fn Z3_get_datatype_sort_recognizer(
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             let dt_sort = Sort::Datatype(dt.clone());
-            cache_dt_func_decl(
+            let recognizer_symbol = ctx
+                .ffi_dt_recognizers
+                .get(&(dt_sort.clone(), ctor.name.clone()))
+                .cloned()
+                .unwrap_or_else(|| {
+                    let display = ctx
+                        .ffi_decl_symbols
+                        .get(&ctor.name)
+                        .map(SymbolKey::display_name)
+                        .unwrap_or_else(|| ctor.name.clone());
+                    SymbolKey::String(format!("is-{display}"))
+                });
+            cache_dt_func_decl_with_symbol(
                 ctx,
                 FuncDecl::new(format!("is-{}", ctor.name), vec![dt_sort], Sort::Bool),
                 DatatypeOp::Recognizer {
                     ctor: ctor.name.clone(),
                 },
+                recognizer_symbol,
             )
         })
     }
@@ -684,5 +839,32 @@ pub unsafe extern "C" fn Z3_get_datatype_sort_constructor_accessor(
                 },
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn datatype_descriptor_budget_is_cumulative_across_reused_lists() {
+        let mut descriptors = 0;
+        extend_datatype_descriptor_budget(&mut descriptors, [2, 1], 5).expect("first list fits");
+        assert_eq!(descriptors, 5, "two constructors plus three fields");
+        assert_eq!(
+            extend_datatype_descriptor_budget(&mut descriptors, [0], 5),
+            Err(())
+        );
+
+        let mut reused = 0;
+        extend_datatype_descriptor_budget(&mut reused, [0, 0], 5)
+            .expect("first constructor list fits");
+        extend_datatype_descriptor_budget(&mut reused, [1], 5)
+            .expect("reused list remains within aggregate limit");
+        assert_eq!(reused, 4);
+        assert_eq!(
+            extend_datatype_descriptor_budget(&mut reused, [1], 5),
+            Err(())
+        );
     }
 }

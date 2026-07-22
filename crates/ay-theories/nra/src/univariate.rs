@@ -5044,7 +5044,7 @@ mod tests {
         // x^2 = 4 => x in {-2, 2}. Rational witness exists.
         let c = constr(&[-4, 0, 1], Rel::Eq);
         let w = witness_value(decide_single_variable(&[c])).expect("sat");
-        assert!(&w * &w == rat(4));
+        assert_eq!(&w * &w, rat(4));
     }
 
     #[test]

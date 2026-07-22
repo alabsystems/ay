@@ -3367,9 +3367,8 @@ fn drive_to_fixpoint(
             }
             PropResult::Propagated(lit, _reason, _cid) => {
                 forced.insert(lit);
-                match prop.assign_literal(lit, level) {
-                    PropResult::Conflict(..) => return (true, forced),
-                    _ => {}
+                if let PropResult::Conflict(..) = prop.assign_literal(lit, level) {
+                    return (true, forced);
                 }
             }
         }
@@ -3460,9 +3459,7 @@ fn counting_matches_watched_on_random_big_m_constraints() {
                 let to_unassign: Vec<Lit> = (1..=num_vars as i32).collect();
                 counting.unassign_literals(&to_unassign);
                 watched.unassign_literals(&to_unassign);
-                for v in &mut values {
-                    *v = None;
-                }
+                values.fill(None);
                 decisions.clear();
                 continue;
             }
@@ -3545,9 +3542,7 @@ fn counting_matches_watched_on_random_big_m_constraints() {
                 let to_unassign: Vec<Lit> = (1..=num_vars as i32).collect();
                 counting.unassign_literals(&to_unassign);
                 watched.unassign_literals(&to_unassign);
-                for v in &mut values {
-                    *v = None;
-                }
+                values.fill(None);
                 decisions.clear();
             }
         }

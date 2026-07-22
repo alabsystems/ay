@@ -17,7 +17,6 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Instant;
-use wait_timeout::ChildExt;
 
 const REPORT_SCHEMA: &str = "ay.sat-delta-report/v1";
 const AY_ENV_PROVENANCE_NOTE: &str = "--ay-env records requested env provenance; AY-only stats-json capture records whether known env-gated solver behavior was exercised.";
@@ -373,11 +372,7 @@ struct SatDeltaReport {
 
 /// Run the SAT delta gate and write compact artifacts under `out_dir`.
 pub fn cmd_sat_delta(args: SatDeltaArgs) -> Result<()> {
-    if !args.timeout_sec.is_finite() || args.timeout_sec <= 0.0 {
-        return Err(BenchError::InvalidArgs {
-            reason: "--timeout must be finite and positive".to_string(),
-        });
-    }
+    crate::resource::checked_benchmark_timeout(args.timeout_sec, "SAT delta")?;
     let resources = crate::resource::PlannedResources::plan(&repo_root(), 1, "ay bench sat-delta")?;
     eprintln!(
         "sat-delta: resource plan jobs=1 memory={}MiB NBCORE={} headroom={}MiB enforcement=rss_watchdog",
@@ -419,13 +414,13 @@ pub fn cmd_sat_delta(args: SatDeltaArgs) -> Result<()> {
 
     let mut solver_provenance = BTreeMap::new();
     for (name, path, kind) in &solvers {
-        solver_provenance.insert(name.clone(), binary_provenance(path, *kind));
+        solver_provenance.insert(name.clone(), binary_provenance(path, *kind, &resources));
     }
-    let runner = current_runner_provenance();
+    let runner = current_runner_provenance(&resources);
     let proof_checker_provenance = args
         .proof_checker
         .as_ref()
-        .map(|path| binary_provenance(path, SolverKind::Reference));
+        .map(|path| binary_provenance(path, SolverKind::Reference, &resources));
     let evidence_warnings = evidence_warnings(
         &git,
         &runner,
@@ -573,8 +568,11 @@ impl RowValidation {
 }
 
 fn load_manifest(path: &Path) -> Result<Vec<Benchmark>> {
-    let text = fs::read_to_string(path)
-        .with_bench_context(|| format!("reading manifest {}", path.display()))?;
+    let text = crate::resource::read_bounded_text(
+        path,
+        crate::resource::MAX_METADATA_BYTES,
+        "SAT delta manifest",
+    )?;
     let mut lines = text.lines();
     let header = lines.next().ok_or_else(|| BenchError::InvalidArgs {
         reason: format!("empty manifest {}", path.display()),
@@ -791,13 +789,13 @@ fn run_one(
     fs::create_dir_all(&case_dir)
         .with_bench_context(|| format!("creating case dir {}", case_dir.display()))?;
 
-    let input = prepare_input(&benchmark.path, &case_dir)?;
+    let input = prepare_input(&benchmark.path, &case_dir, resources, args.timeout_sec)?;
     let stdout_path = case_dir.join("stdout.txt");
     let stderr_path = case_dir.join("stderr.txt");
     let proof_path = case_dir.join("proof.out");
     let command_path = case_dir.join("command.argv");
 
-    let mut command = Command::new(solver_path);
+    let mut command = resources.external_command(solver_path);
     match kind {
         SolverKind::AY => {
             for (key, value) in &args.ay_env {
@@ -838,38 +836,34 @@ fn run_one(
         .with_bench_context(|| format!("creating {}", stdout_path.display()))?;
     let stderr_file = File::create(&stderr_path)
         .with_bench_context(|| format!("creating {}", stderr_path.display()))?;
-    command.stdout(Stdio::from(stdout_file));
-    command.stderr(Stdio::from(stderr_file));
-    crate::resource::isolate_process_group(&mut command);
-
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
     let start = Instant::now();
-    let mut child = command
-        .spawn()
+    let (mut child, watchdog) = resources
+        .spawn_external_child(&mut command, "ay bench sat-delta")
         .with_bench_context(|| format!("spawning solver {}", solver_path.display()))?;
-    let watchdog = match resources.watch_external_child(&child, "ay bench sat-delta") {
-        Ok(watchdog) => watchdog,
-        Err(error) => {
-            crate::resource::terminate_process_group(&mut child);
-            return Err(error);
-        }
+    let Some(stdout_pipe) = child.stdout.take() else {
+        crate::resource::terminate_guarded_child(&mut child, watchdog, "ay bench sat-delta")?;
+        return Err(BenchError::msg("sat-delta solver stdout pipe missing"));
     };
+    let Some(stderr_pipe) = child.stderr.take() else {
+        crate::resource::terminate_guarded_child(&mut child, watchdog, "ay bench sat-delta")?;
+        return Err(BenchError::msg("sat-delta solver stderr pipe missing"));
+    };
+    let stdout_capture = crate::resource::BoundedFileCapture::start(stdout_pipe, stdout_file);
+    let stderr_capture = crate::resource::BoundedFileCapture::start(stderr_pipe, stderr_file);
     let wait_timeout = wait_timeout_for_solver(kind, args.timeout_sec);
-    let (externally_timed_out, status) = match child.wait_timeout(wait_timeout) {
-        Ok(Some(status)) => (false, Some(status)),
-        Ok(None) => {
-            crate::resource::terminate_process_group(&mut child);
-            (true, child.try_wait().ok().flatten())
-        }
-        Err(error) => {
-            crate::resource::terminate_process_group(&mut child);
-            let _ = watchdog.finish();
-            return Err(error.into());
-        }
-    };
-    // Reap descendants left behind by a solver wrapper before asking the
-    // watchdog for its final classification.
-    crate::resource::terminate_process_group(&mut child);
-    let memout = watchdog.finish()?;
+    let outcome = crate::resource::wait_for_guarded_child(
+        &mut child,
+        watchdog,
+        wait_timeout,
+        "ay bench sat-delta",
+    )?;
+    let externally_timed_out = outcome.timed_out;
+    let status = outcome.status;
+    let memout = outcome.memout;
+    let stdout_output = stdout_capture.finish()?;
+    let stderr_output = stderr_capture.finish()?;
     let elapsed = start.elapsed();
     let timed_out = !memout
         && (externally_timed_out
@@ -877,21 +871,24 @@ fn run_one(
     let elapsed_s = round3(elapsed.as_secs_f64());
     let exit_code = status.as_ref().and_then(ExitStatus::code);
 
-    let stdout_text = fs::read_to_string(&stdout_path).unwrap_or_default();
-    let stderr_text = fs::read_to_string(&stderr_path).unwrap_or_default();
+    let stdout_text = stdout_output.text;
+    let stderr_text = stderr_output.text;
+    let output_incomplete = stdout_output.incomplete || stderr_output.incomplete;
     let (stats, bcp_relocation, bcp_search_inplace_watch_scan, dense_mutex_focused_restart_gate) =
         capture_run_stats(kind, &stderr_text, &case_dir)?;
     let actual = if memout {
         "memout".to_string()
     } else if timed_out {
         "timeout".to_string()
+    } else if output_incomplete {
+        "error".to_string()
     } else {
         parse_sat_status(&stdout_text)
             .or_else(|| parse_sat_status(&stderr_text))
             .unwrap_or_else(|| "unknown".to_string())
     };
-    let mut invalid =
-        !timed_out && actual == "unknown" && !mentions_unknown(&stdout_text, &stderr_text);
+    let mut invalid = output_incomplete
+        || (!timed_out && actual == "unknown" && !mentions_unknown(&stdout_text, &stderr_text));
     let validation = validate_row(
         kind,
         &actual,
@@ -911,7 +908,7 @@ fn run_one(
     } else {
         round3(2.0 * args.timeout_sec)
     };
-    let binary = binary_provenance(solver_path, kind);
+    let binary = binary_provenance(solver_path, kind, resources);
 
     Ok(RunRecord {
         solver: solver_name.to_string(),
@@ -977,7 +974,12 @@ fn ay_elapsed_exceeded_time_budget(
     matches!(kind, SolverKind::AY) && elapsed.as_secs_f64() > timeout_sec
 }
 
-fn prepare_input(path: &Path, case_dir: &Path) -> Result<PathBuf> {
+fn prepare_input(
+    path: &Path,
+    case_dir: &Path,
+    resources: &crate::resource::PlannedResources,
+    timeout_sec: f64,
+) -> Result<PathBuf> {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return Err(BenchError::InvalidArgs {
             reason: format!("benchmark path has no filename: {}", path.display()),
@@ -998,13 +1000,82 @@ fn prepare_input(path: &Path, case_dir: &Path) -> Result<PathBuf> {
         };
         let output_file = File::create(&output)
             .with_bench_context(|| format!("creating decompressed input {}", output.display()))?;
-        let status = Command::new(tool)
+        let mut command = resources.external_command(tool);
+        command
             .arg("-dc")
             .arg(path)
-            .stdout(Stdio::from(output_file))
-            .status()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .stdin(Stdio::null())
+            .env("MEMLIMIT", resources.plan.memlimit_mb_per_child.to_string())
+            .env("NBCORE", resources.plan.nbcore_per_child.to_string());
+        let (mut child, watchdog) = resources
+            .spawn_external_child(&mut command, "ay bench sat-delta decompress")
             .with_bench_context(|| format!("decompressing {}", path.display()))?;
-        if !status.success() {
+        let Some(stdout_pipe) = child.stdout.take() else {
+            crate::resource::terminate_guarded_child(
+                &mut child,
+                watchdog,
+                "ay bench sat-delta decompress",
+            )?;
+            fs::remove_file(&output)
+                .with_bench_context(|| format!("removing {}", output.display()))?;
+            return Err(BenchError::msg(
+                "sat-delta decompressor stdout pipe missing",
+            ));
+        };
+        let capture = crate::resource::LimitedFileCapture::start(
+            stdout_pipe,
+            output_file,
+            crate::resource::MAX_DECOMPRESSED_BYTES,
+        );
+        let capture_breach = capture.breach_flag();
+        let outcome = crate::resource::wait_for_guarded_child_with_limits(
+            &mut child,
+            watchdog,
+            std::time::Duration::from_secs_f64(timeout_sec),
+            "ay bench sat-delta decompress",
+            None,
+            Some(capture_breach.as_ref()),
+        );
+        let capture = capture.finish();
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = fs::remove_file(&output);
+                return Err(error);
+            }
+        };
+        let capture = match capture {
+            Ok(capture) => capture,
+            Err(error) => {
+                let _ = fs::remove_file(&output);
+                return Err(error);
+            }
+        };
+        if capture.exceeded {
+            let _ = fs::remove_file(&output);
+            return Err(BenchError::msg(format!(
+                "decompressed input {} exceeded the fixed {}-byte cap",
+                path.display(),
+                crate::resource::MAX_DECOMPRESSED_BYTES
+            )));
+        }
+        if capture.write_failed {
+            let _ = fs::remove_file(&output);
+            return Err(BenchError::msg(format!(
+                "writing decompressed input {} failed",
+                output.display()
+            )));
+        }
+        if outcome.memout
+            || outcome.timed_out
+            || outcome
+                .status
+                .as_ref()
+                .is_none_or(|status| !status.success())
+        {
+            let _ = fs::remove_file(&output);
             return Err(BenchError::UnsupportedFormat {
                 path: path.to_path_buf(),
             });
@@ -1016,10 +1087,15 @@ fn prepare_input(path: &Path, case_dir: &Path) -> Result<PathBuf> {
 }
 
 fn collect_command_argv(program: &Path, command: &Command) -> Vec<String> {
+    let args = command.get_args().collect::<Vec<_>>();
+    let solver_args = args
+        .iter()
+        .position(|arg| *arg == program.as_os_str())
+        .map_or(args.as_slice(), |index| &args[index + 1..]);
     std::iter::once(program.display().to_string())
         .chain(
-            command
-                .get_args()
+            solver_args
+                .iter()
                 .map(|arg| arg.to_string_lossy().to_string()),
         )
         .collect()
@@ -1318,27 +1394,56 @@ fn solver_output_has_model_lines(stdout: &str) -> bool {
     stdout.lines().any(|line| line.starts_with('v'))
 }
 
-#[derive(Debug)]
-struct DimacsFormula {
-    num_vars: Option<usize>,
-    clauses: Vec<Vec<i64>>,
-}
+const MAX_PARENT_DIMACS_VALIDATION_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_DIMACS_LINE_BYTES: usize = 1024 * 1024;
 
-fn parse_dimacs_formula(path: &Path) -> std::result::Result<DimacsFormula, String> {
-    let text = fs::read_to_string(path).map_err(|err| err.to_string())?;
+/// Check a model against DIMACS in one pass. Only one bounded line is retained,
+/// rather than a `String` plus a second in-memory copy of every clause.
+fn stream_validate_dimacs_model(
+    path: &Path,
+    assignment: &BTreeMap<usize, bool>,
+) -> std::result::Result<bool, String> {
+    use std::io::BufRead as _;
+
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    if metadata.len() > MAX_PARENT_DIMACS_VALIDATION_BYTES {
+        return Err(format!(
+            "cnf-too-large-for-parent-validation:{}>{}",
+            metadata.len(),
+            MAX_PARENT_DIMACS_VALIDATION_BYTES
+        ));
+    }
+    let file = File::open(path).map_err(|error| error.to_string())?;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let mut line = String::new();
+    let mut line_no = 0_usize;
     let mut num_vars = None;
-    let mut clauses = Vec::new();
-    let mut current = Vec::new();
-    for (line_index, raw) in text.lines().enumerate() {
-        let line_no = line_index + 1;
-        let stripped = raw.trim();
+    let mut clause_satisfied = false;
+    let mut clause_has_literal = false;
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        line_no += 1;
+        if read > MAX_DIMACS_LINE_BYTES {
+            return Err(format!("cnf-line-too-long:{line_no}"));
+        }
+        let stripped = line.trim();
         if stripped.is_empty() || stripped.starts_with('c') {
             continue;
         }
         if stripped.starts_with('p') {
-            let parts = stripped.split_whitespace().collect::<Vec<_>>();
-            if parts.len() >= 4 && parts[1] == "cnf" {
-                num_vars = parts[2].parse::<usize>().ok();
+            let mut parts = stripped.split_whitespace();
+            if parts.next() != Some("p") || parts.next() != Some("cnf") {
+                return Err(format!("malformed-cnf-header:{line_no}"));
+            }
+            num_vars = parts.next().and_then(|token| token.parse::<usize>().ok());
+            if num_vars.is_none() {
+                return Err(format!("malformed-cnf-header:{line_no}"));
             }
             continue;
         }
@@ -1350,23 +1455,37 @@ fn parse_dimacs_formula(path: &Path) -> std::result::Result<DimacsFormula, Strin
                 .parse::<i64>()
                 .map_err(|_| format!("malformed-cnf-token:{line_no}"))?;
             if lit == 0 {
-                clauses.push(std::mem::take(&mut current));
-            } else {
-                current.push(lit);
+                if !clause_satisfied {
+                    return Ok(false);
+                }
+                clause_satisfied = false;
+                clause_has_literal = false;
+                continue;
             }
+            clause_has_literal = true;
+            let abs_lit = lit
+                .checked_abs()
+                .ok_or_else(|| format!("malformed-cnf-token:{line_no}"))?;
+            let var =
+                usize::try_from(abs_lit).map_err(|_| format!("malformed-cnf-token:{line_no}"))?;
+            if num_vars.is_some_and(|limit| var > limit) {
+                return Err(format!("cnf-variable-out-of-range:{line_no}"));
+            }
+            clause_satisfied |= assignment.get(&var).copied() == Some(lit > 0);
         }
     }
-    if !current.is_empty() {
-        clauses.push(current);
+    if clause_has_literal && !clause_satisfied {
+        return Ok(false);
     }
-    Ok(DimacsFormula { num_vars, clauses })
+    if let Some(limit) = num_vars {
+        if assignment.keys().any(|variable| *variable > limit) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn verify_sat_model(cnf_path: &Path, stdout: &str) -> String {
-    let formula = match parse_dimacs_formula(cnf_path) {
-        Ok(formula) => formula,
-        Err(err) => return format!("error:{err}"),
-    };
     let mut assignment = BTreeMap::new();
     let mut saw_model_line = false;
     let mut saw_terminator = false;
@@ -1420,9 +1539,6 @@ fn verify_sat_model(cnf_path: &Path, stdout: &str) -> String {
             let Ok(var) = usize::try_from(abs_lit) else {
                 return "invalid".to_string();
             };
-            if formula.num_vars.is_some_and(|num_vars| var > num_vars) {
-                return "invalid".to_string();
-            }
             let value = lit > 0;
             if let Some(previous) = assignment.insert(var, value) {
                 if previous != value {
@@ -1439,20 +1555,11 @@ fn verify_sat_model(cnf_path: &Path, stdout: &str) -> String {
     if !saw_terminator {
         return "unterminated".to_string();
     }
-    for clause in &formula.clauses {
-        if !clause.iter().any(|lit| {
-            let Some(abs_lit) = lit.checked_abs() else {
-                return false;
-            };
-            let Ok(var) = usize::try_from(abs_lit) else {
-                return false;
-            };
-            assignment.get(&var).copied() == Some(*lit > 0)
-        }) {
-            return "invalid".to_string();
-        }
+    match stream_validate_dimacs_model(cnf_path, &assignment) {
+        Ok(true) => "valid".to_string(),
+        Ok(false) => "invalid".to_string(),
+        Err(error) => format!("error:{error}"),
     }
-    "valid".to_string()
 }
 
 fn proof_file_nonempty(path: &Path) -> bool {
@@ -1501,6 +1608,10 @@ fn verify_unsat_proof(
         validation.proof_status = "checker-missing".to_string();
         return Ok(validation);
     }
+    let Some(resources) = resources else {
+        validation.proof_status = "resource-plan-missing".to_string();
+        return Ok(validation);
+    };
 
     let stdout_path = case_dir.join("proof-checker.stdout.txt");
     let stderr_path = case_dir.join("proof-checker.stderr.txt");
@@ -1516,81 +1627,76 @@ fn verify_unsat_proof(
         .with_bench_context(|| format!("creating {}", stdout_path.display()))?;
     let stderr_file = File::create(&stderr_path)
         .with_bench_context(|| format!("creating {}", stderr_path.display()))?;
-    let mut command = Command::new(checker);
+    let mut command = resources.external_command(checker);
     for arg in command_argv.iter().skip(1) {
         command.arg(arg);
     }
-    command.stdout(Stdio::from(stdout_file));
-    command.stderr(Stdio::from(stderr_file));
-    if let Some(plan) = resources.map(|resources| &resources.plan) {
-        command.env("MEMLIMIT", plan.memlimit_mb_per_child.to_string());
-        command.env("NBCORE", plan.nbcore_per_child.to_string());
-    }
-    crate::resource::isolate_process_group(&mut command);
-    match command.spawn() {
-        Ok(mut child) => {
-            let watchdog = match resources
-                .map(|resources| {
-                    resources.watch_external_child(&child, "ay bench sat-delta proof checker")
-                })
-                .transpose()
-            {
-                Ok(watchdog) => watchdog,
-                Err(error) => {
-                    crate::resource::terminate_process_group(&mut child);
-                    return Err(error);
-                }
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    command.env("MEMLIMIT", resources.plan.memlimit_mb_per_child.to_string());
+    command.env("NBCORE", resources.plan.nbcore_per_child.to_string());
+    match resources.spawn_external_child(&mut command, "ay bench sat-delta proof checker") {
+        Ok((mut child, watchdog)) => {
+            let Some(stdout_pipe) = child.stdout.take() else {
+                crate::resource::terminate_guarded_child(
+                    &mut child,
+                    watchdog,
+                    "ay bench sat-delta proof checker",
+                )?;
+                validation.proof_status = "checker-capture-error".to_string();
+                return Ok(validation);
             };
+            let Some(stderr_pipe) = child.stderr.take() else {
+                crate::resource::terminate_guarded_child(
+                    &mut child,
+                    watchdog,
+                    "ay bench sat-delta proof checker",
+                )?;
+                validation.proof_status = "checker-capture-error".to_string();
+                return Ok(validation);
+            };
+            let stdout_capture =
+                crate::resource::BoundedFileCapture::start(stdout_pipe, stdout_file);
+            let stderr_capture =
+                crate::resource::BoundedFileCapture::start(stderr_pipe, stderr_file);
             let timeout = std::time::Duration::from_secs_f64(args.timeout_sec.max(1.0));
-            let (status, timed_out) = match child.wait_timeout(timeout) {
-                Ok(Some(status)) => (Some(status), false),
-                Ok(None) => {
-                    crate::resource::terminate_process_group(&mut child);
-                    (None, true)
-                }
-                Err(error) => {
-                    crate::resource::terminate_process_group(&mut child);
-                    if let Some(watchdog) = watchdog {
-                        let _ = watchdog.finish();
-                    }
-                    return Err(error.into());
-                }
-            };
-            // A checker wrapper can exit while descendants remain. Reap the
-            // whole isolated group before disarming memory enforcement.
-            crate::resource::terminate_process_group(&mut child);
-            let memout = watchdog
-                .map(crate::resource::RssWatchdog::finish)
-                .transpose()?
-                .unwrap_or(false);
-            validation.proof_checker_exit_code = status.as_ref().and_then(ExitStatus::code);
-            if memout {
+            let outcome = crate::resource::wait_for_guarded_child(
+                &mut child,
+                watchdog,
+                timeout,
+                "ay bench sat-delta proof checker",
+            )?;
+            let stdout_output = stdout_capture.finish()?;
+            let stderr_output = stderr_capture.finish()?;
+            validation.proof_checker_exit_code = outcome.status.as_ref().and_then(ExitStatus::code);
+            if outcome.memout {
                 validation.proof_status = "memout".to_string();
                 return Ok(validation);
             }
-            if timed_out {
+            if outcome.timed_out {
                 validation.proof_status = "timeout".to_string();
                 return Ok(validation);
             }
+            if stdout_output.incomplete || stderr_output.incomplete {
+                validation.proof_status = "checker-output-truncated".to_string();
+                return Ok(validation);
+            }
+            validation.proof_status = if validation.proof_checker_exit_code == Some(0)
+                && proof_checker_output_is_verified(&stdout_output.text, &stderr_output.text)
+            {
+                "valid".to_string()
+            } else {
+                "invalid".to_string()
+            };
+            Ok(validation)
         }
         Err(err) => {
             fs::write(&stderr_path, err.to_string())
                 .with_bench_context(|| format!("writing {}", stderr_path.display()))?;
             validation.proof_status = "checker-spawn-error".to_string();
-            return Ok(validation);
+            Ok(validation)
         }
     }
-
-    let stdout_text = fs::read_to_string(&stdout_path).unwrap_or_default();
-    let stderr_text = fs::read_to_string(&stderr_path).unwrap_or_default();
-    validation.proof_status = if validation.proof_checker_exit_code == Some(0)
-        && proof_checker_output_is_verified(&stdout_text, &stderr_text)
-    {
-        "valid".to_string()
-    } else {
-        "invalid".to_string()
-    };
-    Ok(validation)
 }
 
 fn proof_checker_argv(
@@ -2346,7 +2452,11 @@ fn display_optional_u64(value: Option<u64>) -> String {
     value.map_or_else(String::new, |value| value.to_string())
 }
 
-fn binary_provenance(path: &Path, kind: SolverKind) -> BinaryProvenance {
+fn binary_provenance(
+    path: &Path,
+    kind: SolverKind,
+    resources: &crate::resource::PlannedResources,
+) -> BinaryProvenance {
     let resolved = absolute_path(path);
     let metadata = fs::metadata(&resolved).ok();
     let build_profile = infer_build_profile(&resolved);
@@ -2364,14 +2474,14 @@ fn binary_provenance(path: &Path, kind: SolverKind) -> BinaryProvenance {
             .and_then(|meta| meta.modified().ok())
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs() as i64),
-        version: solver_version(&resolved, kind),
+        version: solver_version(&resolved, kind, resources),
         build_profile,
     }
 }
 
-fn current_runner_provenance() -> BinaryProvenance {
+fn current_runner_provenance(resources: &crate::resource::PlannedResources) -> BinaryProvenance {
     let path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("<unknown-runner>"));
-    binary_provenance(&path, SolverKind::AY)
+    binary_provenance(&path, SolverKind::AY, resources)
 }
 
 fn infer_build_profile(path: &Path) -> Option<String> {
@@ -2501,21 +2611,26 @@ fn version_commit_token(version: &str) -> Option<String> {
     }
 }
 
-fn solver_version(path: &Path, kind: SolverKind) -> Option<String> {
-    let mut command = Command::new(path);
-    match kind {
-        SolverKind::AY => {
-            command.arg("--version");
-        }
-        SolverKind::Reference => {
-            command.arg("--version");
-        }
+fn solver_version(
+    path: &Path,
+    _kind: SolverKind,
+    resources: &crate::resource::PlannedResources,
+) -> Option<String> {
+    let output = resources
+        .capture_external_output(
+            path,
+            ["--version"],
+            std::time::Duration::from_secs(10),
+            "ay bench sat-delta version probe",
+        )
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    let output = command.output().ok()?;
     let text = if output.stdout.is_empty() {
-        String::from_utf8_lossy(&output.stderr).to_string()
+        output.stderr
     } else {
-        String::from_utf8_lossy(&output.stdout).to_string()
+        output.stdout
     };
     text.lines()
         .next()
@@ -2557,11 +2672,14 @@ fn git_provenance() -> GitProvenance {
 }
 
 fn run_text<const N: usize>(args: [&str; N]) -> String {
-    let output = Command::new(args[0]).args(&args[1..]).output();
+    let output = crate::resource::capture_local_output(
+        args[0],
+        args[1..].iter().copied(),
+        std::time::Duration::from_secs(10),
+        args[0],
+    );
     match output {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
+        Ok(output) if output.status.success() => output.stdout.trim().to_string(),
         _ => "unknown".to_string(),
     }
 }
@@ -2614,6 +2732,10 @@ fn round3(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_resources() -> crate::resource::PlannedResources {
+        crate::resource::PlannedResources::for_test(&crate::runner::repo_root_public(), 4096)
+    }
 
     #[test]
     fn parse_sat_status_requires_exact_status_line() {
@@ -2928,7 +3050,9 @@ mod tests {
             require_dense_mutex_focused_restart_gate_exercise: false,
         };
 
-        let validation = verify_unsat_proof(&cnf, &proof, &args, &case_dir, None).unwrap();
+        let resources = test_resources();
+        let validation =
+            verify_unsat_proof(&cnf, &proof, &args, &case_dir, Some(&resources)).unwrap();
 
         assert_eq!(validation.proof_status, "valid");
         assert_eq!(validation.proof_checker_exit_code, Some(0));
@@ -3222,6 +3346,7 @@ c after
             require_dense_mutex_focused_restart_gate_exercise: false,
         };
 
+        let resources = test_resources();
         let validation = validate_row(
             SolverKind::AY,
             "unsat",
@@ -3231,7 +3356,7 @@ c after
             &proof,
             &args,
             tmp.path(),
-            None,
+            Some(&resources),
         )
         .unwrap();
 

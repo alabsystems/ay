@@ -91,12 +91,12 @@ fn build_big_terms() -> (TermStore, Vec<TermId>, Vec<TermId>) {
     let mut ineq_atoms = Vec::new();
     let mut eq_atoms = Vec::new();
     for i in 0..110 {
-        let v = terms.mk_var(&format!("x{i}"), Sort::Real);
+        let v = terms.mk_var(format!("x{i}"), Sort::Real);
         let c = terms.mk_rational(BigRational::from(BigInt::from(i as i64 + 1)));
         ineq_atoms.push(terms.mk_le(v, c)); // x_i <= i+1
     }
     for i in 0..5 {
-        let v = terms.mk_var(&format!("e{i}"), Sort::Real);
+        let v = terms.mk_var(format!("e{i}"), Sort::Real);
         let c = terms.mk_rational(BigRational::from(BigInt::from(i as i64)));
         eq_atoms.push(terms.mk_eq(v, c)); // e_i = i
     }

@@ -6,11 +6,15 @@ For each instance (z3 solved, ay did not at baseline timeout) run ay under each
 named config at a longer timeout and report how many flip to solved, and whether
 any answer is WRONG vs the .yml expected_verdict.
 """
-import argparse, concurrent.futures as cf, json, os, re, subprocess, sys, time
+import argparse, concurrent.futures as cf, json, os, re, sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _oom_guard import plan_solver_resources, warn_concurrent_build  # noqa: E402
+from _oom_guard import (  # noqa: E402
+    plan_solver_resources,
+    run_captured,
+    warn_concurrent_build,
+)
 
 VERDICT_RE = re.compile(r"^(sat|unsat|unknown)\s*$")
 
@@ -36,22 +40,50 @@ def parse_verdict(out):
             v = m.group(1)
     return v
 
-def run_ay(smt2, ay_bin, timeout_s, env_extra, memlimit_mb=0):
+def run_ay(smt2, ay_bin, timeout_s, env_extra, memlimit_mb=0, nbcore=1):
+    if memlimit_mb <= 0 or nbcore <= 0:
+        raise ValueError("CHC A/B run requires positive memory and core budgets")
     env = dict(os.environ)
     env.update(env_extra)
+    if memlimit_mb:
+        env["MEMLIMIT"] = str(memlimit_mb)
+    env["NBCORE"] = str(max(1, nbcore))
     argv = [ay_bin, "--chc", "--timeout", str(timeout_s * 1000)]
     if memlimit_mb:
         # Per-child envelope: ay's standalone default is 85% of RAM per
         # process, sibling-blind across workers (scripts/_oom_guard.py).
         argv += ["--memory", str(memlimit_mb)]
     argv.append(smt2)
-    t0 = time.time()
     try:
-        p = subprocess.run(argv,
-                           capture_output=True, text=True, timeout=timeout_s + 10, env=env)
-        return parse_verdict(p.stdout + "\n" + p.stderr), round(time.time() - t0, 2)
-    except subprocess.TimeoutExpired:
-        return "unknown", round(time.time() - t0, 2)
+        result = run_captured(
+            argv,
+            memlimit_mb,
+            timeout_s=timeout_s + 10,
+            label="chc_flag_ab.py",
+            env=env,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return "unknown", 0.0, {
+            "execution_status": "error", "exit_code": None,
+            "error": str(exc)[:200], "output_truncated": False,
+        }
+    if result.memout:
+        execution_status = "memout"
+        answer = "unknown"
+    elif result.timed_out:
+        execution_status = "timeout"
+        answer = "unknown"
+    elif result.output_truncated:
+        execution_status = "output-truncated"
+        answer = "unknown"
+    else:
+        execution_status = "completed"
+        answer = parse_verdict(result.stdout + "\n" + result.stderr)
+    return answer, round(result.wall_sec, 2), {
+        "execution_status": execution_status,
+        "exit_code": result.returncode,
+        "output_truncated": result.output_truncated,
+    }
 
 def main():
     ap = argparse.ArgumentParser()
@@ -91,13 +123,24 @@ def main():
     # give each ay child an
     # explicit --memory envelope.
     warn_concurrent_build()
-    plan = plan_solver_resources(a.workers, label="chc_flag_ab.py")
+    requested_workers = a.workers
+    plan = plan_solver_resources(requested_workers, label="chc_flag_ab.py")
     a.workers = plan.jobs
 
     print(f"ref_only targets resolved: {len(targets)} (timeout {a.timeout}s, "
-          f"workers {a.workers}, --memory {plan.memlimit_mb or 'default'} MiB/child)")
+          f"workers {a.workers}, --memory {plan.memlimit_mb} MiB/child, "
+          f"NBCORE {plan.nbcore}, headroom {plan.headroom_mb} MiB)")
+    resource_plan = {
+        "requested_jobs": requested_workers,
+        "jobs": plan.jobs,
+        "memlimit_mb_per_child": plan.memlimit_mb,
+        "nbcore_per_child": plan.nbcore,
+        "headroom_mb": plan.headroom_mb,
+        "enforcement": "exec-stopped + rss-watchdog-zero-grace; ay --memory; "
+                       "MEMLIMIT/NBCORE environment; bounded 1MiB/stream capture",
+    }
     out = {"timeout": a.timeout, "n_targets": len(targets),
-           "workers": a.workers, "memlimit_mb": plan.memlimit_mb, "configs": {}}
+           "resource_plan": resource_plan, "configs": {}}
 
     for cfg_name, env_extra in configs.items():
         solved = 0
@@ -105,16 +148,18 @@ def main():
         per = []
         def work(t):
             rel, smt2 = t
-            v, dt = run_ay(smt2, a.ay, a.timeout, env_extra, plan.memlimit_mb)
+            v, dt, execution = run_ay(smt2, a.ay, a.timeout, env_extra,
+                                      plan.memlimit_mb, plan.nbcore)
             exp = expected_for(smt2)
-            return rel, v, dt, exp
+            return rel, v, dt, exp, execution
         with cf.ThreadPoolExecutor(max_workers=a.workers) as ex:
-            for rel, v, dt, exp in ex.map(work, targets):
+            for rel, v, dt, exp, execution in ex.map(work, targets):
                 if v in ("sat", "unsat"):
                     solved += 1
                     if exp and v != exp:
                         wrong.append({"rel": rel, "ay": v, "expected": exp})
-                per.append({"rel": rel, "ay": v, "t": dt, "expected": exp})
+                per.append({"rel": rel, "ay": v, "t": dt, "expected": exp,
+                            **execution})
                 print(f"[{cfg_name}] {v:7} ({dt:5.1f}s) exp={exp} {rel}", flush=True)
         fam = Counter(p["rel"].split("/")[0] for p in per if p["ay"] in ("sat", "unsat"))
         out["configs"][cfg_name] = {"solved_of_refonly": solved, "wrong": wrong,

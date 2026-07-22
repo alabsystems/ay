@@ -1214,9 +1214,9 @@ fn test_ite_lifting_deep_shared_ite_dag_is_linear_not_exponential() {
     let z = store.mk_var("z", Sort::Int);
     let mut x = store.mk_var("x0", Sort::Int);
     for i in 1..=depth {
-        let c = store.mk_var(&format!("c{i}"), Sort::Bool);
-        let d = store.mk_var(&format!("d{i}"), Sort::Bool);
-        let w = store.mk_var(&format!("w{i}"), Sort::Int);
+        let c = store.mk_var(format!("c{i}"), Sort::Bool);
+        let d = store.mk_var(format!("d{i}"), Sort::Bool);
+        let w = store.mk_var(format!("w{i}"), Sort::Int);
         let inner = store.mk_ite(d, x, w);
         x = store.mk_ite(c, x, inner);
     }

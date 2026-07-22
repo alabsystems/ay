@@ -73,7 +73,7 @@ const TIGHTEN_STACK_SIZE: usize = 1024 * 1024;
 /// turn an invalid goal `unsat` — only normalize the boundary atom so the
 /// existing (sound) implied-equality export can fire.
 fn tighten_int_strict_term(
-    terms: &mut ay_core::TermStore,
+    terms: &mut TermStore,
     term: TermId,
     subst: &HashMap<TermId, TermId>,
     cache: &mut HashMap<TermId, TermId>,
@@ -185,7 +185,7 @@ fn tighten_int_strict_term(
 /// equation and every other atom untouched. No descent into `Forall`/`Exists`
 /// bodies (ground order-atom operands never contain them; guarded for safety).
 fn subst_ground_int_vars(
-    terms: &mut ay_core::TermStore,
+    terms: &mut TermStore,
     term: TermId,
     subst: &HashMap<TermId, TermId>,
 ) -> TermId {
@@ -231,11 +231,7 @@ fn subst_ground_int_vars(
 /// the acyclicity / self-reference checks for the ground-equality fold are
 /// conservative (a candidate is rejected if its right-hand side mentions any
 /// substituted variable *anywhere*).
-fn term_mentions_any_var(
-    terms: &ay_core::TermStore,
-    term: TermId,
-    targets: &HashSet<TermId>,
-) -> bool {
+fn term_mentions_any_var(terms: &TermStore, term: TermId, targets: &HashSet<TermId>) -> bool {
     let mut stack = vec![term];
     let mut seen: HashSet<TermId> = HashSet::default();
     while let Some(t) = stack.pop() {
@@ -285,7 +281,7 @@ fn farkas_pair_clause_valid(terms: &TermStore, a: TermId, b: TermId) -> bool {
 }
 
 /// Insert every `Var` `TermId` reachable from `root` into `out`.
-fn collect_all_var_ids(terms: &ay_core::TermStore, root: TermId, out: &mut HashSet<TermId>) {
+fn collect_all_var_ids(terms: &TermStore, root: TermId, out: &mut HashSet<TermId>) {
     let mut stack = vec![root];
     let mut seen: HashSet<TermId> = HashSet::default();
     while let Some(t) = stack.pop() {
@@ -326,11 +322,7 @@ fn collect_all_var_ids(terms: &ay_core::TermStore, root: TermId, out: &mut HashS
 /// from the matching instantiation (e.g. a ground `(+ bit0 bit1)` rewritten to
 /// `(+ 0 1)` while the live `forall` body keeps `(+ bit0 bit1)`), dropping the
 /// syntactic conflict E-matching relies on.
-fn collect_vars_under_quantifiers(
-    terms: &ay_core::TermStore,
-    root: TermId,
-    out: &mut HashSet<TermId>,
-) {
+fn collect_vars_under_quantifiers(terms: &TermStore, root: TermId, out: &mut HashSet<TermId>) {
     let mut stack = vec![root];
     let mut seen: HashSet<TermId> = HashSet::default();
     while let Some(t) = stack.pop() {
@@ -371,7 +363,7 @@ fn collect_vars_under_quantifiers(
 /// `Ite`; E-matching instances are quantifier-free ground bodies, so any residual
 /// binder/let (never produced by `instantiate_body`) is returned unchanged.
 fn reduce_selectors_rec(
-    terms: &mut ay_core::TermStore,
+    terms: &mut TermStore,
     ctor_sels: &HashMap<String, Vec<String>>,
     term: TermId,
     memo: &mut HashMap<TermId, TermId>,
@@ -1787,8 +1779,7 @@ impl Executor {
         if self.active_support_axioms.iter().any(|l| l.term == root) {
             return;
         }
-        self.active_support_axioms
-            .push(ay_core::TheoryLit::new(root, true));
+        self.active_support_axioms.push(TheoryLit::new(root, true));
     }
 
     /// Promote-unsat optimization (Phase D, #557): check deferred instantiations
@@ -2391,7 +2382,7 @@ impl Executor {
 /// contain a DIRECTLY nested same-polarity binder tower whose outer node has
 /// no triggers? (`Forall` whose body is a `Forall`, or `Exists` whose body is
 /// an `Exists`.) Never mints a term.
-fn term_has_same_polarity_binder_tower(terms: &ay_core::TermStore, root: TermId) -> bool {
+fn term_has_same_polarity_binder_tower(terms: &TermStore, root: TermId) -> bool {
     let mut visited: HashSet<TermId> = HashSet::default();
     let mut stack: Vec<TermId> = vec![root];
     while let Some(t) = stack.pop() {
@@ -2433,11 +2424,7 @@ fn term_has_same_polarity_binder_tower(terms: &ay_core::TermStore, root: TermId)
 /// True iff every merged binder name occurs somewhere in the trigger group's
 /// patterns — the coverage requirement for carrying an inner trigger onto a
 /// merged quantifier (a non-covering group would yield partial substitutions).
-fn trigger_group_covers_names(
-    terms: &ay_core::TermStore,
-    group: &[TermId],
-    names: &[&str],
-) -> bool {
+fn trigger_group_covers_names(terms: &TermStore, group: &[TermId], names: &[&str]) -> bool {
     let mut found: HashSet<String> = HashSet::default();
     let mut visited: HashSet<TermId> = HashSet::default();
     let mut stack: Vec<TermId> = group.to_vec();

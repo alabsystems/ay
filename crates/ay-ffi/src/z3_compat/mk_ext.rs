@@ -45,8 +45,9 @@ use ay_dpll::api::{DatatypeConstructor, DatatypeField, DatatypeSort, FuncDecl, S
 use num_bigint::BigInt;
 
 use super::{
-    alloc_sort, ast_to_term, cache_dt_func_decl, cache_func_decl, cache_func_decl_with_symbol,
-    ffi_function_semantic_name, ffi_guard_ast, ffi_guard_ptr, record_ast_sort, term_to_ast,
+    alloc_sort, ast_to_term, cache_dt_func_decl_with_symbol, cache_func_decl,
+    cache_func_decl_with_symbol, ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast,
+    ffi_guard_ptr, ffi_read_bounded_text, ffi_try_declare_function, record_ast_sort, term_to_ast,
     DatatypeOp, SymbolKey, Z3Context, Z3_ast, Z3_constructor, Z3_context, Z3_func_decl,
     Z3_mk_exists, Z3_mk_exists_const, Z3_mk_forall, Z3_mk_forall_const, Z3_mk_solver, Z3_pattern,
     Z3_solver, Z3_sort, Z3_string, Z3_symbol, AY_MAX_CHAR, MAX_FFI_BITVECTOR_WIDTH, Z3_INVALID_ARG,
@@ -62,12 +63,21 @@ use super::{
 /// # Safety
 /// `s` must be null or a valid symbol handle from a prior AY FFI allocation.
 unsafe fn read_symbol_name(s: Z3_symbol) -> Option<String> {
+    // SAFETY: forwarded to `read_symbol_key` under the same contract.
+    unsafe { read_symbol_key(s) }.map(|key| key.semantic_name())
+}
+
+/// Read the exact caller-visible symbol identity.
+///
+/// # Safety
+/// `s` must be null or a valid symbol handle from a prior AY FFI allocation.
+unsafe fn read_symbol_key(s: Z3_symbol) -> Option<SymbolKey> {
     if s.is_null() {
         return None;
     }
     // SAFETY: `s` null-checked above; a valid AY symbol handle kept alive by the
     // owning context (single-threaded per context).
-    Some(unsafe { (*s).semantic_name() })
+    Some(unsafe { (*s).key.clone() })
 }
 
 /// Attach the optional `:qid` / `:skolemid` symbols to a just-built quantifier
@@ -106,13 +116,19 @@ unsafe fn attach_quantifier_ids(c: Z3_context, ast: Z3_ast, qid: Z3_symbol, skid
 ///
 /// Returns null (after setting `last_error`) if the solver rejects the
 /// definition. Mirrors `datatypes.rs::declare_and_fill`'s declaration step.
-fn declare_datatype_and_alloc(ctx: &mut Z3Context, dt: &DatatypeSort) -> Z3_sort {
+fn declare_datatype_and_alloc(
+    ctx: &mut Z3Context,
+    dt: &DatatypeSort,
+    symbol: &SymbolKey,
+) -> Z3_sort {
     if let Err(e) = ctx.solver.try_declare_datatype(dt) {
         ctx.last_error = Z3_INVALID_ARG;
         ctx.error_msg = Some(format!("{e}"));
         return ptr::null_mut();
     }
-    alloc_sort(ctx, Sort::Datatype(dt.clone()))
+    let sort = Sort::Datatype(dt.clone());
+    ctx.ffi_sort_symbols.insert(sort.clone(), symbol.clone());
+    alloc_sort(ctx, sort)
 }
 
 /// Build a constructor func_decl (`(field sorts...) -> DT`) tagged so
@@ -122,8 +138,9 @@ fn make_constructor_decl(
     dt: &DatatypeSort,
     ctor: &DatatypeConstructor,
     dt_sort: &Sort,
+    symbol: SymbolKey,
 ) -> Z3_func_decl {
-    cache_dt_func_decl(
+    cache_dt_func_decl_with_symbol(
         ctx,
         FuncDecl::new(
             ctor.name.clone(),
@@ -134,18 +151,25 @@ fn make_constructor_decl(
             dt: dt.clone(),
             ctor: ctor.name.clone(),
         },
+        symbol,
     )
 }
 
 /// Build a recognizer func_decl (`DT -> Bool`, named `is-<ctor>`) tagged for
 /// AY's datatype tester builder.
-fn make_recognizer_decl(ctx: &mut Z3Context, ctor_name: &str, dt_sort: &Sort) -> Z3_func_decl {
-    cache_dt_func_decl(
+fn make_recognizer_decl(
+    ctx: &mut Z3Context,
+    ctor_name: &str,
+    dt_sort: &Sort,
+    symbol: SymbolKey,
+) -> Z3_func_decl {
+    cache_dt_func_decl_with_symbol(
         ctx,
         FuncDecl::new(format!("is-{ctor_name}"), vec![dt_sort.clone()], Sort::Bool),
         DatatypeOp::Recognizer {
             ctor: ctor_name.to_string(),
         },
+        symbol,
     )
 }
 
@@ -156,8 +180,9 @@ fn make_accessor_decl(
     field_name: &str,
     field_sort: Sort,
     dt_sort: &Sort,
+    symbol: SymbolKey,
 ) -> Z3_func_decl {
-    cache_dt_func_decl(
+    cache_dt_func_decl_with_symbol(
         ctx,
         FuncDecl::new(
             field_name.to_string(),
@@ -168,6 +193,7 @@ fn make_accessor_decl(
             field: field_name.to_string(),
             result_sort: field_sort,
         },
+        symbol,
     )
 }
 
@@ -192,6 +218,11 @@ pub unsafe extern "C" fn Z3_mk_array_sort_n(
     domain: *const Z3_sort,
     range: Z3_sort,
 ) -> Z3_sort {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_array_sort_n domains", n) } {
+        return ptr::null_mut();
+    }
     if n == 0 || domain.is_null() || range.is_null() {
         return ptr::null_mut();
     }
@@ -235,6 +266,11 @@ pub unsafe extern "C" fn Z3_mk_select_n(
     n: c_uint,
     idxs: *const Z3_ast,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_select_n indices", n) } {
+        return 0;
+    }
     if n == 0 || idxs.is_null() {
         // SAFETY: guard null-checks `c`.
         unsafe {
@@ -278,6 +314,11 @@ pub unsafe extern "C" fn Z3_mk_store_n(
     idxs: *const Z3_ast,
     v: Z3_ast,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_store_n indices", n) } {
+        return 0;
+    }
     if n == 0 || idxs.is_null() {
         // SAFETY: guard null-checks `c`.
         unsafe {
@@ -644,10 +685,11 @@ pub unsafe extern "C" fn Z3_mk_datatype_sort(
     params: *const Z3_sort,
 ) -> Z3_sort {
     let _ = params;
-    // SAFETY: `name` may be null; `read_symbol_name` null-checks it.
-    let Some(dt_name) = (unsafe { read_symbol_name(name) }) else {
+    // SAFETY: `name` may be null; `read_symbol_key` null-checks it.
+    let Some(dt_symbol) = (unsafe { read_symbol_key(name) }) else {
         return ptr::null_mut();
     };
+    let dt_name = dt_symbol.semantic_name();
     // SAFETY: `c` valid per contract; `ffi_guard_ptr` null-checks + isolates panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
@@ -659,7 +701,9 @@ pub unsafe extern "C" fn Z3_mk_datatype_sort(
                 );
                 return ptr::null_mut();
             }
-            alloc_sort(ctx, Sort::Uninterpreted(dt_name.clone()))
+            let sort = Sort::Uninterpreted(dt_name.clone());
+            ctx.ffi_sort_symbols.insert(sort.clone(), dt_symbol.clone());
+            alloc_sort(ctx, sort)
         })
     }
 }
@@ -684,26 +728,47 @@ pub unsafe extern "C" fn Z3_mk_enumeration_sort(
     enum_consts: *mut Z3_func_decl,
     enum_testers: *mut Z3_func_decl,
 ) -> Z3_sort {
-    // SAFETY: `name` may be null; `read_symbol_name` null-checks it.
-    let Some(dt_name) = (unsafe { read_symbol_name(name) }) else {
+    let output_arrays =
+        c_uint::from(!enum_consts.is_null()) + c_uint::from(!enum_testers.is_null());
+    let output_counts = match output_arrays {
+        0 => [0, 0],
+        1 => [n, 0],
+        _ => [n, n],
+    };
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "Z3_mk_enumeration_sort caller arrays",
+            &[n, output_counts[0], output_counts[1]],
+        )
+    } {
+        return ptr::null_mut();
+    }
+    // SAFETY: `name` may be null; `read_symbol_key` null-checks it.
+    let Some(dt_symbol) = (unsafe { read_symbol_key(name) }) else {
         return ptr::null_mut();
     };
+    let dt_name = dt_symbol.semantic_name();
     if n > 0 && enum_names.is_null() {
         return ptr::null_mut();
     }
     // Pre-extract element names.
     let mut ctors = Vec::with_capacity(n as usize);
+    let mut ctor_symbols = Vec::with_capacity(n as usize);
     for i in 0..n as usize {
         // SAFETY: `enum_names` points to `n` elements (checked); `add(i)` in bounds.
         let sym = unsafe { *enum_names.add(i) };
         // SAFETY: `sym` is a valid AY symbol handle (or null -> reject).
-        let Some(en) = (unsafe { read_symbol_name(sym) }) else {
+        let Some(ctor_symbol) = (unsafe { read_symbol_key(sym) }) else {
             return ptr::null_mut();
         };
         ctors.push(DatatypeConstructor {
-            name: en,
+            name: ctor_symbol.semantic_name(),
             fields: Vec::new(),
         });
+        ctor_symbols.push(ctor_symbol);
     }
     let dt = DatatypeSort {
         name: dt_name,
@@ -713,14 +778,21 @@ pub unsafe extern "C" fn Z3_mk_enumeration_sort(
     // SAFETY: `c` valid per contract; `ffi_guard_ptr` null-checks + isolates panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let sort_handle = declare_datatype_and_alloc(ctx, &dt);
+            let sort_handle = declare_datatype_and_alloc(ctx, &dt, &dt_symbol);
             if sort_handle.is_null() {
                 return ptr::null_mut();
             }
             let dt_sort = Sort::Datatype(dt.clone());
-            for (i, ctor) in dt.constructors.iter().enumerate() {
-                let cdecl = make_constructor_decl(ctx, &dt, ctor, &dt_sort);
-                let tdecl = make_recognizer_decl(ctx, &ctor.name, &dt_sort);
+            for (i, (ctor, ctor_symbol)) in
+                dt.constructors.iter().zip(ctor_symbols.iter()).enumerate()
+            {
+                let cdecl = make_constructor_decl(ctx, &dt, ctor, &dt_sort, ctor_symbol.clone());
+                let tdecl = make_recognizer_decl(
+                    ctx,
+                    &ctor.name,
+                    &dt_sort,
+                    SymbolKey::String(format!("is-{}", ctor_symbol.display_name())),
+                );
                 if !enum_consts.is_null() {
                     // SAFETY: caller guarantees room for `n` slots; `i < n`.
                     // (already in the enclosing unsafe context)
@@ -764,10 +836,11 @@ pub unsafe extern "C" fn Z3_mk_list_sort(
     if elem_sort.is_null() {
         return ptr::null_mut();
     }
-    // SAFETY: `name` may be null; `read_symbol_name` null-checks it.
-    let Some(dt_name) = (unsafe { read_symbol_name(name) }) else {
+    // SAFETY: `name` may be null; `read_symbol_key` null-checks it.
+    let Some(dt_symbol) = (unsafe { read_symbol_key(name) }) else {
         return ptr::null_mut();
     };
+    let dt_name = dt_symbol.semantic_name();
     // SAFETY: `elem_sort` null-checked above; a valid AY sort handle.
     let elem = unsafe { (*elem_sort).sort.clone() };
     let self_sort = Sort::Uninterpreted(dt_name.clone());
@@ -798,17 +871,51 @@ pub unsafe extern "C" fn Z3_mk_list_sort(
     // SAFETY: `c` valid per contract; `ffi_guard_ptr` null-checks + isolates panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let sort_handle = declare_datatype_and_alloc(ctx, &dt);
+            let sort_handle = declare_datatype_and_alloc(ctx, &dt, &dt_symbol);
             if sort_handle.is_null() {
                 return ptr::null_mut();
             }
             let dt_sort = Sort::Datatype(dt.clone());
-            let nil = make_constructor_decl(ctx, &dt, &dt.constructors[0], &dt_sort);
-            let is_nil = make_recognizer_decl(ctx, "nil", &dt_sort);
-            let cons = make_constructor_decl(ctx, &dt, &dt.constructors[1], &dt_sort);
-            let is_cons = make_recognizer_decl(ctx, "cons", &dt_sort);
-            let head = make_accessor_decl(ctx, "head", elem.clone(), &dt_sort);
-            let tail = make_accessor_decl(ctx, "tail", self_sort.clone(), &dt_sort);
+            let nil = make_constructor_decl(
+                ctx,
+                &dt,
+                &dt.constructors[0],
+                &dt_sort,
+                SymbolKey::String("nil".to_string()),
+            );
+            let is_nil = make_recognizer_decl(
+                ctx,
+                "nil",
+                &dt_sort,
+                SymbolKey::String("is-nil".to_string()),
+            );
+            let cons = make_constructor_decl(
+                ctx,
+                &dt,
+                &dt.constructors[1],
+                &dt_sort,
+                SymbolKey::String("cons".to_string()),
+            );
+            let is_cons = make_recognizer_decl(
+                ctx,
+                "cons",
+                &dt_sort,
+                SymbolKey::String("is-cons".to_string()),
+            );
+            let head = make_accessor_decl(
+                ctx,
+                "head",
+                elem.clone(),
+                &dt_sort,
+                SymbolKey::String("head".to_string()),
+            );
+            let tail = make_accessor_decl(
+                ctx,
+                "tail",
+                self_sort.clone(),
+                &dt_sort,
+                SymbolKey::String("tail".to_string()),
+            );
             // SAFETY: each out-pointer, when non-null, is writable per contract.
             // (already in the enclosing unsafe context)
             {
@@ -858,19 +965,33 @@ pub unsafe extern "C" fn Z3_mk_tuple_sort(
     mk_tuple_decl: *mut Z3_func_decl,
     proj_decl: *mut Z3_func_decl,
 ) -> Z3_sort {
-    // SAFETY: `mk_tuple_name` may be null; `read_symbol_name` null-checks it.
-    let Some(tuple_name) = (unsafe { read_symbol_name(mk_tuple_name) }) else {
+    let projection_count = if proj_decl.is_null() { 0 } else { num_fields };
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "Z3_mk_tuple_sort caller arrays",
+            &[num_fields, num_fields, projection_count],
+        )
+    } {
+        return ptr::null_mut();
+    }
+    // SAFETY: `mk_tuple_name` may be null; `read_symbol_key` null-checks it.
+    let Some(tuple_symbol) = (unsafe { read_symbol_key(mk_tuple_name) }) else {
         return ptr::null_mut();
     };
+    let tuple_name = tuple_symbol.semantic_name();
     if num_fields > 0 && (field_names.is_null() || field_sorts.is_null()) {
         return ptr::null_mut();
     }
     let mut fields = Vec::with_capacity(num_fields as usize);
+    let mut field_symbols = Vec::with_capacity(num_fields as usize);
     for i in 0..num_fields as usize {
         // SAFETY: `field_names` points to `num_fields` elems (checked); in bounds.
         let fsym = unsafe { *field_names.add(i) };
         // SAFETY: `fsym` is a valid AY symbol handle (or null -> reject).
-        let Some(fname) = (unsafe { read_symbol_name(fsym) }) else {
+        let Some(field_symbol) = (unsafe { read_symbol_key(fsym) }) else {
             return ptr::null_mut();
         };
         // SAFETY: `field_sorts` points to `num_fields` elems (checked); in bounds.
@@ -881,9 +1002,10 @@ pub unsafe extern "C" fn Z3_mk_tuple_sort(
         // SAFETY: `fsort_ptr` null-checked; a valid AY sort handle.
         let fsort = unsafe { (*fsort_ptr).sort.clone() };
         fields.push(DatatypeField {
-            name: fname,
+            name: field_symbol.semantic_name(),
             sort: fsort,
         });
+        field_symbols.push(field_symbol);
     }
     // The tuple sort and its single constructor share `mk_tuple_name` (Z3
     // convention); sorts and functions live in disjoint namespaces.
@@ -898,20 +1020,28 @@ pub unsafe extern "C" fn Z3_mk_tuple_sort(
     // SAFETY: `c` valid per contract; `ffi_guard_ptr` null-checks + isolates panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let sort_handle = declare_datatype_and_alloc(ctx, &dt);
+            let sort_handle = declare_datatype_and_alloc(ctx, &dt, &tuple_symbol);
             if sort_handle.is_null() {
                 return ptr::null_mut();
             }
             let dt_sort = Sort::Datatype(dt.clone());
             let ctor = &dt.constructors[0];
-            let ctor_decl = make_constructor_decl(ctx, &dt, ctor, &dt_sort);
+            let ctor_decl = make_constructor_decl(ctx, &dt, ctor, &dt_sort, tuple_symbol.clone());
             if !mk_tuple_decl.is_null() {
                 // SAFETY: `mk_tuple_decl` non-null and writable per contract.
                 // (already in the enclosing unsafe context)
                 *mk_tuple_decl = ctor_decl;
             }
-            for (i, field) in ctor.fields.iter().enumerate() {
-                let acc = make_accessor_decl(ctx, &field.name, field.sort.clone(), &dt_sort);
+            for (i, (field, field_symbol)) in
+                ctor.fields.iter().zip(field_symbols.iter()).enumerate()
+            {
+                let acc = make_accessor_decl(
+                    ctx,
+                    &field.name,
+                    field.sort.clone(),
+                    &dt_sort,
+                    field_symbol.clone(),
+                );
                 if !proj_decl.is_null() {
                     // SAFETY: caller guarantees room for `num_fields` slots; `i < num_fields`.
                     // (already in the enclosing unsafe context)
@@ -986,15 +1116,16 @@ pub unsafe extern "C" fn Z3_mk_finite_domain_sort(
     size: u64,
 ) -> Z3_sort {
     // SAFETY: `name`, when non-null, is a live `SymbolHandle`; `as_ref` null-checks.
-    let sort_name = unsafe { name.as_ref() }.map(super::SymbolHandle::semantic_name);
+    let sort_symbol = unsafe { name.as_ref() }.map(|handle| handle.key.clone());
     // SAFETY: `c` valid per contract; `ffi_guard_ptr` null-checks + isolates panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let Some(sort_name) = sort_name.clone() else {
+            let Some(sort_symbol) = sort_symbol.clone() else {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some("Z3_mk_finite_domain_sort: null name symbol".to_string());
                 return ptr::null_mut();
             };
+            let sort_name = sort_symbol.semantic_name();
             if size == 0 {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some(format!(
@@ -1002,7 +1133,9 @@ pub unsafe extern "C" fn Z3_mk_finite_domain_sort(
                 ));
                 return ptr::null_mut();
             }
-            alloc_sort(ctx, Sort::FiniteDomain(sort_name, size))
+            let sort = Sort::FiniteDomain(sort_name, size);
+            ctx.ffi_sort_symbols.insert(sort.clone(), sort_symbol);
+            alloc_sort(ctx, sort)
         })
     }
 }
@@ -1027,16 +1160,18 @@ pub unsafe extern "C" fn Z3_mk_finite_domain_sort(
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_type_variable(c: Z3_context, s: Z3_symbol) -> Z3_sort {
     // SAFETY: `s`, when non-null, is a live `SymbolHandle`; `as_ref` null-checks.
-    let var_name = unsafe { s.as_ref() }.map(super::SymbolHandle::semantic_name);
+    let var_symbol = unsafe { s.as_ref() }.map(|handle| handle.key.clone());
     // SAFETY: `c` valid per contract; `ffi_guard_ptr` null-checks + isolates panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let Some(var_name) = var_name.clone() else {
+            let Some(var_symbol) = var_symbol.clone() else {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some("Z3_mk_type_variable: null name symbol".to_string());
                 return ptr::null_mut();
             };
-            alloc_sort(ctx, Sort::TypeVar(var_name))
+            let sort = Sort::TypeVar(var_symbol.semantic_name());
+            ctx.ffi_sort_symbols.insert(sort.clone(), var_symbol);
+            alloc_sort(ctx, sort)
         })
     }
 }
@@ -1061,6 +1196,11 @@ pub unsafe extern "C" fn Z3_mk_fresh_func_decl(
     domain: *const Z3_sort,
     range: Z3_sort,
 ) -> Z3_func_decl {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_fresh_func_decl domain", domain_size) } {
+        return ptr::null_mut();
+    }
     if range.is_null() {
         return ptr::null_mut();
     }
@@ -1068,13 +1208,10 @@ pub unsafe extern "C" fn Z3_mk_fresh_func_decl(
         return ptr::null_mut();
     }
     let pfx = if prefix.is_null() {
-        "fresh".to_string()
+        Ok("fresh".to_string())
     } else {
         // SAFETY: caller guarantees `prefix` is a valid null-terminated C string.
-        unsafe { std::ffi::CStr::from_ptr(prefix) }
-            .to_str()
-            .unwrap_or("fresh")
-            .to_string()
+        unsafe { ffi_read_bounded_text(prefix) }
     };
     let mut dom_sorts = Vec::with_capacity(domain_size as usize);
     for i in 0..domain_size as usize {
@@ -1092,8 +1229,16 @@ pub unsafe extern "C" fn Z3_mk_fresh_func_decl(
     // SAFETY: `c` valid per contract; `ffi_guard_ptr` null-checks + isolates panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
+            let pfx = match &pfx {
+                Ok(pfx) => pfx,
+                Err(error) => {
+                    ctx.last_error = Z3_INVALID_ARG;
+                    ctx.error_msg = Some(format!("Z3_mk_fresh_func_decl: {error}"));
+                    return ptr::null_mut();
+                }
+            };
             // Fail-close reserved-namespace capture — see `reserved_name_error`.
-            if let Some(msg) = super::reserved_name_error(&pfx) {
+            if let Some(msg) = super::reserved_name_error(pfx) {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some(msg);
                 return ptr::null_mut();
@@ -1142,6 +1287,11 @@ pub unsafe extern "C" fn Z3_mk_rec_func_decl(
     domain: *const Z3_sort,
     range: Z3_sort,
 ) -> Z3_func_decl {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_rec_func_decl domain", domain_size) } {
+        return ptr::null_mut();
+    }
     if s.is_null() || range.is_null() {
         return ptr::null_mut();
     }
@@ -1175,11 +1325,7 @@ pub unsafe extern "C" fn Z3_mk_rec_func_decl(
                     return ptr::null_mut();
                 }
             }
-            let semantic_name = ffi_function_semantic_name(ctx, &symbol, &dom_sorts, &range_sort);
-            match ctx
-                .solver
-                .try_declare_fun(&semantic_name, &dom_sorts, range_sort.clone())
-            {
+            match ffi_try_declare_function(ctx, &symbol, &dom_sorts, &range_sort) {
                 Ok(decl) => {
                     // Record rec-DECLARED-ness: a rec-declared name that never
                     // receives a `Z3_add_rec_def` body must not be surfaced by
@@ -1191,7 +1337,7 @@ pub unsafe extern "C" fn Z3_mk_rec_func_decl(
                     // defined (`Z3_add_rec_def` rejects them) and their
                     // applications ARE the builtin operator.
                     if !ay_dpll::api::rec_def_name_conflates_with_builtin(&display_name) {
-                        ctx.rec_declared_names.insert(semantic_name.clone());
+                        ctx.rec_declared_names.insert(decl.name().to_string());
                     }
                     ctx.ffi_used_decl_names.insert(display_name.clone());
                     cache_func_decl_with_symbol(ctx, decl, symbol.clone())
@@ -1469,6 +1615,11 @@ pub unsafe extern "C" fn Z3_mk_re_power(c: Z3_context, re: Z3_ast, n: c_uint) ->
 /// null only when `len == 0`).
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_lstring(c: Z3_context, len: c_uint, s: Z3_string) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_lstring bytes", len) } {
+        return 0;
+    }
     if len == 0 {
         // SAFETY: guard null-checks `c`; empty string is the zero-length literal.
         return unsafe {
@@ -1528,6 +1679,11 @@ pub unsafe extern "C" fn Z3_mk_u32string(
     len: c_uint,
     chars: *const c_uint,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_u32string code points", len) } {
+        return 0;
+    }
     if len > 0 && chars.is_null() {
         return 0;
     }

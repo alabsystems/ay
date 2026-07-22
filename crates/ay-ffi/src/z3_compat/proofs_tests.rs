@@ -249,7 +249,7 @@ fn proof_text_for_ast_rejects_non_proof_handles() {
         // The real proof handle does resolve.
         assert!(proof_text_for_ast(ctx_ref, proof).is_some());
         // A tagged-but-out-of-range index must be None (not a panic / not UB).
-        assert!(proof_text_for_ast(ctx_ref, PROOF_AST_TAG | 9999).is_none());
+        assert!(proof_text_for_ast(ctx_ref, PROOF_AST_TAG | 0x270f).is_none());
 
         Z3_del_context(ctx);
     }

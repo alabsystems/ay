@@ -275,12 +275,14 @@ impl Executor {
                                     fixed.entry(a2[0]).or_default().push((i, c));
                                 }
                             }
-                        } else if n2 == "str.indexof" && a2.len() == 3 && is_str_var(a2[0]) {
-                            if get_int(a2[2]) == Some(0) {
-                                if let (Some(needle), Some(k)) = (get_str(a2[1]), get_int(r)) {
-                                    if !needle.is_empty() {
-                                        fixed.entry(a2[0]).or_default().push((k, needle));
-                                    }
+                        } else if n2 == "str.indexof"
+                            && a2.len() == 3
+                            && is_str_var(a2[0])
+                            && get_int(a2[2]) == Some(0)
+                        {
+                            if let (Some(needle), Some(k)) = (get_str(a2[1]), get_int(r)) {
+                                if !needle.is_empty() {
+                                    fixed.entry(a2[0]).or_default().push((k, needle));
                                 }
                             }
                         }

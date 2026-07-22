@@ -1134,3 +1134,258 @@ fn accepted_lengths_diff_subset_of_lhs() {
         Some(lenset(&[2]))
     );
 }
+
+// ── `(_ re.loop lo hi)` with `lo > hi` is the EMPTY language ───────
+//
+// SMT-LIB 2.6: `((_ re.loop i n) e)` denotes `⋃_{k=i}^{n} L(e)^k`. When
+// `i > n` the index set is empty, so the regex denotes the empty language —
+// which is NOT nullable and matches nothing at all. `evaluate`,
+// `accepted_lengths` and `WeRegex::loop_bounded` always folded this; `delta`
+// (nullability) did NOT, and answered "yes, `\"\"` matches" for the empty
+// language. Found by `crates/ay-proof/tests/string_ground_diff_fuzz.rs`
+// (#regex-loop-degenerate-bounds); the end-to-end symptom was a WRONG-UNSAT on
+// `(not (str.in_re "" (re.+ ((_ re.loop 4 3) (re.* re.allchar)))))`, which is
+// satisfiable.
+
+#[test]
+fn degenerate_loop_bounds_are_not_nullable() {
+    let mut terms = TermStore::new();
+    let ch = mk_re_allchar(&mut terms);
+    let star = mk_re_star(&mut terms, ch);
+    let degenerate = mk_re_loop(&mut terms, star, 4, 3);
+    assert_eq!(
+        RegExpSolver::is_nullable(&terms, degenerate),
+        Some(false),
+        "((_ re.loop 4 3) R) is the EMPTY language and cannot contain \"\""
+    );
+    assert_eq!(RegExpSolver::evaluate(&terms, "", degenerate), Some(false));
+    assert_eq!(RegExpSolver::evaluate(&terms, "a", degenerate), Some(false));
+}
+
+#[test]
+fn plus_over_degenerate_loop_rejects_empty_string() {
+    // The exact wrong-UNSAT shape: `re.+` over the empty language is empty.
+    let mut terms = TermStore::new();
+    let ch = mk_re_allchar(&mut terms);
+    let star = mk_re_star(&mut terms, ch);
+    let degenerate = mk_re_loop(&mut terms, star, 4, 3);
+    let plus = mk_re_plus(&mut terms, degenerate);
+    assert_eq!(RegExpSolver::evaluate(&terms, "", plus), Some(false));
+}
+
+#[test]
+fn complement_of_degenerate_loop_is_nullable() {
+    // `(re.comp ((_ re.loop 4 2) R))` = `¬∅` = `Σ*`, which DOES contain "".
+    // Reporting it non-nullable would give the core solver a bogus `|x| > 0`.
+    let mut terms = TermStore::new();
+    let a = mk_str_to_re(&mut terms, "a");
+    let degenerate = mk_re_loop(&mut terms, a, 4, 2);
+    let comp = mk_re_comp(&mut terms, degenerate);
+    assert_eq!(RegExpSolver::is_nullable(&terms, comp), Some(true));
+    assert_eq!(RegExpSolver::evaluate(&terms, "", comp), Some(true));
+}
+
+// ── `str.substr` with an out-of-`usize` length ─────────────────────
+//
+// SMT-LIB 2.6: `(str.substr s m n)` is the unique `w` with `s = u·w·v`,
+// `|u| = m`, `|w| = min(n, |s| - m)` when `0 <= m < |s|` and `0 < n`. `n` only
+// CLAMPS, so an astronomically large `n` selects the whole suffix. The shared
+// evaluator used to answer `None` ("unevaluable"), and the DPLL copy computed
+// `start + len` unguarded — `(str.substr "abc" 1 18446744073709551615)`
+// panicked with "attempt to add with overflow", losing an `unsat`
+// (#string-substr-length-overflow).
+
+#[test]
+fn substr_with_out_of_usize_length_selects_the_whole_suffix() {
+    use num_bigint::BigInt;
+    let huge = BigInt::from(u64::MAX) * BigInt::from(u64::MAX);
+    assert_eq!(
+        crate::eval::eval_str_substr("abc", &BigInt::from(1), &huge),
+        Some("bc".to_string())
+    );
+    assert_eq!(
+        crate::eval::eval_str_substr("abc", &BigInt::from(1), &BigInt::from(usize::MAX)),
+        Some("bc".to_string())
+    );
+    // An out-of-`usize` START is necessarily past the end: "".
+    assert_eq!(
+        crate::eval::eval_str_substr("abc", &huge, &BigInt::from(2)),
+        Some(String::new())
+    );
+    assert_eq!(crate::eval::eval_str_at("abc", &huge), Some(String::new()));
+    assert_eq!(
+        crate::eval::eval_str_indexof("abc", "b", &huge),
+        Some(BigInt::from(-1))
+    );
+}
+// ── Memoised concrete-membership evaluator (#re-eval-memo) ─────────
+//
+// The recursive-descent matcher tries every split point of every child and
+// recurses; without a memo the same `(node, substring)` sub-problem is asked
+// for exponentially many times. These pin BOTH halves of the fix: the answers
+// are unchanged, and the classic catastrophic-backtracking shapes now finish.
+
+/// `(a*)*` against a long all-`a` string that the trailing literal rejects —
+/// the textbook exponential blow-up. Unmemoised this does not terminate in any
+/// reasonable time; memoised it is instant and correctly `false`.
+#[test]
+fn nested_star_no_match_terminates() {
+    let mut terms = TermStore::new();
+    let a = mk_str_to_re(&mut terms, "a");
+    let inner = mk_re_star(&mut terms, a);
+    let outer = mk_re_star(&mut terms, inner);
+    let b = mk_str_to_re(&mut terms, "b");
+    let r = mk_re_concat(&mut terms, vec![outer, b]);
+    let s = "a".repeat(40);
+    assert_eq!(RegExpSolver::evaluate(&terms, &s, r), Some(false));
+    let mut yes = s.clone();
+    yes.push('b');
+    assert_eq!(RegExpSolver::evaluate(&terms, &yes, r), Some(true));
+}
+
+/// `(a|aa)*` — every prefix has two decompositions, so the split tree is
+/// exponential in |s| without a memo. The answer is `true` either way.
+#[test]
+fn ambiguous_star_alternation_terminates() {
+    let mut terms = TermStore::new();
+    let a = mk_str_to_re(&mut terms, "a");
+    let aa = mk_str_to_re(&mut terms, "aa");
+    let u = mk_re_union(&mut terms, vec![a, aa]);
+    let r = mk_re_star(&mut terms, u);
+    assert_eq!(
+        RegExpSolver::evaluate(&terms, &"a".repeat(48), r),
+        Some(true)
+    );
+}
+
+/// A chain of `(re.opt allchar)` concatenations: each child may consume 0 or 1
+/// characters, so the concat split loop branches at every position. Pins that
+/// the `eval_concat` memo is keyed by `(node, idx, substring)` — a wrong key
+/// would return one child's verdict for another and flip these answers.
+#[test]
+fn optional_chain_concat_lengths_are_exact() {
+    let mut terms = TermStore::new();
+    let ch = mk_re_allchar(&mut terms);
+    let opt = mk_re_opt(&mut terms, ch);
+    let lit = mk_str_to_re(&mut terms, "z");
+    let mut children: Vec<TermId> = (0..12).map(|_| opt).collect();
+    children.push(lit);
+    let r = mk_re_concat(&mut terms, children);
+    // Up to 12 optional characters, then a mandatory "z".
+    assert_eq!(RegExpSolver::evaluate(&terms, "z", r), Some(true));
+    assert_eq!(
+        RegExpSolver::evaluate(&terms, &format!("{}z", "x".repeat(12)), r),
+        Some(true)
+    );
+    assert_eq!(
+        RegExpSolver::evaluate(&terms, &format!("{}z", "x".repeat(13)), r),
+        Some(false)
+    );
+    assert_eq!(RegExpSolver::evaluate(&terms, "x", r), Some(false));
+}
+
+/// `((_ re.loop 2 4) (re.opt allchar))` — the loop memo key must carry `lo`
+/// and `hi`, not just the body: the same `(body, substring)` pair has
+/// different answers at different remaining-iteration counts.
+#[test]
+fn loop_memo_key_distinguishes_bounds() {
+    let mut terms = TermStore::new();
+    let ch = mk_re_allchar(&mut terms);
+    let opt = mk_re_opt(&mut terms, ch);
+    let r24 = terms.mk_app(
+        Symbol::indexed("re.loop", vec![2, 4]),
+        vec![opt],
+        Sort::RegLan,
+    );
+    let r22 = terms.mk_app(
+        Symbol::indexed("re.loop", vec![2, 2]),
+        vec![opt],
+        Sort::RegLan,
+    );
+    // 2..4 iterations of an optional char accept "", "x", "xx", "xxx", "xxxx".
+    assert_eq!(RegExpSolver::evaluate(&terms, "xxxx", r24), Some(true));
+    assert_eq!(RegExpSolver::evaluate(&terms, "xxxxx", r24), Some(false));
+    // Exactly 2 iterations cannot reach 3 characters.
+    assert_eq!(RegExpSolver::evaluate(&terms, "xx", r22), Some(true));
+    assert_eq!(RegExpSolver::evaluate(&terms, "xxx", r22), Some(false));
+}
+
+/// The work counter is monotone and actually charged by an evaluation.
+#[test]
+fn regex_eval_work_counter_advances() {
+    let mut terms = TermStore::new();
+    let a = mk_str_to_re(&mut terms, "a");
+    let r = mk_re_star(&mut terms, a);
+    let before = crate::regex_eval_work();
+    assert_eq!(RegExpSolver::evaluate(&terms, "aaaa", r), Some(true));
+    assert!(crate::regex_eval_work() > before);
+}
+
+/// A shared nullable DAG must be charged on every consultation but computed
+/// once per distinct delta node. Without the delta memo this shape is
+/// exponential; with it the exact cost is `2 * depth + 2` (top Eval, each
+/// intersection miss + shared-child hit, and the leaf).
+#[test]
+fn bounded_nullable_shared_dag_is_memoised_and_exact() {
+    const DEPTH: u64 = 24;
+    let mut terms = TermStore::new();
+    let mut body = mk_str_to_re(&mut terms, "");
+    for _ in 0..DEPTH {
+        body = mk_re_inter(&mut terms, vec![body, body]);
+    }
+    let plus = mk_re_plus(&mut terms, body);
+    let exact = 2 * DEPTH + 2;
+
+    assert_eq!(
+        RegExpSolver::evaluate_with_work_limit(&terms, "", plus, exact - 1),
+        Err(RegexWorkLimitExceeded)
+    );
+    assert_eq!(
+        RegExpSolver::evaluate_with_work_limit(&terms, "", plus, exact),
+        Ok(Some(true))
+    );
+}
+
+/// A new miss at the memo cap fails closed before uncached recursive work can
+/// restore catastrophic backtracking. This uses a zero-entry cap so the
+/// regression is exercised without allocating the production million-entry
+/// table.
+#[test]
+fn memo_cap_fails_closed_before_uncached_work() {
+    let mut terms = TermStore::new();
+    let a = mk_str_to_re(&mut terms, "a");
+    let r = mk_re_star(&mut terms, a);
+    let mut budget = RegexWorkBudget::limited_with_memo_cap(4, 0);
+    let before = crate::regex_eval_work();
+
+    assert_eq!(
+        RegExpSolver::evaluate_with_budget(&terms, "aaaa", r, &mut budget),
+        Ok(None)
+    );
+    assert_eq!(crate::regex_eval_work().saturating_sub(before), 1);
+}
+
+/// All substring probes in replace, and all repeated searches in replace-all,
+/// consume one operation-wide budget instead of receiving fresh caps.
+#[test]
+fn bounded_regex_replacements_share_the_whole_operation_budget() {
+    let mut terms = TermStore::new();
+    let a = mk_str_to_re(&mut terms, "a");
+
+    assert_eq!(
+        crate::ground_eval_replace_re_with_work_limit(&terms, "bbb", a, "x", 9),
+        Err(RegexWorkLimitExceeded)
+    );
+    assert_eq!(
+        crate::ground_eval_replace_re_with_work_limit(&terms, "bbb", a, "x", 10),
+        Ok(Some("bbb".to_string()))
+    );
+    assert_eq!(
+        crate::ground_eval_replace_re_all_with_work_limit(&terms, "aaaa", a, "x", 7),
+        Err(RegexWorkLimitExceeded)
+    );
+    assert_eq!(
+        crate::ground_eval_replace_re_all_with_work_limit(&terms, "aaaa", a, "x", 8),
+        Ok(Some("xxxx".to_string()))
+    );
+}

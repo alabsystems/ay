@@ -215,6 +215,7 @@ impl Solver {
         self.executor.execute(&Command::Reset)?;
         self.scope_level = 0;
         self.var_names.clear();
+        self.var_terms_by_name.clear();
         self.var_sorts.clear();
         self.last_assumptions = None;
         self.last_unknown_reason = None;
@@ -222,7 +223,7 @@ impl Solver {
         self.last_artifact_export_failure = None;
         self.soft_constraints.clear();
         self.defined_funs.clear();
-        self.scope_level = 0;
+        self.native_fun_signatures.clear();
         self.core_tracker = crate::api::types::CoreEvolutionTracker::new();
         self.native_replay_events.clear();
         self.record_native_replay_event(NativeReplayEventKind::Reset);
@@ -246,10 +247,11 @@ impl Solver {
     pub fn try_reset_assertions(&mut self) -> Result<(), SolverError> {
         self.executor.execute(&Command::ResetAssertions)?;
         self.scope_level = 0;
-        // Preserve var_names and var_sorts — declarations survive reset_assertions.
-        // Clear defined_funs because their bodies reference terms from the old
-        // assertion context that may become invalid after reset-assertions.
-        self.defined_funs.clear();
+        // Preserve declarations and API-level definitions. ResetAssertions
+        // clears assertions/scopes but deliberately retains the context's term
+        // store, so definition parameter/body TermIds remain valid. Clearing
+        // this map silently changed a formerly-defined function into an
+        // uninterpreted one after reset-assertions.
         self.last_assumptions = None;
         self.last_unknown_reason = None;
         self.last_executor_error = None;

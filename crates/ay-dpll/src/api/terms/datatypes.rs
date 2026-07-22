@@ -98,7 +98,10 @@ impl Solver {
             type_params: Vec::new(),
         };
         let cmd = Command::DeclareDatatype(dt.name.clone(), datatype_dec);
-        self.executor.execute(&cmd)?;
+        self.executor.execute_native_global_declaration(&cmd)?;
+        self.record_native_replay_event(NativeReplayEventKind::DeclareDatatype {
+            datatype: dt.clone(),
+        });
         Ok(())
     }
 

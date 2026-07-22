@@ -233,9 +233,12 @@ impl TheorySolver for EufSolver<'_> {
         self.propagate_disequalities(&mut propagations);
 
         self.propagation_count += propagations.len() as u64;
-        // Store buffer back for reuse, drain to return owned Vec.
+        // Store the allocation back for reuse, then move its elements into the
+        // independently owned result without discarding the reusable capacity.
         self.propagation_output_buf = propagations;
-        self.propagation_output_buf.drain(..).collect()
+        let mut output = Vec::with_capacity(self.propagation_output_buf.len());
+        output.append(&mut self.propagation_output_buf);
+        output
     }
 
     fn push(&mut self) {

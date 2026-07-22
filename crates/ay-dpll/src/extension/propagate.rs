@@ -1474,6 +1474,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                             .is_multiple_of(u64::from(self.semantic_verify_interval));
 
                     if should_verify {
+                        ay_lia::instrument::bump_verify_prop_selected();
                         // #qfuflia-a2-verifier-reuse: EUF-domain propagations
                         // verify against the cached verify-only solver
                         // (push/assert/check/pop) instead of constructing a
@@ -1484,9 +1485,60 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                         // path.
                         let prop_domain =
                             crate::verification::classify_propagation_domain(terms, &prop);
-                        let verified_by_cache = if prop_domain
-                            == crate::verification::TheoryDomain::Unknown
-                        {
+                        // #verify-memo (AY_VERIFY_MEMO=1, default off =
+                        // byte-identical): obligation memo for the two arms
+                        // WITHOUT one — the cached mixed-domain N-O verifier
+                        // (each check still pays the full N-O fixpoint, ~20k
+                        // verify-partition LIA checks/run on hash_sat_08_04)
+                        // and the fresh-solver dispatch. Array has its own
+                        // memo; EUF's cached push/pop check is already
+                        // O(merges) with its own warmup/sampling. Key = the
+                        // canonical literal-set signature of the exact
+                        // verified obligation (sorted reasons + propagated
+                        // literal — the verify_array_memo discipline). The
+                        // verifier is a pure function of (terms, obligation)
+                        // and TermIds are stable/hash-consed, so an identical
+                        // key means an identical query and the replayed
+                        // verdict is exactly what a re-run would return.
+                        // Trust-TRUE-only: only ACCEPTS are memoized, every
+                        // rejection re-runs the complete fail-closed check.
+                        // COVERAGE is unchanged: the sampling policy above is
+                        // untouched, and a hit replays a verdict recorded
+                        // from a FULL verification of the byte-identical
+                        // obligation this solve.
+                        let verify_memo_key: Option<Vec<(u32, bool)>> =
+                            if crate::verification::verify_memo_armed()
+                                && self.verify_prop_memo.is_some()
+                                && matches!(
+                                    prop_domain,
+                                    crate::verification::TheoryDomain::Unknown
+                                        | crate::verification::TheoryDomain::Arithmetic
+                                        | crate::verification::TheoryDomain::BitVec
+                                        | crate::verification::TheoryDomain::String
+                                )
+                            {
+                                let mut key: Vec<(u32, bool)> =
+                                    prop.reason.iter().map(|l| (l.term.0, l.value)).collect();
+                                key.sort_unstable();
+                                key.push((prop.literal.term.0, prop.literal.value));
+                                Some(key)
+                            } else {
+                                None
+                            };
+                        let verify_memo_hit =
+                            match (&verify_memo_key, self.verify_prop_memo.as_deref()) {
+                                (Some(k), Some(memo)) => memo.get(k) == Some(&true),
+                                _ => false,
+                            };
+                        if verify_memo_key.is_some() {
+                            ay_lia::instrument::bump_verify_prop_memo(verify_memo_hit);
+                        }
+                        let verified_by_cache = if verify_memo_hit {
+                            // Identical obligation previously FULLY verified
+                            // and accepted this solve — replay the verdict.
+                            Some(true)
+                        } else if prop_domain == crate::verification::TheoryDomain::Unknown {
+                            ay_lia::instrument::bump_verify_prop_mixed_full();
                             // Mixed-domain: cached Nelson-Oppen verifier.
                             let cache = self.verify_mixed_cache.get_or_insert_with(|| {
                                 let all_terms = prop
@@ -1664,6 +1716,7 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                             continue;
                         }
                         if verified_by_cache.is_none() {
+                            ay_lia::instrument::bump_verify_prop_fresh_full();
                             if let Err(e) = verify_propagation_semantic(&prop, terms) {
                                 tracing::error!(
                                     error = %e,
@@ -1673,6 +1726,22 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
                                     "BUG(#6242): propagation semantic verification failed; skipping unsound propagation"
                                 );
                                 continue;
+                            }
+                        }
+                        // #verify-memo: reaching here means the obligation was
+                        // ACCEPTED (rejections `continue` above). Record the
+                        // full-verification accept for identical re-derivations
+                        // this solve. Bounded like VERIFY_ARRAY_MEMO_CAP; on
+                        // overflow we stop inserting (every query still
+                        // verified, only slower).
+                        if !verify_memo_hit {
+                            if let (Some(key), Some(memo)) =
+                                (verify_memo_key, self.verify_prop_memo.as_deref_mut())
+                            {
+                                const VERIFY_PROP_MEMO_CAP: usize = 1 << 20;
+                                if memo.len() < VERIFY_PROP_MEMO_CAP {
+                                    memo.insert(key, true);
+                                }
                             }
                         }
                     }

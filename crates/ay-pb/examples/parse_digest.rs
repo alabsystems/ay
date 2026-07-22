@@ -87,7 +87,10 @@ fn main() {
                 continue;
             }
         };
-        let line = if path.ends_with(".wbo") {
+        let line = if std::path::Path::new(&path)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("wbo"))
+        {
             match ay_pb::parse_wbo(&text) {
                 Ok(instance) => digest_wbo(&instance),
                 Err(err) => format!("PARSE-ERROR({err})"),

@@ -25,13 +25,13 @@
 //! `ffi_guard_*` helpers (#6192) to prevent undefined behavior from panics
 //! unwinding across the `extern "C"` boundary.
 
-use std::ffi::{c_char, c_uint, CStr};
+use std::ffi::{c_char, c_uint};
 
 use ay_dpll::api::{Sort, Term};
 
 use super::{
-    ast_to_term, ffi_guard_ast, record_ast_sort, term_to_ast, Z3Context, Z3_ast, Z3_context,
-    Z3_sort, Z3_SORT_ERROR,
+    ast_to_term, ffi_count_within_limit, ffi_guard_ast, ffi_read_bounded_text, record_ast_sort,
+    term_to_ast, Z3Context, Z3_ast, Z3_context, Z3_sort, Z3_INVALID_ARG, Z3_SORT_ERROR,
 };
 
 /// Whether a term is AY's first-class String sort.
@@ -61,15 +61,11 @@ fn sort_error(ctx: &mut Z3Context, msg: &str) -> Z3_ast {
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_string(c: Z3_context, s: *const c_char) -> Z3_ast {
     let value = if s.is_null() {
-        String::new()
+        Ok(String::new())
     } else {
-        // SAFETY: The caller's `# Safety` contract requires `s` to be a valid,
-        // null-terminated C string for the duration of this call. It was
-        // null-checked above.
-        unsafe { CStr::from_ptr(s) }
-            .to_str()
-            .unwrap_or("")
-            .to_string()
+        // SAFETY: `s` is non-null and a valid NUL-terminated string per the
+        // caller contract; the helper bounds the scan and clone.
+        unsafe { ffi_read_bounded_text(s) }
     };
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
@@ -77,7 +73,15 @@ pub unsafe extern "C" fn Z3_mk_string(c: Z3_context, s: *const c_char) -> Z3_ast
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.string_const(&value);
+            let value = match &value {
+                Ok(value) => value,
+                Err(error) => {
+                    ctx.last_error = Z3_INVALID_ARG;
+                    ctx.error_msg = Some(format!("Z3_mk_string: {error}"));
+                    return 0;
+                }
+            };
+            let t = ctx.solver.string_const(value);
             let a = term_to_ast(t);
             record_ast_sort(ctx, a, Sort::String);
             a
@@ -160,6 +164,11 @@ pub unsafe extern "C" fn Z3_mk_seq_unit(c: Z3_context, a: Z3_ast) -> Z3_ast {
 /// `c` must be valid; `args` must point to `n` valid `Z3_ast` values.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_mk_seq_concat(c: Z3_context, n: c_uint, args: *const Z3_ast) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_seq_concat", n) } {
+        return 0;
+    }
     if n == 0 || args.is_null() {
         return 0;
     }

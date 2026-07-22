@@ -1287,12 +1287,10 @@ fn lrat_add_counts(line: &str) -> Option<(usize, usize)> {
         literal_count += 1;
     }
 
-    let mut hint_count = 0;
-    for token in tokens {
+    for (hint_count, token) in tokens.enumerate() {
         if token == "0" {
             return Some((literal_count, hint_count));
         }
-        hint_count += 1;
     }
     None
 }

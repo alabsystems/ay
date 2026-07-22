@@ -75,7 +75,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, ParseError> {
 #[derive(Debug)]
 pub enum CommandStreamItem {
     /// A command parsed and elaborated successfully.
-    Command(Command),
+    Command(Box<Command>),
     /// A parse or elaboration error for one command. The stream has already
     /// skipped past the offending command, so the next call resumes with the
     /// command that follows it.
@@ -167,7 +167,7 @@ impl<'a> CommandStream<'a> {
                     ));
                 }
                 match Command::from_sexp(&sexp) {
-                    Ok(cmd) => Some(CommandStreamItem::Command(cmd)),
+                    Ok(cmd) => Some(CommandStreamItem::Command(Box::new(cmd))),
                     Err(mut err) => {
                         // Attach the command's own position when the error
                         // carries none, so the report can point at the

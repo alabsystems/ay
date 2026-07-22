@@ -1252,17 +1252,25 @@ fn preregister_to_int_reductions_emits_from_int_axioms_and_roundtrip() {
     );
 }
 
+/// P3 went DEFAULT-ON (`AY_STR_P3=0` is the kill switch); this test previously
+/// asserted the pre-default-on contract and had gone stale. What still needs
+/// pinning is the TEST OVERRIDE: it must force the gate on regardless of the
+/// env default, and clearing it must return the gate to whatever the env says.
 #[test]
-fn str_p3_gate_defaults_on_and_test_override_works() {
+fn str_p3_gate_default_and_test_override_track_the_env() {
     use super::super::strings_preregister::{str_p3_enabled, STR_P3_TEST_OVERRIDE};
-    // P3 became DEFAULT-ON in 87796d22f9 (49 conversions, all z3-agreeing,
-    // 396-file regression sweep with 0 losses, canary-gated). Default is now
-    // on; `AY_STR_P3=0` is the kill switch.
-    if std::env::var("AY_STR_P3").is_err() {
-        assert!(str_p3_enabled(), "AY_STR_P3 must default ON");
-    }
-    // The test override still force-enables regardless of env.
+    let env_default = !matches!(std::env::var("AY_STR_P3").ok().as_deref(), Some("0"));
+    assert_eq!(
+        str_p3_enabled(),
+        env_default,
+        "P3 is DEFAULT-ON; only AY_STR_P3=0 turns it off"
+    );
     STR_P3_TEST_OVERRIDE.with(|c| c.set(true));
     assert!(str_p3_enabled(), "test override must enable the P3 gate");
     STR_P3_TEST_OVERRIDE.with(|c| c.set(false));
+    assert_eq!(
+        str_p3_enabled(),
+        env_default,
+        "clearing the override must return the gate to the env default"
+    );
 }

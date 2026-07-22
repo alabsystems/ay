@@ -96,6 +96,40 @@ fn test_wrapper_converts_child_abort_to_unknown() {
     );
 }
 
+/// Legacy/unknown crash-hook values may still abort for compatibility, but
+/// none may synthesize a definitive status line before the crash.
+#[test]
+#[timeout(60_000)]
+fn test_wrapper_crash_hook_cannot_forge_sat_before_abort() {
+    let ay_path = env!("CARGO_BIN_EXE_ay");
+    let (path, _cleanup) = write_temp_horn("no_forged_sat");
+
+    let output = Command::new(ay_path)
+        .arg("--chc")
+        .arg("--competition")
+        .arg("--timeout")
+        .arg("10000")
+        .arg(&path)
+        .env_remove("CARGO_TARGET_TMPDIR")
+        .env("AY_INTERNAL_TEST_ABORT_SOLVE_CHILD", "sat-then-abort")
+        .output()
+        .expect("spawn ay");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.lines().any(|line| line.trim() == "unknown"),
+        "crashed child must fail closed, got stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| matches!(line.trim(), "sat" | "unsat")),
+        "crash hook must never synthesize a definitive verdict: {stdout:?}"
+    );
+    assert_eq!(output.status.code(), Some(0));
+}
+
 /// A DELIBERATE error exit must keep its error status: the crash classifier
 /// only reinterprets abnormal aborts, never intentional nonzero exits. An
 /// invalid CLI flag makes the wrapped child exit 2 (clap usage error) — the

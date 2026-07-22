@@ -8,7 +8,7 @@ use ay_core::kani_compat::DetHashMap as HashMap;
 use crate::command::Term as ParsedTerm;
 use ay_core::{Constant, Sort, Symbol, TermData, TermId};
 
-use super::{Context, ElaborateError, Result, MAX_FUN_EXPANSION_DEPTH};
+use super::{Context, ElaborateError, Result, SymbolInfo, MAX_FUN_EXPANSION_DEPTH};
 
 mod arithmetic;
 mod bitvectors;
@@ -59,40 +59,107 @@ impl Context {
         }
     }
 
+    /// Check a declared function's complete domain and insert only the
+    /// SMT-LIB Int-to-Real coercion. Generic applications used to trust the
+    /// declaration's result sort without checking either arity or operand
+    /// sorts, allowing an ill-sorted term such as `f(true)` for `f : Int ->
+    /// Bool` to reach `check-sat` and receive a definitive verdict.
+    pub(super) fn validate_application_signature(
+        &mut self,
+        name: &str,
+        expected_sorts: &[Sort],
+        args: &mut [TermId],
+    ) -> Result<()> {
+        if expected_sorts.len() != args.len() {
+            return Err(ElaborateError::InvalidConstant(format!(
+                "{name} requires {} arguments, got {}",
+                expected_sorts.len(),
+                args.len()
+            )));
+        }
+        for (arg, expected) in args.iter_mut().zip(expected_sorts.iter()) {
+            let actual = self.terms.sort(*arg).clone();
+            if &actual == expected {
+                continue;
+            }
+            if actual == Sort::Int && expected == &Sort::Real {
+                *arg = self.coerce_int_to_real(*arg);
+                continue;
+            }
+            return Err(ElaborateError::SortMismatch {
+                expected: expected.to_string(),
+                actual: actual.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_declared_application(
+        &mut self,
+        name: &str,
+        info: &SymbolInfo,
+        args: &mut [TermId],
+    ) -> Result<()> {
+        self.validate_application_signature(name, &info.arg_sorts, args)
+    }
+
     pub(super) fn elaborate_app(
         &mut self,
         name: &str,
         args: &[ParsedTerm],
         env: &HashMap<String, TermId>,
     ) -> Result<TermId> {
-        let name = if let Some(ctor_name) = name
-            .strip_prefix("(_ is ")
-            .and_then(|s| s.strip_suffix(')'))
-        {
-            format!("is-{ctor_name}")
-        } else {
-            name.to_string()
-        };
-        let name = name.as_str();
-
-        if let Some((params, body)) = self.fun_defs.get(name).cloned() {
-            if params.len() == args.len() {
-                // Guard against unbounded recursion in define-fun-rec (#8622)
-                if self.fun_expansion_depth >= MAX_FUN_EXPANSION_DEPTH {
-                    return Err(ElaborateError::RecursionDepthExceeded(
-                        MAX_FUN_EXPANSION_DEPTH,
-                    ));
-                }
-                self.fun_expansion_depth += 1;
-                let mut new_env = env.clone();
-                for ((param_name, _), arg) in params.iter().zip(args) {
-                    let arg_id = self.elaborate_term(arg, env)?;
-                    new_env.insert(param_name.clone(), arg_id);
-                }
-                let result = self.elaborate_term(&body, &new_env);
-                self.fun_expansion_depth -= 1;
-                return result;
+        if let Some((params, result_sort, body)) = self.fun_defs.get(name).cloned() {
+            if params.len() != args.len() {
+                return Err(ElaborateError::InvalidConstant(format!(
+                    "{name} requires {} arguments, got {}",
+                    params.len(),
+                    args.len()
+                )));
             }
+            // Guard against unbounded recursion in define-fun-rec (#8622)
+            if self.fun_expansion_depth >= MAX_FUN_EXPANSION_DEPTH {
+                return Err(ElaborateError::RecursionDepthExceeded(
+                    MAX_FUN_EXPANSION_DEPTH,
+                ));
+            }
+            self.fun_expansion_depth += 1;
+            let mut arg_ids = Vec::with_capacity(args.len());
+            for arg in args {
+                match self.elaborate_term(arg, env) {
+                    Ok(arg) => arg_ids.push(arg),
+                    Err(error) => {
+                        self.fun_expansion_depth -= 1;
+                        return Err(error);
+                    }
+                }
+            }
+            let expected_sorts: Vec<Sort> = params.iter().map(|(_, sort)| sort.clone()).collect();
+            if let Err(error) =
+                self.validate_application_signature(name, &expected_sorts, &mut arg_ids)
+            {
+                self.fun_expansion_depth -= 1;
+                return Err(error);
+            }
+            let mut new_env = env.clone();
+            for ((param_name, _), arg_id) in params.iter().zip(arg_ids) {
+                new_env.insert(param_name.clone(), arg_id);
+            }
+            let result = self.elaborate_term(&body, &new_env).and_then(|body_term| {
+                let actual = self.terms.sort(body_term).clone();
+                if actual == result_sort {
+                    Ok(body_term)
+                } else if actual == Sort::Int && result_sort == Sort::Real {
+                    Ok(self.coerce_int_to_real(body_term))
+                } else {
+                    Err(ElaborateError::SortMismatch {
+                        expected: result_sort.to_string(),
+                        actual: actual.to_string(),
+                    })
+                }
+            });
+            self.fun_expansion_depth -= 1;
+            return result;
         }
 
         // Short-circuit `ite` when the condition elaborates to a constant
@@ -305,39 +372,52 @@ impl Context {
         }
 
         if let Some(info) = overload {
+            self.validate_declared_application(name, &info, &mut arg_ids)?;
+            if arg_ids.is_empty() {
+                if let Some(term) = info.term {
+                    return Ok(term);
+                }
+            }
             return Ok(self
                 .terms
                 .mk_app(Symbol::named(&app_name), arg_ids, info.sort));
         }
 
-        if let Some(info) = self.symbols.get(name) {
-            if !info.arg_sorts.is_empty() {
-                let sort = info.sort.clone();
-                // A USER-declared `to_real` (deliberately declarable — it is a
-                // valid `(_ map f)` target) builds an App byte-identical to the
-                // builtin's. Mark the store so the to_real-integrality rewrites
-                // in the comparison/equality constructors stand down — they
-                // would otherwise fabricate semantics for this free function
-                // (a wrong-verdict class). This runs while elaborating the
-                // ARGUMENT of any enclosing comparison, i.e. strictly before
-                // the constructor that would rewrite it (bottom-up
-                // elaboration), so ordering is safe. (#to-real-bridge)
-                if name == "to_real" {
-                    self.terms.mark_to_real_shadowed();
+        if let Some(info) = self.symbols.get(name).cloned() {
+            self.validate_declared_application(name, &info, &mut arg_ids)?;
+            if arg_ids.is_empty() {
+                if let Some(term) = info.term {
+                    return Ok(term);
                 }
-                // A USER-declared `is_int` (also declarable — see
-                // EXCLUDED_DECLARABLE_OP_NAMES "map-target") builds an App
-                // byte-identical to the builtin's. Mark the store so the
-                // `is_int` quantifier eliminator (ay-dpll::qe::isint) stands
-                // down — applying integrality (critical-residue) reasoning to
-                // this free predicate fabricates its semantics (a confirmed
-                // wrong-UNSAT class). Same discipline/ordering as to_real
-                // above. (#isint-shadow)
-                if name == "is_int" {
-                    self.terms.mark_is_int_shadowed();
-                }
-                return Ok(self.terms.mk_app(Symbol::named(&app_name), arg_ids, sort));
             }
+            let sort = info.sort;
+            let declared_app_name = info.internal_name.unwrap_or_else(|| app_name.clone());
+            // A USER-declared `to_real` (deliberately declarable — it is a
+            // valid `(_ map f)` target) builds an App byte-identical to the
+            // builtin's. Mark the store so the to_real-integrality rewrites
+            // in the comparison/equality constructors stand down — they
+            // would otherwise fabricate semantics for this free function
+            // (a wrong-verdict class). This runs while elaborating the
+            // ARGUMENT of any enclosing comparison, i.e. strictly before
+            // the constructor that would rewrite it (bottom-up
+            // elaboration), so ordering is safe. (#to-real-bridge)
+            if name == "to_real" {
+                self.terms.mark_to_real_shadowed();
+            }
+            // A USER-declared `is_int` (also declarable — see
+            // EXCLUDED_DECLARABLE_OP_NAMES "map-target") builds an App
+            // byte-identical to the builtin's. Mark the store so the
+            // `is_int` quantifier eliminator (ay-dpll::qe::isint) stands
+            // down — applying integrality (critical-residue) reasoning to
+            // this free predicate fabricates its semantics (a confirmed
+            // wrong-UNSAT class). Same discipline/ordering as to_real
+            // above. (#isint-shadow)
+            if name == "is_int" {
+                self.terms.mark_is_int_shadowed();
+            }
+            return Ok(self
+                .terms
+                .mk_app(Symbol::named(&declared_app_name), arg_ids, sort));
         }
 
         if let Some(term) = self.try_elaborate_core_app(name, &mut arg_ids)? {
@@ -368,172 +448,12 @@ impl Context {
             return Ok(term);
         }
 
-        if name.starts_with("(_ ") {
-            let parts: Vec<&str> = name
-                .trim_start_matches("(_ ")
-                .trim_end_matches(')')
-                .split_whitespace()
-                .collect();
-            if parts.is_empty() {
-                return Err(ElaborateError::InvalidConstant(name.to_string()));
-            }
-
-            // Handle map specially: (_ map f) where f is a symbol, not a numeral.
-            // Route to elaborate_indexed_app with the string indices so it gets
-            // the full symbol-based resolution path.
-            if parts[0] == "map" {
-                let str_indices: Vec<String> = parts[1..].iter().map(ToString::to_string).collect();
-                return self.elaborate_indexed_app("map", &str_indices, args, env);
-            }
-
-            let indices: Vec<u32> = parts[1..]
-                .iter()
-                .map(|index| {
-                    index.parse().map_err(|_| {
-                        ElaborateError::InvalidConstant(format!(
-                            "{} requires numeric indices, got `{index}`",
-                            parts[0]
-                        ))
-                    })
-                })
-                .collect::<Result<_>>()?;
-
-            match parts[0] {
-                "extract" => {
-                    if indices.len() != 2 || arg_ids.len() != 1 {
-                        return Err(ElaborateError::InvalidConstant(
-                            "extract requires 2 indices and 1 argument".to_string(),
-                        ));
-                    }
-                    self.checked_bv_extract(indices[0], indices[1], arg_ids[0])
-                }
-                "int2bv" => {
-                    if indices.len() != 1 || arg_ids.len() != 1 {
-                        return Err(ElaborateError::InvalidConstant(
-                            "int2bv requires 1 index and 1 argument".to_string(),
-                        ));
-                    }
-                    Self::checked_bitvector_sort(indices[0])?;
-                    self.expect_int_operand("int2bv", arg_ids[0])?;
-                    Ok(self.terms.mk_int2bv(indices[0], arg_ids[0]))
-                }
-                "zero_extend" => {
-                    if indices.len() != 1 || arg_ids.len() != 1 {
-                        return Err(ElaborateError::InvalidConstant(
-                            "zero_extend requires 1 index and 1 argument".to_string(),
-                        ));
-                    }
-                    self.check_bv_extension_width("zero_extend", indices[0], arg_ids[0])?;
-                    Ok(self.terms.mk_bvzero_extend(indices[0], arg_ids[0]))
-                }
-                "sign_extend" => {
-                    if indices.len() != 1 || arg_ids.len() != 1 {
-                        return Err(ElaborateError::InvalidConstant(
-                            "sign_extend requires 1 index and 1 argument".to_string(),
-                        ));
-                    }
-                    self.check_bv_extension_width("sign_extend", indices[0], arg_ids[0])?;
-                    Ok(self.terms.mk_bvsign_extend(indices[0], arg_ids[0]))
-                }
-                "rotate_left" => {
-                    if indices.len() != 1 || arg_ids.len() != 1 {
-                        return Err(ElaborateError::InvalidConstant(
-                            "rotate_left requires 1 index and 1 argument".to_string(),
-                        ));
-                    }
-                    self.expect_bv_operand_width("rotate_left", arg_ids[0])?;
-                    Ok(self.terms.mk_bvrotate_left(indices[0], arg_ids[0]))
-                }
-                "rotate_right" => {
-                    if indices.len() != 1 || arg_ids.len() != 1 {
-                        return Err(ElaborateError::InvalidConstant(
-                            "rotate_right requires 1 index and 1 argument".to_string(),
-                        ));
-                    }
-                    self.expect_bv_operand_width("rotate_right", arg_ids[0])?;
-                    Ok(self.terms.mk_bvrotate_right(indices[0], arg_ids[0]))
-                }
-                "repeat" => {
-                    if indices.len() != 1 || arg_ids.len() != 1 {
-                        return Err(ElaborateError::InvalidConstant(
-                            "repeat requires 1 index and 1 argument".to_string(),
-                        ));
-                    }
-                    self.check_bv_repeat_width(indices[0], arg_ids[0])?;
-                    Ok(self.terms.mk_bvrepeat(indices[0], arg_ids[0]))
-                }
-                "re.loop" => {
-                    if indices.len() != 2 || arg_ids.len() != 1 {
-                        return Err(ElaborateError::InvalidConstant(
-                            "re.loop requires 2 indices and 1 argument".to_string(),
-                        ));
-                    }
-                    Ok(self.terms.mk_app(
-                        Symbol::indexed("re.loop", indices),
-                        vec![arg_ids[0]],
-                        Sort::RegLan,
-                    ))
-                }
-                "re.^" => {
-                    if indices.len() != 1 || arg_ids.len() != 1 {
-                        return Err(ElaborateError::InvalidConstant(
-                            "re.^ requires 1 index and 1 argument".to_string(),
-                        ));
-                    }
-                    let n = indices[0];
-                    Ok(self.terms.mk_app(
-                        Symbol::indexed("re.loop", vec![n, n]),
-                        vec![arg_ids[0]],
-                        Sort::RegLan,
-                    ))
-                }
-                "to_fp" => {
-                    let fp_sort =
-                        self.validate_indexed_fp_application("to_fp", &indices, &arg_ids)?;
-                    Ok(self
-                        .terms
-                        .mk_app(Symbol::indexed("to_fp", indices), arg_ids, fp_sort))
-                }
-                "to_fp_unsigned" => {
-                    let fp_sort =
-                        self.validate_indexed_fp_application("to_fp_unsigned", &indices, &arg_ids)?;
-                    Ok(self.terms.mk_app(
-                        Symbol::indexed("to_fp_unsigned", indices),
-                        arg_ids,
-                        fp_sort,
-                    ))
-                }
-                "fp.to_ubv" | "fp.to_sbv" => {
-                    let bv_sort =
-                        self.validate_indexed_fp_application(parts[0], &indices, &arg_ids)?;
-                    Ok(self.terms.mk_app(
-                        Symbol::indexed(parts[0], indices.clone()),
-                        arg_ids,
-                        bv_sort,
-                    ))
-                }
-                _ => {
-                    let result_sort = if let Some(info) = self.symbols.get(name) {
-                        info.sort.clone()
-                    } else {
-                        return Err(ElaborateError::Unsupported(format!(
-                            "unknown indexed identifier: {}",
-                            parts[0]
-                        )));
-                    };
-                    Ok(self
-                        .terms
-                        .mk_app(Symbol::indexed(parts[0], indices), arg_ids, result_sort))
-                }
-            }
+        let result_sort = if let Some(info) = self.symbols.get(name) {
+            info.sort.clone()
         } else {
-            let result_sort = if let Some(info) = self.symbols.get(name) {
-                info.sort.clone()
-            } else {
-                return Err(ElaborateError::UndefinedSymbol(name.to_string()));
-            };
-            Ok(self.terms.mk_app(Symbol::named(name), arg_ids, result_sort))
-        }
+            return Err(ElaborateError::UndefinedSymbol(name.to_string()));
+        };
+        Ok(self.terms.mk_app(Symbol::named(name), arg_ids, result_sort))
     }
 
     /// True when `term` has a (non-recursive or recursive) datatype sort — i.e.

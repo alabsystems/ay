@@ -49,7 +49,7 @@ const MIN_GAIN: f64 = 1e-7;
 /// The result of propagating bounds.
 pub(crate) enum Presolved {
     /// A model with (possibly) tighter column bounds.
-    Tightened(Model),
+    Tightened(Box<Model>),
     /// The bounds are contradictory: the model has no feasible point at all.
     Infeasible,
 }
@@ -70,7 +70,7 @@ pub(crate) fn tighten_bounds(model: &Model, deadline: Option<std::time::Instant>
     // stay pristine, and the search runs without presolve. Exact-coeff models
     // are unaffected.
     if model.has_inexact_coeffs() {
-        return Presolved::Tightened(model.clone());
+        return Presolved::Tightened(Box::new(model.clone()));
     }
     // The arithmetic runs on the small-int-fast [`Rational`] (inline `i64/i64`,
     // exact big fallback): eight sweeps of allocating `BigRational` activity
@@ -332,7 +332,7 @@ pub(crate) fn tighten_bounds(model: &Model, deadline: Option<std::time::Instant>
         }
     }
 
-    Presolved::Tightened(out)
+    Presolved::Tightened(Box::new(out))
 }
 
 /// Float mirror of one `tighten_bounds` row visit, on the scout's f64

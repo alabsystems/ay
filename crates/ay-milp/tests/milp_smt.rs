@@ -38,7 +38,10 @@ fn binary_feasibility_finds_witness() {
 fn expired_deadline_fails_closed_before_binary_feasibility() {
     let mut m = Model::new();
     let _ = m.add_binary_col();
-    let opts = SolveOpts::new().with_deadline(Instant::now() - Duration::from_millis(1));
+    let expired_deadline = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("test clock must support a one-millisecond lookback");
+    let opts = SolveOpts::new().with_deadline(expired_deadline);
     let mut session = BabSession::new(m.clone(), &opts).unwrap();
     assert!(matches!(
         session.check().unwrap(),

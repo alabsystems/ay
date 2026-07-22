@@ -12,7 +12,7 @@
 //! cargo run --release -p ay-milp --example milp_ls -- 80 60
 //! ```
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ay_milp::{Col, Model, Row, Sense};
 
@@ -216,7 +216,7 @@ fn tabu(inst: &Inst, start: &[bool], iters: u64, tenure: usize, rng: &mut Rng) -
         let Some((_, j, on)) = pick else {
             // Every move is tabu. Forget the list rather than give up -- a stalled tabu search
             // that breaks here does ~40 flips and reports a hill-climb's answer.
-            until.iter_mut().for_each(|u| *u = 0);
+            until.fill(0);
             continue;
         };
         p.set(j, on);
@@ -234,6 +234,13 @@ fn main() {
     let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(80);
     let m: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(60);
     let secs: f64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(10.0);
+    let time_limit = if secs.is_nan() || secs <= 0.0 {
+        Duration::ZERO
+    } else if secs >= Duration::MAX.as_secs_f64() {
+        Duration::MAX
+    } else {
+        Duration::from_secs_f64(secs)
+    };
 
     let (model, cols, rows) = build(n, m, 2_026);
     let inst = Inst::new(&model, &cols, &rows);
@@ -253,7 +260,7 @@ fn main() {
     let mut best_val = p.val;
     let t0 = Instant::now();
     let mut iters = 0u64;
-    while t0.elapsed().as_secs_f64() < secs {
+    while t0.elapsed() < time_limit {
         iters += 1;
         let mut q = Pt::empty(&inst);
         for j in 0..inst.n {
@@ -293,7 +300,7 @@ fn main() {
     // Tabu, restarted from the best point each time it stalls.
     let t1 = Instant::now();
     let mut rounds = 0u64;
-    while t1.elapsed().as_secs_f64() < secs {
+    while t1.elapsed() < time_limit {
         rounds += 1;
         let tenure = 5 + rng.below(inst.n / 4);
         let (x, v) = tabu(&inst, &best, 20_000, tenure, &mut rng);

@@ -19,7 +19,7 @@
 //! such case is flagged with a `DIVERGENCE:` note in its doc comment. Nothing
 //! here manufactures a term, sort, or verdict AY did not actually compute.
 
-use std::ffi::{c_uint, CStr};
+use std::ffi::c_uint;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::ptr;
@@ -32,9 +32,11 @@ use ay_frontend::parse;
 use super::model_params::eval_term_under_model;
 use super::{
     apply_supported_params, ast_to_term, cache_ast_vector, cache_string,
-    ensure_cross_context_translation_semantics, ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_ptr,
-    ffi_guard_uint, ffi_guard_void, record_ast_sort, sort_handle_to_ast, term_to_ast, ModelHandle,
-    ParamDescr, ParamDescrsHandle, Z3Context, Z3_apply_result, Z3_ast, Z3_ast_vector,
+    ensure_cross_context_translation_semantics, ffi_count_within_limit, ffi_guard_ast,
+    ffi_guard_const_ptr, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
+    ffi_read_bounded_parser_file, ffi_read_bounded_parser_text, ffi_read_bounded_text,
+    record_ast_sort, sort_handle_to_ast, term_to_ast, transfer_cross_context_ffi_metadata,
+    ModelHandle, ParamDescr, ParamDescrsHandle, Z3Context, Z3_apply_result, Z3_ast, Z3_ast_vector,
     Z3_constructor, Z3_context, Z3_func_decl, Z3_model, Z3_param_descrs, Z3_params, Z3_pattern,
     Z3_sort, Z3_string, Z3_symbol, HANDLE_TAG_MASK, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_OK,
     Z3_PK_BOOL,
@@ -56,11 +58,9 @@ unsafe fn cstr_opt(s: Z3_string) -> Option<String> {
     if s.is_null() {
         return None;
     }
-    // SAFETY: `s` is non-null (checked above) and valid per this fn's contract.
-    unsafe { CStr::from_ptr(s) }
-        .to_str()
-        .ok()
-        .map(str::to_string)
+    // SAFETY: `s` is non-null (checked above) and valid per this fn's contract;
+    // the shared helper bounds the scan and clone.
+    unsafe { ffi_read_bounded_text(s) }.ok()
 }
 
 // ============================================================================
@@ -281,8 +281,17 @@ pub unsafe extern "C" fn Z3_translate(source: Z3_context, a: Z3_ast, target: Z3_
                     Some("Z3_translate: term translation produced no result".to_string());
                 return 0;
             };
+            if !transfer_cross_context_ffi_metadata(
+                src,
+                tgt,
+                &[src_term],
+                &[new_term],
+                "Z3_translate",
+            ) {
+                return 0;
+            }
             let ast = term_to_ast(new_term);
-            let sort = tgt.solver.term_sort(new_term);
+            let sort = src.solver.term_sort(src_term);
             record_ast_sort(tgt, ast, sort);
             tgt.last_error = Z3_OK;
             ast
@@ -335,6 +344,11 @@ pub unsafe extern "C" fn Z3_add_rec_def(
     args: *const Z3_ast,
     body: Z3_ast,
 ) {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the helper only mutates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_add_rec_def", n) } {
+        return;
+    }
     // Pre-extract the decl and argument terms outside the guard (raw derefs).
     // SAFETY: `f`, when non-null, is a live `FuncDeclHandle`; `as_ref` null-checks.
     let decl_handle = unsafe { f.as_ref() };
@@ -880,7 +894,8 @@ pub unsafe extern "C" fn Z3_apply_result_to_string(c: Z3_context, r: Z3_apply_re
                 parts.push(s);
             }
             ctx.last_error = Z3_OK;
-            cache_string(ctx, parts.join("\n"))
+            let rendered = super::ffi_surface_text(ctx, &parts.join("\n"));
+            cache_string(ctx, rendered)
         })
     }
 }
@@ -961,6 +976,7 @@ pub unsafe extern "C" fn Z3_pattern_to_string(c: Z3_context, p: Z3_pattern) -> Z
             }
             s.push(')');
             ctx.last_error = Z3_OK;
+            let s = super::ffi_surface_text(ctx, &s);
             cache_string(ctx, s)
         })
     }
@@ -1070,6 +1086,17 @@ pub unsafe extern "C" fn Z3_benchmark_to_smtlib_string(
     assumptions: *const Z3_ast,
     formula: Z3_ast,
 ) -> Z3_string {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the helper only mutates its error state.
+    if !unsafe {
+        ffi_count_within_limit(
+            c,
+            "Z3_benchmark_to_smtlib_string assumptions",
+            num_assumptions,
+        )
+    } {
+        return ptr::null();
+    }
     // Decode the header strings and collect the assertion terms outside the guard.
     // SAFETY: each string, when non-null, is a valid C string per the contract.
     let name = unsafe { cstr_opt(name) }.unwrap_or_default();
@@ -1120,6 +1147,7 @@ pub unsafe extern "C" fn Z3_benchmark_to_smtlib_string(
             out.push_str("(check-sat)\n");
 
             ctx.last_error = Z3_OK;
+            let out = super::ffi_surface_text(ctx, &out);
             cache_string(ctx, out)
         })
     }
@@ -1167,7 +1195,7 @@ pub unsafe extern "C" fn Z3_parse_smtlib2_file(
                 ctx.error_msg = Some("Z3_parse_smtlib2_file: null/invalid file name".to_string());
                 return cache_ast_vector(ctx, Vec::new());
             };
-            let content = match std::fs::read_to_string(&path) {
+            let content = match ffi_read_bounded_parser_file(&path) {
                 Ok(text) => text,
                 Err(e) => {
                     ctx.last_error = Z3_EXCEPTION;
@@ -1206,7 +1234,13 @@ pub unsafe extern "C" fn Z3_parse_smtlib2_file(
 pub unsafe extern "C" fn Z3_eval_smtlib2_string(c: Z3_context, str: Z3_string) -> Z3_string {
     // Decode the input outside the guard (raw deref).
     // SAFETY: `str`, when non-null, is a valid C string per the contract.
-    let input = unsafe { cstr_opt(str) };
+    let input = if str.is_null() {
+        None
+    } else {
+        // SAFETY: `str` is a valid NUL-terminated parser source per the caller
+        // contract; the parser helper enforces the larger explicit source cap.
+        unsafe { ffi_read_bounded_parser_text(str) }.ok()
+    };
     // SAFETY: `ffi_guard_const_ptr` handles a null context and catches panics.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {

@@ -360,7 +360,7 @@ fn test_substitute_var_empty_subst() {
     row.substitute_var(1, &[], &Rational::one());
     assert_eq!(row.coeffs.len(), 1, "one variable removed");
     assert_eq!(row.coeffs[0].0, 2);
-    assert!(row.coeffs[0].1 == Rational::new(5, 1));
+    assert_eq!(row.coeffs[0].1, Rational::new(5, 1));
     assert!(row.constant == Rational::new(10, 1), "constant unchanged");
 }
 
@@ -381,7 +381,7 @@ fn test_substitute_var_entering_absent() {
     assert_eq!(row.coeffs.len(), 3, "new variable added");
     assert_eq!(row.coeffs[0].0, 1);
     assert_eq!(row.coeffs[1].0, 2);
-    assert!(row.coeffs[1].1 == Rational::new(6, 1));
+    assert_eq!(row.coeffs[1].1, Rational::new(6, 1));
     assert_eq!(row.coeffs[2].0, 3);
 }
 

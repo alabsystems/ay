@@ -85,30 +85,6 @@ pub(super) fn merge_lia_values(euf_model: &mut EufModel, lia_model: Option<&LiaM
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ay_core::TermId;
-    use num_bigint::BigInt;
-
-    #[test]
-    fn merge_lia_values_overwrites_both_euf_integer_views() {
-        let term = TermId(0);
-        let mut euf = EufModel::default();
-        euf.int_values.insert(term, BigInt::from(0));
-        euf.term_values.insert(term, "0".to_string());
-        let mut lia = LiaModel {
-            values: Default::default(),
-        };
-        lia.values.insert(term, BigInt::from(7));
-
-        merge_lia_values(&mut euf, Some(&lia));
-
-        assert_eq!(euf.int_values.get(&term), Some(&BigInt::from(7)));
-        assert_eq!(euf.term_values.get(&term).map(String::as_str), Some("7"));
-    }
-}
-
 /// Merge LRA values into an EUF model for Real-sorted terms.
 ///
 /// LRA is authoritative for Real-sorted terms, same rationale as `merge_lia_values`.
@@ -196,4 +172,28 @@ pub(super) fn extract_array_model(
     euf_model: &EufModel,
 ) -> ArrayModel {
     arrays.extract_model(&euf_model.term_values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ay_core::TermId;
+    use num_bigint::BigInt;
+
+    #[test]
+    fn merge_lia_values_overwrites_both_euf_integer_views() {
+        let term = TermId(0);
+        let mut euf = EufModel::default();
+        euf.int_values.insert(term, BigInt::from(0));
+        euf.term_values.insert(term, "0".to_string());
+        let mut lia = LiaModel {
+            values: Default::default(),
+        };
+        lia.values.insert(term, BigInt::from(7));
+
+        merge_lia_values(&mut euf, Some(&lia));
+
+        assert_eq!(euf.int_values.get(&term), Some(&BigInt::from(7)));
+        assert_eq!(euf.term_values.get(&term).map(String::as_str), Some("7"));
+    }
 }

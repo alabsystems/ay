@@ -645,7 +645,7 @@ mod tests {
     }
 
     fn tester(terms: &mut TermStore, ctor: &str, arg: TermId) -> TermId {
-        terms.mk_app(Symbol::named(&format!("is-{ctor}")), [arg], Sort::Bool)
+        terms.mk_app(Symbol::named(format!("is-{ctor}")), [arg], Sort::Bool)
     }
 
     /// LOAD-BEARING M0b constraint: a reconstruction operand `list_cons_1(self)`

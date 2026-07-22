@@ -388,6 +388,43 @@ pub enum TheoryLemmaKind {
         index_eq: bool,
     },
 
+    /// Array store-permutation axiom (store-commutativity, n-ary).
+    ///
+    /// Two `store` chains over the SAME base array that write the SAME
+    /// multiset of `(index, value)` pairs denote the same array, provided the
+    /// indices are pairwise distinct. The clause therefore carries the
+    /// disjointness side condition explicitly, one literal per unordered pair:
+    ///
+    /// ```text
+    /// (cl (= i_1 i_2) … (= i_{n-1} i_n)
+    ///     (= (store … (store b i_1 v_1) … i_n v_n)
+    ///        (store … (store b i_{σ1} v_{σ1}) … i_{σn} v_{σn})))
+    /// ```
+    ///
+    /// Uses Alethe rule `store_permutation`. Validated by `ay-proof`
+    /// `validate_array_store_permutation` (exact schema; fail-closed).
+    ArrayStorePermutation,
+
+    /// Array read-over-write evaluated through a `store` CHAIN, optionally
+    /// under an array equality premise (the n-ary generalization of
+    /// `ArraySelectStore`).
+    ///
+    /// Chain evaluation, no premise:
+    /// ```text
+    /// (cl (= x i_1) … (= x i_k) (= (select C x) eval(C, x)))
+    /// ```
+    /// Under an array equality:
+    /// ```text
+    /// (cl (not (= L R)) (= x i_1) … (= x i_k) (= eval(L, x) eval(R, x)))
+    /// ```
+    /// where `eval(C, x)` walks `C`'s store chain outermost-first, taking the
+    /// value of the first entry whose index is syntactically `x`, and skipping
+    /// an entry only when the clause carries the matching `(= x i)` literal.
+    ///
+    /// Uses Alethe rule `read_over_write_chain`. Validated by `ay-proof`
+    /// `validate_array_row_chain` (exact schema; fail-closed).
+    ArrayRowChain,
+
     /// Array extensionality axiom.
     ///
     /// `(=> (forall ((i Index)) (= (select a i) (select b i))) (= a b))`
@@ -420,6 +457,38 @@ pub enum TheoryLemmaKind {
     ///
     /// Uses Alethe rule `string_code_inj`.
     StringNormalForm,
+
+    /// Ground string/regex evaluation: the clause carries a literal every one
+    /// of whose leaves is a constant (or a regular expression built only from
+    /// constants) and which evaluates to TRUE under the SMT-LIB Unicode-string
+    /// semantics — e.g. `(not (str.in_re "/mod/forum/" (re.++ .. )))`. A clause
+    /// with a literal true under every interpretation is a tautology.
+    ///
+    /// Uses Alethe rule `string_ground_eval`; validated by `ay-proof` with an
+    /// INDEPENDENT ground evaluator (a memoized interval regex matcher, not the
+    /// solver's `WeRegex`/`RegexSolver` code), fail-closed on any non-ground
+    /// leaf, unimplemented operator, or budget exhaustion.
+    StringGroundEval,
+
+    /// Regex intersection-emptiness over a SYMBOLIC string term: the clause
+    /// carries a group of literals `±(str.in_re t Rᵢ)` over one common term `t`
+    /// whose regexes are all ground, and the intersection of the languages the
+    /// group DENIES is empty — e.g.
+    /// `(cl (not (str.in_re X R₁)) (not (str.in_re X R₂)))` where
+    /// `L(R₁) ∩ L(R₂) = ∅`. No `t` falsifies the whole group, so some literal
+    /// is true under every interpretation and the clause is a tautology.
+    /// A negated membership contributes the exact complement `¬L(R)`.
+    ///
+    /// This is the SYMBOLIC counterpart of [`Self::StringGroundEval`], which
+    /// only decides facts whose subject is a constant.
+    ///
+    /// Uses Alethe rule `regex_intersect_empty`; validated by `ay-proof` with
+    /// an INDEPENDENT derivative-product emptiness checker (a hash-consed
+    /// arena over code-point interval sets with a verified total partition of
+    /// the SMT-LIB alphabet — not the solver's `WeRegex` search), fail-closed
+    /// on any non-ground leaf, unimplemented operator, incomplete alphabet
+    /// partition, reachable accepting state, or budget exhaustion.
+    RegexIntersectEmpty,
 
     /// Datatype constructor distinctness: `(cl (not (= t C1)) (not (= t C2)))`
     /// where `C1` and `C2` are applications of DISTINCT constructors of the same
@@ -484,11 +553,15 @@ impl TheoryLemmaKind {
             Self::BvBitBlast | Self::BvBitBlastGate { .. } => "bv_bitblast",
             Self::ArraySelectStore { index_eq: true } => "read_over_write_pos",
             Self::ArraySelectStore { index_eq: false } => "read_over_write_neg",
+            Self::ArrayStorePermutation => "store_permutation",
+            Self::ArrayRowChain => "read_over_write_chain",
             Self::ArrayExtensionality => "extensionality",
             Self::FpToBv { .. } => "fp_to_bv",
             Self::StringLengthAxiom => "string_length",
             Self::StringContentAxiom => "string_decompose",
             Self::StringNormalForm => "string_code_inj",
+            Self::StringGroundEval => "string_ground_eval",
+            Self::RegexIntersectEmpty => "regex_intersect_empty",
             Self::DatatypeDistinct => "dt_distinct",
             Self::DatatypeSelectorProject => "dt_project",
             Self::BoolTautology => "bool_tautology",

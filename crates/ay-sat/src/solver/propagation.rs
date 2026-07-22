@@ -732,6 +732,7 @@ impl Solver {
     /// the unchecked trail push (`assign_bcp_unchecked`, #shave7). Safe code
     /// (Vec::reserve); one predictable branch per propagate call, a no-op
     /// after the first call unless `num_vars` grew.
+    #[cfg(feature = "raw-pointer-bcp")]
     #[inline]
     pub(super) fn reserve_trail_for_bcp(&mut self) {
         if self.trail.capacity() < self.num_vars {

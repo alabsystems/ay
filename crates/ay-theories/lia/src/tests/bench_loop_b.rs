@@ -115,7 +115,12 @@ fn synth_dragon_shape(terms: &mut TermStore) -> Vec<(TermId, bool)> {
             // stay strictly below the defined variable.
             let wide_cap = 3 + (e % 38);
             let narrow_cap = 3 + (e % 4);
-            let width = (if e % 8 == 0 { wide_cap } else { narrow_cap }).min(d);
+            let width = (if e.is_multiple_of(8) {
+                wide_cap
+            } else {
+                narrow_cap
+            })
+            .min(d);
             let rhs_width = width - 1;
 
             // Pick `rhs_width` distinct indices strictly below `d` via a

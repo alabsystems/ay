@@ -15,32 +15,34 @@ use num_bigint::BigInt;
 ///
 /// Returns empty string if i < 0 or i >= |s| (SMT-LIB semantics).
 pub fn eval_str_at(s: &str, i: &BigInt) -> Option<String> {
-    let idx: i64 = i.try_into().ok()?;
-    if idx < 0 {
+    // An index outside `usize` is either negative or `>= |s|`: both give "".
+    let Ok(idx) = usize::try_from(i) else {
         return Some(String::new());
-    }
-    let idx = idx as usize;
+    };
     Some(s.chars().nth(idx).map_or(String::new(), |c| c.to_string()))
 }
 
 /// Evaluate `str.substr(s, i, n)`: substring of s starting at i with length n.
 ///
 /// SMT-LIB semantics: if i < 0 or i >= |s| or n <= 0, returns "".
-/// Otherwise returns s[i..min(i+n, |s|)].
+/// Otherwise returns s[i..min(i+n, |s|)] — note `n` only ever CLAMPS, so an
+/// `n` too large for a machine integer selects the whole suffix rather than
+/// making the operation unevaluable (#string-substr-length-overflow).
 pub fn eval_str_substr(s: &str, i: &BigInt, n: &BigInt) -> Option<String> {
-    let start: i64 = i.try_into().ok()?;
-    let len: i64 = n.try_into().ok()?;
-    if start < 0 || len <= 0 {
+    if *n <= BigInt::from(0) {
         return Some(String::new());
     }
-    let start = start as usize;
-    let len = len as usize;
+    // A start outside `usize` is either negative or `>= |s|`: both give "".
+    let Ok(start) = usize::try_from(i) else {
+        return Some(String::new());
+    };
     let chars: Vec<char> = s.chars().collect();
     if start >= chars.len() {
         return Some(String::new());
     }
-    let end = std::cmp::min(start + len, chars.len());
-    Some(chars[start..end].iter().collect())
+    let avail = chars.len() - start;
+    let take = usize::try_from(n).map_or(avail, |v| std::cmp::min(v, avail));
+    Some(chars[start..start + take].iter().collect())
 }
 
 /// Evaluate `str.replace(s, t, u)`: replace first occurrence of t in s with u.
@@ -71,16 +73,17 @@ pub fn eval_str_replace(s: &str, t: &str, u: &str) -> String {
 /// SMT-LIB semantics: returns -1 if t is not found or i < 0 or i > |s|.
 /// If t is empty and 0 <= i <= |s|, returns i.
 pub fn eval_str_indexof(s: &str, t: &str, start: &BigInt) -> Option<BigInt> {
-    let i: i64 = start.try_into().ok()?;
     let chars: Vec<char> = s.chars().collect();
-    let s_len = chars.len() as i64;
-    if i < 0 || i > s_len {
+    // A start outside `usize` is either negative or `> |s|`: both give -1.
+    let Ok(i) = usize::try_from(start) else {
+        return Some(BigInt::from(-1));
+    };
+    if i > chars.len() {
         return Some(BigInt::from(-1));
     }
     if t.is_empty() {
         return Some(BigInt::from(i));
     }
-    let i = i as usize;
     // Search from position i in char-level representation.
     let suffix: String = chars[i..].iter().collect();
     let t_chars: Vec<char> = t.chars().collect();

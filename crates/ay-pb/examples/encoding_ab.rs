@@ -96,7 +96,7 @@ fn rows(args: &[String]) {
             let total: i128 = obj.terms.iter().map(|t| t.coeff.max(0)).sum();
             let mid = total / 2;
             let (c, r) = normalize_row(&coeffs, -mid);
-            println!("OBJROW file={path} {}", describe_row(&c, r),);
+            println!("OBJROW file={path} {}", describe_row(&c, r));
         }
     }
 

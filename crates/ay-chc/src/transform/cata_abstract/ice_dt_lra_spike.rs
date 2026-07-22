@@ -23,6 +23,7 @@
 use std::time::Duration;
 
 use ay_core::time::Instant;
+use ay_test_support::env::{lock_env, ScopedEnvVar};
 
 use crate::{
     ChcExpr, ChcParser, ChcProblem, ChcSort, ChcVar, ClauseBody, ClauseHead, HornClause,
@@ -297,7 +298,7 @@ fn bounded_ts_atoms(pid: PredicateId, arg_sorts: &[ChcSort], real_k: usize) -> V
 }
 
 #[test]
-#[ignore]
+#[ignore = "manual scale experiment; requires an external benchmark in AY_LRA_TS"]
 fn lra_ice_dt_s3_srvr_4_scale() {
     let path = match std::env::var("AY_LRA_TS") {
         Ok(p) => p,
@@ -523,7 +524,7 @@ fn harvest_body_atoms(problem: &ChcProblem) -> Vec<Vec<ChcExpr>> {
 }
 
 #[test]
-#[ignore]
+#[ignore = "manual body-atom experiment; requires AY_LRA_TS and serial execution"]
 fn lra_ice_dt_s3_srvr_4_bodyatoms() {
     let path = match std::env::var("AY_LRA_TS") {
         Ok(p) => p,
@@ -543,8 +544,11 @@ fn lra_ice_dt_s3_srvr_4_bodyatoms() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(64);
     // The raw-LRA guard harvest legitimately exceeds the cata default (40); let
-    // the core admit up to the u64 ceiling for this diagnostic run.
-    std::env::set_var("AY_ICE_DT_MAX_ATOMS", atom_cap.min(64).to_string());
+    // the core admit up to the u64 ceiling for this diagnostic run. Serialized
+    // + restore-on-exit via the workspace env choke point; the guard holds for
+    // the rest of this diagnostic body.
+    let _env_lock = lock_env();
+    let _max_atoms = ScopedEnvVar::set("AY_ICE_DT_MAX_ATOMS", &atom_cap.min(64).to_string());
     let smt = std::fs::read_to_string(&path).expect("read TS benchmark");
     let problem = ChcParser::parse(&smt).expect("benchmark CHC should parse");
 

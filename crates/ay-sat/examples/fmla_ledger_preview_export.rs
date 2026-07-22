@@ -198,7 +198,10 @@ fn read_dimacs_input(root: &Path, relative_path: &str) -> Result<(Vec<u8>, Strin
     let path = root.join(relative_path);
     let compressed_bytes =
         fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
-    if relative_path.ends_with(".xz") {
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xz"))
+    {
         let output = Command::new("xz")
             .arg("-dc")
             .arg("--")

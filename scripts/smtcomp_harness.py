@@ -179,8 +179,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _oom_guard import (  # noqa: E402
+    guarded_popen,
     plan_solver_resources,
-    rss_watchdog,
     warn_concurrent_build,
 )
 
@@ -985,7 +985,7 @@ def valid_resource_envelope(value: object) -> bool:
             int(value["version"]) == RESOURCE_ENVELOPE_VERSION
             and int(value["requested_jobs"]) > 0
             and int(value["admitted_jobs"]) > 0
-            and int(value["memlimit_mb"]) >= 0
+            and int(value["memlimit_mb"]) > 0
             and int(value["nbcore"]) > 0
             and int(value["headroom_mb"]) >= 0
             and watchdog["implementation"]
@@ -997,7 +997,7 @@ def valid_resource_envelope(value: object) -> bool:
             and watchdog["measurement_failure"]
                 == "fail-closed-after-5-samples"
             and watchdog["kill_signal"] == "SIGKILL"
-            and bool(watchdog["enabled"]) == (int(value["memlimit_mb"]) > 0)
+            and bool(watchdog["enabled"])
         )
     except (KeyError, TypeError, ValueError):
         return False
@@ -1204,12 +1204,12 @@ def run_process(inv: Invocation, timeout_s: int, stdout_sink_path: Path | None =
     Reaps via os.wait4 for child rusage (see module docstring for the
     process-tree limitation).
 
-    `memlimit_mb` (0 = none) attaches the scripts/_oom_guard.py rss_watchdog
-    backstop. A timeout alone does not bound the RSS of concurrent children, and
-    this harness can invoke competitors without a native memory limit. Apply the
-    external envelope uniformly; local wrapper or kernel limits cannot be
-    assumed and may not cover `ay`, Java solvers, or binaries selected from
-    `.competitors/`.
+    A positive `memlimit_mb` is mandatory and attaches the shared zero-grace
+    process-group RSS watchdog. The envelope applies uniformly to AY, Java
+    solvers, and binaries selected from `.competitors/`; a timeout or a solver's
+    native limit cannot substitute for the external bound. Output is drained
+    concurrently into bounded buffers so neither child RSS nor parent capture
+    can escape the envelope.
     """
     if resource_envelope is not None:
         if not valid_resource_envelope(resource_envelope):
@@ -1218,6 +1218,8 @@ def run_process(inv: Invocation, timeout_s: int, stdout_sink_path: Path | None =
         if memlimit_mb not in (0, envelope_memlimit):
             raise ValueError("memlimit_mb disagrees with resource_envelope")
         memlimit_mb = envelope_memlimit
+    if memlimit_mb <= 0:
+        raise ValueError("run_process requires a positive memory envelope")
     child_env = os.environ.copy()
     if resource_envelope is not None:
         child_env["NBCORE"] = str(resource_envelope["nbcore"])
@@ -1238,24 +1240,18 @@ def run_process(inv: Invocation, timeout_s: int, stdout_sink_path: Path | None =
             sink = open(stdout_sink_path, "wb")
         t0 = time.monotonic()
         try:
-            proc = subprocess.Popen(
-                inv.argv,
+            proc, guard = guarded_popen(
+                inv.argv, memlimit_mb,
+                label=f"smtcomp_harness.py[{inv.argv[0]}]", grace_mb=0,
+                poll_s=WATCHDOG_POLL_S, non_reaping_watch=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 stdin=stdin_fh if stdin_fh else subprocess.DEVNULL,
-                start_new_session=True,
                 cwd=str(REPO),
                 env=child_env,
             )
         except OSError as exc:
             return ExecResult(b"", "", 0.0, None, None, False, spawn_error=str(exc))
-        guard = rss_watchdog(
-            _NonReapingProcessView(proc.pid),
-            memlimit_mb,
-            label=f"smtcomp_harness.py[{inv.argv[0]}]",
-            poll_s=WATCHDOG_POLL_S,
-            grace_mb=0,
-        )
         t_out = threading.Thread(target=_drain_head,
                                  args=(proc.stdout, out_buf, STDOUT_CAP, sink, out_total),
                                  daemon=True)
@@ -1832,7 +1828,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         print(f"[dry-run] temp file ({prep_label}): {tmp}")
         for sol in solvers:
             inv = build_invocation(sol, track, inst.logic, tmp,
-                                   resource_envelope, timeout_s=timeout_s)
+                                   resource_envelope, timeout_s=args.timeout)
             assert inv is not None
             feed = f"  (stdin <- {inv.stdin_path})" if inv.stdin_path else ""
             print(f"[dry-run] {sol.name}: argv = {inv.argv}{feed}")

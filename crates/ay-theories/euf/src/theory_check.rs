@@ -27,10 +27,8 @@ impl EufSolver<'_> {
         for i in self.term_cache_watermark..n {
             let t = TermId(i as u32);
             match self.terms.get(t) {
-                TermData::Const(c) => {
-                    if !matches!(c, Constant::Bool(_)) {
-                        self.const_terms_cache.push(t);
-                    }
+                TermData::Const(c) if !matches!(c, Constant::Bool(_)) => {
+                    self.const_terms_cache.push(t);
                 }
                 TermData::App(sym, _) => {
                     if sym.name() == "distinct" {

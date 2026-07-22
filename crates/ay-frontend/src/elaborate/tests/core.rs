@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+use crate::Command;
 
 #[test]
 fn test_elaborate_assert_soft_records_soft_constraint() {
@@ -87,6 +88,538 @@ fn test_elaborate_simple() {
     }
 
     assert_eq!(ctx.assertions.len(), 1);
+}
+
+#[test]
+fn declared_function_applications_enforce_arity_and_domain_sorts() {
+    for input in [
+        "(declare-fun f (Int) Bool) (assert (f true))",
+        "(declare-fun f (Int) Bool) (assert (f 1 2))",
+        "(declare-fun f ((Array Int Int)) Bool) (assert (f 1))",
+        "(declare-const c Bool) (assert (c true))",
+    ] {
+        let commands = parse(input).expect("ill-sorted application still parses");
+        let mut ctx = Context::new();
+        let error = commands
+            .iter()
+            .try_for_each(|command| ctx.process_command(command).map(|_| ()))
+            .expect_err("declared signature mismatch must fail elaboration");
+        assert!(
+            matches!(
+                error,
+                ElaborateError::SortMismatch { .. } | ElaborateError::InvalidConstant(_)
+            ),
+            "expected a typed application error for `{input}`, got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn bare_symbols_reject_non_nullary_and_ambiguous_nullary_declarations() {
+    for input in [
+        "(declare-fun f (Int) Bool) (assert f)",
+        "(declare-const c Int) (declare-const c Bool) (assert c)",
+    ] {
+        let commands = parse(input).expect("symbol script parses");
+        let mut ctx = Context::new();
+        let error = commands
+            .iter()
+            .try_for_each(|command| ctx.process_command(command).map(|_| ()))
+            .expect_err("bare symbol must not select an inapplicable/ambiguous declaration");
+        assert!(
+            matches!(
+                error,
+                ElaborateError::InvalidConstant(_) | ElaborateError::Unsupported(_)
+            ),
+            "unexpected bare-symbol error for `{input}`: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn defined_function_applications_enforce_arity_and_parameter_sorts() {
+    for input in [
+        "(define-fun f ((x Int)) Bool true) (assert (f true))",
+        "(define-fun f ((x Int)) Bool true) (assert (f))",
+        "(define-fun-rec f ((x Int)) Bool true) (assert (f true))",
+        "(define-funs-rec ((f ((x Int)) Bool)) (true)) (assert (f true))",
+    ] {
+        let commands = parse(input).expect("ill-sorted macro application still parses");
+        let mut ctx = Context::new();
+        let error = commands
+            .iter()
+            .try_for_each(|command| ctx.process_command(command).map(|_| ()))
+            .expect_err("macro parameter mismatch must fail before body expansion");
+        assert!(
+            matches!(
+                error,
+                ElaborateError::SortMismatch { .. } | ElaborateError::InvalidConstant(_)
+            ),
+            "expected typed macro application error for `{input}`, got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn defined_function_application_coerces_int_to_real_parameter() {
+    let commands = parse("(define-fun f ((x Real)) Bool (= x 1.0)) (assert (f 1))")
+        .expect("well-sorted macro application parses");
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command)
+            .expect("Int argument must coerce to the Real parameter");
+    }
+    assert_eq!(ctx.terms.sort(ctx.assertions[0]), &Sort::Bool);
+}
+
+#[test]
+fn defined_function_bodies_enforce_declared_result_sort() {
+    for input in [
+        "(define-fun f ((x Int)) Bool x)",
+        "(define-fun f () Bool 0)",
+        "(define-fun-rec f ((x Int)) Bool x)",
+        "(define-funs-rec ((f ((x Int)) Bool)) (x))",
+    ] {
+        let commands = parse(input).expect("ill-sorted definition parses");
+        let mut ctx = Context::new();
+        let error = commands
+            .iter()
+            .try_for_each(|command| ctx.process_command(command).map(|_| ()))
+            .expect_err("definition result-sort mismatch must fail during registration");
+        assert!(
+            matches!(error, ElaborateError::SortMismatch { .. }),
+            "unexpected definition error for `{input}`: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn defined_function_body_coerces_int_result_to_declared_real() {
+    let commands = parse("(define-fun f ((x Int)) Real x) (assert (= (f 1) 1.0))").unwrap();
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command).unwrap();
+    }
+    assert!(ctx.terms.is_true(ctx.assertions[0]));
+}
+
+#[test]
+fn declared_function_application_coerces_int_to_real_and_prefers_exact_overload() {
+    let input = r#"
+        (declare-fun real_pred (Real) Bool)
+        (assert (real_pred 1))
+        (declare-fun overloaded (Int) Bool)
+        (declare-fun overloaded (Real) Int)
+        (assert (overloaded 1))
+    "#;
+    let commands = parse(input).expect("well-sorted overload script parses");
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command)
+            .expect("valid applications must elaborate");
+    }
+
+    let TermData::App(_, real_args) = ctx.terms.get(ctx.assertions[0]) else {
+        panic!("real_pred assertion must remain an application");
+    };
+    assert_eq!(ctx.terms.sort(real_args[0]), &Sort::Real);
+    assert_eq!(ctx.terms.sort(ctx.assertions[1]), &Sort::Bool);
+}
+
+#[test]
+fn native_function_alias_keeps_private_identity_after_int_to_real_coercion() {
+    let mut ctx = Context::new();
+    ctx.register_native_function_alias(
+        "surface".to_string(),
+        "!private-function".to_string(),
+        vec![Sort::Real],
+        Sort::Bool,
+    )
+    .expect("native alias registers");
+    let commands = parse("(assert (surface 1))").expect("alias application parses");
+    ctx.process_command(&commands[0])
+        .expect("Int argument coerces to the Real domain");
+
+    let TermData::App(Symbol::Named(name), args) = ctx.terms.get(ctx.assertions[0]) else {
+        panic!("alias assertion must be a named application");
+    };
+    assert_eq!(name, "!private-function");
+    assert_eq!(ctx.terms.sort(args[0]), &Sort::Real);
+}
+
+#[test]
+fn overloaded_native_aliases_keep_the_selected_private_identity() {
+    let mut ctx = Context::new();
+    ctx.register_native_function_alias(
+        "exact".to_string(),
+        "!private-exact-int".to_string(),
+        vec![Sort::Int],
+        Sort::Bool,
+    )
+    .unwrap();
+    ctx.register_native_function_alias(
+        "exact".to_string(),
+        "!private-exact-real".to_string(),
+        vec![Sort::Real],
+        Sort::Bool,
+    )
+    .unwrap();
+    ctx.register_native_function_alias(
+        "coercive".to_string(),
+        "!private-coercive-real".to_string(),
+        vec![Sort::Real],
+        Sort::Bool,
+    )
+    .unwrap();
+    ctx.register_native_function_alias(
+        "coercive".to_string(),
+        "!private-coercive-bool".to_string(),
+        vec![Sort::Bool],
+        Sort::Bool,
+    )
+    .unwrap();
+
+    let commands = parse("(assert (exact 1)) (assert (coercive 1))").unwrap();
+    for command in &commands {
+        ctx.process_command(command).unwrap();
+    }
+
+    let TermData::App(Symbol::Named(exact_name), exact_args) = ctx.terms.get(ctx.assertions[0])
+    else {
+        panic!("exact overload must remain an application");
+    };
+    assert_eq!(exact_name, "!private-exact-int");
+    assert_eq!(ctx.terms.sort(exact_args[0]), &Sort::Int);
+
+    let TermData::App(Symbol::Named(coercive_name), coercive_args) =
+        ctx.terms.get(ctx.assertions[1])
+    else {
+        panic!("coercive overload must remain an application");
+    };
+    assert_eq!(coercive_name, "!private-coercive-real");
+    assert_eq!(ctx.terms.sort(coercive_args[0]), &Sort::Real);
+}
+
+#[test]
+fn ordinary_overloads_get_disjoint_core_identities_and_complete_iteration() {
+    let commands = parse(
+        "(declare-fun f (Int) Bool) (declare-fun f (Bool) Bool) \
+         (assert (f 0)) (assert (f true))",
+    )
+    .unwrap();
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command).unwrap();
+    }
+
+    let heads: Vec<&str> = ctx
+        .assertions
+        .iter()
+        .map(|term| match ctx.terms.get(*term) {
+            TermData::App(Symbol::Named(name), _) => name.as_str(),
+            other => panic!("expected declared application, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        heads[0], "f",
+        "the first declaration keeps its surface identity"
+    );
+    assert!(heads[1].starts_with(INTERNAL_SYMBOL_PREFIX));
+    assert_ne!(heads[0], heads[1]);
+    assert_eq!(ctx.dt_surface_name(heads[1]), Some("f"));
+
+    let overloads: Vec<_> = ctx
+        .symbol_iter()
+        .filter(|(name, _)| name.as_str() == "f")
+        .collect();
+    assert_eq!(overloads.len(), 2, "iteration must expose every signature");
+    assert_eq!(overloads[0].1.arg_sorts, vec![Sort::Int]);
+    assert_eq!(overloads[1].1.arg_sorts, vec![Sort::Bool]);
+}
+
+#[test]
+fn result_sort_overloads_selected_by_ascription_have_disjoint_identities() {
+    let commands = parse(
+        "(declare-fun f (Int) Int) (declare-fun f (Int) Bool) \
+         (assert (= ((as f Int) 0) 0)) (assert (not ((as f Bool) 0)))",
+    )
+    .unwrap();
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command).unwrap();
+    }
+
+    let TermData::App(_, equality_args) = ctx.terms.get(ctx.assertions[0]) else {
+        panic!("first assertion must be equality");
+    };
+    let int_head = equality_args
+        .iter()
+        .find_map(|term| match ctx.terms.get(*term) {
+            TermData::App(Symbol::Named(name), _) => Some(name),
+            _ => None,
+        })
+        .expect("qualified Int overload must be an application");
+    let TermData::Not(bool_app) = ctx.terms.get(ctx.assertions[1]) else {
+        panic!("second assertion must be negated");
+    };
+    let TermData::App(Symbol::Named(bool_head), _) = ctx.terms.get(*bool_app) else {
+        panic!("qualified Bool overload must be an application");
+    };
+    assert_eq!(int_head, "f");
+    assert_ne!(int_head, bool_head);
+    assert_eq!(ctx.dt_surface_name(bool_head), Some("f"));
+}
+
+#[test]
+fn pop_removes_only_scoped_overload_and_restores_outer_declaration() {
+    let commands = parse(
+        "(declare-fun f (Int) Bool) (push 1) \
+         (declare-fun f (Bool) Bool) (assert (f true)) (pop 1) (assert (f 0))",
+    )
+    .unwrap();
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command).unwrap();
+    }
+
+    let remaining: Vec<_> = ctx
+        .symbol_iter()
+        .filter(|(name, _)| name.as_str() == "f")
+        .collect();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].1.arg_sorts, vec![Sort::Int]);
+    assert_eq!(remaining[0].1.internal_name, None);
+
+    let bad = parse("(assert (f false))").unwrap();
+    assert!(
+        ctx.process_command(&bad[0]).is_err(),
+        "popped Bool overload must no longer resolve"
+    );
+}
+
+#[test]
+fn multi_pop_underflow_is_atomic() {
+    let setup = parse(
+        "(declare-sort Outer 0) (push 1) (define-sort Scoped () Int) \
+         (declare-const local Bool) (assert local) (assert-soft local) (maximize 1)",
+    )
+    .expect("scope setup parses");
+    let mut ctx = Context::new();
+    for command in &setup {
+        ctx.process_command(command).expect("scope setup executes");
+    }
+
+    let before = (
+        ctx.scopes.len(),
+        ctx.assertions.len(),
+        ctx.soft_constraints.len(),
+        ctx.objectives.len(),
+    );
+    let error = ctx
+        .process_command(&parse("(pop 2)").expect("pop parses")[0])
+        .expect_err("pop beyond the current depth must fail");
+    assert!(matches!(error, ElaborateError::ScopeUnderflow));
+    assert_eq!(
+        (
+            ctx.scopes.len(),
+            ctx.assertions.len(),
+            ctx.soft_constraints.len(),
+            ctx.objectives.len(),
+        ),
+        before,
+        "a failed multi-pop must not consume a valid scope prefix"
+    );
+    assert!(ctx.sort_defs.contains_key("Outer"));
+    assert!(ctx.sort_defs.contains_key("Scoped"));
+    assert!(ctx.symbols.contains_key("local"));
+
+    ctx.process_command(&parse("(pop 1)").expect("pop parses")[0])
+        .expect("the preserved scope remains poppable");
+    assert!(ctx.sort_defs.contains_key("Outer"));
+    assert!(!ctx.sort_defs.contains_key("Scoped"));
+    assert!(!ctx.symbols.contains_key("local"));
+    assert!(ctx.assertions.is_empty());
+    assert!(ctx.soft_constraints.is_empty());
+    assert!(ctx.objectives.is_empty());
+}
+
+#[test]
+fn oversized_push_is_rejected_before_allocating_or_changing_depth() {
+    let mut ctx = Context::new();
+    let error = ctx
+        .process_command(&Command::Push(u32::MAX))
+        .expect_err("compact push amplification must be bounded");
+    assert!(matches!(error, ElaborateError::Unsupported(_)));
+    assert!(ctx.scopes.is_empty());
+
+    ctx.process_command(&Command::Push(2))
+        .expect("ordinary scope depth remains usable after rejection");
+    assert_eq!(ctx.scopes.len(), 2);
+    ctx.process_command(&Command::Pop(2))
+        .expect("ordinary multi-pop succeeds");
+    assert!(ctx.scopes.is_empty());
+}
+
+#[test]
+fn sort_declarations_share_one_collision_checked_namespace() {
+    for input in [
+        "(declare-sort S 0) (declare-sort S 0)",
+        "(declare-sort S 0) (define-sort S () Int)",
+        "(define-sort S () Int) (declare-sort S 0)",
+        "(define-sort S (T) T) (define-sort S () Int)",
+        "(declare-datatype S ((mk-S))) (define-sort S () Int)",
+    ] {
+        let commands = parse(input).expect("sort collision script parses");
+        let mut ctx = Context::new();
+        ctx.process_command(&commands[0])
+            .expect("first sort binding succeeds");
+        let error = ctx
+            .process_command(&commands[1])
+            .expect_err("second sort binding must not overwrite the first");
+        assert!(
+            matches!(error, ElaborateError::SortRedeclaration(ref name) if name == "S"),
+            "expected SortRedeclaration for `{input}`, got {error:?}"
+        );
+    }
+}
+
+#[test]
+fn unsupported_declare_sort_arity_and_duplicate_alias_parameters_fail_without_mutation() {
+    for input in ["(declare-sort Higher 1)", "(define-sort Higher (T T) T)"] {
+        let command = parse(input).expect("sort command parses");
+        let mut ctx = Context::new();
+        assert!(
+            ctx.process_command(&command[0]).is_err(),
+            "unsupported sort declaration must fail: {input}"
+        );
+        assert!(!ctx.sort_defs.contains_key("Higher"));
+        assert!(!ctx.parametric_sort_defs.contains_key("Higher"));
+    }
+}
+
+#[test]
+fn sort_synonym_recursion_guard_is_restored_after_unwind() {
+    let mut ctx = Context::new();
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.with_sort_synonym_expansion("Outer".to_string(), |context| {
+            context.with_sort_synonym_expansion("Alias".to_string(), |_| {
+                panic!("injected recursive sort elaboration panic");
+            });
+        });
+    }));
+    assert!(unwind.is_err());
+    assert!(
+        ctx.expanding_sort_synonyms.is_empty(),
+        "every active synonym guard must unwind with the panic"
+    );
+
+    let valid = parse("(define-sort Alias (T) T) (declare-const value (Alias Int))")
+        .expect("valid synonym script parses");
+    for command in &valid {
+        ctx.process_command(command)
+            .expect("a caught panic must not poison later synonym expansion");
+    }
+    assert_eq!(ctx.symbols["value"].sort, Sort::Int);
+}
+
+#[test]
+fn native_global_declaration_preserves_options_and_survives_scoped_overload_pop() {
+    let mut ctx = Context::new();
+    let setup = parse("(declare-fun f (Int) Bool) (push 1) (declare-fun f (Bool) Bool)")
+        .expect("parse setup");
+    for command in &setup {
+        ctx.process_command(command).expect("execute setup");
+    }
+
+    let native = parse("(declare-fun f (Real) Bool)").expect("parse native declaration");
+    ctx.execute_native_global_declaration(&native[0])
+        .expect("execute native declaration");
+    assert_eq!(
+        ctx.get_option(":global-declarations"),
+        Some(&OptionValue::Bool(false))
+    );
+    assert_eq!(
+        ctx.get_option(":global-decls"),
+        Some(&OptionValue::Bool(false))
+    );
+
+    ctx.process_command(&parse("(pop 1)").expect("parse pop")[0])
+        .expect("pop scope");
+    let remaining: Vec<_> = ctx
+        .symbol_iter()
+        .filter(|(name, _)| name.as_str() == "f")
+        .map(|(_, info)| info.arg_sorts.clone())
+        .collect();
+    assert_eq!(remaining, vec![vec![Sort::Int], vec![Sort::Real]]);
+}
+
+#[test]
+fn native_global_declaration_tracking_restores_after_unwind() {
+    let mut ctx = Context::new();
+    ctx.push();
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.with_native_global_declaration_tracking(|_| panic!("injected native panic"));
+    }));
+    assert!(unwind.is_err());
+
+    let scoped = parse("(declare-const scoped Bool)").expect("parse scoped declaration");
+    ctx.process_command(&scoped[0])
+        .expect("execute scoped declaration after unwind");
+    assert!(ctx.symbols.contains_key("scoped"));
+    assert!(ctx.pop());
+    assert!(
+        !ctx.symbols.contains_key("scoped"),
+        "a panic in native tracking must not make later declarations global"
+    );
+}
+
+#[test]
+fn ordinary_overload_identity_skips_native_alias_collision() {
+    let mut ctx = Context::new();
+    let base = parse("(declare-fun f (Int) Bool)").expect("parse base declaration");
+    ctx.process_command(&base[0])
+        .expect("declare base overload");
+
+    ctx.register_native_global_function_alias(
+        "native_alias".to_string(),
+        "__ay_overload_0".to_string(),
+        vec![Sort::Int],
+        Sort::Bool,
+    )
+    .expect("register colliding native identity");
+
+    let overload = parse("(declare-fun f (Bool) Bool)").expect("parse overload");
+    ctx.process_command(&overload[0]).expect("declare overload");
+    let bool_overload = ctx
+        .symbol_iter()
+        .find(|(name, info)| name.as_str() == "f" && info.arg_sorts == vec![Sort::Bool])
+        .expect("Bool overload");
+    assert_eq!(
+        bool_overload.1.internal_name.as_deref(),
+        Some("__ay_overload_1")
+    );
+}
+
+#[test]
+fn same_name_native_alias_is_an_exact_no_op() {
+    let mut ctx = Context::new();
+    let declaration = parse("(declare-fun same_name (Int) Bool)").expect("parse declaration");
+    ctx.execute_native_global_declaration(&declaration[0])
+        .expect("declare native function");
+    ctx.register_native_global_function_alias(
+        "same_name".to_string(),
+        "same_name".to_string(),
+        vec![Sort::Int],
+        Sort::Bool,
+    )
+    .expect("register exact alias");
+
+    assert_eq!(
+        ctx.symbol_iter()
+            .filter(|(name, _)| name.as_str() == "same_name")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -780,6 +1313,132 @@ fn test_legit_qualified_as_builtin_uses_still_work() {
 }
 
 #[test]
+fn qualified_builtin_paths_validate_arity_and_carrier_sorts() {
+    for input in [
+        "(assert (= ((as seq.empty (Seq Int)) 0) (as seq.empty (Seq Int))))",
+        "(assert (= (as seq.empty Int) 0))",
+        "(assert (= (as set.empty (Array Int Int)) (as set.empty (Array Int Int))))",
+        "(assert (= (as multiset.empty (Array Int Bool)) (as multiset.empty (Array Int Bool))))",
+        "(assert (= ((as const (Array Int Int)) true) ((as const (Array Int Int)) true)))",
+    ] {
+        let commands = parse(input).expect("malformed qualified use should still parse");
+        let mut ctx = Context::new();
+        assert!(
+            commands
+                .iter()
+                .try_for_each(|command| ctx.process_command(command).map(|_| ()))
+                .is_err(),
+            "qualified builtin must reject malformed use: {input}"
+        );
+    }
+}
+
+#[test]
+fn qualified_const_array_performs_int_to_real_value_coercion() {
+    let commands = parse("(assert (= (select ((as const (Array Int Real)) 0) 1) 0.0))").unwrap();
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command).unwrap();
+    }
+    assert!(ctx.terms.is_true(ctx.assertions[0]));
+}
+
+#[test]
+fn qualified_declared_app_resolves_full_signature_and_result_sort() {
+    let commands = parse(
+        "(declare-fun f (Int) Bool) (declare-fun f (Int) Int) \
+         (assert ((as f Bool) 0)) (assert (= ((as f Int) 0) 0)) \
+         (declare-fun real_pred (Real) Bool) (assert ((as real_pred Bool) 0))",
+    )
+    .unwrap();
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command).unwrap();
+    }
+    assert_eq!(ctx.assertions.len(), 3);
+}
+
+#[test]
+fn qualified_declared_app_rejects_bad_domain_result_and_constructor_sorts() {
+    for input in [
+        "(declare-fun f (Int) Bool) (assert ((as f Bool) true))",
+        "(declare-fun f (Int) Bool) (assert (= ((as f Int) 0) 0))",
+        "(declare-datatype D ((C (field Int)))) \
+         (assert (= ((as C D) true) ((as C D) true)))",
+    ] {
+        let commands = parse(input).unwrap();
+        let mut ctx = Context::new();
+        assert!(
+            commands
+                .iter()
+                .try_for_each(|command| ctx.process_command(command).map(|_| ()))
+                .is_err(),
+            "qualified identifier must reject mismatched signature: {input}"
+        );
+    }
+}
+
+#[test]
+fn qualified_declared_app_preserves_selected_private_identity_and_rejects_ambiguity() {
+    let mut ctx = Context::new();
+    ctx.register_native_function_alias(
+        "surface".to_string(),
+        "!qualified-private".to_string(),
+        vec![Sort::Int],
+        Sort::Bool,
+    )
+    .unwrap();
+    let commands = parse("(assert ((as surface Bool) 0))").unwrap();
+    ctx.process_command(&commands[0]).unwrap();
+    let TermData::App(Symbol::Named(name), _) = ctx.terms.get(ctx.assertions[0]) else {
+        panic!("qualified alias application must remain an application");
+    };
+    assert_eq!(name, "!qualified-private");
+
+    ctx.register_native_function_alias(
+        "ambiguous".to_string(),
+        "!qualified-one".to_string(),
+        vec![Sort::Int],
+        Sort::Bool,
+    )
+    .unwrap();
+    ctx.register_native_function_alias(
+        "ambiguous".to_string(),
+        "!qualified-two".to_string(),
+        vec![Sort::Int],
+        Sort::Bool,
+    )
+    .unwrap();
+    let commands = parse("(assert ((as ambiguous Bool) 0))").unwrap();
+    assert!(ctx.process_command(&commands[0]).is_err());
+}
+
+#[test]
+fn qualified_defined_function_expands_body_and_checks_result_ascription() {
+    let commands = parse(
+        "(define-fun positive ((x Int)) Bool (> x 0)) \
+         (assert ((as positive Bool) 1))",
+    )
+    .unwrap();
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command).unwrap();
+    }
+    assert!(ctx.terms.is_true(ctx.assertions[0]));
+
+    let commands = parse(
+        "(define-fun positive ((x Int)) Bool (> x 0)) \
+         (assert (= ((as positive Int) 1) 1))",
+    )
+    .unwrap();
+    let mut ctx = Context::new();
+    assert!(commands
+        .iter()
+        .try_for_each(|command| ctx.process_command(command).map(|_| ()))
+        .is_err());
+}
+
+#[test]
 fn test_is_reserved_op_name_classification() {
     use crate::elaborate::{is_excluded_declarable_op_name, is_reserved_op_name};
     // Structurally-matched theory ops: reserved.
@@ -885,6 +1544,7 @@ fn test_is_reserved_op_name_classification() {
 ///   - `map.dom`          (encoder/collection_map.rs)
 ///   - `map.subset`       (encoder/collection_map.rs)
 ///   - `multiset.subset`  (encoder/ir_encoder/multiset.rs)
+///
 /// Reserving them hard-fails those default (no-fallback) encodings on the
 /// first collection proof. Misuse of the declared name fails CLOSED (probed:
 /// mismatched Int-sorted declarations answer unknown/sat, never a bogus
@@ -1144,7 +1804,7 @@ fn test_reserved_op_table_covers_all_elaborator_match_arms() {
         "multiset.empty",
         "map.empty",
         "const",
-        // term.rs vocabulary (rounding modes, FP special literals)
+        // term.rs rounding modes and indexed.rs FP special literals
         "roundNearestTiesToEven",
         "NaN",
     ] {
@@ -1383,4 +2043,235 @@ fn test_unknown_indexed_identifier_rejected() {
         }
     }
     assert!(found_error, "Expected error for unknown indexed identifier");
+}
+
+#[test]
+fn stringified_declarations_do_not_authorize_generic_indexed_identifiers() {
+    for input in [
+        "(declare-fun |(_ shadow 1)| (Int) Bool) (assert ((_ shadow 1) true))",
+        "(declare-fun |(_ shadow 1)| (Int) Bool) \
+         (declare-fun |(_ shadow 1)| (Bool) Bool) \
+         (assert ((_ shadow 1) 0))",
+    ] {
+        let commands = parse(input).unwrap();
+        let mut ctx = Context::new();
+        assert!(
+            commands
+                .iter()
+                .try_for_each(|command| ctx.process_command(command).map(|_| ()))
+                .is_err(),
+            "a quoted stringified declaration must not authorize indexed syntax: {input}"
+        );
+    }
+}
+
+#[test]
+fn definitional_forall_adoption_rolls_back_on_later_assert_failure() {
+    let commands = parse(
+        "(declare-fun f (Int) Int) \
+         (assert (forall ((x Int)) (= (f x) (+ x 1))))",
+    )
+    .expect("parse");
+    let mut ctx = Context::new();
+    ctx.process_command(&commands[0]).expect("declaration");
+
+    ctx.fail_next_assert_after_macro_adoption();
+    let error = ctx
+        .process_command(&commands[1])
+        .expect_err("injected error");
+    assert!(matches!(error, ElaborateError::Unsupported(_)));
+    assert!(ctx.adopted_macro_interp("f").is_none());
+    assert!(ctx.assertions.is_empty());
+
+    // A second attempt can adopt the same definition. This proves both the
+    // model interpretation and the expansion entry were removed on rollback.
+    ctx.process_command(&commands[1])
+        .expect("adoption succeeds after rollback");
+    assert!(ctx.adopted_macro_interp("f").is_some());
+    assert_eq!(ctx.assertions.len(), 1);
+}
+
+#[test]
+fn rejected_to_real_declaration_does_not_set_sticky_shadow_state() {
+    let mut ctx = Context::new();
+    let bad = parse("(declare-fun to_real ((_ BitVec 0)) Real)").expect("parse");
+    assert!(ctx.process_command(&bad[0]).is_err());
+    assert!(!ctx.terms.to_real_is_shadowed());
+
+    let valid = parse("(declare-fun to_real (Int) Real)").expect("parse");
+    ctx.process_command(&valid[0]).expect("valid declaration");
+    assert!(ctx.terms.to_real_is_shadowed());
+}
+
+#[test]
+fn define_funs_rec_late_sort_error_is_atomic() {
+    let commands = parse(
+        "(define-funs-rec \
+           ((f ((x Int)) Int) (g ((y (_ BitVec 0))) Int)) \
+           (x y))",
+    )
+    .expect("parse");
+    let mut ctx = Context::new();
+    assert!(ctx.process_command(&commands[0]).is_err());
+    assert!(!ctx.symbols.contains_key("f"));
+    assert!(!ctx.symbols.contains_key("g"));
+
+    let declaration = parse("(declare-fun f (Int) Int)").expect("parse");
+    ctx.process_command(&declaration[0])
+        .expect("failed recursive group left no binding");
+}
+
+#[test]
+fn define_funs_rec_body_error_restores_scope_tracking() {
+    let mut ctx = Context::new();
+    ctx.process_command(&Command::Push(1)).expect("push");
+    let commands = parse(
+        "(define-funs-rec \
+           ((f ((x Int)) Int) (g ((y Int)) Bool)) \
+           (x y))",
+    )
+    .expect("parse");
+    assert!(ctx.process_command(&commands[0]).is_err());
+    assert!(!ctx.symbols.contains_key("f"));
+    assert!(!ctx.symbols.contains_key("g"));
+    assert!(!ctx.scopes.last().expect("scope").symbols.contains_key("f"));
+    assert!(!ctx.scopes.last().expect("scope").symbols.contains_key("g"));
+
+    let declaration = parse("(declare-const f Int)").expect("parse");
+    ctx.process_command(&declaration[0])
+        .expect("name is reusable after rollback");
+    ctx.process_command(&Command::Pop(1)).expect("pop");
+    assert!(!ctx.symbols.contains_key("f"));
+}
+
+#[test]
+fn define_funs_rec_duplicate_names_fail_before_mutation() {
+    let commands = parse(
+        "(define-funs-rec \
+           ((f ((x Int)) Int) (f ((y Int)) Int)) \
+           (x y))",
+    )
+    .expect("parse");
+    let mut ctx = Context::new();
+    assert!(ctx.process_command(&commands[0]).is_err());
+    assert!(!ctx.symbols.contains_key("f"));
+}
+
+#[test]
+fn define_fun_rec_body_error_restores_scope_tracking() {
+    let mut ctx = Context::new();
+    ctx.process_command(&Command::Push(1)).expect("push");
+    let commands = parse("(define-fun-rec f ((x Int)) Bool x)").expect("parse");
+    assert!(ctx.process_command(&commands[0]).is_err());
+    assert!(!ctx.symbols.contains_key("f"));
+    assert!(!ctx.scopes.last().expect("scope").symbols.contains_key("f"));
+
+    let declaration = parse("(declare-const f Int)").expect("parse");
+    ctx.process_command(&declaration[0])
+        .expect("name is reusable after rollback");
+    ctx.process_command(&Command::Pop(1)).expect("pop");
+    assert!(!ctx.symbols.contains_key("f"));
+}
+
+#[test]
+fn indexed_identifiers_do_not_alias_quoted_symbols() {
+    for input in [
+        // The quoted let-bound name is #x01; the structured literal is #x00.
+        "(assert (let ((|(_ bv0 8)| #x01)) (distinct |(_ bv0 8)| (_ bv0 8))))",
+        // AY lowers both character literal spellings to their integer code point.
+        "(assert (let ((|(_ Char 65)| 66)) (distinct |(_ Char 65)| (_ Char 65))))",
+        "(assert (let ((|(_ char #x41)| 66)) (distinct |(_ char #x41)| (_ char #x41))))",
+        // Positive and negative zero are distinct FloatingPoint bit patterns.
+        "(assert (let ((|(_ +zero 8 24)| (_ -zero 8 24))) \
+             (distinct |(_ +zero 8 24)| (_ +zero 8 24))))",
+        // A quoted array constant is independent of the indexed as-array value.
+        "(declare-fun f (Int) Int) \
+         (declare-const |(_ as-array f)| (Array Int Int)) \
+         (assert (distinct |(_ as-array f)| (_ as-array f)))",
+        // A quoted function name is independent of the structured DT tester.
+        "(declare-datatype D ((C) (E))) \
+         (declare-fun |(_ is C)| (D) Bool) \
+         (declare-const x D) \
+         (assert (distinct (|(_ is C)| x) ((_ is C) x)))",
+    ] {
+        let commands = parse(input).expect("indexed/quoted regression parses");
+        let mut ctx = Context::new();
+        for command in &commands {
+            ctx.process_command(command)
+                .expect("indexed and quoted identifiers elaborate independently");
+        }
+        assert_eq!(ctx.assertions.len(), 1, "{input}");
+        assert_ne!(ctx.assertions[0], ctx.terms.false_term(), "{input}");
+    }
+}
+
+#[test]
+fn unknown_indexed_identifier_does_not_resolve_as_quoted_symbol() {
+    let commands = parse(
+        "(declare-const |(_ mystery 1)| Int) \
+         (assert (= |(_ mystery 1)| (_ mystery 1)))",
+    )
+    .expect("syntax parses");
+    let mut ctx = Context::new();
+    ctx.process_command(&commands[0])
+        .expect("quoted declaration is valid");
+    assert!(
+        ctx.process_command(&commands[1]).is_err(),
+        "the structured unknown identifier must fail closed"
+    );
+}
+
+#[test]
+fn qualified_indexed_identifier_does_not_alias_same_spelled_symbol() {
+    let quoted = parse(
+        "(declare-const |(_ mystery 1)| Int) \
+         (assert (= (as |(_ mystery 1)| Int) 0))",
+    )
+    .expect("qualified quoted-symbol syntax parses");
+    let mut ctx = Context::new();
+    for command in &quoted {
+        ctx.process_command(command)
+            .expect("qualified quoted symbol resolves to its declaration");
+    }
+
+    let indexed = parse(
+        "(declare-const |(_ mystery 1)| Int) \
+         (assert (= (as (_ mystery 1) Int) 0))",
+    )
+    .expect("qualified indexed syntax parses");
+    let mut ctx = Context::new();
+    ctx.process_command(&indexed[0])
+        .expect("quoted declaration is valid");
+    assert!(
+        ctx.process_command(&indexed[1]).is_err(),
+        "unsupported qualified indexed identifier must fail closed"
+    );
+}
+
+#[test]
+fn character_literal_range_is_enforced() {
+    let valid = parse(
+        "(assert (= (_ Char 0) 0)) \
+         (assert (= (_ Char 196607) 196607)) \
+         (assert (= (_ char #x2ffff) 196607))",
+    )
+    .expect("boundary literals parse");
+    let mut ctx = Context::new();
+    for command in &valid {
+        ctx.process_command(command)
+            .expect("boundary character literal is valid");
+    }
+
+    for input in [
+        "(assert (= (_ Char -1) 0))",
+        "(assert (= (_ Char 196608) 0))",
+        "(assert (= (_ char #x30000) 0))",
+    ] {
+        let commands = parse(input).expect("out-of-range syntax parses");
+        let mut ctx = Context::new();
+        assert!(
+            ctx.process_command(&commands[0]).is_err(),
+            "out-of-range Char literal elaborated: {input}"
+        );
+    }
 }

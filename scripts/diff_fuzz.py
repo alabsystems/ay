@@ -17,7 +17,16 @@
 #
 # AY runner: either an `smt_run`-style binary taking a file arg, or the `ay`
 # CLI via `--ay-stdin "<bin> --z3-mode -in"` reading from stdin.
-import argparse, os, random, re, signal, subprocess, sys, tempfile
+import argparse, json, os, random, re, sys, tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _oom_guard import (  # noqa: E402
+    plan_solver_resources,
+    run_captured,
+    warn_concurrent_build,
+)
+
+RESOURCE_PLAN = None
 
 INT_BINOPS = ["+", "-"]
 CMP = ["<=", "<", ">=", ">", "="]
@@ -193,34 +202,23 @@ def run(cmd, text, timeout):
     # Launch the child as its own process-group leader (start_new_session) so a
     # timeout can kill the ENTIRE tree — otherwise a solver that forks workers
     # leaves orphaned processes at PID 1 that pile up and saturate the machine.
-    p = subprocess.Popen(
-        cmd,
-        stdin=(subprocess.PIPE if text is not None else subprocess.DEVNULL),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-
-    def _kill_tree():
-        try:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-
     try:
-        out, _ = p.communicate(input=text, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_tree()
-        try:
-            p.communicate(timeout=5)  # reap the killed group
-        except Exception:
-            pass
+        result = run_captured(
+            cmd, RESOURCE_PLAN.memlimit_mb, timeout,
+            label="diff_fuzz.py",
+            env=dict(os.environ, MEMLIMIT=str(RESOURCE_PLAN.memlimit_mb),
+                     NBCORE=str(RESOURCE_PLAN.nbcore)),
+            input_text=text,
+        )
+    except OSError as error:
+        return f"error:{error}"
+    if result.memout:
+        return "memout"
+    if result.timed_out:
         return "timeout"
-    except Exception as e:
-        _kill_tree()
-        return f"error:{e}"
-    for line in out.splitlines():
+    if result.output_truncated:
+        return "error:output-truncated"
+    for line in result.stdout.splitlines():
         t = line.strip()
         if t in ("sat", "unsat", "unknown"):
             return t
@@ -235,23 +233,17 @@ _MODEL_INT_RE = re.compile(
 def run_capture(cmd, timeout):
     """Run `cmd`, return full stdout (or None on timeout/error). Same
     process-group kill discipline as run()."""
-    p = subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
     try:
-        out, _ = p.communicate(timeout=timeout)
-        return out
-    except Exception:
-        try:
-            os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-            p.communicate(timeout=5)
-        except Exception:
-            pass
+        result = run_captured(
+            cmd, RESOURCE_PLAN.memlimit_mb, timeout,
+            label="diff_fuzz.py[model]",
+            env=dict(os.environ, MEMLIMIT=str(RESOURCE_PLAN.memlimit_mb),
+                     NBCORE=str(RESOURCE_PLAN.nbcore)),
+        )
+        if result.memout or result.timed_out or result.output_truncated:
+            return None
+        return result.stdout
+    except OSError:
         return None
 
 
@@ -282,6 +274,7 @@ def z3_pin_check(z3_bin, smt, model, timeout):
 
 
 def main():
+    global RESOURCE_PLAN
     ap = argparse.ArgumentParser()
     ap.add_argument("--logic", default="QF_UFLIA")
     ap.add_argument("--n", type=int, default=2000)
@@ -298,8 +291,23 @@ def main():
                          "accept the pinned formula (model cross-validation). "
                          "Needs --ay to be the `ay` CLI (file arg, get-model).")
     args = ap.parse_args()
+    if args.n <= 0 or args.timeout <= 0:
+        ap.error("--n and --timeout must be positive")
+
+    warn_concurrent_build()
+    RESOURCE_PLAN = plan_solver_resources(1, label="diff_fuzz.py")
+    envelope = {
+        "requested_jobs": 1, "jobs": RESOURCE_PLAN.jobs,
+        "memlimit_mb_per_child": RESOURCE_PLAN.memlimit_mb,
+        "nbcore_per_child": RESOURCE_PLAN.nbcore,
+        "headroom_mb": RESOURCE_PLAN.headroom_mb,
+        "enforcement": "process-group rss_watchdog; MEMLIMIT/NBCORE environment",
+    }
 
     os.makedirs(args.out_dir, exist_ok=True)
+    with open(os.path.join(args.out_dir, "resource-envelope.json"), "w") as fh:
+        json.dump(envelope, fh, indent=2)
+        fh.write("\n")
     rng = random.Random(args.seed)
     conflicts = 0
     both_def = 0
@@ -356,6 +364,18 @@ def main():
                   f"| pins={pins_checked} pin-failures={pin_failures}", file=sys.stderr)
     print(f"\n=== {args.logic} seed={args.seed}: {args.n} cases, both-definite={both_def}, "
           f"SOUNDNESS CONFLICTS={conflicts}, pins={pins_checked}, pin-failures={pin_failures} ===")
+    with open(os.path.join(args.out_dir, "summary.json"), "w") as fh:
+        json.dump({
+            "logic": args.logic,
+            "seed": args.seed,
+            "cases": args.n,
+            "both_definite": both_def,
+            "conflicts": conflicts,
+            "pins_checked": pins_checked,
+            "pin_failures": pin_failures,
+            "resource_plan": envelope,
+        }, fh, indent=2)
+        fh.write("\n")
     sys.exit(1 if conflicts else 0)
 
 

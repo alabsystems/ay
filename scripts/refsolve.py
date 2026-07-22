@@ -11,13 +11,20 @@ restricted licence — <=2000 vars/cons/nz — covers these small NN/window MILP
 at zero cost); if gurobipy is absent the gurobi column is reported as SKIP.
 """
 import glob
+import json
+import math
 import os
 import re
-import subprocess
 import sys
+from pathlib import Path
 
 import milp2mps
 import pyscipopt
+from _oom_guard import (  # noqa: E402
+    plan_solver_resources,
+    run_captured,
+    warn_concurrent_build,
+)
 
 try:
     import gurobipy as _gp
@@ -35,13 +42,20 @@ TMO = float(sys.argv[2]) if len(sys.argv) > 2 else 30.0
 OUT = sys.argv[3] if len(sys.argv) > 3 else "/tmp/refsolve.csv"
 TMP = "/tmp/cmp_mps"
 os.makedirs(TMP, exist_ok=True)
+PLAN = None
 
 
 def highs(mps):
     try:
-        r = subprocess.run(["highs", "--time_limit", str(TMO), mps],
-                           capture_output=True, text=True, timeout=TMO + 30)
-    except subprocess.TimeoutExpired:
+        r = run_captured(
+            ["highs", "--time_limit", str(TMO), mps],
+            PLAN.memlimit_mb, TMO + 30, label="refsolve.py[highs]",
+            env=dict(os.environ, MEMLIMIT=str(PLAN.memlimit_mb),
+                     NBCORE=str(PLAN.nbcore), OMP_NUM_THREADS=str(PLAN.nbcore)),
+        )
+    except OSError:
+        return "OTHER"
+    if r.timed_out or r.memout or r.output_truncated:
         return "OTHER"
     txt = r.stdout or ""
     m = re.search(r"^\s*Model status\s*:?\s*(.+)$", txt, re.M) or re.search(r"^\s*Status\s+(.+)$", txt, re.M)
@@ -58,6 +72,7 @@ def scip(mps):
         m = pyscipopt.Model()
         m.hideOutput()
         m.setParam("limits/time", TMO)
+        m.setParam("parallel/maxnthreads", 1)
         m.readProblem(mps)
         m.optimize()
         st = m.getStatus()
@@ -77,6 +92,7 @@ def gurobi(mps):
         m = _gp.read(mps, _GENV)
         m.Params.OutputFlag = 0
         m.Params.TimeLimit = TMO
+        m.Params.Threads = 1
         m.optimize()
         if m.Status == _GRB.OPTIMAL:
             return "SAT"
@@ -88,6 +104,19 @@ def gurobi(mps):
 
 
 def main():
+    global PLAN
+    if not math.isfinite(TMO) or TMO <= 0:
+        raise SystemExit("timeout_s must be finite and positive")
+    warn_concurrent_build()
+    PLAN = plan_solver_resources(1, label="refsolve.py")
+    resource_plan = {
+        "requested_jobs": 1, "jobs": PLAN.jobs,
+        "memlimit_mb_per_child": PLAN.memlimit_mb,
+        "nbcore_per_child": PLAN.nbcore,
+        "headroom_mb": PLAN.headroom_mb,
+        "external_enforcement": "process-group rss_watchdog; MEMLIMIT/NBCORE environment",
+        "in_process_references": "single-threaded; share the harness process",
+    }
     files = sorted(glob.glob(os.path.join(CORPUS, "*.milp")))
     rows = []
     for f in files:
@@ -105,6 +134,9 @@ def main():
         fh.write("stem,highs,scip,gurobi\n")
         for stem, h, s, g in rows:
             fh.write(f"{stem},{h},{s},{g}\n")
+    Path(OUT + ".resource-envelope.json").write_text(
+        json.dumps(resource_plan, indent=2) + "\n"
+    )
 
     def tally(idx, name):
         sat = sum(1 for r in rows if r[idx] == "SAT")

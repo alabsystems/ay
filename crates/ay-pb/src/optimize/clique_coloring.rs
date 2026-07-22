@@ -195,9 +195,11 @@ fn detect(instance: &PbInstance, objective: &PbObjective) -> Option<CliqueColori
     }
 
     // Recover `t` from the variable count: num_vars = C + n + n*n + n*t.
-    // `c + n + n*n` matches that documented shape exactly — not a `c*n` typo.
-    #[allow(clippy::suspicious_operation_groupings)]
-    let fixed = c + n + n * n;
+    // Name each block boundary so the positional layout remains explicit.
+    let base_g1 = c + n;
+    let g1_vars = n * n;
+    let base_g2 = base_g1 + g1_vars;
+    let fixed = base_g2;
     if num_vars < fixed + n {
         return None;
     }
@@ -210,15 +212,12 @@ fn detect(instance: &PbInstance, objective: &PbObjective) -> Option<CliqueColori
         return None;
     }
 
-    // `base_g2 = c + n + n*n` follows the documented variable layout
-    // `num_vars = C + n + n*n + n*t` — not a `c*n` typo.
-    #[allow(clippy::suspicious_operation_groupings)]
     let shape = CliqueColoringShape {
         n,
         t,
         base_obj,
-        base_g1: c + n,
-        base_g2: c + n + n * n,
+        base_g1,
+        base_g2,
     };
 
     // Expected total constraint count for this family.
@@ -391,14 +390,18 @@ mod tests {
     /// as ground truth for the recogniser and the brute-force cross-check.
     fn canonical_instance(n: usize, t: usize) -> (PbInstance, PbObjective) {
         let c = n * (n - 1) / 2;
+        let base_g1 = c + n;
+        let g1_vars = n * n;
+        let base_g2 = base_g1 + g1_vars;
         let shape = CliqueColoringShape {
             n,
             t,
             base_obj: c,
-            base_g1: c + n,
-            base_g2: c + n + n * n,
+            base_g1,
+            base_g2,
         };
-        let num_vars = c + n + n * n + n * t;
+        let g2_vars = n * t;
+        let num_vars = base_g2 + g2_vars;
         let mut constraints: Vec<PbConstraint> = Vec::new();
         // A
         for i in 1..=n {

@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::command::{Command, DatatypeDec, Sort, SygusGrammar, Term};
+use crate::command::{Command, DatatypeDec, QualifiedIdentifier, Sort, SygusGrammar, Term};
 use crate::sexp::{PARSE_STACK_RED_ZONE, PARSE_STACK_SIZE};
 
 /// Parsed-formula statistics collected from SMT-LIB commands.
@@ -197,7 +197,9 @@ impl FormulaStats {
                 }
             }
             Term::QualifiedApp(function, sort, args) => {
-                self.bump_theory(classify_operator(function));
+                if let QualifiedIdentifier::Symbol(function) = function {
+                    self.bump_theory(classify_operator(function));
+                }
                 self.collect_sort(sort);
                 for arg in args {
                     self.collect_term(arg);

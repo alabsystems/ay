@@ -493,12 +493,10 @@ impl ArraySolver<'_> {
                     }
                     self.register_store(term_id, args[0], insert_structural);
                 }
-                "const-array" if args.len() == 1 => {
+                "const-array" if args.len() == 1 && insert_structural => {
                     // Purely structural: no array-var / queue effect, so this
                     // term is not recorded in `var_layer_terms`.
-                    if insert_structural {
-                        self.const_array_cache.insert(term_id, args[0]);
-                    }
+                    self.const_array_cache.insert(term_id, args[0]);
                 }
                 // lambda-array terms: register as array vars for extensionality.
                 // Beta reduction is handled eagerly in mk_select, so the theory

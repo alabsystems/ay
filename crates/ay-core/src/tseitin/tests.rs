@@ -204,7 +204,7 @@ fn test_incremental_api() {
 
     // 'a' was already encoded, so we should just get a unit clause
     // with the same variable
-    assert!(clauses2.len() == 1);
+    assert_eq!(clauses2.len(), 1);
     let unit_clause = &clauses2[0];
     assert_eq!(unit_clause.0.len(), 1);
     assert_eq!(unit_clause.0[0].unsigned_abs(), var_a);

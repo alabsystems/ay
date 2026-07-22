@@ -45,8 +45,9 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _oom_guard import (  # noqa: E402
+    copy_stream_limited,
     plan_solver_resources,
-    rss_watchdog,
+    run_captured,
     warn_concurrent_build,
 )
 
@@ -63,6 +64,7 @@ TRACK_PATTERNS = [
 
 ANSWERS = {"SATISFIABLE", "OPTIMUM FOUND", "UNSATISFIABLE"}
 CHECK_LOCK = threading.Lock()
+MAX_CHECK_INPUT_BYTES = 16 * 1024 * 1024
 
 
 def classify_track(path: str) -> str:
@@ -240,12 +242,10 @@ def executable_provenance(command: str) -> dict:
                 "runnable": False}
 
 
-def parse_solver_output(stream):
-    """Extract only answer-bearing output from a seekable solver log."""
-    stream.flush()
-    stream.seek(0)
+def parse_solver_output(output):
+    """Extract only answer-bearing output from bounded solver output."""
     status, oval, vtoks = None, None, []
-    for line in stream:
+    for line in output.splitlines():
         if line.startswith("s "):
             status = line[2:].strip()
         elif line.startswith("o "):
@@ -278,73 +278,52 @@ def run_instance(binary: str, path: Path, timeout_ms: int, wall_cap: float,
         raise ValueError("wind tunnel requires positive resource budgets")
     try:
         with lzma.open(path, "rb") as src, tmp.open("wb") as dst:
-            shutil.copyfileobj(src, dst, length=1024 * 1024)
-        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8",
-                                    errors="replace") as stdout:
-            with tempfile.TemporaryFile(mode="w+t", encoding="utf-8",
-                                        errors="replace") as stderr:
-                try:
-                    start = time.monotonic()
-                    proc = subprocess.Popen(
-                        [binary, "pb", "solve", "--timeout", str(timeout_ms),
-                         str(tmp)],
-                        stdin=subprocess.DEVNULL,
-                        stdout=stdout,
-                        stderr=stderr,
-                        text=True,
-                        env=env,
-                        start_new_session=True,
-                    )
-                except OSError as exc:
-                    return {"status": "SPAWN_ERROR", "o": None, "check": "-",
-                            "seconds": round(time.monotonic() - start, 3),
-                            "exit_code": None, "memout": False,
-                            "timed_out": False, "error": str(exc)[:200]}
+            copy_stream_limited(src, dst)
+        try:
+            captured = run_captured(
+                [binary, "pb", "solve", "--timeout", str(timeout_ms), str(tmp)],
+                memlimit_mb,
+                wall_cap,
+                label="wind_tunnel.py",
+                env=env,
+            )
+        except Exception as exc:
+            return {"status": "SPAWN_ERROR", "o": None, "check": "-",
+                    "seconds": 0.0, "exit_code": None, "memout": False,
+                    "timed_out": False, "error": str(exc)[:200]}
+        seconds = captured.wall_sec
+        exit_code = captured.returncode
+        if captured.memout:
+            return {"status": "MEMOUT", "o": None, "check": "-",
+                    "seconds": round(seconds, 3), "exit_code": exit_code,
+                    "memout": True, "timed_out": False}
+        if captured.timed_out:
+            return {"status": "WALLTIMEOUT", "o": None, "check": "-",
+                    "seconds": round(seconds, 3), "exit_code": exit_code,
+                    "memout": False, "timed_out": True}
+        if captured.cancelled or captured.output_truncated:
+            return {"status": "CAPTURE_ERROR", "o": None, "check": "-",
+                    "seconds": round(seconds, 3), "exit_code": exit_code,
+                    "memout": False, "timed_out": False,
+                    "error": "solver output truncated or capture cancelled"}
 
-                guard = rss_watchdog(proc, memlimit_mb,
-                                     label="wind_tunnel.py", grace_mb=0)
-                timed_out = False
-                try:
-                    try:
-                        exit_code = proc.wait(timeout=wall_cap)
-                    except subprocess.TimeoutExpired:
-                        timed_out = True
-                        kill_process_group(proc)
-                        exit_code = proc.wait()
-                finally:
-                    # Wrappers can exit before descendants. Kill the entire
-                    # isolated group and reap the direct child before disarming.
-                    kill_process_group(proc)
-                    if proc.poll() is None:
-                        proc.wait()
-                    guard.stop()
-                seconds = time.monotonic() - start
-                if guard.breached:
-                    return {"status": "MEMOUT", "o": None, "check": "-",
-                            "seconds": round(seconds, 3),
-                            "exit_code": exit_code, "memout": True,
-                            "timed_out": False}
-                if timed_out:
-                    return {"status": "WALLTIMEOUT", "o": None,
-                            "check": "-", "seconds": round(seconds, 3),
-                            "exit_code": exit_code, "memout": False,
-                            "timed_out": True}
-
-                # Output parsing retains a complete model. Keep parsing and
-                # instance checking under one lock so those unmetered parent-
-                # side structures cannot multiply by the solver job count.
-                with CHECK_LOCK:
-                    status, oval, vtoks = parse_solver_output(stdout)
-                    if status is None:
-                        status = "NOANSWER" if exit_code == 0 else "CRASH"
-                    chk = "-"
-                    if status in ("SATISFIABLE", "OPTIMUM FOUND"):
-                        text = tmp.read_text(errors="replace")
-                        chk = check_answer(text, is_wbo, status, oval, vtoks)
-                return {"status": status, "o": oval, "check": chk,
-                        "seconds": round(seconds, 3),
-                        "exit_code": exit_code, "memout": False,
-                        "timed_out": False}
+        # Output parsing retains a complete model. Serialize checks so their
+        # parent-side structures cannot multiply, and reject large instances
+        # before allocating a full parser representation.
+        with CHECK_LOCK:
+            status, oval, vtoks = parse_solver_output(captured.stdout)
+            if status is None:
+                status = "NOANSWER" if exit_code == 0 else "CRASH"
+            chk = "-"
+            if status in ("SATISFIABLE", "OPTIMUM FOUND"):
+                if tmp.stat().st_size > MAX_CHECK_INPUT_BYTES:
+                    chk = f"BAD(input-too-large>{MAX_CHECK_INPUT_BYTES})"
+                else:
+                    text = tmp.read_text(errors="replace")
+                    chk = check_answer(text, is_wbo, status, oval, vtoks)
+        return {"status": status, "o": oval, "check": chk,
+                "seconds": round(seconds, 3), "exit_code": exit_code,
+                "memout": False, "timed_out": False}
     finally:
         tmp.unlink(missing_ok=True)
 

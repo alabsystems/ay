@@ -20,6 +20,8 @@
 //! absolute host paths even though ambient home and temporary-directory
 //! variables are withheld.
 
+pub mod env;
+
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};

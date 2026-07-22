@@ -3,7 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 // #8529: Use deterministic hash maps in all builds.
-use ay_core::kani_compat::DetHashMap as HashMap;
+use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 
 use crate::command;
 use ay_core::Sort;
@@ -96,7 +96,49 @@ impl Context {
         subst: &HashMap<String, Sort>,
         instance: Option<&str>,
     ) -> Result<()> {
-        for ctor in constructors {
+        let selector_sorts = self.elaborate_datatype_selector_sorts(constructors, subst)?;
+        self.register_elaborated_datatype_constructors(
+            dt_name,
+            dt_sort,
+            constructors,
+            &selector_sorts,
+            instance,
+        );
+        Ok(())
+    }
+
+    /// Elaborate every selector sort before datatype metadata is committed.
+    /// Keeping the fallible phase separate makes ordinary datatype declarations
+    /// transactional without cloning the full term/assertion context.
+    fn elaborate_datatype_selector_sorts(
+        &mut self,
+        constructors: &[command::ConstructorDec],
+        subst: &HashMap<String, Sort>,
+    ) -> Result<Vec<Vec<Sort>>> {
+        constructors
+            .iter()
+            .map(|ctor| {
+                ctor.selectors
+                    .iter()
+                    .map(|selector| self.elaborate_sort_inner(&selector.sort, subst))
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect()
+    }
+
+    /// Commit constructors whose selector sorts have already been elaborated.
+    /// This phase is intentionally infallible: all user-controlled validation
+    /// happens before any datatype/symbol maps are changed.
+    fn register_elaborated_datatype_constructors(
+        &mut self,
+        dt_name: &str,
+        dt_sort: &Sort,
+        constructors: &[command::ConstructorDec],
+        selector_sorts: &[Vec<Sort>],
+        instance: Option<&str>,
+    ) {
+        debug_assert_eq!(constructors.len(), selector_sorts.len());
+        for (ctor, selector_sorts) in constructors.iter().zip(selector_sorts) {
             // For a monomorphized parametric INSTANCE, the constructor/selector/
             // tester get INTERNAL names that are name-disjoint per instance
             // (e.g. `osome@Opt!{Bool}`), so the DT theory treats each instance as
@@ -121,12 +163,6 @@ impl Context {
                 (dt_name.to_string(), ctor_internal.to_string()),
             );
             self.track_scoped_constructor(ctor_internal.to_string());
-            // Elaborate selector sorts (substituting any type parameters)
-            let selector_sorts: Vec<Sort> = ctor
-                .selectors
-                .iter()
-                .map(|s| self.elaborate_sort_inner(&s.sort, subst))
-                .collect::<Result<Vec<_>>>()?;
             self.ctor_selector_info.insert(
                 ctor_internal.to_string(),
                 sel_internals
@@ -201,7 +237,6 @@ impl Context {
                 },
             );
         }
-        Ok(())
     }
 
     /// Whether `name` is a registered datatype member name — a constructor,
@@ -234,10 +269,24 @@ impl Context {
         {
             return true;
         }
-        // Parametric-INSTANCE members: the internal (mangled) names are keyed
-        // in the maps above; the user-facing surface names are the values of
-        // the internal->surface map.
-        if self.dt_internal_surface.values().any(|s| s == name) {
+        // Parametric-INSTANCE members: ordinary declaration overloads also use
+        // the internal->surface map, so require datatype metadata for the
+        // mapped internal identity rather than classifying every alias as a
+        // constructor/selector/tester.
+        let mapped_datatype_member = self.dt_internal_surface.iter().any(|(internal, surface)| {
+            if surface != name {
+                return false;
+            }
+            self.constructors.contains_key(internal)
+                || internal
+                    .strip_prefix("is-")
+                    .is_some_and(|ctor| self.constructors.contains_key(ctor))
+                || self
+                    .ctor_selector_info
+                    .values()
+                    .any(|selectors| selectors.iter().any(|(selector, _)| selector == internal))
+        });
+        if mapped_datatype_member {
             return true;
         }
         // Parametric TEMPLATE members (not yet instantiated): their surface
@@ -295,6 +344,17 @@ impl Context {
         Ok(())
     }
 
+    /// Build the narrow context needed to preflight selector sorts. This copies
+    /// only sort aliases/templates, not the term store, assertions, symbols, or
+    /// scopes that dominate a live solver context.
+    pub(super) fn datatype_sort_preflight_context(&self) -> Self {
+        let mut context = Self::new();
+        context.sort_defs = self.sort_defs.clone();
+        context.parametric_sort_defs = self.parametric_sort_defs.clone();
+        context.parametric_datatypes = self.parametric_datatypes.clone();
+        context
+    }
+
     /// Declare a single datatype
     ///
     /// A datatype declaration creates:
@@ -325,6 +385,15 @@ impl Context {
             return Ok(());
         }
 
+        let empty: HashMap<String, Sort> = HashMap::default();
+        let mut preflight = self.datatype_sort_preflight_context();
+        preflight
+            .sort_defs
+            .insert(name.to_string(), Sort::Uninterpreted(name.to_string()));
+        preflight.elaborate_datatype_selector_sorts(&datatype_dec.constructors, &empty)?;
+        let selector_sorts =
+            self.elaborate_datatype_selector_sorts(&datatype_dec.constructors, &empty)?;
+
         // Register the sort as uninterpreted
         let sort = Sort::Uninterpreted(name.to_string());
         self.sort_defs.insert(name.to_string(), sort.clone());
@@ -341,9 +410,16 @@ impl Context {
         self.track_scoped_datatype(name.to_string());
         self.track_scoped_sort_def(name.to_string());
 
-        // Register constructors, selectors, and testers
-        let empty: HashMap<String, Sort> = HashMap::default();
-        self.register_datatype_constructors(name, &sort, &datatype_dec.constructors, &empty, None)
+        // Register constructors, selectors, and testers. The fallible sort
+        // elaboration completed above, so the state-changing phase is atomic.
+        self.register_elaborated_datatype_constructors(
+            name,
+            &sort,
+            &datatype_dec.constructors,
+            &selector_sorts,
+            None,
+        );
+        Ok(())
     }
 
     /// Declare multiple (possibly mutually recursive) datatypes
@@ -359,10 +435,22 @@ impl Context {
         sort_decs: &[command::SortDec],
         datatype_decs: &[command::DatatypeDec],
     ) -> Result<()> {
+        if sort_decs.len() != datatype_decs.len() {
+            return Err(ElaborateError::Unsupported(format!(
+                "declare-datatypes has {} sort declaration(s) but {} datatype declaration(s)",
+                sort_decs.len(),
+                datatype_decs.len()
+            )));
+        }
+
         // Validate all names before making any changes
+        let mut group_sort_names: HashSet<String> = HashSet::default();
         for sort_dec in sort_decs {
             if is_reserved_symbol(&sort_dec.name) {
                 return Err(ElaborateError::ReservedSymbol(sort_dec.name.clone()));
+            }
+            if !group_sort_names.insert(sort_dec.name.clone()) {
+                return Err(ElaborateError::SortRedeclaration(sort_dec.name.clone()));
             }
             // Reject re-declaring an existing sort name (#reserved-ops
             // reverse gate). Checked against the PRE-EXISTING state for every
@@ -370,43 +458,113 @@ impl Context {
             // mutually recursive groups do not self-collide.
             self.check_datatype_sort_redeclaration(&sort_dec.name)?;
         }
-        for datatype_dec in datatype_decs {
+        for (sort_dec, datatype_dec) in sort_decs.iter().zip(datatype_decs) {
             Self::validate_datatype_names(None, datatype_dec)?;
+            if sort_dec.arity == 0 && !datatype_dec.type_params.is_empty() {
+                return Err(ElaborateError::Unsupported(format!(
+                    "datatype '{}' declares type parameters but arity 0",
+                    sort_dec.name
+                )));
+            }
+            if sort_dec.arity != 0 && datatype_dec.type_params.len() != sort_dec.arity as usize {
+                return Err(ElaborateError::Unsupported(format!(
+                    "datatype '{}' has arity {} but {} type parameter(s)",
+                    sort_dec.name,
+                    sort_dec.arity,
+                    datatype_dec.type_params.len()
+                )));
+            }
         }
 
-        // First pass: register all sort names. Parametric members (arity > 0)
-        // are stored as templates; monomorphic members (arity 0) get a concrete
-        // uninterpreted sort so the second pass can reference them.
-        for (sort_dec, datatype_dec) in sort_decs.iter().zip(datatype_decs.iter()) {
+        // Validate every monomorphic field sort against a narrow scratch
+        // context containing the whole mutually-recursive group. This catches
+        // all user errors before the live context changes, including references
+        // to a parametric datatype declared by the same group.
+        let empty: HashMap<String, Sort> = HashMap::default();
+        let mut preflight = self.datatype_sort_preflight_context();
+        for (sort_dec, datatype_dec) in sort_decs.iter().zip(datatype_decs) {
             if sort_dec.arity == 0 {
-                if !datatype_dec.type_params.is_empty() {
-                    return Err(ElaborateError::Unsupported(format!(
-                        "datatype '{}' declares type parameters but arity 0",
-                        sort_dec.name
-                    )));
-                }
-                let sort = Sort::Uninterpreted(sort_dec.name.clone());
-                self.sort_defs.insert(sort_dec.name.clone(), sort);
-                self.track_scoped_sort_def(sort_dec.name.clone());
+                preflight.sort_defs.insert(
+                    sort_dec.name.clone(),
+                    Sort::Uninterpreted(sort_dec.name.clone()),
+                );
             } else {
-                if datatype_dec.type_params.len() != sort_dec.arity as usize {
-                    return Err(ElaborateError::Unsupported(format!(
-                        "datatype '{}' has arity {} but {} type parameter(s)",
-                        sort_dec.name,
-                        sort_dec.arity,
-                        datatype_dec.type_params.len()
-                    )));
-                }
+                preflight
+                    .parametric_datatypes
+                    .insert(sort_dec.name.clone(), datatype_dec.clone());
+            }
+        }
+        for (sort_dec, datatype_dec) in sort_decs.iter().zip(datatype_decs) {
+            if sort_dec.arity == 0 {
+                preflight.elaborate_datatype_selector_sorts(&datatype_dec.constructors, &empty)?;
+            }
+        }
+
+        // Parametric templates must be visible while the live context
+        // elaborates monomorphic members that reference them. Preflight above
+        // guarantees this phase cannot fail for user-controlled input.
+        let parametric_names: Vec<String> = sort_decs
+            .iter()
+            .filter(|sort_dec| sort_dec.arity != 0)
+            .map(|sort_dec| sort_dec.name.clone())
+            .collect();
+        let scoped_parametric_count = self
+            .scopes
+            .last()
+            .map_or(0, |frame| frame.parametric_datatypes.len());
+        for (sort_dec, datatype_dec) in sort_decs.iter().zip(datatype_decs) {
+            if sort_dec.arity != 0 {
                 self.parametric_datatypes
                     .insert(sort_dec.name.clone(), datatype_dec.clone());
                 self.track_scoped_parametric(sort_dec.name.clone());
             }
         }
+        let selector_sorts = sort_decs
+            .iter()
+            .zip(datatype_decs)
+            .map(|(sort_dec, datatype_dec)| {
+                if sort_dec.arity == 0 {
+                    self.elaborate_datatype_selector_sorts(&datatype_dec.constructors, &empty)
+                } else {
+                    Ok(Vec::new())
+                }
+            })
+            .collect::<Result<Vec<_>>>();
+        let selector_sorts = match selector_sorts {
+            Ok(selector_sorts) => selector_sorts,
+            Err(error) => {
+                // The scratch context above should make this branch reachable
+                // only if live sort metadata changed unexpectedly. Still fail
+                // closed and remove every group template rather than exposing a
+                // partially declared group.
+                for name in &parametric_names {
+                    self.parametric_datatypes.remove(name);
+                }
+                if let Some(frame) = self.scopes.last_mut() {
+                    frame.parametric_datatypes.truncate(scoped_parametric_count);
+                }
+                return Err(error);
+            }
+        };
+
+        // First pass: register all sort names. Parametric members (arity > 0)
+        // are stored as templates; monomorphic members (arity 0) get a concrete
+        // uninterpreted sort so the second pass can reference them.
+        for sort_dec in sort_decs {
+            if sort_dec.arity == 0 {
+                let sort = Sort::Uninterpreted(sort_dec.name.clone());
+                self.sort_defs.insert(sort_dec.name.clone(), sort);
+                self.track_scoped_sort_def(sort_dec.name.clone());
+            }
+        }
 
         // Second pass: register constructors/selectors/testers for the
         // monomorphic members only.
-        let empty: HashMap<String, Sort> = HashMap::default();
-        for (sort_dec, datatype_dec) in sort_decs.iter().zip(datatype_decs.iter()) {
+        for ((sort_dec, datatype_dec), selector_sorts) in sort_decs
+            .iter()
+            .zip(datatype_decs)
+            .zip(selector_sorts.iter())
+        {
             if sort_dec.arity != 0 {
                 continue;
             }
@@ -421,13 +579,13 @@ impl Context {
             self.datatypes.insert(sort_dec.name.clone(), ctor_names);
             self.track_scoped_datatype(sort_dec.name.clone());
 
-            self.register_datatype_constructors(
+            self.register_elaborated_datatype_constructors(
                 &sort_dec.name,
                 &sort,
                 &datatype_dec.constructors,
-                &empty,
+                selector_sorts,
                 None,
-            )?;
+            );
         }
 
         Ok(())

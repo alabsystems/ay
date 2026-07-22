@@ -222,7 +222,7 @@ fn main() {
             println!("FEASIBLE {} {dt:.3}", ratio_str(&(&v / &p.obj_scale)));
         }
         Ok(Outcome::Infeasible { .. }) => println!("INFEASIBLE - {dt:.3}"),
-        Ok(Outcome::Unbounded { .. }) => println!("UNBOUNDED - {dt:.3}"),
+        Ok(Outcome::Unbounded) => println!("UNBOUNDED - {dt:.3}"),
         Ok(Outcome::Unknown { reason }) => println!("UNKNOWN {reason:?} {dt:.3}"),
         Err(e) => println!("ERROR {e:?} {dt:.3}"),
         Ok(other) => println!("OTHER {other:?} {dt:.3}"),
@@ -241,6 +241,10 @@ fn main() {
         let pxline = ay_milp::px_profile_line();
         if !pxline.is_empty() {
             eprintln!("{pxline}");
+        }
+        let sbline = ay_milp::sb_profile_line();
+        if !sbline.is_empty() {
+            eprintln!("{sbline}");
         }
     }
 }

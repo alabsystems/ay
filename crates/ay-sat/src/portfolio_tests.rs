@@ -765,11 +765,13 @@ fn test_portfolio_soundness_gate_rejects_untrusted_unsat() {
 /// must be OFF for unsound cross-worker clause sharing.
 #[test]
 fn test_portfolio_clause_sharing_disabled_for_soundness() {
-    assert!(
-        !PORTFOLIO_CLAUSE_SHARING_ENABLED,
-        "cross-worker clause sharing must stay disabled until it is re-expressed \
-         over the stable external variable namespace (task #14 soundness)"
-    );
+    const {
+        assert!(
+            !PORTFOLIO_CLAUSE_SHARING_ENABLED,
+            "cross-worker clause sharing must stay disabled until it is re-expressed \
+             over the stable external variable namespace (task #14 soundness)"
+        );
+    }
 }
 
 /// Regression: the multi-threaded portfolio must NEVER report UNSAT on a
@@ -876,7 +878,7 @@ fn pigeonhole_cnf(holes: usize) -> String {
     let mut out = format!("p cnf {} {}\n", nv, clauses.len());
     for cl in &clauses {
         for lit in cl {
-            out.push_str(&format!("{} ", lit));
+            out.push_str(&format!("{lit} "));
         }
         out.push_str("0\n");
     }

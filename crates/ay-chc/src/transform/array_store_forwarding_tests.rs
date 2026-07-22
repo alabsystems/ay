@@ -10,6 +10,7 @@ use crate::parser::ChcParser;
 use crate::pdr::{PdrConfig, PdrResult, PdrSolver};
 use crate::portfolio::{EngineConfig, PortfolioConfig, PortfolioResult, PortfolioSolver};
 use crate::transform::{DeadParamEliminator, TransformationPipeline};
+use std::fmt::Write as _;
 
 fn parse(smt: &str) -> ChcProblem {
     let problem =
@@ -403,10 +404,17 @@ fn threaded_memory_problem(relations: usize, arrays: usize, query_bound: i64) ->
     for k in 0..relations {
         smt.push_str(&format!("(declare-fun P{k} (Int {arr_params}) Bool)\n"));
     }
-    let mvars: String = (1..=arrays)
-        .map(|j| format!("(m{j} (Array Int Int)) "))
-        .collect();
-    let margs = |_: usize| -> String { (1..=arrays).map(|j| format!(" m{j}")).collect() };
+    let mut mvars = String::new();
+    for j in 1..=arrays {
+        write!(mvars, "(m{j} (Array Int Int)) ").expect("writing to a String cannot fail");
+    }
+    let margs = |_: usize| -> String {
+        let mut args = String::new();
+        for j in 1..=arrays {
+            write!(args, " m{j}").expect("writing to a String cannot fail");
+        }
+        args
+    };
     smt.push_str(&format!(
         "(assert (forall ((x Int) {mvars}) (=> (= x 0) (P0 x{}))))\n",
         margs(0)

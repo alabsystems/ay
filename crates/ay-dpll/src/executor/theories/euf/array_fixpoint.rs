@@ -55,25 +55,6 @@ fn contains_symbolic_array_default(terms: &ay_core::TermStore, root: TermId) -> 
     false
 }
 
-#[cfg(test)]
-mod array_default_alias_tests {
-    use super::contains_symbolic_array_default;
-    use ay_core::{Sort, TermStore};
-
-    #[test]
-    fn detects_direct_and_nested_symbolic_bool_defaults() {
-        let mut terms = TermStore::new();
-        let array = terms.mk_var("a", Sort::array(Sort::Int, Sort::Bool));
-        let default = terms.mk_array_default(array);
-        let negated = terms.mk_not(default);
-        let plain = terms.mk_var("p", Sort::Bool);
-
-        assert!(contains_symbolic_array_default(&terms, default));
-        assert!(contains_symbolic_array_default(&terms, negated));
-        assert!(!contains_symbolic_array_default(&terms, plain));
-    }
-}
-
 impl ArrayAxiomPlan {
     fn from_mode(mode: ArrayAxiomMode) -> Self {
         match mode {
@@ -517,6 +498,14 @@ impl Executor {
                         .as_ref()
                         .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
                         || solve_deadline.expired()
+                        // RSS discipline (#array-deadline-forward): poll the
+                        // process-wide memory ceiling at split-loop
+                        // boundaries too — repeated QF_AX subset re-solves
+                        // grow the term store monotonically and the
+                        // competition harness pairs the internal limit with
+                        // a zero-grace external RSS watchdog. Protective
+                        // only (Unknown), no-op when no ceiling is set.
+                        || ay_sys::process_memory_exceeded()
                 },
                 // #8596: Pure ArrayEUF has no arithmetic solver. Triangle axioms
                 // create (x <= y) atoms with no theory interpretation, causing
@@ -1371,5 +1360,24 @@ impl Executor {
         self.ctx.assertions.retain(|a| seen.insert(*a));
 
         self.array_axiom_scope = None;
+    }
+}
+
+#[cfg(test)]
+mod array_default_alias_tests {
+    use super::contains_symbolic_array_default;
+    use ay_core::{Sort, TermStore};
+
+    #[test]
+    fn detects_direct_and_nested_symbolic_bool_defaults() {
+        let mut terms = TermStore::new();
+        let array = terms.mk_var("a", Sort::array(Sort::Int, Sort::Bool));
+        let default = terms.mk_array_default(array);
+        let negated = terms.mk_not(default);
+        let plain = terms.mk_var("p", Sort::Bool);
+
+        assert!(contains_symbolic_array_default(&terms, default));
+        assert!(contains_symbolic_array_default(&terms, negated));
+        assert!(!contains_symbolic_array_default(&terms, plain));
     }
 }

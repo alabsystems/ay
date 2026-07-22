@@ -4,8 +4,10 @@
 
 //! Integration tests for the catamorphism-abstraction adaptive route.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
+
+use ay_test_support::env::{lock_env, ScopedEnvVar};
 
 use crate::adaptive::{AdaptiveConfig, AdaptivePortfolio};
 use crate::engine_result::ValidationEvidence;
@@ -16,19 +18,11 @@ use crate::{
 };
 
 /// The route reads `AY_CHC_DISABLE_CATA` from the process environment, so
-/// every test in this module serializes through one lock to keep the
-/// kill-switch test from perturbing concurrently running route tests.
-fn env_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-/// Serialize route tests; recover from a poisoned lock (a panicking sibling
-/// test must not cascade into spurious PoisonError failures here).
+/// every test in this module serializes through the one workspace-wide env
+/// lock to keep the kill-switch test from perturbing concurrently running
+/// route tests (and any other env-touching test in this binary).
 fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-    env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    lock_env()
 }
 
 fn list_sort() -> ChcSort {
@@ -398,8 +392,8 @@ fn cata_route_never_reports_false_safe_on_broken_sortedness() {
     let _guard = env_guard();
     // The CATA v3 element/ordering levels are on by default, so the route
     // exercises the `Sorted`/`Min` catamorphisms on this problem. Guard against
-    // a sibling test leaving the opt-out kill switch set.
-    std::env::remove_var("AY_CHC_DISABLE_CATA_ELEMENTS");
+    // a sibling test leaving the opt-out kill switch set (restored on exit).
+    let _cata_elements = ScopedEnvVar::unset("AY_CHC_DISABLE_CATA_ELEMENTS");
     let solver = route_solver(broken_sortedness_unsafe_problem());
     let outcome = solver.try_cata_abstraction_route(None);
     match outcome {
@@ -416,10 +410,9 @@ fn cata_route_never_reports_false_safe_on_broken_sortedness() {
 #[test]
 fn cata_route_respects_kill_switch() {
     let _guard = env_guard();
-    std::env::set_var("AY_CHC_DISABLE_CATA", "1");
+    let _cata = ScopedEnvVar::set("AY_CHC_DISABLE_CATA", "1");
     let solver = route_solver(equal_shape_safe_problem());
     let result = solver.try_cata_abstraction_route(None);
-    std::env::remove_var("AY_CHC_DISABLE_CATA");
     assert!(result.is_none(), "kill switch must disable the cata lane");
 }
 

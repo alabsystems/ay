@@ -2222,7 +2222,10 @@ fn test_oll_matches_reference_on_real_instance_when_requested() {
         return;
     };
     let text = std::fs::read_to_string(&path).expect("read instance file");
-    let instance = if path.ends_with(".wbo") {
+    let instance = if std::path::Path::new(&path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wbo"))
+    {
         let wbo = crate::parse_wbo(&text).expect("parse wbo");
         wbo::wbo_to_pbo(&wbo)
     } else {

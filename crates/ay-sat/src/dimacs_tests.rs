@@ -9,53 +9,29 @@ use crate::circuit_scout::{
     CircuitOriginalDimacsSatModelAuthorityPacket, CircuitSourceFrameFamily, CircuitSourceFrameKind,
     CircuitSourceFrameRow,
 };
-use std::{
-    fs,
-    path::PathBuf,
-    sync::{Mutex, MutexGuard},
-};
+use ay_test_support::env::{lock_env, ScopedEnvVar};
+use std::sync::MutexGuard;
+use std::{fs, path::PathBuf};
 
-static CIRCUIT_MULTIPLIER22_DIMACS_AUTHORITY_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-struct EnvGuard(Vec<(&'static str, Option<String>)>);
-
-impl EnvGuard {
-    fn capture(keys: &[&'static str]) -> Self {
-        Self(
-            keys.iter()
-                .map(|key| (*key, std::env::var(key).ok()))
-                .collect(),
-        )
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in &self.0 {
-            if let Some(value) = value {
-                std::env::set_var(key, value);
-            } else {
-                std::env::remove_var(key);
-            }
-        }
-    }
-}
-
-fn circuit_multiplier22_dimacs_authority_env_guard() -> (MutexGuard<'static, ()>, EnvGuard) {
-    let guard = CIRCUIT_MULTIPLIER22_DIMACS_AUTHORITY_ENV_TEST_LOCK
-        .lock()
-        .expect("env test lock");
-    let env = EnvGuard::capture(&[
+/// Acquire the one workspace-wide env lock and clear the six authority env
+/// vars, capturing their prior values; the returned guards restore them (also
+/// on panic) when both drop. The caller layers its own [`ScopedEnvVar::set`]
+/// guards on top in a SEPARATE binding so restore stays LIFO (the set layer
+/// unwinds before this reset layer).
+fn circuit_multiplier22_dimacs_authority_env_guard() -> (MutexGuard<'static, ()>, Vec<ScopedEnvVar>)
+{
+    let guard = lock_env();
+    let env = [
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV,
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_FORMULA_ENV,
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_STDOUT_ENV,
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_ARTIFACT_ENV,
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_COMMAND_ENV,
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_EXIT_STATUS_ENV,
-    ]);
-    for (key, _) in &env.0 {
-        std::env::remove_var(key);
-    }
+    ]
+    .into_iter()
+    .map(ScopedEnvVar::unset)
+    .collect();
     (guard, env)
 }
 
@@ -331,36 +307,42 @@ fn checker_json_with_field(
     serde_json::to_vec(&payload).expect("checker json serializes")
 }
 
+/// Set the six authority env vars for the test body, returning restore-on-drop
+/// guards the caller MUST hold (in a binding separate from the reset guards from
+/// [`circuit_multiplier22_dimacs_authority_env_guard`]).
+#[must_use]
 fn set_circuit_multiplier22_dimacs_authority_env(
     formula_path: &Path,
     model_stdout_path: &Path,
     checker_verdict_json_path: &Path,
     checker_command: &[String],
     checker_exit_status: i32,
-) {
-    std::env::set_var(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
-    std::env::set_var(
-        CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_FORMULA_ENV,
-        formula_path.to_str().expect("formula path utf8"),
-    );
-    std::env::set_var(
-        CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_STDOUT_ENV,
-        model_stdout_path.to_str().expect("model stdout path utf8"),
-    );
-    std::env::set_var(
-        CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_ARTIFACT_ENV,
-        checker_verdict_json_path
-            .to_str()
-            .expect("checker verdict path utf8"),
-    );
-    std::env::set_var(
-        CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_COMMAND_ENV,
-        serde_json::to_string(checker_command).expect("checker command json"),
-    );
-    std::env::set_var(
-        CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_EXIT_STATUS_ENV,
-        checker_exit_status.to_string(),
-    );
+) -> Vec<ScopedEnvVar> {
+    vec![
+        ScopedEnvVar::set(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1"),
+        ScopedEnvVar::set(
+            CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_FORMULA_ENV,
+            formula_path.to_str().expect("formula path utf8"),
+        ),
+        ScopedEnvVar::set(
+            CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_STDOUT_ENV,
+            model_stdout_path.to_str().expect("model stdout path utf8"),
+        ),
+        ScopedEnvVar::set(
+            CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_ARTIFACT_ENV,
+            checker_verdict_json_path
+                .to_str()
+                .expect("checker verdict path utf8"),
+        ),
+        ScopedEnvVar::set(
+            CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_COMMAND_ENV,
+            &serde_json::to_string(checker_command).expect("checker command json"),
+        ),
+        ScopedEnvVar::set(
+            CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_EXIT_STATUS_ENV,
+            &checker_exit_status.to_string(),
+        ),
+    ]
 }
 
 #[test]
@@ -1131,11 +1113,13 @@ fn test_circuit_multiplier22_dimacs_authority_run_matrix_handoff_rejects_checker
 #[test]
 fn test_circuit_multiplier22_dimacs_authority_env_handoff_requires_complete_run_matrix_artifacts() {
     let (_lock, _env) = circuit_multiplier22_dimacs_authority_env_guard();
-    std::env::set_var(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
-    std::env::set_var(
-        CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_FORMULA_ENV,
-        "formula.cnf",
-    );
+    let _authority_env = [
+        ScopedEnvVar::set(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1"),
+        ScopedEnvVar::set(
+            CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_FORMULA_ENV,
+            "formula.cnf",
+        ),
+    ];
     let (formula, source_rows, _authority_packet) =
         circuit_multiplier22_dimacs_authority_fixture(true);
 
@@ -1181,32 +1165,12 @@ fn test_circuit_multiplier22_dimacs_authority_env_handoff_accepts_complete_matri
         &authority_packet.checker_verdict_json,
     )
     .expect("write retained checker verdict");
-    std::env::set_var(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
-    std::env::set_var(
-        CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_FORMULA_ENV,
-        formula_path.to_str().expect("formula path utf8"),
-    );
-    std::env::set_var(
-        CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_STDOUT_ENV,
-        model_stdout_path.to_str().expect("model stdout path utf8"),
-    );
-    std::env::set_var(
-        CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_ARTIFACT_ENV,
-        checker_verdict_json_path
-            .to_str()
-            .expect("checker verdict path utf8"),
-    );
-    std::env::set_var(
-        CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_COMMAND_ENV,
-        serde_json::to_string(&authority_packet.artifacts.checker_command)
-            .expect("checker command json"),
-    );
-    std::env::set_var(
-        CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_EXIT_STATUS_ENV,
-        authority_packet
-            .checker_evidence
-            .checker_exit_status
-            .to_string(),
+    let _authority_env = set_circuit_multiplier22_dimacs_authority_env(
+        &formula_path,
+        &model_stdout_path,
+        &checker_verdict_json_path,
+        &authority_packet.artifacts.checker_command,
+        authority_packet.checker_evidence.checker_exit_status,
     );
 
     let decision = circuit_multiplier22_dimacs_sat_model_authority_route_from_env(
@@ -1246,7 +1210,7 @@ fn test_circuit_multiplier22_dimacs_authority_env_handoff_retained_stdout_admits
     ) = retained_authority_file_fixture_with_checker_json(|packet| {
         packet.checker_verdict_json.clone()
     });
-    set_circuit_multiplier22_dimacs_authority_env(
+    let _authority_env = set_circuit_multiplier22_dimacs_authority_env(
         &formula_path,
         &model_stdout_path,
         &checker_verdict_json_path,
@@ -1298,7 +1262,7 @@ fn test_circuit_multiplier22_dimacs_authority_env_handoff_retained_stdout_reject
     ) = retained_authority_file_fixture_with_checker_json(|packet| {
         packet.checker_verdict_json.clone()
     });
-    set_circuit_multiplier22_dimacs_authority_env(
+    let _authority_env = set_circuit_multiplier22_dimacs_authority_env(
         &formula_path,
         &model_stdout_path,
         &checker_verdict_json_path,
@@ -1340,7 +1304,7 @@ fn test_circuit_multiplier22_dimacs_authority_env_handoff_retained_stdout_reject
     });
     fs::write(&model_stdout_path, b"s SATISFIABLE\nv -1 -2 3 0\n")
         .expect("write drifted retained model stdout");
-    set_circuit_multiplier22_dimacs_authority_env(
+    let _authority_env = set_circuit_multiplier22_dimacs_authority_env(
         &formula_path,
         &model_stdout_path,
         &checker_verdict_json_path,
@@ -1380,7 +1344,7 @@ fn test_circuit_multiplier22_dimacs_authority_env_handoff_retained_stdout_blocks
     ) = retained_authority_file_fixture_with_checker_json(|packet| {
         packet.checker_verdict_json.clone()
     });
-    set_circuit_multiplier22_dimacs_authority_env(
+    let _authority_env = set_circuit_multiplier22_dimacs_authority_env(
         &formula_path,
         &model_stdout_path,
         &checker_verdict_json_path,
@@ -1446,7 +1410,7 @@ fn test_circuit_multiplier22_dimacs_authority_env_handoff_rejects_incomplete_che
         ) = retained_authority_file_fixture_with_checker_json(|packet| {
             checker_json_without_field(packet, field)
         });
-        set_circuit_multiplier22_dimacs_authority_env(
+        let _authority_env = set_circuit_multiplier22_dimacs_authority_env(
             &formula_path,
             &model_stdout_path,
             &checker_verdict_json_path,
@@ -1517,7 +1481,7 @@ fn test_circuit_multiplier22_dimacs_authority_env_handoff_rejects_checker_artifa
         ) = retained_authority_file_fixture_with_checker_json(|packet| {
             checker_json_with_field(packet, field, value)
         });
-        set_circuit_multiplier22_dimacs_authority_env(
+        let _authority_env = set_circuit_multiplier22_dimacs_authority_env(
             &formula_path,
             &model_stdout_path,
             &checker_verdict_json_path,
@@ -1566,21 +1530,21 @@ fn test_circuit_multiplier22_dimacs_authority_env_handoff_derives_paths_from_che
         &authority_packet.checker_verdict_json,
     )
     .expect("write retained checker verdict");
-    std::env::set_var(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_ARTIFACT_ENV,
         checker_verdict_json_path
             .to_str()
             .expect("checker verdict path utf8"),
     );
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_COMMAND_ENV,
-        serde_json::to_string(&authority_packet.artifacts.checker_command)
+        &serde_json::to_string(&authority_packet.artifacts.checker_command)
             .expect("checker command json"),
     );
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_EXIT_STATUS_ENV,
-        authority_packet
+        &authority_packet
             .checker_evidence
             .checker_exit_status
             .to_string(),
@@ -1636,20 +1600,20 @@ fn test_circuit_multiplier22_dimacs_authority_env_handoff_rejects_checker_comman
         .to_str()
         .expect("drift formula path utf8")
         .to_owned();
-    std::env::set_var(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_ARTIFACT_ENV,
         checker_verdict_json_path
             .to_str()
             .expect("checker verdict path utf8"),
     );
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_COMMAND_ENV,
-        serde_json::to_string(&checker_command).expect("checker command json"),
+        &serde_json::to_string(&checker_command).expect("checker command json"),
     );
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_EXIT_STATUS_ENV,
-        authority_packet
+        &authority_packet
             .checker_evidence
             .checker_exit_status
             .to_string(),
@@ -1693,27 +1657,27 @@ fn test_circuit_multiplier22_dimacs_authority_env_handoff_rejects_formula_path_d
         &authority_packet.checker_verdict_json,
     )
     .expect("write retained checker verdict");
-    std::env::set_var(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_FORMULA_ENV,
         drift_formula_path
             .to_str()
             .expect("drift formula path utf8"),
     );
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_ARTIFACT_ENV,
         checker_verdict_json_path
             .to_str()
             .expect("checker verdict path utf8"),
     );
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_COMMAND_ENV,
-        serde_json::to_string(&authority_packet.artifacts.checker_command)
+        &serde_json::to_string(&authority_packet.artifacts.checker_command)
             .expect("checker command json"),
     );
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_EXIT_STATUS_ENV,
-        authority_packet
+        &authority_packet
             .checker_evidence
             .checker_exit_status
             .to_string(),
@@ -1756,14 +1720,14 @@ fn test_circuit_multiplier22_dimacs_authority_env_handoff_blocks_missing_checker
         &authority_packet.checker_verdict_json,
     )
     .expect("write retained checker verdict");
-    std::env::set_var(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_ARTIFACT_ENV,
         checker_verdict_json_path
             .to_str()
             .expect("checker verdict path utf8"),
     );
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_EXIT_STATUS_ENV,
         "0",
     );
@@ -1805,18 +1769,18 @@ fn test_circuit_multiplier22_dimacs_authority_env_handoff_blocks_malformed_check
         &authority_packet.checker_verdict_json,
     )
     .expect("write retained checker verdict");
-    std::env::set_var(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_ARTIFACT_ENV,
         checker_verdict_json_path
             .to_str()
             .expect("checker verdict path utf8"),
     );
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_COMMAND_ENV,
         r#"["ay",""]"#,
     );
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_EXIT_STATUS_ENV,
         "0",
     );
@@ -1858,16 +1822,16 @@ fn test_circuit_multiplier22_dimacs_authority_env_handoff_blocks_missing_checker
         &authority_packet.checker_verdict_json,
     )
     .expect("write retained checker verdict");
-    std::env::set_var(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_ARTIFACT_ENV,
         checker_verdict_json_path
             .to_str()
             .expect("checker verdict path utf8"),
     );
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_COMMAND_ENV,
-        serde_json::to_string(&authority_packet.artifacts.checker_command)
+        &serde_json::to_string(&authority_packet.artifacts.checker_command)
             .expect("checker command json"),
     );
 
@@ -1904,7 +1868,7 @@ fn test_circuit_multiplier22_dimacs_authority_env_handoff_blocks_nonzero_checker
     ) = retained_authority_file_fixture_with_checker_json(|packet| {
         packet.checker_verdict_json.clone()
     });
-    set_circuit_multiplier22_dimacs_authority_env(
+    let _authority_env = set_circuit_multiplier22_dimacs_authority_env(
         &formula_path,
         &model_stdout_path,
         &checker_verdict_json_path,
@@ -1949,19 +1913,19 @@ fn test_circuit_multiplier22_dimacs_authority_env_handoff_blocks_malformed_statu
         &authority_packet.checker_verdict_json,
     )
     .expect("write retained checker verdict");
-    std::env::set_var(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_ENV, "1");
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_MODEL_CHECKER_ARTIFACT_ENV,
         checker_verdict_json_path
             .to_str()
             .expect("checker verdict path utf8"),
     );
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_COMMAND_ENV,
-        serde_json::to_string(&authority_packet.artifacts.checker_command)
+        &serde_json::to_string(&authority_packet.artifacts.checker_command)
             .expect("checker command json"),
     );
-    std::env::set_var(
+    let _authority_env = ScopedEnvVar::set(
         CIRCUIT_MULTIPLIER22_DIMACS_MODEL_AUTHORITY_CHECKER_EXIT_STATUS_ENV,
         "not-an-exit-status",
     );

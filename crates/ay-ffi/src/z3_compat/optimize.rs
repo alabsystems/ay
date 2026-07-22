@@ -57,7 +57,7 @@
 //! satisfied softs, which could select a different model and sever the model from
 //! the certified optimum/accounting.
 //!
-use std::ffi::{c_int, c_uint, c_void, CStr};
+use std::ffi::{c_int, c_uint, c_void};
 use std::ptr;
 
 use ay_dpll::api::{MaxSmtStatus, ObjectiveValue, Sort, Term};
@@ -68,7 +68,8 @@ use num_rational::BigRational;
 use super::{
     apply_supported_params, ast_to_term, cache_ast_vector, cache_string, cache_symbol,
     ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint,
-    ffi_guard_void, flatten_statistics, record_ast_sort, term_to_ast, DecisionOwnerFamily,
+    ffi_guard_void, ffi_read_bounded_parser_file, ffi_read_bounded_parser_text,
+    ffi_read_bounded_text, flatten_statistics, record_ast_sort, term_to_ast, DecisionOwnerFamily,
     ModelHandle, OptimizeCheckOutcome, OptimizeHandle, OptimizeScopeMarker, ParamDescr,
     ParamDescrsHandle, SoftRecord, StatsHandle, Z3Context, Z3_ast, Z3_ast_vector, Z3_context,
     Z3_model, Z3_optimize, Z3_param_descrs, Z3_params, Z3_stats, Z3_string, Z3_symbol,
@@ -231,10 +232,7 @@ pub unsafe extern "C" fn Z3_optimize_assert_soft(
     } else {
         // SAFETY: the caller's `# Safety` contract guarantees `weight`, when non-null, points to
         // a valid null-terminated C string owned by the caller for the duration of this call.
-        match unsafe { CStr::from_ptr(weight) }.to_str() {
-            Ok(s) => Some(s.to_string()),
-            Err(_) => Some(String::new()), // non-UTF-8 → treated as invalid below
-        }
+        Some(unsafe { ffi_read_bounded_text(weight) }.unwrap_or_default())
     };
     let group: Option<String> = if id.is_null() {
         None
@@ -1478,15 +1476,12 @@ fn parse_optimize_transaction(
 #[no_mangle]
 pub unsafe extern "C" fn Z3_optimize_from_string(c: Z3_context, o: Z3_optimize, s: Z3_string) {
     // Extract the string outside the guard (raw-pointer deref).
-    let input: Option<String> = if s.is_null() {
+    let input = if s.is_null() {
         None
     } else {
         // SAFETY: the caller's contract guarantees `s`, when non-null, is a valid
         // null-terminated C string owned by the caller for this call's duration.
-        match unsafe { CStr::from_ptr(s) }.to_str() {
-            Ok(v) => Some(v.to_string()),
-            Err(_) => Some(String::new()), // non-UTF-8 → treated as parse error below
-        }
+        Some(unsafe { ffi_read_bounded_parser_text(s) })
     };
     // SAFETY: `ffi_guard_void` handles null `c` and catches panics; `o` is
     // null-checked via `as_ref`.
@@ -1497,10 +1492,18 @@ pub unsafe extern "C" fn Z3_optimize_from_string(c: Z3_context, o: Z3_optimize, 
                 ctx.error_msg = Some("null Z3_optimize handle in from_string".to_string());
                 return;
             };
-            let Some(input) = input.as_deref() else {
-                ctx.last_error = Z3_EXCEPTION;
-                ctx.error_msg = Some("Z3_optimize_from_string: null input string".to_string());
-                return;
+            let input = match input.as_ref() {
+                None => {
+                    ctx.last_error = Z3_EXCEPTION;
+                    ctx.error_msg = Some("Z3_optimize_from_string: null input string".to_string());
+                    return;
+                }
+                Some(Ok(input)) => input,
+                Some(Err(error)) => {
+                    ctx.last_error = Z3_EXCEPTION;
+                    ctx.error_msg = Some(format!("Z3_optimize_from_string: {error}"));
+                    return;
+                }
             };
             parse_optimize_transaction(ctx, opt, input, "Z3_optimize_from_string");
         });
@@ -1519,10 +1522,7 @@ pub unsafe extern "C" fn Z3_optimize_from_file(c: Z3_context, o: Z3_optimize, s:
         None
     } else {
         // SAFETY: caller guarantees a valid null-terminated C string when non-null.
-        match unsafe { CStr::from_ptr(s) }.to_str() {
-            Ok(v) => Some(v.to_string()),
-            Err(_) => None,
-        }
+        unsafe { ffi_read_bounded_text(s) }.ok()
     };
     // SAFETY: `ffi_guard_void` handles null `c` and catches panics; `o` is
     // null-checked via `as_ref`.
@@ -1538,7 +1538,7 @@ pub unsafe extern "C" fn Z3_optimize_from_file(c: Z3_context, o: Z3_optimize, s:
                 ctx.error_msg = Some("Z3_optimize_from_file: null/invalid path".to_string());
                 return;
             };
-            let contents = match std::fs::read_to_string(path) {
+            let contents = match ffi_read_bounded_parser_file(path) {
                 Ok(v) => v,
                 Err(e) => {
                     ctx.last_error = Z3_FILE_ACCESS_ERROR;

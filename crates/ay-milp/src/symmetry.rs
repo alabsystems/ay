@@ -1268,7 +1268,7 @@ fn assemble_orbitopes(
             break;
         }
         let k = cls.len();
-        if k < 2 || k > MAX_ORBITOPE_BLOCKS {
+        if !(2..=MAX_ORBITOPE_BLOCKS).contains(&k) {
             continue;
         }
         if cls.iter().any(|&c| consumed[c as usize]) {
@@ -1898,7 +1898,7 @@ mod tests {
     /// pairwise-fixpoint lex chain from COMPLETE orbitopal fixing (per-cell
     /// min/max over the enumerated sorted points)? Prints a deficit count.
     #[test]
-    #[ignore]
+    #[ignore = "diagnostic may enumerate 2000 times 3^12 assignments"]
     fn lex_chain_completeness_deficit_stats() {
         let blocks: Vec<Vec<u32>> = (0..4u32).map(|i| (3 * i..3 * i + 3).collect()).collect();
         let n = 12usize;

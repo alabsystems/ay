@@ -40,7 +40,7 @@ fn fp_numeral_introspection() {
         assert!(Z3_fpa_is_numeral(c, onefive));
         assert!(Z3_fpa_is_numeral_normal(c, onefive));
         let mut sgn: bool = true;
-        assert!(Z3_fpa_get_numeral_sign(c, onefive, &mut sgn));
+        assert!(Z3_fpa_get_numeral_sign(c, onefive, &raw mut sgn));
         assert!(!sgn); // positive → sign bit false
 
         // A symbolic FP const is NOT a numeral.

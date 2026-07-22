@@ -1359,7 +1359,7 @@ verify = ["s", "--version"]
     fn load_rejects_unknown_recipe_kind() {
         let body = git_entry("t").replace("cc-single-file", "curl-pipe-sh");
         let err = load_inline(&format!("schema_version = 1\n{body}")).unwrap_err();
-        let msg = format!("{:#}", err);
+        let msg = format!("{err:#}");
         assert!(msg.contains("curl-pipe-sh"), "{msg}");
     }
 
@@ -1368,13 +1368,13 @@ verify = ["s", "--version"]
         // verify as a shell string, not an argv array.
         let body = git_entry("t").replace(r#"verify = ["{bin}"]"#, r#"verify = "t --version""#);
         let err = load_inline(&format!("schema_version = 1\n{body}")).unwrap_err();
-        let msg = format!("{:#}", err);
+        let msg = format!("{err:#}");
         assert!(msg.contains("verify"), "{msg}");
 
         // recipe_args as a shell string.
         let body = git_entry("t").replace(r#"recipe_args = ["t.c"]"#, r#"recipe_args = "t.c -O3""#);
         let err = load_inline(&format!("schema_version = 1\n{body}")).unwrap_err();
-        let msg = format!("{:#}", err);
+        let msg = format!("{err:#}");
         assert!(msg.contains("recipe_args"), "{msg}");
     }
 
@@ -1386,13 +1386,13 @@ verify = ["s", "--version"]
             git_entry("dup")
         );
         let err = load_inline(&body).unwrap_err();
-        assert!(format!("{:#}", err).contains("duplicate"));
+        assert!(format!("{err:#}").contains("duplicate"));
     }
 
     #[test]
     fn load_rejects_unsupported_schema_version() {
         let err = load_inline("schema_version = 99\n").unwrap_err();
-        assert!(format!("{:#}", err).contains("schema_version"));
+        assert!(format!("{err:#}").contains("schema_version"));
     }
 
     #[test]
@@ -1403,7 +1403,7 @@ verify = ["s", "--version"]
             git_entry("t").replace("kind = \"checker\"", "kind = \"reference-solver\"")
         );
         let err = load_inline(&body).unwrap_err();
-        assert!(format!("{:#}", err).contains("reference-solver"));
+        assert!(format!("{err:#}").contains("reference-solver"));
 
         // Declared-but-unpinned (`commit = ""`) loads: the sanctioned
         // pre-0.1.0 cadical state (warns at install time instead).
@@ -1499,7 +1499,7 @@ verify = ["b", "--help"]
         ];
         for (entry, needle) in cases {
             let err = load_inline(&format!("schema_version = 1\n{entry}")).unwrap_err();
-            let msg = format!("{:#}", err);
+            let msg = format!("{err:#}");
             assert!(msg.contains(needle), "expected {needle:?} in: {msg}");
         }
     }

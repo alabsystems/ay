@@ -287,7 +287,11 @@ fn demand_shadow_takesome_flips_to_unsat() {
     let (prod, _ps) = solve(RED_FREEVAR_TAKESOME_REPRO, false, Duration::from_secs(8));
     let (shadow, ss) = solve(RED_FREEVAR_TAKESOME_REPRO, true, cap);
     let diag = ShadowDiag::from_stats(&ss);
-    eprintln!("[demand-shadow] FLIP takesome: prod={prod} shadow={shadow} diag={diag:?}");
+    eprintln!(
+        "[demand-shadow] FLIP takesome: prod={prod} shadow={shadow} diag={diag:?} \
+         dt_resume_depth={}",
+        diag.dt_resume_depth
+    );
     // Production (eager) is the pinned RED: NOT unsat (Unknown/timeout).
     assert_ne!(
         prod, "unsat",

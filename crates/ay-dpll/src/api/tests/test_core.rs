@@ -2565,8 +2565,7 @@ fn test_auflia_quantifier_forall_trigger_instantiation_8616() {
     let result = solver.check_sat();
     assert!(
         result.is_unsat(),
-        "Expected UNSAT via E-matching trigger instantiation, got {:?}",
-        result
+        "Expected UNSAT via E-matching trigger instantiation, got {result:?}"
     );
 }
 
@@ -2603,10 +2602,10 @@ fn test_datatype_member_redeclaration_adopted_or_rejected() {
         .try_declare_fun("mk-pta", &[Sort::Int], carrier.clone())
         .expect("identical-signature constructor redeclaration must be adopted");
     let sel = solver
-        .try_declare_fun("pta-x", &[carrier.clone()], Sort::Int)
+        .try_declare_fun("pta-x", std::slice::from_ref(&carrier), Sort::Int)
         .expect("identical-signature selector redeclaration must be adopted");
     let _tester = solver
-        .try_declare_fun("is-mk-pta", &[carrier.clone()], Sort::Bool)
+        .try_declare_fun("is-mk-pta", std::slice::from_ref(&carrier), Sort::Bool)
         .expect("identical-signature tester redeclaration must be adopted");
 
     // Mismatched signatures: rejected by the DatatypeMemberCollision gate.

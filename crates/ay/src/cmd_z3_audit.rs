@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,6 +39,9 @@ const BROADER_LEDGER_HEADING: &str = "## Broader Z3 Compatibility Honesty Ledger
 const C_API_FFI_SMOKE_ID: &str = "c_api_ffi_smoke";
 const SMT_MODEL_VALIDATION_SMOKE_ID: &str = "smt_model_validation_smoke";
 const SMT_REF_ONLY_EXAMPLE_LIMIT: usize = 3;
+const MAX_CHC_MANIFEST_ARTIFACTS: usize = 4_096;
+const MAX_CHC_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_CHC_TOTAL_ARTIFACT_BYTES: u64 = 256 * 1024 * 1024;
 const SMTLIB_EVAL_IDS: &[&str] = &[
     "smt-local-suite",
     "smt-smtcomp-qf-lia",
@@ -1352,7 +1355,7 @@ fn check_compatibility_inventory(
 fn check_private_compatibility_doc(path: &Path, inventory: &CompatibilityInventory) -> AuditCheck {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return AuditCheck::pass(
                 "compatibility_doc",
                 "private compatibility prose is not shipped; embedded inventory is authoritative",
@@ -1407,7 +1410,7 @@ fn check_cli_reference(path: &Path) -> AuditCheck {
             "cli_reference_scope",
             "CLI reference does not preserve the scoped Z3-compatibility disclaimer",
         ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => AuditCheck::pass(
+        Err(error) if error.kind() == io::ErrorKind::NotFound => AuditCheck::pass(
             "cli_reference_scope",
             "private CLI reference is not shipped; embedded compatibility claim scope is authoritative",
         ),
@@ -2301,7 +2304,7 @@ fn chc_certificate_replay_row(
     run: bool,
 ) -> ProofInventoryRow {
     let command = format!(
-        "{} solve --chc --proof <work-dir>/chc-certificate.smt2 {CHC_CANARY_PROBLEM} && ay z3-audit --reference-cache {}",
+        "{} solve --chc --stats-json --proof <work-dir>/chc-certificate.smt2 {CHC_CANARY_PROBLEM} && ay z3-audit --reference-cache {}",
         ay.display(),
         reference_cache_path.display()
     );
@@ -2335,7 +2338,14 @@ fn chc_certificate_replay_row(
     let emit = match run_command_capture(
         repo_root,
         ay,
-        &["solve", "--chc", "--proof", &certificate_arg, &problem_arg],
+        &[
+            "solve",
+            "--chc",
+            "--stats-json",
+            "--proof",
+            &certificate_arg,
+            &problem_arg,
+        ],
     ) {
         Ok(output) => output,
         Err(error) => {
@@ -2349,8 +2359,7 @@ fn chc_certificate_replay_row(
             );
         }
     };
-    let obligations_dir = work_dir.join("chc-obligations");
-    if !emit.status.success() || !certificate.is_file() || !obligations_dir.is_dir() {
+    if !emit.status.success() {
         return ProofInventoryRow::fail(
             "chc_certificate_replay",
             "CHC certificate replay",
@@ -2358,47 +2367,27 @@ fn chc_certificate_replay_row(
             "1/1 CHC certificate emitted and all replay obligations are UNSAT",
             command,
             format!(
-                "certificate emission failed: status={:?} cert_exists={} obligations_dir_exists={} stdout_tail={:?} stderr_tail={:?}",
+                "certificate emission failed: status={:?} stdout_tail={:?} stderr_tail={:?}",
                 emit.status.code(),
-                certificate.is_file(),
-                obligations_dir.is_dir(),
                 tail_text(&String::from_utf8_lossy(&emit.stdout)),
                 tail_text(&String::from_utf8_lossy(&emit.stderr))
             ),
         );
     }
-
-    let mut obligations = match fs::read_dir(&obligations_dir) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("smt2"))
-            .collect::<Vec<_>>(),
+    let emitted = match emitted_chc_artifacts(&emit, &certificate) {
+        Ok(emitted) => emitted,
         Err(error) => {
             return ProofInventoryRow::fail(
                 "chc_certificate_replay",
                 "CHC certificate replay",
-                "0/1 CHC replay obligations enumerated",
+                "0/1 same-run CHC evidence manifest authenticated",
                 "1/1 CHC certificate emitted and all replay obligations are UNSAT",
                 command,
-                format!("failed to read {}: {error}", obligations_dir.display()),
+                format!("failed to authenticate emitted CHC artifacts: {error}"),
             );
         }
     };
-    obligations.sort();
-    if obligations.is_empty() {
-        return ProofInventoryRow::fail(
-            "chc_certificate_replay",
-            "CHC certificate replay",
-            "0/1 CHC replay obligations emitted",
-            "1/1 CHC certificate emitted and all replay obligations are UNSAT",
-            command,
-            format!(
-                "no .smt2 obligations found in {}",
-                obligations_dir.display()
-            ),
-        );
-    }
+    let obligations = emitted.obligations;
 
     let cache = match reference_cache {
         Some(cache) => cache,
@@ -2430,7 +2419,7 @@ fn chc_certificate_replay_row(
             format!(
                 "CHC certificate replay passed from cache {}; certificate={} obligations={}",
                 cache.path.display(),
-                certificate.display(),
+                emitted.certificate.path.display(),
                 matched
             ),
         ),
@@ -2461,6 +2450,431 @@ fn resolve_work_dir(repo_root: &Path, explicit: Option<&Path>) -> PathBuf {
         || env::temp_dir().join(format!("ay-z3-audit-proof-{}", std::process::id())),
         |path| resolve_repo_path(repo_root, path),
     )
+}
+
+#[derive(Debug)]
+struct EmittedChcArtifacts {
+    certificate: AuthenticatedChcArtifact,
+    obligations: Vec<AuthenticatedChcArtifact>,
+}
+
+#[derive(Debug)]
+struct AuthenticatedChcArtifact {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+#[derive(Debug)]
+struct ChcManifestArtifact {
+    path: PathBuf,
+    bytes: u64,
+    sha256: String,
+}
+
+/// Resolve the exact artifacts named by the stats record from this solver
+/// process. CHC obligation directories are intentionally unique per emission;
+/// directory scans at a stable legacy pathname can therefore only find stale
+/// evidence and must never be used as run authority.
+fn emitted_chc_artifacts(
+    output: &Output,
+    expected_certificate: &Path,
+) -> Result<EmittedChcArtifacts> {
+    emitted_chc_artifacts_from_streams(&output.stdout, &output.stderr, expected_certificate)
+}
+
+fn emitted_chc_artifacts_from_streams(
+    stdout: &[u8],
+    stderr: &[u8],
+    expected_certificate: &Path,
+) -> Result<EmittedChcArtifacts> {
+    let stats = unique_chc_stats_json(stdout, stderr)?;
+    let manifest = field(&stats, "chc_evidence_manifest")?;
+    let schema = string_field(manifest, "schema")?;
+    if schema != "ay.chc-evidence-manifest/v1" {
+        anyhow::bail!(
+            "CHC evidence manifest schema mismatch: expected ay.chc-evidence-manifest/v1, got {schema}"
+        );
+    }
+
+    let artifacts = field(manifest, "artifacts")?;
+    let proof_entry = field(artifacts, "proof")?;
+    if string_field(proof_entry, "status")? != "hash-bound" {
+        anyhow::bail!("CHC evidence manifest proof is not hash-bound");
+    }
+    let proof = parse_chc_manifest_artifact(
+        field(proof_entry, "artifact")?,
+        "proof certificate",
+        "proof-certificate",
+    )?;
+
+    let expected_parent = expected_certificate.parent().with_context(|| {
+        format!(
+            "expected CHC certificate {} has no parent",
+            expected_certificate.display()
+        )
+    })?;
+    let expected_parent = fs::canonicalize(expected_parent).with_context(|| {
+        format!(
+            "resolve expected CHC artifact parent {}",
+            expected_parent.display()
+        )
+    })?;
+    let certificate_name = expected_certificate.file_name().with_context(|| {
+        format!(
+            "expected CHC certificate {} has no file name",
+            expected_certificate.display()
+        )
+    })?;
+    let expected_physical_certificate = expected_parent.join(certificate_name);
+    let certificate = validate_chc_manifest_file(&proof, "proof certificate")?;
+    if certificate.path != expected_physical_certificate {
+        anyhow::bail!(
+            "CHC manifest proof path {} is not the requested same-run certificate {}",
+            certificate.path.display(),
+            expected_physical_certificate.display()
+        );
+    }
+
+    let obligations_entry = field(artifacts, "replay_obligations")?;
+    if string_field(obligations_entry, "status")? != "hash-bound" {
+        anyhow::bail!("CHC evidence manifest replay obligations are not hash-bound");
+    }
+    let obligation_values = array_field(obligations_entry, "artifacts")?;
+    if obligation_values.is_empty() {
+        anyhow::bail!("CHC evidence manifest contains no replay obligations");
+    }
+    if obligation_values.len() > MAX_CHC_MANIFEST_ARTIFACTS {
+        anyhow::bail!(
+            "CHC evidence manifest contains {} replay obligations, exceeding the limit of {MAX_CHC_MANIFEST_ARTIFACTS}",
+            obligation_values.len()
+        );
+    }
+
+    let certificate_name = certificate_name.to_str().with_context(|| {
+        format!(
+            "CHC certificate file name is not UTF-8: {}",
+            expected_physical_certificate.display()
+        )
+    })?;
+    let obligation_dir_prefix = format!("{certificate_name}.chc-obligations-");
+    let mut physical_obligations_parent: Option<PathBuf> = None;
+    let mut unique_paths = BTreeSet::new();
+    let mut obligations = Vec::with_capacity(obligation_values.len());
+    let mut total_artifact_bytes = proof.bytes;
+    for (index, value) in obligation_values.iter().enumerate() {
+        let label = format!("replay obligation {index}");
+        let kind = string_field(value, "kind")?;
+        if kind.trim().is_empty() {
+            anyhow::bail!("{label} descriptor has an empty obligation kind");
+        }
+        let artifact = parse_chc_manifest_artifact(value, &label, "replay-obligation")?;
+        total_artifact_bytes = total_artifact_bytes
+            .checked_add(artifact.bytes)
+            .with_context(|| "CHC evidence manifest total byte length overflow")?;
+        if total_artifact_bytes > MAX_CHC_TOTAL_ARTIFACT_BYTES {
+            anyhow::bail!(
+                "CHC evidence manifest declares {total_artifact_bytes} artifact bytes, exceeding the limit of {MAX_CHC_TOTAL_ARTIFACT_BYTES}"
+            );
+        }
+        if artifact
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("smt2")
+        {
+            anyhow::bail!(
+                "{label} path is not an .smt2 file: {}",
+                artifact.path.display()
+            );
+        }
+        let raw_parent = artifact
+            .path
+            .parent()
+            .with_context(|| format!("{label} path has no parent: {}", artifact.path.display()))?;
+        let raw_parent_metadata = fs::symlink_metadata(raw_parent)
+            .with_context(|| format!("inspect {label} parent {}", raw_parent.display()))?;
+        if !raw_parent_metadata.file_type().is_dir() {
+            anyhow::bail!(
+                "{label} parent is not a physical directory: {}",
+                raw_parent.display()
+            );
+        }
+        let physical_parent = fs::canonicalize(raw_parent)
+            .with_context(|| format!("resolve {label} parent {}", raw_parent.display()))?;
+        if physical_parent.parent() != Some(expected_parent.as_path()) {
+            anyhow::bail!(
+                "{label} parent {} is outside the expected physical CHC run parent {}",
+                physical_parent.display(),
+                expected_parent.display()
+            );
+        }
+        let parent_name = physical_parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| {
+                format!(
+                    "{label} parent has no UTF-8 directory name: {}",
+                    physical_parent.display()
+                )
+            })?;
+        let suffix = parent_name
+            .strip_prefix(&obligation_dir_prefix)
+            .with_context(|| {
+                format!(
+                    "{label} parent {} does not use expected prefix {obligation_dir_prefix}",
+                    physical_parent.display()
+                )
+            })?;
+        let Some((pid, nonce)) = suffix.split_once('-') else {
+            anyhow::bail!(
+                "{label} parent {} lacks the expected pid-nonce suffix",
+                physical_parent.display()
+            );
+        };
+        if pid.is_empty()
+            || nonce.is_empty()
+            || !pid.bytes().all(|byte| byte.is_ascii_digit())
+            || !nonce.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            anyhow::bail!(
+                "{label} parent {} has an invalid pid-nonce suffix",
+                physical_parent.display()
+            );
+        }
+        match physical_obligations_parent.as_ref() {
+            Some(expected) if expected != &physical_parent => anyhow::bail!(
+                "CHC manifest mixes replay obligation directories: {} and {}",
+                expected.display(),
+                physical_parent.display()
+            ),
+            None => physical_obligations_parent = Some(physical_parent),
+            Some(_) => {}
+        }
+
+        let authenticated = validate_chc_manifest_file(&artifact, &label)?;
+        if authenticated.path.parent() != physical_obligations_parent.as_deref() {
+            anyhow::bail!(
+                "{label} physical path {} escaped its authenticated obligation directory",
+                authenticated.path.display()
+            );
+        }
+        if !unique_paths.insert(authenticated.path.clone()) {
+            anyhow::bail!(
+                "CHC evidence manifest repeats replay obligation path {}",
+                authenticated.path.display()
+            );
+        }
+        obligations.push(authenticated);
+    }
+    obligations.sort_by(|left, right| left.path.cmp(&right.path));
+
+    Ok(EmittedChcArtifacts {
+        certificate,
+        obligations,
+    })
+}
+
+fn unique_chc_stats_json(stdout: &[u8], stderr: &[u8]) -> Result<Value> {
+    let mut candidates = Vec::new();
+    for (stream, bytes) in [("stderr", stderr), ("stdout", stdout)] {
+        for (line_index, line) in String::from_utf8_lossy(bytes).lines().enumerate() {
+            let line = line.trim();
+            if !line.starts_with('{') || !line.ends_with('}') {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if value.get("chc_evidence_manifest").is_some() {
+                candidates.push((stream, line_index + 1, value));
+            }
+        }
+    }
+    match candidates.len() {
+        1 => {
+            let (_, _, value) = candidates
+                .pop()
+                .context("same-run CHC stats candidate disappeared during parsing")?;
+            if value.get("mode").and_then(Value::as_str) != Some("chc") {
+                anyhow::bail!("same-run stats JSON carrying CHC evidence has mode other than chc");
+            }
+            Ok(value)
+        }
+        0 => anyhow::bail!("solver output contains no --stats-json CHC evidence manifest"),
+        count => anyhow::bail!(
+            "solver output contains {count} CHC evidence manifests; same-run artifact authority is ambiguous"
+        ),
+    }
+}
+
+fn parse_chc_manifest_artifact(
+    value: &Value,
+    label: &str,
+    expected_role: &str,
+) -> Result<ChcManifestArtifact> {
+    let schema = string_field(value, "schema")?;
+    if schema != "ay.chc-proof-artifact-digest/v1" {
+        anyhow::bail!(
+            "{label} descriptor schema mismatch: expected ay.chc-proof-artifact-digest/v1, got {schema}"
+        );
+    }
+    let role = string_field(value, "role")?;
+    if role != expected_role {
+        anyhow::bail!("{label} role mismatch: expected {expected_role}, got {role}");
+    }
+    let path = PathBuf::from(string_field(value, "path")?);
+    if !path.is_absolute() {
+        anyhow::bail!("{label} manifest path must be absolute: {}", path.display());
+    }
+    let bytes = field(value, "bytes")?
+        .as_u64()
+        .with_context(|| format!("{label} descriptor bytes is not a non-negative integer"))?;
+    if bytes == 0 {
+        anyhow::bail!("{label} descriptor has zero bytes");
+    }
+    let sha256 = string_field(value, "sha256")?;
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        anyhow::bail!("{label} descriptor has invalid lowercase SHA-256: {sha256}");
+    }
+    Ok(ChcManifestArtifact {
+        path,
+        bytes,
+        sha256,
+    })
+}
+
+fn validate_chc_manifest_file(
+    artifact: &ChcManifestArtifact,
+    label: &str,
+) -> Result<AuthenticatedChcArtifact> {
+    if artifact.bytes > MAX_CHC_ARTIFACT_BYTES {
+        anyhow::bail!(
+            "{label} declares {} bytes, exceeding the per-artifact limit of {MAX_CHC_ARTIFACT_BYTES}: {}",
+            artifact.bytes,
+            artifact.path.display()
+        );
+    }
+    let expected_len = usize::try_from(artifact.bytes)
+        .with_context(|| format!("{label} byte length does not fit in memory"))?;
+    let path_metadata = fs::symlink_metadata(&artifact.path)
+        .with_context(|| format!("inspect {label} {}", artifact.path.display()))?;
+    if !path_metadata.file_type().is_file() {
+        anyhow::bail!(
+            "{label} is not a physical regular file: {}",
+            artifact.path.display()
+        );
+    }
+    if path_metadata.len() != artifact.bytes {
+        anyhow::bail!(
+            "{label} byte length mismatch for {}: manifest={} actual={}",
+            artifact.path.display(),
+            artifact.bytes,
+            path_metadata.len()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if path_metadata.nlink() != 1 {
+            anyhow::bail!(
+                "{label} has unexpected hard links: {}",
+                artifact.path.display()
+            );
+        }
+    }
+
+    let mut open_options = fs::OpenOptions::new();
+    open_options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open_options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    let mut file = open_options
+        .open(&artifact.path)
+        .with_context(|| format!("open {label} {}", artifact.path.display()))?;
+    let opened_metadata = file
+        .metadata()
+        .with_context(|| format!("inspect opened {label} {}", artifact.path.display()))?;
+    if !opened_metadata.file_type().is_file() || opened_metadata.len() != artifact.bytes {
+        anyhow::bail!(
+            "{label} changed type or size while opening: {}",
+            artifact.path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if path_metadata.dev() != opened_metadata.dev()
+            || path_metadata.ino() != opened_metadata.ino()
+            || opened_metadata.nlink() != 1
+        {
+            anyhow::bail!(
+                "{label} changed identity while opening: {}",
+                artifact.path.display()
+            );
+        }
+    }
+
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(expected_len)
+        .with_context(|| format!("reserve memory for {label} {}", artifact.path.display()))?;
+    let read_limit = artifact
+        .bytes
+        .checked_add(1)
+        .with_context(|| format!("{label} byte length overflow"))?;
+    Read::by_ref(&mut file)
+        .take(read_limit)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {label} {}", artifact.path.display()))?;
+    let observed_bytes = u64::try_from(bytes.len())
+        .with_context(|| format!("{label} observed byte length overflow"))?;
+    let observed_sha256 = sha256_hex(&bytes);
+    if observed_bytes != artifact.bytes || observed_sha256 != artifact.sha256 {
+        anyhow::bail!(
+            "{label} digest mismatch for {}: manifest_bytes={} actual_bytes={} manifest_sha256={} actual_sha256={observed_sha256}",
+            artifact.path.display(),
+            artifact.bytes,
+            observed_bytes,
+            artifact.sha256
+        );
+    }
+
+    let after_metadata = fs::symlink_metadata(&artifact.path)
+        .with_context(|| format!("reinspect {label} {}", artifact.path.display()))?;
+    if !after_metadata.file_type().is_file() || after_metadata.len() != artifact.bytes {
+        anyhow::bail!(
+            "{label} changed type or size while hashing: {}",
+            artifact.path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if opened_metadata.dev() != after_metadata.dev()
+            || opened_metadata.ino() != after_metadata.ino()
+            || after_metadata.nlink() != 1
+        {
+            anyhow::bail!(
+                "{label} changed identity while hashing: {}",
+                artifact.path.display()
+            );
+        }
+    }
+
+    let path = fs::canonicalize(&artifact.path)
+        .with_context(|| format!("resolve physical {label} path {}", artifact.path.display()))?;
+    Ok(AuthenticatedChcArtifact {
+        path,
+        bytes,
+        sha256: observed_sha256,
+    })
 }
 
 fn generate_reference_cache(repo_root: &Path, ay: &Path, z3: &str) -> Result<Value> {
@@ -2527,60 +2941,52 @@ fn generate_reference_cache(repo_root: &Path, ay: &Path, z3: &str) -> Result<Val
     let emit = run_command_capture(
         repo_root,
         ay,
-        &["solve", "--chc", "--proof", &certificate_arg, &problem_arg],
+        &[
+            "solve",
+            "--chc",
+            "--stats-json",
+            "--proof",
+            &certificate_arg,
+            &problem_arg,
+        ],
     )
     .context("emit CHC certificate for reference cache")?;
-    let obligations_dir = work_dir.join("chc-obligations");
-    if !emit.status.success() || !certificate.is_file() || !obligations_dir.is_dir() {
+    if !emit.status.success() {
         anyhow::bail!(
-            "CHC certificate emission failed: status={:?} cert_exists={} obligations_dir_exists={} stdout_tail={:?} stderr_tail={:?}",
+            "CHC certificate emission failed: status={:?} stdout_tail={:?} stderr_tail={:?}",
             emit.status.code(),
-            certificate.is_file(),
-            obligations_dir.is_dir(),
             tail_text(&String::from_utf8_lossy(&emit.stdout)),
             tail_text(&String::from_utf8_lossy(&emit.stderr))
         );
     }
-
-    let mut obligation_paths = fs::read_dir(&obligations_dir)
-        .with_context(|| format!("read {}", obligations_dir.display()))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("smt2"))
-        .collect::<Vec<_>>();
-    obligation_paths.sort();
-    if obligation_paths.is_empty() {
-        anyhow::bail!(
-            "no CHC obligation .smt2 files in {}",
-            obligations_dir.display()
-        );
-    }
+    let emitted = emitted_chc_artifacts(&emit, &certificate)
+        .context("authenticate same-run CHC evidence manifest for reference cache")?;
+    let authenticated_obligations = emitted.obligations;
 
     let z3_path = Path::new(z3);
     let mut obligations = Vec::new();
-    for obligation in &obligation_paths {
-        let obligation_arg = obligation.to_string_lossy().into_owned();
-        let replay = run_command_capture(repo_root, z3_path, &[&obligation_arg])
-            .with_context(|| format!("run {z3} {}", obligation.display()))?;
+    for obligation in &authenticated_obligations {
+        let replay =
+            run_command_capture_with_stdin(repo_root, z3_path, &["-in"], &obligation.bytes)
+                .with_context(|| format!("run {z3} -in for {}", obligation.path.display()))?;
         let stdout = String::from_utf8_lossy(&replay.stdout).to_string();
         let stderr = String::from_utf8_lossy(&replay.stderr).to_string();
         let stdout_first_line = first_non_empty_line(&stdout).unwrap_or("").to_string();
         if !replay.status.success() || stdout_first_line.trim() != "unsat" {
             anyhow::bail!(
                 "Z3 did not replay CHC obligation as UNSAT: {} status={:?} stdout_tail={:?} stderr_tail={:?}",
-                obligation.display(),
+                obligation.path.display(),
                 replay.status.code(),
                 tail_text(&stdout),
                 tail_text(&stderr)
             );
         }
         obligations.push(json!({
-            "name": obligation
+            "name": obligation.path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("obligation.smt2"),
-            "sha256": sha256_file(obligation)
-                .with_context(|| format!("hash {}", obligation.display()))?,
+            "sha256": obligation.sha256,
             "status_code": replay.status.code(),
             "stdout_first_line": stdout_first_line,
             "stdout": stdout,
@@ -4624,7 +5030,7 @@ fn parse_surface_evidence(
 fn validate_cached_chc_obligations(
     cache: &ReferenceCache,
     problem: &Path,
-    obligations: &[PathBuf],
+    obligations: &[AuthenticatedChcArtifact],
 ) -> Result<usize> {
     let problem_sha256 =
         sha256_file(problem).with_context(|| format!("hash CHC canary {}", problem.display()))?;
@@ -4645,16 +5051,15 @@ fn validate_cached_chc_obligations(
 
     let mut matched = BTreeSet::new();
     for obligation in obligations {
-        let sha256 = sha256_file(obligation)
-            .with_context(|| format!("hash CHC obligation {}", obligation.display()))?;
+        let sha256 = &obligation.sha256;
         let cached = cache
             .chc_obligations
             .obligations
-            .get(&sha256)
+            .get(sha256)
             .with_context(|| {
                 format!(
                     "emitted CHC obligation {} has hash {sha256}, which is absent from cache {}",
-                    obligation.display(),
+                    obligation.path.display(),
                     cache.path.display()
                 )
             })?;
@@ -4666,7 +5071,7 @@ fn validate_cached_chc_obligations(
                 cached.stdout_first_line
             );
         }
-        matched.insert(sha256);
+        matched.insert(sha256.clone());
     }
 
     if matched.len() != cache.chc_obligations.obligations.len() {
@@ -4905,11 +5310,44 @@ fn external_tool_inventory(repo_root: &Path, z3: &str, alethe_checker: &str) -> 
     ]
 }
 
-fn run_command_capture(repo_root: &Path, program: &Path, args: &[&str]) -> std::io::Result<Output> {
+fn run_command_capture(repo_root: &Path, program: &Path, args: &[&str]) -> io::Result<Output> {
     ProcessCommand::new(program)
         .args(args)
         .current_dir(repo_root)
         .output()
+}
+
+fn run_command_capture_with_stdin(
+    repo_root: &Path,
+    program: &Path,
+    args: &[&str],
+    input: &[u8],
+) -> io::Result<Output> {
+    let mut child = ProcessCommand::new(program)
+        .args(args)
+        .current_dir(repo_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            format!("failed to capture stdin for {}", program.display()),
+        )
+    })?;
+
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || stdin.write_all(input));
+        let output = child.wait_with_output();
+        let write_result = writer
+            .join()
+            .map_err(|_| io::Error::other("stdin writer thread panicked"))?;
+        match (output, write_result) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
+    })
 }
 
 fn run_builtin_smokes(
@@ -5072,11 +5510,7 @@ fn check_ay_unsupported_option(ay: &Path) -> AuditCheck {
     }
 }
 
-fn run_program_stdin(
-    program: &std::ffi::OsStr,
-    args: &[&str],
-    input: &str,
-) -> std::io::Result<Output> {
+fn run_program_stdin(program: &std::ffi::OsStr, args: &[&str], input: &str) -> io::Result<Output> {
     let mut child = ProcessCommand::new(program)
         .args(args)
         .env("AY_INTERNAL_PROVENANCE_CHILD", "1")

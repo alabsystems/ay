@@ -267,6 +267,10 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
             for &(var_idx, phase) in &_itp_saved_phase_hints {
                 solver.set_var_phase(SatVariable::new(var_idx), phase);
             }
+            // #array-deadline-forward: forward the executor's live per-solve
+            // deadline so inprocessing/L0-GC phases honor the caller's wall
+            // budget (see the assume arm).
+            solver.set_solve_deadline($self.solve_deadline.get());
             // Deterministic resource budgets: `:rlimit` conflict budget
             // (#8749) with the default ground-phase conflict + decision
             // allowances (#ground-determinism) when no explicit `:rlimit`
@@ -1005,6 +1009,8 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
             for &(var_idx, phase) in &_itp_saved_phase_hints {
                 solver.set_var_phase(SatVariable::new(var_idx), phase);
             }
+            // #array-deadline-forward: see the assume arm.
+            solver.set_solve_deadline($self.solve_deadline.get());
             // Deterministic resource budgets (#8749 `:rlimit` +
             // #ground-determinism defaults), incremental arm.
             solver.set_conflict_budget(

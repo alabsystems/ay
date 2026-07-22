@@ -31,9 +31,10 @@ use std::ffi::c_uint;
 use ay_dpll::api::{FuncDecl, Model, Sort, Term};
 
 use super::{
-    ast_to_term, ffi_guard_ast, ffi_guard_ptr, ffi_guard_uint, lookup_ast_sort, record_ast_sort,
-    term_to_ast, ModelHandle, Z3_ast, Z3_ast_vector, Z3_context, Z3_func_decl, Z3_model, Z3_sort,
-    Z3_symbol, Z3_INVALID_ARG, Z3_IOB, Z3_SORT_ERROR,
+    ast_to_term, ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast, ffi_guard_ptr,
+    ffi_guard_uint, lookup_ast_sort, record_ast_sort, term_to_ast, ModelHandle, Z3_ast,
+    Z3_ast_vector, Z3_context, Z3_func_decl, Z3_model, Z3_sort, Z3_symbol, Z3_INVALID_ARG, Z3_IOB,
+    Z3_SORT_ERROR,
 };
 
 // ============================================================================
@@ -80,6 +81,11 @@ pub unsafe extern "C" fn Z3_substitute_vars(
     if a == 0 {
         return 0;
     }
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_substitute_vars", num_exprs) } {
+        return 0;
+    }
     if num_exprs == 0 || to.is_null() {
         return a;
     }
@@ -120,6 +126,17 @@ pub unsafe extern "C" fn Z3_substitute_funs(
     to: *const Z3_ast,
 ) -> Z3_ast {
     if a == 0 {
+        return 0;
+    }
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "Z3_substitute_funs declaration and replacement arrays",
+            &[num_funs, num_funs],
+        )
+    } {
         return 0;
     }
     if num_funs == 0 || from.is_null() || to.is_null() {
@@ -179,6 +196,11 @@ pub unsafe extern "C" fn Z3_update_term(
     args: *const Z3_ast,
 ) -> Z3_ast {
     if a == 0 {
+        return 0;
+    }
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_update_term", num_args) } {
         return 0;
     }
     let arg_terms: Vec<Term> = if num_args == 0 || args.is_null() {
@@ -287,6 +309,17 @@ pub unsafe extern "C" fn Z3_mk_lambda(
     decl_names: *const Z3_symbol,
     body: Z3_ast,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe {
+        ffi_counts_within_limit(
+            c,
+            "Z3_mk_lambda sort and name arrays",
+            &[num_decls, num_decls],
+        )
+    } {
+        return 0;
+    }
     if num_decls == 0 || sorts.is_null() || decl_names.is_null() || body == 0 {
         // SAFETY: `c` is the caller's context pointer; guard null-checks it.
         return unsafe {
@@ -365,6 +398,11 @@ pub unsafe extern "C" fn Z3_mk_lambda_const(
     bound: *const Z3_ast,
     body: Z3_ast,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_lambda_const bounds", num_bound) } {
+        return 0;
+    }
     if num_bound == 0 || bound.is_null() || body == 0 {
         // SAFETY: `c` is the caller's context pointer; guard null-checks it.
         return unsafe {
@@ -409,6 +447,11 @@ pub unsafe extern "C" fn Z3_mk_map(
     n: c_uint,
     args: *const Z3_ast,
 ) -> Z3_ast {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_mk_map arrays", n) } {
+        return 0;
+    }
     if f.is_null() || n == 0 || args.is_null() {
         return 0;
     }
@@ -570,6 +613,11 @@ unsafe fn mk_set_nary(
     num_args: c_uint,
     args: *const Z3_ast,
 ) -> Z3_ast {
+    // SAFETY: every caller of this unsafe helper forwards a null or live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "set combinator arguments", num_args) } {
+        return 0;
+    }
     if num_args == 0 || args.is_null() {
         // SAFETY: `c` is the caller's context pointer; guard null-checks it.
         return unsafe {

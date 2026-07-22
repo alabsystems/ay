@@ -158,6 +158,13 @@ pub(crate) struct CoreSolver {
     ///
     /// Reference: CVC5 purification in `theory_strings_preprocess.cpp`
     reduced_terms: HashSet<TermId>,
+    /// ADDITIONAL pending lemmas queued behind `pending_lemma` (NF-engine
+    /// closure 3, `AY_STR_NF=1`): distinct extra buffered NF split lemmas and
+    /// extra dynamic reduction requests discovered in the same check round.
+    /// Drained by the executor via `take_pending_string_lemmas` so a skolem
+    /// web reduces in 1-2 CEGAR rounds instead of one round per lemma.
+    /// Always empty when the closure is disabled.
+    extra_lemmas: Vec<StringLemma>,
 }
 
 impl CoreSolver {
@@ -179,6 +186,11 @@ impl CoreSolver {
     /// replace-family terms, which persist across CEGAR iterations via the
     /// warm-state reduced set.
     const MAX_REPLACE_ALL_STEPS: usize = 32;
+
+    /// Cap on ADDITIONAL lemmas batched behind the primary one in a single
+    /// check round (NF-engine closure 3). Bounds the per-round clause burst
+    /// so a wide skolem web cannot flood the SAT solver in one iteration.
+    const MAX_EXTRA_LEMMAS: usize = 8;
 
     /// Create a new core solver.
     pub(crate) fn new() -> Self {
@@ -310,14 +322,50 @@ impl CoreSolver {
         state: &SolverState,
         term: TermId,
     ) -> bool {
+        // Closure 3 (`AY_STR_NF=1`, sub-flag 3): with a lemma already pending,
+        // the pre-closure path stopped here — one dynamic reduction lemma per
+        // check, so a 5-substr web needed ~10 CEGAR rounds. Under the closure
+        // the request is still built and QUEUED (bounded), so the executor
+        // lowers the whole reduction batch in one iteration. Each reduction
+        // axiom is universally valid on its own (see reductions.rs), so
+        // batching cannot change any answer — only the round count.
         if self.pending_lemma.is_some() {
+            if !crate::str_nf_closure_enabled(3)
+                || self.extra_lemmas.len() >= Self::MAX_EXTRA_LEMMAS
+            {
+                return true;
+            }
+            let Some(extra) = Self::build_dynamic_extf_lemma(terms, state, self, term) else {
+                return false;
+            };
+            if self.pending_lemma.as_ref() != Some(&extra) && !self.extra_lemmas.contains(&extra) {
+                self.extra_lemmas.push(extra);
+            }
             return true;
         }
-        let TermData::App(Symbol::Named(name), args) = terms.get(term) else {
+        let Some(lemma) = Self::build_dynamic_extf_lemma(terms, state, self, term) else {
             return false;
         };
+        self.pending_lemma = Some(lemma);
+        true
+    }
+
+    /// Build the dynamic reduction lemma for `term`, if one applies.
+    ///
+    /// Split out of `request_dynamic_extf_lemma` so closure 3 can queue
+    /// ADDITIONAL requests behind an already-pending one without duplicating
+    /// the per-symbol axiom selection.
+    fn build_dynamic_extf_lemma(
+        terms: &TermStore,
+        state: &SolverState,
+        core: &Self,
+        term: TermId,
+    ) -> Option<StringLemma> {
+        let TermData::App(Symbol::Named(name), args) = terms.get(term) else {
+            return None;
+        };
         if name == "str.substr" && args.len() == 3 {
-            self.pending_lemma = Some(StringLemma {
+            return Some(StringLemma {
                 kind: StringLemmaKind::SubstrReduction,
                 x: term,
                 y: term,
@@ -325,13 +373,12 @@ impl CoreSolver {
                 start_offset: 0,
                 reason: Vec::new(),
             });
-            return true;
         }
         // CAP-2: symbolic str.indexof blocks progress the same way symbolic
         // str.substr does. Request the first-occurrence reduction axiom on
         // demand instead of latching `incomplete` (Unknown) forever.
         if name == "str.indexof" && args.len() == 3 {
-            self.pending_lemma = Some(StringLemma {
+            return Some(StringLemma {
                 kind: StringLemmaKind::IndexofReduction,
                 x: term,
                 y: term,
@@ -339,12 +386,11 @@ impl CoreSolver {
                 start_offset: 0,
                 reason: Vec::new(),
             });
-            return true;
         }
         // CAP-2 follow-on: symbolic str.replace gets the first-occurrence
         // replacement axiom on demand.
         if name == "str.replace" && args.len() == 3 {
-            self.pending_lemma = Some(StringLemma {
+            return Some(StringLemma {
                 kind: StringLemmaKind::ReplaceReduction,
                 x: term,
                 y: term,
@@ -352,7 +398,6 @@ impl CoreSolver {
                 start_offset: 0,
                 reason: Vec::new(),
             });
-            return true;
         }
         // Extf wave 2: str.to_int digit decomposition. Requires a concrete
         // upper bound on len(arg) from an asserted literal; the bound is
@@ -360,12 +405,8 @@ impl CoreSolver {
         // clause. No bound → fall through to incomplete (Unknown), exactly
         // as before.
         if (name == "str.to_int" || name == "str.to.int") && args.len() == 1 {
-            let Some((bound, guard_lit)) =
-                Self::find_concrete_len_upper_bound(terms, state, args[0])
-            else {
-                return false;
-            };
-            self.pending_lemma = Some(StringLemma {
+            let (bound, guard_lit) = Self::find_concrete_len_upper_bound(terms, state, args[0])?;
+            return Some(StringLemma {
                 kind: StringLemmaKind::ToIntReduction,
                 x: term,
                 y: term,
@@ -373,12 +414,11 @@ impl CoreSolver {
                 start_offset: 0,
                 reason: vec![guard_lit],
             });
-            return true;
         }
         // Extf wave 2: str.from_int via the mutual to_int definition plus a
         // canonical-decimal regex. Universally valid — no bound needed.
         if (name == "str.from_int" || name == "int.to.str") && args.len() == 1 {
-            self.pending_lemma = Some(StringLemma {
+            return Some(StringLemma {
                 kind: StringLemmaKind::FromIntReduction,
                 x: term,
                 y: term,
@@ -386,17 +426,16 @@ impl CoreSolver {
                 start_offset: 0,
                 reason: Vec::new(),
             });
-            return true;
         }
         // Extf wave 2: str.replace_all one-step first-match reduction. The
         // step recurses on a fresh replace_all(suf, t, u) application, so a
         // budget bounds the total chain; past it, fall through to incomplete
         // (Unknown) — never hang, never guess.
         if name == "str.replace_all" && args.len() == 3 {
-            if self.reduced_replace_all_steps(terms) >= Self::MAX_REPLACE_ALL_STEPS {
-                return false;
+            if core.reduced_replace_all_steps(terms) >= Self::MAX_REPLACE_ALL_STEPS {
+                return None;
             }
-            self.pending_lemma = Some(StringLemma {
+            return Some(StringLemma {
                 kind: StringLemmaKind::ReplaceAllReduction,
                 x: term,
                 y: term,
@@ -404,7 +443,6 @@ impl CoreSolver {
                 start_offset: 0,
                 reason: Vec::new(),
             });
-            return true;
         }
         // Extf wave 2 Part B: regex replace partial reductions. Only for
         // GROUND engine-evaluable regexes — the reduction relies on ground
@@ -419,7 +457,7 @@ impl CoreSolver {
             } else {
                 StringLemmaKind::ReplaceReAllReduction
             };
-            self.pending_lemma = Some(StringLemma {
+            return Some(StringLemma {
                 kind,
                 x: term,
                 y: term,
@@ -427,9 +465,8 @@ impl CoreSolver {
                 start_offset: 0,
                 reason: Vec::new(),
             });
-            return true;
         }
-        false
+        None
     }
 
     /// Handle an int-valued extf application that could not be evaluated.
@@ -739,6 +776,12 @@ impl CoreSolver {
         self.pending_lemma.take()
     }
 
+    /// Take the ADDITIONAL lemmas batched behind the primary one
+    /// (NF-engine closure 3). Always empty when the closure is disabled.
+    pub(crate) fn take_extra_lemmas(&mut self) -> Vec<StringLemma> {
+        std::mem::take(&mut self.extra_lemmas)
+    }
+
     /// Clear computed state for a new check round.
     pub(crate) fn clear(&mut self) {
         self.normal_forms.clear();
@@ -747,5 +790,10 @@ impl CoreSolver {
         self.incomplete = false;
         self.pending_lemma = None;
         self.buffered_lemmas.clear();
+        // Closure 3: batched extras are per-round. They are drained by the
+        // executor immediately after the round that produced them returns
+        // `NeedStringLemma`; anything still here belongs to a superseded
+        // round and must not leak into the next one.
+        self.extra_lemmas.clear();
     }
 }

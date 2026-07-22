@@ -1013,6 +1013,15 @@ impl OllEngine {
             (hard, soft, soft_weights)
         };
         let mut sat = SatSolver::new(num_vars as usize);
+        // (The interim #maxsat-domain-bcp-regression-workaround that disabled
+        // domain BCP for +5 is now REMOVED: the underlying regression is fixed
+        // directly — see #maxsat-domain-bcp-fix (propagate_domain_bcp's fused
+        // out-of-domain skip) in propagation_bcp.rs. Domain BCP is re-enabled and
+        // recovers the full regression. Escape hatch to force full BCP still
+        // exists via AY_AB_NO_DOMAIN_BCP.)
+        if std::env::var_os("AY_AB_NO_DOMAIN_BCP").is_some() {
+            sat.set_domain_bcp_min_vars(100_000_000);
+        }
         // #maxsat-inproc-throttle: scale the incremental inprocessing re-fire
         // interval with clause count. Between OLL core-extraction solves the
         // SAT engine re-runs subsumption + vivification, each an O(arena) scan;

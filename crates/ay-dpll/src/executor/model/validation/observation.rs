@@ -807,7 +807,7 @@ impl Executor {
                     ));
                 }
                 if std::env::var_os("AY_F1_DIAG").is_some() {
-                    if let ay_core::TermData::App(sym, args) = self.ctx.terms.get(term) {
+                    if let TermData::App(sym, args) = self.ctx.terms.get(term) {
                         if sym.name() == "=" {
                             for &arg in args {
                                 eprintln!(

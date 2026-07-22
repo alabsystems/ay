@@ -30,6 +30,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+ay-test-support.workspace = true
 
 [lints]
 workspace = true

@@ -206,7 +206,7 @@ mod tests {
         for fp in 0..(MEMO_CAPACITY as u64 + 8) {
             memo.record_unknown(fp, 1000, 1000);
         }
-        assert!(memo.entries.len() == MEMO_CAPACITY);
+        assert_eq!(memo.entries.len(), MEMO_CAPACITY);
         // The first 8 entries were evicted FIFO.
         assert!(!memo.should_skip(0, 1000));
         assert!(memo.should_skip(MEMO_CAPACITY as u64 + 7, 1000));

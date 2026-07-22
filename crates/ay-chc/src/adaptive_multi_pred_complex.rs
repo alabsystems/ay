@@ -2531,7 +2531,7 @@ mod tests {
     /// build) and runs a multi-second bounded refutation. Run with:
     /// `cargo test -p ay-chc reve_branching_tree_refutation -- --ignored`.
     #[test]
-    #[ignore]
+    #[ignore = "requires the non-vendored CHC-COMP-26 reve corpus and multi-second refutations"]
     fn reve_branching_tree_refutation_validates_unsafe_not_safe() {
         let reve = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../benchmarks/chc/chc-comp26-benchmarks/eldarica-misc/BV/reve");
@@ -2605,7 +2605,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires the non-vendored CHC-COMP-26 IntDualyzer corpus"]
     fn bv_probe_refutes_intdualyzer_unsafe_targets() {
         for name in ["quicksort.c-bv_000", "SOR.c-bv_000", "LU.c-bv_000"] {
             let Some(result) = intdualyzer_probe(name) else {
@@ -2620,7 +2620,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires the non-vendored CHC-COMP-26 IntDualyzer corpus"]
     fn bv_probe_leaves_intdualyzer_safe_guards_not_unsafe() {
         for name in ["mergesort.c-bv_000", "queens.c-bv_000"] {
             let Some(result) = intdualyzer_probe(name) else {

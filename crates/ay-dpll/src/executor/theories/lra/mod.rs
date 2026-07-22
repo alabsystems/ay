@@ -56,9 +56,9 @@ fn inc_engine_reverify_enabled() -> bool {
 /// #lra-inc-engine S3 (`AY_LRA_INC_WARM`): persist the LraSolver across check-sats
 /// in the inc-engine lane so the deep-check `compute_implied_bounds` re-derivation
 /// becomes O(delta) (the base bounds + implied cache carry over; re-asserting an
-/// already-set bound is a non-tightening no-op). Default OFF (byte-identical).
-/// Soundness-in-development: run with AY_LRA_INC_ENGINE_REVERIFY=1 so any stale
-/// popped-scope bound surfaces as a disagreement the from-scratch re-verify catches.
+/// already-set bound is a non-tightening no-op). Default ON; set
+/// `AY_LRA_INC_WARM=0` to opt out. `AY_LRA_INC_ENGINE_REVERIFY=1` additionally
+/// checks an incremental UNSAT result against the from-scratch path.
 fn inc_engine_warm_on() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // DEFAULT-ON (opt out: AY_LRA_INC_WARM=0). Warm theory persists the LraSolver
@@ -66,7 +66,7 @@ fn inc_engine_warm_on() -> bool {
     // is a net win in the isolated (competition) config, sound without any
     // re-verify (0-wrong vs z3), with cascade-cap + adaptive-drop-after-SAT
     // neutralizing the alternating-file warm-start regression.
-    *V.get_or_init(|| std::env::var("AY_LRA_INC_WARM").map_or(true, |v| v != "0"))
+    *V.get_or_init(|| !std::env::var("AY_LRA_INC_WARM").is_ok_and(|v| v == "0"))
 }
 
 impl Executor {
@@ -134,8 +134,8 @@ impl Executor {
             // (reset_search_state_incremental) instead of a full reset — level-0
             // trail / watches / VSIDS / learned clauses persist across check-sats
             // (the accumulated BMC unrolling is NOT re-solved from scratch). Default
-            // OFF (AY_LRA_INC_ENGINE / lra_inc_engine_override); proof sessions never
-            // route here. 0-wrong is structural: Sat is re-validated against the
+            // ON (opt out with AY_LRA_INC_ENGINE=0 or lra_inc_engine_override=false);
+            // proof sessions never route here. 0-wrong is structural: Sat is re-validated against the
             // original assertions; Unsat is sound by the scope-selector
             // monotone-strengthening argument + the between-solve-GC reason guard.
             // DEFAULT-ON for QF_LRA incremental (opt out: AY_LRA_INC_ENGINE=0).
@@ -149,9 +149,8 @@ impl Executor {
                 Some(v) => v,
                 None => {
                     static INC_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                    *INC_ENV.get_or_init(|| {
-                        std::env::var("AY_LRA_INC_ENGINE").map_or(true, |v| v != "0")
-                    })
+                    *INC_ENV
+                        .get_or_init(|| !std::env::var("AY_LRA_INC_ENGINE").is_ok_and(|v| v == "0"))
                 }
             };
             if inc_engine_on && !self.produce_proofs_enabled() {
@@ -189,7 +188,8 @@ impl Executor {
     /// speedup is deferred to S3 (warm theory) and S4 (dropping the re-verify).
     ///
     /// SOUNDNESS (0-wrong is mandatory, and here structural):
-    ///   * default OFF + proof sessions excluded (routed above);
+    ///   * default ON for incremental QF_LRA, with proof sessions excluded
+    ///     (routed above) and `AY_LRA_INC_ENGINE=0` as the kill switch;
     ///   * scoped BVE disabled ⇒ the arena stays append-only ⇒ the incremental
     ///     reset never searches a projected `∃v.(clauses)` formula, and
     ///     `can_use_incremental_reset` still fails closed to a full ledger-rebuild
@@ -199,9 +199,11 @@ impl Executor {
     ///     model that omits a not-yet-attached delta clause fails closed to
     ///     Unknown, never a wrong SAT (and a clause SUBSET being UNSAT implies the
     ///     superset is UNSAT, so a missed delta clause cannot yield a false UNSAT);
-    ///   * every Unsat is unconditionally re-verified by the trusted from-scratch
-    ///     standalone lane ([`Self::reverify_unsat_via_standalone`]), closing the
-    ///     persisted-blocking-clause / retracted-lemma false-UNSAT hazard;
+    ///   * Unsat is structural: scope-selector pops only add units, the arena is
+    ///     append-only, scoped BVE is disabled, and between-solve GC preserves
+    ///     reason clauses, so retained learned clauses remain entailed;
+    ///     `AY_LRA_INC_ENGINE_REVERIFY=1` opts into the from-scratch standalone
+    ///     re-verification backstop ([`Self::reverify_unsat_via_standalone`]);
     ///   * any non-definite / error / scope-mismatch falls back to the standalone
     ///     lane, which owns the verdict.
     pub(in crate::executor) fn solve_lra_inc_engine(&mut self) -> Result<SolveResult> {
@@ -288,11 +290,23 @@ impl Executor {
         // fallback then resolves; never a wrong verdict. AY_LRA_INC_ENGINE_FULL=1
         // disables the slice (full budget, no double-solve) for A/B measurement
         // of the persistence win.
+        // #lra-inc-engine: DEFAULT-ON (opt out AY_LRA_INC_ENGINE_FULL=0). Give the
+        // engine arm the FULL solve deadline instead of a ~2s slice. The slice was
+        // a defensive "try-incremental-cheaply-then-fall-back" cap, but on the
+        // scored hybrid_networks corpus it STARVES the incremental arm: it times out
+        // every deep check → returns Unknown → the lane re-solves the whole check
+        // FROM SCRATCH via the standalone lane, defeating the entire point of the
+        // persistent incremental SAT (learned-clause reuse). Measured isolated @90s
+        // on all 10 real files: full budget vs slice = .ind 131 vs 125 (+6), .bmc
+        // 246 vs 180 (+66), TOTAL 377 vs 305 (+24%), with the arm answering 100% of
+        // .ind checks definitively (0 fallbacks) instead of 26% fallback. SOUND
+        // regardless of budget — the arm's Unsat is trusted by the same S4 argument
+        // and its Sat is re-validated (last_model_validated=false). The board's 559
+        // evidence was itself measured with this flag ON; this makes the DEFAULT
+        // binary match it instead of running the crippled slice.
         fn inc_engine_full_budget() -> bool {
             static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *V.get_or_init(|| {
-                std::env::var("AY_LRA_INC_ENGINE_FULL").is_ok_and(|v| v != "0" && !v.is_empty())
-            })
+            *V.get_or_init(|| std::env::var("AY_LRA_INC_ENGINE_FULL").map_or(true, |v| v != "0"))
         }
         let inc_full_deadline = self.solve_deadline.get();
         if !inc_engine_full_budget() {
@@ -307,11 +321,11 @@ impl Executor {
         // their scoped-persistent-state behaviors (the engine arm executes on the
         // SESSION-persistent state exactly as the persist-SAT arm does).
         self.lra_persist_sat_active = true;
-        // #lra-inc-engine S3 (warm theory): when AY_LRA_INC_WARM is set, persist
-        // the LraSolver across check-sats (the eager split-loop macro take/store)
-        // so the deep-check compute_implied_bounds becomes O(delta). Default OFF;
-        // develop/gate with AY_LRA_INC_ENGINE_REVERIFY=1 (the from-scratch
-        // re-verify is the soundness backstop for any stale-bound false UNSAT).
+        // #lra-inc-engine S3 (warm theory): persist the LraSolver across check-sats
+        // by default (the eager split-loop macro take/store), so the deep-check
+        // compute_implied_bounds becomes O(delta). AY_LRA_INC_WARM=0 opts out;
+        // AY_LRA_INC_ENGINE_REVERIFY=1 additionally checks incremental UNSAT against
+        // the from-scratch path.
         let _inc_warm_guard = crate::warm_theory_flag::WarmTheoryGuard::new(inc_engine_warm_on());
         let result = self.solve_lra_inc_engine_arm();
         drop(_inc_warm_guard);

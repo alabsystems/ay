@@ -800,9 +800,7 @@ impl ProofTracker {
         self.lemma_map.clear();
         // Scope stack preserved — push/pop balance maintained across check-sat calls.
         // Update watermarks to point into the now-empty proof.
-        for watermark in &mut self.scope_stack {
-            *watermark = 0;
-        }
+        self.scope_stack.fill(0);
         // Keep enabled state and theory name
     }
 }

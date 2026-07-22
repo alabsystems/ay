@@ -1962,12 +1962,282 @@ fn cached_chc_validation_rejects_missing_obligation_hash() {
         },
         surface_evidence: BTreeMap::new(),
     };
+    let bytes = fs::read(&obligation).expect("read obligation");
+    let authenticated = AuthenticatedChcArtifact {
+        path: fs::canonicalize(&obligation).expect("canonical obligation"),
+        sha256: sha256_hex(&bytes),
+        bytes,
+    };
 
-    let error =
-        validate_cached_chc_obligations(&cache, &repo_root.join(CHC_CANARY_PROBLEM), &[obligation])
-            .unwrap_err();
+    let error = validate_cached_chc_obligations(
+        &cache,
+        &repo_root.join(CHC_CANARY_PROBLEM),
+        &[authenticated],
+    )
+    .unwrap_err();
 
     assert!(error.to_string().contains("absent from cache"));
+}
+
+fn chc_manifest_artifact(path: &Path, role: &str) -> Value {
+    let physical_path = fs::canonicalize(path).expect("canonical artifact path");
+    let mut artifact = json!({
+        "schema": "ay.chc-proof-artifact-digest/v1",
+        "schema_version": 1,
+        "role": role,
+        "sha256": sha256_file(&physical_path).expect("artifact digest"),
+        "bytes": fs::metadata(&physical_path).expect("artifact metadata").len(),
+        "path": physical_path,
+    });
+    if role == "replay-obligation" {
+        artifact["kind"] = json!("safety");
+    }
+    artifact
+}
+
+fn chc_stats_json(certificate: &Path, obligations: &[&Path]) -> Value {
+    json!({
+        "mode": "chc",
+        "result": "unsat",
+        "chc_evidence_manifest": {
+            "schema": "ay.chc-evidence-manifest/v1",
+            "artifacts": {
+                "proof": {
+                    "status": "hash-bound",
+                    "artifact": chc_manifest_artifact(certificate, "proof-certificate"),
+                },
+                "replay_obligations": {
+                    "status": "hash-bound",
+                    "artifacts": obligations
+                        .iter()
+                        .map(|path| chc_manifest_artifact(path, "replay-obligation"))
+                        .collect::<Vec<_>>(),
+                },
+            },
+        },
+    })
+}
+
+#[test]
+fn chc_manifest_artifacts_ignore_planted_legacy_obligation_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let certificate = dir.path().join("chc-certificate.smt2");
+    fs::write(&certificate, "(set-logic HORN)\n; certificate\n").expect("certificate");
+    let obligations_dir = dir
+        .path()
+        .join("chc-certificate.smt2.chc-obligations-123-0");
+    fs::create_dir(&obligations_dir).expect("unique obligations directory");
+    let obligation = obligations_dir.join("000-safety.smt2");
+    fs::write(
+        &obligation,
+        "(set-logic HORN)\n(assert false)\n(check-sat)\n",
+    )
+    .expect("obligation");
+
+    let stale_dir = dir.path().join("chc-obligations");
+    fs::create_dir(&stale_dir).expect("legacy stale directory");
+    let stale = stale_dir.join("stale.smt2");
+    fs::write(&stale, "(check-sat)\n").expect("stale obligation");
+
+    let stats =
+        serde_json::to_vec(&chc_stats_json(&certificate, &[&obligation])).expect("serialize stats");
+    let emitted = emitted_chc_artifacts_from_streams(b"unsat\n", &stats, &certificate)
+        .expect("authenticate manifest artifacts");
+
+    assert_eq!(
+        emitted.certificate.path,
+        fs::canonicalize(&certificate).expect("physical certificate")
+    );
+    assert_eq!(
+        emitted
+            .obligations
+            .iter()
+            .map(|artifact| artifact.path.clone())
+            .collect::<Vec<_>>(),
+        vec![fs::canonicalize(&obligation).expect("physical obligation")]
+    );
+    assert!(!emitted
+        .obligations
+        .iter()
+        .any(|artifact| artifact.path == stale));
+    assert_eq!(
+        emitted.obligations[0].bytes,
+        fs::read(&obligation).expect("read obligation bytes")
+    );
+}
+
+#[test]
+fn cached_chc_validation_uses_authenticated_bytes_after_path_replacement() {
+    let repo_root = resolve_repo_root(None).expect("repo root");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let certificate = dir.path().join("chc-certificate.smt2");
+    fs::write(&certificate, "certificate\n").expect("certificate");
+    let obligations_dir = dir
+        .path()
+        .join("chc-certificate.smt2.chc-obligations-123-5");
+    fs::create_dir(&obligations_dir).expect("obligations directory");
+    let obligation = obligations_dir.join("000-safety.smt2");
+    let original = b"(assert false)\n(check-sat)\n";
+    fs::write(&obligation, original).expect("obligation");
+
+    let stats =
+        serde_json::to_vec(&chc_stats_json(&certificate, &[&obligation])).expect("serialize stats");
+    let emitted = emitted_chc_artifacts_from_streams(b"", &stats, &certificate)
+        .expect("authenticate same-run artifacts");
+    let original_sha256 = sha256_hex(original);
+
+    fs::rename(
+        &obligation,
+        obligations_dir.join("authenticated-original.smt2"),
+    )
+    .expect("move authenticated inode");
+    fs::write(&obligation, "(check-sat)\n").expect("plant replacement");
+
+    let mut cached_obligations = BTreeMap::new();
+    cached_obligations.insert(
+        original_sha256,
+        CachedObligation {
+            name: "000-safety.smt2".to_string(),
+            status_code: Some(0),
+            stdout_first_line: "unsat".to_string(),
+        },
+    );
+    let cache = ReferenceCache {
+        path: dir.path().join("reference-cache.json"),
+        z3_version: "Z3 version 4.test".to_string(),
+        basic_smt_transcript: CachedTranscript {
+            input_sha256: sha256_hex(BASIC_SMT_TRANSCRIPT_INPUT.as_bytes()),
+            status_code: Some(0),
+            stdout: "sat\n((x 1))\n".to_string(),
+            stderr: String::new(),
+        },
+        chc_obligations: CachedChcObligations {
+            problem_sha256: sha256_file(&repo_root.join(CHC_CANARY_PROBLEM)).unwrap(),
+            obligations: cached_obligations,
+        },
+        surface_evidence: BTreeMap::new(),
+    };
+
+    assert_eq!(
+        validate_cached_chc_obligations(
+            &cache,
+            &repo_root.join(CHC_CANARY_PROBLEM),
+            &emitted.obligations,
+        )
+        .expect("validate captured evidence"),
+        1
+    );
+    assert_eq!(emitted.obligations[0].bytes, original);
+}
+
+#[test]
+fn command_capture_with_stdin_passes_exact_authenticated_bytes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = b"(assert false)\n(check-sat)\n";
+    let output = run_command_capture_with_stdin(dir.path(), Path::new("sh"), &["-c", "cat"], input)
+        .expect("run stdin echo helper");
+
+    assert!(output.status.success());
+    assert_eq!(output.stdout, input);
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn chc_manifest_artifacts_reject_digest_or_length_mismatch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let certificate = dir.path().join("chc-certificate.smt2");
+    fs::write(&certificate, "certificate\n").expect("certificate");
+    let obligations_dir = dir
+        .path()
+        .join("chc-certificate.smt2.chc-obligations-123-1");
+    fs::create_dir(&obligations_dir).expect("unique obligations directory");
+    let obligation = obligations_dir.join("000-safety.smt2");
+    fs::write(&obligation, "(assert false)\n(check-sat)\n").expect("obligation");
+
+    let mut bad_digest = chc_stats_json(&certificate, &[&obligation]);
+    bad_digest["chc_evidence_manifest"]["artifacts"]["replay_obligations"]["artifacts"][0]
+        ["sha256"] = json!("0".repeat(64));
+    let stderr = serde_json::to_vec(&bad_digest).expect("serialize bad digest stats");
+    let error = emitted_chc_artifacts_from_streams(b"", &stderr, &certificate)
+        .expect_err("digest mismatch must fail closed");
+    assert!(error.to_string().contains("digest mismatch"), "{error:#}");
+
+    let mut bad_length = chc_stats_json(&certificate, &[&obligation]);
+    bad_length["chc_evidence_manifest"]["artifacts"]["proof"]["artifact"]["bytes"] = json!(1);
+    let stderr = serde_json::to_vec(&bad_length).expect("serialize bad length stats");
+    let error = emitted_chc_artifacts_from_streams(b"", &stderr, &certificate)
+        .expect_err("length mismatch must fail closed");
+    assert!(
+        error.to_string().contains("byte length mismatch"),
+        "{error:#}"
+    );
+
+    let mut missing_kind = chc_stats_json(&certificate, &[&obligation]);
+    missing_kind["chc_evidence_manifest"]["artifacts"]["replay_obligations"]["artifacts"][0]
+        ["kind"] = json!("");
+    let stderr = serde_json::to_vec(&missing_kind).expect("serialize empty-kind stats");
+    let error = emitted_chc_artifacts_from_streams(b"", &stderr, &certificate)
+        .expect_err("empty obligation kind must fail closed");
+    assert!(
+        error.to_string().contains("empty obligation kind"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn chc_manifest_artifacts_require_one_unique_physical_obligation_parent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let certificate = dir.path().join("chc-certificate.smt2");
+    fs::write(&certificate, "certificate\n").expect("certificate");
+    let first_dir = dir
+        .path()
+        .join("chc-certificate.smt2.chc-obligations-123-2");
+    let second_dir = dir
+        .path()
+        .join("chc-certificate.smt2.chc-obligations-123-3");
+    fs::create_dir(&first_dir).expect("first obligations directory");
+    fs::create_dir(&second_dir).expect("second obligations directory");
+    let first = first_dir.join("000-initiation.smt2");
+    let second = second_dir.join("001-safety.smt2");
+    fs::write(&first, "(assert false)\n(check-sat)\n").expect("first obligation");
+    fs::write(&second, "(assert false)\n(check-sat)\n").expect("second obligation");
+
+    let stats = serde_json::to_vec(&chc_stats_json(&certificate, &[&first, &second]))
+        .expect("serialize mixed-parent stats");
+    let error = emitted_chc_artifacts_from_streams(b"", &stats, &certificate)
+        .expect_err("mixed same-run directories must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("mixes replay obligation directories"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn chc_manifest_artifacts_require_the_requested_certificate_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let certificate = dir.path().join("chc-certificate.smt2");
+    let planted = dir.path().join("other-certificate.smt2");
+    fs::write(&certificate, "same-run certificate\n").expect("certificate");
+    fs::write(&planted, "stale certificate\n").expect("planted certificate");
+    let obligations_dir = dir
+        .path()
+        .join("chc-certificate.smt2.chc-obligations-123-4");
+    fs::create_dir(&obligations_dir).expect("obligations directory");
+    let obligation = obligations_dir.join("000-safety.smt2");
+    fs::write(&obligation, "(assert false)\n(check-sat)\n").expect("obligation");
+
+    let stats = serde_json::to_vec(&chc_stats_json(&planted, &[&obligation]))
+        .expect("serialize wrong-proof stats");
+    let error = emitted_chc_artifacts_from_streams(b"", &stats, &certificate)
+        .expect_err("manifest proof must match requested path");
+    assert!(
+        error
+            .to_string()
+            .contains("not the requested same-run certificate"),
+        "{error:#}"
+    );
 }
 
 fn valid_reference_cache_value(repo_root: &Path) -> Value {

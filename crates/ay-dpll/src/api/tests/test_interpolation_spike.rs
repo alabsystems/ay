@@ -1123,11 +1123,8 @@ impl<'a> Interpolator<'a> {
                 }
                 _ => None,
             };
-            if itp.is_none() {
-                // A hole we cannot interpolate: bail honestly.
-                return None;
-            }
-            partial.push(itp);
+            // A hole we cannot interpolate: bail honestly.
+            partial.push(Some(itp?));
         }
         partial.last().and_then(Clone::clone)
     }
@@ -1364,7 +1361,8 @@ fn run_spike(label: &str, src: &str, a_count: usize) -> (ProofShape, Option<Spik
         let itp_text = itp.text(&solver);
         let check_a_script =
             build_script(&part.decls, &part.a_lines, &[format!("(not {itp_text})")]);
-        let check_b_script = build_script(&part.decls, &part.b_lines, &[itp_text.clone()]);
+        let check_b_script =
+            build_script(&part.decls, &part.b_lines, std::slice::from_ref(&itp_text));
         let ra = check_script(&check_a_script);
         let rb = check_script(&check_b_script);
         eprintln!("[spike:{label}] verify: A&!I={ra} I&B={rb}");
@@ -1431,7 +1429,11 @@ fn run_spike(label: &str, src: &str, a_count: usize) -> (ProofShape, Option<Spik
                     &part.a_lines,
                     &[format!("(not {i_text})")],
                 ));
-                let rb = check_script(&build_script(&part.decls, &part.b_lines, &[i_text.clone()]));
+                let rb = check_script(&build_script(
+                    &part.decls,
+                    &part.b_lines,
+                    std::slice::from_ref(&i_text),
+                ));
                 shape.prod_verified = non_shared == 0 && ra == "unsat" && rb == "unsat";
                 eprintln!(
                     "[spike:{label}] production: A&!I={ra} I&B={rb} non_shared_vars={non_shared} \
@@ -1590,7 +1592,11 @@ fn test_interpolation_repro_replay() {
                     &part.a_lines,
                     &[format!("(not {i_text})")],
                 ));
-                let rb = check_script(&build_script(&part.decls, &part.b_lines, &[i_text.clone()]));
+                let rb = check_script(&build_script(
+                    &part.decls,
+                    &part.b_lines,
+                    std::slice::from_ref(&i_text),
+                ));
                 let ok = non_shared == 0 && ra == "unsat" && rb == "unsat";
                 verified_any |= ok;
                 eprintln!(

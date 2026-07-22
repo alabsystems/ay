@@ -3,6 +3,7 @@
 // Licensed under the Apache License, Version 2.0
 
 use crate::command::{self, Term as ParsedTerm};
+use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{Sort, Symbol, TermId};
 
 use super::{is_reserved_symbol, Context, ElaborateError, Result, SymbolInfo};
@@ -23,8 +24,58 @@ pub enum IntroKind {
 }
 
 impl Context {
+    fn reject_redefinition(
+        &self,
+        kind: IntroKind,
+        name: &str,
+        arg_sorts: &[command::Sort],
+        ret_sort: &command::Sort,
+    ) -> Result<()> {
+        if let Some(message) = self.redefinition_error(kind, name, arg_sorts, ret_sort) {
+            return Err(ElaborateError::Redefinition(message));
+        }
+        Ok(())
+    }
+
+    fn reject_unrepresentable_overload(&self, kind: IntroKind, name: &str) -> Result<()> {
+        // Ordinary declarations have opaque per-signature identities and can
+        // coexist. Definitions remain name-keyed in `fun_defs`: any accepted
+        // overload on either side would make application expansion select one
+        // body solely by spelling and conflate the other signature.
+        let conflicts = match kind {
+            IntroKind::Declare => self.fun_defs.contains_key(name),
+            IntroKind::Macro | IntroKind::Recursive => self.has_symbol_binding(name),
+        };
+        if conflicts {
+            return Err(ElaborateError::UnrepresentableOverload(name.to_string()));
+        }
+        Ok(())
+    }
+
+    fn validate_defined_function_body(
+        &mut self,
+        params: &[(String, Sort)],
+        result_sort: &Sort,
+        body: &ParsedTerm,
+    ) -> Result<()> {
+        let mut env = HashMap::default();
+        for (name, sort) in params {
+            env.insert(name.clone(), self.terms.mk_var(name, sort.clone()));
+        }
+        let body_term = self.elaborate_term(body, &env)?;
+        let actual = self.terms.sort(body_term);
+        if actual == result_sort || (actual == &Sort::Int && result_sort == &Sort::Real) {
+            return Ok(());
+        }
+        Err(ElaborateError::SortMismatch {
+            expected: result_sort.to_string(),
+            actual: actual.to_string(),
+        })
+    }
+
     /// Declare a constant
     pub(crate) fn declare_const(&mut self, name: &str, sort: &command::Sort) -> Result<()> {
+        self.reject_redefinition(IntroKind::Declare, name, &[], sort)?;
         if is_reserved_symbol(name) {
             return Err(ElaborateError::ReservedSymbol(name.to_string()));
         }
@@ -33,22 +84,24 @@ impl Context {
         if self.is_datatype_member_name(name) {
             return Err(ElaborateError::DatatypeMemberCollision(name.to_string()));
         }
+        self.reject_unrepresentable_overload(IntroKind::Declare, name)?;
         let sort = self.elaborate_sort(sort)?;
-        let term = self.mk_declared_const_term(name, &sort);
-        self.symbols.insert(
+        let internal_name = self.ordinary_declaration_internal_name(name);
+        let term_name = internal_name.as_deref().unwrap_or(name);
+        let term = self.mk_declared_const_term(term_name, &sort);
+        self.register_overloadable_symbol(
             name.to_string(),
             SymbolInfo {
                 term: Some(term),
                 sort,
                 arg_sorts: vec![],
-                internal_name: None,
+                internal_name,
             },
         );
         // A USER declaration always wins over a colliding solver-internal
         // registration: it must never be model-suppressed
         // (#mv-internal-symbol-suppression).
         self.internal_symbols.remove(name);
-        self.track_scoped_symbol(name.to_string());
         Ok(())
     }
 
@@ -135,6 +188,7 @@ impl Context {
                                     self.build_const_term(&field_name, field_sort, visiting);
                                 // Register the field so it is collected as a
                                 // solvable variable and resolvable in get-value.
+                                self.track_scoped_symbol(&field_name);
                                 self.symbols.insert(
                                     field_name.clone(),
                                     SymbolInfo {
@@ -147,7 +201,6 @@ impl Context {
                                 // Solver-internal, NOT user-declared: `(get-model)`
                                 // must not print it (#mv-internal-symbol-suppression).
                                 self.internal_symbols.insert(field_name.clone());
-                                self.track_scoped_symbol(field_name);
                                 field_terms.push(field_term);
                             }
                             visiting.pop();
@@ -172,6 +225,7 @@ impl Context {
         arg_sorts: &[command::Sort],
         ret_sort: &command::Sort,
     ) -> Result<()> {
+        self.reject_redefinition(IntroKind::Declare, name, arg_sorts, ret_sort)?;
         // Declaration-activated collection predicates (`set.subset`,
         // `map.dom`, `map.subset`, `multiset.subset`) are the SOLE exception
         // to the reserved-name gate, and only HERE (declare-fun) and only at
@@ -197,16 +251,7 @@ impl Context {
         if self.is_datatype_member_name(name) {
             return Err(ElaborateError::DatatypeMemberCollision(name.to_string()));
         }
-        // A user declaration of `to_real` (deliberately declarable — a valid
-        // `(_ map f)` target) shadows the builtin: its applications are
-        // byte-identical to the builtin's in the term store, so the
-        // to_real-integrality rewrites must stand down for the rest of the
-        // session (sticky, fail-closed). Covers both SMT-LIB text and the
-        // programmatic `try_declare_fun` path (which funnels through this
-        // method via Command::DeclareFun). (#to-real-bridge)
-        if name == "to_real" {
-            self.terms.mark_to_real_shadowed();
-        }
+        self.reject_unrepresentable_overload(IntroKind::Declare, name)?;
         let mut elaborated_arg_sorts: Vec<Sort> = Vec::with_capacity(arg_sorts.len());
         for s in arg_sorts {
             elaborated_arg_sorts.push(self.elaborate_sort(s)?);
@@ -224,27 +269,35 @@ impl Context {
             )));
         }
 
+        let internal_name = self.ordinary_declaration_internal_name(name);
+
         // If no arguments, it's a constant — apply the same eager single-
         // constructor datatype elimination as declare-const.
         let term = if arg_sorts.is_empty() {
-            Some(self.mk_declared_const_term(name, &ret_sort))
+            Some(self.mk_declared_const_term(internal_name.as_deref().unwrap_or(name), &ret_sort))
         } else {
             None
         };
 
-        self.symbols.insert(
+        // Commit the sticky shadow marker only after every fallible sort and
+        // signature check succeeds. A rejected declaration must not disable
+        // builtin `to_real` reasoning for the rest of the session.
+        if name == "to_real" {
+            self.terms.mark_to_real_shadowed();
+        }
+
+        self.register_overloadable_symbol(
             name.to_string(),
             SymbolInfo {
                 term,
                 sort: ret_sort,
                 arg_sorts,
-                internal_name: None,
+                internal_name,
             },
         );
         // A USER declaration always wins over a colliding solver-internal
         // registration (#mv-internal-symbol-suppression).
         self.internal_symbols.remove(name);
-        self.track_scoped_symbol(name.to_string());
         Ok(())
     }
 
@@ -268,7 +321,7 @@ impl Context {
     /// `(new_kind, old_kind)` pair. The returned string is the message BODY
     /// (no `line/column` prefix — the CLI adds position). (#P0.3)
     pub fn redefinition_error(
-        &mut self,
+        &self,
         new_kind: IntroKind,
         name: &str,
         arg_sorts: &[command::Sort],
@@ -303,11 +356,14 @@ impl Context {
             return None;
         }
 
+        // Redefinition probing is observational: lazy sort/datatype expansion
+        // must not mutate the live context before the command is accepted.
+        let mut probe = self.datatype_sort_preflight_context();
         let mut elaborated_arg_sorts: Vec<Sort> = Vec::with_capacity(arg_sorts.len());
         for s in arg_sorts {
-            elaborated_arg_sorts.push(self.elaborate_sort(s).ok()?);
+            elaborated_arg_sorts.push(probe.elaborate_sort(s).ok()?);
         }
-        let elaborated_ret_sort = self.elaborate_sort(ret_sort).ok()?;
+        let elaborated_ret_sort = probe.elaborate_sort(ret_sort).ok()?;
 
         // Rule 2 — match rule. A plain macro on the existing side ignores the
         // result sort; everything else keys on the full signature.
@@ -349,6 +405,8 @@ impl Context {
         ret_sort: &command::Sort,
         body: &ParsedTerm,
     ) -> Result<()> {
+        let parsed_arg_sorts: Vec<_> = params.iter().map(|(_, sort)| sort.clone()).collect();
+        self.reject_redefinition(IntroKind::Macro, name, &parsed_arg_sorts, ret_sort)?;
         if is_reserved_symbol(name) {
             return Err(ElaborateError::ReservedSymbol(name.to_string()));
         }
@@ -356,6 +414,7 @@ impl Context {
         if self.is_datatype_member_name(name) {
             return Err(ElaborateError::DatatypeMemberCollision(name.to_string()));
         }
+        self.reject_unrepresentable_overload(IntroKind::Macro, name)?;
         let mut params_vec: Vec<(String, Sort)> = Vec::with_capacity(params.len());
         for (n, s) in params {
             params_vec.push((n.clone(), self.elaborate_sort(s)?));
@@ -363,12 +422,17 @@ impl Context {
         let params = params_vec;
         let ret_sort = self.elaborate_sort(ret_sort)?;
 
+        self.validate_defined_function_body(&params, &ret_sort, body)?;
+
         // Store the definition for expansion
-        self.fun_defs
-            .insert(name.to_string(), (params.clone(), body.clone()));
+        self.fun_defs.insert(
+            name.to_string(),
+            (params.clone(), ret_sort.clone(), body.clone()),
+        );
 
         // Also add to symbol table
         let arg_sorts: Vec<Sort> = params.iter().map(|(_, s)| s.clone()).collect();
+        self.track_scoped_symbol(name);
         self.symbols.insert(
             name.to_string(),
             SymbolInfo {
@@ -380,7 +444,6 @@ impl Context {
         );
         // Track in current scope for pop() cleanup (#8621).
         self.track_scoped_fun_def(name.to_string());
-        self.track_scoped_symbol(name.to_string());
         Ok(())
     }
 
@@ -395,6 +458,8 @@ impl Context {
         ret_sort: &command::Sort,
         body: &ParsedTerm,
     ) -> Result<()> {
+        let parsed_arg_sorts: Vec<_> = params.iter().map(|(_, sort)| sort.clone()).collect();
+        self.reject_redefinition(IntroKind::Recursive, name, &parsed_arg_sorts, ret_sort)?;
         if is_reserved_symbol(name) {
             return Err(ElaborateError::ReservedSymbol(name.to_string()));
         }
@@ -402,6 +467,7 @@ impl Context {
         if self.is_datatype_member_name(name) {
             return Err(ElaborateError::DatatypeMemberCollision(name.to_string()));
         }
+        self.reject_unrepresentable_overload(IntroKind::Recursive, name)?;
         let mut params_vec: Vec<(String, Sort)> = Vec::with_capacity(params.len());
         for (n, s) in params {
             params_vec.push((n.clone(), self.elaborate_sort(s)?));
@@ -411,26 +477,39 @@ impl Context {
 
         // For recursive functions, add to symbol table first so body can reference the function
         let arg_sorts: Vec<Sort> = params.iter().map(|(_, s)| s.clone()).collect();
-        self.symbols.insert(
+        let scope_symbols_before = self.scopes.last().map(|frame| frame.symbols.clone());
+        self.track_scoped_symbol(name);
+        let previous_symbol = self.symbols.insert(
             name.to_string(),
             SymbolInfo {
                 term: None,
-                sort: ret_sort,
+                sort: ret_sort.clone(),
                 arg_sorts,
                 internal_name: None,
             },
         );
 
+        if let Err(error) = self.validate_defined_function_body(&params, &ret_sort, body) {
+            if let Some(previous) = previous_symbol {
+                self.symbols.insert(name.to_string(), previous);
+            } else {
+                self.symbols.remove(name);
+            }
+            if let (Some(frame), Some(symbols)) = (self.scopes.last_mut(), scope_symbols_before) {
+                frame.symbols = symbols;
+            }
+            return Err(error);
+        }
+
         // Store the definition for expansion
         self.fun_defs
-            .insert(name.to_string(), (params, body.clone()));
+            .insert(name.to_string(), (params, ret_sort, body.clone()));
         // Mark as a recursive-function declaration (distinct from a plain macro)
         // for z3-parity redefinition collision (#P0.3).
         self.recursive_fun_names.insert(name.to_string());
 
         // Track in current scope for pop() cleanup (#8621).
         self.track_scoped_fun_def(name.to_string());
-        self.track_scoped_symbol(name.to_string());
 
         Ok(())
     }
@@ -444,8 +523,22 @@ impl Context {
         declarations: &[command::FuncDeclaration],
         bodies: &[ParsedTerm],
     ) -> Result<()> {
+        if declarations.len() != bodies.len() {
+            return Err(ElaborateError::InvalidConstant(format!(
+                "define-funs-rec has {} declarations but {} bodies",
+                declarations.len(),
+                bodies.len()
+            )));
+        }
+
         // Validate all function names first
+        let mut names = HashSet::default();
         for (name, _params, _ret_sort) in declarations {
+            if !names.insert(name.clone()) {
+                return Err(ElaborateError::InvalidConstant(format!(
+                    "define-funs-rec contains duplicate function name '{name}'"
+                )));
+            }
             if is_reserved_symbol(name) {
                 return Err(ElaborateError::ReservedSymbol(name.clone()));
             }
@@ -455,12 +548,32 @@ impl Context {
             }
         }
 
+        // Enforce the same collision rules for every caller of Context, not
+        // just the CLI wrapper. Probe the whole batch before registering any
+        // mutually recursive signature.
+        for (name, params, ret_sort) in declarations {
+            let parsed_arg_sorts: Vec<_> = params.iter().map(|(_, sort)| sort.clone()).collect();
+            self.reject_redefinition(IntroKind::Recursive, name, &parsed_arg_sorts, ret_sort)?;
+            self.reject_unrepresentable_overload(IntroKind::Recursive, name)?;
+        }
+
         // Elaborated declarations with internal Sort type
         type ElaboratedDecl = (String, Vec<(String, Sort)>, Sort);
 
-        // First pass: register all function signatures in the symbol table
-        let mut elaborated_decls: Vec<ElaboratedDecl> = Vec::new();
+        // Prove every sort can elaborate before the live symbol table changes.
+        // The narrow probe absorbs lazy parametric-sort/datatype instantiation,
+        // so a bad later declaration cannot leave earlier signatures behind.
+        let mut preflight = self.datatype_sort_preflight_context();
+        for (_name, params, ret_sort) in declarations {
+            for (_param_name, sort) in params {
+                preflight.elaborate_sort(sort)?;
+            }
+            preflight.elaborate_sort(ret_sort)?;
+        }
 
+        // Elaborate all live signatures before registering the first one. The
+        // preflight above makes this deterministic/fallible phase atomic.
+        let mut elaborated_decls: Vec<ElaboratedDecl> = Vec::new();
         for (name, params, ret_sort) in declarations {
             let mut params_vec: Vec<(String, Sort)> = Vec::with_capacity(params.len());
             for (n, s) in params {
@@ -469,8 +582,19 @@ impl Context {
             let params = params_vec;
             let ret_sort = self.elaborate_sort(ret_sort)?;
 
-            let arg_sorts: Vec<Sort> = params.iter().map(|(_, s)| s.clone()).collect();
-            self.symbols.insert(
+            elaborated_decls.push((name.clone(), params, ret_sort));
+        }
+
+        // First commit phase: register all signatures so mutually recursive
+        // bodies resolve every peer. Preserve the exact state needed to undo a
+        // later body-validation error, including the current scope's lazy
+        // symbol snapshots.
+        let scope_symbols_before = self.scopes.last().map(|frame| frame.symbols.clone());
+        let mut previous_symbols: Vec<(String, Option<SymbolInfo>)> = Vec::new();
+        for (name, params, ret_sort) in &elaborated_decls {
+            let arg_sorts: Vec<Sort> = params.iter().map(|(_, sort)| sort.clone()).collect();
+            self.track_scoped_symbol(name);
+            let previous = self.symbols.insert(
                 name.clone(),
                 SymbolInfo {
                     term: None,
@@ -479,19 +603,37 @@ impl Context {
                     internal_name: None,
                 },
             );
+            previous_symbols.push((name.clone(), previous));
+        }
 
-            elaborated_decls.push((name.clone(), params, ret_sort));
+        let validation = elaborated_decls.iter().zip(bodies.iter()).try_for_each(
+            |((_name, params, ret_sort), body)| {
+                self.validate_defined_function_body(params, ret_sort, body)
+            },
+        );
+        if let Err(error) = validation {
+            for (name, previous) in previous_symbols.into_iter().rev() {
+                if let Some(previous) = previous {
+                    self.symbols.insert(name, previous);
+                } else {
+                    self.symbols.remove(&name);
+                }
+            }
+            if let (Some(frame), Some(symbols)) = (self.scopes.last_mut(), scope_symbols_before) {
+                frame.symbols = symbols;
+            }
+            return Err(error);
         }
 
         // Second pass: store all function definitions
-        for ((name, params, _ret_sort), body) in elaborated_decls.into_iter().zip(bodies.iter()) {
-            self.fun_defs.insert(name.clone(), (params, body.clone()));
+        for ((name, params, ret_sort), body) in elaborated_decls.into_iter().zip(bodies.iter()) {
+            self.fun_defs
+                .insert(name.clone(), (params, ret_sort, body.clone()));
             // Mark as recursive-function declarations for z3-parity redefinition
             // collision (#P0.3).
             self.recursive_fun_names.insert(name.clone());
             // Track in current scope for pop() cleanup (#8621).
             self.track_scoped_fun_def(name.clone());
-            self.track_scoped_symbol(name);
         }
 
         Ok(())

@@ -1461,6 +1461,40 @@ fn soft_reset_preserves_statistics_and_reduced_terms() {
     );
 }
 
+/// NF-engine closure 5 is QUARANTINED: `AY_STR_NF=1` alone must NOT enable
+/// it (measured wrong-UNSAT witness — see
+/// `NF_CLOSURES_REQUIRING_EXPLICIT_OPT_IN`), while the closures that are
+/// still trusted stay reachable. Naming it explicitly in
+/// `AY_STR_NF_CLOSURES` remains possible for repair work.
+#[test]
+fn nf_closure_5_is_not_enabled_by_the_master_switch_alone() {
+    // `AY_STR_NF_CLOSURES` is unset in the test process, so the subset is
+    // `None` and the quarantine list is the only thing that can exclude 5.
+    if std::env::var("AY_STR_NF_CLOSURES").is_ok() {
+        return;
+    }
+    STR_NF_TEST_OVERRIDE.with(|c| c.set(true));
+    let five = str_nf_closure_enabled(5);
+    let trusted: Vec<bool> = (1u8..=4)
+        .chain(std::iter::once(6))
+        .map(str_nf_closure_enabled)
+        .collect();
+    STR_NF_TEST_OVERRIDE.with(|c| c.set(false));
+
+    assert!(
+        !five,
+        "closure 5 is quarantined: AY_STR_NF=1 alone must not enable it"
+    );
+    assert!(
+        trusted.iter().all(|&t| t),
+        "closures 1-4 and 6 must stay enabled under AY_STR_NF=1: {trusted:?}"
+    );
+    assert!(
+        !str_nf_closure_enabled(6),
+        "every closure must be off when the master switch is off"
+    );
+}
+
 #[cfg(kani)]
 mod verification {
     use super::*;

@@ -189,7 +189,7 @@ fn detect(model: &Model) -> Option<MarketSplit> {
             }
         }
         let (s, sc) = slack?; // every target row must carry its slack
-        if !(sc > 0.0) {
+        if sc.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             return None; // slack must absorb the deficit side (markshare: +)
         }
         let mut nbin = 0usize;
@@ -552,7 +552,7 @@ impl Engine {
         let z: Vec<BigInt> = z1
             .iter()
             .map(|v| v.to_integer())
-            .chain(std::iter::repeat(BigInt::zero()).take(self.n - r))
+            .chain(std::iter::repeat_n(BigInt::zero(), self.n - r))
             .collect();
         // x = U · [z; 0].
         let mut x = vec![BigInt::zero(); self.n];
@@ -846,7 +846,7 @@ impl EnumState<'_> {
                 self.aborted = true;
                 return None;
             }
-            if self.nodes % (1 << 22) == 0 && Instant::now() >= eng.deadline {
+            if self.nodes.is_multiple_of(1 << 22) && Instant::now() >= eng.deadline {
                 self.aborted = true;
                 return None;
             }
@@ -898,7 +898,7 @@ impl EnumState<'_> {
                     xk = xk.checked_add(yt.checked_mul(eng.k[t][k])?)?;
                 }
             }
-            if xk < 0 || xk > 1 {
+            if !(0..=1).contains(&xk) {
                 return Some(false);
             }
         }
@@ -1192,7 +1192,7 @@ mod tests {
         let lo = BigRational::from_float(iv.lo).expect("finite lower endpoint");
         let hi = BigRational::from_float(iv.hi).expect("finite upper endpoint");
         assert!(
-            lo <= *exact && *exact <= hi,
+            (lo..=hi).contains(exact),
             "interval [{}, {}] does not enclose {exact}",
             iv.lo,
             iv.hi,

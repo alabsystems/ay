@@ -6349,8 +6349,7 @@ mod tests {
         );
         assert!(lines.contains(&"all_sat_enumeration_fail_closed=true".to_string()));
         assert!(lines.contains(&format!(
-            "model_blocking_required_contract_revision={}",
-            AY_SYMBOLIC_EXECUTION_ROUTE_REQUIRED_CONTRACT_REVISION
+            "model_blocking_required_contract_revision={AY_SYMBOLIC_EXECUTION_ROUTE_REQUIRED_CONTRACT_REVISION}"
         )));
 
         assert!(

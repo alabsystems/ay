@@ -712,7 +712,7 @@ fn test_executor_qf_abv_cegar_fc_cross_base_budget_overflow_unsat_8510() {
 
     // Assert select values for each s_i
     for i in 0..23 {
-        writeln!(smt, "(assert (= (select mem s{i}) #x{:02x}))", i).unwrap();
+        writeln!(smt, "(assert (= (select mem s{i}) #x{i:02x}))").unwrap();
     }
 
     // Two more symbolic selects that must alias (p == q)

@@ -14,17 +14,27 @@ use ay_bench::cross_verify::{
     build_report, classify_answers, cmd_cross_verify, render_cross_table, CrossClass, CrossEntry,
     CrossReport, CrossVerifyArgs,
 };
-use ay_bench::harvest::{BaselineRow, BaselineStore};
+use ay_bench::harvest::{
+    BaselineRow, BaselineStore, ENFORCEMENT_AY_MEMORY_V1, ENFORCEMENT_RSS_WATCHDOG_V1,
+};
 
 fn sample(corpus: &str, bench: &str, solver: &str, answer: &str) -> BaselineRow {
     BaselineRow {
         corpus: corpus.to_string(),
         benchmark_path: bench.to_string(),
-        content_hash: "fh128:deadbeef".to_string(),
+        content_hash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .to_string(),
+        solver_input_hash:
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
         solver: solver.to_string(),
         solver_version: "v1".to_string(),
+        solver_path: format!("/usr/bin/{solver}"),
+        solver_sha256: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            .to_string(),
+        solver_size_bytes: 1234,
         answer: answer.to_string(),
         expected: "unknown".to_string(),
+        expected_source: "unknown".to_string(),
         wall_ms: 10,
         exit_code: Some(0),
         timeout_s: 30.0,
@@ -36,7 +46,15 @@ fn sample(corpus: &str, bench: &str, solver: &str, answer: &str) -> BaselineRow 
         resource_memlimit_mb: 1024,
         resource_nbcore: 1,
         resource_headroom_mb: 16000,
-        resource_enforcement: "test".to_string(),
+        resource_enforcement: ENFORCEMENT_RSS_WATCHDOG_V1.to_string(),
+        solver_argv_json: "[]".to_string(),
+        solver_env_json: "{}".to_string(),
+        stdout_sha256: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            .to_string(),
+        stderr_sha256: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            .to_string(),
+        stdout_truncated: false,
+        stderr_truncated: false,
     }
 }
 
@@ -92,7 +110,23 @@ fn classify_missing_solver_row() {
     assert_eq!(classify_answers(&answers), CrossClass::Missing);
 }
 
+#[test]
+fn classify_empty_answer_set_is_safe() {
+    assert_eq!(classify_answers(&[]), CrossClass::Partial);
+}
+
 // ---------- build_report (in-memory store) ----------
+
+#[test]
+fn build_report_rejects_empty_or_duplicate_solver_sets() {
+    let store = BaselineStore::open_in_memory().expect("open");
+    let empty = build_report(&store, "c1", &[]).expect_err("empty solver set");
+    assert!(empty.to_string().contains("at least 2"));
+
+    let duplicate = build_report(&store, "c1", &["z3".to_string(), "z3".to_string()])
+        .expect_err("duplicate solver set");
+    assert!(duplicate.to_string().contains("distinct"));
+}
 
 #[test]
 fn build_report_agree_and_dispute() {
@@ -116,7 +150,9 @@ fn build_report_agree_and_dispute() {
     assert_eq!(report.dispute, 1);
     assert_eq!(report.partial, 0);
     assert_eq!(report.missing, 0);
+    assert_eq!(report.non_comparable, 0);
     assert!(report.has_disputes());
+    assert!(report.has_failures());
 
     let dispute = report
         .entries
@@ -153,7 +189,155 @@ fn build_report_partial_and_missing() {
     assert_eq!(report.partial, 1);
     assert_eq!(report.missing, 1);
     assert_eq!(report.dispute, 0);
+    assert_eq!(report.non_comparable, 0);
     assert!(!report.has_disputes());
+    assert!(report.has_failures());
+}
+
+#[test]
+fn build_report_refuses_different_resource_envelopes() {
+    let mut store = BaselineStore::open_in_memory().expect("open");
+    let z3 = sample("c1", "a.smt2", "z3", "sat");
+    let mut golem = sample("c1", "a.smt2", "golem", "unsat");
+    golem.resource_memlimit_mb = 2048;
+    store.upsert_rows(&[z3, golem]).expect("upsert");
+
+    let report =
+        build_report(&store, "c1", &["z3".to_string(), "golem".to_string()]).expect("report");
+
+    // A resource mismatch invalidates timing comparison, but cannot erase a
+    // same-input logical contradiction.
+    assert_eq!(report.dispute, 1);
+    assert_eq!(report.non_comparable, 1);
+    assert!(report.has_failures());
+    assert!(report.entries[0]
+        .non_comparable_reason
+        .as_deref()
+        .unwrap()
+        .contains("resource envelopes differ"));
+}
+
+#[test]
+fn build_report_refuses_different_wall_time_envelopes() {
+    let mut store = BaselineStore::open_in_memory().expect("open");
+    let z3 = sample("c1", "a.smt2", "z3", "sat");
+    let mut golem = sample("c1", "a.smt2", "golem", "sat");
+    golem.timeout_s = 60.0;
+    store.upsert_rows(&[z3, golem]).expect("upsert");
+
+    let report =
+        build_report(&store, "c1", &["z3".to_string(), "golem".to_string()]).expect("report");
+
+    assert_eq!(report.agree, 1);
+    assert_eq!(report.non_comparable, 1);
+    assert!(!report.entries[0].comparable);
+    assert!(report.entries[0]
+        .non_comparable_reason
+        .as_deref()
+        .unwrap()
+        .contains("resource envelopes differ"));
+}
+
+#[test]
+fn build_report_refuses_different_benchmark_content() {
+    let mut store = BaselineStore::open_in_memory().expect("open");
+    let z3 = sample("c1", "a.smt2", "z3", "sat");
+    let mut golem = sample("c1", "a.smt2", "golem", "sat");
+    golem.content_hash =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+    store.upsert_rows(&[z3, golem]).expect("upsert");
+
+    let report =
+        build_report(&store, "c1", &["z3".to_string(), "golem".to_string()]).expect("report");
+
+    assert_eq!(report.agree, 0);
+    assert_eq!(report.non_comparable, 1);
+    assert!(report.entries[0]
+        .non_comparable_reason
+        .as_deref()
+        .unwrap()
+        .contains("benchmark content differs"));
+}
+
+#[test]
+fn build_report_refuses_legacy_content_hashes_even_when_they_match() {
+    let mut store = BaselineStore::open_in_memory().expect("open");
+    let mut z3 = sample("c1", "a.smt2", "z3", "sat");
+    let mut golem = sample("c1", "a.smt2", "golem", "unsat");
+    z3.content_hash = "fh128:deadbeef".to_string();
+    golem.content_hash = "fh128:deadbeef".to_string();
+    store.upsert_rows(&[z3, golem]).expect("upsert");
+
+    let report =
+        build_report(&store, "c1", &["z3".to_string(), "golem".to_string()]).expect("report");
+
+    // Without stable content identity these could be answers to different
+    // bytes, so the apparent contradiction is deliberately suppressed.
+    assert_eq!(report.dispute, 0);
+    assert_eq!(report.non_comparable, 1);
+    assert_eq!(report.entries[0].classification, "non_comparable");
+    assert!(report.entries[0]
+        .non_comparable_reason
+        .as_deref()
+        .unwrap()
+        .contains("legacy or unsupported content hash"));
+}
+
+#[test]
+fn build_report_refuses_rows_without_recognized_enforcement() {
+    let mut store = BaselineStore::open_in_memory().expect("open");
+    let z3 = sample("c1", "a.smt2", "z3", "sat");
+    let mut golem = sample("c1", "a.smt2", "golem", "sat");
+    golem.resource_enforcement.clear();
+    store.upsert_rows(&[z3, golem]).expect("upsert");
+
+    let report =
+        build_report(&store, "c1", &["z3".to_string(), "golem".to_string()]).expect("report");
+
+    assert_eq!(report.non_comparable, 1);
+    assert!(report.entries[0]
+        .non_comparable_reason
+        .as_deref()
+        .unwrap()
+        .contains("envelopes are missing"));
+}
+
+#[test]
+fn build_report_rejects_free_form_enforcement_that_contains_known_words() {
+    let mut store = BaselineStore::open_in_memory().expect("open");
+    let z3 = sample("c1", "a.smt2", "z3", "sat");
+    let mut golem = sample("c1", "a.smt2", "golem", "sat");
+    golem.resource_enforcement =
+        "trust me: --memory and rss_watchdog with grace=0 were somewhere".to_string();
+    store.upsert_rows(&[z3, golem]).expect("upsert");
+
+    let report =
+        build_report(&store, "c1", &["z3".to_string(), "golem".to_string()]).expect("report");
+
+    assert_eq!(report.non_comparable, 1);
+    assert!(!report.entries[0].comparable);
+}
+
+#[test]
+fn build_report_refuses_different_exact_enforcement_mechanisms() {
+    let mut store = BaselineStore::open_in_memory().expect("open");
+    let mut ay = sample("c1", "a.smt2", "ay", "sat");
+    ay.resource_enforcement = ENFORCEMENT_AY_MEMORY_V1.to_string();
+    let z3 = sample("c1", "a.smt2", "z3", "sat");
+    store.upsert_rows(&[ay, z3]).expect("upsert");
+
+    let report = build_report(&store, "c1", &["ay".to_string(), "z3".to_string()]).expect("report");
+
+    // Exact enforcement differences invalidate performance comparison, but
+    // do not erase same-input logical agreement.
+    assert_eq!(report.agree, 1);
+    assert_eq!(report.non_comparable, 1);
+    assert!(!report.entries[0].comparable);
+    assert!(report.entries[0]
+        .non_comparable_reason
+        .as_deref()
+        .unwrap()
+        .contains("resource envelopes differ"));
 }
 
 #[test]
@@ -234,6 +418,7 @@ fn render_cross_table_no_disputes() {
         dispute: 0,
         partial: 0,
         missing: 0,
+        non_comparable: 0,
         entries: vec![],
     };
     let text = render_cross_table(&report);
@@ -257,10 +442,13 @@ fn render_cross_table_with_disputes() {
         dispute: 1,
         partial: 0,
         missing: 0,
+        non_comparable: 0,
         entries: vec![CrossEntry {
             benchmark_path: "d.smt2".into(),
             answers,
             classification: "dispute".into(),
+            comparable: true,
+            non_comparable_reason: None,
         }],
     };
     let text = render_cross_table(&report);

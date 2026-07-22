@@ -2305,6 +2305,42 @@ fn test_incremental_unsat_pop_push_unsat_lrat_no_panic() {
     assert!(!bytes.is_empty(), "proof output should contain proof steps");
 }
 
+/// A permanent base-level contradiction can survive a push/pop while the pop's
+/// selector addition becomes the last proof record. A later solve must append a
+/// fresh checker-visible empty clause instead of treating the old
+/// `empty_clause_in_proof` flag as proof that the stream still ends in one.
+#[test]
+#[cfg(debug_assertions)]
+fn test_base_unsat_reterminalizes_lrat_after_incremental_proof_addition() {
+    use crate::proof::ProofOutput;
+
+    let proof = ProofOutput::lrat_text(Vec::new(), 0);
+    let mut solver = Solver::with_proof_output(1, proof);
+    let x = Literal::positive(Variable(0));
+    solver.add_clause(vec![x]);
+    solver.add_clause(vec![x.negated()]);
+    assert!(
+        solver.solve().is_unsat(),
+        "base contradiction must be UNSAT"
+    );
+
+    solver.push();
+    assert!(solver.pop());
+    assert!(
+        solver.solve().is_unsat(),
+        "permanent base contradiction must remain certifiable after push/pop"
+    );
+
+    let output = solver.take_proof_writer().expect("proof writer");
+    let proof_text = String::from_utf8(output.into_vec().expect("proof bytes")).expect("UTF-8");
+    let last_add = proof_text
+        .lines()
+        .rfind(|line| !line.contains(" d "))
+        .expect("proof must contain an addition");
+    let tokens: Vec<&str> = last_add.split_whitespace().collect();
+    assert_eq!(tokens.get(1), Some(&"0"), "terminal add: {last_add}");
+}
+
 /// Coverage Gap 6: register_clause_id advances writer counter.
 ///
 /// Verifies that after adding original clauses, emitting a derived clause

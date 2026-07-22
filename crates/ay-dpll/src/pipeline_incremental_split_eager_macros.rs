@@ -444,6 +444,10 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         &mut theory,
                     );
 
+                // #array-deadline-forward: forward the executor's live
+                // per-solve deadline so inprocessing/L0-GC phases honor the
+                // caller's wall budget (see the assume arm).
+                solver.set_solve_deadline($self.solve_deadline.get());
                 // Deterministic resource budgets (#8749 `:rlimit` +
                 // #ground-determinism defaults). Bound this refinement's SAT
                 // solve; with the `$max_splits` cap this guarantees
@@ -533,15 +537,34 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                                 $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager L440"));
                                 break 'split_loop Ok(SolveResult::Unknown);
                             }
+                            // Strings NF-engine closure 3 (`AY_STR_NF=1`):
+                            // drain any ADDITIONAL lemmas the theory queued
+                            // behind this one and lower the whole batch in
+                            // THIS iteration instead of one CEGAR round-trip
+                            // per lemma. Always empty with the closure off, so
+                            // the loop below runs exactly once — byte-identical.
+                            let _islp_sl_extra =
+                                ay_core::TheorySolver::take_pending_string_lemmas(&mut theory);
                             pipeline_export_theory_state!(
                                 theory, $export_theory, $export_expr,
                                 _islp_learned_cuts, _islp_seen_hnf_cuts, _islp_dioph_state
                             );
                             drop(theory);
-                            let $sl_lemma = _islp_sl;
-                            let $sl_negations = &mut _islp_negations;
-                            let (_islp_new_sl_clauses, _islp_sl_stall): (Vec<Vec<TermId>>, bool) =
-                                $sl_handler;
+                            let mut _islp_new_sl_clauses: Vec<Vec<TermId>> = Vec::new();
+                            let mut _islp_sl_stall = false;
+                            for _islp_sl_one in
+                                std::iter::once(_islp_sl).chain(_islp_sl_extra.into_iter())
+                            {
+                                let $sl_lemma = _islp_sl_one;
+                                let $sl_negations = &mut _islp_negations;
+                                let (_islp_one_clauses, _islp_one_stall): (Vec<Vec<TermId>>, bool) =
+                                    $sl_handler;
+                                _islp_new_sl_clauses.extend(_islp_one_clauses);
+                                if _islp_one_stall {
+                                    _islp_sl_stall = true;
+                                    break;
+                                }
+                            }
                             if _islp_sl_stall {
                                 $self.last_unknown_reason = Some(UnknownReason::SplitLimit);
                                 $self.last_result = Some(SolveResult::Unknown);
@@ -1299,7 +1322,25 @@ use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
                         );
                     }
                     SatResult::Unsat(_) => {
-                        if !_islp_string_lemma_clauses.is_empty() {
+                        // Strings NF-engine closure 5 (`AY_STR_NF=1`): a
+                        // propositional UNSAT reached after string lemma
+                        // clauses were added is a PROOF when every such clause
+                        // is universally valid (exact reduction axioms over
+                        // fresh skolems + tautological splits — classified at
+                        // the single lowering chokepoint) and no distrusted
+                        // NF-dependent string conflict was ever turned into a
+                        // clause (`check_during_propagate` gate, plus the
+                        // adapter's `check()` gate). Under those two
+                        // conditions every clause in the solver is a
+                        // consequence of the original formula, so UNSAT of the
+                        // augmented set is UNSAT of the original. The
+                        // remaining guards below (`_ext_partial`, the
+                        // split-clause / verify-before-accept backstop) still
+                        // apply — this only removes the blanket downgrade.
+                        let _islp_sl_unsat_trustworthy =
+                            ay_strings::str_nf_closure_enabled(5)
+                                && $self.string_lemma_kinds_all_valid;
+                        if !_islp_string_lemma_clauses.is_empty() && !_islp_sl_unsat_trustworthy {
                             $self.last_unknown_reason = Some(UnknownReason::SplitLimit);
                             $self.last_result = Some(SolveResult::Unknown);
                             $crate::pipeline_fns::debug_split_exit(concat!($tag, "-eager L1148"));

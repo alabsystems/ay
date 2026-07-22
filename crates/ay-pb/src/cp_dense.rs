@@ -193,9 +193,7 @@ impl DenseCp {
         match self.epoch.checked_add(1) {
             Some(next) => self.epoch = next,
             None => {
-                for s in &mut self.stamp {
-                    *s = 0;
-                }
+                self.stamp.fill(0);
                 self.epoch = 1;
             }
         }

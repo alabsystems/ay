@@ -363,7 +363,8 @@ impl Executor {
             if !info.arg_sorts.is_empty() {
                 // Check if we have EUF model with function tables.
                 if let Some(ref euf_model) = model.euf_model {
-                    if let Some(table) = euf_model.function_tables.get(name) {
+                    let identity = self.ctx.symbol_identity_name(name, info);
+                    if let Some(table) = euf_model.function_tables.get(identity) {
                         // Resolve @?N placeholders in function table values (#5452).
                         // The EUF model builds tables before theory values are merged,
                         // so Int/Real/BV-returning functions have @?N placeholders

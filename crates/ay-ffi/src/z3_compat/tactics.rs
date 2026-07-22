@@ -73,16 +73,16 @@
 //! returns a no-op that pretends to be the requested tactic, and it NEVER maps a
 //! name to a transform whose soundness is unknown.
 
-use std::ffi::CStr;
 use std::ptr;
 
 use ay_dpll::api::Tactic;
 use ay_frontend::{ApplyTactic, SExpr};
 
 use super::{
-    cache_string, ffi_guard_const_ptr, ffi_guard_ptr, DecisionOwnerFamily, ParamDescrsHandle,
-    TacticHandle, Z3Context, Z3SolverHandle, Z3_context, Z3_param_descrs, Z3_params, Z3_probe,
-    Z3_solver, Z3_string, Z3_tactic, Z3_INVALID_ARG, Z3_OK,
+    cache_string, ffi_count_within_limit, ffi_guard_const_ptr, ffi_guard_ptr,
+    ffi_read_bounded_text, DecisionOwnerFamily, ParamDescrsHandle, TacticHandle, Z3Context,
+    Z3SolverHandle, Z3_context, Z3_param_descrs, Z3_params, Z3_probe, Z3_solver, Z3_string,
+    Z3_tactic, Z3_INVALID_ARG, Z3_OK,
 };
 use std::os::raw::c_uint;
 
@@ -138,8 +138,8 @@ pub unsafe extern "C" fn Z3_mk_tactic(c: Z3_context, name: Z3_string) -> Z3_tact
     } else {
         // SAFETY: the caller's `# Safety` contract guarantees `name`, when non-null, points to a
         // valid null-terminated C string owned by the caller for the duration of this call.
-        match unsafe { CStr::from_ptr(name) }.to_str() {
-            Ok(s) => Some(s.to_string()),
+        match unsafe { ffi_read_bounded_text(name) } {
+            Ok(s) => Some(s),
             Err(_) => Some(String::new()), // non-UTF-8 -> unsupported below
         }
     };
@@ -662,6 +662,11 @@ pub unsafe extern "C" fn Z3_tactic_par_or(
     num: c_uint,
     ts: *const Z3_tactic,
 ) -> Z3_tactic {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_tactic_par_or", num) } {
+        return ptr::null_mut();
+    }
     // Pre-extract every operand tactic outside the guard (raw-pointer derefs).
     // SAFETY: the caller's contract guarantees `ts` points to `num` valid
     // `Z3_tactic` handles when `num > 0`. We read each slot and clone its tactic;
@@ -714,10 +719,7 @@ pub unsafe extern "C" fn Z3_tactic_get_descr(c: Z3_context, name: Z3_string) -> 
         None
     } else {
         // SAFETY: caller contract guarantees a valid null-terminated C string.
-        unsafe { CStr::from_ptr(name) }
-            .to_str()
-            .ok()
-            .map(str::to_string)
+        unsafe { ffi_read_bounded_text(name) }.ok()
     };
     // SAFETY: `ffi_guard_const_ptr` handles null `c` and catches panics.
     unsafe {

@@ -45,8 +45,7 @@ fn ay_verdict(smt: &str) -> String {
     stdout
         .lines()
         .map(str::trim)
-        .filter(|l| matches!(*l, "sat" | "unsat" | "unknown"))
-        .last()
+        .rfind(|line| matches!(*line, "sat" | "unsat" | "unknown"))
         .unwrap_or("<none>")
         .to_string()
 }

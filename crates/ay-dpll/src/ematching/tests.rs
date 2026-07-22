@@ -780,11 +780,11 @@ fn test_collect_quantifiers_nnf_negated_exists() {
             match terms.get(*body) {
                 TermData::Not(_) => {} // correct: body is negated
                 other => {
-                    panic!("expected Not(...) body in NNF-converted forall, got {other:?}",)
+                    panic!("expected Not(...) body in NNF-converted forall, got {other:?}")
                 }
             }
         }
-        other => panic!("expected Forall from NNF conversion of NOT(exists), got {other:?}",),
+        other => panic!("expected Forall from NNF conversion of NOT(exists), got {other:?}"),
     }
 }
 
@@ -861,11 +861,11 @@ fn test_collect_quantifiers_nnf_negated_forall() {
             match terms.get(*body) {
                 TermData::Not(_) => {}
                 other => {
-                    panic!("expected Not(...) body in NNF-converted exists, got {other:?}",)
+                    panic!("expected Not(...) body in NNF-converted exists, got {other:?}")
                 }
             }
         }
-        other => panic!("expected Exists from NNF conversion of NOT(forall), got {other:?}",),
+        other => panic!("expected Exists from NNF conversion of NOT(forall), got {other:?}"),
     }
 }
 

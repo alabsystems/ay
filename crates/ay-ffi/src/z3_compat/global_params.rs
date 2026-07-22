@@ -39,11 +39,11 @@
 //! consulted by any solve path, so it cannot affect a verdict by construction.
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::ptr;
 use std::sync::Mutex;
 
-use super::Z3_string;
+use super::{ffi_read_bounded_text, Z3_string};
 
 /// Registered value type of a global parameter (drives set-time validation).
 #[derive(Clone, Copy)]
@@ -170,28 +170,25 @@ pub unsafe extern "C" fn Z3_global_param_set(param_id: Z3_string, param_value: Z
     if param_id.is_null() || param_value.is_null() {
         return;
     }
-    // SAFETY: null-checked above; caller contract guarantees NUL-terminated
-    // strings.
-    let (Ok(key), Ok(value)) = (
-        unsafe { CStr::from_ptr(param_id) }.to_str(),
-        unsafe { CStr::from_ptr(param_value) }.to_str(),
-    ) else {
+    // SAFETY: both pointers were null-checked and are NUL-terminated per the
+    // caller contract; the helper bounds each scan and clone.
+    let (Ok(key), Ok(value)) = (unsafe { ffi_read_bounded_text(param_id) }, unsafe {
+        ffi_read_bounded_text(param_value)
+    }) else {
         return; // non-UTF-8: refuse, never store garbage
     };
-    let norm = normalize(key);
+    let norm = normalize(&key);
     let Some((_, kind)) = registry_entry(&norm) else {
         return; // unknown key/module/param: refuse (z3 parity)
     };
-    if !value_ok(kind, value) {
+    if !value_ok(kind, &value) {
         return; // invalid value for the registered type: refuse (z3 parity)
     }
     let mut store = match STORE.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    store
-        .get_or_insert_with(HashMap::new)
-        .insert(norm, value.to_string());
+    store.get_or_insert_with(HashMap::new).insert(norm, value);
 }
 
 /// Query a process-global configuration parameter (Z3's `Z3_global_param_get`).
@@ -221,12 +218,13 @@ pub unsafe extern "C" fn Z3_global_param_get(
         write_out(ptr::null());
         return false;
     }
-    // SAFETY: null-checked above; caller contract guarantees NUL-termination.
-    let Ok(key) = unsafe { CStr::from_ptr(param_id) }.to_str() else {
+    // SAFETY: null-checked above and NUL-terminated per the caller contract;
+    // the helper bounds the scan and clone.
+    let Ok(key) = (unsafe { ffi_read_bounded_text(param_id) }) else {
         write_out(ptr::null());
         return false;
     };
-    let norm = normalize(key);
+    let norm = normalize(&key);
     let stored = {
         let mut guard = match STORE.lock() {
             Ok(g) => g,

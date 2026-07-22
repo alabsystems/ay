@@ -337,6 +337,153 @@ fn run_script_collect(script: &str) -> Vec<String> {
 }
 
 #[test]
+fn ordinary_result_sort_overloads_remain_independent_for_sat_and_unsat() {
+    let sat = run_script_collect(
+        r#"
+            (set-logic ALL)
+            (declare-fun f (Int) Int)
+            (declare-fun f (Int) Bool)
+            (assert (= ((as f Int) 0) 0))
+            (assert (not ((as f Bool) 0)))
+            (check-sat)
+        "#,
+    );
+    assert_eq!(sat.last().map(String::as_str), Some("sat"), "{sat:?}");
+
+    let unsat = run_script_collect(
+        r#"
+            (set-logic ALL)
+            (declare-fun f (Int) Int)
+            (declare-fun f (Int) Bool)
+            (assert (= ((as f Int) 0) 0))
+            (assert (= ((as f Int) 0) 1))
+            (check-sat)
+        "#,
+    );
+    assert_eq!(unsat.last().map(String::as_str), Some("unsat"), "{unsat:?}");
+}
+
+#[test]
+fn overloaded_declarations_serialize_completely_with_surface_names() {
+    let mut exec = Executor::new();
+    let commands = parse(
+        r#"
+            (declare-fun f (Int) Int)
+            (declare-fun f (Int) Bool)
+            (assert (= ((as f Int) 0) 0))
+            (assert ((as f Bool) 0))
+        "#,
+    )
+    .unwrap();
+    exec.execute_all(&commands).unwrap();
+
+    let serialized = exec.to_smtlib2();
+    assert_eq!(serialized.matches("(declare-fun f (Int)").count(), 2);
+    assert!(!serialized.contains("__ay_overload_"), "{serialized}");
+    assert!(serialized.contains("(declare-fun f (Int) Int)"));
+    assert!(serialized.contains("(declare-fun f (Int) Bool)"));
+
+    let replay = run_script_collect(&serialized);
+    assert_eq!(
+        replay.last().map(String::as_str),
+        Some("sat"),
+        "{serialized}"
+    );
+}
+
+#[test]
+fn unsupported_sort_preflight_scans_every_overload() {
+    let mut exec = Executor::new();
+    let commands = parse("(declare-fun f (Int) Int)").unwrap();
+    exec.execute_all(&commands).unwrap();
+
+    // Textual declarations correctly reject this width during elaboration.
+    // Native adapters can supply an already-built core Sort, so add that
+    // overload through the corresponding context hook to exercise the later
+    // solve preflight's defense-in-depth scan.
+    exec.ctx
+        .register_native_function_alias(
+            "f".to_string(),
+            "__ay_test_wide_f".to_string(),
+            vec![Sort::bitvec(1_048_577)],
+            Sort::Int,
+        )
+        .unwrap();
+    assert_eq!(exec.unsupported_bitvector_width(&[]), Some(1_048_577));
+}
+
+#[test]
+fn overloaded_model_output_uses_surface_names_for_distinct_tables() {
+    let output = run_script_collect(
+        r#"
+            (set-option :produce-models true)
+            (set-logic ALL)
+            (declare-fun f (Int) Int)
+            (declare-fun f (Int) Bool)
+            (check-sat)
+            (get-model)
+        "#,
+    );
+    assert_eq!(
+        output.first().map(String::as_str),
+        Some("sat"),
+        "{output:?}"
+    );
+    let model = output.last().expect("get-model output");
+    assert_eq!(model.matches("(define-fun f ").count(), 2, "{model}");
+    assert!(!model.contains("__ay_overload_"), "{model}");
+}
+
+#[test]
+fn model_hides_custom_datatype_recognizer_alias_but_keeps_overloads() {
+    let mut exec = Executor::new();
+    let commands = parse(
+        r#"
+            (set-option :produce-models true)
+            (set-logic ALL)
+            (declare-datatype Color ((red) (blue)))
+            (declare-fun f (Int) Int)
+            (declare-fun f (Int) Bool)
+        "#,
+    )
+    .unwrap();
+    exec.execute_all(&commands).unwrap();
+
+    exec.ctx
+        .register_native_function_alias(
+            "r-red".to_string(),
+            "is-red".to_string(),
+            vec![Sort::Uninterpreted("Color".to_string())],
+            Sort::Bool,
+        )
+        .unwrap();
+    exec.ctx
+        .register_native_function_alias(
+            "r-red".to_string(),
+            "is-red".to_string(),
+            vec![Sort::Uninterpreted("Color".to_string())],
+            Sort::Bool,
+        )
+        .expect("exact datatype-member alias re-registration is idempotent");
+    assert!(exec.is_dt_internal_symbol("is-red"));
+    assert!(exec.is_dt_internal_symbol("r-red"));
+    for (name, info) in exec
+        .ctx
+        .symbol_iter()
+        .filter(|(name, _)| name.as_str() == "f")
+    {
+        assert!(!exec.is_dt_internal_symbol(name));
+        assert!(!exec.is_dt_internal_symbol(exec.ctx.symbol_identity_name(name, info)));
+    }
+
+    exec.last_result = Some(SolveResult::Sat);
+    let model = exec.model();
+    assert!(!model.contains("r-red"), "{model}");
+    assert!(!model.contains("is-red"), "{model}");
+    assert_eq!(model.matches("(define-fun f ").count(), 2, "{model}");
+}
+
+#[test]
 fn test_unsat_core_survives_get_consequences_state_clobber() {
     // #unsat-core-staleness (skeptic reproducer x1): a get-consequences (or
     // get-abduct) between an UNSAT check-sat-assuming and get-unsat-core runs

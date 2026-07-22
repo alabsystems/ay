@@ -878,8 +878,7 @@ fn test_mutual_array_equality_get_model_terminates_gap1() {
     // non-empty model block.
     assert!(
         outputs.len() > 1 && outputs[1].contains("model"),
-        "get-model must produce a model block, got: {:?}",
-        outputs
+        "get-model must produce a model block, got: {outputs:?}"
     );
 }
 

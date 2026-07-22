@@ -42,6 +42,7 @@ serial_test.workspace = true
 tempfile.workspace = true
 wait-timeout.workspace = true
 ay-tla-bridge.workspace = true
+ay-test-support.workspace = true
 
 [lints]
 workspace = true

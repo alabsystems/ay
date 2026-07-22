@@ -197,26 +197,12 @@ impl Executor {
     /// Check whether a symbol is a datatype-internal symbol (constructor, tester,
     /// or selector) that should be excluded from `get-model` output (#5412).
     pub(in crate::executor) fn is_dt_internal_symbol(&self, name: &str) -> bool {
-        // Parametric-instance members are registered under their SURFACE name with
-        // an instance-mangled `internal_name`; exclude them from model output.
-        if self
-            .ctx
-            .symbol_info(name)
-            .is_some_and(|i| i.internal_name.is_some())
-        {
-            return true;
-        }
-        if self.ctx.is_constructor(name).is_some() {
-            return true;
-        }
-        if let Some(ctor) = name.strip_prefix("is-") {
-            if self.ctx.is_constructor(ctor).is_some() {
-                return true;
-            }
-        }
-        self.ctx
-            .ctor_selectors_iter()
-            .any(|(_ctor, selectors)| selectors.iter().any(|sel| sel == name))
+        // Ask the declaration registry, which checks both exact internal
+        // identities and their surface aliases. This is essential for native
+        // API recognizers whose caller-visible name is arbitrary (for example
+        // `r-red` rather than `is-red`). Merely checking `internal_name` would
+        // also hide ordinary overloaded user functions from the model.
+        self.ctx.is_datatype_member_name(name)
     }
 
     /// User-facing surface name of a (possibly instance-mangled) datatype
@@ -317,7 +303,7 @@ impl Executor {
             if let Some(ref euf_model) = model.euf_model {
                 if let Some(elem) = euf_model.term_values.get(&var_term_id) {
                     for ctor_name in constructors {
-                        if let Some(info) = self.ctx.symbol_info(ctor_name) {
+                        if let Some(info) = self.ctx.symbol_info_by_identity(ctor_name) {
                             if info.arg_sorts.is_empty() {
                                 if let Some(ctor_term_id) = info.term {
                                     if euf_model.term_values.get(&ctor_term_id) == Some(elem) {
@@ -554,7 +540,11 @@ impl Executor {
                     .constructor_selector_info(ctor_name)
                     .and_then(|fields| fields.get(field_idx))
                     .map(|(_, fs)| fs.clone())
-                    .or_else(|| self.ctx.symbol_sort(sel_name).cloned());
+                    .or_else(|| {
+                        self.ctx
+                            .symbol_info_by_identity(sel_name)
+                            .map(|info| info.sort.clone())
+                    });
                 if let Some(sel_sort) = field_sort {
                     // A skolem-free concrete default for the field's sort
                     // (datatype -> canonical constructor, array -> const default,
@@ -1025,12 +1015,12 @@ impl Executor {
 
         // A sort that (recursively, through arrays) carries a declared datatype.
         let carries_dt =
-            |sort: &Sort| -> bool { self.census_sort_carries_dt(sort, &datatype_ctors) };
+            |sort: &Sort| -> bool { Self::census_sort_carries_dt(sort, &datatype_ctors) };
         // Is the array `arr` a datatype-carrying array?
         let is_dt_array = |arr: TermId, exec: &Self| -> bool {
             matches!(exec.ctx.terms.sort(arr), Sort::Array(a)
-                if exec.census_sort_carries_dt(&a.index_sort, &datatype_ctors)
-                    || exec.census_sort_carries_dt(&a.element_sort, &datatype_ctors))
+                if Self::census_sort_carries_dt(&a.index_sort, &datatype_ctors)
+                    || Self::census_sort_carries_dt(&a.element_sort, &datatype_ctors))
         };
 
         // (1) Model array-identity: reachable terms, union-find over model-true
@@ -1049,7 +1039,7 @@ impl Executor {
         // gate/bypass. (#dt-array-census-element-only)
         let has_dt_element_array = reachable.iter().any(|&t| {
             matches!(self.ctx.terms.sort(t), Sort::Array(a)
-                if self.census_sort_carries_dt(&a.element_sort, &datatype_ctors))
+                if Self::census_sort_carries_dt(&a.element_sort, &datatype_ctors))
         });
         if !has_dt_element_array {
             return false;
@@ -1216,7 +1206,7 @@ impl Executor {
         }
 
         let mut uf: HashMap<TermId, TermId> = HashMap::default();
-        let mut union = |uf: &mut HashMap<TermId, TermId>, x: TermId, y: TermId| {
+        let union = |uf: &mut HashMap<TermId, TermId>, x: TermId, y: TermId| {
             let rx = Self::census_find(uf, x);
             let ry = Self::census_find(uf, y);
             if rx != ry {
@@ -1570,13 +1560,13 @@ impl Executor {
     }
 
     /// A sort that (recursively through arrays) carries a declared datatype.
-    fn census_sort_carries_dt(&self, sort: &Sort, dts: &HashSet<String>) -> bool {
+    fn census_sort_carries_dt(sort: &Sort, dts: &HashSet<String>) -> bool {
         match sort {
             Sort::Datatype(dt) => dts.contains(&dt.name),
             Sort::Uninterpreted(n) => dts.contains(n.as_str()),
             Sort::Array(a) => {
-                self.census_sort_carries_dt(&a.index_sort, dts)
-                    || self.census_sort_carries_dt(&a.element_sort, dts)
+                Self::census_sort_carries_dt(&a.index_sort, dts)
+                    || Self::census_sort_carries_dt(&a.element_sort, dts)
             }
             _ => false,
         }
@@ -1807,8 +1797,7 @@ impl Executor {
             let (c2, d2) = self.census_collect_cells(model, t2, class_cells, uf, depth);
             for (k, v1) in &c1 {
                 if let Some(v2) = c2.get(k).copied().or(d2) {
-                    if self.census_compatible(model, *v1, v2, class_cells, uf, depth - 1)? == false
-                    {
+                    if !self.census_compatible(model, *v1, v2, class_cells, uf, depth - 1)? {
                         return Some(false);
                     }
                 }
@@ -1818,14 +1807,12 @@ impl Executor {
                     if c1.contains_key(k) {
                         continue;
                     }
-                    if self.census_compatible(model, dv1, *v2, class_cells, uf, depth - 1)? == false
-                    {
+                    if !self.census_compatible(model, dv1, *v2, class_cells, uf, depth - 1)? {
                         return Some(false);
                     }
                 }
                 if let Some(dv2) = d2 {
-                    if self.census_compatible(model, dv1, dv2, class_cells, uf, depth - 1)? == false
-                    {
+                    if !self.census_compatible(model, dv1, dv2, class_cells, uf, depth - 1)? {
                         return Some(false);
                     }
                 }

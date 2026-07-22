@@ -288,16 +288,16 @@ fn test_ic3_mode_domain_only_decisions() {
 
     // Bump activity on some non-domain variables to make them high-priority
     // in the heap. Without domain restriction, the heap would pick these first.
-    for i in 10..20 {
+    for &var in vars.iter().take(20).skip(10) {
         for _ in 0..100 {
-            solver.vsids.bump(vars[i], &solver.vals, true);
+            solver.vsids.bump(var, &solver.vals, true);
         }
     }
 
     // Bump domain variables with lower activity.
-    for i in 0..5 {
+    for &var in vars.iter().take(5) {
         for _ in 0..10 {
-            solver.vsids.bump(vars[i], &solver.vals, true);
+            solver.vsids.bump(var, &solver.vals, true);
         }
     }
 

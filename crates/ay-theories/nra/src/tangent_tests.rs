@@ -449,11 +449,14 @@ fn test_even_power_nonneg_mathematical_property() {
 fn test_tangent_plane_square_monomial() {
     // At point a=3: T(x) = 3*x + 3*x - 9 = 6x - 9
     let a = rat(3);
+    let tangent_offset = &a * &a;
     // T evaluated at x=3: 6*3 - 9 = 9 = 3^2 (exact at tangent point)
-    let t_at_3 = &a * &rat(3) + &a * &rat(3) - &a * &a;
+    let tangent_at_3 = &a * &rat(3) + &a * &rat(3);
+    let t_at_3 = tangent_at_3 - &tangent_offset;
     assert_eq!(t_at_3, rat(9));
     // T evaluated at x=0: 0 - 9 = -9 (underestimate, actual 0)
-    let t_at_0 = &a * &rat(0) + &a * &rat(0) - &a * &a;
+    let tangent_at_0 = &a * &rat(0) + &a * &rat(0);
+    let t_at_0 = tangent_at_0 - tangent_offset;
     assert_eq!(t_at_0, rat(-9));
     assert!(t_at_0 <= rat(0), "tangent plane underestimates at x=0");
 }
@@ -491,7 +494,9 @@ fn test_mccormick_unit_interval() {
     let half = BigRational::new(1.into(), 2.into());
     let one = rat(1);
     // Lower bound 2 at (1,1) evaluated at (0.5, 0.5):
-    let lb2 = &one * &half + &one * &half - &one * &one;
+    let linear = &one * &half + &one * &half;
+    let unit_product = &one * &one;
+    let lb2 = linear - unit_product;
     assert_eq!(lb2, rat(0));
     assert!(
         lb2 <= BigRational::new(1.into(), 4.into()),

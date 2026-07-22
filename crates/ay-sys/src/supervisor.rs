@@ -20,6 +20,45 @@
 
 #![cfg(unix)]
 
+use std::process::Command;
+
+/// Arrange for `command` and all of its descendants to inherit a hard virtual
+/// address-space ceiling.
+///
+/// The limit is installed in the forked child immediately before `exec`, so it
+/// never constrains the supervising AY process. Lowering both the soft and hard
+/// limits prevents the executed program from raising its own allowance again.
+/// A failure in `getrlimit`/`setrlimit` makes `Command::spawn` fail closed.
+pub fn configure_child_address_space_limit(command: &mut Command, bytes: u64) {
+    use std::os::unix::process::CommandExt as _;
+
+    let requested = libc::rlim_t::try_from(bytes).unwrap_or(libc::rlim_t::MAX);
+    // SAFETY: `pre_exec` is necessarily unsafe because only async-signal-safe
+    // operations are permitted after fork. This closure captures one POD
+    // integer and calls only `getrlimit(2)`/`setrlimit(2)` on owned stack
+    // storage. It performs no allocation, locking, or access to shared Rust
+    // state. Returning `last_os_error` is the standard `Command` pre-exec error
+    // path and causes the parent-side spawn to fail.
+    unsafe {
+        command.pre_exec(move || {
+            let mut inherited: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(libc::RLIMIT_AS, &raw mut inherited) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let effective = requested.min(inherited.rlim_max);
+            let limit = libc::rlimit {
+                rlim_cur: effective,
+                rlim_max: effective,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &raw const limit) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+}
+
 /// True iff the process currently has ONLY its main thread — the precondition for
 /// the textbook-safe `fork()` the solve supervisor uses (no other thread can be
 /// mid-mutation of an async-signal-unsafe lock the child would inherit and deadlock
@@ -187,6 +226,31 @@ pub fn die_with_signal(sig: i32) -> ! {
         libc::raise(sig);
     }
     std::process::abort();
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn child_address_space_limit_is_installed_before_exec() {
+        const LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "ulimit -v"]);
+        configure_child_address_space_limit(&mut command, LIMIT_BYTES);
+        let output = command.output().expect("spawn address-space-limited shell");
+        assert!(output.status.success());
+        let kib: u64 = String::from_utf8(output.stdout)
+            .expect("shell output is UTF-8")
+            .trim()
+            .parse()
+            .expect("ulimit -v reports KiB");
+        assert!(
+            kib <= LIMIT_BYTES / 1024,
+            "child limit {kib} KiB exceeds requested {} KiB",
+            LIMIT_BYTES / 1024
+        );
+    }
 }
 
 /// Trigger a genuine stack overflow via unbounded recursion, hitting the guard

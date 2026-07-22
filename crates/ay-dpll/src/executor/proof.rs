@@ -13,7 +13,9 @@ mod check;
 use ay_core::term::TermData;
 use ay_core::{AletheRule, Proof, ProofId, ProofStep, Sort, Symbol, TheoryLemmaKind};
 use ay_core::{TermId, TermStore};
-use ay_frontend::command::{Constant as FrontendConstant, Term as FrontendTerm};
+use ay_frontend::command::{
+    Constant as FrontendConstant, Index as FrontendIndex, Term as FrontendTerm,
+};
 use ay_frontend::{Command, CommandResult, OptionValue};
 #[cfg(not(feature = "proof-checker"))]
 use ay_proof::{check_proof_partial, PartialProofCheck};
@@ -1297,6 +1299,7 @@ impl Executor {
                 .mk_app(Symbol::named("="), [raw_select, e_id], Sort::Bool);
             let neg_t = self.ctx.terms.mk_not_raw(eq_t);
 
+            self.record_rebuilt_authored_proof_premise(neg_t);
             proof.steps.clear();
             proof.named_steps.clear();
             let assume_id = proof.add_assume(neg_t, None);
@@ -1470,8 +1473,12 @@ impl Executor {
                 continue;
             };
             let (Some(ctor_sort), Some(sel_sort)) = (
-                self.ctx.symbol_sort(ctor).cloned(),
-                self.ctx.symbol_sort(sel).cloned(),
+                self.ctx
+                    .symbol_info_by_identity(ctor)
+                    .map(|info| info.sort.clone()),
+                self.ctx
+                    .symbol_info_by_identity(sel)
+                    .map(|info| info.sort.clone()),
             ) else {
                 continue;
             };
@@ -1507,6 +1514,7 @@ impl Executor {
             }
             let neg_t = self.ctx.terms.mk_not_raw(eq_t);
 
+            self.record_rebuilt_authored_proof_premise(neg_t);
             proof.steps.clear();
             proof.named_steps.clear();
             let assume_id = proof.add_assume(neg_t, None);
@@ -1577,6 +1585,7 @@ impl Executor {
             }
             let neg_t = self.ctx.terms.mk_not_raw(eq_t);
 
+            self.record_rebuilt_authored_proof_premise(neg_t);
             proof.steps.clear();
             proof.named_steps.clear();
             let assume_id = proof.add_assume(neg_t, None);
@@ -1712,6 +1721,7 @@ impl Executor {
             }
             let neg_t = self.ctx.terms.mk_not_raw(eq_t);
 
+            self.record_rebuilt_authored_proof_premise(neg_t);
             proof.steps.clear();
             proof.named_steps.clear();
             let assume_id = proof.add_assume(neg_t, None);
@@ -2220,6 +2230,7 @@ impl Executor {
                 continue;
             }
 
+            self.record_rebuilt_authored_proof_premise(a_t);
             proof.steps.clear();
             proof.named_steps.clear();
             let assume_id = proof.add_assume(a_t, None);
@@ -2279,6 +2290,7 @@ impl Executor {
             }
             let neg_t = self.ctx.terms.mk_not_raw(eq_t);
 
+            self.record_rebuilt_authored_proof_premise(neg_t);
             proof.steps.clear();
             proof.named_steps.clear();
             let assume_id = proof.add_assume(neg_t, None);
@@ -2540,11 +2552,24 @@ impl Executor {
 
     /// Exact authored premise scope for Alethe authority checks. Combined
     /// preprocessing may expose both temporary problem representatives and
-    /// original source assertions; check-sat-assuming adds a third authored
+    /// original source assertions; proof reconstruction may re-intern the
+    /// exact parsed source form; check-sat-assuming adds another authored
     /// source. Derived temporary constraints are intentionally absent.
     fn proof_export_scope_assertions(&self) -> Vec<TermId> {
         let mut scope = self.proof_problem_assertions();
         for assertion in self.proof_original_problem_assertions() {
+            if !scope.contains(&assertion) {
+                scope.push(assertion);
+            }
+        }
+        // Proof reconstruction deliberately rebuilds the parsed source form
+        // with raw constructors when elaboration folded it away (and creates
+        // fresh alpha-renamed binders for quantified input). These terms are
+        // genuine authored premises, captured once by the same provenance
+        // path used by `proof_legit_assume_set`; excluding them here would let
+        // the internal authority gate accept a proof that Alethe export then
+        // rejects as a non-problem `assume`.
+        for &assertion in &self.last_proof_rebuild_originals {
             if !scope.contains(&assertion) {
                 scope.push(assertion);
             }
@@ -2557,6 +2582,16 @@ impl Executor {
             }
         }
         scope
+    }
+
+    /// Admit one raw term reconstructed from a parsed source assertion as an
+    /// authored proof premise. Callers must finish their structural and strict
+    /// lemma-recognizer gates before recording it; arbitrary solver-derived
+    /// terms never enter this set.
+    fn record_rebuilt_authored_proof_premise(&mut self, premise: TermId) {
+        if !self.last_proof_rebuild_originals.contains(&premise) {
+            self.last_proof_rebuild_originals.push(premise);
+        }
     }
 
     /// Get the last serialized LRAT certificate, if proof export captured one.
@@ -3999,6 +4034,9 @@ fn build_bv_pterm(terms: &mut TermStore, pt: &FrontendTerm) -> Option<TermId> {
             matches!(terms.sort(id), Sort::BitVec(_)).then_some(id)
         }
         FrontendTerm::Const(c) => build_bv_const(terms, c),
+        FrontendTerm::IndexedApp(name, indices, args) if args.is_empty() => {
+            build_bv_decimal_indexed(terms, name, indices)
+        }
         // Width-CHANGING `concat`: result width is the sum of operand widths.
         FrontendTerm::App(op, args) if op == "concat" && args.len() == 2 => {
             let a = build_bv_pterm(terms, &args[0])?;
@@ -4046,7 +4084,7 @@ fn build_bv_pterm(terms: &mut TermStore, pt: &FrontendTerm) -> Option<TermId> {
         FrontendTerm::IndexedApp(name, idx_strs, args) if args.len() == 1 => {
             let indices: Vec<u32> = idx_strs
                 .iter()
-                .map(|s| s.parse::<u32>().ok())
+                .map(|index| index.as_numeral()?.parse::<u32>().ok())
                 .collect::<Option<_>>()?;
             let arg = build_bv_pterm(terms, &args[0])?;
             let src_width = terms.sort(arg).bitvec_width()?;
@@ -4091,8 +4129,8 @@ fn build_bv_const(terms: &mut TermStore, c: &FrontendConstant) -> Option<TermId>
 /// over [`build_bv_pterm`]'s bitvector fragment: it additionally handles
 /// `not`/`and`/`or`/`xor`/`=>`, `=` over Bool or BV sides, the BV comparison
 /// predicates, `ite` (Bool condition, Bool or BV branches), Bool-sorted
-/// symbols/constants, and the `(_ bvN W)` decimal bitvector spelling (which
-/// the frontend parses as a `Symbol`). Returns `None` (fail-closed) for
+/// symbols/constants, and the structurally parsed `(_ bvN W)` decimal
+/// bitvector spelling. Returns `None` (fail-closed) for
 /// anything else, or — the load-bearing soundness guard — for any node the
 /// term store FOLDED (the rebuilt term would no longer mirror the surface
 /// assertion). Every accepted node is a structure-preserving rebuild, so an
@@ -4103,12 +4141,14 @@ fn build_qfbv_pterm(terms: &mut TermStore, pt: &FrontendTerm) -> Option<TermId> 
             if let Some(id) = terms.lookup(s) {
                 return matches!(terms.sort(id), Sort::Bool | Sort::BitVec(_)).then_some(id);
             }
-            // `(_ bvN W)` decimal bitvector constants parse as a Symbol.
-            build_bv_decimal_symbol(terms, s)
+            None
         }
         FrontendTerm::Const(FrontendConstant::True) => Some(terms.true_term()),
         FrontendTerm::Const(FrontendConstant::False) => Some(terms.false_term()),
         FrontendTerm::Const(c) => build_bv_const(terms, c),
+        FrontendTerm::IndexedApp(name, indices, args) if args.is_empty() => {
+            build_bv_decimal_indexed(terms, name, indices)
+        }
         FrontendTerm::App(op, args) if op == "not" && args.len() == 1 => {
             let a = build_qfbv_pterm(terms, &args[0])?;
             if !matches!(terms.sort(a), Sort::Bool) {
@@ -4225,7 +4265,7 @@ fn build_qfbv_pterm(terms: &mut TermStore, pt: &FrontendTerm) -> Option<TermId> 
         FrontendTerm::IndexedApp(name, idx_strs, args) if args.len() == 1 => {
             let indices: Vec<u32> = idx_strs
                 .iter()
-                .map(|s| s.parse::<u32>().ok())
+                .map(|index| index.as_numeral()?.parse::<u32>().ok())
                 .collect::<Option<_>>()?;
             let arg = build_qfbv_pterm(terms, &args[0])?;
             let src_width = terms.sort(arg).bitvec_width()?;
@@ -4243,13 +4283,18 @@ fn build_qfbv_pterm(terms: &mut TermStore, pt: &FrontendTerm) -> Option<TermId> 
     }
 }
 
-/// Parse a `(_ bvN W)` surface symbol (the frontend's spelling for decimal
-/// bitvector constants) into a `mk_bitvec` term. Returns `None` for any other
-/// symbol shape (fail-closed). The value is reduced modulo `2^W` exactly as
-/// SMT-LIB defines `(_ bvN W)`.
-fn build_bv_decimal_symbol(terms: &mut TermStore, s: &str) -> Option<TermId> {
-    let inner = s.strip_prefix("(_ bv")?.strip_suffix(')')?;
-    let (value_str, width_str) = inner.split_once(' ')?;
+/// Translate a structurally parsed `(_ bvN W)` into a `mk_bitvec` term. Returns
+/// `None` for every other indexed identifier (fail-closed). The value is
+/// reduced modulo `2^W` exactly as SMT-LIB defines it.
+fn build_bv_decimal_indexed(
+    terms: &mut TermStore,
+    name: &str,
+    indices: &[FrontendIndex],
+) -> Option<TermId> {
+    let value_str = name.strip_prefix("bv")?;
+    let [FrontendIndex::Numeral(width_str)] = indices else {
+        return None;
+    };
     if value_str.is_empty()
         || !value_str.bytes().all(|b| b.is_ascii_digit())
         || width_str.is_empty()

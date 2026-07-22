@@ -62,8 +62,7 @@ fn proof_itp_stats_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
         std::env::var("AY_PROOF_ITP_STATS")
-            .ok()
-            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     })
 }
 

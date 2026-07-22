@@ -60,7 +60,7 @@ use ay_core::{
     AletheRule, FarkasAnnotation, Proof, ProofId, ProofStep, Sort, Symbol, TermId, TheoryLemmaKind,
     TheoryLit,
 };
-use ay_frontend::command::Term as FrontendTerm;
+use ay_frontend::command::{Index as FrontendIndex, Term as FrontendTerm};
 
 use super::proof_euf_lemma::EufLemmaPlan;
 use super::proof_surface_syntax::strip_frontend_annotations;
@@ -209,6 +209,28 @@ fn expand_surface_lets(
                 .collect::<Option<Vec<_>>>()?;
             Some(FrontendTerm::App(head.clone(), args))
         }
+        FrontendTerm::IndexedApp(name, indices, args) => {
+            let args = args
+                .iter()
+                .map(|arg| expand_surface_lets(arg, env))
+                .collect::<Option<Vec<_>>>()?;
+            Some(FrontendTerm::IndexedApp(
+                name.clone(),
+                indices.clone(),
+                args,
+            ))
+        }
+        FrontendTerm::QualifiedApp(identifier, sort, args) => {
+            let args = args
+                .iter()
+                .map(|arg| expand_surface_lets(arg, env))
+                .collect::<Option<Vec<_>>>()?;
+            Some(FrontendTerm::QualifiedApp(
+                identifier.clone(),
+                sort.clone(),
+                args,
+            ))
+        }
         FrontendTerm::Annotated(inner, notes) => {
             let inner = expand_surface_lets(inner, env)?;
             Some(FrontendTerm::Annotated(Box::new(inner), notes.clone()))
@@ -220,6 +242,65 @@ fn expand_surface_lets(
             // needs no expansion.
             env.is_empty().then(|| term.clone())
         }
+    }
+}
+
+#[cfg(test)]
+mod surface_let_tests {
+    use super::*;
+
+    #[test]
+    fn expansion_descends_into_structured_indexed_terms() {
+        let zero = FrontendTerm::IndexedApp(
+            "bv0".to_string(),
+            vec![FrontendIndex::Numeral("8".to_string())],
+            Vec::new(),
+        );
+        let term = FrontendTerm::Let(
+            vec![("x".to_string(), zero.clone())],
+            Box::new(FrontendTerm::App(
+                "=".to_string(),
+                vec![
+                    FrontendTerm::Symbol("x".to_string()),
+                    FrontendTerm::IndexedApp(
+                        "bv1".to_string(),
+                        vec![FrontendIndex::Numeral("8".to_string())],
+                        Vec::new(),
+                    ),
+                ],
+            )),
+        );
+        let expanded = expand_surface_lets(&term, &std::collections::HashMap::new())
+            .expect("binder-free indexed term expands");
+        assert!(matches!(
+            expanded,
+            FrontendTerm::App(ref op, ref args)
+                if op == "=" && args.first() == Some(&zero)
+        ));
+    }
+
+    #[test]
+    fn raw_intern_accepts_structured_decimal_bitvector_literal() {
+        let mut executor = Executor::new();
+        let literal = FrontendTerm::IndexedApp(
+            "bv3".to_string(),
+            vec![FrontendIndex::Numeral("4".to_string())],
+            Vec::new(),
+        );
+        let raw = executor
+            .raw_intern_surface(&literal)
+            .expect("structured decimal bitvector literal interns");
+        assert_eq!(executor.ctx.terms.sort(raw), &Sort::bitvec(4));
+
+        let ordinary = FrontendTerm::Symbol("(_ bv3 4)".to_string());
+        assert!(executor.raw_intern_surface(&ordinary).is_none());
+
+        let character = FrontendTerm::IndexedApp(
+            "Char".to_string(),
+            vec![FrontendIndex::Numeral("65".to_string())],
+            Vec::new(),
+        );
+        assert!(executor.raw_intern_surface(&character).is_none());
     }
 }
 
@@ -3246,6 +3327,42 @@ impl Executor {
                 }
                 let sort = self.ctx.terms.sort(elab).clone();
                 Some(self.ctx.terms.mk_app(Symbol::named(head), raw_args, sort))
+            }
+            FrontendTerm::IndexedApp(name, indices, args) => {
+                let elab = self.ctx.elaborate_surface_subterm(stripped)?;
+                if args.is_empty() {
+                    let [FrontendIndex::Numeral(width)] = indices.as_slice() else {
+                        return None;
+                    };
+                    let value = name.strip_prefix("bv")?;
+                    if value.is_empty()
+                        || !value.bytes().all(|byte| byte.is_ascii_digit())
+                        || width.parse::<u32>().ok().is_none_or(|bits| bits == 0)
+                    {
+                        return None;
+                    }
+                    // Preserve the decimal-BV class accepted by the former
+                    // flattened Symbol path. Other nullary indexed constants
+                    // canonicalize to unrelated core shapes and fail closed.
+                    return Some(elab);
+                }
+                let numeric_indices = indices
+                    .iter()
+                    .map(|index| match index {
+                        FrontendIndex::Numeral(value) => value.parse::<u32>().ok(),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                let raw_args = args
+                    .iter()
+                    .map(|arg| self.raw_intern_surface(arg))
+                    .collect::<Option<Vec<_>>>()?;
+                let sort = self.ctx.terms.sort(elab).clone();
+                Some(
+                    self.ctx
+                        .terms
+                        .mk_app(Symbol::indexed(name, numeric_indices), raw_args, sort),
+                )
             }
             _ => None,
         }

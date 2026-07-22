@@ -495,10 +495,7 @@ impl TheoryCombiner<'_> {
                         ));
                     }
                 }
-                eprintln!(
-                    "[class-merge-dbg] value={_val} group={:?} diseq={pairs:?}",
-                    group
-                );
+                eprintln!("[class-merge-dbg] value={_val} group={group:?} diseq={pairs:?}");
             }
             // Keep the highest-authority class at this value; move any
             // lower-authority known-disequal class as a unit.
@@ -765,11 +762,7 @@ impl TheoryCombiner<'_> {
                 // outer witness completion consumes this marker by discarding
                 // the candidate model, so the public SAT funnel fails closed.
                 if std::env::var_os("AY_F1_DIAG").is_some() {
-                    fn fmt_term(
-                        terms: &ay_core::TermStore,
-                        t: ay_core::TermId,
-                        depth: usize,
-                    ) -> String {
+                    fn fmt_term(terms: &ay_core::TermStore, t: TermId, depth: usize) -> String {
                         if depth == 0 {
                             return format!("#{}", t.0);
                         }

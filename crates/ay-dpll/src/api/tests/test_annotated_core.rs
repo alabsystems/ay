@@ -189,7 +189,7 @@ fn test_annotated_core_euf_congruence() {
     let b = solver.declare_const("b", int_sort.clone());
 
     // Declare uninterpreted function f: Int -> Int
-    let f = solver.declare_fun("f", &[int_sort.clone()], int_sort);
+    let f = solver.declare_fun("f", std::slice::from_ref(&int_sort), Sort::Int);
 
     let ab = solver.eq(a, b);
     solver.try_assert_named(ab, "a_eq_b").unwrap();

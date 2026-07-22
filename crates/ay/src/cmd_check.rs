@@ -2318,15 +2318,15 @@ mod tests {
     #[test]
     fn test_parse_satcomp_model_matches_matrix_duplicate_assignment_status() {
         let status =
-            parse_satcomp_model_reader("v 1 1 0\n".as_bytes(), 1).expect_err("reject duplicate");
+            parse_satcomp_model_reader(b"v 1 1 0\n".as_slice(), 1).expect_err("reject duplicate");
 
         assert_eq!(status, "duplicate-assignment:1");
     }
 
     #[test]
     fn test_parse_satcomp_model_matches_matrix_duplicate_terminator_status() {
-        let status =
-            parse_satcomp_model_reader("v 1 0\nv 0\n".as_bytes(), 1).expect_err("reject duplicate");
+        let status = parse_satcomp_model_reader(b"v 1 0\nv 0\n".as_slice(), 1)
+            .expect_err("reject duplicate");
 
         assert_eq!(status, "duplicate-terminator:2");
     }

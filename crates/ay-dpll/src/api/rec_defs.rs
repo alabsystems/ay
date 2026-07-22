@@ -1020,7 +1020,7 @@ mod tests {
 
         let n = s.declare_const("n", Sort::Int);
         let call = s.try_apply(&fib, &[n]).unwrap();
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let err = s
             .try_expand_rec_defs(&[call], &defs, ROUNDS, 200_000, None)
             .expect_err("symbolic fib must fail closed");
@@ -1040,16 +1040,21 @@ mod tests {
     #[test]
     fn zero_ary_definition_expands_both_shapes() {
         let mut s = solver();
-        let c_decl = s.declare_fun("c", &[], Sort::Int);
+        // The native API represents a declared 0-arity function as a `Var`
+        // and intentionally rejects a second function declaration with the
+        // same name. Build the alternate `App(name, [])` representation at
+        // the term layer so this unit test can exercise both accepted input
+        // shapes without violating the declaration API's uniqueness contract.
+        let var_shape = s.declare_const("c", Sort::Int);
         let five = int(&mut s, 5);
         let def = s.make_rec_fun_def(&[], five);
         let mut defs = HashMap::new();
         defs.insert("c".to_string(), def);
 
-        // App shape: `c()` built through apply.
-        let app_shape = s.try_apply(&c_decl, &[]).unwrap();
-        // Var shape: the interned constant `c`.
-        let var_shape = s.declare_const("c", Sort::Int);
+        let app_shape = Term(
+            s.terms_mut()
+                .mk_app(Symbol::named("c"), Vec::new(), Sort::Int),
+        );
         let out = s
             .try_expand_rec_defs(&[app_shape, var_shape], &defs, ROUNDS, BUDGET, None)
             .expect("0-ary def must expand");
@@ -1292,8 +1297,10 @@ mod tests {
 
         let five = int(&mut s, 5);
         let call = s.try_apply(&d, &[five]).unwrap();
-        let started = std::time::Instant::now();
-        let expired = std::time::Instant::now() - std::time::Duration::from_millis(1);
+        let started = Instant::now();
+        let expired = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("a one-millisecond subtraction must remain in Instant's range");
         let err = s
             .try_expand_rec_defs(&[call], &defs, ROUNDS, BUDGET, Some(expired))
             .expect_err("an expired deadline must fail closed");
@@ -1311,7 +1318,7 @@ mod tests {
         let fcall = s.try_apply(&fact, &[five2]).unwrap();
         let target = int(&mut s, 120);
         let goal = s.try_eq(fcall, target).unwrap();
-        let live = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let live = Instant::now() + std::time::Duration::from_secs(5);
         let out = s
             .try_expand_rec_defs(&[goal], &fdefs, ROUNDS, BUDGET, Some(live))
             .expect("ground factorial must expand under a live deadline");

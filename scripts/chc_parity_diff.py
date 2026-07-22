@@ -10,10 +10,10 @@ Resolves each .yml's input_files to its sibling .smt2, runs both solvers, and
 classifies agree / ay_only / ref_only / disagree / both_unknown, plus checks each
 solver's verdict against the .yml expected_verdict to flag WRONG answers.
 """
-import argparse, concurrent.futures as cf, json, os, re, signal, subprocess, sys, time
+import argparse, concurrent.futures as cf, json, os, re, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _oom_guard import plan_solver_resources, rss_watchdog, warn_concurrent_build  # noqa: E402
+from _oom_guard import plan_solver_resources, run_captured, warn_concurrent_build  # noqa: E402
 
 VERDICT_RE = re.compile(r"^(sat|unsat|unknown)\s*$")
 
@@ -44,34 +44,28 @@ def parse_verdict(out):
             v = m.group(1)   # last bare verdict line wins
     return v
 
-def run(cmd, hard_timeout, memlimit_mb):
+def run(cmd, hard_timeout, memlimit_mb, nbcore):
     t0 = time.time()
     try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             text=True, start_new_session=True)
-        guard = rss_watchdog(
-            p, memlimit_mb, label="chc_parity_diff.py", grace_mb=0
+        p = run_captured(
+            cmd,
+            memlimit_mb,
+            hard_timeout,
+            label="chc_parity_diff.py",
+            env=dict(os.environ, MEMLIMIT=str(memlimit_mb),
+                     NBCORE=str(max(1, nbcore))),
         )
-        try:
-            stdout, stderr = p.communicate(timeout=hard_timeout)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-            stdout, stderr = p.communicate()
-            guard.stop()
-            if guard.breached:
-                return "memout", time.time() - t0
-            return "unknown", time.time() - t0
-        guard.stop()
-        if guard.breached:
+        if p.memout:
             return "memout", time.time() - t0
-        return parse_verdict(stdout + "\n" + stderr), time.time() - t0
-    except subprocess.TimeoutExpired:
+        if p.timed_out or p.cancelled:
+            return "unknown", time.time() - t0
+        if p.output_truncated:
+            return "unknown", time.time() - t0
+        return parse_verdict(p.stdout + "\n" + p.stderr), time.time() - t0
+    except (OSError, RuntimeError):
         return "unknown", time.time() - t0
 
-def solve_one(smt2, ay_bin, timeout, memlimit_mb=0):
+def solve_one(smt2, ay_bin, timeout, memlimit_mb=0, nbcore=1):
     # ay --chc --timeout is MILLISECONDS; z3 -T: is SECONDS.
     # Same per-child memory envelope for BOTH solvers. AY gets its graceful
     # --memory path; both children get the external RSS watchdog because z3's
@@ -81,8 +75,8 @@ def solve_one(smt2, ay_bin, timeout, memlimit_mb=0):
     if memlimit_mb:
         ay_argv += ["--memory", str(memlimit_mb)]
         z3_argv += [f"-memory:{memlimit_mb}"]
-    ay_v, ay_t = run(ay_argv + [smt2], timeout + 8, memlimit_mb)
-    z3_v, z3_t = run(z3_argv + [smt2], timeout + 8, memlimit_mb)
+    ay_v, ay_t = run(ay_argv + [smt2], timeout + 8, memlimit_mb, nbcore)
+    z3_v, z3_t = run(z3_argv + [smt2], timeout + 8, memlimit_mb, nbcore)
     return ay_v, ay_t, z3_v, z3_t
 
 def classify(ay, z3):
@@ -114,7 +108,7 @@ def main():
     plan = plan_solver_resources(a.workers, label="chc_parity_diff.py")
     a.workers = plan.jobs
     print(f"workers={a.workers} memory envelope="
-          f"{plan.memlimit_mb or 'default'} MiB/child "
+          f"{plan.memlimit_mb} MiB/child NBCORE={plan.nbcore} "
           "(rss_watchdog both; ay --memory)",
           flush=True)
 
@@ -143,7 +137,8 @@ def main():
 
     def work(job):
         rel, smt2, fam, exp = job
-        ay, ayt, z3, z3t = solve_one(smt2, a.ay, a.timeout, plan.memlimit_mb)
+        ay, ayt, z3, z3t = solve_one(smt2, a.ay, a.timeout,
+                                     plan.memlimit_mb, plan.nbcore)
         return rel, fam, exp, ay, ayt, z3, z3t
 
     with cf.ThreadPoolExecutor(max_workers=a.workers) as ex:

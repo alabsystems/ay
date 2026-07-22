@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -20,7 +20,19 @@ use clap::Subcommand;
 use serde::Serialize;
 
 const EMBEDDED_OOM_GUARD: &str = include_str!("../../../scripts/_oom_guard.py");
-const WATCHDOG_BREACH_EXIT: i32 = 86;
+const MAXSAT_WATCHDOG_SERVER_READY: &[u8] = b"AY_OOM_WATCHDOG_SERVER_READY_V1\n";
+const MAXSAT_WATCHDOG_SERVER_MAX_LINE: u64 = 4096;
+const MAXSAT_WATCHDOG_SERVER_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(1);
+const MAXSAT_WATCHDOG_SERVER_STATE_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+const MAXSAT_RESOURCE_ENVELOPE_SCHEMA_V2: &str = "ay.maxsat-resource-envelope/v2";
+const MAXSAT_RESOURCE_PLANNER_PROTOCOL_V1: &str = "ay-oom-guard-plan/v1";
+const MAXSAT_CHILD_ENFORCEMENT_V1: &str = "ay-resource-v1:rss-watchdog-zero-grace";
+const MAXSAT_SOLVER_ENVIRONMENT_V1: &str = "ay-maxsat-solver-env/v1:MEMLIMIT+NBCORE";
+const MAXSAT_AGGREGATE_ENFORCEMENT_V1: &str = "ay-host-exclusive-flock-v1";
+const MAXSAT_LEASE_PROTOCOL_V1: &str = "ay-oom-guard-lease-sidecar/v1";
+const MAXSAT_LEASE_READINESS_V1: &str = "AY_OOM_HARNESS_LEASE_READY_V1";
+const MAXSAT_LEASE_LOCATION_V1: &str = "ay-host-user-lock-path/v1:/tmp/ay-oom-guard-<uid>.lock";
+const MAXSAT_LEASE_READY_MARKER: &[u8] = b"AY_OOM_HARNESS_LEASE_READY_V1\n";
 
 #[derive(Debug, Clone)]
 enum OomGuardSource {
@@ -52,25 +64,231 @@ impl OomGuardSource {
 
 #[derive(Debug, Clone, Serialize)]
 struct MaxSatResourcePlan {
+    schema: &'static str,
     requested_jobs: usize,
     jobs: usize,
     memlimit_mb_per_child: usize,
     nbcore_per_child: usize,
     headroom_mb: usize,
     planner: String,
+    planner_protocol: &'static str,
     enforcement: &'static str,
+    solver_environment: &'static str,
+    aggregate_enforcement: &'static str,
+    lease_protocol: &'static str,
+    lease_readiness: &'static str,
+    lease_location: &'static str,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct MaxSatResources {
     plan: MaxSatResourcePlan,
     guard: OomGuardSource,
+    watchdog_server: Arc<MaxSatWatchdogServer>,
+    // Declared after the server so Rust's field drop order keeps aggregate
+    // admission alive through watch-server teardown.
+    campaign_lease: Arc<MaxSatCampaignLease>,
+}
+
+/// Host-wide admission lease retained from before planning until every
+/// campaign child and report has finished. The Python sidecar owns the flock;
+/// keeping its stdin open owns the sidecar lifetime.
+#[derive(Debug)]
+struct MaxSatCampaignLease {
+    label: String,
+    process: Mutex<Option<(Child, ChildStdin)>>,
+}
+
+impl MaxSatCampaignLease {
+    fn acquire(guard: &OomGuardSource, label: &str) -> Result<Self> {
+        let command = guard.command();
+        Self::acquire_command(command, label, Stdio::inherit(), None)
+    }
+
+    #[cfg(unix)]
+    fn acquire_command(
+        mut command: Command,
+        label: &str,
+        stderr: Stdio,
+        test_lock_path: Option<&Path>,
+    ) -> Result<Self> {
+        use std::io::Read as _;
+        use std::os::unix::process::CommandExt as _;
+
+        command
+            .arg("lease")
+            .arg("--label")
+            .arg(label)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(stderr)
+            .process_group(0);
+        if let Some(test_lock_path) = test_lock_path {
+            command.arg("--test-lock-path").arg(test_lock_path);
+        }
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to acquire host-wide MaxSAT lease for {label}"))?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                terminate_maxsat_process_group(&mut child);
+                bail!("{label}: MaxSAT campaign lease stdin is missing");
+            }
+        };
+        let mut ready_pipe = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                drop(stdin);
+                terminate_maxsat_process_group(&mut child);
+                bail!("{label}: MaxSAT campaign lease readiness pipe is missing");
+            }
+        };
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let ready_reader = std::thread::spawn(move || {
+            let mut marker = vec![0_u8; MAXSAT_LEASE_READY_MARKER.len()];
+            let result = ready_pipe
+                .read_exact(&mut marker)
+                .map(|()| marker == MAXSAT_LEASE_READY_MARKER)
+                .map_err(|error| error.to_string());
+            let _ = ready_sender.send(result);
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match ready_receiver.try_recv() {
+                Ok(Ok(true)) => break,
+                Ok(Ok(false)) => {
+                    drop(stdin);
+                    terminate_maxsat_process_group(&mut child);
+                    let _ = ready_reader.join();
+                    bail!("{label}: MaxSAT campaign lease emitted an invalid readiness marker");
+                }
+                Ok(Err(error)) => {
+                    drop(stdin);
+                    terminate_maxsat_process_group(&mut child);
+                    let _ = ready_reader.join();
+                    bail!("{label}: reading MaxSAT campaign lease readiness failed: {error}");
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    drop(stdin);
+                    terminate_maxsat_process_group(&mut child);
+                    let _ = ready_reader.join();
+                    bail!("{label}: MaxSAT campaign lease readiness channel disconnected");
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    drop(stdin);
+                    let _ = ready_reader.join();
+                    bail!("{label}: MaxSAT campaign lease exited before arming ({status})");
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    drop(stdin);
+                    terminate_maxsat_process_group(&mut child);
+                    let _ = ready_reader.join();
+                    bail!("{label}: checking MaxSAT campaign lease failed: {error}");
+                }
+            }
+            if Instant::now() >= deadline {
+                drop(stdin);
+                terminate_maxsat_process_group(&mut child);
+                let _ = ready_reader.join();
+                bail!("{label}: MaxSAT campaign lease did not arm within 10 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = ready_reader.join();
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("{label}: checking armed MaxSAT campaign lease"))?
+        {
+            drop(stdin);
+            bail!("{label}: MaxSAT campaign lease exited immediately after arming ({status})");
+        }
+        Ok(Self {
+            label: label.to_string(),
+            process: Mutex::new(Some((child, stdin))),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn acquire_command(
+        _command: Command,
+        label: &str,
+        _stderr: Stdio,
+        _test_lock_path: Option<&Path>,
+    ) -> Result<Self> {
+        bail!(
+            "{label}: host-wide MaxSAT campaign admission requires POSIX process groups and flock"
+        )
+    }
+
+    fn ensure_alive(&self) -> Result<()> {
+        let mut process = self
+            .process
+            .lock()
+            .map_err(|_| anyhow::anyhow!("{}: MaxSAT campaign lease mutex poisoned", self.label))?;
+        let Some((child, _stdin)) = process.as_mut() else {
+            bail!("{}: MaxSAT campaign lease is not active", self.label);
+        };
+        match child.try_wait() {
+            Ok(None) => Ok(()),
+            Ok(Some(status)) => bail!(
+                "{}: MaxSAT campaign lease exited early ({status}); refusing uncoordinated execution",
+                self.label
+            ),
+            Err(error) => bail!(
+                "{}: checking MaxSAT campaign lease failed: {error}",
+                self.label
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    fn kill_process_for_test(&self) {
+        if let Ok(mut process) = self.process.lock() {
+            if let Some((child, _stdin)) = process.as_mut() {
+                terminate_maxsat_process_group(child);
+            }
+        }
+    }
+}
+
+impl Drop for MaxSatCampaignLease {
+    fn drop(&mut self) {
+        let process = match self.process.get_mut() {
+            Ok(process) => process.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        let Some((mut child, stdin)) = process else {
+            return;
+        };
+        drop(stdin);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(None) | Err(_) => {
+                    terminate_maxsat_process_group(&mut child);
+                    return;
+                }
+            }
+        }
+    }
 }
 
 impl MaxSatResources {
     fn plan(requested_jobs: usize) -> Result<Self> {
         let requested_jobs = requested_jobs.max(1);
         let guard = locate_oom_guard().map_or(OomGuardSource::Embedded, OomGuardSource::Checkout);
+        let campaign_lease = Arc::new(MaxSatCampaignLease::acquire(&guard, "ay maxsat bench")?);
+        campaign_lease.ensure_alive()?;
         let output = guard
             .command()
             .arg("plan")
@@ -91,6 +309,9 @@ impl MaxSatResources {
                 output.status
             );
         }
+        campaign_lease
+            .ensure_alive()
+            .context("host-wide MaxSAT lease exited while resource planning")?;
         let mut values = BTreeMap::new();
         for line in String::from_utf8_lossy(&output.stdout).lines() {
             let Some((key, raw)) = line.trim().split_once('=') else {
@@ -122,36 +343,97 @@ impl MaxSatResources {
         }
         Ok(Self {
             plan: MaxSatResourcePlan {
+                schema: MAXSAT_RESOURCE_ENVELOPE_SCHEMA_V2,
                 requested_jobs,
                 jobs,
                 memlimit_mb_per_child,
                 nbcore_per_child,
                 headroom_mb,
                 planner: guard.provenance(),
-                enforcement: "rss_watchdog(grace=0) process-group RSS; MEMLIMIT/NBCORE env",
+                planner_protocol: MAXSAT_RESOURCE_PLANNER_PROTOCOL_V1,
+                enforcement: MAXSAT_CHILD_ENFORCEMENT_V1,
+                solver_environment: MAXSAT_SOLVER_ENVIRONMENT_V1,
+                aggregate_enforcement: MAXSAT_AGGREGATE_ENFORCEMENT_V1,
+                lease_protocol: MAXSAT_LEASE_PROTOCOL_V1,
+                lease_readiness: MAXSAT_LEASE_READINESS_V1,
+                lease_location: MAXSAT_LEASE_LOCATION_V1,
             },
+            watchdog_server: MaxSatWatchdogServer::new(guard.clone()),
             guard,
+            campaign_lease,
         })
     }
 
-    fn watch(&self, child: &Child, label: &str) -> Result<MaxSatWatchdog> {
-        let sidecar = self
-            .guard
-            .command()
-            .arg("watch")
-            .arg("--pid")
-            .arg(child.id().to_string())
-            .arg("--limit-mb")
-            .arg(self.plan.memlimit_mb_per_child.to_string())
-            .arg("--grace-mb")
-            .arg("0")
-            .arg("--label")
-            .arg(label)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .spawn()
-            .context("failed to start MaxSAT RSS watchdog")?;
-        Ok(MaxSatWatchdog { sidecar })
+    fn ensure_campaign_lease(&self) -> Result<()> {
+        self.campaign_lease.ensure_alive()
+    }
+
+    fn wrap_stopped(&self, target: &Command) -> Command {
+        let mut command = self.guard.command();
+        command
+            .arg("exec-stopped")
+            .arg("--")
+            .arg(target.get_program())
+            .args(target.get_args());
+        command
+    }
+
+    fn watch(&self, child: &mut Child, label: &str) -> Result<MaxSatWatchdog> {
+        if let Err(error) = self
+            .ensure_campaign_lease()
+            .context("host-wide MaxSAT lease exited before watchdog registration")
+        {
+            terminate_maxsat_process_group(child);
+            return Err(error);
+        }
+        if let Err(error) = wait_for_maxsat_guard_stop(child, label) {
+            terminate_maxsat_process_group(child);
+            return Err(error);
+        }
+        let watchdog = match self.watchdog_server.register(
+            child.id(),
+            self.plan.memlimit_mb_per_child,
+            label,
+            Some(Arc::clone(&self.campaign_lease)),
+        ) {
+            Ok(watchdog) => watchdog,
+            Err(error) => {
+                terminate_maxsat_process_group(child);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .ensure_campaign_lease()
+            .context("host-wide MaxSAT lease exited while watchdog was arming")
+        {
+            drop(watchdog);
+            terminate_maxsat_process_group(child);
+            return Err(error);
+        }
+        #[cfg(unix)]
+        {
+            let resumed = i32::try_from(child.id())
+                .context("MaxSAT child PID does not fit pid_t")
+                .and_then(|pid| {
+                    nix::sys::signal::killpg(
+                        nix::unistd::Pid::from_raw(pid),
+                        nix::sys::signal::Signal::SIGCONT,
+                    )
+                    .context("resuming guarded MaxSAT child")
+                });
+            if let Err(error) = resumed {
+                drop(watchdog);
+                terminate_maxsat_process_group(child);
+                return Err(error);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            drop(watchdog);
+            terminate_maxsat_process_group(child);
+            bail!("guarded MaxSAT execution requires POSIX process groups");
+        }
+        Ok(watchdog)
     }
 }
 
@@ -177,36 +459,785 @@ fn locate_oom_guard() -> Option<PathBuf> {
     None
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MaxSatWatchdogServerEvent {
+    Ready,
+    Done,
+    Breach(u64),
+}
+
+type MaxSatWatchdogServerMessage = std::result::Result<MaxSatWatchdogServerEvent, String>;
+
+#[derive(Debug, Clone, Copy)]
+struct MaxSatWatchdogOutcome {
+    breached: bool,
+    breach_time_ns: Option<u64>,
+}
+
+fn maxsat_monotonic_time_ns() -> Result<u64> {
+    #[cfg(unix)]
+    {
+        let timestamp = nix::time::clock_gettime(nix::time::ClockId::CLOCK_MONOTONIC)
+            .context("reading monotonic clock for MaxSAT watchdog attribution")?;
+        let elapsed: Duration = timestamp.into();
+        u64::try_from(elapsed.as_nanos())
+            .context("monotonic clock exceeds MaxSAT watchdog timestamp range")
+    }
+    #[cfg(not(unix))]
+    {
+        bail!("MaxSAT watchdog attribution requires POSIX clock_gettime")
+    }
+}
+
+fn maxsat_watchdog_breached_before(
+    outcome: MaxSatWatchdogOutcome,
+    trigger_ns: u64,
+) -> Result<bool> {
+    if !outcome.breached {
+        return Ok(false);
+    }
+    let breach_time_ns = outcome
+        .breach_time_ns
+        .context("MaxSAT RSS watchdog breach timestamp is missing")?;
+    Ok(breach_time_ns <= trigger_ns)
+}
+
+#[cfg(target_os = "linux")]
+fn maxsat_watchdog_server_process_is_responsive(pid: u32) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((_, suffix)) = stat.rsplit_once(") ") else {
+        return false;
+    };
+    !matches!(
+        suffix.as_bytes().first().copied(),
+        Some(b'T' | b't' | b'Z' | b'X')
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn maxsat_watchdog_server_process_is_responsive(_pid: u32) -> bool {
+    true
+}
+
+#[derive(Debug)]
+struct MaxSatWatchdogServerProcess {
+    child: Child,
+    stdin: ChildStdin,
+}
+
+/// One `_oom_guard.py watch-server` per MaxSAT campaign. Each registration
+/// retains its own zero-grace process-group envelope, while all registrations
+/// share the server interpreter's cached `/proc` snapshot.
+#[derive(Debug)]
+struct MaxSatWatchdogServer {
+    guard: OomGuardSource,
+    process: Mutex<Option<MaxSatWatchdogServerProcess>>,
+    registrations:
+        Arc<Mutex<std::collections::HashMap<u64, mpsc::Sender<MaxSatWatchdogServerMessage>>>>,
+    healthy: Arc<AtomicBool>,
+    last_heartbeat_ns: Arc<AtomicU64>,
+    last_process_check_ns: AtomicU64,
+    next_id: AtomicU64,
+}
+
+impl MaxSatWatchdogServer {
+    fn new(guard: OomGuardSource) -> Arc<Self> {
+        Arc::new(Self {
+            guard,
+            process: Mutex::new(None),
+            registrations: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            healthy: Arc::new(AtomicBool::new(false)),
+            last_heartbeat_ns: Arc::new(AtomicU64::new(0)),
+            last_process_check_ns: AtomicU64::new(0),
+            next_id: AtomicU64::new(1),
+        })
+    }
+
+    fn reserve_watch_id(&self) -> Result<u64> {
+        let mut id = self.next_id.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = id.checked_add(1).filter(|_| id != 0) else {
+                bail!("MaxSAT RSS watchdog registration ID exhausted");
+            };
+            match self
+                .next_id
+                .compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return Ok(id),
+                Err(observed) => id = observed,
+            }
+        }
+    }
+
+    fn ensure_started(&self) -> Result<()> {
+        let mut process = self
+            .process
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MaxSAT RSS watchdog server mutex poisoned"))?;
+        if let Some(server) = process.as_mut() {
+            if self.heartbeat_is_fresh()
+                && maxsat_watchdog_server_process_is_responsive(server.child.id())
+            {
+                return match server.child.try_wait() {
+                    Ok(None) => Ok(()),
+                    Ok(Some(status)) => {
+                        self.healthy.store(false, Ordering::Release);
+                        bail!("MaxSAT campaign RSS watchdog server exited unexpectedly ({status})")
+                    }
+                    Err(error) => {
+                        self.healthy.store(false, Ordering::Release);
+                        Err(error).context("checking MaxSAT RSS watchdog server")
+                    }
+                };
+            }
+            bail!("MaxSAT campaign RSS watchdog server is no longer healthy");
+        }
+
+        let mut command = self.guard.command();
+        command
+            .arg("watch-server")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        isolate_maxsat_process_group(&mut command);
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "starting MaxSAT RSS watchdog server {}",
+                self.guard.provenance()
+            )
+        })?;
+        let Some(stdin) = child.stdin.take() else {
+            terminate_maxsat_process_group(&mut child);
+            bail!("MaxSAT RSS watchdog server stdin is missing");
+        };
+        let Some(stdout) = child.stdout.take() else {
+            drop(stdin);
+            terminate_maxsat_process_group(&mut child);
+            bail!("MaxSAT RSS watchdog server stdout is missing");
+        };
+
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let registrations = Arc::clone(&self.registrations);
+        let healthy = Arc::clone(&self.healthy);
+        let last_heartbeat_ns = Arc::clone(&self.last_heartbeat_ns);
+        std::thread::spawn(move || {
+            maxsat_watchdog_server_reader(
+                stdout,
+                registrations,
+                healthy,
+                last_heartbeat_ns,
+                ready_sender,
+            );
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match ready_receiver.try_recv() {
+                Ok(Ok(())) => break,
+                Ok(Err(error)) => {
+                    drop(stdin);
+                    terminate_maxsat_process_group(&mut child);
+                    bail!("MaxSAT RSS watchdog server readiness failed: {error}");
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    drop(stdin);
+                    terminate_maxsat_process_group(&mut child);
+                    bail!("MaxSAT RSS watchdog server readiness channel disconnected");
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    drop(stdin);
+                    terminate_maxsat_process_group(&mut child);
+                    bail!("MaxSAT RSS watchdog server exited before arming ({status})");
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    drop(stdin);
+                    terminate_maxsat_process_group(&mut child);
+                    return Err(error).context("checking MaxSAT RSS watchdog server startup");
+                }
+            }
+            if Instant::now() >= deadline {
+                drop(stdin);
+                terminate_maxsat_process_group(&mut child);
+                bail!("MaxSAT RSS watchdog server did not arm within 10 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        *process = Some(MaxSatWatchdogServerProcess { child, stdin });
+        Ok(())
+    }
+
+    fn register(
+        self: &Arc<Self>,
+        pid: u32,
+        limit_mb: usize,
+        label: &str,
+        campaign_lease: Option<Arc<MaxSatCampaignLease>>,
+    ) -> Result<MaxSatWatchdog> {
+        use std::fmt::Write as _;
+
+        self.ensure_started()?;
+        if label.len() > 512 {
+            bail!("MaxSAT RSS watchdog label exceeds 512 bytes");
+        }
+        let watch_id = self.reserve_watch_id()?;
+        let mut label_hex = String::with_capacity(label.len().saturating_mul(2));
+        for byte in label.as_bytes() {
+            write!(&mut label_hex, "{byte:02x}")
+                .map_err(|_| anyhow::anyhow!("encoding MaxSAT RSS watchdog label failed"))?;
+        }
+        let command = format!("WATCH {watch_id} {pid} {limit_mb} {label_hex}\n");
+        if command.len() > MAXSAT_WATCHDOG_SERVER_MAX_LINE as usize {
+            bail!("MaxSAT RSS watchdog command exceeds protocol limit");
+        }
+
+        let (sender, receiver) = mpsc::channel();
+        self.registrations
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MaxSAT RSS watchdog registration mutex poisoned"))?
+            .insert(watch_id, sender);
+        let write_result = (|| -> Result<()> {
+            if !self.healthy.load(Ordering::Acquire) {
+                bail!("MaxSAT RSS watchdog server became unhealthy");
+            }
+            let mut process = self
+                .process
+                .lock()
+                .map_err(|_| anyhow::anyhow!("MaxSAT RSS watchdog server mutex poisoned"))?;
+            let server = process
+                .as_mut()
+                .context("MaxSAT RSS watchdog server process is missing")?;
+            server
+                .stdin
+                .write_all(command.as_bytes())
+                .and_then(|()| server.stdin.flush())
+                .with_context(|| format!("registering MaxSAT RSS watchdog for child {pid}"))
+        })();
+        // A failed write may have delivered a command prefix. Retain the
+        // sender until server EOF drains registrations, so a late response
+        // cannot become an unknown-id campaign-wide protocol failure.
+        write_result?;
+
+        match receiver.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(MaxSatWatchdogServerEvent::Ready)) => Ok(MaxSatWatchdog {
+                server: Arc::clone(self),
+                campaign_lease,
+                watch_id,
+                target_pgid: i32::try_from(pid).ok(),
+                terminal_outcome: None,
+                terminal_error: None,
+                receiver,
+            }),
+            Ok(Ok(_)) => bail!("MaxSAT RSS watchdog {watch_id} terminated before readiness"),
+            Ok(Err(error)) => {
+                bail!("MaxSAT RSS watchdog {watch_id} failed before readiness: {error}")
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Keep the sender registered until the server reports a
+                // terminal event. The stopped target will be killed by the
+                // caller; removing this ID early would poison other watches.
+                bail!("MaxSAT RSS watchdog {watch_id} did not arm within 10 seconds")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("MaxSAT RSS watchdog {watch_id} readiness channel disconnected")
+            }
+        }
+    }
+
+    fn heartbeat_is_fresh(&self) -> bool {
+        if !self.healthy.load(Ordering::Acquire) {
+            return false;
+        }
+        let Ok(now_ns) = maxsat_monotonic_time_ns() else {
+            self.healthy.store(false, Ordering::Release);
+            return false;
+        };
+        let last_ns = self.last_heartbeat_ns.load(Ordering::Acquire);
+        if last_ns == 0
+            || now_ns.saturating_sub(last_ns)
+                > u64::try_from(MAXSAT_WATCHDOG_SERVER_HEARTBEAT_TIMEOUT.as_nanos())
+                    .unwrap_or(u64::MAX)
+        {
+            self.healthy.store(false, Ordering::Release);
+            return false;
+        }
+        true
+    }
+
+    fn is_healthy(&self) -> bool {
+        if !self.heartbeat_is_fresh() {
+            return false;
+        }
+        let Ok(now_ns) = maxsat_monotonic_time_ns() else {
+            self.healthy.store(false, Ordering::Release);
+            return false;
+        };
+        let interval_ns = u64::try_from(MAXSAT_WATCHDOG_SERVER_STATE_CHECK_INTERVAL.as_nanos())
+            .unwrap_or(u64::MAX);
+        let previous = self.last_process_check_ns.load(Ordering::Acquire);
+        if now_ns.saturating_sub(previous) < interval_ns
+            || self
+                .last_process_check_ns
+                .compare_exchange(previous, now_ns, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return true;
+        }
+        let responsive = self
+            .process
+            .lock()
+            .ok()
+            .and_then(|process| process.as_ref().map(|server| server.child.id()))
+            .is_some_and(maxsat_watchdog_server_process_is_responsive);
+        if !responsive {
+            self.healthy.store(false, Ordering::Release);
+        }
+        responsive
+    }
+
+    #[cfg(test)]
+    fn process_id(&self) -> Option<u32> {
+        self.process
+            .lock()
+            .ok()
+            .and_then(|process| process.as_ref().map(|server| server.child.id()))
+    }
+
+    #[cfg(test)]
+    fn kill_process_for_test(&self) {
+        if let Ok(mut process) = self.process.lock() {
+            if let Some(server) = process.as_mut() {
+                terminate_maxsat_process_group(&mut server.child);
+            }
+        }
+    }
+}
+
+impl Drop for MaxSatWatchdogServer {
+    fn drop(&mut self) {
+        self.healthy.store(false, Ordering::Release);
+        let process = match self.process.get_mut() {
+            Ok(process) => process.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        let Some(mut server) = process else {
+            return;
+        };
+        drop(server.stdin);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match server.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(None) | Err(_) => {
+                    terminate_maxsat_process_group(&mut server.child);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn maxsat_watchdog_server_reader(
+    stdout: std::process::ChildStdout,
+    registrations: Arc<
+        Mutex<std::collections::HashMap<u64, mpsc::Sender<MaxSatWatchdogServerMessage>>>,
+    >,
+    healthy: Arc<AtomicBool>,
+    last_heartbeat_ns: Arc<AtomicU64>,
+    ready: mpsc::Sender<std::result::Result<(), String>>,
+) {
+    use std::io::{BufRead as _, Read as _};
+
+    let result = (|| -> std::result::Result<(), String> {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut marker = vec![0_u8; MAXSAT_WATCHDOG_SERVER_READY.len()];
+        reader
+            .read_exact(&mut marker)
+            .map_err(|error| format!("reading MaxSAT watchdog server readiness failed: {error}"))?;
+        if marker != MAXSAT_WATCHDOG_SERVER_READY {
+            return Err("invalid MaxSAT RSS watchdog server readiness marker".to_string());
+        }
+        last_heartbeat_ns.store(
+            maxsat_monotonic_time_ns().map_err(|error| error.to_string())?,
+            Ordering::Release,
+        );
+        healthy.store(true, Ordering::Release);
+        let _ = ready.send(Ok(()));
+        loop {
+            let mut line = Vec::new();
+            let read = (&mut reader)
+                .take(MAXSAT_WATCHDOG_SERVER_MAX_LINE + 1)
+                .read_until(b'\n', &mut line)
+                .map_err(|error| {
+                    format!("reading MaxSAT watchdog server response failed: {error}")
+                })?;
+            if read == 0 {
+                return Err("MaxSAT RSS watchdog server closed its response pipe".to_string());
+            }
+            if line.len() > MAXSAT_WATCHDOG_SERVER_MAX_LINE as usize || !line.ends_with(b"\n") {
+                return Err(
+                    "MaxSAT RSS watchdog server response exceeds protocol limit".to_string()
+                );
+            }
+            let line = std::str::from_utf8(&line[..line.len() - 1]).map_err(|error| {
+                format!("MaxSAT RSS watchdog server emitted non-UTF-8: {error}")
+            })?;
+            if let Some(timestamp) = line.strip_prefix("HEARTBEAT ") {
+                let timestamp = timestamp.parse::<u64>().map_err(|_| {
+                    "MaxSAT RSS watchdog server heartbeat has invalid timestamp".to_string()
+                })?;
+                if timestamp == 0 {
+                    return Err(
+                        "MaxSAT RSS watchdog server heartbeat has zero timestamp".to_string()
+                    );
+                }
+                last_heartbeat_ns.store(
+                    maxsat_monotonic_time_ns().map_err(|error| error.to_string())?,
+                    Ordering::Release,
+                );
+                continue;
+            }
+            let (watch_id, event, terminal) = parse_maxsat_watchdog_server_event(line)?;
+            let sender = {
+                let mut registrations = registrations
+                    .lock()
+                    .map_err(|_| "MaxSAT RSS watchdog registration mutex poisoned".to_string())?;
+                if terminal {
+                    registrations.remove(&watch_id)
+                } else {
+                    registrations.get(&watch_id).cloned()
+                }
+            }
+            .ok_or_else(|| format!("MaxSAT RSS watchdog server reported unknown id {watch_id}"))?;
+            // A local caller may time out and kill a stopped child before a
+            // late response arrives. A dropped receiver is local, not a reason
+            // to disarm the other campaign registrations.
+            let _ = sender.send(event);
+        }
+    })();
+    if !healthy.swap(false, Ordering::AcqRel) {
+        let _ =
+            ready.send(Err(result.as_ref().err().cloned().unwrap_or_else(|| {
+                "MaxSAT RSS watchdog server stopped".to_string()
+            })));
+    }
+    let failure = result
+        .err()
+        .unwrap_or_else(|| "MaxSAT RSS watchdog server stopped".to_string());
+    if let Ok(mut registrations) = registrations.lock() {
+        for (_, sender) in registrations.drain() {
+            let _ = sender.send(Err(failure.clone()));
+        }
+    }
+}
+
+fn parse_maxsat_watchdog_server_event(
+    line: &str,
+) -> std::result::Result<(u64, MaxSatWatchdogServerMessage, bool), String> {
+    let fields = line.split(' ').collect::<Vec<_>>();
+    let watch_id = fields
+        .get(1)
+        .ok_or_else(|| "MaxSAT watchdog server response omitted id".to_string())?
+        .parse::<u64>()
+        .map_err(|_| "MaxSAT watchdog server response has invalid id".to_string())?;
+    if watch_id == 0 {
+        return Err("MaxSAT watchdog server response has zero id".to_string());
+    }
+    match fields.as_slice() {
+        ["READY", _] => Ok((watch_id, Ok(MaxSatWatchdogServerEvent::Ready), false)),
+        ["DONE", _] => Ok((watch_id, Ok(MaxSatWatchdogServerEvent::Done), true)),
+        ["BREACH", _, timestamp] => {
+            let timestamp = timestamp
+                .parse::<u64>()
+                .map_err(|_| "MaxSAT watchdog server breach has invalid timestamp".to_string())?;
+            if timestamp == 0 {
+                return Err("MaxSAT watchdog server breach has zero timestamp".to_string());
+            }
+            Ok((
+                watch_id,
+                Ok(MaxSatWatchdogServerEvent::Breach(timestamp)),
+                true,
+            ))
+        }
+        ["ERROR", _, encoded] => {
+            if encoded.len() > 1024 || encoded.len() % 2 != 0 {
+                return Err("MaxSAT watchdog server error has invalid encoding".to_string());
+            }
+            let mut bytes = Vec::with_capacity(encoded.len() / 2);
+            for pair in encoded.as_bytes().as_chunks::<2>().0 {
+                let pair = std::str::from_utf8(pair)
+                    .map_err(|_| "MaxSAT watchdog server error has invalid encoding".to_string())?;
+                bytes.push(u8::from_str_radix(pair, 16).map_err(|_| {
+                    "MaxSAT watchdog server error has invalid encoding".to_string()
+                })?);
+            }
+            let message = String::from_utf8(bytes)
+                .map_err(|_| "MaxSAT watchdog server error is not UTF-8".to_string())?;
+            Ok((watch_id, Err(message), true))
+        }
+        _ => Err("invalid MaxSAT RSS watchdog server response".to_string()),
+    }
+}
+
 struct MaxSatWatchdog {
-    sidecar: Child,
+    server: Arc<MaxSatWatchdogServer>,
+    campaign_lease: Option<Arc<MaxSatCampaignLease>>,
+    watch_id: u64,
+    target_pgid: Option<i32>,
+    terminal_outcome: Option<MaxSatWatchdogOutcome>,
+    terminal_error: Option<String>,
+    receiver: mpsc::Receiver<MaxSatWatchdogServerMessage>,
 }
 
 impl MaxSatWatchdog {
-    fn finish(mut self) -> Result<bool> {
-        let deadline = Instant::now() + Duration::from_secs(12);
-        loop {
-            if let Some(status) = self.sidecar.try_wait()? {
-                return match status.code() {
-                    Some(0) => Ok(false),
-                    Some(WATCHDOG_BREACH_EXIT) => Ok(true),
-                    _ => bail!("MaxSAT RSS watchdog exited unexpectedly with {status}"),
-                };
-            }
-            if Instant::now() >= deadline {
-                let _ = self.sidecar.kill();
-                let _ = self.sidecar.wait();
-                bail!("MaxSAT RSS watchdog did not exit after child cleanup");
-            }
-            std::thread::sleep(Duration::from_millis(20));
+    fn ensure_campaign_lease_alive(&mut self) -> Result<()> {
+        let result = match self.campaign_lease.as_deref() {
+            Some(lease) => lease.ensure_alive(),
+            None => Ok(()),
+        };
+        if let Err(error) = result {
+            self.kill_target();
+            return Err(error).context("host-wide MaxSAT lease failed while child was guarded");
         }
+        Ok(())
+    }
+
+    fn kill_target(&mut self) {
+        #[cfg(unix)]
+        if let Some(raw) = self.target_pgid.take() {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(raw),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            self.target_pgid = None;
+        }
+    }
+
+    fn decode_terminal_event(
+        &self,
+        event: MaxSatWatchdogServerMessage,
+    ) -> Result<MaxSatWatchdogOutcome> {
+        match event.map_err(|error| {
+            anyhow::anyhow!("MaxSAT RSS watchdog {} failed: {error}", self.watch_id)
+        })? {
+            MaxSatWatchdogServerEvent::Done => Ok(MaxSatWatchdogOutcome {
+                breached: false,
+                breach_time_ns: None,
+            }),
+            MaxSatWatchdogServerEvent::Breach(breach_time_ns) => Ok(MaxSatWatchdogOutcome {
+                breached: true,
+                breach_time_ns: Some(breach_time_ns),
+            }),
+            MaxSatWatchdogServerEvent::Ready => {
+                bail!(
+                    "MaxSAT RSS watchdog {} emitted duplicate readiness",
+                    self.watch_id
+                )
+            }
+        }
+    }
+
+    /// Poll server and registration health while the guarded child is active.
+    /// Any campaign-server failure kills the complete target process group.
+    fn poll(&mut self) -> Result<Option<MaxSatWatchdogOutcome>> {
+        self.ensure_campaign_lease_alive()?;
+        if let Some(error) = &self.terminal_error {
+            bail!("{error}");
+        }
+        if let Some(outcome) = self.terminal_outcome {
+            return Ok(Some(outcome));
+        }
+        if !self.server.is_healthy() {
+            self.kill_target();
+            bail!("MaxSAT campaign RSS watchdog server stopped while a solver was active");
+        }
+        match self.receiver.try_recv() {
+            Ok(message) => match self.decode_terminal_event(message) {
+                Ok(outcome) => {
+                    self.target_pgid = None;
+                    self.terminal_outcome = Some(outcome);
+                    Ok(Some(outcome))
+                }
+                Err(error) => {
+                    self.kill_target();
+                    let error = error.to_string();
+                    self.terminal_error = Some(error.clone());
+                    bail!("{error}")
+                }
+            },
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.kill_target();
+                bail!(
+                    "MaxSAT RSS watchdog {} response channel disconnected",
+                    self.watch_id
+                )
+            }
+        }
+    }
+
+    fn finish(mut self) -> Result<MaxSatWatchdogOutcome> {
+        self.ensure_campaign_lease_alive()?;
+        if let Some(error) = &self.terminal_error {
+            bail!("{error}");
+        }
+        if let Some(outcome) = self.terminal_outcome {
+            self.target_pgid = None;
+            return Ok(outcome);
+        }
+        if !self.server.is_healthy() {
+            self.kill_target();
+            bail!("MaxSAT campaign RSS watchdog server stopped before reporting completion");
+        }
+        let message = match self.receiver.recv_timeout(Duration::from_secs(12)) {
+            Ok(message) => message,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                self.kill_target();
+                bail!(
+                    "MaxSAT RSS watchdog {} did not report completion within 12 seconds",
+                    self.watch_id
+                )
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.kill_target();
+                bail!(
+                    "MaxSAT RSS watchdog {} response channel disconnected",
+                    self.watch_id
+                )
+            }
+        };
+        let outcome = self.decode_terminal_event(message)?;
+        self.target_pgid = None;
+        self.ensure_campaign_lease_alive()?;
+        Ok(outcome)
+    }
+
+    fn detach_campaign_lease(&mut self) {
+        self.campaign_lease = None;
+    }
+
+    /// The caller has already killed and reaped the target leader. Disarm the
+    /// PGID before awaiting the terminal record so error-path Drop can never
+    /// signal a subsequently reused process-group ID.
+    fn finish_after_target_cleanup(mut self) -> Result<MaxSatWatchdogOutcome> {
+        self.target_pgid = None;
+        self.finish()
     }
 }
 
 impl Drop for MaxSatWatchdog {
     fn drop(&mut self) {
-        let _ = self.sidecar.kill();
-        let _ = self.sidecar.wait();
+        self.kill_target();
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaxSatUnreapedChildState {
+    Running,
+    Stopped,
+    Exited,
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "haiku",
+    all(target_os = "linux", not(target_env = "uclibc")),
+))]
+fn observe_maxsat_child_unreaped(
+    child: &Child,
+    include_stopped: bool,
+    label: &str,
+) -> Result<MaxSatUnreapedChildState> {
+    use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
+
+    let raw_pid = i32::try_from(child.id())
+        .with_context(|| format!("{label}: child PID does not fit pid_t"))?;
+    let mut flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+    if include_stopped {
+        flags |= WaitPidFlag::WSTOPPED;
+    }
+    match waitid(Id::Pid(nix::unistd::Pid::from_raw(raw_pid)), flags) {
+        Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => {
+            Ok(MaxSatUnreapedChildState::Exited)
+        }
+        Ok(WaitStatus::Stopped(..)) if include_stopped => Ok(MaxSatUnreapedChildState::Stopped),
+        Ok(WaitStatus::StillAlive | WaitStatus::Continued(..)) => {
+            Ok(MaxSatUnreapedChildState::Running)
+        }
+        Ok(status) => bail!("{label}: unexpected unreaped child status: {status:?}"),
+        Err(error) => bail!("{label}: observing child without reaping failed: {error}"),
+    }
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "haiku",
+    all(target_os = "linux", not(target_env = "uclibc")),
+)))]
+fn observe_maxsat_child_unreaped(
+    _child: &Child,
+    _include_stopped: bool,
+    label: &str,
+) -> Result<MaxSatUnreapedChildState> {
+    bail!("{label}: safe unreaped child observation is unavailable on this platform")
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "haiku",
+    all(target_os = "linux", not(target_env = "uclibc")),
+))]
+fn wait_for_maxsat_guard_stop(child: &Child, label: &str) -> Result<()> {
+    use nix::sys::wait::{waitid, Id, WaitPidFlag, WaitStatus};
+
+    let raw_pid = i32::try_from(child.id()).context("MaxSAT child PID does not fit pid_t")?;
+    let pid = nix::unistd::Pid::from_raw(raw_pid);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match waitid(
+            Id::Pid(pid),
+            WaitPidFlag::WEXITED
+                | WaitPidFlag::WSTOPPED
+                | WaitPidFlag::WNOHANG
+                | WaitPidFlag::WNOWAIT,
+        ) {
+            Ok(WaitStatus::Stopped(_, nix::sys::signal::Signal::SIGSTOP)) => return Ok(()),
+            Ok(WaitStatus::StillAlive) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(WaitStatus::StillAlive) => {
+                bail!("{label}: MaxSAT child did not enter its watchdog safety stop")
+            }
+            Ok(status) => bail!(
+                "{label}: MaxSAT child exited or changed state before watchdog arming: {status:?}"
+            ),
+            Err(error) => bail!("{label}: observing stopped MaxSAT child failed: {error}"),
+        }
+    }
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "haiku",
+    all(target_os = "linux", not(target_env = "uclibc")),
+)))]
+fn wait_for_maxsat_guard_stop(_child: &Child, label: &str) -> Result<()> {
+    bail!("{label}: safe unreaped MaxSAT child observation is unavailable on this platform")
 }
 
 #[cfg(unix)]
@@ -219,6 +1250,12 @@ fn isolate_maxsat_process_group(command: &mut Command) {
 fn isolate_maxsat_process_group(_command: &mut Command) {}
 
 fn terminate_maxsat_process_group(child: &mut Child) {
+    let _ = terminate_maxsat_process_group_with_status(child);
+}
+
+fn terminate_maxsat_process_group_with_status(
+    child: &mut Child,
+) -> Option<std::process::ExitStatus> {
     #[cfg(unix)]
     if let Ok(pid) = i32::try_from(child.id()) {
         let _ = nix::sys::signal::killpg(
@@ -228,7 +1265,7 @@ fn terminate_maxsat_process_group(child: &mut Child) {
     }
     #[cfg(not(unix))]
     let _ = child.kill();
-    let _ = child.wait();
+    child.wait().ok()
 }
 
 const MAXSAT_CAPTURE_BYTES: usize = 32 * 1024 * 1024;
@@ -1056,7 +2093,7 @@ fn bench(args: &MaxSatBenchArgs) -> Result<i32> {
     let jobs = resources.plan.jobs;
 
     safe_println!(
-        "ay maxsat bench: {} instances, timeout {}s, {} parallel jobs{}; memory={}MiB/child NBCORE={} headroom={}MiB enforcement={}",
+        "ay maxsat bench: {} instances, timeout {}s, {} parallel jobs{}; memory={}MiB/child NBCORE={} headroom={}MiB enforcement={} aggregate={}",
         files.len(),
         args.timeout,
         jobs,
@@ -1068,6 +2105,7 @@ fn bench(args: &MaxSatBenchArgs) -> Result<i32> {
         resources.plan.nbcore_per_child,
         resources.plan.headroom_mb,
         resources.plan.enforcement,
+        resources.plan.aggregate_enforcement,
     );
 
     let external: Option<(String, Vec<String>)> = match &args.solver {
@@ -1160,6 +2198,10 @@ fn bench(args: &MaxSatBenchArgs) -> Result<i32> {
         }
     });
 
+    resources
+        .ensure_campaign_lease()
+        .context("host-wide MaxSAT lease exited during benchmark execution")?;
+
     let mut results = results.into_inner().expect("results lock");
     results.sort_by(|a, b| a.instance.cmp(&b.instance));
 
@@ -1189,6 +2231,10 @@ fn bench(args: &MaxSatBenchArgs) -> Result<i32> {
         write_json_report(out, args, &results, field.as_ref(), &resources.plan)?;
         safe_println!("wrote {}", out.display());
     }
+
+    resources
+        .ensure_campaign_lease()
+        .context("host-wide MaxSAT lease exited before campaign completion")?;
 
     Ok(bench_exit_code(summary))
 }
@@ -1470,7 +2516,17 @@ fn run_one(
 ) -> RunResult {
     let instance = instance_key(file);
     let start = Instant::now();
-    let mut command = match external {
+    if let Err(error) = resources.ensure_campaign_lease() {
+        return RunResult {
+            instance,
+            status: RunStatus::Error,
+            seconds: start.elapsed().as_secs_f64(),
+            cost: None,
+            detail: format!("host-wide resource lease unavailable: {error}"),
+            authority: "none".to_string(),
+        };
+    }
+    let command = match external {
         Some((_, words)) => {
             let mut cmd = Command::new(&words[0]);
             let mut file_used = false;
@@ -1500,6 +2556,7 @@ fn run_one(
             cmd
         }
     };
+    let mut command = resources.wrap_stopped(&command);
     command.env("MEMLIMIT", resources.plan.memlimit_mb_per_child.to_string());
     command.env("NBCORE", resources.plan.nbcore_per_child.to_string());
     command.stdin(Stdio::null());
@@ -1525,10 +2582,9 @@ fn run_one(
     // Drain concurrently, retaining a bounded head/tail. A noisy or hostile
     // external solver cannot OOM the parent benchmark process.
     let capture = child.stdout.take().map(MaxSatCapture::start);
-    let watchdog = match resources.watch(&child, "ay maxsat bench") {
+    let mut watchdog = match resources.watch(&mut child, "ay maxsat bench") {
         Ok(watchdog) => watchdog,
         Err(error) => {
-            terminate_maxsat_process_group(&mut child);
             if let Some(capture) = capture {
                 let _ = capture.finish();
             }
@@ -1545,50 +2601,201 @@ fn run_one(
 
     let mut killed = false;
     let mut wait_error = None;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
+    let mut campaign_lease_error = None;
+    let mut watchdog_poll_error = None;
+    let mut terminal_trigger_ns = None;
+    let mut watchdog_breach_observed = false;
+    let completed_normally = loop {
+        match observe_maxsat_child_unreaped(&child, false, "MaxSAT solver") {
+            Ok(MaxSatUnreapedChildState::Exited) => match maxsat_monotonic_time_ns() {
+                Ok(trigger_ns) => {
+                    terminal_trigger_ns = Some(trigger_ns);
+                    break true;
+                }
+                Err(error) => {
+                    wait_error = Some(format!("cannot timestamp child completion: {error}"));
+                    break false;
+                }
+            },
+            Ok(MaxSatUnreapedChildState::Running) => {
+                if let Err(error) = resources.ensure_campaign_lease() {
+                    campaign_lease_error = Some(error.to_string());
+                    break false;
+                }
+                match watchdog.poll() {
+                    Ok(Some(outcome)) if outcome.breached => {
+                        // The server already killed the group on breach. Reap
+                        // the leader now; `finish_after_target_cleanup` retains
+                        // the authenticated terminal classification.
+                        watchdog_breach_observed = true;
+                        break false;
+                    }
+                    Ok(Some(_)) => {
+                        watchdog_poll_error =
+                            Some("RSS watchdog stopped before the MaxSAT child".to_string());
+                        break false;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        match resources.ensure_campaign_lease() {
+                            Ok(()) => watchdog_poll_error = Some(error.to_string()),
+                            Err(lease_error) => {
+                                campaign_lease_error = Some(lease_error.to_string());
+                            }
+                        }
+                        break false;
+                    }
+                }
                 if start.elapsed().as_secs_f64() > timeout + KILL_GRACE_SECS {
-                    terminate_maxsat_process_group(&mut child);
-                    killed = true;
-                    break None;
+                    match maxsat_monotonic_time_ns() {
+                        Ok(trigger_ns) => {
+                            terminal_trigger_ns = Some(trigger_ns);
+                            killed = true;
+                        }
+                        Err(error) => {
+                            wait_error = Some(format!("cannot timestamp timeout trigger: {error}"));
+                        }
+                    }
+                    break false;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
+            Ok(MaxSatUnreapedChildState::Stopped) => {
+                wait_error = Some("MaxSAT solver stopped unexpectedly".to_string());
+                break false;
+            }
             Err(error) => {
                 wait_error = Some(error.to_string());
-                terminate_maxsat_process_group(&mut child);
-                break None;
+                break false;
             }
         }
     };
     // Normal wrapper exit is not proof its descendants exited. Kill/reap the
     // complete isolated group before disarming the watchdog or collecting
     // output.
-    terminate_maxsat_process_group(&mut child);
+    let cleanup_status = terminate_maxsat_process_group_with_status(&mut child);
+    let status = completed_normally.then_some(cleanup_status).flatten();
     let seconds = start.elapsed().as_secs_f64();
-    let memout = match watchdog.finish() {
-        Ok(memout) => memout,
+    if campaign_lease_error.is_none() {
+        campaign_lease_error = resources
+            .ensure_campaign_lease()
+            .err()
+            .map(|error| error.to_string());
+    }
+    if campaign_lease_error.is_some() {
+        // The primary failure already proves that aggregate admission is
+        // gone. Consume this registration's terminal event without rechecking
+        // the same dead lease and obscuring the primary error.
+        watchdog.detach_campaign_lease();
+    }
+    let watchdog_outcome = match watchdog.finish_after_target_cleanup() {
+        Ok(outcome) => outcome,
         Err(error) => {
+            if campaign_lease_error.is_none() {
+                campaign_lease_error = resources
+                    .ensure_campaign_lease()
+                    .err()
+                    .map(|lease_error| lease_error.to_string());
+            }
             if let Some(capture) = capture {
                 let _ = capture.finish();
             }
+            let mut failures = Vec::new();
+            if let Some(lease_error) = campaign_lease_error.as_deref() {
+                failures.push(format!(
+                    "host-wide resource lease exited early: {lease_error}"
+                ));
+            }
+            if let Some(poll_error) = watchdog_poll_error.as_deref() {
+                failures.push(format!(
+                    "RSS watchdog failed while child was active: {poll_error}"
+                ));
+            }
+            if let Some(error) = wait_error.as_deref() {
+                failures.push(format!("wait failed: {error}"));
+            }
+            failures.push(format!("RSS watchdog terminal cleanup failed: {error}"));
             return RunResult {
                 instance,
                 status: RunStatus::Error,
                 seconds,
                 cost: None,
-                detail: format!("RSS watchdog failed: {error}"),
+                detail: failures.join("; "),
                 authority: "none".to_string(),
             };
         }
     };
+    if watchdog_breach_observed && !watchdog_outcome.breached {
+        if let Some(capture) = capture {
+            let _ = capture.finish();
+        }
+        return RunResult {
+            instance,
+            status: RunStatus::Error,
+            seconds,
+            cost: None,
+            detail: "RSS watchdog lost a previously observed breach".to_string(),
+            authority: "none".to_string(),
+        };
+    }
+    let memout = match terminal_trigger_ns {
+        Some(trigger_ns) if !watchdog_breach_observed => {
+            match maxsat_watchdog_breached_before(watchdog_outcome, trigger_ns) {
+                Ok(memout) => memout,
+                Err(error) => {
+                    if let Some(capture) = capture {
+                        let _ = capture.finish();
+                    }
+                    return RunResult {
+                        instance,
+                        status: RunStatus::Error,
+                        seconds,
+                        cost: None,
+                        detail: format!("cannot attribute RSS watchdog breach: {error}"),
+                        authority: "none".to_string(),
+                    };
+                }
+            }
+        }
+        _ => watchdog_outcome.breached,
+    };
+    if campaign_lease_error.is_none() {
+        campaign_lease_error = resources
+            .ensure_campaign_lease()
+            .err()
+            .map(|error| error.to_string());
+    }
     let exited_ok =
         status.is_some_and(|s| s.success() || s.code() == Some(30) || s.code() == Some(20));
     let (stdout, capture_truncated) = capture
         .map(MaxSatCapture::finish)
         .unwrap_or_else(|| (String::new(), true));
+    if let Some(error) = campaign_lease_error {
+        let detail = match watchdog_poll_error.as_deref() {
+            Some(poll_error) => format!(
+                "host-wide resource lease exited early: {error}; RSS watchdog failed while child was active: {poll_error}"
+            ),
+            None => format!("host-wide resource lease exited early: {error}"),
+        };
+        return RunResult {
+            instance,
+            status: RunStatus::Error,
+            seconds,
+            cost: None,
+            detail,
+            authority: "none".to_string(),
+        };
+    }
+    if let Some(error) = watchdog_poll_error {
+        return RunResult {
+            instance,
+            status: RunStatus::Error,
+            seconds,
+            cost: None,
+            detail: format!("RSS watchdog failed while child was active: {error}"),
+            authority: "none".to_string(),
+        };
+    }
     if memout {
         return RunResult {
             instance,
@@ -1618,7 +2825,7 @@ fn run_one(
             status: RunStatus::Error,
             seconds,
             cost: None,
-            detail: format!("solver stdout exceeded {} bytes", MAXSAT_CAPTURE_BYTES),
+            detail: format!("solver stdout exceeded {MAXSAT_CAPTURE_BYTES} bytes"),
             authority: "none".to_string(),
         };
     }
@@ -2140,6 +3347,17 @@ mod tests {
     }
 
     #[test]
+    fn watchdog_registration_ids_advance_and_fail_closed_at_exhaustion() {
+        let server = MaxSatWatchdogServer::new(OomGuardSource::Embedded);
+        assert_eq!(server.reserve_watch_id().expect("reserve first ID"), 1);
+        assert_eq!(server.next_id.load(Ordering::Relaxed), 2);
+
+        server.next_id.store(u64::MAX, Ordering::Relaxed);
+        assert!(server.reserve_watch_id().is_err());
+        assert_eq!(server.next_id.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
     fn parses_new_maxsat_format() {
         let (num_vars, hard, soft) = parse_text("c new format\nh 1 2 0\n3 -1 0\n");
         assert_eq!(num_vars, 2);
@@ -2315,6 +3533,461 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn maxsat_campaign_lease_excludes_second_campaign_until_drop() {
+        fn acquire(lock_path: &Path, tmpdir: &Path, label: &str) -> Result<MaxSatCampaignLease> {
+            let mut command = OomGuardSource::Embedded.command();
+            command.env("TMPDIR", tmpdir);
+            MaxSatCampaignLease::acquire_command(command, label, Stdio::null(), Some(lock_path))
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "ay-maxsat-lease-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let first_tmp = dir.join("first-tmp");
+        let second_tmp = dir.join("second-tmp");
+        fs::create_dir_all(&first_tmp).expect("first tmpdir");
+        fs::create_dir_all(&second_tmp).expect("second tmpdir");
+        let lock_path = dir.join("host-lease.lock");
+
+        let first =
+            acquire(&lock_path, &first_tmp, "MaxSAT lease regression first").expect("first lease");
+        first.ensure_alive().expect("first lease stays alive");
+        let error = acquire(&lock_path, &second_tmp, "MaxSAT lease regression blocked")
+            .expect_err("a concurrent campaign must not acquire the same host lease");
+        assert!(
+            error.to_string().contains("lease"),
+            "unexpected acquisition error: {error:#}"
+        );
+
+        drop(first);
+        let replacement = acquire(
+            &lock_path,
+            &second_tmp,
+            "MaxSAT lease regression replacement",
+        )
+        .expect("replacement lease");
+        replacement
+            .ensure_alive()
+            .expect("replacement lease stays alive");
+        drop(replacement);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn maxsat_campaign_lease_detects_early_sidecar_exit() {
+        let dir = std::env::temp_dir().join(format!(
+            "ay-maxsat-lease-death-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let command = OomGuardSource::Embedded.command();
+        let lock_path = dir.join("host-lease.lock");
+        let lease = MaxSatCampaignLease::acquire_command(
+            command,
+            "MaxSAT lease death regression",
+            Stdio::null(),
+            Some(&lock_path),
+        )
+        .expect("lease");
+        lease.kill_process_for_test();
+        let error = lease
+            .ensure_alive()
+            .expect_err("a dead lease sidecar must fail the campaign closed");
+        assert!(error.to_string().contains("exited early"), "{error:#}");
+        drop(lease);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "haiku",
+            all(target_os = "linux", not(target_env = "uclibc")),
+        )
+    ))]
+    fn spawn_maxsat_watchdog_test_child(script: &str) -> Child {
+        let mut command = OomGuardSource::Embedded.command();
+        command
+            .arg("exec-stopped")
+            .arg("--")
+            .arg("sh")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        isolate_maxsat_process_group(&mut command);
+        command.spawn().expect("spawn stopped watchdog target")
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "haiku",
+            all(target_os = "linux", not(target_env = "uclibc")),
+        )
+    ))]
+    fn resume_maxsat_watchdog_test_child(child: &Child) {
+        let pid = i32::try_from(child.id()).expect("child pid");
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGCONT,
+        )
+        .expect("resume watchdog target");
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "haiku",
+            all(target_os = "linux", not(target_env = "uclibc")),
+        )
+    ))]
+    #[test]
+    fn maxsat_campaign_watchdog_server_is_shared_across_children() {
+        let server = MaxSatWatchdogServer::new(OomGuardSource::Embedded);
+        let mut first = spawn_maxsat_watchdog_test_child("sleep 60");
+        let mut second = spawn_maxsat_watchdog_test_child("sleep 60");
+        wait_for_maxsat_guard_stop(&first, "first shared-watchdog target").expect("first stopped");
+        let first_watch = server
+            .register(first.id(), 10_000, "first shared-watchdog target", None)
+            .expect("first watch");
+        let server_pid = server.process_id().expect("watch-server pid");
+        wait_for_maxsat_guard_stop(&second, "second shared-watchdog target")
+            .expect("second stopped");
+        let second_watch = server
+            .register(second.id(), 10_000, "second shared-watchdog target", None)
+            .expect("second watch");
+        assert_eq!(
+            server.process_id(),
+            Some(server_pid),
+            "both registrations must use one campaign watch-server"
+        );
+
+        resume_maxsat_watchdog_test_child(&first);
+        resume_maxsat_watchdog_test_child(&second);
+        terminate_maxsat_process_group(&mut first);
+        terminate_maxsat_process_group(&mut second);
+        assert!(
+            !first_watch
+                .finish_after_target_cleanup()
+                .expect("first terminal watch result")
+                .breached
+        );
+        assert!(
+            !second_watch
+                .finish_after_target_cleanup()
+                .expect("second terminal watch result")
+                .breached
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "haiku",
+            all(target_os = "linux", not(target_env = "uclibc")),
+        )
+    ))]
+    #[test]
+    fn maxsat_watchdog_server_death_kills_target_descendants() {
+        let dir = std::env::temp_dir().join(format!(
+            "ay-maxsat-watch-server-death-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let descendant_file = dir.join("descendant.pid");
+        let script = format!("sleep 60 & echo $! > '{}'; wait", descendant_file.display());
+        let server = MaxSatWatchdogServer::new(OomGuardSource::Embedded);
+        let mut child = spawn_maxsat_watchdog_test_child(&script);
+        wait_for_maxsat_guard_stop(&child, "watch-server death target").expect("target stopped");
+        let mut watchdog = server
+            .register(child.id(), 10_000, "watch-server death target", None)
+            .expect("watch registered");
+        resume_maxsat_watchdog_test_child(&child);
+        for _ in 0..200 {
+            if descendant_file.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let descendant = fs::read_to_string(&descendant_file).expect("descendant pid");
+
+        server.kill_process_for_test();
+        let mut observed_error = None;
+        for _ in 0..200 {
+            match watchdog.poll() {
+                Err(error) => {
+                    observed_error = Some(error);
+                    break;
+                }
+                Ok(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        let error = observed_error.expect("watch-server death must fail the active watch closed");
+        assert!(error.to_string().contains("watchdog"), "{error:#}");
+        terminate_maxsat_process_group(&mut child);
+        let _ = watchdog.finish_after_target_cleanup();
+
+        let proc_stat = PathBuf::from(format!("/proc/{}/stat", descendant.trim()));
+        for _ in 0..100 {
+            let dead_or_zombie = fs::read_to_string(&proc_stat)
+                .map(|stat| {
+                    stat.rsplit(')')
+                        .nth(1)
+                        .is_some_and(|rest| rest.trim().starts_with('Z'))
+                })
+                .unwrap_or(true);
+            if dead_or_zombie {
+                fs::remove_dir_all(&dir).ok();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "descendant {} survived watch-server failure",
+            descendant.trim()
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "haiku",
+            all(target_os = "linux", not(target_env = "uclibc")),
+        )
+    ))]
+    #[test]
+    fn maxsat_missing_watchdog_heartbeat_kills_active_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "ay-maxsat-watch-heartbeat-loss-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let fake_server = dir.join("watch-server.py");
+        fs::write(
+            &fake_server,
+            "import sys\nsys.stdout.write('AY_OOM_WATCHDOG_SERVER_READY_V1\\n')\nsys.stdout.flush()\nfor line in sys.stdin.buffer:\n fields=line.decode('ascii').strip().split(' ')\n if len(fields)==5 and fields[0]=='WATCH':\n  print(f'READY {fields[1]}', flush=True)\n",
+        )
+        .expect("write fake watch server");
+        let server = MaxSatWatchdogServer::new(OomGuardSource::Checkout(fake_server));
+        let mut child = spawn_maxsat_watchdog_test_child("sleep 60");
+        wait_for_maxsat_guard_stop(&child, "heartbeat-loss target").expect("target stopped");
+        let mut watchdog = server
+            .register(child.id(), 10_000, "heartbeat-loss target", None)
+            .expect("watch registered");
+        resume_maxsat_watchdog_test_child(&child);
+
+        let started = Instant::now();
+        let mut observed_error = None;
+        for _ in 0..300 {
+            match watchdog.poll() {
+                Err(error) => {
+                    observed_error = Some(error);
+                    break;
+                }
+                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let error = observed_error.expect("heartbeat loss must fail the active watch closed");
+        assert!(started.elapsed() < Duration::from_secs(3), "{error:#}");
+        assert!(error.to_string().contains("watchdog"), "{error:#}");
+        terminate_maxsat_process_group(&mut child);
+        let _ = watchdog.finish_after_target_cleanup();
+        drop(server);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "android",
+            target_os = "freebsd",
+            target_os = "haiku",
+            all(target_os = "linux", not(target_env = "uclibc")),
+        )
+    ))]
+    #[test]
+    fn maxsat_campaign_lease_loss_kills_active_target_descendants() {
+        let dir = std::env::temp_dir().join(format!(
+            "ay-maxsat-active-lease-death-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let descendant_file = dir.join("descendant.pid");
+        let lock_path = dir.join("host-lease.lock");
+        let lease = Arc::new(
+            MaxSatCampaignLease::acquire_command(
+                OomGuardSource::Embedded.command(),
+                "active MaxSAT lease death regression",
+                Stdio::null(),
+                Some(&lock_path),
+            )
+            .expect("campaign lease"),
+        );
+        let server = MaxSatWatchdogServer::new(OomGuardSource::Embedded);
+        let script = format!("sleep 60 & echo $! > '{}'; wait", descendant_file.display());
+        let mut child = spawn_maxsat_watchdog_test_child(&script);
+        wait_for_maxsat_guard_stop(&child, "active lease-death target").expect("target stopped");
+        let mut watchdog = server
+            .register(
+                child.id(),
+                10_000,
+                "active lease-death target",
+                Some(Arc::clone(&lease)),
+            )
+            .expect("watch registered");
+        resume_maxsat_watchdog_test_child(&child);
+        for _ in 0..200 {
+            if descendant_file.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let descendant = fs::read_to_string(&descendant_file).expect("descendant pid");
+
+        lease.kill_process_for_test();
+        let mut observed_error = None;
+        for _ in 0..200 {
+            match watchdog.poll() {
+                Err(error) => {
+                    observed_error = Some(error);
+                    break;
+                }
+                Ok(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        let error = observed_error.expect("lease death must fail the active watch closed");
+        assert!(error.to_string().contains("lease"), "{error:#}");
+
+        terminate_maxsat_process_group(&mut child);
+        watchdog.detach_campaign_lease();
+        let outcome = watchdog
+            .finish_after_target_cleanup()
+            .expect("consume terminal watch result after known lease death");
+        assert!(!outcome.breached);
+
+        let proc_stat = PathBuf::from(format!("/proc/{}/stat", descendant.trim()));
+        for _ in 0..100 {
+            let dead_or_zombie = fs::read_to_string(&proc_stat)
+                .map(|stat| {
+                    stat.rsplit(')')
+                        .nth(1)
+                        .is_some_and(|rest| rest.trim().starts_with('Z'))
+                })
+                .unwrap_or(true);
+            if dead_or_zombie {
+                fs::remove_dir_all(&dir).ok();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!(
+            "descendant {} survived aggregate lease failure",
+            descendant.trim()
+        );
+    }
+
+    #[test]
+    fn maxsat_watchdog_breach_attribution_uses_monotonic_trigger() {
+        let breach = MaxSatWatchdogOutcome {
+            breached: true,
+            breach_time_ns: Some(100),
+        };
+        assert!(maxsat_watchdog_breached_before(breach, 100).expect("equal timestamp"));
+        assert!(maxsat_watchdog_breached_before(breach, 101).expect("earlier breach"));
+        assert!(!maxsat_watchdog_breached_before(breach, 99).expect("later breach"));
+        assert!(!maxsat_watchdog_breached_before(
+            MaxSatWatchdogOutcome {
+                breached: false,
+                breach_time_ns: None,
+            },
+            100,
+        )
+        .expect("non-breach"));
+        assert!(maxsat_watchdog_breached_before(
+            MaxSatWatchdogOutcome {
+                breached: true,
+                breach_time_ns: None,
+            },
+            100,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn maxsat_resource_plan_persists_versioned_enforcement_provenance() {
+        let plan = MaxSatResourcePlan {
+            schema: MAXSAT_RESOURCE_ENVELOPE_SCHEMA_V2,
+            requested_jobs: 4,
+            jobs: 2,
+            memlimit_mb_per_child: 2048,
+            nbcore_per_child: 3,
+            headroom_mb: 16_000,
+            planner: "embedded:scripts/_oom_guard.py".to_string(),
+            planner_protocol: MAXSAT_RESOURCE_PLANNER_PROTOCOL_V1,
+            enforcement: MAXSAT_CHILD_ENFORCEMENT_V1,
+            solver_environment: MAXSAT_SOLVER_ENVIRONMENT_V1,
+            aggregate_enforcement: MAXSAT_AGGREGATE_ENFORCEMENT_V1,
+            lease_protocol: MAXSAT_LEASE_PROTOCOL_V1,
+            lease_readiness: MAXSAT_LEASE_READINESS_V1,
+            lease_location: MAXSAT_LEASE_LOCATION_V1,
+        };
+        let value = serde_json::to_value(plan).expect("serialize resource plan");
+        assert_eq!(
+            value["schema"],
+            serde_json::json!("ay.maxsat-resource-envelope/v2")
+        );
+        assert_eq!(
+            value["planner_protocol"],
+            serde_json::json!("ay-oom-guard-plan/v1")
+        );
+        assert_eq!(
+            value["enforcement"],
+            serde_json::json!("ay-resource-v1:rss-watchdog-zero-grace")
+        );
+        assert_eq!(
+            value["solver_environment"],
+            serde_json::json!("ay-maxsat-solver-env/v1:MEMLIMIT+NBCORE")
+        );
+        assert_eq!(
+            value["aggregate_enforcement"],
+            serde_json::json!("ay-host-exclusive-flock-v1")
+        );
+        assert_eq!(
+            value["lease_protocol"],
+            serde_json::json!("ay-oom-guard-lease-sidecar/v1")
+        );
+        assert_eq!(
+            value["lease_readiness"],
+            serde_json::json!("AY_OOM_HARNESS_LEASE_READY_V1")
+        );
+        assert_eq!(
+            value["lease_location"],
+            serde_json::json!("ay-host-user-lock-path/v1:/tmp/ay-oom-guard-<uid>.lock")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn maxsat_runner_reaps_descendants_and_applies_core_envelope() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -2341,17 +4014,37 @@ mod tests {
         fs::set_permissions(&solver, permissions).expect("chmod");
         let input = dir.join("case.wcnf");
         fs::write(&input, "h 1 0\n").expect("write input");
+        let lease_command = OomGuardSource::Embedded.command();
+        let lease_lock_path = dir.join("host-lease.lock");
+        let campaign_lease = MaxSatCampaignLease::acquire_command(
+            lease_command,
+            "MaxSAT runner test",
+            Stdio::null(),
+            Some(&lease_lock_path),
+        )
+        .expect("campaign lease");
         let resources = MaxSatResources {
             plan: MaxSatResourcePlan {
+                schema: MAXSAT_RESOURCE_ENVELOPE_SCHEMA_V2,
                 requested_jobs: 1,
                 jobs: 1,
                 memlimit_mb_per_child: 10_000,
                 nbcore_per_child: 3,
                 headroom_mb: 16_000,
                 planner: "test".to_string(),
-                enforcement: "test",
+                planner_protocol: MAXSAT_RESOURCE_PLANNER_PROTOCOL_V1,
+                enforcement: MAXSAT_CHILD_ENFORCEMENT_V1,
+                solver_environment: MAXSAT_SOLVER_ENVIRONMENT_V1,
+                aggregate_enforcement: MAXSAT_AGGREGATE_ENFORCEMENT_V1,
+                lease_protocol: MAXSAT_LEASE_PROTOCOL_V1,
+                lease_readiness: MAXSAT_LEASE_READINESS_V1,
+                lease_location: MAXSAT_LEASE_LOCATION_V1,
             },
             guard: OomGuardSource::Checkout(locate_oom_guard().expect("oom guard")),
+            campaign_lease: Arc::new(campaign_lease),
+            watchdog_server: MaxSatWatchdogServer::new(OomGuardSource::Checkout(
+                locate_oom_guard().expect("oom guard"),
+            )),
         };
         let external = ("fake".to_string(), vec![solver.display().to_string()]);
         let result = run_one(

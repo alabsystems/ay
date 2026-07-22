@@ -80,6 +80,24 @@ pub trait TheorySolver {
     /// Check consistency of current assignment.
     fn check(&mut self) -> TheoryResult;
 
+    /// Drain ADDITIONAL pending string lemmas queued behind a
+    /// `TheoryResult::NeedStringLemma` (strings NF-engine closure 3,
+    /// `AY_STR_NF=1`).
+    ///
+    /// When a string theory discovers several independent lemma requests in
+    /// one check round (multiple buffered NF splits, multiple blocked
+    /// extended-function reductions), it returns the first via
+    /// `NeedStringLemma` and queues the rest. The executor drains this queue
+    /// immediately after receiving the primary lemma and lowers the whole
+    /// batch in ONE solver iteration instead of one CEGAR round-trip per
+    /// lemma (skolem webs reduce in 1-2 rounds instead of ~10).
+    ///
+    /// The default returns an empty vector (no batching) — correct for every
+    /// non-string theory and for string solvers with the closure disabled.
+    fn take_pending_string_lemmas(&mut self) -> Vec<StringLemma> {
+        Vec::new()
+    }
+
     /// Cheap consistency check suitable for BCP-time eager callbacks.
     ///
     /// Called by the eager extension during SAT search instead of `check`.

@@ -14,10 +14,9 @@ fn per_depth(total: Duration) -> Duration {
 }
 
 fn variant(r: &ay_chc::VerifiedChcResult) -> &'static str {
-    use ay_chc::VerifiedChcResult::*;
     match r {
-        Safe(_) => "Safe",
-        Unsafe(_) => "Unsafe",
+        ay_chc::VerifiedChcResult::Safe(_) => "Safe",
+        ay_chc::VerifiedChcResult::Unsafe(_) => "Unsafe",
         _ => "Unknown/Other",
     }
 }

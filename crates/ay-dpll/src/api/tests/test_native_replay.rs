@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use crate::api::{
-    Logic, NativeReplayArtifact, NativeReplayEventKind, NativeReplayMetadata, SolveResult, Solver,
-    Sort,
+    DatatypeConstructor, DatatypeField, DatatypeSort, Logic, NativeReplayArtifact,
+    NativeReplayEventKind, NativeReplayMetadata, SolveResult, Solver, Sort,
 };
 
 #[test]
@@ -318,4 +318,218 @@ fn native_replay_replays_check_sat_assuming_event() {
         replay_from_json.result.result(),
         details.solve.result.result()
     );
+}
+
+#[test]
+fn native_replay_preserves_datatype_semantics_in_memory_and_json() {
+    let mut solver = Solver::try_new(Logic::Uf).expect("solver");
+    let color = DatatypeSort::new(
+        "ReplayColor",
+        vec![
+            DatatypeConstructor::unit("ReplayRed"),
+            DatatypeConstructor::unit("ReplayBlue"),
+        ],
+    );
+    solver
+        .try_declare_datatype(&color)
+        .expect("declare datatype");
+    let value = solver.declare_const("replay_color_value", Sort::Datatype(color.clone()));
+    let red = solver.datatype_constructor(&color, "ReplayRed", &[]);
+    let blue = solver.datatype_constructor(&color, "ReplayBlue", &[]);
+    let value_is_red = solver.try_eq(value, red).expect("value = red");
+    let value_is_blue = solver.try_eq(value, blue).expect("value = blue");
+    solver.try_assert_term(value_is_red).expect("assert red");
+    solver.try_assert_term(value_is_blue).expect("assert blue");
+
+    let details = solver.check_sat_with_details();
+    assert!(details.result.result().is_unsat());
+    let artifact =
+        solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details));
+    assert!(artifact.events.iter().any(|event| matches!(
+        &event.kind,
+        NativeReplayEventKind::DeclareDatatype { datatype } if datatype == &color
+    )));
+
+    let replay = Solver::replay_native_replay_artifact(&artifact).expect("datatype replay");
+    assert!(replay.result.result().is_unsat());
+    let replay_from_json = Solver::replay_native_replay_json_str(&artifact.to_pretty_json())
+        .expect("datatype JSON replay");
+    assert!(replay_from_json.result.result().is_unsat());
+}
+
+#[test]
+fn native_replay_exports_only_active_term_dependencies() {
+    let mut solver = Solver::try_new(Logic::QfLia).expect("solver");
+    let active = solver.declare_const("active", Sort::Int);
+    let dead = solver.declare_const("dead", Sort::Int);
+    let one = solver.int_const(1);
+    let dead_sum = solver.try_add(dead, one).expect("dead expression");
+    let active_eq_one = solver.try_eq(active, one).expect("active = 1");
+    solver
+        .try_assert_term(active_eq_one)
+        .expect("assert active");
+
+    let details = solver.check_sat_with_details();
+    let artifact =
+        solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details));
+    assert!(artifact.terms.iter().all(|node| node.id != dead.0));
+    assert!(artifact.terms.iter().all(|node| node.id != dead_sum.0));
+    assert!(artifact
+        .declarations
+        .iter()
+        .all(|declaration| declaration.term != dead.0));
+
+    let replay = Solver::replay_native_replay_json_str(&artifact.to_pretty_json())
+        .expect("dependency-sliced JSON replay");
+    assert_eq!(replay.result.result(), details.result.result());
+}
+
+#[test]
+fn native_replay_distinguishes_fresh_vars_shadowing_nullary_constructors() {
+    let mut solver = Solver::try_new(Logic::All).expect("solver");
+    let color = DatatypeSort::new(
+        "ShadowColor",
+        vec![
+            DatatypeConstructor::unit("ShadowRed"),
+            DatatypeConstructor::unit("ShadowBlue"),
+        ],
+    );
+    solver.try_declare_datatype(&color).expect("datatype");
+    let red = solver.datatype_constructor(&color, "ShadowRed", &[]);
+    let shadow = solver.declare_const_with_fresh_identity(
+        "ShadowRed",
+        "!ay.test-shadow-red",
+        Sort::Datatype(color.clone()),
+    );
+    let shadow_ne_red = solver
+        .try_eq(shadow, red)
+        .and_then(|equal| solver.try_not(equal))
+        .expect("shadow != red");
+    solver.try_assert_term(shadow_ne_red).expect("assert");
+
+    let details = solver.check_sat_with_details();
+    assert!(details.result.result().is_sat());
+    let artifact =
+        solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details));
+    let shadow_node = artifact
+        .terms
+        .iter()
+        .find(|node| node.id == shadow.0)
+        .expect("shadow node");
+    assert!(!shadow_node.is_datatype_constructor);
+    let red_node = artifact
+        .terms
+        .iter()
+        .find(|node| node.id == red.0)
+        .expect("constructor node");
+    assert!(red_node.is_datatype_constructor);
+
+    let replay = Solver::replay_native_replay_json_str(&artifact.to_pretty_json())
+        .expect("shadowing replay");
+    assert!(
+        replay.result.result().is_sat(),
+        "replay result={:?} unknown={:?} executor={:?}",
+        replay.result.result(),
+        replay.unknown_reason,
+        replay.executor_error
+    );
+}
+
+#[test]
+fn native_replay_structural_sorts_round_trip_without_kind_loss() {
+    let mut solver = Solver::try_new(Logic::All).expect("solver");
+    let char_value = solver.declare_const("char_value", Sort::Char);
+    let finite_sort = Sort::FiniteDomain("FiniteFive".to_string(), 5);
+    let finite_value = solver.declare_const("finite_value", finite_sort.clone());
+    let type_var_sort = Sort::TypeVar("TypeAlpha".to_string());
+    let type_left = solver.declare_const("type_left", type_var_sort.clone());
+    let type_right = solver.declare_const("type_right", type_var_sort.clone());
+    let zero = solver.int_const(0);
+    let char_nonnegative = solver.try_ge(char_value, zero).expect("char >= 0");
+    let finite_nonnegative = solver.try_ge(finite_value, zero).expect("finite >= 0");
+    let types_equal = solver
+        .try_eq(type_left, type_right)
+        .expect("type vars equal");
+    solver
+        .try_assert_term(char_nonnegative)
+        .expect("assert char");
+    solver
+        .try_assert_term(finite_nonnegative)
+        .expect("assert finite");
+    solver
+        .try_assert_term(types_equal)
+        .expect("assert type var");
+
+    let nested = DatatypeSort::new(
+        "StructuralBox",
+        vec![DatatypeConstructor::new(
+            "StructuralBoxMk",
+            vec![DatatypeField::new("structural_char", Sort::Char)],
+        )],
+    );
+    solver
+        .try_declare_datatype(&nested)
+        .expect("nested datatype");
+
+    let details = solver.check_sat_with_details();
+    let artifact =
+        solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details));
+    let parsed = NativeReplayArtifact::from_json_str(&artifact.to_pretty_json())
+        .expect("parse structural sorts");
+    for expected in [Sort::Char, finite_sort, type_var_sort] {
+        assert!(parsed
+            .declarations
+            .iter()
+            .any(|declaration| declaration.sort == expected));
+    }
+    assert!(parsed.events.iter().any(|event| matches!(
+        &event.kind,
+        NativeReplayEventKind::DeclareDatatype { datatype } if datatype == &nested
+    )));
+    let replay = Solver::replay_native_replay_artifact(&parsed).expect("structural sort replay");
+    assert_eq!(replay.result.result(), details.result.result());
+}
+
+#[test]
+fn native_replay_u128_json_is_lossless_above_u64() {
+    let solver = Solver::try_new(Logic::QfLia).expect("solver");
+    let mut artifact = solver.export_native_replay_artifact(NativeReplayMetadata::default(), None);
+    let large = u128::from(u64::MAX) + 42;
+    artifact.created_unix_ms = large;
+    artifact.timeout_ms = Some(large + 1);
+
+    let json = artifact.to_pretty_json();
+    let parsed = NativeReplayArtifact::from_json_str(&json).expect("parse large u128 values");
+    assert_eq!(parsed.created_unix_ms, large);
+    assert_eq!(parsed.timeout_ms, Some(large + 1));
+}
+
+#[test]
+fn native_replay_keeps_functions_referenced_by_as_array_and_array_map() {
+    let mut solver = Solver::try_new(Logic::All).expect("solver");
+    solver
+        .try_declare_fun("replay_array_function", &[Sort::Int], Sort::Int)
+        .expect("declare mapped function");
+    let array_sort = Sort::array(Sort::Int, Sort::Int);
+    let as_array = solver.as_array("replay_array_function", array_sort.clone());
+    let source = solver.declare_const("replay_source_array", array_sort.clone());
+    let mapped = solver.array_map("replay_array_function", &[source], array_sort.clone());
+    let zero = solver.int_const(0);
+    let as_array_value = solver.try_select(as_array, zero).expect("select as-array");
+    let mapped_value = solver.try_select(mapped, zero).expect("select map");
+    let values_equal = solver
+        .try_eq(as_array_value, mapped_value)
+        .expect("array values equal");
+    solver.try_assert_term(values_equal).expect("assert");
+
+    let details = solver.check_sat_with_details();
+    let artifact =
+        solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details));
+    assert!(artifact
+        .function_declarations
+        .iter()
+        .any(|declaration| declaration.name == "replay_array_function"));
+    let replay = Solver::replay_native_replay_json_str(&artifact.to_pretty_json())
+        .expect("higher-order array replay");
+    assert_eq!(replay.result.result(), details.result.result());
 }

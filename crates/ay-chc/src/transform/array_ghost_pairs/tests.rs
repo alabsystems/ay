@@ -443,16 +443,16 @@ fn certified_model_passes_external_validation_gates() {
     model.set_ghost_pair_certificate(certificate);
     assert!(model.has_quantified_array_certificate());
 
-    let mut config = crate::PdrConfig::default();
-    config.solve_timeout = Some(Duration::from_secs(30));
-    assert_eq!(
+    let config = crate::PdrConfig {
+        solve_timeout: Some(Duration::from_secs(30)),
+        ..crate::PdrConfig::default()
+    };
+    assert!(
         crate::engines::validate_external_invariant_model(&problem, &model, &config).unwrap(),
-        true,
         "full validation gate must accept the sealed certificate"
     );
-    assert_eq!(
+    assert!(
         crate::engines::external_invariant_model_excludes_error(&problem, &model, &config).unwrap(),
-        true,
         "excludes-error gate must accept the sealed certificate"
     );
 }

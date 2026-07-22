@@ -4,17 +4,19 @@
 
 //! Low-level system interfaces for AY.
 //!
-//! This crate provides safe wrappers around OS-specific system calls for memory
-//! measurement. It is the only crate in the ay workspace that permits `unsafe`
+//! This crate provides safe wrappers around OS-specific system calls used for
+//! memory measurement, process supervision, and a small number of filesystem
+//! operations. It is the only crate in the ay workspace that permits `unsafe`
 //! code, keeping FFI boundaries minimal and auditable.
 //!
 //! ## Why this crate exists
 //!
-//! All other ay crates use `#![forbid(unsafe_code)]`. Memory measurement
-//! requires FFI calls (`getrusage`, `sysctlbyname`, `sysconf`), so the unsafe
-//! code is isolated here behind safe public APIs.
+//! All other ay crates use `#![forbid(unsafe_code)]`. The required operating
+//! system interfaces are isolated here behind safe public APIs.
 
 use std::alloc::{GlobalAlloc, Layout};
+#[cfg(target_os = "linux")]
+pub mod fs;
 #[cfg(unix)]
 pub mod supervisor;
 pub mod time;

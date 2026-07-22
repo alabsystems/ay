@@ -3,6 +3,7 @@
 
 use super::*;
 
+use ay_test_support::env::{lock_env, ScopedEnvVar};
 use std::fs;
 use std::io::{Read, Seek};
 
@@ -850,37 +851,6 @@ fn test_run_with_writer_proof_mode_propagates_proof_io_errors() {
     );
 }
 
-// Serializes AY_PB_PARALLEL mutation (process-global state) for the stats
-// test below, so a concurrently-running test can never observe the mid-test
-// override (same pattern as WBO_SLS_ENV_LOCK in the ay-pb portfolio tests).
-static PARALLEL_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-/// Drop-based restore for a process-global env var: holds the prior value and
-/// reinstates it (or removes the var) on drop, so a panicking solve cannot
-/// leak the override into other tests (the repo's EnvVarRestoreGuard pattern,
-/// see ay-dpll's group_regression tests).
-struct EnvVarRestoreGuard {
-    key: &'static str,
-    previous: Option<std::ffi::OsString>,
-}
-
-impl EnvVarRestoreGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarRestoreGuard {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(value) => std::env::set_var(self.key, value),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
-
 #[test]
 fn test_run_with_writer_emits_stats_comments() {
     let file = NamedTempFile::new().expect("temp file should exist");
@@ -904,8 +874,8 @@ fn test_run_with_writer_emits_stats_comments() {
     // binary's stats-json tests). The lock serializes the mutation against
     // concurrent tests; the guard restores the prior value on EVERY exit path
     // (a panicking solve cannot leak AY_PB_PARALLEL=0).
-    let _lock = PARALLEL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _parallel_guard = EnvVarRestoreGuard::set("AY_PB_PARALLEL", "0");
+    let _lock = lock_env();
+    let _parallel_guard = ScopedEnvVar::set("AY_PB_PARALLEL", "0");
     let run_result = run_with_writer(&cmd, &mut output);
     run_result.expect("command should succeed");
 
@@ -929,10 +899,6 @@ fn test_run_with_writer_emits_stats_comments() {
         "Expected solved WBO result, got: {rendered}"
     );
 }
-
-/// Serializes the `AY_PB_WCSP_EDAC` process-global env mutation across the
-/// two probe E2E tests (same pattern as `PARALLEL_ENV_LOCK`).
-static WCSP_EDAC_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 /// Two one-hot domains, every cross combination costs 5 => the root EDAC
 /// probe's trail-checked floor is exactly c0 = 5 (see
@@ -970,8 +936,8 @@ fn run_wbo_text(text: &str) -> String {
 fn test_run_with_writer_wcsp_edac_probe_proves_unsat_at_top() {
     // c0 = 5 >= top = 5: with the opt-in flag set, the trail-checked floor
     // proves there is no admissible model before any conversion/search.
-    let _lock = WCSP_EDAC_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let _guard = EnvVarRestoreGuard::set("AY_PB_WCSP_EDAC", "1");
+    let _lock = lock_env();
+    let _guard = ScopedEnvVar::set("AY_PB_WCSP_EDAC", "1");
     let rendered = run_wbo_text(&format!("soft: 5 ;\n{WCSP_UNIFORM_COST_5_ROWS}"));
     assert!(
         rendered.contains("c wcsp edac root probe: c0=5 top=5"),
@@ -989,11 +955,11 @@ fn test_run_with_writer_wcsp_edac_probe_proves_unsat_at_top() {
 
 #[test]
 fn test_run_with_writer_wcsp_edac_probe_defers_below_top_and_defaults_off() {
-    let _lock = WCSP_EDAC_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = lock_env();
     // Control 1 (flag ON, c0 = 5 < top = 6): the probe reports its floor but
     // must NOT assert a verdict; the ordinary solve finds a cost-5 model.
     {
-        let _guard = EnvVarRestoreGuard::set("AY_PB_WCSP_EDAC", "1");
+        let _guard = ScopedEnvVar::set("AY_PB_WCSP_EDAC", "1");
         let rendered = run_wbo_text(&format!("soft: 6 ;\n{WCSP_UNIFORM_COST_5_ROWS}"));
         assert!(
             rendered.contains("c wcsp edac root probe: c0=5 top=6"),
@@ -1012,7 +978,7 @@ fn test_run_with_writer_wcsp_edac_probe_defers_below_top_and_defaults_off() {
     // the identical UNSAT verdict comes from the ordinary converted solve,
     // cross-checking the probe verdict of the previous test.
     {
-        std::env::remove_var("AY_PB_WCSP_EDAC");
+        let _wcsp_edac = ScopedEnvVar::unset("AY_PB_WCSP_EDAC");
         let rendered = run_wbo_text(&format!("soft: 5 ;\n{WCSP_UNIFORM_COST_5_ROWS}"));
         assert!(
             !rendered.contains("wcsp edac"),

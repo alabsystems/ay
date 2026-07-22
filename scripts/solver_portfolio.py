@@ -26,21 +26,39 @@ Usage:
   AY = ./target/release/examples/mps_solve  (built via: cargo build --release -p ay-milp --examples)
 """
 from __future__ import annotations
-import argparse, glob, os, subprocess, sys, time, pathlib
+import argparse, glob, json, math, os, sys, time, pathlib
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _oom_guard import (  # noqa: E402
+    plan_solver_resources,
+    run_captured,
+    warn_concurrent_build,
+)
 
 # ---- AY (the exact-certified subject) -------------------------------------
 # Absolute path resolved at import: some commercial solver libraries (COPT's
 # license probe, Xpress) chdir the process, which would break a relative path
 # on the second instance.
 AY_BIN = os.path.abspath(os.environ.get("AY_BIN", "./target/release/examples/mps_solve"))
+PLAN = None
 
 def run_ay(path, T):
     t0 = time.monotonic()
     try:
-        r = subprocess.run([AY_BIN, path, str(T)], capture_output=True, text=True,
-                           timeout=T + 90)
-    except subprocess.TimeoutExpired:
+        r = run_captured(
+            [AY_BIN, path, str(T)], PLAN.memlimit_mb, T + 90,
+            label="solver_portfolio.py[ay]",
+            env=dict(os.environ, MEMLIMIT=str(PLAN.memlimit_mb),
+                     NBCORE=str(PLAN.nbcore)),
+        )
+    except OSError:
+        return dict(status="CRASH", obj=None, bound=None, nodes=None, t=0.0)
+    if r.memout:
+        return dict(status="MEMOUT", obj=None, bound=None, nodes=None, t=r.wall_sec)
+    if r.timed_out:
         return dict(status="TIMEOUT", obj=None, bound=None, nodes=None, t=T + 90)
+    if r.output_truncated:
+        return dict(status="CRASH", obj=None, bound=None, nodes=None, t=r.wall_sec)
     dt = time.monotonic() - t0
     out = (r.stdout or "").strip().splitlines()
     if not out:
@@ -175,24 +193,41 @@ def fmt(v):
     return f"{v:.6g}"
 
 def main():
+    global PLAN
     ap = argparse.ArgumentParser()
     ap.add_argument("files", nargs="*")
     ap.add_argument("--dir")
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--tol", type=float, default=1e-4, help="rel tol for prover agreement")
+    ap.add_argument("--out", type=pathlib.Path,
+                    default=pathlib.Path("evals/results/solver-portfolio/latest.json"))
     a = ap.parse_args()
+    if not math.isfinite(a.timeout) or a.timeout <= 0:
+        ap.error("--timeout must be finite and positive")
+    warn_concurrent_build()
+    PLAN = plan_solver_resources(1, label="solver_portfolio.py")
+    resource_plan = {
+        "requested_jobs": 1, "jobs": PLAN.jobs,
+        "memlimit_mb_per_child": PLAN.memlimit_mb,
+        "nbcore_per_child": PLAN.nbcore,
+        "headroom_mb": PLAN.headroom_mb,
+        "external_enforcement": "process-group rss_watchdog; MEMLIMIT/NBCORE environment",
+        "in_process_references": "single-threaded; share the harness process",
+    }
     files = list(a.files)
     if a.dir: files += sorted(glob.glob(os.path.join(a.dir, "*.mps")))
     if not files:
         print("no instances", file=sys.stderr); sys.exit(2)
 
     disagreements = []
+    records = []
     print(f"# portfolio @ {a.timeout}s, 1 thread. OPT=proved, FEAS=incumbent only.\n")
     for path in files:
         name = pathlib.Path(path).stem
         res = {}
         for sname, fn in SOLVERS:
             res[sname] = fn(path, a.timeout)
+        records.append({"file": path, "solvers": res})
         # --- soundness: all provers must agree ---
         proven = {s: r["obj"] for s, r in res.items()
                   if r["status"] == "OPT" and r["obj"] is not None}
@@ -224,6 +259,16 @@ def main():
             print(f"   {name}: {s} proved {fmt(v)} vs field {fmt(ref)}")
     else:
         print("OK: every solver that proved optimality AGREED on the value (0 disagreements).")
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    a.out.write_text(json.dumps({
+        "timeout_sec": a.timeout,
+        "tolerance": a.tol,
+        "resource_plan": resource_plan,
+        "records": records,
+        "disagreements": disagreements,
+    }, indent=2) + "\n")
+    print(f"wrote {a.out}")
+    return 1 if disagreements else 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

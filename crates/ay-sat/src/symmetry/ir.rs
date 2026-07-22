@@ -516,7 +516,7 @@ mod tests {
     /// Manual benchmark (ignored): set `AY_IR_BENCH_CNF` to a DIMACS path and run
     /// `cargo test -p ay-sat --lib symmetry::ir::tests::bench_clique -- --ignored --nocapture`.
     #[test]
-    #[ignore]
+    #[ignore = "manual benchmark requires AY_IR_BENCH_CNF"]
     fn bench_clique() {
         let path = std::env::var("AY_IR_BENCH_CNF").expect("set AY_IR_BENCH_CNF");
         let text = std::fs::read_to_string(&path).unwrap();

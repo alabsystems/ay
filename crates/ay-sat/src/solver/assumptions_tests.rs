@@ -218,17 +218,14 @@ fn test_ic3_push_pop_pattern_no_finalize_sat_fail() {
         // internal error. If FINALIZE_SAT_FAIL triggers, the result would
         // be Unknown with SatUnknownReason::InvalidSatModel.
         let inner = result.into_inner();
-        match &inner {
-            AssumeResult::Unknown => {
-                // Check if this was a FINALIZE_SAT_FAIL
-                if let Some(detail) = &solver.cold.last_unknown_detail {
-                    assert!(
-                        !detail.contains("unsatisfied"),
-                        "FINALIZE_SAT_FAIL in round {round}: {detail}"
-                    );
-                }
+        if let AssumeResult::Unknown = &inner {
+            // Check if this was a FINALIZE_SAT_FAIL
+            if let Some(detail) = &solver.cold.last_unknown_detail {
+                assert!(
+                    !detail.contains("unsatisfied"),
+                    "FINALIZE_SAT_FAIL in round {round}: {detail}"
+                );
             }
-            _ => {} // SAT or UNSAT is fine
         }
     }
 }

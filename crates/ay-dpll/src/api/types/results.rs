@@ -385,6 +385,15 @@ impl PartialEq for VerifiedSolveResult {
 
 impl Eq for VerifiedSolveResult {}
 
+/// Convenience for constructing `SolveResult::Unsat` in tests.
+#[cfg(test)]
+impl SolveResult {
+    /// Create an `Unsat` result with an empty proof certificate (for tests).
+    pub fn unsat_for_test() -> Self {
+        Self::Unsat(SmtProofCertificate::empty())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,14 +404,5 @@ mod tests {
         assert!(result.is_unknown());
         assert!(!result.was_model_validated());
         assert_eq!(result.accept_for_consumer(), Ok(&SolveResult::Unknown));
-    }
-}
-
-/// Convenience for constructing `SolveResult::Unsat` in tests.
-#[cfg(test)]
-impl SolveResult {
-    /// Create an `Unsat` result with an empty proof certificate (for tests).
-    pub fn unsat_for_test() -> Self {
-        Self::Unsat(SmtProofCertificate::empty())
     }
 }

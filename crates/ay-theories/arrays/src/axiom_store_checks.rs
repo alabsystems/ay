@@ -308,7 +308,16 @@ impl ArraySolver<'_> {
             })
             .collect();
 
-        for &(sel1_term, sel2_term) in candidate_pairs.iter() {
+        for (pair_idx, &(sel1_term, sel2_term)) in candidate_pairs.iter().enumerate() {
+            // #array-deadline-forward: same O(pairs x explain-BFS) shape as
+            // `row2_extended_conflict_lemmas` — amortized interrupt/deadline
+            // poll so one dense final_check cannot overshoot the caller's
+            // wall budget. FAIL-CLOSED: `None` here means "no conflict found
+            // this round"; the final_check boundary poll maps the stop to
+            // Unknown.
+            if pair_idx % 32 == 0 && self.interrupted_or_deadline() {
+                return None;
+            }
             let Some(sel1) = select_terms.get(&sel1_term) else {
                 continue;
             };
@@ -360,7 +369,14 @@ impl ArraySolver<'_> {
     /// different orders. Once the store maps match, the select values are equal
     /// for every `k`, so an exact select disequality is a conflict.
     pub(crate) fn check_store_permutation_select_conflicts(&self) -> Option<TheoryResult> {
-        for &(sel1_term, sel2_term) in self.select_conflict_candidate_pairs().iter() {
+        for (pair_idx, &(sel1_term, sel2_term)) in
+            self.select_conflict_candidate_pairs().iter().enumerate()
+        {
+            // #array-deadline-forward: amortized interrupt/deadline poll (see
+            // check_nested_select_conflicts above; fail-closed the same way).
+            if pair_idx % 32 == 0 && self.interrupted_or_deadline() {
+                return None;
+            }
             let Some(&(array1, index1)) = self.select_cache.get(&sel1_term) else {
                 continue;
             };
@@ -2182,7 +2198,16 @@ impl ArraySolver<'_> {
         }
 
         let mut retained = Vec::new();
-        for (eq_term, lhs, rhs) in candidates {
+        // #array-deadline-forward: this O(eqs x selects^2 x explain-BFS)
+        // triple loop was measured running 30+s past the caller's wall
+        // budget on QF_AX storecomm nf subset re-solves. Amortized
+        // interrupt/deadline poll every 64 select pairs. FAIL-CLOSED on
+        // stop: the current + remaining candidates are retained in
+        // `pending_array_eqs` (exactly what a no-conflict pass does), and
+        // the final_check boundary poll maps the stop to Unknown.
+        let mut poll_tick: u32 = 0;
+        for ci in 0..candidates.len() {
+            let (eq_term, lhs, rhs) = candidates[ci];
             if self.assigns.get(&eq_term) != Some(&true) {
                 continue;
             }
@@ -2192,6 +2217,13 @@ impl ArraySolver<'_> {
             if let (Some(lhs_selects), Some(rhs_selects)) = (lhs_selects, rhs_selects) {
                 for &(idx1, sel1) in lhs_selects {
                     for &(idx2, sel2) in rhs_selects {
+                        poll_tick = poll_tick.wrapping_add(1);
+                        if poll_tick & 63 == 0 && self.interrupted_or_deadline() {
+                            retained.push((eq_term, lhs, rhs));
+                            retained.extend_from_slice(&candidates[ci + 1..]);
+                            self.pending_array_eqs = retained;
+                            return None;
+                        }
                         // SOUNDNESS (#arr_lia561 wrong-UNSAT): `parent_selects` is
                         // merged across the equality/alias closure (including
                         // model/sentinel equalities), so a select listed under

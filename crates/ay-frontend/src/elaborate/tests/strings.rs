@@ -164,6 +164,7 @@ fn test_elaborate_regex_builtins() {
             (assert (str.in_re x (re.diff (str.to_re "a") (str.to_re "b"))))
             (assert (str.in_re x (re.range "a" "z")))
             (assert (str.in_re x ((_ re.^  3) (str.to_re "a"))))
+            (assert (str.in_re x ((_ re.loop 2 4) (str.to_re "a"))))
         "#;
     let commands = parse(input).unwrap();
     let mut ctx = Context::new();
@@ -172,7 +173,29 @@ fn test_elaborate_regex_builtins() {
         ctx.process_command(cmd).unwrap();
     }
 
-    assert_eq!(ctx.assertions.len(), 12);
+    assert_eq!(ctx.assertions.len(), 13);
+}
+
+#[test]
+fn indexed_regex_repetition_rejects_invalid_bounds_and_operand_sort() {
+    for input in [
+        "(assert (str.in_re \"x\" ((_ re.loop 3 2) (str.to_re \"a\"))))",
+        "(assert (str.in_re \"x\" ((_ re.loop 1 2) 7)))",
+        "(assert (str.in_re \"x\" ((_ re.^ 2) 7)))",
+    ] {
+        let commands = parse(input).expect("invalid indexed regex still parses");
+        let mut ctx = Context::new();
+        let error = ctx
+            .process_command(&commands[0])
+            .expect_err("invalid indexed regex must fail elaboration");
+        assert!(
+            matches!(
+                error,
+                ElaborateError::InvalidConstant(_) | ElaborateError::SortMismatch { .. }
+            ),
+            "unexpected error for `{input}`: {error:?}"
+        );
+    }
 }
 
 #[test]

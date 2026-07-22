@@ -124,6 +124,14 @@ impl TheorySolver for StringSolver<'_> {
         }
     }
 
+    /// Closure 3 (`AY_STR_NF=1`, sub-flag 3): hand the executor every
+    /// ADDITIONAL lemma the core queued behind the primary one, so a whole
+    /// skolem web is lowered in a single CEGAR iteration. Empty (hence
+    /// byte-identical behavior) when the closure is disabled.
+    fn take_pending_string_lemmas(&mut self) -> Vec<StringLemma> {
+        self.core.take_extra_lemmas()
+    }
+
     fn propagate(&mut self) -> Vec<TheoryPropagation> {
         let props = self.infer.drain_propagations();
         self.propagation_count += props.len() as u64;

@@ -613,10 +613,10 @@ impl NiaSolver<'_> {
     /// Used to assemble exact integer model points from the LIA model.
     pub(crate) fn collect_int_var_leaves(&self, term: TermId, out: &mut Vec<TermId>) {
         match self.terms.get(term) {
-            TermData::Var(_, _) => {
-                if matches!(self.terms.sort(term), Sort::Int) && !out.contains(&term) {
-                    out.push(term);
-                }
+            TermData::Var(_, _)
+                if matches!(self.terms.sort(term), Sort::Int) && !out.contains(&term) =>
+            {
+                out.push(term);
             }
             TermData::App(_, args) => {
                 for &arg in args {

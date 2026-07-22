@@ -72,6 +72,18 @@ struct StringVarConstraints {
     suffixes: Vec<String>,
     /// Constant substrings the witness must contain (`str.contains v c`).
     contains: Vec<String>,
+    /// Constant substrings the witness must NOT contain, from a HARD
+    /// `(not (str.contains v c))` conjunct (NF-engine closure 6,
+    /// `AY_STR_NF=1`; the vector stays EMPTY when the flag is off, so every
+    /// check below is a no-op and the flags-off materializer is
+    /// byte-identical).
+    ///
+    /// EXACTNESS: `¬str.contains(v, c)` says exactly "no window of `v` equals
+    /// `c`", which is the windowed-disequality form of the increment spec and
+    /// is checked here literally by `!value.contains(c)`. Both the check and
+    /// the fill-character search below are therefore an exact rendering of the
+    /// asserted literal, not an approximation of it.
+    forbidden: Vec<String>,
     /// Hard `str.indexof` results (`(= (str.indexof v "w" k) r)` literals).
     indexofs: Vec<IndexofConstraint>,
     /// Hard `str.to_int` results (`(= (str.to_int v) N)` literals, extf
@@ -361,7 +373,7 @@ impl Executor {
                 TermData::Var(name, _) if *self.ctx.terms.sort(t) == Sort::String => {
                     let user_declared = self
                         .ctx
-                        .symbol_info(name)
+                        .symbol_info_by_identity(name)
                         .is_some_and(|info| info.arg_sorts.is_empty());
                     if user_declared && seen.insert(t) {
                         out.push(t);
@@ -568,6 +580,13 @@ impl Executor {
                 return false;
             }
         }
+        // NF-engine closure 6: hard `(not (str.contains v c))` conjuncts. The
+        // check is the literal negation of the predicate, so it is exact.
+        for c in &cons.forbidden {
+            if value.contains(c.as_str()) {
+                return false;
+            }
+        }
         for io in &cons.indexofs {
             let needle: Vec<char> = io.needle.chars().collect();
             if eval_indexof_chars(&chars, &needle, io.offset) != io.result {
@@ -734,7 +753,18 @@ impl Executor {
                 }
             }
         }
-        if !cons.indexofs.is_empty() || !cons.to_ints.is_empty() {
+        if !cons.indexofs.is_empty() || !cons.to_ints.is_empty() || !cons.forbidden.is_empty() {
+            // NF-engine closure 6 widens this candidate fill set: the default
+            // `FILL_CHAR` may itself BE the forbidden needle (the pyex idiom
+            // `¬contains(x, ",")` is fine, but `¬contains(x, "a")` is not), and
+            // a uniform fill of a single character can only ever create the
+            // needle when the needle is a repetition of that character. Trying
+            // a handful of distinct letters therefore covers every single-char
+            // and same-char-repetition needle; anything else falls through to
+            // the pre-existing default fill, where the strict substitution
+            // re-validation remains the gate. Each candidate is accepted only
+            // after `value_satisfies_constraints` — which now enforces
+            // `forbidden` exactly — so no unchecked value can escape.
             for fill in ['a', 'b', 'c', 'd', 'e'] {
                 let candidate = complete(fill);
                 if Self::value_satisfies_constraints(&candidate, Some(required_len), cons) {
@@ -816,6 +846,32 @@ impl Executor {
                     && args.len() == 2
                 {
                     self.collect_regex_membership(args[0], args[1], positive, out);
+                    return;
+                }
+                // NF-engine closure 6 (`AY_STR_NF=1`): a hard NEGATED
+                // `str.contains(v, c)` with a CONSTANT needle is the second
+                // predicate collected in the negative polarity. Like
+                // `str.in_re`, its negation is EXACTLY representable here (a
+                // forbidden substring), so it must be checked BEFORE the
+                // `positive` guard below discards negated predicates.
+                if ay_strings::str_nf_closure_enabled(6)
+                    && !positive
+                    && name == "str.contains"
+                    && args.len() == 2
+                {
+                    if let (TermData::Var(..), TermData::Const(Constant::String(c))) =
+                        (self.ctx.terms.get(args[0]), self.ctx.terms.get(args[1]))
+                    {
+                        // The empty needle is a tautological `contains`, so its
+                        // negation is unsatisfiable; recording it would make
+                        // every candidate fail. Leave it to the strict
+                        // re-validation, which rejects the assertion outright.
+                        if !c.is_empty() {
+                            if let Some(cons) = out.get_mut(&args[0]) {
+                                cons.forbidden.push(c.clone());
+                            }
+                        }
+                    }
                     return;
                 }
                 if !positive {

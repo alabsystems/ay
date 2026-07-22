@@ -509,7 +509,7 @@ impl Executor {
             return false;
         }
         let mut visited: ay_core::kani_compat::DetHashSet<TermId> = Default::default();
-        let mut stack: Vec<TermId> = self.ctx.assertions.iter().copied().collect();
+        let mut stack: Vec<TermId> = self.ctx.assertions.to_vec();
         stack.extend(extra.iter().copied());
         while let Some(t) = stack.pop() {
             if !visited.insert(t) {
@@ -784,7 +784,7 @@ impl Executor {
             return true;
         }
         let mut visited: ay_core::kani_compat::DetHashSet<TermId> = Default::default();
-        let mut stack: Vec<TermId> = self.ctx.assertions.iter().copied().collect();
+        let mut stack: Vec<TermId> = self.ctx.assertions.to_vec();
         stack.extend(extra.iter().copied());
         while let Some(t) = stack.pop() {
             if !visited.insert(t) {

@@ -34,7 +34,6 @@
 //! handles are arena-owned by the context and freed by `Z3_del_context`,
 //! mirroring the goal/tactic/apply-result handle discipline.
 
-use std::ffi::CStr;
 use std::ptr;
 
 use ay_dpll::api::Term;
@@ -42,7 +41,8 @@ use ay_frontend::{Probe, ProbeCmp, SExpr};
 
 use super::{
     ast_to_term, cache_probe, cache_string, ffi_guard_const_ptr, ffi_guard_double, ffi_guard_ptr,
-    ffi_guard_uint, Z3_context, Z3_goal, Z3_probe, Z3_string, Z3_INVALID_ARG, Z3_OK,
+    ffi_guard_uint, ffi_read_bounded_text, Z3_context, Z3_goal, Z3_probe, Z3_string,
+    Z3_INVALID_ARG, Z3_OK,
 };
 use std::os::raw::{c_double, c_uint};
 
@@ -226,8 +226,8 @@ pub unsafe extern "C" fn Z3_mk_probe(c: Z3_context, name: Z3_string) -> Z3_probe
     } else {
         // SAFETY: caller contract guarantees `name`, when non-null, is a valid
         // null-terminated C string owned for the duration of this call.
-        match unsafe { CStr::from_ptr(name) }.to_str() {
-            Ok(s) => Some(s.to_string()),
+        match unsafe { ffi_read_bounded_text(name) } {
+            Ok(s) => Some(s),
             Err(_) => Some(String::new()), // non-UTF-8 -> unsupported below
         }
     };
@@ -516,10 +516,7 @@ pub unsafe extern "C" fn Z3_probe_get_descr(c: Z3_context, name: Z3_string) -> Z
         None
     } else {
         // SAFETY: caller contract guarantees a valid null-terminated C string.
-        unsafe { CStr::from_ptr(name) }
-            .to_str()
-            .ok()
-            .map(str::to_string)
+        unsafe { ffi_read_bounded_text(name) }.ok()
     };
     // SAFETY: `ffi_guard_const_ptr` handles a null context and catches panics.
     unsafe {

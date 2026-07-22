@@ -55,15 +55,42 @@ impl Solver {
     /// let y = solver.declare_const("y", Sort::Int);
     /// # let _ = (x, y);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if `name` is already bound to a different constant sort or to a
+    /// function. Repeating the same constant declaration is idempotent.
     pub fn declare_const(&mut self, name: &str, sort: Sort) -> Term {
+        // Looking up the exact native identity through the reverse index keeps
+        // repeated declaration O(1); scanning `var_names` (or every overload
+        // of a surface name) would make large declaration sets quadratic.
+        if let Some(&term_id) = self.var_terms_by_name.get(name) {
+            match self.var_sorts.get(&term_id) {
+                Some(existing_sort) if existing_sort == &sort => return Term(term_id),
+                Some(existing_sort) => panic!(
+                    "constant '{name}' is already declared with sort {existing_sort}, not {sort}"
+                ),
+                None => panic!("native constant '{name}' is missing its sort metadata"),
+            }
+        }
+        assert!(
+            !self.executor.context().has_symbol_binding(name),
+            "symbol '{name}' is already bound to a different declaration"
+        );
+
         let term_sort = sort.as_term_sort();
-        let term_id = self.terms_mut().mk_var(name, term_sort.clone());
+        // A compatibility adapter can retain this display name under a
+        // different private declaration identity. `mk_var` would silently
+        // return that adapter term (even at another sort), so a genuinely new
+        // native declaration always gets its own core identity.
+        let term_id = self.terms_mut().mk_fresh_named_var(name, term_sort.clone());
         self.var_names.insert(term_id, name.to_string());
+        self.var_terms_by_name.insert(name.to_string(), term_id);
         self.var_sorts.insert(term_id, sort);
-        // Register the symbol in the context so it appears in models
+        // Register the symbol in the context so it appears in models. Native
+        // declarations are context-global even when created inside push/pop.
         self.executor
-            .context_mut()
-            .register_symbol(name.to_string(), term_id, term_sort);
+            .register_native_global_symbol(name.to_string(), term_id, term_sort.clone());
         self.record_native_replay_event(NativeReplayEventKind::DeclareConst {
             name: name.to_string(),
             term: term_id,
@@ -81,23 +108,42 @@ impl Solver {
     /// printed name while differing by symbol kind or sort.  The ordinary
     /// [`declare_const`](Self::declare_const) intentionally keeps its
     /// name-interning behavior.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `identity_name` is already registered in this solver.
     pub fn declare_const_with_fresh_identity(
         &mut self,
-        display_name: &str,
+        _display_name: &str,
         identity_name: &str,
         sort: Sort,
     ) -> Term {
+        assert!(
+            !self.var_terms_by_name.contains_key(identity_name)
+                && !self.executor.context().has_symbol_binding(identity_name),
+            "native constant identity '{identity_name}' is already in use"
+        );
         let term_sort = sort.as_term_sort();
+        // Keep the private declaration identity in the core DAG.  Datatype
+        // constructors and several theory paths are keyed by core symbol text;
+        // storing `display_name` here would let an adapter constant named like
+        // a constructor inherit constructor semantics.  API adapters retain
+        // and project the caller-visible spelling from their own declaration
+        // metadata (the Z3 compatibility layer does this for AST/model text).
         let term_id = self
             .terms_mut()
-            .mk_fresh_named_var(display_name, term_sort.clone());
+            .mk_fresh_named_var(identity_name, term_sort.clone());
         // Model extraction is keyed by declaration identity, not display
         // text: two C-API constants may intentionally share a printed name.
         self.var_names.insert(term_id, identity_name.to_string());
+        self.var_terms_by_name
+            .insert(identity_name.to_string(), term_id);
         self.var_sorts.insert(term_id, sort);
-        self.executor
-            .context_mut()
-            .register_symbol(identity_name.to_string(), term_id, term_sort);
+        self.executor.register_native_global_symbol(
+            identity_name.to_string(),
+            term_id,
+            term_sort.clone(),
+        );
         self.record_native_replay_event(NativeReplayEventKind::DeclareConst {
             name: identity_name.to_string(),
             term: term_id,
@@ -185,6 +231,21 @@ impl Solver {
         domain: &[Sort],
         range: Sort,
     ) -> Result<FuncDecl, SolverError> {
+        if let Some((existing_domain, existing_range)) = self.native_fun_signatures.get(name) {
+            if existing_domain == domain && existing_range == &range {
+                return Ok(FuncDecl {
+                    name: name.to_string(),
+                    domain: domain.to_vec(),
+                    range,
+                });
+            }
+            return Err(SolverError::InvalidArgument {
+                operation: "declare_fun",
+                message: format!(
+                    "function name '{name}' is already in use with a different native signature"
+                ),
+            });
+        }
         // #reserved-ops: ADOPT an identical-signature redeclaration of a
         // datatype constructor/selector/tester. Embedders (deductive-checks's encoder
         // in particular) declare the EXACT native member names after
@@ -214,6 +275,15 @@ impl Solver {
             }
         }
 
+        // The native API constructs core applications directly from a
+        // `FuncDecl`; unlike the SMT-LIB elaborator, it has no expected-sort
+        // context in which to resolve an overloaded surface name.  Allowing a
+        // second declaration (or a declaration that shadows an inline
+        // definition) would therefore collapse distinct functions onto the
+        // same `Symbol::Named` identity.  Fail closed until `FuncDecl` carries
+        // an opaque declaration identity of its own.
+        self.reject_reused_native_function_name(name, "declare_fun")?;
+
         // Build the DeclareFun command to register the function with the SMT context
         let domain_sorts: Vec<_> = domain.iter().map(SortExt::to_command_sort).collect();
         let range_sort = range.to_command_sort();
@@ -221,7 +291,9 @@ impl Solver {
 
         // Execute the command to register the function
         // This makes it appear in ctx.symbol_iter() for model printing
-        self.executor.execute(&cmd)?;
+        self.executor.execute_native_global_declaration(&cmd)?;
+        self.native_fun_signatures
+            .insert(name.to_string(), (domain.to_vec(), range.clone()));
         self.record_native_replay_event(NativeReplayEventKind::DeclareFun {
             name: name.to_string(),
             domain: domain.to_vec(),
@@ -249,9 +321,22 @@ impl Solver {
     ) -> Result<(), SolverError> {
         let arg_sorts = decl.domain.iter().map(Sort::as_term_sort).collect();
         let ret_sort = decl.range.as_term_sort();
+        let declaration_matches = self
+            .executor
+            .context()
+            .symbol_info_by_identity(&decl.name)
+            .is_some_and(|info| info.arg_sorts == arg_sorts && info.sort == ret_sort);
+        if !declaration_matches {
+            return Err(SolverError::InvalidArgument {
+                operation: "register_native_function_alias",
+                message: format!(
+                    "function handle '{}' does not match a registered native declaration",
+                    decl.name
+                ),
+            });
+        }
         self.executor
-            .context_mut()
-            .register_native_function_alias(
+            .register_native_global_function_alias(
                 surface_name.to_string(),
                 decl.name.clone(),
                 arg_sorts,
@@ -322,6 +407,10 @@ impl Solver {
     where
         F: FnOnce(&mut Self, &[Term]) -> Result<Term, SolverError>,
     {
+        // Check before invoking the caller's closure: a rejected definition
+        // must not consume terms or allow arbitrary closure side effects.
+        self.reject_reused_native_function_name(name, "define_fun")?;
+
         // Create fresh variables for each parameter
         let mut param_terms = Vec::with_capacity(params.len());
         let mut param_entries = Vec::with_capacity(params.len());
@@ -338,6 +427,11 @@ impl Solver {
 
         // Build the body using the parameter variables
         let body = body_fn(self, &param_terms)?;
+
+        // The body builder has mutable access to the solver and may itself
+        // introduce declarations. Re-check before installing this definition
+        // so a closure cannot create a same-name alias after the entry check.
+        self.reject_reused_native_function_name(name, "define_fun")?;
 
         // Verify the body sort matches the declared return sort
         let body_sort = self.terms().sort(body.0).clone();
@@ -360,6 +454,7 @@ impl Solver {
                 return_sort: expected_sort,
             },
         );
+        self.executor.invalidate_for_native_api_mutation();
 
         Ok(FuncDecl {
             name: name.to_string(),
@@ -394,6 +489,8 @@ impl Solver {
         return_sort: Sort,
         body: Term,
     ) -> Result<FuncDecl, SolverError> {
+        self.reject_reused_native_function_name(name, "define_fun")?;
+
         let mut param_entries = Vec::with_capacity(params.len());
         let mut domain = Vec::with_capacity(params.len());
 
@@ -430,6 +527,7 @@ impl Solver {
                 return_sort: expected_sort,
             },
         );
+        self.executor.invalidate_for_native_api_mutation();
 
         Ok(FuncDecl {
             name: name.to_string(),
@@ -508,6 +606,24 @@ impl Solver {
 
         // Check if this is a defined function (#8613) — expand inline
         if let Some(def) = self.defined_funs.get(&func.name).cloned() {
+            let signature_matches = def.params.len() == func.domain.len()
+                && def
+                    .params
+                    .iter()
+                    .zip(func.domain.iter())
+                    .all(|((_, param), expected)| {
+                        self.terms().sort(*param) == &expected.as_term_sort()
+                    })
+                && def.return_sort == func.range.as_term_sort();
+            if !signature_matches {
+                return Err(SolverError::InvalidArgument {
+                    operation: "apply",
+                    message: format!(
+                        "function handle for '{}' does not match its registered definition",
+                        func.name
+                    ),
+                });
+            }
             let subst: HashMap<TermId, TermId> = def
                 .params
                 .iter()
@@ -515,6 +631,16 @@ impl Solver {
                 .map(|((_, param), arg)| (*param, arg.0))
                 .collect();
             return Ok(Term(self.substitute_defined_fun_body(def.body, &subst)));
+        }
+
+        if !self.function_handle_is_registered(func) {
+            return Err(SolverError::InvalidArgument {
+                operation: "apply",
+                message: format!(
+                    "function handle for '{}' does not match a registered native declaration",
+                    func.name
+                ),
+            });
         }
 
         // Otherwise create an uninterpreted function application.
@@ -540,6 +666,38 @@ impl Solver {
             arg_ids,
             result_sort,
         )))
+    }
+
+    fn reject_reused_native_function_name(
+        &self,
+        name: &str,
+        operation: &'static str,
+    ) -> Result<(), SolverError> {
+        if self.defined_funs.contains_key(name) || self.executor.context().has_symbol_binding(name)
+        {
+            return Err(SolverError::InvalidArgument {
+                operation,
+                message: format!(
+                    "function name '{name}' is already in use; native function overloading is not supported"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn function_handle_is_registered(&self, func: &FuncDecl) -> bool {
+        if let Some((domain, range)) = self.native_fun_signatures.get(&func.name) {
+            return native_signature_accepts_instance(domain, range, &func.domain, &func.range);
+        }
+
+        // Datatype operation handles are adopted by `try_declare_fun` without
+        // recording a second native declaration. Preserve that exact,
+        // registered member contract while rejecting every missing user UF.
+        let term_domain: Vec<Sort> = func.domain.iter().map(Sort::as_term_sort).collect();
+        let term_range = func.range.as_term_sort();
+        let ctx = self.executor.context();
+        ctx.is_datatype_member_name(&func.name)
+            && ctx.has_symbol_with_signature(&func.name, &term_domain, &term_range)
     }
 
     fn substitute_defined_fun_body(
@@ -640,5 +798,61 @@ impl Solver {
                 unreachable!("unhandled TermData variant in define-fun substitution: {other:?}")
             }
         }
+    }
+}
+
+fn native_signature_accepts_instance(
+    declared_domain: &[Sort],
+    declared_range: &Sort,
+    handle_domain: &[Sort],
+    handle_range: &Sort,
+) -> bool {
+    if declared_domain.len() != handle_domain.len() {
+        return false;
+    }
+    let mut type_bindings: HashMap<String, Sort> = HashMap::default();
+    declared_domain
+        .iter()
+        .zip(handle_domain)
+        .all(|(declared, actual)| {
+            native_sort_accepts_instance(declared, actual, &mut type_bindings)
+        })
+        && native_sort_accepts_instance(declared_range, handle_range, &mut type_bindings)
+}
+
+fn native_sort_accepts_instance(
+    declared: &Sort,
+    actual: &Sort,
+    type_bindings: &mut HashMap<String, Sort>,
+) -> bool {
+    match declared {
+        Sort::TypeVar(name) => match type_bindings.get(name) {
+            Some(bound) => bound == actual,
+            None => {
+                type_bindings.insert(name.clone(), actual.clone());
+                true
+            }
+        },
+        Sort::Array(declared_array) => match actual {
+            Sort::Array(actual_array) => {
+                native_sort_accepts_instance(
+                    &declared_array.index_sort,
+                    &actual_array.index_sort,
+                    type_bindings,
+                ) && native_sort_accepts_instance(
+                    &declared_array.element_sort,
+                    &actual_array.element_sort,
+                    type_bindings,
+                )
+            }
+            _ => false,
+        },
+        Sort::Seq(declared_element) => match actual {
+            Sort::Seq(actual_element) => {
+                native_sort_accepts_instance(declared_element, actual_element, type_bindings)
+            }
+            _ => false,
+        },
+        _ => declared == actual,
     }
 }

@@ -577,8 +577,35 @@ pub fn find_witness_bounded(
     exact_len: Option<usize>,
     max_len: usize,
 ) -> Option<String> {
-    if constraints.iter().any(WeRegex::is_empty_lang) {
-        return None;
+    find_witnesses_bounded(constraints, exact_len, max_len, 1)
+        .into_iter()
+        .next()
+}
+
+/// [`find_witness_bounded`] as an ENUMERATOR: the first `want` DISTINCT words
+/// accepted by every regex in `constraints`, in the BFS's own order.
+///
+/// `want = 1` is exactly [`find_witness_bounded`] — the search returns at the
+/// first accepting word, so that caller's witness is unchanged. Larger `want`
+/// keeps the same BFS running and collects successive accepting words instead
+/// of returning at the first.
+///
+/// The extra words are what a formula asking for two DIFFERENT members of one
+/// language at one length needs (stringfuzz `regex-026`:
+/// `x, y ∈ (BB(##)*)*`, `x ≠ y`, `len x = len y`). Like the single-witness
+/// form this is purely best-effort: each returned word is exact (the goal test
+/// is [`WeRegex::nullable`] on exact derivatives), and a short result means
+/// "not found", never "no further witness exists".
+#[must_use]
+pub fn find_witnesses_bounded(
+    constraints: &[WeRegex],
+    exact_len: Option<usize>,
+    max_len: usize,
+    want: usize,
+) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    if want == 0 || constraints.iter().any(WeRegex::is_empty_lang) {
+        return found;
     }
     let accepts = |state: &[WeRegex], len: usize| -> bool {
         state.iter().all(WeRegex::nullable) && exact_len.is_none_or(|n| n == len)
@@ -586,7 +613,10 @@ pub fn find_witness_bounded(
 
     let start: Vec<WeRegex> = constraints.to_vec();
     if accepts(&start, 0) {
-        return Some(String::new());
+        found.push(String::new());
+        if found.len() >= want {
+            return found;
+        }
     }
 
     let mut crit: BTreeSet<char> = BTreeSet::new();
@@ -635,7 +665,7 @@ pub fn find_witness_bounded(
     while let Some((state, prefix)) = frontier.pop_front() {
         popped += 1;
         if popped > max_states {
-            return None;
+            return found;
         }
         let depth = prefix.chars().count();
         if depth >= max_len {
@@ -651,15 +681,25 @@ pub fn find_witness_bounded(
             }
             let mut word = prefix.clone();
             word.push(c);
-            if accepts(&next, depth + 1) {
-                return Some(word);
+            let hit = accepts(&next, depth + 1);
+            if hit {
+                if !found.contains(&word) {
+                    found.push(word.clone());
+                }
+                // `want = 1` returns here, exactly as the single-witness search
+                // always did — same BFS, same first word.
+                if found.len() >= want {
+                    return found;
+                }
             }
+            // An accepted word can still be the prefix of a longer accepted
+            // one, so the state is enqueued whether or not it was a hit.
             if seen.insert((depth + 1, next.clone())) {
                 frontier.push_back((next, word));
             }
         }
     }
-    None
+    found
 }
 
 /// State cap for the [`concat_membership_definitely_empty`] product search.

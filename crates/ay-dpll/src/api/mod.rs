@@ -223,6 +223,11 @@ pub struct Solver {
     executor: Box<Executor>,
     /// Variable names for model extraction
     var_names: HashMap<TermId, String>,
+    /// Exact native declaration identity -> variable term.
+    ///
+    /// This reverse index makes idempotent declarations and adapter-identity
+    /// collision checks constant-time even when a solver has many constants.
+    var_terms_by_name: HashMap<String, TermId>,
     /// Variable sorts for model extraction
     var_sorts: HashMap<TermId, Sort>,
     /// Last assumptions from check_sat_assuming (TermId -> Term mapping)
@@ -267,6 +272,10 @@ pub struct Solver {
     /// by substituting parameter terms rather than creating an uninterpreted
     /// application.
     defined_funs: HashMap<String, DefinedFun>,
+    /// Exact native uninterpreted-function signatures, preserving API-level
+    /// sort kinds (notably `TypeVar`) that the frontend lowers in its core
+    /// symbol table. This authenticates public `FuncDecl` handles in O(1).
+    native_fun_signatures: HashMap<String, (Vec<Sort>, Sort)>,
     /// Native API replay trace for downstream reducers/debuggers.
     native_replay_events: Vec<NativeReplayEvent>,
 }
@@ -383,6 +392,7 @@ impl Solver {
         Ok(Self {
             executor,
             var_names: HashMap::default(),
+            var_terms_by_name: HashMap::default(),
             var_sorts: HashMap::default(),
             last_assumptions: None,
             interrupt: Arc::new(AtomicBool::new(false)),
@@ -400,6 +410,7 @@ impl Solver {
             #[cfg(test)]
             corrupt_native_soft_transaction: false,
             defined_funs: HashMap::default(),
+            native_fun_signatures: HashMap::default(),
             native_replay_events,
         })
     }

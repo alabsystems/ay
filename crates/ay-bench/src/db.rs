@@ -26,6 +26,7 @@
 //!     proof_exists     INTEGER,
 //!     proof_bytes      INTEGER,
 //!     proof_hash       TEXT,
+//!     proof_validation TEXT,
 //!     resource_envelope TEXT,
 //!     benchmark_content_hash TEXT,
 //!     PRIMARY KEY(commit_hash, eval_name, benchmark_path)
@@ -74,6 +75,8 @@ pub struct ResultRow {
     pub proof_bytes: Option<i64>,
     /// Content hash of the proof artifact, if one was produced.
     pub proof_hash: Option<String>,
+    /// Closed proof-checking state (`unchecked` or `not-emitted`).
+    pub proof_validation: Option<String>,
     // --- #8774: optional proof-complexity features ---
     /// Structural family (e.g. `"php"`, `"tseitin"`, `"random-xor"`).
     /// `None` for ad-hoc corpora that do not tag instances by family.
@@ -108,31 +111,44 @@ impl StorePath {
 /// Connection handle to the results store.
 pub struct ResultsStore {
     conn: Connection,
+    authority: Option<crate::resource::PreparedStorePath>,
 }
 
 impl ResultsStore {
     /// Open (or create) the store at the given path. Creates parent directories
     /// and initializes the schema on first use.
     pub fn open(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_bench_context(|| {
-                format!("creating results store directory {}", parent.display())
-            })?;
-        }
+        let mut authority = crate::resource::prepare_private_store_path(path, "results store")?;
+        let resolved = authority.path().to_path_buf();
         let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            &resolved,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
-        .with_bench_context(|| format!("opening results store {}", path.display()))?;
+        .with_bench_context(|| format!("opening results store {}", resolved.display()))?;
+        authority.authenticate_sqlite_open()?;
         Self::init_schema(&conn)?;
-        Ok(Self { conn })
+        authority.verify_connection_authority()?;
+        Ok(Self {
+            conn,
+            authority: Some(authority),
+        })
     }
 
     /// Open a purely in-memory store (used in tests).
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().bench_context("opening in-memory results store")?;
         Self::init_schema(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            authority: None,
+        })
+    }
+
+    fn verify_authority(&self) -> Result<()> {
+        self.authority.as_ref().map_or(
+            Ok(()),
+            crate::resource::PreparedStorePath::verify_connection_authority,
+        )
     }
 
     fn init_schema(conn: &Connection) -> Result<()> {
@@ -170,6 +186,7 @@ impl ResultsStore {
             "ALTER TABLE bench_results ADD COLUMN proof_exists INTEGER",
             "ALTER TABLE bench_results ADD COLUMN proof_bytes INTEGER",
             "ALTER TABLE bench_results ADD COLUMN proof_hash TEXT",
+            "ALTER TABLE bench_results ADD COLUMN proof_validation TEXT",
             "ALTER TABLE bench_results ADD COLUMN resource_envelope TEXT",
             "ALTER TABLE bench_results ADD COLUMN benchmark_content_hash TEXT",
         ] {
@@ -187,6 +204,7 @@ impl ResultsStore {
 
     /// Insert or replace a batch of rows atomically.
     pub fn upsert_rows(&mut self, rows: &[ResultRow]) -> Result<()> {
+        self.verify_authority()?;
         let tx = self.conn.transaction().bench_context("begin tx")?;
         {
             let mut stmt = tx
@@ -195,14 +213,14 @@ impl ResultsStore {
                         (commit_hash, eval_name, benchmark_path, result,
                          runtime_ms, memory_mb, verifier_ok, timestamp,
                          artifact_output_dir, proof_path, proof_format,
-                         proof_exists, proof_bytes, proof_hash,
+                         proof_exists, proof_bytes, proof_hash, proof_validation,
                          family, clause_width_max, clause_width_mean,
                          xor_density, cardinality_density, modularity,
                          feature_extract_ms, resource_envelope,
                          benchmark_content_hash)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
                              ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                             ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+                             ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
                 )
                 .bench_context("prepare upsert")?;
             for row in rows {
@@ -221,6 +239,7 @@ impl ResultsStore {
                     row.proof_exists,
                     row.proof_bytes,
                     row.proof_hash,
+                    row.proof_validation,
                     row.family,
                     row.clause_width_max,
                     row.clause_width_mean,
@@ -235,7 +254,7 @@ impl ResultsStore {
             }
         }
         tx.commit().bench_context("commit tx")?;
-        Ok(())
+        self.verify_authority()
     }
 
     /// Fetch all rows for a given commit hash. Optionally filter by eval name.
@@ -244,13 +263,14 @@ impl ResultsStore {
         commit_hash: &str,
         eval_filter: Option<&str>,
     ) -> Result<Vec<ResultRow>> {
+        self.verify_authority()?;
         let mut rows = Vec::new();
         if let Some(eval) = eval_filter {
             let mut stmt = self.conn.prepare(
                 "SELECT commit_hash, eval_name, benchmark_path, result,
                         runtime_ms, memory_mb, verifier_ok, timestamp,
                         artifact_output_dir, proof_path, proof_format,
-                        proof_exists, proof_bytes, proof_hash,
+                        proof_exists, proof_bytes, proof_hash, proof_validation,
                         family, clause_width_max, clause_width_mean,
                         xor_density, cardinality_density, modularity,
                         feature_extract_ms, resource_envelope,
@@ -267,7 +287,7 @@ impl ResultsStore {
                 "SELECT commit_hash, eval_name, benchmark_path, result,
                         runtime_ms, memory_mb, verifier_ok, timestamp,
                         artifact_output_dir, proof_path, proof_format,
-                        proof_exists, proof_bytes, proof_hash,
+                        proof_exists, proof_bytes, proof_hash, proof_validation,
                         family, clause_width_max, clause_width_mean,
                         xor_density, cardinality_density, modularity,
                         feature_extract_ms, resource_envelope,
@@ -280,11 +300,13 @@ impl ResultsStore {
                 rows.push(r?);
             }
         }
+        self.verify_authority()?;
         Ok(rows)
     }
 
     /// Commit hashes that have stored results, newest-first by timestamp.
     pub fn known_commits(&self) -> Result<Vec<String>> {
+        self.verify_authority()?;
         let mut stmt = self.conn.prepare(
             "SELECT commit_hash, MAX(timestamp) AS t
              FROM bench_results
@@ -296,6 +318,7 @@ impl ResultsStore {
         for r in rows {
             out.push(r?);
         }
+        self.verify_authority()?;
         Ok(out)
     }
 }
@@ -316,15 +339,16 @@ fn row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<ResultRow> {
         proof_exists: r.get(11)?,
         proof_bytes: r.get(12)?,
         proof_hash: r.get(13)?,
-        family: r.get(14)?,
-        clause_width_max: r.get(15)?,
-        clause_width_mean: r.get(16)?,
-        xor_density: r.get(17)?,
-        cardinality_density: r.get(18)?,
-        modularity: r.get(19)?,
-        feature_extract_ms: r.get(20)?,
-        resource_envelope: r.get(21)?,
-        benchmark_content_hash: r.get(22)?,
+        proof_validation: r.get(14)?,
+        family: r.get(15)?,
+        clause_width_max: r.get(16)?,
+        clause_width_mean: r.get(17)?,
+        xor_density: r.get(18)?,
+        cardinality_density: r.get(19)?,
+        modularity: r.get(20)?,
+        feature_extract_ms: r.get(21)?,
+        resource_envelope: r.get(22)?,
+        benchmark_content_hash: r.get(23)?,
     })
 }
 
@@ -332,17 +356,18 @@ fn row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<ResultRow> {
 /// when git is unavailable or the revision is unknown.
 #[must_use]
 pub fn resolve_rev(repo_root: &Path, rev: &str) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .arg("rev-parse")
-        .arg(rev)
-        .output()
-        .ok()?;
+    let output = crate::resource::capture_local_output_in(
+        "git",
+        ["rev-parse", "--verify", "--end-of-options", rev],
+        std::time::Duration::from_secs(5),
+        "git revision resolution",
+        Some(repo_root),
+    )
+    .ok()?;
     if !output.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let s = output.stdout.trim().to_string();
     if s.is_empty() {
         None
     } else {
@@ -380,6 +405,7 @@ mod tests {
             proof_exists: None,
             proof_bytes: None,
             proof_hash: None,
+            proof_validation: None,
             family: None,
             clause_width_max: None,
             clause_width_mean: None,
@@ -448,6 +474,57 @@ mod tests {
         assert_eq!(p.as_path(), Path::new("/tmp/repo/.ay-bench/results.sqlite"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_store_rejects_visible_path_replacement_after_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("results.sqlite");
+        let displaced = dir.path().join("authenticated-results.sqlite");
+        let mut store = ResultsStore::open(&path).expect("open authenticated store");
+        std::fs::rename(&path, &displaced).expect("displace authenticated inode");
+        let replacement = b"replacement must be preserved";
+        std::fs::write(&path, replacement).expect("plant replacement");
+
+        let error = store
+            .upsert_rows(&[sample("c1", "a.smt2", "sat", 10, 1)])
+            .expect_err("path replacement must fail closed");
+
+        assert!(
+            error.to_string().contains("changed identity"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read replacement"),
+            replacement,
+            "failed authority check must never unlink or overwrite a replacement"
+        );
+    }
+
+    #[test]
+    fn test_store_initialization_failure_preserves_existing_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("invalid.sqlite");
+        let original = b"not a sqlite database";
+        std::fs::write(&path, original).expect("write invalid store");
+
+        let error = match ResultsStore::open(&path) {
+            Ok(_) => panic!("invalid store must fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("initializing bench_results schema"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read invalid store"),
+            original,
+            "initialization rollback must never remove an authenticated target by pathname"
+        );
+    }
+
     /// #8774 regression: a row with populated proof-complexity feature
     /// columns must round-trip through the store unchanged, including
     /// exact `f64` values and the `family` tag.
@@ -496,6 +573,7 @@ mod tests {
         row.proof_exists = Some(true);
         row.proof_bytes = Some(128);
         row.proof_hash = Some("fh128:0123456789abcdef0123456789abcdef".to_string());
+        row.proof_validation = Some("unchecked".to_string());
         let legacy = sample("artifact", "legacy.cnf", "sat", 50, 1);
 
         let mut store = ResultsStore::open_in_memory().expect("open in-memory");

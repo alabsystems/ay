@@ -15,12 +15,10 @@ serde.workspace = true
 rusqlite.workspace = true
 rayon.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 wait-timeout.workspace = true
 ay-proof-complexity.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
+nix = { workspace = true, features = ["fs", "time"] }

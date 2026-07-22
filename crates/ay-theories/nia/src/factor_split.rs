@@ -976,11 +976,9 @@ impl NiaSolver<'_> {
                                 grew = true;
                             }
                         }
-                        Rel::Le | Rel::Lt if bound <= zero => {
-                            // x - y <= bound <= 0  =>  x <= y.
-                            if orderings.insert((x, y)) {
-                                grew = true;
-                            }
+                        // x - y <= bound <= 0  =>  x <= y.
+                        Rel::Le | Rel::Lt if bound <= zero && orderings.insert((x, y)) => {
+                            grew = true;
                         }
                         Rel::Ge | Rel::Gt
                             if bound >= zero

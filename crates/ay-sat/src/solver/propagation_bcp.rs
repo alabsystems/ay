@@ -92,6 +92,56 @@ fn bcp_scan_blocker_fast_path(
     (i, j, None)
 }
 
+/// Domain-restricted twin of `bcp_scan_blocker_fast_path` (#maxsat-domain-bcp-fix).
+///
+/// The 75ff66d6 clean-room re-expression of domain BCP reused the non-domain
+/// `bcp_scan_blocker_fast_path`, which RETURNS on every non-satisfied blocker —
+/// so each UNASSIGNED out-of-domain watcher (the DOMINANT case on lb-crawl /
+/// small-COI MaxSAT domain queries) tore down the tight scan and re-entered the
+/// outer `'watch` loop just to `continue`. That converted the common-case skip
+/// from one tight-loop iteration into a loop teardown + re-entry per watcher — a
+/// pure throughput loss (identical answers) that regressed weighted MaxSAT −19.
+/// This helper fuses the #8475 out-of-domain skip back INTO the tight loop, as
+/// the pre-rewrite path did, so the skip stays in-register. Returns the number
+/// of fused skips so the caller can bump `domain_bcp_skips`. Byte-identical
+/// propagation semantics; no tick/schedule effect.
+#[inline(always)]
+fn bcp_scan_blocker_fast_path_domain(
+    entries: &mut [u64],
+    vals: &[i8],
+    domain: &[bool],
+    mut i: usize,
+    mut j: usize,
+) -> (usize, usize, u64, Option<(u32, u64, i8)>) {
+    let watch_len = entries.len();
+    let mut skips: u64 = 0;
+    while i < watch_len {
+        let entry = ay_prefetch::entry_at(entries, i);
+        ay_prefetch::entry_set(entries, j, entry);
+        if i + 1 < watch_len {
+            let next_entry = ay_prefetch::entry_at(entries, i + 1);
+            ay_prefetch::prefetch_val_l1(vals, watched::entry_blocker_raw(next_entry) as usize);
+        }
+        let blocker_raw = watched::entry_blocker_raw(entry);
+        let blocker_val = val_at(vals, blocker_raw as usize);
+        i += 1;
+        if blocker_val > 0 {
+            // Satisfied blocker: kept, full entry already copied.
+            j += 1;
+            continue;
+        }
+        // Fused #8475 domain skip: an UNASSIGNED out-of-domain blocker cannot be
+        // falsified by the restricted query — keep the watcher, stay in-loop.
+        if blocker_val == 0 && !domain_has_lit(domain, blocker_raw) {
+            skips += 1;
+            j += 1;
+            continue;
+        }
+        return (i, j, skips, Some((blocker_raw, entry, blocker_val)));
+    }
+    (i, j, skips, None)
+}
+
 /// Update only the blocker half of a kept long-clause watcher.
 ///
 /// In all callers, the current watcher's entry has already been copied to
@@ -2210,28 +2260,18 @@ impl Solver {
             let mut binary_conflict: Option<ClauseRef> = None;
 
             'watch: loop {
+                // #maxsat-domain-bcp-fix: fused domain fast-path scan — the #8475
+                // out-of-domain skip is handled IN the tight loop (see helper),
+                // not by unwinding to this outer loop per watcher.
                 let entries = self.deferred_watch_list.entries_mut();
-                let (new_i, new_j, slow_entry) =
-                    bcp_scan_blocker_fast_path(entries, &self.vals, i, j);
+                let (new_i, new_j, skips, slow_entry) =
+                    bcp_scan_blocker_fast_path_domain(entries, &self.vals, domain, i, j);
                 i = new_i;
                 j = new_j;
+                self.stats.domain_bcp_skips += skips;
                 let Some((blocker_raw, entry, blocker_val)) = slow_entry else {
                     break 'watch;
                 };
-
-                // Domain skip (#8475): an UNASSIGNED watched literal over a
-                // non-domain variable witnesses that this clause cannot be
-                // falsified by the restricted query (domain closure
-                // invariant) — keep the watcher unmodified, no propagation,
-                // no conflict, no arena access. A FALSE out-of-domain
-                // blocker (root-level unit, or a watch re-established by
-                // clause-DB maintenance between queries, #8661) falls
-                // through to normal processing.
-                if blocker_val == 0 && !domain_has_lit(domain, blocker_raw) {
-                    self.stats.domain_bcp_skips += 1;
-                    j += 1;
-                    continue;
-                }
 
                 // Binary clause handling: the blocker IS the other literal.
                 if watched::entry_is_binary(entry) {

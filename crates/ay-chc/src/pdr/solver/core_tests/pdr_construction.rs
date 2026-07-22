@@ -323,9 +323,9 @@ fn upsert_clause_guarded_lemma_enforces_per_key_cap() {
         2,
     );
 
-    assert!((inserted0, bumped0) == (true, false));
-    assert!((inserted1, bumped1) == (true, false));
-    assert!((inserted2, bumped2) == (false, false));
+    assert_eq!((inserted0, bumped0), (true, false));
+    assert_eq!((inserted1, bumped1), (true, false));
+    assert_eq!((inserted2, bumped2), (false, false));
     let cgl = &solver.caches.clause_guarded_lemmas;
     assert_eq!(cgl.get(&key).expect("key should be present").len(), 2);
 }
@@ -342,7 +342,7 @@ fn upsert_clause_guarded_lemma_clears_keys_on_global_cap_overflow() {
     for clause_idx in 0..PdrCacheStore::clause_guarded_keys_cap() {
         let (inserted, bumped) =
             solver.upsert_clause_guarded_lemma((pred, clause_idx), ChcExpr::Bool(true), 1, 4);
-        assert!((inserted, bumped) == (true, false));
+        assert_eq!((inserted, bumped), (true, false));
     }
     assert_eq!(
         solver.caches.clause_guarded_lemmas.len(),
@@ -352,7 +352,7 @@ fn upsert_clause_guarded_lemma_clears_keys_on_global_cap_overflow() {
     let overflow_key = (pred, PdrCacheStore::clause_guarded_keys_cap());
     let (inserted, bumped) =
         solver.upsert_clause_guarded_lemma(overflow_key, ChcExpr::Bool(true), 1, 4);
-    assert!((inserted, bumped) == (true, false));
+    assert_eq!((inserted, bumped), (true, false));
     assert_eq!(
         solver.caches.clause_guarded_lemmas.len(),
         1,

@@ -106,7 +106,7 @@ gpu = ["cli", "ay-sat/gpu"]
 replay-jit = ["cli", "dep:ay-replay"]
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, optional = true }
+nix = { workspace = true, optional = true, features = ["fs", "time"] }
 signal-hook = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -114,13 +114,14 @@ criterion.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 ntest = "0.9"
-nix.workspace = true
+nix = { workspace = true, features = ["fs"] }
 tempfile.workspace = true
 wait-timeout.workspace = true
 ay-drat-check.workspace = true
 ay-lrat-check.workspace = true
 ay-replay.workspace = true
 ay-sat.workspace = true
+ay-test-support.workspace = true
 
 [[bin]]
 name = "ay"

@@ -10,7 +10,7 @@ use super::{Context, ElaborateError, Result};
 impl Context {
     /// Char operators (`char.to_int`, `char.<=`, `char.is_digit`) desugar to Int
     /// arithmetic on a Unicode code point: a char literal `(_ char n)` lowers to
-    /// the Int `n` (see `elaborate/term.rs`), and the native `Sort::Char` also
+    /// the Int `n` (see `elaborate/indexed.rs`), and the native `Sort::Char` also
     /// lowers to a bounded Int. So a well-formed char-op argument is `Int`- or
     /// `Char`-sorted. ANY other sort means the argument is not a code point —
     /// e.g. a variable over an auto-uninterpreted `Char` sort name: the SMT-LIB
@@ -254,7 +254,7 @@ impl Context {
             }
             // Char theory. A Char is a Unicode code point, which AY represents as
             // that bounded Int (char literals `(_ Char n)` elaborate to the Int
-            // `n`, see `elaborate/term.rs`), so every char operator desugars to
+            // `n`, see `elaborate/indexed.rs`), so every char operator desugars to
             // Int arithmetic on the code point — sound because a Char IS its code
             // point. `char.to_int` is then the identity.
             "char.to_int" => {

@@ -8,7 +8,7 @@
 //! the `ffi_guard_*` helpers (#6192) to prevent undefined behavior from panics
 //! unwinding across the `extern "C"` boundary.
 
-use std::ffi::{c_char, c_int, c_uint, CStr};
+use std::ffi::{c_char, c_int, c_uint};
 use std::ptr;
 
 use ay_dpll::api::{
@@ -19,10 +19,12 @@ use ay_frontend::Command;
 
 use super::{
     apply_supported_params, ast_to_term, cache_ast_vector, cache_string,
-    ensure_cross_context_translation_semantics, ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int,
-    ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, term_to_ast, DecisionOwnerFamily, ModelHandle,
-    SolverCheckOutcome, Z3Context, Z3SolverHandle, Z3_ast, Z3_ast_vector, Z3_context, Z3_func_decl,
-    Z3_model, Z3_params, Z3_solver, Z3_sort, Z3_string, Z3_symbol, Z3_EXCEPTION, Z3_INVALID_ARG,
+    ensure_cross_context_translation_semantics, ffi_count_within_limit, ffi_guard_ast,
+    ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
+    ffi_read_bounded_parser_file, ffi_read_bounded_parser_text, ffi_read_bounded_text, term_to_ast,
+    transfer_cross_context_ffi_metadata, DecisionOwnerFamily, ModelHandle, SolverCheckOutcome,
+    Z3Context, Z3SolverHandle, Z3_ast, Z3_ast_vector, Z3_context, Z3_func_decl, Z3_model,
+    Z3_params, Z3_solver, Z3_sort, Z3_string, Z3_symbol, Z3_EXCEPTION, Z3_INVALID_ARG,
     Z3_INVALID_USAGE, Z3_L_FALSE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK,
 };
 
@@ -58,7 +60,9 @@ pub(super) fn auxiliary_query_acceptance_is_supported(
     let reason = if has_user_propagator {
         Some("a user propagator is active, but this auxiliary query has no final-check loop")
     } else if !ctx.transitive_closure_regs.is_empty() {
-        Some("transitive-closure semantics are active, but this auxiliary query has no model verifier")
+        Some(
+            "transitive-closure semantics are active, but this auxiliary query has no model verifier",
+        )
     } else {
         None
     };
@@ -1106,6 +1110,11 @@ pub unsafe extern "C" fn Z3_solver_check_assumptions(
     num_assumptions: c_uint,
     assumptions: *const Z3_ast,
 ) -> c_int {
+    // SAFETY: this public entry point requires `c` to be null or a live,
+    // exclusively borrowed context; the bound checker only updates its error state.
+    if !unsafe { ffi_count_within_limit(c, "Z3_solver_check_assumptions", num_assumptions) } {
+        return Z3_L_UNDEF;
+    }
     // A non-empty raw array may never be represented by a null pointer.  In
     // addition to rejecting the malformed call, retire the preceding decision
     // artifacts so they cannot be mistaken for this query's result.
@@ -1236,6 +1245,7 @@ pub unsafe extern "C" fn Z3_solver_to_string(c: Z3_context, s: Z3_solver) -> *co
                 Some(handle) => ctx.solver.assertions_sexpr(&handle.assertions),
                 None => ctx.solver.assertions_sexpr(&[]),
             };
+            let sexpr = super::ffi_surface_text(ctx, &sexpr);
             cache_string(ctx, sexpr)
         })
     }
@@ -1388,13 +1398,11 @@ pub unsafe extern "C" fn Z3_parse_smtlib2_string(
     let input_string = if str.is_null() {
         None
     } else {
-        // SAFETY: The caller's `# Safety` contract requires the C string pointer to be
-        // non-null and to point to a valid, null-terminated sequence of bytes owned by the
-        // caller for the duration of this call. The pointer was null-checked before entering
-        // this block.
-        match unsafe { CStr::from_ptr(str) }.to_str() {
-            Ok(s) => Some(s.to_string()),
-            Err(_) => {
+        // SAFETY: `str` is non-null and a valid NUL-terminated string per the
+        // caller contract; the helper bounds the scan and clone.
+        match unsafe { ffi_read_bounded_parser_text(str) } {
+            Ok(s) => Some(s),
+            Err(error) => {
                 // SAFETY: `c` was validated non-null by the outer FFI
                 // contract. This borrow is scoped to this block and does
                 // not overlap with any other &mut Z3Context. Using
@@ -1406,7 +1414,7 @@ pub unsafe extern "C" fn Z3_parse_smtlib2_string(
                 // this block and does not alias any other reference into `Z3Context`.
                 if let Some(ctx) = unsafe { c.as_mut() } {
                     ctx.last_error = Z3_EXCEPTION;
-                    ctx.error_msg = Some("invalid UTF-8 in input string".to_string());
+                    ctx.error_msg = Some(format!("Z3_parse_smtlib2_string: {error}"));
                     return cache_ast_vector(ctx, Vec::new());
                 }
                 return ptr::null_mut();
@@ -1528,16 +1536,13 @@ pub unsafe extern "C" fn Z3_solver_assert_and_track(
 #[no_mangle]
 pub unsafe extern "C" fn Z3_solver_from_string(c: Z3_context, s: Z3_solver, str: Z3_string) {
     // Extract the input string outside the guard (raw-pointer deref).
-    let input: Option<String> = if str.is_null() {
+    let input = if str.is_null() {
         None
     } else {
-        // SAFETY: caller contract: `str` is a valid null-terminated C string.
-        match unsafe { CStr::from_ptr(str) }.to_str() {
-            Ok(s) => Some(s.to_string()),
-            Err(_) => Some(String::new()), // invalid UTF-8 -> honest parse error below
-        }
+        // SAFETY: caller contract: `str` is a valid NUL-terminated C string;
+        // the helper bounds the scan and clone.
+        Some(unsafe { ffi_read_bounded_parser_text(str) })
     };
-    let invalid_utf8 = !str.is_null() && input.as_deref() == Some("");
     // SAFETY: `ffi_guard_void` validates/guards `c`; `s` is null-checked via `as_mut`.
     unsafe {
         ffi_guard_void(c, |ctx| {
@@ -1545,16 +1550,19 @@ pub unsafe extern "C" fn Z3_solver_from_string(c: Z3_context, s: Z3_solver, str:
                 note_null_solver_handle(ctx, "Z3_solver_from_string");
                 return;
             }
-            let Some(text) = input.as_deref() else {
-                ctx.last_error = Z3_EXCEPTION;
-                ctx.error_msg = Some("Z3_solver_from_string: null input string".to_string());
-                return;
+            let text = match input.as_ref() {
+                None => {
+                    ctx.last_error = Z3_EXCEPTION;
+                    ctx.error_msg = Some("Z3_solver_from_string: null input string".to_string());
+                    return;
+                }
+                Some(Ok(text)) => text,
+                Some(Err(error)) => {
+                    ctx.last_error = Z3_EXCEPTION;
+                    ctx.error_msg = Some(format!("Z3_solver_from_string: {error}"));
+                    return;
+                }
             };
-            if invalid_utf8 {
-                ctx.last_error = Z3_EXCEPTION;
-                ctx.error_msg = Some("Z3_solver_from_string: invalid UTF-8 in input".to_string());
-                return;
-            }
             if let Some(terms) = parse_solver_transaction(ctx, text, "Z3_solver_from_string") {
                 // SAFETY: null-checked before the transaction; the handle is
                 // arena-owned and no reference to it was held while all handle
@@ -1578,15 +1586,12 @@ pub unsafe extern "C" fn Z3_solver_from_file(c: Z3_context, s: Z3_solver, file_n
     let path: Option<String> = if file_name.is_null() {
         None
     } else {
-        // SAFETY: caller contract: `file_name` is a valid null-terminated C string.
-        unsafe { CStr::from_ptr(file_name) }
-            .to_str()
-            .ok()
-            .map(String::from)
+        // SAFETY: caller contract: `file_name` is a valid NUL-terminated C
+        // string; the helper bounds the scan and clone.
+        unsafe { ffi_read_bounded_text(file_name) }.ok()
     };
-    let contents: Option<Result<String, String>> = path
-        .as_deref()
-        .map(|p| std::fs::read_to_string(p).map_err(|e| e.to_string()));
+    let contents: Option<Result<String, String>> =
+        path.as_deref().map(ffi_read_bounded_parser_file);
     // SAFETY: `ffi_guard_void` validates/guards `c`; `s` is null-checked via `as_mut`.
     unsafe {
         ffi_guard_void(c, |ctx| {
@@ -1670,6 +1675,7 @@ pub unsafe extern "C" fn Z3_solver_translate(
                     return ptr::null_mut();
                 }
             }
+            let previous_owner = tgt.decision_owner;
             if !tgt.claim_decision_owner(DecisionOwnerFamily::Solver, "Z3_solver_translate") {
                 return ptr::null_mut();
             }
@@ -1693,8 +1699,26 @@ pub unsafe extern "C" fn Z3_solver_translate(
                     flat.push(*a);
                 }
                 let new_flat = tgt.solver.translate_terms_from(&src.solver, &flat);
-                let new_t: Vec<(Term, Term)> =
-                    new_flat.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+                let mut source_roots = assertions.clone();
+                source_roots.extend(flat.iter().copied());
+                let mut target_roots = new_a.clone();
+                target_roots.extend(new_flat.iter().copied());
+                if !transfer_cross_context_ffi_metadata(
+                    src,
+                    tgt,
+                    &source_roots,
+                    &target_roots,
+                    "Z3_solver_translate",
+                ) {
+                    tgt.decision_owner = previous_owner;
+                    return ptr::null_mut();
+                }
+                let new_t: Vec<(Term, Term)> = new_flat
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| (c[0], c[1]))
+                    .collect();
                 (new_a, new_t)
             };
             let mut new_handle = Z3SolverHandle::new(tactic);
@@ -2349,6 +2373,7 @@ impl<'a> DimacsEncoder<'a> {
                     .solver
                     .format_term_checked(*t)
                     .unwrap_or_else(|| "?".to_string());
+                let name = super::ffi_surface_text(self.ctx, &name);
                 // Keep the mapping comment single-line.
                 let name = name.replace('\n', " ");
                 out.push_str(&format!("c {v} {name}\n"));
@@ -2402,6 +2427,7 @@ pub unsafe extern "C" fn Z3_solver_to_dimacs_string(
                 enc.assert_formula(*t);
             }
             let text = enc.render(include_names);
+            let text = super::ffi_surface_text(ctx, &text);
             cache_string(ctx, text)
         })
     }

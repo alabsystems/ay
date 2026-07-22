@@ -328,7 +328,12 @@ pub use adaptive::adjust_features_for_instance;
 pub use clause_provenance::{ClauseProvenance, CoreProvenanceSummary};
 pub use clause_trace::{ClauseTrace, ClauseTraceEntry};
 pub use cube_and_conquer::CubeAndConquerSolver;
-pub use decision_trace::{write_minimal_trace, TraceOutcome};
+pub use decision_trace::{
+    decision_trace_suppressed_after_public_mismatch, finish_reserved_decision_trace,
+    finish_reserved_decision_trace_retained, invalidate_reserved_decision_trace,
+    reserve_decision_trace, suppress_decision_trace_after_public_mismatch, write_minimal_trace,
+    write_minimal_trace_to, SettledDecisionTrace, TraceOutcome,
+};
 pub use dimacs::{parse_str as parse_dimacs, DimacsError, DimacsFormula};
 pub use er_proof::{ErDefinition, ErObligationKind, ErProducer, ErProofLog};
 pub use extension::{

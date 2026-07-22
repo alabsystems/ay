@@ -34,8 +34,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _oom_guard import (  # noqa: E402
+    copy_stream_limited,
     plan_solver_resources,
-    rss_watchdog,
+    run_captured,
     warn_concurrent_build,
 )
 
@@ -104,59 +105,28 @@ def run(bin_path: str, inst: Path, timeout_ms: int, wall_cap: float, memlimit_mb
         proof_path = proof_dir / f"{inst.stem}.{mode}.{os.getpid()}.pbp"
         args += ["--proof", str(proof_path)]
     args.append(str(inst))
-    start = time.monotonic()
     try:
-        # Temporary files drain arbitrary model/progress output without a pipe
-        # deadlock and without retaining it in the benchmark driver's RAM.
-        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as stdout:
-            with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as stderr:
-                try:
-                    proc = subprocess.Popen(
-                        args,
-                        stdin=subprocess.DEVNULL,
-                        stdout=stdout,
-                        stderr=stderr,
-                        text=True,
-                        env=env,
-                        start_new_session=True,
-                    )
-                except OSError:
-                    return "SPAWN_ERROR", round(time.monotonic() - start, 4)
-
-                # `--bin` is intentionally arbitrary. MEMLIMIT is trusted only
-                # by ay-pb-lineage binaries, so enforce the exact same envelope
-                # outside the complete process group as well.
-                guard = rss_watchdog(
-                    proc,
-                    memlimit_mb,
-                    label=f"proof_overhead.py[{mode}]",
-                    grace_mb=0,
-                )
-                timed_out = False
-                try:
-                    try:
-                        returncode = proc.wait(timeout=wall_cap)
-                    except subprocess.TimeoutExpired:
-                        timed_out = True
-                        kill_process_group(proc)
-                        returncode = proc.wait()
-                finally:
-                    # A wrapper may exit while descendants remain. Clean the
-                    # isolated group before disarming the RSS watcher.
-                    kill_process_group(proc)
-                    if proc.poll() is None:
-                        proc.wait()
-                    guard.stop()
-
-                if guard.breached:
-                    st = "MEMOUT"
-                elif timed_out:
-                    st = "WALLTIMEOUT"
-                else:
-                    st = s_line_file(stdout)
-                    if st == "NO_S_LINE" and returncode != 0:
-                        st = f"SPAWN_ERROR({returncode})"
-                secs = time.monotonic() - start
+        try:
+            captured = run_captured(
+                args,
+                memlimit_mb,
+                wall_cap,
+                label=f"proof_overhead.py[{mode}]",
+                env=env,
+            )
+        except Exception:
+            return "SPAWN_ERROR", 0.0
+        if captured.memout:
+            st = "MEMOUT"
+        elif captured.timed_out:
+            st = "WALLTIMEOUT"
+        elif captured.cancelled or captured.output_truncated:
+            st = "SPAWN_ERROR(CAPTURE)"
+        else:
+            st = s_line(captured.stdout)
+            if st == "NO_S_LINE" and captured.returncode != 0:
+                st = f"SPAWN_ERROR({captured.returncode})"
+        secs = captured.wall_sec
     finally:
         if proof_path is not None:
             proof_path.unlink(missing_ok=True)
@@ -258,7 +228,7 @@ def main() -> int:
             import lzma
             inst = tmp / p.name[:-3]
             with lzma.open(p, "rb") as src, inst.open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
+                copy_stream_limited(src, dst)
         else:
             inst = p
         try:

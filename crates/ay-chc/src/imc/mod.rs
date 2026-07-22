@@ -33,9 +33,7 @@ use std::time::Duration;
 fn imc_stats_enabled() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
-        std::env::var("AY_IMC_STATS")
-            .ok()
-            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        std::env::var("AY_IMC_STATS").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
     })
 }
 

@@ -172,10 +172,8 @@ where
             // `assume` of a term the problem never asserted (and no quantifier
             // instantiation justifies) is a laundered free axiom, flagged here
             // exactly like a `trust`/`hole` fallback.
-            ProofStep::Assume(term) => {
-                if !is_legit_assume(*term) {
-                    report.foreign_assume_on_path = report.foreign_assume_on_path.saturating_add(1);
-                }
+            ProofStep::Assume(term) if !is_legit_assume(*term) => {
+                report.foreign_assume_on_path = report.foreign_assume_on_path.saturating_add(1);
             }
             // Anchor is a leaf node; nothing to traverse.
             ProofStep::Anchor { .. } => {}

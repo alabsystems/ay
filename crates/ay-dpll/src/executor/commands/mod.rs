@@ -279,13 +279,14 @@ impl Executor {
         use ay_core::term::Symbol;
         match self.ctx.terms.get(term_id) {
             TermData::App(Symbol::Named(name), args) => {
-                if !declared.contains(name) && !is_builtin_operator(name) {
-                    declared.insert(name.clone());
+                let surface_name = self.ctx.dt_surface_name(name).unwrap_or(name);
+                if !declared.contains(surface_name) && !is_builtin_operator(name) {
+                    declared.insert(surface_name.to_string());
                     let res_sort = format_sort(self.ctx.terms.sort(term_id));
                     if args.is_empty() {
                         out.push(format!(
                             "(declare-const {} {})\n",
-                            quote_symbol(name),
+                            quote_symbol(surface_name),
                             res_sort
                         ));
                     } else {
@@ -295,7 +296,7 @@ impl Executor {
                             .collect();
                         out.push(format!(
                             "(declare-fun {} ({}) {})\n",
-                            quote_symbol(name),
+                            quote_symbol(surface_name),
                             arg_sorts.join(" "),
                             res_sort
                         ));
@@ -350,7 +351,9 @@ impl Executor {
             // Un-mangle instance-specific datatype member names (e.g.
             // `osome@Opt!{Int}` -> `osome`) for user-facing `(get-value ...)`/`eval`
             // echo; non-datatype symbols are returned unchanged.
-            TermData::Var(name, _) => quote_symbol(self.ctx.dt_surface_name(name).unwrap_or(name)),
+            TermData::Var(name, _) => {
+                self.format_declared_symbol_identity(name, self.ctx.terms.sort(term_id))
+            }
             TermData::Const(Constant::Bool(true)) => "true".to_string(),
             TermData::Const(Constant::Bool(false)) => "false".to_string(),
             TermData::Const(Constant::Int(n)) => format_bigint(n),
@@ -385,7 +388,9 @@ impl Executor {
                     }
                 }
                 let name = match sym {
-                    Symbol::Named(n) => quote_symbol(self.ctx.dt_surface_name(n).unwrap_or(n)),
+                    Symbol::Named(n) => {
+                        self.format_declared_symbol_identity(n, self.ctx.terms.sort(term_id))
+                    }
                     _ => format_symbol(sym),
                 };
                 if args.is_empty() {
@@ -891,7 +896,21 @@ impl Executor {
                 snapshot.is_some_and(|map| map.contains_key(tid)) || assumptions.contains(tid)
             });
             if authenticated && !core_terms.is_empty() {
-                return core_terms.iter().map(|&tid| (name_of(tid), tid)).collect();
+                // TermId dedup (#uc-core-dedup): hash-consed duplicate assert
+                // bodies share one TermId, and the harvest can surface that
+                // TermId more than once (duplicate asserted formulas encode to
+                // the same SAT literal). `term_to_name` keeps one label per
+                // TermId, so without dedup the SAME label printed N times —
+                // inflating |core| under 2025 UC scoring and printing a
+                // malformed duplicate-entry core. First occurrence wins
+                // (deterministic: core order is solver-derived, itself
+                // deterministic).
+                let mut seen: std::collections::HashSet<TermId> = std::collections::HashSet::new();
+                return core_terms
+                    .iter()
+                    .filter(|&&tid| seen.insert(tid))
+                    .map(|&tid| (name_of(tid), tid))
+                    .collect();
             }
         }
 
@@ -901,16 +920,35 @@ impl Executor {
         // dedup keeps this byte-identical to the historical all-named
         // fallback; after a plain check-sat without assumptions it reduces
         // to exactly the historical all-named fallback.
+        //
+        // TermId dedup applies to the named entries too (#uc-core-dedup): two
+        // `:named` labels on hash-consed-identical assert bodies share one
+        // TermId; printing one label suffices (the printed core denotes the
+        // same conjunction) and keeps |core| honest. First label wins.
         let mut seen: std::collections::HashSet<TermId> = std::collections::HashSet::new();
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut entries: Vec<(Option<String>, TermId)> = Vec::new();
         for (name, tid) in self.ctx.named_terms_iter() {
-            seen.insert(tid);
-            entries.push((Some(name.to_string()), tid));
+            if seen.insert(tid) {
+                seen_names.insert(name.to_string());
+                entries.push((Some(name.to_string()), tid));
+            }
         }
         for &tid in assumptions {
-            if seen.insert(tid) {
-                entries.push((name_of(tid), tid));
+            if !seen.insert(tid) {
+                continue;
             }
+            // A rewritten named assert (#uc-rewrite-provenance) carries its
+            // parse label on a DIFFERENT TermId than the parse root already
+            // emitted above — dedup by printed label too, or the padded core
+            // prints that label twice.
+            let name = name_of(tid);
+            if let Some(n) = &name {
+                if !seen_names.insert(n.clone()) {
+                    continue;
+                }
+            }
+            entries.push((name, tid));
         }
         entries
     }
@@ -1127,6 +1165,22 @@ impl Executor {
                 "(error \"unsat assumptions not available, no check-sat has been performed\")"
                     .to_string()
             }
+        }
+    }
+
+    /// Render a core symbol identity using its public SMT-LIB spelling. An
+    /// overloaded identifier must carry its result-sort ascription so replay
+    /// resolves the same full signature instead of depending on declaration
+    /// order (or becoming ambiguous for equal domains).
+    fn format_declared_symbol_identity(&self, identity: &str, result_sort: &Sort) -> String {
+        if let Some(surface_name) = self.ctx.overloaded_surface_name(identity) {
+            format!(
+                "(as {} {})",
+                quote_symbol(surface_name),
+                format_sort(result_sort)
+            )
+        } else {
+            quote_symbol(self.ctx.dt_surface_name(identity).unwrap_or(identity))
         }
     }
 }

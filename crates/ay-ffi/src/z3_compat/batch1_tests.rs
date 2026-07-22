@@ -129,13 +129,58 @@ fn translate_across_contexts() {
         // Rendered form should match across contexts.
         let s_src = CStr::from_ptr(Z3_ast_to_string(src, sum))
             .to_str()
-            .unwrap()
+            .expect("source AST rendering must be valid UTF-8")
             .to_string();
         let s_dst = CStr::from_ptr(Z3_ast_to_string(dst, translated))
             .to_str()
-            .unwrap()
+            .expect("translated AST rendering must be valid UTF-8")
             .to_string();
         assert_eq!(s_src, s_dst);
+
+        // Translation also installs the exact public declaration identity in
+        // the target. Recreating x must reuse the translated leaf, while the
+        // next fresh constant remains distinct.
+        let translated_x = Z3_get_app_arg(dst, translated, 0);
+        let dst_int = Z3_mk_int_sort(dst);
+        let remade_x = Z3_mk_const(dst, Z3_mk_string_symbol(dst, c"x".as_ptr()), dst_int);
+        assert_eq!(remade_x, translated_x);
+        let y = Z3_mk_const(dst, Z3_mk_string_symbol(dst, c"y".as_ptr()), dst_int);
+        assert_ne!(y, 0);
+        assert_ne!(y, translated_x);
+        Z3_del_context(src);
+        Z3_del_context(dst);
+    }
+}
+
+#[test]
+fn translate_rejects_target_private_identity_collision() {
+    unsafe {
+        let src = ctx();
+        let dst = ctx();
+
+        // Both contexts allocate private constant identity zero independently,
+        // but attach different public symbols. The semantic DAG copier would
+        // otherwise intern these as the same target node.
+        let dst_int = Z3_mk_int_sort(dst);
+        let dst_x = Z3_mk_const(dst, Z3_mk_string_symbol(dst, c"x".as_ptr()), dst_int);
+        let src_int = Z3_mk_int_sort(src);
+        let src_y = Z3_mk_const(src, Z3_mk_string_symbol(src, c"y".as_ptr()), src_int);
+
+        assert_eq!(Z3_translate(src, src_y, dst), 0);
+        assert_eq!(Z3_get_error_code(dst), Z3_INVALID_USAGE);
+        let error = CStr::from_ptr(Z3_get_error_msg(dst, Z3_INVALID_USAGE))
+            .to_str()
+            .expect("Z3 error message must be valid UTF-8");
+        assert!(error.contains("cross-context translation metadata conflict"));
+
+        // Collision preflight is atomic with respect to public metadata.
+        assert_eq!(
+            CStr::from_ptr(Z3_ast_to_string(dst, dst_x))
+                .to_str()
+                .expect("target AST rendering must be valid UTF-8"),
+            "x"
+        );
+
         Z3_del_context(src);
         Z3_del_context(dst);
     }
@@ -148,7 +193,9 @@ fn eval_smtlib2_runs_a_script() {
         let script = c"(declare-const x Int)(assert (> x 5))(check-sat)";
         let out = Z3_eval_smtlib2_string(c, script.as_ptr());
         assert!(!out.is_null());
-        let text = CStr::from_ptr(out).to_str().unwrap();
+        let text = CStr::from_ptr(out)
+            .to_str()
+            .expect("SMT-LIB evaluation output must be valid UTF-8");
         assert!(text.contains("sat"), "expected sat in output, got: {text}");
         Z3_del_context(c);
     }
@@ -166,11 +213,11 @@ fn parse_smtlib2_string_returns_assertion_vector() {
             c,
             script.as_ptr(),
             0,
-            std::ptr::null(),
-            std::ptr::null(),
+            ptr::null(),
+            ptr::null(),
             0,
-            std::ptr::null(),
-            std::ptr::null(),
+            ptr::null(),
+            ptr::null(),
         );
         assert!(!vec.is_null(), "parse returned a null vector");
         assert_eq!(
@@ -187,7 +234,9 @@ fn parse_smtlib2_string_returns_assertion_vector() {
             assert_ne!(a, 0, "assertion {i} decoded to a null AST");
             let s = Z3_ast_to_string(c, a);
             assert!(!s.is_null(), "ast_to_string returned null for element {i}");
-            let text = CStr::from_ptr(s).to_str().unwrap();
+            let text = CStr::from_ptr(s)
+                .to_str()
+                .expect("parsed assertion rendering must be valid UTF-8");
             assert!(!text.is_empty(), "element {i} rendered empty");
             rendered.push_str(text);
             rendered.push('\n');
@@ -206,11 +255,11 @@ fn parse_smtlib2_string_returns_assertion_vector() {
             c,
             bad.as_ptr(),
             0,
-            std::ptr::null(),
-            std::ptr::null(),
+            ptr::null(),
+            ptr::null(),
             0,
-            std::ptr::null(),
-            std::ptr::null(),
+            ptr::null(),
+            ptr::null(),
         );
         assert!(
             !bad_vec.is_null(),
@@ -241,7 +290,9 @@ fn params_to_string_renders() {
         Z3_params_set_bool(c, p, Z3_mk_string_symbol(c, c"foo".as_ptr()), true);
         let s = Z3_params_to_string(c, p);
         assert!(!s.is_null());
-        let text = CStr::from_ptr(s).to_str().unwrap();
+        let text = CStr::from_ptr(s)
+            .to_str()
+            .expect("parameter rendering must be valid UTF-8");
         assert!(text.contains("foo"), "got: {text}");
         Z3_del_context(c);
     }

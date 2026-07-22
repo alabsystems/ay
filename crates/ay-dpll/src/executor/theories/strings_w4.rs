@@ -82,8 +82,36 @@ use crate::executor_types::{Result, SolveResult};
 use super::super::model::{EvalValue, Model};
 use super::super::Executor;
 
+#[cfg(test)]
+thread_local! {
+    static W4_ENABLED_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct W4EnabledTestOverride {
+    previous: Option<bool>,
+}
+
+#[cfg(test)]
+impl Drop for W4EnabledTestOverride {
+    fn drop(&mut self) {
+        W4_ENABLED_TEST_OVERRIDE.with(|slot| slot.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+fn w4_test_enabled_override(value: bool) -> W4EnabledTestOverride {
+    let previous = W4_ENABLED_TEST_OVERRIDE.with(|slot| slot.replace(Some(value)));
+    W4EnabledTestOverride { previous }
+}
+
 /// Master switch (`AY_STR_W4=1`, default OFF → byte-identical pipeline).
 pub(in crate::executor) fn str_w4_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(value) = W4_ENABLED_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return value;
+    }
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // DEFAULT-ON: 31/92 sat-side conversions (26 attributable to W4), 29 of
     // 31 models z3-PINNED, 0 disagreements, 0 regressions on a 404-file solved
@@ -122,6 +150,92 @@ const MAX_W4_CANDIDATES: usize = 6;
 /// Per-variable seed values.
 const MAX_W4_SEED_POOL: usize = 10;
 
+/// W4's DETERMINISTIC search budget, in [`w4_work_clock`] units.
+/// See [`Executor::w4_work_deadline`] for why this is counted, not timed.
+///
+/// Sized from a census, not taste. Over the 600-file QF_S + QF_SLIA canary,
+/// with the budget OFF (`AY_STR_W4_WORK=0`), 92 files have a W4/W5/W6 witness
+/// accepted by the full validation battery. The COSTLIEST of those searches
+/// finishes in 84.4M units (`pyex/httplib2-entry-disposition/c788221f…`;
+/// runner-up 82.4M, then a long tail at 30.7M and below). The starvation cases
+/// are 2.9-5.1x above that and produce no candidate at all:
+///
+///   242.9M  full_str_int/restoreIpAddresses__1800   (12.4 s of a 20 s solve;
+///                                                    the refutation it starves
+///                                                    then takes 0.2 s)
+///   432.3M  20230329-denghang/instance50668         (whole 20 s solve; the
+///                                                    refutation takes 0.02 s)
+///
+/// 128M sits 1.5x above the costliest search that ever succeeds and 1.9x below
+/// the cheapest starvation case, so it preserves every measured conversion
+/// while returning ~half to ~three-quarters of those two solves to the
+/// procedure that actually decides them.
+const MAX_W4_SEARCH_WORK: u64 = 128_000_000;
+
+/// WIDE ADMISSION ceiling on jointly-synthesized string variables.
+///
+/// [`MAX_W4_VARS`] / [`super::strings_w6::MAX_W6_SYNTH_VARS`] are WORK bounds:
+/// before the search had a work budget, a joint climb over dozens of variables
+/// was the only thing that could eat a whole solve, so the variable count stood
+/// in for cost. [`MAX_W4_SEARCH_WORK`] now measures that cost directly, so the
+/// count no longer has to — a wide formula whose climb is cheap should not be
+/// declined for a proxy the budget has superseded.
+///
+/// Measured: `kaluza/sat/big/398` declares 85 string variables and was declined
+/// at the classic bound of 12; admitted here it builds a JOINT witness the full
+/// model battery accepts, in 14,812 work units (0.0 s) — four orders of
+/// magnitude inside even the reduced wide budget.
+const MAX_W4_WIDE_VARS: usize = 128;
+
+/// Wide formulas get [`MAX_W4_SEARCH_WORK`] divided by this. They are the
+/// population that had NO admission at all, so the tax a non-converting one
+/// pays must be small and bounded: 128M/16 = 8M units, ~0.4 s.
+const W4_WIDE_WORK_SHARE: u64 = 16;
+
+#[cfg(test)]
+thread_local! {
+    /// Thread-local override (`Some(None)` means explicitly unbounded) so tiny
+    /// budget tests do not mutate the process environment or the OnceLock.
+    static W4_WORK_TEST_OVERRIDE: std::cell::Cell<Option<Option<u64>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+struct W4WorkTestOverride {
+    previous: Option<Option<u64>>,
+}
+
+#[cfg(test)]
+impl Drop for W4WorkTestOverride {
+    fn drop(&mut self) {
+        W4_WORK_TEST_OVERRIDE.with(|slot| slot.set(self.previous));
+    }
+}
+
+#[cfg(test)]
+fn w4_test_work_budget_override(value: Option<u64>) -> W4WorkTestOverride {
+    let previous = W4_WORK_TEST_OVERRIDE.with(|slot| slot.replace(Some(value)));
+    W4WorkTestOverride { previous }
+}
+
+/// Per-pass work cap. `AY_STR_W4_WORK=0` restores the pre-budget unbounded
+/// search exactly (the kill switch and the A/B knob in one).
+pub(super) fn w4_search_work_budget() -> Option<u64> {
+    #[cfg(test)]
+    if let Some(value) = W4_WORK_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return value;
+    }
+    static V: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("AY_STR_W4_WORK").ok() {
+        Some(s) => match s.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(n) => Some(n),
+            Err(_) => Some(MAX_W4_SEARCH_WORK),
+        },
+        None => Some(MAX_W4_SEARCH_WORK),
+    })
+}
+
 /// Drop the shared evaluation memo (`#eval-memo`).
 ///
 /// `Executor::evaluate_term` caches results keyed by `TermId` ALONE, which is
@@ -137,6 +251,16 @@ const MAX_W4_SEED_POOL: usize = 10;
 /// the memo the real validation then read.
 pub(super) fn w4_memo_reset() {
     crate::executor::model::eval_memo_clear();
+}
+
+/// The DETERMINISTIC work clock W4's search budget is measured against: the
+/// term evaluator's memo-missing node visits PLUS the regex evaluator's
+/// membership sub-problem consultations. Both halves are needed — the
+/// `full_str_int` refutation family burns 230M node visits and no regex work,
+/// while `denghang/instance50668` burns 65 s inside `str.in_re` atoms for only
+/// 370k node visits, so either counter alone leaves one family unbounded.
+pub(super) fn w4_work_clock() -> u64 {
+    crate::executor::model::eval_node_visits().saturating_add(ay_strings::regex_eval_work())
 }
 
 impl Executor {
@@ -161,7 +285,15 @@ impl Executor {
         } else {
             MAX_W4_VARS
         };
-        if vars.is_empty() || vars.len() > var_cap {
+        // WIDE band (see `MAX_W4_WIDE_VARS`): admitted, on a reduced budget.
+        let wide = vars.len() > var_cap;
+        if vars.is_empty() || vars.len() > MAX_W4_WIDE_VARS {
+            if super::debug_auflia_enabled() {
+                safe_eprintln!(
+                    "[W4] declined: {} string var(s), admission ceiling {MAX_W4_WIDE_VARS}",
+                    vars.len()
+                );
+            }
             return Ok(None);
         }
 
@@ -170,6 +302,9 @@ impl Executor {
         let (forced_true, forced_false) = self.forced_literal_closure_ext(true);
         let atoms = self.w4_collect_atoms(&forced_true, &forced_false);
         if atoms.is_empty() {
+            if super::debug_auflia_enabled() {
+                safe_eprintln!("[W4] declined: empty entailed atom set");
+            }
             return Ok(None);
         }
         // TARGETING GATE. W4 is a PER-POSITION synthesizer: it only ever makes
@@ -229,9 +364,16 @@ impl Executor {
         }
 
         // (c)-(e) synthesize joint assignments; keep the self-consistent ones.
+        //
+        // W4'S OWN SEARCH BUDGET (deterministic — see `w4_work_deadline`). The
+        // climb below is the pass's whole cost; everything above it is a linear
+        // syntactic walk. Armed here and DISARMED on every exit, so validation
+        // and every later pre-pass run unbudgeted.
+        let work_at_entry = w4_work_clock();
+        self.w4_budget_arm(wide);
         let mut candidates: Vec<HashMap<TermId, String>> = Vec::new();
         for seed_idx in 0..pool_len.min(MAX_W4_SEEDS) {
-            if self.should_abort_theory_loop() {
+            if self.w4_budget_exhausted() || self.should_abort_theory_loop() {
                 break;
             }
             let mut assign: HashMap<TermId, String> = HashMap::default();
@@ -240,7 +382,9 @@ impl Executor {
                 assign.insert(*var, pick.cloned().unwrap_or_default());
             }
             self.w4_synthesize(&var_atoms, &mut assign, &alphabet, &numeric, fresh);
-            let mut viol = self.w4_violations(&atoms, &assign);
+            let Some(mut viol) = self.w4_violations_complete(&atoms, &assign) else {
+                break;
+            };
             // W5 (`AY_STR_W5=1`): the per-character climb plateaus whenever a
             // violated atom's haystack is rooted at `str.++`/`str.replace` or
             // keyed on an `str.indexof` result — `w4_origin` cannot name a
@@ -256,7 +400,10 @@ impl Executor {
                     &numeric,
                     fresh,
                 );
-                viol = self.w4_violations(&atoms, &assign);
+                let Some(post_w5) = self.w4_violations_complete(&atoms, &assign) else {
+                    break;
+                };
+                viol = post_w5;
             }
             if super::debug_auflia_enabled() {
                 let mut shown: Vec<String> = assign.values().map(|s| format!("{s:?}")).collect();
@@ -277,6 +424,16 @@ impl Executor {
                     break;
                 }
             }
+        }
+        // Search over. Validation is NOT part of the search budget: an
+        // exhausted budget must never throw away a witness W4 already built.
+        let spent = w4_work_clock().saturating_sub(work_at_entry);
+        self.w4_budget_disarm();
+        if super::debug_auflia_enabled() {
+            safe_eprintln!(
+                "[W4] search spent {spent} node visit(s) of {:?}",
+                w4_search_work_budget()
+            );
         }
         if candidates.is_empty() {
             return Ok(None);
@@ -393,6 +550,13 @@ impl Executor {
         if depth > 64 {
             return false;
         }
+        // W7 (`AY_STR_W7=1`): a DEFINED variable mentions whatever its defining
+        // right-hand side mentions, so an atom about `_EXTEND_VAR_3` counts as
+        // an atom about the `ip_str` it is carved out of. `None` outside W7's
+        // own pass, so W4/W5/W6 are unchanged. See `strings_w7.rs`.
+        if let Some(rhs) = self.w7_def_of(term) {
+            return self.w4_mentions(rhs, var, depth + 1);
+        }
         match self.ctx.terms.get(term) {
             TermData::App(_, args) => args.iter().any(|&a| self.w4_mentions(a, var, depth + 1)),
             TermData::Not(inner) => self.w4_mentions(*inner, var, depth + 1),
@@ -415,7 +579,7 @@ impl Executor {
     /// an entailed `(= v "lit")` pin (alone — it is the only legal value),
     /// otherwise harvested equality constants, the required-literal packing,
     /// and uniform pads of a fresh / class-representative character.
-    fn w4_seed_pools(
+    pub(super) fn w4_seed_pools(
         &self,
         vars: &[TermId],
         atoms: &[(TermId, bool)],
@@ -544,6 +708,12 @@ impl Executor {
         if depth > 32 {
             return false;
         }
+        // W7: unwrap a DEFINED variable into its defining term, so a window of
+        // `_EXTEND_VAR_3` is recognised as a window of `ip_str`. `None` outside
+        // W7's own pass.
+        if let Some(rhs) = self.w7_def_of(term) {
+            return self.w4_window_root(rhs, var, depth + 1);
+        }
         let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(term) else {
             return false;
         };
@@ -569,7 +739,7 @@ impl Executor {
         for _pass in 0..MAX_W4_PASSES {
             let mut changed = false;
             for (var, atoms) in var_atoms {
-                if atoms.is_empty() {
+                if atoms.is_empty() || self.w4_budget_exhausted() {
                     continue;
                 }
                 let before = assign.get(var).cloned().unwrap_or_default();
@@ -597,7 +767,9 @@ impl Executor {
         fresh: char,
     ) {
         let mut best = assign.get(&var).cloned().unwrap_or_default();
-        let mut best_score = self.w4_violations(atoms, assign);
+        let Some(mut best_score) = self.w4_violations_complete(atoms, assign) else {
+            return;
+        };
         let mut stall = 0usize;
         let w5 = super::strings_w5::str_w5_enabled();
         let w6 = super::strings_w6::str_w6_enabled();
@@ -615,10 +787,10 @@ impl Executor {
         let stall_cap = 2usize;
         let is_numeric = numeric.contains(&var);
         for _round in 0..MAX_W4_ROUNDS {
-            if best_score == 0 || self.should_abort_theory_loop() {
+            if best_score == 0 || self.w4_budget_exhausted() || self.should_abort_theory_loop() {
                 break;
             }
-            let model = w4_trial_model(assign);
+            let model = self.w4_model_of(assign);
             w4_memo_reset();
             let cur: Vec<char> = best.chars().collect();
             let mut repairs: Vec<String> = Vec::new();
@@ -626,7 +798,13 @@ impl Executor {
                 if repairs.len() >= repair_cap {
                     break;
                 }
-                if !matches!(self.evaluate_term(&model, atom), EvalValue::Bool(v) if v != pol) {
+                let value = self.evaluate_term(&model, atom);
+                if self.w4_budget_exhausted() {
+                    w4_memo_reset();
+                    assign.insert(var, best);
+                    return;
+                }
+                if !matches!(value, EvalValue::Bool(v) if v != pol) {
                     continue;
                 }
                 // W5 supplies the two positional repairs W4's arms structurally
@@ -667,6 +845,22 @@ impl Executor {
                             }
                         }
                     }
+                    // W7's class-membership arm, consulted last and ONLY while
+                    // W7's own pass is armed, so W4/W5/W6 are unchanged.
+                    if self.w7_defs.is_some() {
+                        for cand in self.w7_repair_candidates(&model, atom, pol, var, &cur, fresh) {
+                            if repairs.len() >= repair_cap {
+                                break;
+                            }
+                            let next: String = cand.into_iter().collect();
+                            if next.chars().count() <= MAX_W4_LEN
+                                && next != best
+                                && !repairs.contains(&next)
+                            {
+                                repairs.push(next);
+                            }
+                        }
+                    }
                     continue;
                 };
                 let next: String = next.into_iter().collect();
@@ -681,7 +875,10 @@ impl Executor {
             let mut round_best: Option<(String, usize)> = None;
             for cand in repairs {
                 assign.insert(var, cand.clone());
-                let score = self.w4_violations(atoms, assign);
+                let Some(score) = self.w4_violations_complete(atoms, assign) else {
+                    assign.insert(var, best);
+                    return;
+                };
                 if round_best.as_ref().is_none_or(|(_, s)| score < *s) {
                     round_best = Some((cand, score));
                 }
@@ -707,6 +904,36 @@ impl Executor {
         assign.insert(var, best);
     }
 
+    /// Whether the W4 search currently in flight has spent its deterministic
+    /// work budget. Always `false` outside `try_per_position_witnesses` (no
+    /// deadline is armed there), so W6's and W7's own passes are unaffected.
+    pub(in crate::executor) fn w4_budget_exhausted(&self) -> bool {
+        self.w4_work_deadline
+            .get()
+            .is_some_and(|limit| w4_work_clock() >= limit)
+    }
+
+    /// Remaining matcher/node work in the active W4 pass. `None` means no W4
+    /// budget is armed, so ordinary evaluation keeps its historical behavior.
+    pub(in crate::executor) fn w4_remaining_work(&self) -> Option<u64> {
+        self.w4_work_deadline
+            .get()
+            .map(|limit| limit.saturating_sub(w4_work_clock()))
+    }
+
+    /// Install the per-pass work deadline (`try_per_position_witnesses` entry).
+    fn w4_budget_arm(&self, wide: bool) {
+        let share = if wide { W4_WIDE_WORK_SHARE } else { 1 };
+        self.w4_work_deadline
+            .set(w4_search_work_budget().map(|b| w4_work_clock().saturating_add(b / share)));
+    }
+
+    /// Drop back to "unbudgeted" — every exit of the W4 pass, and before
+    /// validation, which must never be cut short by the SEARCH's budget.
+    fn w4_budget_disarm(&self) {
+        self.w4_work_deadline.set(None);
+    }
+
     /// Number of entailed atoms DEFINITIVELY violated by `assign`.
     /// Atoms the evaluator cannot decide are not counted (they are decided by
     /// the real validation gate later).
@@ -715,14 +942,63 @@ impl Executor {
         atoms: &[(TermId, bool)],
         assign: &HashMap<TermId, String>,
     ) -> usize {
-        let model = w4_trial_model(assign);
+        self.w4_violations_complete(atoms, assign)
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Complete violation score, or `None` when W4's resource budget expires
+    /// during the sweep. Ordinary evaluator `Unknown` remains uncounted; only
+    /// resource exhaustion invalidates the whole score.
+    pub(super) fn w4_violations_complete(
+        &self,
+        atoms: &[(TermId, bool)],
+        assign: &HashMap<TermId, String>,
+    ) -> Option<usize> {
+        // W7: score the CLOSURE of the assignment under the defining equations
+        // (see `w4_model_of`). A defined variable whose value is stale
+        // disagrees with its own definition, so every score computed from it is
+        // about an assignment W7 would never hand to validation. Outside W7's
+        // own pass `w4_model_of` is exactly `w4_trial_model`, so W4/W5/W6
+        // scoring is byte-identical.
+        let model = self.w4_model_of(assign);
         w4_memo_reset();
-        let n = atoms
-            .iter()
-            .filter(|&&(t, pol)| matches!(self.evaluate_term(&model, t), EvalValue::Bool(v) if v != pol))
-            .count();
+        let score = (|| {
+            let mut n = 0usize;
+            for &(term, polarity) in atoms {
+                if self.w4_budget_exhausted() {
+                    return None;
+                }
+                let value = self.evaluate_term(&model, term);
+                if self.w4_budget_exhausted() {
+                    return None;
+                }
+                if matches!(value, EvalValue::Bool(v) if v != polarity) {
+                    n += 1;
+                }
+            }
+            Some(n)
+        })();
         w4_memo_reset();
-        n
+        score
+    }
+
+    /// The trial model an evaluation epoch should run against.
+    ///
+    /// Identical to [`w4_trial_model`] outside W7's pass. Under W7 the DEFINED
+    /// variables are recomputed from their defining equations first — string
+    /// values by [`Self::w7_propagate_defs`], integer values into an
+    /// `LiaModel` — so an origin resolved through a definition and the value
+    /// read back through it cannot disagree, and an Int variable a branch
+    /// defines is not silently read as 0.
+    pub(super) fn w4_model_of(&self, assign: &HashMap<TermId, String>) -> Model {
+        if self.w7_defs.is_some() {
+            let mut closed = assign.clone();
+            self.w7_propagate_defs(&mut closed);
+            let mut model = w4_trial_model(&closed);
+            self.w7_fill_int_defs(&mut model);
+            return model;
+        }
+        w4_trial_model(assign)
     }
 
     /// Map a violated entailed atom back to a per-position edit of `target`.
@@ -895,6 +1171,13 @@ impl Executor {
         if depth > 32 {
             return None;
         }
+        // W7: a DEFINED variable's position inside `target` is its defining
+        // term's position — this is what lets the per-position climb edit
+        // `ip_str` for an atom that only ever names `_EXTEND_VAR_3`. `None`
+        // outside W7's own pass, so W4/W5/W6 origins are unchanged.
+        if let Some(rhs) = self.w7_def_of(term) {
+            return self.w4_origin(model, rhs, target, depth + 1);
+        }
         let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(term) else {
             return None;
         };
@@ -970,6 +1253,26 @@ impl Executor {
         &mut self,
         candidates: &[HashMap<TermId, String>],
     ) -> Result<Option<SolveResult>> {
+        self.w4_validate_candidates_with_bools(candidates, &HashMap::default())
+    }
+
+    /// [`Self::w4_validate_candidates`] with BOOLEAN pins carried in the
+    /// candidate model.
+    ///
+    /// W7's branch selection knows which arm of a top-level `(ite c A B)` it
+    /// built the witness for, and `c` is a Bool VARIABLE of the formula — so
+    /// the candidate is only a model at all when `c` carries that value.
+    /// Measured on `kaluza/sat/small/bettermatch1`: with the string values
+    /// alone the whole formula is not decided (`unknown`), and with the branch
+    /// condition pinned the same values validate. The pins ride
+    /// `Model::bool_overrides`, the same slot model completion and array
+    /// reconciliation already use, and they change only what the candidate
+    /// SAYS — `finalize_sat_model_validation` still decides it.
+    pub(super) fn w4_validate_candidates_with_bools(
+        &mut self,
+        candidates: &[HashMap<TermId, String>],
+        bools: &HashMap<TermId, bool>,
+    ) -> Result<Option<SolveResult>> {
         // Save EVERY per-solve field the validation pipeline mutates — the
         // exact set `restore_witness_state` (shared with the other validated
         // witness pre-passes) covers, so a failed candidate leaves no trace
@@ -1013,7 +1316,9 @@ impl Executor {
                 return Ok(None);
             }
             w4_memo_reset();
-            self.last_model = Some(w4_trial_model(cand));
+            let mut model = self.w4_model_of(cand);
+            model.bool_overrides = bools.clone();
+            self.last_model = Some(model);
             self.last_result = Some(SolveResult::Sat);
             self.last_model_validated = false;
             if let Ok(SolveResult::Sat) = self.finalize_sat_model_validation() {
@@ -1023,6 +1328,12 @@ impl Executor {
                     );
                 }
                 return Ok(Some(SolveResult::Sat));
+            }
+            if super::debug_auflia_enabled() {
+                safe_eprintln!(
+                    "[W4] candidate rejected by the validation battery: reason={:?}",
+                    self.last_unknown_reason
+                );
             }
             restore(self);
             w4_memo_reset();
@@ -1039,10 +1350,18 @@ impl Executor {
 /// A trial model carrying ONLY the candidate string assignment — the same
 /// shape the P2 negative-only guess pass hands to the validation battery.
 pub(super) fn w4_trial_model(assign: &HashMap<TermId, String>) -> Model {
+    w4_trial_model_bools(assign, &HashMap::default())
+}
+
+/// [`w4_trial_model`] with Boolean pins in `bool_overrides`.
+pub(super) fn w4_trial_model_bools(
+    assign: &HashMap<TermId, String>,
+    bools: &HashMap<TermId, bool>,
+) -> Model {
     Model {
         sat_model: Vec::new(),
         term_to_var: HashMap::default(),
-        bool_overrides: HashMap::default(),
+        bool_overrides: bools.clone(),
         euf_model: None,
         array_model: None,
         lra_model: None,

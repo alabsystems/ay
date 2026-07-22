@@ -185,7 +185,7 @@ impl ArraySolver<'_> {
         // #8615: Early exit if the external interrupt flag is set.
         // final_check runs many expensive O(n²) sub-checks; returning Unknown
         // allows the DPLL(T) loop to detect the interrupt and abort.
-        if self.is_interrupted() {
+        if self.interrupted_or_deadline() {
             return TheoryResult::Unknown;
         }
 
@@ -256,7 +256,7 @@ impl ArraySolver<'_> {
         self.build_equiv_class_cache();
 
         // #8615: Check interrupt after building equiv class cache.
-        if self.is_interrupted() {
+        if self.interrupted_or_deadline() {
             return TheoryResult::Unknown;
         }
 
@@ -286,7 +286,7 @@ impl ArraySolver<'_> {
         self.populate_final_check_row2_upward_queue();
 
         // #8615: Check interrupt after rebuilding ROW2-upward candidates.
-        if self.is_interrupted() {
+        if self.interrupted_or_deadline() {
             return TheoryResult::Unknown;
         }
 
@@ -328,7 +328,7 @@ impl ArraySolver<'_> {
         }
 
         // #8615: Check interrupt between sub-checks.
-        if self.is_interrupted() {
+        if self.interrupted_or_deadline() {
             return TheoryResult::Unknown;
         }
 
@@ -367,7 +367,7 @@ impl ArraySolver<'_> {
         }
 
         // #8615: Check interrupt between sub-checks.
-        if self.is_interrupted() {
+        if self.interrupted_or_deadline() {
             return TheoryResult::Unknown;
         }
 
@@ -535,7 +535,7 @@ impl ArraySolver<'_> {
         }
 
         // #8615: Check interrupt before expensive event-driven queue population.
-        if self.is_interrupted() {
+        if self.interrupted_or_deadline() {
             return TheoryResult::Unknown;
         }
 
@@ -578,7 +578,7 @@ impl ArraySolver<'_> {
         }
 
         // #8615: Check interrupt before expensive event-driven queue population.
-        if self.is_interrupted() {
+        if self.interrupted_or_deadline() {
             return TheoryResult::Unknown;
         }
 
@@ -613,7 +613,7 @@ impl ArraySolver<'_> {
         }
 
         // #8615: Check interrupt between sub-checks.
-        if self.is_interrupted() {
+        if self.interrupted_or_deadline() {
             return TheoryResult::Unknown;
         }
 
@@ -642,7 +642,7 @@ impl ArraySolver<'_> {
         }
 
         // #8615: Check interrupt between sub-checks.
-        if self.is_interrupted() {
+        if self.interrupted_or_deadline() {
             return TheoryResult::Unknown;
         }
 
@@ -684,7 +684,7 @@ impl ArraySolver<'_> {
         }
 
         // #8615: Check interrupt between sub-checks.
-        if self.is_interrupted() {
+        if self.interrupted_or_deadline() {
             return TheoryResult::Unknown;
         }
 
@@ -713,7 +713,7 @@ impl ArraySolver<'_> {
         }
 
         // #8615: Check interrupt before interface equality generation.
-        if self.is_interrupted() {
+        if self.interrupted_or_deadline() {
             return TheoryResult::Unknown;
         }
 
@@ -732,7 +732,7 @@ impl ArraySolver<'_> {
         }
 
         // #8615: Check interrupt before interface equality generation.
-        if self.is_interrupted() {
+        if self.interrupted_or_deadline() {
             self.rollback_unreturned_model_equality_requests(&model_eq_requests);
             return TheoryResult::Unknown;
         }

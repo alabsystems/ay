@@ -148,7 +148,7 @@ script does not exist until its index entry does
 | cert-ci-gate | gate.pb | `scripts/cert_ci.sh` | sh | active | - | CERT-track CI gate (campaign M0: CakePB/VeriPB CI harness, stage 1). |
 | proof-overhead-gate | gate.pb | `scripts/proof_overhead.py` | python | active | - | Proof Tap overhead gate: dense-tap proof-on vs plain, median <= 2x. |
 | critical-solver-policy-gate | gate.release | `scripts/check_critical_solver_policy.sh` | bash | active | `ay gate` | Enforce that changes to critical solver files land with native solver gate evidence. |
-| doc-reality-gate | gate.release | `scripts/check_doc_reality.sh` | bash | placeholder | `ay gate` | placeholder: no checks configured |
+| doc-reality-gate | gate.release | `scripts/check_doc_reality.sh` | bash | active | `ay gate` | Check that local Markdown links in AY's public documentation resolve inside the checkout. |
 | public-clone-check | gate.release | `scripts/public-clone-check.sh` | bash | active | - | Unauthenticated public-clone build evidence: simulate what a fresh clone of the public repo sees. |
 | sat-soundness-gate | gate.soundness | `scripts/ci/sat_soundness_gate.sh` | bash | active | `ay gate` | SAT soundness gate: run ay on labeled vendored CNFs; fail the build on wrong verdicts. |
 | smt-soundness-gate | gate.soundness | `scripts/ci/smt_soundness_gate.sh` | bash | active | `ay gate` | SMT soundness-differential gate; the in-tree pre-push net. |

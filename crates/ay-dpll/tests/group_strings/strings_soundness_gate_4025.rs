@@ -46,10 +46,11 @@ fn string_logics_solve_correctly_after_gate_removal() {
     }
 }
 
-/// QF_SNIA with string terms is also gated to `unknown`.
+/// QF_SNIA routes supported string/integer formulas through the combined
+/// strings+arithmetic lane and validates the resulting model.
 #[test]
 #[timeout(10_000)]
-fn qf_snia_to_int_is_incomplete() {
+fn qf_snia_to_int_supported_case_is_sat() {
     let smt = r#"
 (set-logic QF_SNIA)
 (declare-fun x () String)
@@ -59,8 +60,8 @@ fn qf_snia_to_int_is_incomplete() {
     let result = crate::common::solve(smt);
     assert_eq!(
         crate::common::sat_result(&result),
-        Some("unknown"),
-        "QF_SNIA str.to_int should be gated to unknown"
+        Some("sat"),
+        "str.to_int(x) = 42 has the validated witness x = \"42\""
     );
 }
 

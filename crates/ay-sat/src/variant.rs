@@ -2293,9 +2293,11 @@ mod tests {
 
     #[test]
     fn test_official_main_lrat_clamps_custom_proof_incomplete_specialists() {
-        let mut profile = InprocessingFeatureProfile::default();
-        profile.sweep = true;
-        profile.symmetry = true;
+        let profile = InprocessingFeatureProfile {
+            sweep: true,
+            symmetry: true,
+            ..InprocessingFeatureProfile::default()
+        };
         let input = VariantInput::new(32, 96, true, true)
             .with_route_profile(VariantRouteProfile::OfficialSatCompMainLrat);
 

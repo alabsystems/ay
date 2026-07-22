@@ -285,7 +285,7 @@ const TARGETS: &[(&str, &str)] = &[
 ];
 
 #[test]
-#[ignore]
+#[ignore = "manual abstract-problem dump; requires AY_SPIKE_CORPUS"]
 fn ice_dt_dump_abstract() {
     let corpus = match std::env::var("AY_SPIKE_CORPUS") {
         Ok(d) => std::path::PathBuf::from(d),
@@ -314,7 +314,7 @@ fn ice_dt_dump_abstract() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "slow corpus spike gate; requires AY_SPIKE_CORPUS"]
 fn ice_dt_spike_gate() {
     let corpus = match std::env::var("AY_SPIKE_CORPUS") {
         Ok(d) => std::path::PathBuf::from(d),
@@ -444,7 +444,7 @@ fn run_dt_flags(abstraction: &CataAbstraction, budget: Duration) -> LearnRun {
 /// `AY_SPIKE_CORPUS=<tip-adt-lia dir> AY_SWEEP_SECS=40 cargo test -p ay-chc \
 ///   disj_cube_sweep -- --ignored --nocapture`
 #[test]
-#[ignore]
+#[ignore = "manual corpus performance sweep; requires AY_SPIKE_CORPUS"]
 fn disj_cube_sweep() {
     let corpus = match std::env::var("AY_SPIKE_CORPUS") {
         Ok(d) => std::path::PathBuf::from(d),
@@ -600,7 +600,7 @@ fn run_affine(abstraction: &CataAbstraction, budget: Duration) -> LearnRun {
 /// `AY_NAT_SPIKE_FILE=<abs.smt2> AY_NAT_SPIKE_SECS=30 cargo test -p ay-chc \
 ///   nat_peano_spike -- --ignored --nocapture`
 #[test]
-#[ignore]
+#[ignore = "manual per-benchmark learner spike; requires AY_NAT_SPIKE_FILE"]
 fn nat_peano_spike() {
     let file = match std::env::var("AY_NAT_SPIKE_FILE") {
         Ok(f) => std::path::PathBuf::from(f),

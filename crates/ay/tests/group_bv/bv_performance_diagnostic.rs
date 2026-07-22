@@ -175,8 +175,7 @@ fn external_codegen_faulhaber_small_constant_multipliers() {
     assert_eq!(
         outcome,
         Outcome::Unsat,
-        "ExternalCodegen Faulhaber regression did not close in {:?}",
-        elapsed
+        "ExternalCodegen Faulhaber regression did not close in {elapsed:?}"
     );
 }
 

@@ -819,7 +819,14 @@ impl ChcExpr {
                                     } else {
                                         (1u128 << width) - 1
                                     };
-                                    return Some(ChcExpr::BitVec((v >> lo) & mask, width));
+                                    // lo >= 128: the u128-backed constant has no
+                                    // bits there — extracting the high half of a
+                                    // 128-bit product's overflow check (e.g.
+                                    // extract(255,128) on a u128 mul) must yield
+                                    // 0, not a host shr-overflow panic
+                                    // (model-checker-consumer CodegenConstValue/bigints ICE).
+                                    let shifted = if *lo >= 128 { 0 } else { v >> lo };
+                                    return Some(ChcExpr::BitVec(shifted & mask, width));
                                 }
                                 if args_changed {
                                     ChcExpr::Op(*op, simplified_args)
@@ -859,7 +866,11 @@ impl ChcExpr {
                             ChcOp::BvSignExtend(n) if simplified_args.len() == 1 => {
                                 if let ChcExpr::BitVec(v, w) = simplified_args[0].as_ref() {
                                     // Sign-extend: replicate the sign bit
-                                    let sign_bit = if *w > 0 { (v >> (w - 1)) & 1 } else { 0 };
+                                    let sign_bit = if *w > 0 && *w <= 128 {
+                                        (v >> (w - 1)) & 1
+                                    } else {
+                                        0
+                                    };
                                     let new_width = w + n;
                                     let result = if sign_bit == 1 {
                                         let upper_mask = if new_width >= 128 {

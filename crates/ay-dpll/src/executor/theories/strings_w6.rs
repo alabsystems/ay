@@ -614,10 +614,19 @@ impl Executor {
         }
         let vars = self.collect_string_variables();
         if vars.is_empty() || vars.len() > MAX_W6_VARS {
+            if super::debug_auflia_enabled() {
+                safe_eprintln!(
+                    "[W6] declined: {} string var(s), joint work bound {MAX_W6_VARS}",
+                    vars.len()
+                );
+            }
             return Ok(None);
         }
         let memberships = self.w6_collect_memberships();
         if memberships.is_empty() {
+            if super::debug_auflia_enabled() {
+                safe_eprintln!("[W6] declined: no regex membership to build a word from");
+            }
             return Ok(None);
         }
 

@@ -16,9 +16,8 @@
 use ay_dpll::Executor;
 use ay_dpll::UnknownReason;
 use ay_frontend::parse;
+use ay_test_support::env::with_env_edits;
 use ntest::timeout;
-use std::ffi::OsString;
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const HARD_SEED_INPUT: &str = r#"
@@ -48,31 +47,6 @@ const HARD_SEED_INPUT: &str = r#"
 (check-sat)
 "#;
 
-struct EnvVarRestoreGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl EnvVarRestoreGuard {
-    fn new(key: &'static str, new_value: Option<OsString>) -> Self {
-        let previous = std::env::var_os(key);
-        match new_value {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
-        }
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarRestoreGuard {
-    fn drop(&mut self) {
-        match &self.previous {
-            Some(value) => std::env::set_var(self.key, value),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
-
 fn with_global_timeout_ms<T>(timeout_ms: u64, f: impl FnOnce() -> T) -> T {
     with_global_timeout_override(Some(timeout_ms), f)
 }
@@ -82,12 +56,14 @@ fn with_global_timeout_unset<T>(f: impl FnOnce() -> T) -> T {
 }
 
 fn with_global_timeout_override<T>(timeout_ms: Option<u64>, f: impl FnOnce() -> T) -> T {
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let env_lock = ENV_LOCK.get_or_init(|| Mutex::new(()));
-    let _env_guard = env_lock.lock().expect("env lock should not be poisoned");
-    let timeout_value = timeout_ms.map(|ms| OsString::from(ms.to_string()));
-    let _timeout_guard = EnvVarRestoreGuard::new("AY_GLOBAL_TIMEOUT_MS", timeout_value);
-    f()
+    // Serialized + restore-on-exit via the workspace env choke point.
+    with_env_edits(|env| {
+        match timeout_ms {
+            Some(ms) => env.set("AY_GLOBAL_TIMEOUT_MS", &ms.to_string()),
+            None => env.remove("AY_GLOBAL_TIMEOUT_MS"),
+        }
+        f()
+    })
 }
 
 #[test]
