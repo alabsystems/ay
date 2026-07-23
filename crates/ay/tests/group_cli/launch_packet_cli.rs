@@ -503,6 +503,11 @@ fn launch_packet_index_summarizes_packet_artifacts() {
         ),
         "{index}"
     );
+    assert!(
+        index.contains("Do not publish a broad public-launch claim"),
+        "{index}"
+    );
+    assert!(!index.contains("public broad public-launch"), "{index}");
 }
 
 #[test]

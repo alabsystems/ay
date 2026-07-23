@@ -338,7 +338,10 @@ pub unsafe extern "C" fn Z3_parser_context_from_string(
                 "Z3_parser_context_from_string",
             )
             .unwrap_or_default();
-            let asts = terms.into_iter().map(term_to_ast).collect();
+            let asts = terms
+                .into_iter()
+                .map(|term| term_to_ast(ctx, term))
+                .collect();
             cache_ast_vector(ctx, asts)
         })
     }

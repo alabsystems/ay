@@ -607,9 +607,11 @@ impl TermStore {
         self.skolem_id.get(&id).map(String::as_str)
     }
 
-    /// Register a Skolemization-minted symbol name (constant or function). See
-    /// the `skolem_symbols` field docs: call ONLY from the Skolem creation site
-    /// so membership remains exact provenance.
+    /// Register an authenticated Skolem symbol name (constant or function). See
+    /// the `skolem_symbols` field docs: call only from the Skolem creation site,
+    /// or while restoring an offline certificate after independently checking
+    /// its exact substitution, freshness, uniqueness, and dependency provenance,
+    /// so membership remains exact authority rather than a name heuristic.
     pub fn mark_skolem_symbol(&mut self, name: impl Into<String>) {
         self.skolem_symbols.insert(name.into());
     }

@@ -331,6 +331,55 @@ fn algebraic_layer_root_and_bounds() {
 }
 
 #[test]
+fn algebraic_handles_are_authenticated_to_their_context() {
+    unsafe {
+        let local = ctx();
+        let foreign = ctx();
+        let local_real = Z3_mk_real_sort(local);
+        let foreign_real = Z3_mk_real_sort(foreign);
+
+        // Deliberately store different exact values at the same arena index.
+        // Without a context salt the foreign sqrt(2) handle would alias the
+        // local sqrt(3) value.
+        let local_three = Z3_mk_numeral(local, c"3".as_ptr(), local_real);
+        let foreign_two = Z3_mk_numeral(foreign, c"2".as_ptr(), foreign_real);
+        let local_sqrt3 = Z3_algebraic_root(local, local_three, 2);
+        let foreign_sqrt2 = Z3_algebraic_root(foreign, foreign_two, 2);
+        assert_ne!(local_sqrt3, 0);
+        assert_ne!(foreign_sqrt2, 0);
+        assert_eq!(
+            local_sqrt3 & TAGGED_AST_INDEX_MASK,
+            foreign_sqrt2 & TAGGED_AST_INDEX_MASK,
+            "fixture must exercise colliding algebraic-arena indices"
+        );
+        assert_ne!(local_sqrt3, foreign_sqrt2);
+
+        assert!(!Z3_algebraic_is_value(local, foreign_sqrt2));
+        assert!(!Z3_algebraic_is_pos(local, foreign_sqrt2));
+        assert_eq!(Z3_get_error_code(local), Z3_INVALID_ARG);
+        assert!(Z3_ast_to_string(local, foreign_sqrt2).is_null());
+        assert!(Z3_algebraic_is_pos(local, local_sqrt3));
+
+        // AST vectors are heterogeneous Z3 containers, so authenticated
+        // algebraic handles must round-trip just like term ASTs. A foreign
+        // tagged handle must still fail closed instead of aliasing the local
+        // arena entry with the same index.
+        let values = Z3_mk_ast_vector(local);
+        Z3_ast_vector_push(local, values, local_sqrt3);
+        assert_eq!(Z3_ast_vector_get(local, values, 0), local_sqrt3);
+        Z3_ast_vector_push(local, values, foreign_sqrt2);
+        assert_eq!(Z3_get_error_code(local), Z3_INVALID_ARG);
+        assert_eq!(Z3_ast_vector_size(local, values), 1);
+        Z3_ast_vector_set(local, values, 0, foreign_sqrt2);
+        assert_eq!(Z3_get_error_code(local), Z3_INVALID_ARG);
+        assert_eq!(Z3_ast_vector_get(local, values, 0), local_sqrt3);
+
+        Z3_del_context(foreign);
+        Z3_del_context(local);
+    }
+}
+
+#[test]
 fn rcf_del_and_null_handles_are_sound() {
     unsafe {
         let c = ctx();

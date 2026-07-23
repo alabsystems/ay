@@ -525,6 +525,111 @@ fn test_unsat_core_survives_get_consequences_state_clobber() {
 }
 
 #[test]
+fn test_unsat_proof_survives_get_consequences_probe_solves() {
+    let outputs = run_script_collect(
+        r#"
+            (set-option :produce-proofs true)
+            (set-logic QF_BOOL)
+            (declare-const p Bool)
+            (declare-const q Bool)
+            (assert p)
+            (assert q)
+            (check-sat-assuming ((not q)))
+            (get-proof)
+            (get-consequences () (p))
+            (get-proof)
+        "#,
+    );
+    assert_eq!(outputs[0], "unsat", "verdict: {outputs:?}");
+    assert!(
+        outputs[1].contains("(cl)"),
+        "first proof must derive the empty clause: {outputs:?}"
+    );
+    assert_eq!(
+        outputs[1], outputs[3],
+        "internal consequence probes must restore the complete proof/scope snapshot: {outputs:?}"
+    );
+}
+
+#[test]
+fn combined_theory_consequence_probe_restores_proof_assertion_provenance() {
+    let mut exec = Executor::new();
+    let setup = parse(
+        r#"
+            (set-option :produce-proofs true)
+            (set-logic ALL)
+            (declare-const q Bool)
+            (declare-const r Bool)
+            (declare-const x Int)
+            (declare-fun f (Int) Int)
+            (assert q)
+            (assert r)
+            (assert (= x 0))
+            (check-sat-assuming ((not q)))
+        "#,
+    )
+    .unwrap();
+    let setup_outputs = exec.execute_all(&setup).unwrap();
+    assert_eq!(setup_outputs, ["unsat"], "{setup_outputs:?}");
+    assert!(exec.last_proof.is_some(), "initial proof was not retained");
+
+    // Model a legitimate narrower preprocessing window: `r` is an immutable
+    // authored root but is irrelevant to the retained q / not-q refutation, so
+    // this proof window does not export it as a current premise. A later
+    // combined-theory probe will rediscover `r` in its own preprocessing
+    // window; restoring the old proof must restore this narrower map as well.
+    let r = exec.ctx.terms.lookup("r").expect("declared r");
+    let provenance = exec
+        .proof_problem_assertion_provenance
+        .as_mut()
+        .expect("public solve should freeze proof assertion provenance");
+    assert!(
+        provenance.original_problem_assertions.contains(&r),
+        "r must remain an immutable authored root"
+    );
+    provenance
+        .problem_assertions
+        .retain(|assertion| *assertion != r);
+    provenance.assertion_sources.remove(&r);
+
+    let before = exec
+        .proof_problem_assertion_provenance
+        .clone()
+        .expect("narrowed proof assertion provenance");
+    let probe = parse(
+        r#"
+            (get-consequences ()
+                ((= (+ (f x) 1) (+ (f 0) 1))))
+        "#,
+    )
+    .unwrap();
+    let probe_outputs = exec.execute_all(&probe).unwrap();
+    assert!(
+        probe_outputs
+            .first()
+            .is_some_and(|output| output.starts_with("(sat (")),
+        "combined-theory consequence probe did not complete: {probe_outputs:?}"
+    );
+
+    let after = exec
+        .proof_problem_assertion_provenance
+        .as_ref()
+        .expect("probe must restore proof assertion provenance");
+    assert_eq!(
+        after.original_problem_assertions, before.original_problem_assertions,
+        "probe changed the authored assertion roots"
+    );
+    assert_eq!(
+        after.problem_assertions, before.problem_assertions,
+        "probe changed the exportable assertion roots"
+    );
+    assert_eq!(
+        after.assertion_sources, before.assertion_sources,
+        "probe changed the proof assertion source map"
+    );
+}
+
+#[test]
 fn test_unsat_core_complementary_named_and_assumption_literal() {
     // #unsat-core-polarity (skeptic reproducer s_f): a named assertion whose
     // literal is COMPLEMENTARY to a user assumption literal on the same
@@ -560,4 +665,118 @@ fn test_unsat_core_complementary_named_and_assumption_literal() {
              load-bearing named assertion nm0: {core}"
         );
     }
+}
+
+/// #dump-self-contained: a serialized script must declare every uninterpreted
+/// sort it references (declaration sorts, term sorts, quantifier binder
+/// sorts), or the dump is unusable as a standalone repro. The sort names are
+/// verification-consumer-shaped on purpose (`__verification_consumer_mutref::int` needs pipe-quoting).
+#[test]
+fn serialized_script_declares_referenced_uninterpreted_sorts() {
+    let mut exec = Executor::new();
+    let commands = parse(
+        r#"
+            (set-logic ALL)
+            (declare-sort |__verification_consumer_mutref::int| 0)
+            (declare-sort Unit 0)
+            (declare-const u Unit)
+            (declare-const m |__verification_consumer_mutref::int|)
+            (declare-const n |__verification_consumer_mutref::int|)
+            (declare-fun cur (|__verification_consumer_mutref::int|) Int)
+            (assert (= (cur m) 5))
+            (assert (distinct m n))
+            (assert (= u u))
+        "#,
+    )
+    .unwrap();
+    exec.execute_all(&commands).unwrap();
+
+    let script = exec.to_smtlib2();
+    assert!(
+        script.contains("(declare-sort |__verification_consumer_mutref::int| 0)"),
+        "{script}"
+    );
+    assert!(script.contains("(declare-sort Unit 0)"), "{script}");
+    // Sort declarations must precede the first symbol declaration that uses
+    // them.
+    let sort_pos = script.find("(declare-sort |__verification_consumer_mutref::int| 0)");
+    let use_pos = script.find("(declare-const m");
+    assert!(sort_pos < use_pos, "{script}");
+    // The built-in FP RoundingMode sort must never be re-declared.
+    assert!(!script.contains("(declare-sort RoundingMode"), "{script}");
+
+    // Round-trip: the serialized script must parse and solve in a fresh
+    // executor through ay's own front end.
+    let replay = run_script_collect(&script);
+    assert_eq!(replay.last().map(String::as_str), Some("sat"), "{script}");
+}
+
+/// #dump-self-contained: an uninterpreted sort reachable only through a
+/// compound sort (array index/element, seq element) or a quantifier binder is
+/// still declared.
+#[test]
+fn serialized_script_declares_sorts_nested_in_compound_sorts() {
+    let mut exec = Executor::new();
+    let commands = parse(
+        r#"
+            (set-logic ALL)
+            (declare-sort Elem 0)
+            (declare-sort Idx 0)
+            (declare-sort SeqElem 0)
+            (declare-sort BinderOnly 0)
+            (declare-const a (Array Idx Elem))
+            (declare-const i Idx)
+            (declare-const s (Seq SeqElem))
+            (assert (= (select a i) (select a i)))
+            (assert (= s s))
+            (assert (forall ((q BinderOnly)) (= q q)))
+        "#,
+    )
+    .unwrap();
+    exec.execute_all(&commands).unwrap();
+
+    let script = exec.to_smtlib2();
+    assert!(script.contains("(declare-sort Elem 0)"), "{script}");
+    assert!(script.contains("(declare-sort Idx 0)"), "{script}");
+    assert!(script.contains("(declare-sort SeqElem 0)"), "{script}");
+    assert!(script.contains("(declare-sort BinderOnly 0)"), "{script}");
+
+    let replay = run_script_collect(&script);
+    assert_eq!(replay.last().map(String::as_str), Some("sat"), "{script}");
+}
+
+/// #dump-self-contained: a script whose terms touch a declared DATATYPE sort
+/// is serialized fail-visible — the carrier is declared as an uninterpreted
+/// sort and the script carries a warning header marking it as a UF
+/// over-abstraction (not oracle-equivalent for external solvers).
+#[test]
+fn serialized_script_marks_datatype_sorts_fail_visible() {
+    let mut exec = Executor::new();
+    let commands = parse(
+        r#"
+            (set-logic ALL)
+            (declare-datatypes ((Pair 0))
+                (((mk-pair (first Int) (second Int)))))
+            (declare-const p Pair)
+            (assert (= p (mk-pair 1 2)))
+            (assert (= (first p) 1))
+            (assert ((_ is mk-pair) p))
+        "#,
+    )
+    .unwrap();
+    exec.execute_all(&commands).unwrap();
+
+    let script = exec.to_smtlib2();
+    assert!(
+        script.contains("; WARNING: NOT oracle-equivalent"),
+        "{script}"
+    );
+    assert!(script.contains(";   datatype sort: Pair"), "{script}");
+    assert!(script.contains("(declare-sort Pair 0)"), "{script}");
+    // Constructor, selector, and tester applications must all survive the UF
+    // weakening as ordinary declared symbols. The weakened script is expected
+    // to be SAT (not oracle-equivalent), but it must be a real standalone
+    // script accepted by AY's own parser/executor.
+    let replay = run_script_collect(&script);
+    assert_eq!(replay.last().map(String::as_str), Some("sat"), "{script}");
 }

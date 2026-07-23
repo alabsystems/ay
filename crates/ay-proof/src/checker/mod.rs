@@ -4,15 +4,19 @@
 
 //! Proof structure validation for premise linkage, resolution, DRUP, and terminal empty-clause derivation.
 mod array_axiom;
+pub(crate) use array_axiom::{array_select_store_printer_terms, ArraySelectStorePrinterTerms};
 pub use array_axiom::{
-    recognize_array_extensionality, recognize_array_select_store, recognize_array_theory_lemma,
-    ExtDiffRegistry,
+    recognize_array_extensionality, recognize_array_extensionality_chain,
+    recognize_array_select_store, recognize_array_theory_lemma,
+    recognize_folded_array_extensionality, ExtDiffRegistry,
 };
 mod boolean;
 mod boolean_derived;
 mod boolean_negation;
 mod bv_bitblast;
-pub use bv_bitblast::{recognize_bool_tautology, recognize_bv_bitblast};
+pub use bv_bitblast::{
+    recognize_bool_tautology, recognize_bv_bitblast, recognize_bv_ground_evaluate,
+};
 mod clausification;
 mod datatype_axiom;
 pub use datatype_axiom::{recognize_datatype_distinct, recognize_datatype_selector_project};
@@ -22,9 +26,13 @@ mod ite_axiom;
 pub use ite_axiom::recognize_ite_same;
 mod regex_empty;
 pub use regex_empty::recognize_regex_intersect_empty;
+mod rounding_mode;
+pub use rounding_mode::recognize_rounding_mode_domain;
 pub use string_ground::recognize_string_ground_eval;
 mod fp_bounded;
-pub use fp_bounded::{recognize_fp_classification, recognize_fp_classification_op};
+pub use fp_bounded::{
+    recognize_fp_classification, recognize_fp_classification_op, recognize_fp_rounding_mode_domain,
+};
 mod fp_to_bv;
 mod lia;
 mod lra_farkas;
@@ -32,6 +40,8 @@ pub(crate) mod quantifier;
 mod resolution;
 mod string_axiom;
 mod string_ground;
+mod string_length_identity;
+pub use string_length_identity::recognize_string_length_lemma;
 
 use ay_core::{
     AletheRule, FarkasAnnotation, LiaAnnotation, Proof, ProofId, ProofStep, TermId, TermStore,
@@ -58,6 +68,22 @@ pub enum ProofCheckError {
         expected: String,
         /// The schema tag found in the bundle.
         found: String,
+    },
+    /// A serialized proof bundle violated the structural invariants required
+    /// before its untrusted term/proof tables can be indexed safely.
+    #[error("malformed proof bundle: {reason}")]
+    MalformedProofBundle {
+        /// Description of the first rejected structural invariant.
+        reason: String,
+    },
+    /// A context-bound proof used a free assumption outside the supplied
+    /// problem obligation.
+    #[error("step {step} assumes term {term} outside the supplied problem obligation")]
+    UnauthorizedAssumption {
+        /// The unauthorized `Assume` step.
+        step: ProofId,
+        /// The term admitted as an unsupported hypothesis.
+        term: TermId,
     },
     /// The proof has steps but none of them produce a clause.
     #[error("proof has no clause-producing steps")]
@@ -226,20 +252,61 @@ pub fn check_proof_collecting_trust(
     proof: &Proof,
     terms: &TermStore,
 ) -> Result<Vec<(ProofId, Vec<TermId>)>, ProofCheckError> {
+    check_proof_collecting_trust_with_context(proof, terms, None, None, None)
+}
+
+/// As [`check_proof_collecting_trust`], but with the full declaration and
+/// authored-assertion context used by [`crate::check_proof_strict_with_context`].
+///
+/// Datatype constructor and selector declarations allow their corresponding
+/// theory lemmas to be validated at the strict boundary. `problem_assertions`
+/// allows [`ExtDiffRegistry`] to authenticate every
+/// `TheoryLemmaKind::ArrayExtensionality` witness against the proof's
+/// `array_ext_diff_intro` definitions and the problem's authored symbols.
+/// Passing `None` for the problem assertions keeps array extensionality
+/// fail-closed because witness freshness cannot then be established.
+///
+/// Only explicit trust steps (and trust-kind generic theory lemmas) are
+/// deferred and returned to the caller. Every other step, including every
+/// context-dependent theory lemma, must pass the same strict validation used
+/// by [`crate::check_proof_strict_with_context`]. The caller MUST independently
+/// discharge every returned clause before accepting the proof.
+pub fn check_proof_collecting_trust_with_context(
+    proof: &Proof,
+    terms: &TermStore,
+    dt_decls: Option<&[(String, Vec<String>)]>,
+    ctor_selectors: Option<&[(String, Vec<String>)]>,
+    problem_assertions: Option<&[TermId]>,
+) -> Result<Vec<(ProofId, Vec<TermId>)>, ProofCheckError> {
     if proof.steps.is_empty() {
         return Err(ProofCheckError::EmptyProof);
     }
+
+    if let Some(assertions) = problem_assertions {
+        validate_problem_assumptions(proof, terms, assertions)?;
+    }
+
+    // Build the provenance registry before validating any step, exactly as
+    // strict-with-context does. This rejects malformed, duplicate, cyclic, or
+    // non-fresh introductions even when no extensionality lemma cites them.
+    let ext_diff = match problem_assertions {
+        Some(assertions) => Some(ExtDiffRegistry::collect(proof, terms, assertions)?),
+        None => None,
+    };
 
     let mut derived_clauses: Vec<Option<Vec<TermId>>> = Vec::with_capacity(proof.steps.len());
     let mut collected: Vec<(ProofId, Vec<TermId>)> = Vec::new();
 
     for (idx, step) in proof.steps.iter().enumerate() {
-        validate_step(
+        validate_step_with_datatypes(
             terms,
             &mut derived_clauses,
             ProofId(idx as u32),
             step,
             true,
+            dt_decls,
+            ctor_selectors,
+            ext_diff.as_ref(),
             Some(&mut collected),
         )?;
     }
@@ -247,6 +314,44 @@ pub fn check_proof_collecting_trust(
     quantifier::validate_sko_forall_uniqueness(proof, terms)?;
     ensure_terminal_empty_clause(&derived_clauses)?;
     Ok(collected)
+}
+
+pub(crate) fn validate_problem_assumptions(
+    proof: &Proof,
+    terms: &TermStore,
+    problem_assertions: &[TermId],
+) -> Result<(), ProofCheckError> {
+    let mut allowed: ay_core::kani_compat::DetHashSet<TermId> =
+        problem_assertions.iter().copied().collect();
+    let mut expanded = ay_core::kani_compat::DetHashSet::default();
+    let mut stack = problem_assertions.to_vec();
+    while let Some(term) = stack.pop() {
+        if !expanded.insert(term) {
+            continue;
+        }
+        let ay_core::term::TermData::App(ay_core::Symbol::Named(name), args) = terms.get(term)
+        else {
+            continue;
+        };
+        if name != "and" {
+            continue;
+        }
+        for &arg in args {
+            allowed.insert(arg);
+            stack.push(arg);
+        }
+    }
+    for (index, step) in proof.steps.iter().enumerate() {
+        if let ProofStep::Assume(term) = step {
+            if !allowed.contains(term) {
+                return Err(ProofCheckError::UnauthorizedAssumption {
+                    step: ProofId(index as u32),
+                    term: *term,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Crate-internal re-export of the extensionality validator so the whole-proof
@@ -487,6 +592,12 @@ fn validate_theory_lemma(
             TheoryLemmaKind::FpClassification { .. } => {
                 fp_bounded::validate_fp_classification(terms, step_id, clause)?;
             }
+            TheoryLemmaKind::FpRoundingModeDomain => {
+                fp_bounded::validate_fp_rounding_mode_domain(terms, step_id, clause)?;
+            }
+            TheoryLemmaKind::RoundingModeDomain => {
+                rounding_mode::validate_rounding_mode_domain(terms, step_id, clause)?;
+            }
             TheoryLemmaKind::BvBitBlastGate { gate_type, width } => {
                 bv_bitblast::validate_bv_bitblast(
                     terms,
@@ -535,6 +646,16 @@ fn validate_theory_lemma(
             // (#8074).
             TheoryLemmaKind::StringLengthAxiom => {
                 string_axiom::validate_string_length_axiom(terms, step_id, clause)?;
+            }
+            // Universally-valid str.len theorem over symbolic subjects
+            // (#selfcert-strlen): the clause carries a certified length identity
+            // (concat-length sum, empty↔zero-length, non-negativity,
+            // constant-length, equal-length congruence, or containment bound).
+            // The INDEPENDENT structural checker re-derives the exact algebraic
+            // identity and fails closed on any near-miss, so the injected length
+            // axioms can carry a checkable rule instead of a bare foreign assume.
+            TheoryLemmaKind::StringLengthLemma => {
+                string_length_identity::validate_string_length_lemma(terms, step_id, clause)?;
             }
             TheoryLemmaKind::StringContentAxiom => {
                 string_axiom::validate_string_content_axiom(terms, step_id, clause)?;
@@ -823,6 +944,9 @@ fn validate_generic_step(
         }
         AletheRule::DistinctElim if strict => {
             euf::validate_distinct_elim(terms, step_id, clause)?;
+        }
+        AletheRule::Evaluate if strict => {
+            bv_bitblast::validate_bv_ground_evaluate(terms, step_id, clause, premises.len(), args)?;
         }
         AletheRule::LaDisequality if strict => {
             lia::validate_la_disequality(terms, step_id, clause, premises.len(), args)?;

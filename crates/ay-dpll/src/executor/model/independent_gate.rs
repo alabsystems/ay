@@ -1852,7 +1852,20 @@ impl Executor {
                 // structured trace): a theory-search path produced an invalid
                 // model. Emitted while `last_model` is still live (the downgrade
                 // below clears it).
+                if std::env::var_os("AY_MODEL_REJECT_DUMP").is_some() {
+                    eprintln!("[reject-site] apply_independent_model_gate");
+                }
                 self.report_caught_invalid_model(assertion, &term);
+                // DIAGNOSTIC ONLY (`AY_MODEL_REJECT_DUMP=1`; default off is
+                // byte-identical). The gate names the TOP-LEVEL assertion, which
+                // on a single-`assert` benchmark is the whole conjunction — an
+                // unusable census signal. Re-run the SAME evaluator over the
+                // FLATTENED conjuncts to name the one that actually computed
+                // false. WRITE-ONLY: no verdict path reads it, and the
+                // enforcement below is untouched.
+                if std::env::var_os("AY_MODEL_REJECT_DUMP").is_some() {
+                    self.dump_violated_flat_conjuncts(assertion);
+                }
                 self.last_statistics
                     .set_string("model_check_gate.result", "model-violates");
                 self.last_statistics
@@ -1937,6 +1950,50 @@ impl Executor {
                      (evaluator coverage gap, not a refutation); keeping verdict"
                 );
                 result
+            }
+        }
+    }
+
+    /// DIAGNOSTIC ONLY (`AY_MODEL_REJECT_DUMP=1`): name the FLATTENED
+    /// conjuncts of a gate-refuted assertion that the gate's own evaluator
+    /// computes `false`. Pure re-evaluation through the same
+    /// [`IndependentModelView`]; nothing is mutated and no verdict path reads
+    /// the output.
+    fn dump_violated_flat_conjuncts(&self, assertion: TermId) {
+        let Some(model) = self.last_model.as_ref() else {
+            return;
+        };
+        let view = IndependentModelView::new(self, model);
+        view.ensure_def_index();
+        let mut flat: Vec<TermId> = Vec::new();
+        let mut stack = vec![assertion];
+        while let Some(t) = stack.pop() {
+            match self.ctx.terms.get(t) {
+                TermData::App(sym, args) if sym.name() == "and" => {
+                    stack.extend(args.iter().rev().copied());
+                }
+                _ => flat.push(t),
+            }
+            if flat.len() > 100_000 {
+                break;
+            }
+        }
+        // ONE shared evaluator over the whole flattened window: the gate's
+        // UF/select single-valuedness is a CROSS-conjunct property (it keys
+        // applications by evaluated argument values over the entire run), so
+        // re-checking conjuncts one at a time would lose exactly the
+        // inconsistency that refuted the model. Peel off each violated
+        // conjunct and re-run to enumerate a few.
+        let mut window: Vec<TermId> = flat;
+        for _ in 0..8 {
+            match ay_model_check::confirm_model(&self.ctx.terms, &view, &window) {
+                GateVerdict::ModelViolates { assertion: bad } => {
+                    let text = self.format_term(bad);
+                    let text: String = text.chars().take(300).collect();
+                    eprintln!("[gate-false-conjunct] {text}");
+                    window.retain(|&t| t != bad);
+                }
+                _ => break,
             }
         }
     }

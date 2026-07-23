@@ -3720,7 +3720,9 @@ pub(crate) fn emit_dt_tester_exclusion_firewall_lean_from_parsed(
     let testers: Vec<(&str, &PTerm)> = parsed.iter().filter_map(parsed_positive_tester).collect();
     // Datatype (name, ctors) owning a constructor.
     let datatype_of = |ctor: &str| -> Option<&(String, Vec<String>)> {
-        decls.iter().find(|(_, cs)| cs.iter().any(|c| c == ctor))
+        let mut owners = decls.iter().filter(|(_, cs)| cs.iter().any(|c| c == ctor));
+        let owner = owners.next()?;
+        owners.next().is_none().then_some(owner)
     };
     for a in 0..testers.len() {
         for b in (a + 1)..testers.len() {
@@ -3856,7 +3858,9 @@ pub(crate) fn emit_dt_exhaustiveness_firewall_lean_from_parsed(
 ) -> Option<String> {
     let is_ctor = |name: &str| decls.iter().any(|(_, cs)| cs.iter().any(|c| c == name));
     let datatype_of = |ctor: &str| -> Option<&(String, Vec<String>)> {
-        decls.iter().find(|(_, cs)| cs.iter().any(|c| c == ctor))
+        let mut owners = decls.iter().filter(|(_, cs)| cs.iter().any(|c| c == ctor));
+        let owner = owners.next()?;
+        owners.next().is_none().then_some(owner)
     };
     // Flatten every top-level assertion's `and` structure into one conjunct pool.
     let mut conjs: Vec<&PTerm> = Vec::new();
@@ -3878,7 +3882,10 @@ pub(crate) fn emit_dt_exhaustiveness_firewall_lean_from_parsed(
             let Some((dtc, ctors)) = datatype_of(c) else {
                 continue;
             };
-            if ctors.len() != 2 || !ctors.iter().any(|x| x == d) {
+            let Some((dtd, _)) = datatype_of(d) else {
+                continue;
+            };
+            if dtc != dtd || ctors.len() != 2 || !ctors.iter().any(|x| x == d) {
                 continue;
             }
             return Some(render_dt_exhaustiveness_lean(fnv_hex(&format!(
@@ -3972,20 +3979,26 @@ end AySoundness.Emitted.DtExhaust_{hash}
 /// BV-constant compare, not a `DtSelector` theory lemma), so reconstruct from the
 /// frontend assertions like the selector-congruence / injectivity emitters.
 ///
-/// `C` and its selectors come from `ctor_selectors`; the field is abstracted to
-/// `Int` (the projection identity `sel (mk a) = a` is field-sort-independent, as
-/// in the injectivity emitter). EMISSION-ONLY; grounded through
+/// `C` must have exactly one owner in `decls`, and its selectors come from one
+/// unambiguous `ctor_selectors` entry; overloaded surface names therefore
+/// decline instead of borrowing another datatype's field positions. The field
+/// is abstracted to `Int` (the projection identity `sel (mk a) = a` is
+/// field-sort-independent, as in the injectivity emitter). EMISSION-ONLY; grounded through
 /// `AySoundness.firewall_combined_unsat`; axioms ⊆ {propext, Quot.sound}.
 /// Fail-closed (`None`) on any other shape.
 pub(crate) fn emit_dt_selector_over_ctor_firewall_lean_from_parsed(
     parsed: &[PTerm],
+    decls: &[(String, Vec<String>)],
     ctor_selectors: &[(String, Vec<String>)],
 ) -> Option<String> {
     let selectors_of = |ctor: &str| -> Option<&Vec<String>> {
-        ctor_selectors
-            .iter()
-            .find(|(c, _)| c == ctor)
-            .map(|(_, s)| s)
+        let mut matches = ctor_selectors.iter().filter(|(c, _)| c == ctor);
+        let (_, selectors) = matches.next()?;
+        matches.next().is_none().then_some(selectors)
+    };
+    let has_unique_owner = |ctor: &str| {
+        let mut owners = decls.iter().filter(|(_, cs)| cs.iter().any(|c| c == ctor));
+        owners.next().is_some() && owners.next().is_none()
     };
     for a in parsed {
         // A: `(= X (C args))` with `X` a variable and `C` a known constructor.
@@ -4002,6 +4015,9 @@ pub(crate) fn emit_dt_selector_over_ctor_firewall_lean_from_parsed(
             let PTerm::App(c, cargs) = &ea[ci] else {
                 continue;
             };
+            if !has_unique_owner(c) {
+                continue;
+            }
             let Some(sels) = selectors_of(c) else {
                 continue;
             };
@@ -4035,9 +4051,13 @@ pub(crate) fn emit_dt_selector_over_ctor_firewall_lean_from_parsed(
                     if sx != x {
                         continue;
                     }
-                    let Some(idx) = sels.iter().position(|se| se == s) else {
+                    let mut positions = sels.iter().enumerate().filter(|(_, se)| *se == s);
+                    let Some((idx, _)) = positions.next() else {
                         continue;
                     };
+                    if positions.next().is_some() {
+                        continue;
+                    }
                     if cargs[idx] != ba[vi] {
                         continue;
                     }
@@ -4354,6 +4374,227 @@ end AySoundness.Emitted.DtEnumCard_{hash}
         kn = format!("{k}^{n}"),
         lemma_cid = p + 1,
         proof_cid = p + 2,
+    )
+}
+
+/// Recognize a DISEQUALITY over exactly two operands — either `(distinct A B)`
+/// (binary) or `(not (= A B))` — returning `(A, B)`. Used by the F3 emitter to
+/// spot the asserted `f v1 ≠ f (f v2)` regardless of which disequality form the
+/// frontend produced.
+fn parsed_diseq_pair(t: &PTerm) -> Option<(&PTerm, &PTerm)> {
+    let PTerm::App(op, args) = t else {
+        return None;
+    };
+    match op.as_str() {
+        "distinct" if args.len() == 2 => Some((&args[0], &args[1])),
+        "not" if args.len() == 1 => {
+            let PTerm::App(eq, ea) = &args[0] else {
+                return None;
+            };
+            (eq == "=" && ea.len() == 2).then(|| (&ea[0], &ea[1]))
+        }
+        _ => None,
+    }
+}
+
+/// Emit a verified-firewall Lean proof for the DATATYPE F3 (`f³ = f` on a
+/// two-element enum) refutation over the PARSED (frontend) assertions: a
+/// two-constructor ENUM datatype (every constructor nullary), a unary
+/// uninterpreted function `fEnum : Enum → Enum` over it, and the two assertions
+///
+///   (= (fEnum v1) v2)                              — `f v1 = v2`
+///   (distinct (fEnum v1) (fEnum (fEnum v2)))       — `f v1 ≠ f (f v2)`
+///
+/// On a two-element type EVERY self-map `f` satisfies `f x = f (f (f x))`, so
+/// with `f v1 = v2` we get `f (f v2) = f (f (f v1)) = f v1`, contradicting
+/// `f v1 ≠ f (f v2)`. ay's QF_UFDT pipeline refutes eagerly and folds the term
+/// structure away (bare `(cl …) :rule trust`), so the shape is reconstructed
+/// from the frontend assertions like the other datatype emitters and grounded in
+/// the verified `AySoundness.Datatype.F3.f3_conflict` (built on `f3_eq_f`).
+///
+/// Faithful abstraction: the two-element enum is modeled by the concrete
+/// `AySoundness.Datatype.F3.En` (two nullary constructors), and `fEnum` — an
+/// UNINTERPRETED function — by an ARBITRARY `f : En → En`. The F3 theorem holds
+/// for ALL `f`, so modeling the uninterpreted `fEnum` as an arbitrary function is
+/// sound (nothing about `fEnum` beyond its type is used). Emission-only; grounded
+/// through `AySoundness.firewall_combined_unsat`; axioms ⊆ {propext, Quot.sound}.
+///
+/// `enum_datatypes` lists the finite-enum datatypes (all-nullary constructors)
+/// with their constructor count, and `sym_sorts` maps each declared symbol to its
+/// result-sort name (so `(fEnum v1)` and `v1` are confirmed to inhabit the SAME
+/// two-constructor enum, pinning `fEnum : En → En`). DECLINES (`None`) unless the
+/// enum is EXACTLY two-constructor and the whole shape matches — fail-closed.
+pub(crate) fn emit_dt_f3_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    enum_datatypes: &[(String, usize)],
+    sym_sorts: &[(String, String)],
+) -> Option<String> {
+    // Flatten top-level `and` so the two assertions survive being buried in a
+    // conjunction (sat/tautological noise around them is tolerated).
+    let mut conjs: Vec<&PTerm> = Vec::new();
+    for a in parsed {
+        flatten_dt_and(a, &mut conjs);
+    }
+    for c in &conjs {
+        // The disequality `f v1 ≠ f (f v2)` (either operand order).
+        let Some((x, y)) = parsed_diseq_pair(c) else {
+            continue;
+        };
+        for (fa, ffb) in [(x, y), (y, x)] {
+            // fa = (F v1): a unary application of some symbol `F` to a variable.
+            let PTerm::App(f1, fa_args) = fa else {
+                continue;
+            };
+            if fa_args.len() != 1 {
+                continue;
+            }
+            let PTerm::Symbol(v1) = &fa_args[0] else {
+                continue;
+            };
+            // ffb = (F (F v2)): the SAME `F` applied twice to a variable.
+            let PTerm::App(f2, ffb_args) = ffb else {
+                continue;
+            };
+            if f2 != f1 || ffb_args.len() != 1 {
+                continue;
+            }
+            let PTerm::App(f3, inner_args) = &ffb_args[0] else {
+                continue;
+            };
+            if f3 != f1 || inner_args.len() != 1 {
+                continue;
+            }
+            let PTerm::Symbol(v2) = &inner_args[0] else {
+                continue;
+            };
+            // `(F v1)` must inhabit a two-constructor enum, and `v1` the SAME enum
+            // (so `F : En → En` is faithful). DECLINE otherwise — fail-closed.
+            let Some(en) = enum_arg_sort(fa, sym_sorts) else {
+                continue;
+            };
+            if !enum_datatypes.iter().any(|(n, k)| n == &en && *k == 2) {
+                continue;
+            }
+            if enum_arg_sort(&fa_args[0], sym_sorts).as_deref() != Some(en.as_str()) {
+                continue;
+            }
+            // The positive equality `(= (F v1) v2)` (either orientation), on the
+            // SAME `F`, `v1`, `v2`.
+            let has_pos = conjs.iter().any(|p| {
+                let PTerm::App(op, a) = p else {
+                    return false;
+                };
+                if op != "=" || a.len() != 2 {
+                    return false;
+                }
+                for (l, r) in [(&a[0], &a[1]), (&a[1], &a[0])] {
+                    let PTerm::App(g, ga) = l else {
+                        continue;
+                    };
+                    if g != f1 || ga.len() != 1 {
+                        continue;
+                    }
+                    let PTerm::Symbol(lv1) = &ga[0] else {
+                        continue;
+                    };
+                    if lv1 != v1 {
+                        continue;
+                    }
+                    if matches!(r, PTerm::Symbol(rv2) if rv2 == v2) {
+                        return true;
+                    }
+                }
+                false
+            });
+            if has_pos {
+                return Some(render_dt_f3_lean(fnv_hex(&format!(
+                    "dtf3:{c:?}:{f1}:{v1}:{v2}"
+                ))));
+            }
+        }
+    }
+    None
+}
+
+/// Render the F3 (`f³ = f` on a 2-element enum) refutation, grounded in the
+/// verified `AySoundness.Datatype.F3.f3_conflict` (which is built on `f3_eq_f`)
+/// and discharged through `AySoundness.firewall_combined_unsat`. The model is the
+/// concrete two-nullary-constructor `En` with an arbitrary `f : En → En`; the two
+/// atoms are `f v1 = v2` and `f v1 = f (f v2)`. The body is a constant template
+/// up to the namespace hash.
+fn render_dt_f3_lean(hash: String) -> String {
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.Datatype
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — DATATYPE F3 (`f³ = f` on a 2-element
+  enum) conflict grounded in the verified `firewall_combined_unsat`. Over a
+  two-constructor ENUM datatype with an uninterpreted `fEnum : Enum → Enum`, the
+  assertions `fEnum v1 = v2` and `fEnum v1 ≠ fEnum (fEnum v2)` are unsatisfiable:
+  on a two-element type EVERY self-map `f` satisfies `f x = f (f (f x))`, so with
+  `f v1 = v2` we get `f (f v2) = f (f (f v1)) = f v1`, contradicting the
+  disequality. Reconstructed from the frontend parsed ASSERTIONS (ay refutes
+  QF_UFDT eagerly and folds the term structure away before emit). Faithful
+  abstraction: the two-element enum is the concrete two-nullary-constructor
+  `AySoundness.Datatype.F3.En`, and the UNINTERPRETED `fEnum` an ARBITRARY
+  `f : En → En` — the F3 theorem holds for ALL `f`, so nothing about `fEnum`
+  beyond its type is assumed. Discharged through
+  `AySoundness.Datatype.F3.f3_conflict` (built on `f3_eq_f`). Pure Lean 4 core;
+  axioms ⊆ {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.DtF3_{hash}
+open AySoundness
+
+/-- Theory model: an ARBITRARY self-map `f` on the concrete two-element enum
+    `En`, plus the two enum points `v1`, `v2`. Modeling the uninterpreted
+    `fEnum` as an arbitrary `f` is sound — `f3_conflict` holds for every `f`. -/
+structure Val where
+  f : AySoundness.Datatype.F3.En -> AySoundness.Datatype.F3.En
+  v1 : AySoundness.Datatype.F3.En
+  v2 : AySoundness.Datatype.F3.En
+
+/-- Atoms: `1 ↦ (f v1 = v2)`, `2 ↦ (f v1 = f (f v2))`. -/
+def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide (m.f m.v1 = m.v2)
+  | 2 => decide (m.f m.v1 = m.f (m.f m.v2))
+  | _ => false
+
+/-- `fEnum v1 = v2` is `[1]`; the disequality `fEnum v1 ≠ fEnum (fEnum v2)`
+    is `[-2]`. -/
+def original : List (Cid × Clause) := [(1, [1]), (2, [-2])]
+/-- The F3-collapse lemma `f v1 = v2 → f v1 = f (f v2)`, i.e. `[-1, 2]`. -/
+def lemmas   : List (Cid × Clause) := [(3, [-1, 2])]
+def proof    : List (Cid × Clause × List Int) := [(4, [], [1, 2, 3])]
+
+/-- **F3-collapse validity** — the firewall's premise (b): if `f v1 = v2` then
+    `f v1 = f (f v2)`, so `⟨¬(f v1 = v2)⟩ ∨ ⟨f v1 = f (f v2)⟩` holds in every
+    model. The nontrivial branch is closed by the verified
+    `AySoundness.Datatype.F3.f3_conflict` (which is built on `f3_eq_f`); the
+    case split is over the DECIDABLE equality on `En` (no `Classical`). -/
+theorem f3_lemma_valid (m : Val) : clauseSat (atomVal m) [-1, 2] = true := by
+  by_cases h1 : m.f m.v1 = m.v2
+  · by_cases h2 : m.f m.v1 = m.f (m.f m.v2)
+    · simp [clauseSat, litSat, atomVal, h2]
+    · exact (AySoundness.Datatype.F3.f3_conflict m.f m.v1 m.v2 h1 h2).elim
+  · simp [clauseSat, litSat, atomVal, h1]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact f3_lemma_valid m
+
+/-- `fEnum v1 = v2 ∧ fEnum v1 ≠ fEnum (fEnum v2)` is unsatisfiable — via the
+    verified firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.DtF3_{hash}
+"#,
     )
 }
 
@@ -5091,6 +5332,362 @@ end AySoundness.Emitted.DtTesterCaseSplitMixed_{hash}
     )
 }
 
+/// Single-level constant-condition `ite` fold: `(ite true a b) ⟶ a`,
+/// `(ite false a b) ⟶ b` (recursively on the taken branch). Any other term is
+/// returned unchanged. Used to normalize the assert2 `(ite false …)` wrapper of
+/// the nested selector-guarded case split before structural matching.
+fn strip_const_ite(t: &PTerm) -> &PTerm {
+    if let PTerm::App(op, a) = t {
+        if op == "ite" && a.len() == 3 {
+            match &a[0] {
+                PTerm::Const(PConst::True) => return strip_const_ite(&a[1]),
+                PTerm::Const(PConst::False) => return strip_const_ite(&a[2]),
+                _ => {}
+            }
+        }
+    }
+    t
+}
+
+/// Emit a verified-firewall Lean proof for a NESTED SELECTOR-GUARDED datatype
+/// case split — the shape of
+/// `benchmarks/…/soundness_qf_dt_derived_terms/fuzz_ufdt_falsesat_881.smt2`.
+///
+/// The two residual assertions (over a binary-recursive constructor `nd` — one
+/// with EXACTLY two same-datatype fields at positions `p0 < p1`, selectors `selL`
+/// at `p0` and `selR` at `p1` — a bare Tree variable `T`, a second Tree variable
+/// `Y`, and two Boolean guards `G`, `V18`) are
+///
+///   assert1: `T = nd(selR(ite G T (nd Y _ T)))  _  (selL(nd Y _ Y))`
+///   assert2: `(or (and (not V18) (not G))
+///                 (distinct (selR T) (nd (lf …) _ Y) (ite V18 T Y) T))`
+///
+/// and are jointly unsatisfiable via a NESTED `by_cases`:
+///   * `G = false`: assert1's `ite` collapses to `T = nd(T, Y)` — an ACYCLICITY
+///     occurs-check (`AySoundness.Datatype.Tree.acyclic_l`);
+///   * `G = true`: assert1 forces `T = nd(Y, Y)` (the selector fixpoint
+///     `selR T = Y`), so assert2's first disjunct `(… ∧ ¬G)` is FALSE and the
+///     `distinct` must hold; an INNER `by_cases` on `V18` makes the 4-element
+///     `distinct` list contain a DUPLICATE in each branch (`ite V18 T Y = T = T`
+///     when `V18`, or `selR T = Y = ite V18 T Y` when `¬V18`), so it is FALSE by
+///     reflexivity (an element `≠` itself). MIXED across the outer split
+///     (occurs-check vs distinct-with-duplicate), with an inner split on `V18`.
+///
+/// The datatype is faithfully abstracted onto the concrete binary `Tree` of
+/// `AySoundness.Datatype` (`nd`'s two recursive fields ↦ `Tree.node`, sibling
+/// non-recursive fields dropped, `lf` ↦ `Tree.leaf`, the guards to opaque
+/// `Bool`s). The selectors `selL`/`selR` are modelled as TOTAL projections whose
+/// leaf-case is a DEAD extension: assert1 forces `T` (and the `ite`'s else-branch)
+/// to be a `node`, so every selector application in a satisfying assignment lands
+/// on a `node` and the leaf-case value is never consulted — hence proving the
+/// refutation for the concrete projections establishes it for EVERY selector
+/// interpretation. The `distinct`'s falsity comes from GENUINE term duplicates
+/// (identical SMT terms), not from the dropped `Rec`/`Enum` fields, so the
+/// abstraction cannot conflate distinct SMT terms into a spurious conflict.
+/// EMISSION-ONLY, fail-closed; grounded through
+/// `AySoundness.firewall_combined_unsat`; axioms ⊆ {propext, Quot.sound}.
+pub(crate) fn emit_dt_nested_selector_casesplit_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    ctor_rec: &[(String, Vec<bool>)],
+    ctor_selectors: &[(String, Vec<String>)],
+) -> Option<String> {
+    let rec_positions = |ctor: &str| -> Option<Vec<usize>> {
+        let mask = &ctor_rec.iter().find(|(c, _)| c == ctor)?.1;
+        Some((0..mask.len()).filter(|&i| mask[i]).collect())
+    };
+    // The selector name projecting field `p` of constructor `ctor`.
+    let sel_at = |ctor: &str, p: usize| -> Option<String> {
+        ctor_selectors
+            .iter()
+            .find(|(c, _)| c == ctor)?
+            .1
+            .get(p)
+            .cloned()
+    };
+    let is_ctor = |name: &str| ctor_rec.iter().any(|(c, _)| c == name);
+    let as_sym = |t: &PTerm| -> Option<String> {
+        if let PTerm::Symbol(s) = t {
+            Some(s.clone())
+        } else {
+            None
+        }
+    };
+
+    // Locate the two assertions: an equality (assert1) and an `or` (assert2).
+    let mut eq_assert: Option<(&PTerm, &PTerm)> = None;
+    let mut or_assert: Option<&Vec<PTerm>> = None;
+    for a in parsed {
+        if let PTerm::App(op, args) = a {
+            if op == "=" && args.len() == 2 && eq_assert.is_none() {
+                eq_assert = Some((&args[0], &args[1]));
+            } else if op == "or" && args.len() == 2 && or_assert.is_none() {
+                or_assert = Some(args);
+            }
+        }
+    }
+    let (l, r) = eq_assert?;
+    let or_args = or_assert?;
+
+    // ---- assert1: `T = nd(A _ B)` (T a bare Tree variable). Try both sides.
+    for (tvar, rhs) in [(l, r), (r, l)] {
+        let Some(t_name) = as_sym(tvar) else { continue };
+        if is_ctor(&t_name) {
+            continue;
+        }
+        let PTerm::App(nd, rargs) = rhs else { continue };
+        if !is_ctor(nd) {
+            continue;
+        }
+        let Some(rp) = rec_positions(nd) else {
+            continue;
+        };
+        if rp.len() != 2 || rargs.len() <= rp[1] {
+            continue;
+        }
+        let (p0, p1) = (rp[0], rp[1]);
+
+        // A := rargs[p0] = `(selR (ite G T (nd Y _ T)))`, selR = nd's p1 selector.
+        let PTerm::App(sel_r, aargs) = &rargs[p0] else {
+            continue;
+        };
+        if aargs.len() != 1 || sel_at(nd, p1).as_deref() != Some(sel_r.as_str()) {
+            continue;
+        }
+        let PTerm::App(iop, iargs) = &aargs[0] else {
+            continue;
+        };
+        if iop != "ite" || iargs.len() != 3 {
+            continue;
+        }
+        let Some(g_name) = as_sym(&iargs[0]) else {
+            continue;
+        };
+        if as_sym(&iargs[1]).as_deref() != Some(t_name.as_str()) {
+            continue;
+        }
+        let PTerm::App(indh, inner) = &iargs[2] else {
+            continue;
+        };
+        if indh != nd || inner.len() <= p1 {
+            continue;
+        }
+        let Some(y_name) = as_sym(&inner[p0]) else {
+            continue;
+        };
+        if is_ctor(&y_name) || as_sym(&inner[p1]).as_deref() != Some(t_name.as_str()) {
+            continue;
+        }
+
+        // B := rargs[p1] = `(selL (nd Y _ Y))`, selL = nd's p0 selector.
+        let PTerm::App(sel_l, bargs) = &rargs[p1] else {
+            continue;
+        };
+        if bargs.len() != 1 || sel_at(nd, p0).as_deref() != Some(sel_l.as_str()) {
+            continue;
+        }
+        let PTerm::App(bnh, bnargs) = &bargs[0] else {
+            continue;
+        };
+        if bnh != nd
+            || bnargs.len() <= p1
+            || as_sym(&bnargs[p0]).as_deref() != Some(y_name.as_str())
+            || as_sym(&bnargs[p1]).as_deref() != Some(y_name.as_str())
+        {
+            continue;
+        }
+
+        // ---- assert2: `(or (and (not V18) (not G)) (distinct E1 E2 E3 E4))`.
+        for (d1, d2) in [(&or_args[0], &or_args[1]), (&or_args[1], &or_args[0])] {
+            let PTerm::App(andop, aa) = d1 else { continue };
+            if andop != "and" || aa.len() != 2 {
+                continue;
+            }
+            let not_sym = |t: &PTerm| -> Option<String> {
+                let PTerm::App(n, na) = t else { return None };
+                if n != "not" || na.len() != 1 {
+                    return None;
+                }
+                as_sym(&na[0])
+            };
+            let Some(v18_name) = not_sym(&aa[0]) else {
+                continue;
+            };
+            if not_sym(&aa[1]).as_deref() != Some(g_name.as_str()) || is_ctor(&v18_name) {
+                continue;
+            }
+
+            let PTerm::App(dop, de) = d2 else { continue };
+            if dop != "distinct" || de.len() != 4 {
+                continue;
+            }
+            // E1 = (selR T)
+            let PTerm::App(e1s, e1a) = &de[0] else {
+                continue;
+            };
+            if e1s != sel_r || e1a.len() != 1 || as_sym(&e1a[0]).as_deref() != Some(t_name.as_str())
+            {
+                continue;
+            }
+            // E2 = (nd (lf …) _ Y) after folding a constant-condition `ite`. Its
+            // value never affects the `distinct`'s falsity (the duplicates are
+            // among E1/E3/E4); pin the shape only to stay fail-closed.
+            let PTerm::App(e2h, e2a) = strip_const_ite(&de[1]) else {
+                continue;
+            };
+            if e2h != nd || e2a.len() <= p1 || as_sym(&e2a[p1]).as_deref() != Some(y_name.as_str())
+            {
+                continue;
+            }
+            // E3 = (ite V18 T Y)
+            let PTerm::App(e3op, e3a) = &de[2] else {
+                continue;
+            };
+            if e3op != "ite"
+                || e3a.len() != 3
+                || as_sym(&e3a[0]).as_deref() != Some(v18_name.as_str())
+                || as_sym(&e3a[1]).as_deref() != Some(t_name.as_str())
+                || as_sym(&e3a[2]).as_deref() != Some(y_name.as_str())
+            {
+                continue;
+            }
+            // E4 = T
+            if as_sym(&de[3]).as_deref() != Some(t_name.as_str()) {
+                continue;
+            }
+
+            return Some(render_dt_nested_selector_casesplit_lean(fnv_hex(&format!(
+                "dtnestedsel:{t_name}:{y_name}:{g_name}:{v18_name}:{nd}"
+            ))));
+        }
+    }
+    None
+}
+
+/// Render the nested selector-guarded case-split Lean proof (see
+/// [`emit_dt_nested_selector_casesplit_firewall_lean_from_parsed`]). The proof is
+/// fully generic over the four abstracted variables (`v12`/`v13` : `Tree`,
+/// `v17`/`v18` : `Bool`), so only the namespace `hash` varies per instance.
+fn render_dt_nested_selector_casesplit_lean(hash: String) -> String {
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.Datatype
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — DATATYPE NESTED SELECTOR-GUARDED
+  CASE-SPLIT, grounded in the verified `firewall_combined_unsat`. The two residual
+  assertions
+    assert1: `v12 = node (right (ite v17 v12 (node v13 v12))) (left (node v13 v13))`
+    assert2: `(or (and ¬v18 ¬v17)
+                  (distinct (right v12) (node leaf v13) (ite v18 v12 v13) v12))`
+  are jointly unsatisfiable via a NESTED `by_cases`:
+    * `v17 = false`: assert1 collapses to `v12 = node v12 v13` — an ACYCLICITY
+      occurs-check (`AySoundness.Datatype.Tree.acyclic_l`);
+    * `v17 = true`: assert1 forces `v12 = node v13 v13` (the selector fixpoint
+      `right v12 = v13`), so assert2's first disjunct is FALSE (it needs `¬v17`)
+      and the `distinct` must hold; an INNER `by_cases` on `v18` puts a DUPLICATE
+      element into the 4-list in either branch (`ite v18 v12 v13 = v12 = v12` when
+      `v18`, or `right v12 = v13 = ite v18 v12 v13` when `¬v18`), so `distinct` is
+      FALSE by reflexivity.
+  Faithful abstraction: the datatype maps homomorphically onto the concrete binary
+  `Tree` of `AySoundness.Datatype` (2 recursive fields ↦ `node`, 0 ↦ `leaf`,
+  sibling non-recursive fields dropped, guards ↦ opaque `Bool`). The selectors are
+  modelled as TOTAL projections whose leaf-case is a DEAD extension — assert1
+  forces every selected term to be a `node`, so the leaf value is never consulted
+  in any satisfying assignment; and the `distinct`'s falsity rests on GENUINE term
+  duplicates, never on the dropped fields — so no abstract model ⟹ no real model.
+  Pure Lean 4 core; axioms ⊆ {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.DtNestedSelectorCaseSplit_{hash}
+open AySoundness
+open AySoundness.Datatype (Tree)
+
+/-- Right/left selector projections on the binary `Tree` spine (leaf-case is a
+    dead total extension — see the soundness note above). -/
+def rightT : Tree → Tree
+  | Tree.node _ r => r
+  | Tree.leaf => Tree.leaf
+def leftT : Tree → Tree
+  | Tree.node l _ => l
+  | Tree.leaf => Tree.leaf
+
+/-- Theory model: the two opaque Boolean guards and the two datatype variables. -/
+structure Val where
+  v17 : Bool
+  v18 : Bool
+  v12 : Tree
+  v13 : Tree
+
+/-- `(distinct a b c d)` — pairwise disequality over four `Tree` elements. -/
+def distinct4 (a b c d : Tree) : Bool :=
+  decide (a ≠ b ∧ a ≠ c ∧ a ≠ d ∧ b ≠ c ∧ b ≠ d ∧ c ≠ d)
+
+/-- assert1 (binary-`Tree` image):
+    `v12 = node (right (ite v17 v12 (node v13 v12))) (left (node v13 v13))`. -/
+abbrev assert1 (m : Val) : Prop :=
+  m.v12 = Tree.node
+    (rightT (cond m.v17 m.v12 (Tree.node m.v13 m.v12)))
+    (leftT (Tree.node m.v13 m.v13))
+
+/-- assert2: `(or (and ¬v18 ¬v17) (distinct (right v12) (node leaf v13)
+    (ite v18 v12 v13) v12))`. -/
+abbrev assert2 (m : Val) : Prop :=
+  (m.v18 = false ∧ m.v17 = false) ∨
+    distinct4 (rightT m.v12) (Tree.node Tree.leaf m.v13)
+      (cond m.v18 m.v12 m.v13) m.v12 = true
+
+/-- Atom `1 ↦ (assert1 ∧ assert2)` — the full residual conjunction. -/
+def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide (assert1 m ∧ assert2 m)
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1])]
+def lemmas   : List (Cid × Clause) := [(2, [-1])]
+def proof    : List (Cid × Clause × List Int) := [(3, [], [1, 2])]
+
+/-- **Case-split lemma validity** — the firewall's premise (b): the residual
+    conjunction is false in every model, via the NESTED `by_cases`. -/
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1] = true := by
+  have h : ¬ (assert1 m ∧ assert2 m) := by
+    rintro ⟨h1, h2⟩
+    cases hv17 : m.v17
+    · -- v17 = false: assert1 collapses to an occurs-check `v12 = node v12 v13`.
+      simp only [assert1, hv17, cond_false, rightT, leftT] at h1
+      exact absurd h1 (AySoundness.Datatype.Tree.acyclic_l m.v12 m.v13)
+    · -- v17 = true: assert1 forces `v12 = node v13 v13`.
+      simp only [assert1, hv17, cond_true, leftT] at h1
+      have hr : rightT m.v12 = m.v13 := by rw [h1]; rfl
+      rw [hr] at h1
+      -- disjunct-1 of assert2 needs `¬v17`, so the `distinct` must hold.
+      rcases h2 with ⟨_, hv17f⟩ | hd
+      · rw [hv17] at hv17f; exact Bool.noConfusion hv17f
+      · -- inner case-split on v18: each branch is a distinct-with-duplicate.
+        rw [h1] at hd
+        cases hv18 : m.v18
+        · -- v18 = false: `right v12` and `ite v18 v12 v13` are both `v13`.
+          simp [hv18, rightT, distinct4] at hd
+        · -- v18 = true: `ite v18 v12 v13` and `v12` are both `node v13 v13`.
+          simp [hv18, rightT, distinct4] at hd
+  simp [clauseSat, atomVal, litSat, List.any_cons, List.any_nil, h]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- No datatype model satisfies the nested selector-guarded case-split — via the
+    verified firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.DtNestedSelectorCaseSplit_{hash}
+"#,
+    )
+}
+
 /// Emit a verified-firewall Lean proof for an EUF congruence-over-a-transitive-
 /// chain refutation found among the PARSED (frontend) assertions: `(= x m)`,
 /// `(= m y)`, `(not (= (f x) (f y)))` (a two-link chain `x = m = y` plus the
@@ -5308,6 +5905,370 @@ fn render_fp_classify_lean(p1: &str, p2: &str) -> String {
            atomVal (by decide) (by decide) lemma_valid (by decide)\n\n\
          end AY.FpClassifyFirewall\n"
     )
+}
+
+/// Parse a ground SMT-LIB binary bitvector literal (`#b0101…`) into its
+/// `(bit_width, value)`. The `#b` prefix is part of the token text. Declines any
+/// non-binary constant (a hexadecimal, numeral, symbol, …) — the FP-literal
+/// emitters only accept the fully-explicit `(fp #b<sign> #b<exp> #b<mant>)` form.
+fn parse_bin_lit(pc: &PConst) -> Option<(usize, u128)> {
+    let PConst::Binary(text) = pc else {
+        return None;
+    };
+    let bits = text.strip_prefix("#b")?;
+    if bits.is_empty() {
+        return None;
+    }
+    let mut value: u128 = 0;
+    for ch in bits.chars() {
+        value = value.checked_mul(2)?;
+        match ch {
+            '0' => {}
+            '1' => value += 1,
+            _ => return None,
+        }
+    }
+    Some((bits.len(), value))
+}
+
+/// Recognize a ground SMT-LIB float literal `(fp #b<sign> #b<exp> #b<mant>)` and
+/// return the exact IEEE decode ingredients for `FpUnderflow.decodeFin`:
+/// `(src_eb, src_sb, sign, expf, sigf)`. The source format is `eb = |exp|`,
+/// `sb = |mant| + 1` (the hidden bit). Declines any non-concrete shape (a symbolic
+/// float variable, a non-1-bit sign, a hexadecimal component, …).
+fn parse_ground_fp_literal(t: &PTerm) -> Option<(usize, usize, bool, u128, u128)> {
+    let PTerm::App(op, args) = t else {
+        return None;
+    };
+    if op != "fp" || args.len() != 3 {
+        return None;
+    }
+    let bit = |x: &PTerm| match x {
+        PTerm::Const(pc) => parse_bin_lit(pc),
+        _ => None,
+    };
+    let (sign_w, sign_v) = bit(&args[0])?;
+    let (exp_w, exp_v) = bit(&args[1])?;
+    let (mant_w, mant_v) = bit(&args[2])?;
+    // Sign is exactly one bit; exponent and stored significand must be non-empty.
+    if sign_w != 1 || exp_w == 0 || mant_w == 0 {
+        return None;
+    }
+    let sign = sign_v == 1;
+    Some((exp_w, mant_w + 1, sign, exp_v, mant_v))
+}
+
+/// Emit a verified-firewall Lean proof for a FLOATING-POINT `to_fp` NARROWING
+/// UNDERFLOW / OVERFLOW-asymmetry classification conflict found among the PARSED
+/// assertions: a single positive class assertion over a CONCRETE, ground
+/// conversion —
+///
+///   `(fp.isInfinite ((_ to_fp EB SB) RTN (fp #b<s> #b<e> #b<m>)))`   or
+///   `(fp.isNormal   ((_ to_fp EB SB) RTN (fp #b<s> #b<e> #b<m>)))`
+///
+/// — whose RTN-narrowed result the faithful, reference-battery-VALIDATED
+/// `AySoundness.FpUnderflow` model classifies otherwise (e.g. a tiny source
+/// underflows to a subnormal/zero, so it is NOT infinite / NOT normal). ay
+/// reduces `to_fp` to bit-vectors and refutes eagerly (bare-trust), so the
+/// structure is recovered from the frontend AST and the single-atom claim is
+/// grounded through `firewall_combined_unsat`: the source magnitude is decoded
+/// exactly by `FpUnderflow.decodeFin`, the RTN class by `FpUnderflow.classifyRTN`,
+/// and the atom's closed `Bool` (`isInf` / `isNorm`) is refuted by `decide`
+/// (Int-cross-multiplied dyadics — no rounding-fragile arithmetic).
+///
+/// FAIL-CLOSED / emission-only: recognizes ONLY the concrete ground shape under
+/// the `RTN` rounding mode the model covers; returns `None` for any symbolic
+/// float, non-`RTN` mode, non-`to_fp` argument, or non-`fp.isInfinite`/`isNormal`
+/// predicate. Top-level `(and …)` assertions are flattened. If the model were to
+/// disagree with ay's refutation (a modelling bug), the emitted `decide` fails and
+/// the file does not build — it never certifies a false verdict.
+pub(crate) fn emit_fp_tofp_underflow_firewall_lean_from_parsed(parsed: &[PTerm]) -> Option<String> {
+    let mut stack: Vec<&PTerm> = parsed.iter().collect();
+    while let Some(t) = stack.pop() {
+        let PTerm::App(op, args) = t else { continue };
+        if op == "and" {
+            stack.extend(args.iter());
+            continue;
+        }
+        // `(fp.isInfinite X)` → `isInf`; `(fp.isNormal X)` → `isNorm`.
+        let pred_fn = match op.as_str() {
+            "fp.isInfinite" => "isInf",
+            "fp.isNormal" => "isNorm",
+            _ => continue,
+        };
+        let [inner] = args.as_slice() else { continue };
+        // Inner must be `((_ to_fp EB SB) RM FP-LITERAL)`.
+        let PTerm::IndexedApp(name, indices, conv_args) = inner else {
+            continue;
+        };
+        if name != "to_fp" || indices.len() != 2 || conv_args.len() != 2 {
+            continue;
+        }
+        let tgt_eb: usize = indices[0].as_numeral()?.parse().ok()?;
+        let tgt_sb: usize = indices[1].as_numeral()?.parse().ok()?;
+        // Only the RTN rounding mode is covered by the model (round toward −∞).
+        let rm_ok = match &conv_args[0] {
+            PTerm::Symbol(rm) => rm == "RTN" || rm == "roundTowardNegative",
+            _ => false,
+        };
+        if !rm_ok {
+            continue;
+        }
+        let Some((src_eb, src_sb, sign, expf, sigf)) = parse_ground_fp_literal(&conv_args[1])
+        else {
+            continue;
+        };
+        return Some(render_fp_tofp_underflow_lean(
+            pred_fn, src_eb, src_sb, sign, expf, sigf, tgt_eb, tgt_sb,
+        ));
+    }
+    None
+}
+
+/// Render the `to_fp` narrowing-classification firewall file: the ground source
+/// float is decoded by `FpUnderflow.decodeFin` and its RTN class by
+/// `FpUnderflow.classifyRTN`; the single asserted atom (`isInf`/`isNorm` of that
+/// class) is a closed `false`, so the assertion has no model — via the verified
+/// `firewall_combined_unsat`. `#print axioms no_model` documents the ⊆ {propext,
+/// Quot.sound} closure at `lake build`.
+#[allow(clippy::too_many_arguments)]
+fn render_fp_tofp_underflow_lean(
+    pred_fn: &str,
+    src_eb: usize,
+    src_sb: usize,
+    sign: bool,
+    expf: u128,
+    sigf: u128,
+    tgt_eb: usize,
+    tgt_sb: usize,
+) -> String {
+    let sign_lean = if sign { "true" } else { "false" };
+    let hash = fnv_hex(&format!(
+        "{pred_fn}\u{1}{src_eb}\u{1}{src_sb}\u{1}{sign_lean}\u{1}{expf}\u{1}{sigf}\u{1}{tgt_eb}\u{1}{tgt_sb}"
+    ));
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.FpUnderflow
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — floating-point `to_fp` NARROWING
+  classification conflict (underflow / RTN overflow-asymmetry), grounded in the
+  verified, reference-battery-VALIDATED `AySoundness.FpUnderflow` model. The
+  assertion `(fp.<pred> ((_ to_fp {tgt_eb} {tgt_sb}) RTN (fp #b<s> #b<e> #b<m>)))`
+  claims the RTN-narrowed conversion of a GROUND source bitpattern is
+  infinite/normal; the faithful exact-dyadic RTN classifier proves otherwise, so
+  the single-atom assertion is refuted through `firewall_combined_unsat`. The
+  source magnitude is the EXACT IEEE decode `FpUnderflow.decodeFin` and the class
+  is `FpUnderflow.classifyRTN`; both `decide`-reduce (dyadics cross-multiplied in
+  `Int`, no rounding-fragile arithmetic). Pure Lean 4 core; axioms ⊆ {{propext,
+  Quot.sound}}.
+-/
+namespace AySoundness.Emitted.FpTofpUnderflow_{hash}
+open AySoundness
+open AySoundness.FpUnderflow
+
+/-- Exact dyadic value of the ground source float `(fp #b<s> #b<e> #b<m>)` in
+    source format `(eb={src_eb}, sb={src_sb})`, via the model's exact IEEE decode. -/
+def src : Dy := decodeFin {src_eb} {src_sb} {sign_lean} {expf} {sigf}
+
+/-- The single asserted atom: whether the RTN narrowing of `src` into target
+    format `({tgt_eb}, {tgt_sb})` is `{pred_fn}`. The model computes this closed
+    `Bool` — and it is `false`. -/
+def atomVal (_ : Unit) (n : Nat) : Bool :=
+  match n with
+  | 1 => {pred_fn} (classifyRTN {tgt_eb} {tgt_sb} src)
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1])]
+def lemmas   : List (Cid × Clause) := [(2, [-1])]
+def proof    : List (Cid × Clause × List Int) := [(3, [], [1, 2])]
+
+theorem lemma_valid (u : Unit) : clauseSat (atomVal u) [-1] = true := by
+  cases u
+  decide
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ u : Unit, clauseSat (atomVal u) cl = true := by
+  intro cl hcl u
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid u
+
+/-- The concrete `to_fp` classification claim has no model — via the firewall. -/
+theorem no_model : ∀ u : Unit, ¬ Sat (atomVal u) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+#print axioms no_model
+
+end AySoundness.Emitted.FpTofpUnderflow_{hash}
+"#,
+    )
+}
+
+/// Emit a verified-firewall Lean proof for a FLOATING-POINT `fp.rem`
+/// SIGN classification conflict found among the PARSED assertions: a single
+/// positive assertion
+///
+///   `(fp.isNegative (fp.rem (fp #b<s> #b<e> #b<m>) (fp #b<s> #b<e> #b<m>)))`
+///
+/// over TWO CONCRETE, ground same-format float literals, whose exact IEEE-754
+/// remainder the faithful, reference-battery-VALIDATED `AySoundness.FpUnderflow`
+/// `fp.rem` model classifies as NOT negative (the exact `remDy` value is
+/// non-negative). ay reduces `fp.rem` to bit-vectors and refutes eagerly
+/// (bare-trust), so the structure is recovered from the frontend AST and the
+/// single-atom claim is grounded through `firewall_combined_unsat`: both operands
+/// are decoded exactly by `FpUnderflow.decodeFin`, the round-to-nearest-even
+/// remainder by `FpUnderflow.remDy`, and the atom's closed `Bool`
+/// (`remIsNegative`) is refuted by `decide` (Int-exact — no rounding-fragile
+/// arithmetic on the remainder).
+///
+/// FAIL-CLOSED / emission-only: recognizes ONLY the concrete ground shape — TWO
+/// `(fp #b… #b… #b…)` literals of the SAME `(eb, sb)` format under
+/// `fp.isNegative (fp.rem …)`; returns `None` for any symbolic float, mismatched
+/// formats, non-`fp.rem` argument, or non-`fp.isNegative` predicate. Top-level
+/// `(and …)` assertions are flattened. If the model were to disagree with ay's
+/// refutation (a modelling bug), the emitted `decide` fails and the file does not
+/// build — it never certifies a false verdict.
+pub(crate) fn emit_fp_rem_not_negative_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+) -> Option<String> {
+    let mut stack: Vec<&PTerm> = parsed.iter().collect();
+    while let Some(t) = stack.pop() {
+        let PTerm::App(op, args) = t else { continue };
+        if op == "and" {
+            stack.extend(args.iter());
+            continue;
+        }
+        if op != "fp.isNegative" {
+            continue;
+        }
+        let [inner] = args.as_slice() else { continue };
+        // Inner must be `(fp.rem FP-LITERAL FP-LITERAL)`.
+        let PTerm::App(rem_op, rem_args) = inner else {
+            continue;
+        };
+        if rem_op != "fp.rem" || rem_args.len() != 2 {
+            continue;
+        }
+        let (a_eb, a_sb, a_sign, a_expf, a_sigf) = parse_ground_fp_literal(&rem_args[0])?;
+        let (b_eb, b_sb, b_sign, b_expf, b_sigf) = parse_ground_fp_literal(&rem_args[1])?;
+        // `fp.rem` is a same-format operation — decline any mismatched pair.
+        if a_eb != b_eb || a_sb != b_sb {
+            continue;
+        }
+        return Some(render_fp_rem_not_negative_lean(
+            a_eb, a_sb, a_sign, a_expf, a_sigf, b_sign, b_expf, b_sigf,
+        ));
+    }
+    None
+}
+
+/// Render the `fp.rem` sign-classification firewall file: both ground operands
+/// are decoded by `FpUnderflow.decodeFin`, their round-to-nearest-even remainder
+/// by `FpUnderflow.remDy`, and the single asserted atom
+/// (`remIsNegative sign_a a b`) is a closed `false`, so the assertion has no model
+/// — via the verified `firewall_combined_unsat`. The dividend's sign bit `sign_a`
+/// is threaded to resolve the `±0` boundary (`fp.isNegative(−0)=true`).
+/// `#print axioms no_model` documents the ⊆ {propext, Quot.sound} closure at
+/// `lake build`.
+#[allow(clippy::too_many_arguments)]
+fn render_fp_rem_not_negative_lean(
+    eb: usize,
+    sb: usize,
+    a_sign: bool,
+    a_expf: u128,
+    a_sigf: u128,
+    b_sign: bool,
+    b_expf: u128,
+    b_sigf: u128,
+) -> String {
+    let a_sign_lean = if a_sign { "true" } else { "false" };
+    let b_sign_lean = if b_sign { "true" } else { "false" };
+    let hash = fnv_hex(&format!(
+        "{eb}\u{1}{sb}\u{1}{a_sign_lean}\u{1}{a_expf}\u{1}{a_sigf}\u{1}{b_sign_lean}\u{1}{b_expf}\u{1}{b_sigf}"
+    ));
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.FpUnderflow
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — floating-point `fp.rem` SIGN conflict,
+  grounded in the verified, reference-battery-VALIDATED `AySoundness.FpUnderflow`
+  `fp.rem` model. The assertion `(fp.isNegative (fp.rem (fp #b<s> #b<e> #b<m>)
+  (fp #b<s> #b<e> #b<m>)))` claims the exact remainder of two GROUND same-format
+  bitpatterns is negative; the faithful exact round-to-nearest-even remainder
+  proves otherwise (its value is non-negative), so the single-atom assertion is
+  refuted through `firewall_combined_unsat`. Both operands are the EXACT IEEE
+  decode `FpUnderflow.decodeFin`, the remainder is `FpUnderflow.remDy`, and the
+  sign is `FpUnderflow.remIsNegative`; all `decide`-reduce (Int-exact, no
+  rounding-fragile arithmetic on the remainder). Pure Lean 4 core; axioms ⊆
+  {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.FpRemNotNegative_{hash}
+open AySoundness
+open AySoundness.FpUnderflow
+
+/-- Exact dyadic value of the dividend `a = (fp #b<s> #b<e> #b<m>)` in format
+    `(eb={eb}, sb={sb})`, via the model's exact IEEE decode. -/
+def a : Dy := decodeFin {eb} {sb} {a_sign_lean} {a_expf} {a_sigf}
+
+/-- Exact dyadic value of the divisor `b = (fp #b<s> #b<e> #b<m>)` in the same
+    format `(eb={eb}, sb={sb})`, via the model's exact IEEE decode. -/
+def b : Dy := decodeFin {eb} {sb} {b_sign_lean} {b_expf} {b_sigf}
+
+/-- The single asserted atom: whether the round-to-nearest-even remainder
+    `fp.rem a b` is negative. The dividend's sign bit ({a_sign_lean}) resolves the
+    `±0` boundary. The model computes this closed `Bool` — and it is `false`. -/
+def atomVal (_ : Unit) (n : Nat) : Bool :=
+  match n with
+  | 1 => remIsNegative {a_sign_lean} a b
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1])]
+def lemmas   : List (Cid × Clause) := [(2, [-1])]
+def proof    : List (Cid × Clause × List Int) := [(3, [], [1, 2])]
+
+theorem lemma_valid (u : Unit) : clauseSat (atomVal u) [-1] = true := by
+  cases u
+  decide
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ u : Unit, clauseSat (atomVal u) cl = true := by
+  intro cl hcl u
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid u
+
+/-- The concrete `fp.rem` sign claim has no model — via the firewall. -/
+theorem no_model : ∀ u : Unit, ¬ Sat (atomVal u) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+#print axioms no_model
+
+end AySoundness.Emitted.FpRemNotNegative_{hash}
+"#,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Floating-point RNE dot-product forward-error firewall authority gate.
+// ---------------------------------------------------------------------------
+
+/// Deliberately decline every parsed floating-point dot-error proof request.
+///
+/// The Lean `qround` lemmas prove bounds inside fixed-spacing rational models,
+/// but no theorem currently connects the recognized IEEE-754 operations,
+/// intermediate values, and magnitude hypotheses to either model. Emitting a
+/// proof for the parsed formula would therefore overstate what Lean checked.
+/// Keep this production hook fail-closed until that semantic bridge exists and
+/// has been reviewed.
+pub(crate) fn emit_fp_dot_error_bound_firewall_lean_from_parsed(
+    _parsed: &[PTerm],
+    _defined: &[(String, PTerm)],
+) -> Option<String> {
+    None
 }
 
 /// `(str.len s)` (parsed) → `s`.
@@ -6118,6 +7079,208 @@ theorem no_model (p : List {ty}) :
     (by decide) (by decide) (by decide) (by decide) (by decide)
 
 end AySoundness.Emitted.SeqSuffixof_{hash}
+"#,
+    )
+}
+
+/// Parse an `Int`/`Bool` `seq.unit` operand, folding ground integer arithmetic
+/// (`(- 0 2)`, pinned symbols) that `parse_seq_elt` alone does not reach.
+fn parse_seq_elt_arith(t: &PTerm, int_binds: &[(String, i64)]) -> Option<SeqElt> {
+    if let Some(e) = parse_seq_elt(t) {
+        return Some(e);
+    }
+    fold_int(t, int_binds).map(SeqElt::Int)
+}
+
+/// Reconstruct a fully-GROUND sequence value like `parse_ground_seq`, but fold
+/// ground integer arithmetic inside `seq.unit` operands (`(seq.unit (- 0 2))`).
+fn parse_ground_seq_arith(
+    t: &PTerm,
+    seq_binds: &[(String, Vec<SeqElt>)],
+    int_binds: &[(String, i64)],
+) -> Option<Vec<SeqElt>> {
+    match t {
+        PTerm::Symbol(s) => seq_binds
+            .iter()
+            .find(|(n, _)| n == s)
+            .map(|(_, v)| v.clone()),
+        PTerm::QualifiedApp(id, _, args) if args.is_empty() => {
+            (id.as_symbol() == Some("seq.empty")).then(Vec::new)
+        }
+        PTerm::App(op, args) if op == "seq.unit" && args.len() == 1 => {
+            parse_seq_elt_arith(&args[0], int_binds).map(|e| vec![e])
+        }
+        PTerm::App(op, args) if op == "seq.++" => {
+            let mut out = Vec::new();
+            for a in args {
+                out.extend(parse_ground_seq_arith(a, seq_binds, int_binds)?);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Emit a verified-firewall Lean certificate for an OUT-OF-BOUNDS `seq.extract`
+/// feeding a `seq.replace`'s needle that then conflicts with an asserted whole:
+/// `(= (seq.replace HAYSTACK (seq.extract S I N) T) WHOLE)` where the extract
+/// offset `I` is a concrete literal `≥ len(S)` (so the needle is EMPTY for every
+/// count `N`), `T` is a ground NON-EMPTY sequence with head `a`, and `WHOLE` is a
+/// ground NON-EMPTY sequence with head `b ≠ a`.
+///
+/// SMT `seq.replace` with an EMPTY needle matches at position 0 and PREPENDS the
+/// replacement, so the result is `T ++ HAYSTACK`, whose head is pinned by `T`'s
+/// head `a` for EVERY haystack (verified `SeqThy.seqReplaceEmpty_head`). Asserting
+/// the whole equals `WHOLE` (head `b`) is therefore unsatisfiable for every
+/// haystack and every count. The needle's emptiness is grounded through the
+/// verified `SeqThy.seqExtract_oob` (offset ≥ length ⇒ empty, for all `N`); the
+/// head clash is `SeqThy.seqReplaceEmpty_head`; cf. the hand-checked witnesses
+/// `SeqThy.ex_seqExtract_oob_replace_conflict` /
+/// `SeqThy.ex_seqExtract_oob_replace_via_principle`. The haystack `s0` and the
+/// count `n` are quantified UNIVERSALLY, so the certificate refutes the assertion
+/// for every value of the concrete haystack/count.
+///
+/// `None` (fail-closed) unless the read is a genuine OOB-extract / empty-needle
+/// replace with a NON-EMPTY replacement whose head differs from a NON-EMPTY whole
+/// over a single shared element type.
+pub(crate) fn emit_seq_extract_oob_replace_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+) -> Option<String> {
+    let seq_binds = collect_seq_binds(parsed);
+    let int_binds = collect_int_binds(parsed);
+    for asrt in parsed {
+        let PTerm::App(op, args) = asrt else { continue };
+        if op != "=" || args.len() != 2 {
+            continue;
+        }
+        // One side is the `seq.replace`; the other is the ground WHOLE.
+        for (repl_side, whole_side) in [(&args[0], &args[1]), (&args[1], &args[0])] {
+            let PTerm::App(rop, rargs) = repl_side else {
+                continue;
+            };
+            if rop != "seq.replace" || rargs.len() != 3 {
+                continue;
+            }
+            // Needle must be an OOB `seq.extract`: `(seq.extract S I N)` with the
+            // offset `I` a concrete literal `≥ len(S)` (so the slice is empty).
+            let PTerm::App(eop, eargs) = &rargs[1] else {
+                continue;
+            };
+            if eop != "seq.extract" || eargs.len() != 3 {
+                continue;
+            }
+            let Some(inner) = parse_ground_seq_arith(&eargs[0], &seq_binds, &int_binds) else {
+                continue;
+            };
+            let Some(offset) = resolve_index(&eargs[1], &int_binds) else {
+                continue;
+            };
+            // OOB requires a NON-NEGATIVE offset at or past the end.
+            if offset < 0 || (offset as usize) < inner.len() {
+                continue;
+            }
+            // Replacement `T`: ground, NON-EMPTY, head `a`.
+            let Some(tlist) = parse_ground_seq_arith(&rargs[2], &seq_binds, &int_binds) else {
+                continue;
+            };
+            let Some(a) = tlist.first().copied() else {
+                continue;
+            };
+            // Whole: ground, NON-EMPTY, head `b`.
+            let Some(whole) = parse_ground_seq_arith(whole_side, &seq_binds, &int_binds) else {
+                continue;
+            };
+            let Some(b) = whole.first().copied() else {
+                continue;
+            };
+            // Genuine head mismatch over a single shared element type (needle's
+            // inner seq, replacement, and whole all agree).
+            if a.lean_ty() != b.lean_ty() || a == b {
+                continue;
+            }
+            let (Some(ty_s), Some(ty_t), Some(ty_w)) =
+                (seq_elt_ty(&inner), seq_elt_ty(&tlist), seq_elt_ty(&whole))
+            else {
+                continue;
+            };
+            if ty_s != ty_t || ty_t != ty_w {
+                continue;
+            }
+            return Some(render_seq_extract_oob_replace_lean(
+                &inner, offset, &tlist, &whole, a, b, ty_t,
+            ));
+        }
+    }
+    None
+}
+
+/// Render the OOB-`seq.extract` / empty-needle `seq.replace` head-conflict Lean.
+/// Grounds `SeqThy.seqExtract_oob` (needle empty for every count) and
+/// `SeqThy.seqReplaceEmpty_head` (prepended replacement pins the head) over a
+/// universally-quantified haystack `s0` and count `n`.
+fn render_seq_extract_oob_replace_lean(
+    inner: &[SeqElt],
+    offset: i64,
+    tlist: &[SeqElt],
+    whole: &[SeqElt],
+    a: SeqElt,
+    b: SeqElt,
+    ty: &str,
+) -> String {
+    let s_lean = seq_list_lean(inner);
+    let t_lean = seq_list_lean(tlist);
+    let whole_lean = seq_list_lean(whole);
+    let a_bare = a.lean_bare();
+    let b_bare = b.lean_bare();
+    let len = inner.len();
+    let hash = fnv_hex(&format!(
+        "seqextractoobreplace:{s_lean}:{offset}:{t_lean}:{whole_lean}:{a_bare}:{b_bare}:{ty}"
+    ));
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.SeqThy
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — OUT-OF-BOUNDS `seq.extract` feeding an
+  empty-needle `seq.replace` head conflict, grounded in the verified
+  `SeqThy.seqExtract_oob` and `SeqThy.seqReplaceEmpty_head` (cf. the hand-checked
+  witnesses `SeqThy.ex_seqExtract_oob_replace_conflict` /
+  `SeqThy.ex_seqExtract_oob_replace_via_principle`). The assertion
+  `seq.replace HAYSTACK (seq.extract {s_lean} {offset} N) {t_lean} = {whole_lean}`
+  is unsatisfiable: the extract offset `{offset} ≥ len {s_lean} = {len}` makes the
+  needle EMPTY for every count `N` (`seqExtract_oob`), and an SMT `seq.replace`
+  with an empty needle PREPENDS the replacement, so the result is
+  `{t_lean} ++ HAYSTACK` whose head is pinned by `{t_lean}`'s head `{a_bare}` for
+  EVERY haystack (`seqReplaceEmpty_head`); but the whole `{whole_lean}` has head
+  `{b_bare}`, and `{a_bare} ≠ {b_bare}`. Reconstructed from the frontend parsed
+  ASSERTIONS (ay reduces seq.extract / seq.replace eagerly). The haystack `s0` and
+  count `n` are quantified UNIVERSALLY, so the certificate refutes the assertion
+  for every value of the concrete haystack/count; `{s_lean}`, `{t_lean}`,
+  `{whole_lean}` are ground concrete lists, so every side condition closes by
+  `decide`. Pure Lean 4 core; axioms ⊆ {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.SeqExtractOobReplace_{hash}
+open AySoundness
+
+/-- The needle `seq.extract {s_lean} {offset} n` is OUT-OF-BOUNDS (offset
+    `{offset} ≥ len {s_lean} = {len}`), hence EMPTY for every count `n`. -/
+theorem needle_empty (n : Nat) :
+    SeqThy.seqExtract (({s_lean}) : SeqThy.Seq {ty}) {offset} n = ([] : SeqThy.Seq {ty}) :=
+  SeqThy.seqExtract_oob (({s_lean}) : SeqThy.Seq {ty}) {offset} n (by decide)
+
+/-- No haystack `s0` makes `seq.replace s0 [] {t_lean} = {whole_lean}`: the empty
+    needle prepends `{t_lean}` (head `{a_bare}`), but the whole's head is
+    `{b_bare} ≠ {a_bare}`. Combined with `needle_empty`, this refutes the assertion
+    for every haystack and every count. -/
+theorem no_model (s0 : SeqThy.Seq {ty}) :
+    ¬ (SeqThy.seqReplaceEmpty s0 (({t_lean}) : SeqThy.Seq {ty})
+        = (({whole_lean}) : SeqThy.Seq {ty})) := by
+  intro h
+  have hhead :=
+    SeqThy.seqReplaceEmpty_head s0 (({t_lean}) : SeqThy.Seq {ty}) ({a_bare}) (by decide)
+  rw [h] at hhead
+  exact absurd hhead (by decide)
+
+end AySoundness.Emitted.SeqExtractOobReplace_{hash}
 "#,
     )
 }
@@ -8484,6 +9647,460 @@ theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
 end AySoundness.Emitted.WordEqLen_{hash}
 "#,
     )
+}
+
+// ---------------------------------------------------------------------------
+// `str.indexof` ABSENT-needle firewall emitters (grounded in the verified,
+// CLASSICAL-FREE `AySoundness.IndexOfThy.indexOf_absent_all_start`).
+// ---------------------------------------------------------------------------
+
+const MAX_INDEXOF_ALIAS_ASSERTIONS: usize = 10_000;
+const MAX_INDEXOF_ALIAS_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INDEXOF_LITERAL_BYTES: usize = 1024 * 1024;
+const MAX_INDEXOF_FIREWALL_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+const INDEXOF_RENDER_FIXED_RESERVE: usize = 64 * 1024;
+const INDEXOF_RENDER_REFERENCE_FACTOR: usize = 16;
+
+/// Resolve a parsed term to a ground STRING literal (its raw content). A string
+/// literal resolves to itself; a symbol resolves through the `(= sym literal)` /
+/// transitive `(= sym sym')` aliases in `str_binds`. The returned string borrows
+/// the parsed AST: a long literal is never copied once per alias. `None` if the
+/// term is not ground.
+fn resolve_str_literal<'a>(
+    t: &'a PTerm,
+    str_binds: &std::collections::BTreeMap<&'a str, &'a str>,
+) -> Option<&'a str> {
+    match t {
+        PTerm::Const(PConst::String(l)) => Some(l.as_str()),
+        PTerm::Symbol(s) => str_binds.get(s.as_str()).copied(),
+        _ => None,
+    }
+}
+
+/// Collect `(= sym str-literal)` bindings AND transitive `(= sym sym')` string
+/// aliases. A single graph build followed by a worklist traversal is
+/// `O((V + E) log V)`; the former repeated full scan plus linear binding lookup
+/// was cubic on a reverse-ordered alias chain. All names and literal values
+/// borrow the parsed AST, preventing alias-count × literal-size amplification.
+///
+/// The assertion and referenced-byte caps mirror the diagnostic preflight's
+/// resource envelope, but are repeated here because explicit
+/// `--emit-firewall-lean` calls this emitter without that preflight. Crossing
+/// either cap declines the entire lane (fail closed).
+fn collect_str_binds(parsed: &[PTerm]) -> Option<std::collections::BTreeMap<&str, &str>> {
+    use std::collections::{BTreeMap, VecDeque};
+
+    if parsed.len() > MAX_INDEXOF_ALIAS_ASSERTIONS {
+        return None;
+    }
+
+    let mut edges: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut seeds: Vec<(&str, &str)> = Vec::new();
+    let mut alias_bytes = 0usize;
+    for assertion in parsed {
+        let PTerm::App(op, args) = assertion else {
+            continue;
+        };
+        if op != "=" || args.len() != 2 {
+            continue;
+        }
+        match (&args[0], &args[1]) {
+            (PTerm::Symbol(symbol), PTerm::Const(PConst::String(literal)))
+            | (PTerm::Const(PConst::String(literal)), PTerm::Symbol(symbol)) => {
+                alias_bytes = alias_bytes
+                    .checked_add(symbol.len())?
+                    .checked_add(literal.len())?;
+                if alias_bytes > MAX_INDEXOF_ALIAS_BYTES {
+                    return None;
+                }
+                seeds.push((symbol.as_str(), literal.as_str()));
+            }
+            (PTerm::Symbol(left), PTerm::Symbol(right)) if left != right => {
+                alias_bytes = alias_bytes
+                    .checked_add(left.len())?
+                    .checked_add(right.len())?;
+                if alias_bytes > MAX_INDEXOF_ALIAS_BYTES {
+                    return None;
+                }
+                edges.entry(left.as_str()).or_default().push(right.as_str());
+                edges.entry(right.as_str()).or_default().push(left.as_str());
+            }
+            _ => {}
+        }
+    }
+
+    let mut binds = BTreeMap::new();
+    let mut work = VecDeque::new();
+    // Complete one component before considering the next literal seed. If an
+    // asserted-equality component contains conflicting literal seeds then the
+    // query is already inconsistent; choosing its first asserted seed remains
+    // deterministic and every propagated equality is still an asserted fact.
+    for (root, literal) in seeds {
+        if binds.contains_key(root) {
+            continue;
+        }
+        work.push_back(root);
+        while let Some(symbol) = work.pop_front() {
+            if binds.contains_key(symbol) {
+                continue;
+            }
+            binds.insert(symbol, literal);
+            if let Some(neighbors) = edges.get(symbol) {
+                for &neighbor in neighbors {
+                    if !binds.contains_key(neighbor) {
+                        work.push_back(neighbor);
+                    }
+                }
+            }
+        }
+    }
+    Some(binds)
+}
+
+/// Render a string's Unicode codepoints as a bare Lean `List Nat` literal
+/// (`"cba"` ⟹ `[99, 98, 97]`); the surrounding `IndexOfThy.indexOf : Str → …`
+/// fixes the element type, so no ascription is needed. Mirrors the codepoint
+/// mapping of [`word_eq_lean_str_list`] (which additionally ascribes).
+fn indexof_codelist_len(s: &str) -> Option<usize> {
+    let mut len = 2usize; // `[` + `]`
+    let mut first = true;
+    for codepoint in s.chars().map(|c| c as u32) {
+        if !first {
+            len = len.checked_add(2)?; // `, `
+        }
+        first = false;
+        let digits = if codepoint == 0 {
+            1
+        } else {
+            codepoint.ilog10() as usize + 1
+        };
+        len = len.checked_add(digits)?;
+    }
+    Some(len)
+}
+
+fn indexof_codelist(s: &str, exact_len: usize) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(exact_len);
+    out.push('[');
+    for (index, codepoint) in s.chars().map(|c| c as u32).enumerate() {
+        if index != 0 {
+            out.push_str(", ");
+        }
+        write!(&mut out, "{codepoint}").expect("writing to String cannot fail");
+    }
+    out.push(']');
+    debug_assert_eq!(out.len(), exact_len);
+    out
+}
+
+/// Is `needle` ABSENT from `hay` — i.e. does the SMT `str.indexof hay needle _`
+/// return `-1` for every start? Mirrors the verified `IndexOfThy.matchAt` /
+/// `indexOf` model EXACTLY: `matchAt` at position `i` compares
+/// `(hay.drop i).take needle.len` to `needle`, and `indexOf` scans `i ∈
+/// 0..=hay.len`. Absence (⇒ the `by decide` `List.all` premise of
+/// `indexOf_absent_all_start` holds) means no such `i` matches. An EMPTY needle
+/// matches everywhere, so it is NOT absent (the emitters then decline). UTF-8
+/// is self-synchronizing, so byte-substring containment of valid Rust strings is
+/// equivalent to codepoint-list containment. `str::contains` uses a bounded,
+/// allocation-free substring search; the checked byte cap also fences the work.
+fn needle_absent(hay: &str, needle: &str) -> Option<bool> {
+    let input_bytes = hay.len().checked_add(needle.len())?;
+    if input_bytes > MAX_INDEXOF_LITERAL_BYTES {
+        return None;
+    }
+    Some(!needle.is_empty() && !hay.contains(needle))
+}
+
+/// Materialize the two codepoint lists only after proving a conservative upper
+/// bound for every repeated interpolation in the final source. This prevents a
+/// large literal from allocating codepoint strings (and then a much larger
+/// formatted artifact) before `BoundedFirewallArtifacts` can reject it.
+fn bounded_indexof_codelists(
+    hay: &str,
+    needle: &str,
+    max_source_bytes: usize,
+) -> Option<(String, String)> {
+    let source_cap = max_source_bytes.min(MAX_INDEXOF_FIREWALL_SOURCE_BYTES);
+    let hay_len = indexof_codelist_len(hay)?;
+    let needle_len = indexof_codelist_len(needle)?;
+    let repeated_lists = hay_len
+        .checked_add(needle_len)?
+        .checked_mul(INDEXOF_RENDER_REFERENCE_FACTOR)?;
+    let estimated_source = repeated_lists.checked_add(INDEXOF_RENDER_FIXED_RESERVE)?;
+    if estimated_source > source_cap {
+        return None;
+    }
+    Some((
+        indexof_codelist(hay, hay_len),
+        indexof_codelist(needle, needle_len),
+    ))
+}
+
+/// Emit a verified-firewall Lean certificate for a `str.indexof`-ABSENT `≥ 0`
+/// conflict among the PARSED assertions: `(>= (str.indexof H N s) 0)` where the
+/// haystack `H` and needle `N` resolve to ground string LITERALS (through
+/// `(= sym literal)` aliases) and `N` is genuinely ABSENT from `H` (so
+/// `str.indexof = -1` for EVERY start). Asserting `-1 ≥ 0` is unsatisfiable.
+///
+/// Grounded in the verified, CLASSICAL-FREE `IndexOfThy.indexOf_absent_all_start`
+/// (`∀ m, indexOf H N m = -1`, discharged from the decidable `List.all` witness by
+/// `by decide` — NOT `simp`, which would leak `Classical.choice`); cf. the
+/// hand-checked witness `IndexOfThy.xt_indexof_not_ge_zero`. The symbolic start `m`
+/// is quantified UNIVERSALLY (`Val = Nat`), so the certificate refutes the
+/// assertion for every non-negative start. `Ok(None)` unless `H`/`N` are ground
+/// literals and `N` is genuinely absent from `H`; `Err(())` reports a resource
+/// fence so the caller rejects the entire artifact batch rather than silently
+/// publishing an incomplete set.
+pub(crate) fn emit_str_indexof_absent_ge_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    max_source_bytes: usize,
+) -> Result<Option<String>, ()> {
+    let str_binds = collect_str_binds(parsed).ok_or(())?;
+    for asrt in parsed {
+        let PTerm::App(op, args) = asrt else { continue };
+        // `(>= (str.indexof H N s) 0)` — the absent-index-is-non-negative claim.
+        if op != ">=" || args.len() != 2 {
+            continue;
+        }
+        if parsed_numeral(&args[1]) != Some(0) {
+            continue;
+        }
+        let PTerm::App(iop, iargs) = &args[0] else {
+            continue;
+        };
+        if iop != "str.indexof" || iargs.len() != 3 {
+            continue;
+        }
+        let (Some(hay), Some(needle)) = (
+            resolve_str_literal(&iargs[0], &str_binds),
+            resolve_str_literal(&iargs[1], &str_binds),
+        ) else {
+            continue;
+        };
+        // Fail-closed: emit ONLY when the needle is genuinely absent (so the
+        // `by decide` `List.all` premise of `indexOf_absent_all_start` holds).
+        if !needle_absent(hay, needle).ok_or(())? {
+            continue;
+        }
+        let (hay_l, needle_l) =
+            bounded_indexof_codelists(hay, needle, max_source_bytes).ok_or(())?;
+        let rendered =
+            render_str_indexof_absent_ge_lean(&hay_l, &needle_l, max_source_bytes).ok_or(())?;
+        return Ok(Some(rendered));
+    }
+    Ok(None)
+}
+
+/// Render the `str.indexof`-ABSENT `≥ 0` firewall Lean. Grounds
+/// `IndexOfThy.indexOf_absent_all_start` (CLASSICAL-FREE) through the verified
+/// `firewall_combined_unsat` over `Val = Nat` (the universally-quantified symbolic
+/// start `m`). The atom `str.indexof H N m ≥ 0` is refuted by rewriting the index
+/// to `-1` (via the absence lemma) and closing the ground `¬(-1 ≥ 0)` by `decide`.
+fn render_str_indexof_absent_ge_lean(
+    hay_l: &str,
+    needle_l: &str,
+    max_source_bytes: usize,
+) -> Option<String> {
+    let hash = fnv_hex(&format!("indexofabsentge:{hay_l}:{needle_l}"));
+    let rendered = format!(
+        r#"import AySoundness.Firewall
+import AySoundness.StringThy
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — `str.indexof`-ABSENT `≥ 0` conflict,
+  grounded in the verified, CLASSICAL-FREE `IndexOfThy.indexOf_absent_all_start`
+  (cf. the hand-checked witness `IndexOfThy.xt_indexof_not_ge_zero`). The assertion
+  `str.indexof {hay_l} {needle_l} s ≥ 0` is unsatisfiable: the needle {needle_l} is
+  ABSENT from the haystack {hay_l} (its concrete `matchAt` fails at every position,
+  closed by `decide` on the `List.all` witness), so `str.indexof = -1` for EVERY
+  start `m` (`indexOf_absent_all_start`, proved via the constructive
+  `filter_all_false` — NO `Classical.choice`), and `-1 ≥ 0` is false. Reconstructed
+  from the frontend parsed ASSERTIONS (ay reduces str.indexof eagerly). The symbolic
+  start `m` is quantified UNIVERSALLY (`Val = Nat`), so the certificate refutes the
+  assertion for every non-negative start; the `indexOf … m = -1` step is closed by
+  the absence lemma / `decide`, never `simp`. Pure Lean 4 core; axioms ⊆
+  {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.StrIndexofAbsentGe_{hash}
+open AySoundness
+
+abbrev Val := Nat
+
+/-- Atom `1 ↦ str.indexof {hay_l} {needle_l} m ≥ 0` (`m` = the symbolic start). -/
+def atomVal (m : Val) (k : Nat) : Bool :=
+  match k with
+  | 1 => decide (IndexOfThy.indexOf {hay_l} {needle_l} m ≥ 0)
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1])]
+def lemmas   : List (Cid × Clause) := [(2, [-1])]
+def proof    : List (Cid × Clause × List Int) := [(3, [], [1, 2])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1] = true := by
+  -- Close `indexOf … m = -1` via the CLASSICAL-FREE absence lemma (NOT `simp`).
+  have h1 : IndexOfThy.indexOf {hay_l} {needle_l} m = -1 :=
+    IndexOfThy.indexOf_absent_all_start {hay_l} {needle_l} (by decide) m
+  have ha : atomVal m 1 = false := by
+    simp only [atomVal, h1]
+    decide
+  simp [clauseSat, litSat, List.any_cons, List.any_nil, ha]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- No start makes the absent needle's `str.indexof` non-negative — via the
+    firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+-- verify: axioms ⊆ {{propext, Quot.sound}} (NO Classical.choice)
+#print axioms no_model
+
+end AySoundness.Emitted.StrIndexofAbsentGe_{hash}
+"#,
+    );
+    (rendered.len() <= max_source_bytes.min(MAX_INDEXOF_FIREWALL_SOURCE_BYTES)).then_some(rendered)
+}
+
+/// Emit a verified-firewall Lean certificate for a `str.indexof`-ABSENT
+/// `str.is_digit ∘ str.from_int` conflict among the PARSED assertions:
+/// `(str.is_digit (str.from_int (str.indexof T W k)))` where the haystack `T` and
+/// needle `W` resolve to ground string LITERALS (through transitive `(= sym
+/// literal)` / `(= sym sym')` aliases — e.g. `v = "cba"`, `v = t`) and `W` is
+/// genuinely ABSENT from `T`. Asserting the predicate TRUE is unsatisfiable: the
+/// index is `-1`, `str.from_int (-1) = ""`, and `str.is_digit "" = false`.
+///
+/// Grounded in the verified, CLASSICAL-FREE `IndexOfThy.indexOf_absent_all_start`
+/// (`∀ m, indexOf T W m = -1`, via `by decide` — NOT `simp`); the residual
+/// `str.is_digit (str.from_int (-1)) = false` is a ground `decide`. Cf. the
+/// hand-checked witness `IndexOfThy.str_indexof_is_digit_false`. The symbolic start
+/// `m` is quantified UNIVERSALLY (`Val = Nat`). `Ok(None)` unless `T`/`W` are
+/// ground literals and `W` is genuinely absent from `T`; `Err(())` reports a
+/// resource fence to the bounded batch collector.
+pub(crate) fn emit_str_indexof_is_digit_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    max_source_bytes: usize,
+) -> Result<Option<String>, ()> {
+    let str_binds = collect_str_binds(parsed).ok_or(())?;
+    for asrt in parsed {
+        // `(str.is_digit (str.from_int (str.indexof T W k)))`.
+        let PTerm::App(dop, dargs) = asrt else {
+            continue;
+        };
+        if dop != "str.is_digit" || dargs.len() != 1 {
+            continue;
+        }
+        let PTerm::App(fop, fargs) = &dargs[0] else {
+            continue;
+        };
+        if fop != "str.from_int" || fargs.len() != 1 {
+            continue;
+        }
+        let PTerm::App(iop, iargs) = &fargs[0] else {
+            continue;
+        };
+        if iop != "str.indexof" || iargs.len() != 3 {
+            continue;
+        }
+        let (Some(hay), Some(needle)) = (
+            resolve_str_literal(&iargs[0], &str_binds),
+            resolve_str_literal(&iargs[1], &str_binds),
+        ) else {
+            continue;
+        };
+        if !needle_absent(hay, needle).ok_or(())? {
+            continue;
+        }
+        let (hay_l, needle_l) =
+            bounded_indexof_codelists(hay, needle, max_source_bytes).ok_or(())?;
+        let rendered =
+            render_str_indexof_is_digit_lean(&hay_l, &needle_l, max_source_bytes).ok_or(())?;
+        return Ok(Some(rendered));
+    }
+    Ok(None)
+}
+
+/// Render the `str.indexof`-ABSENT `str.is_digit ∘ str.from_int` firewall Lean.
+/// Grounds `IndexOfThy.indexOf_absent_all_start` (CLASSICAL-FREE) through the
+/// verified `firewall_combined_unsat` over `Val = Nat`; the residual
+/// `str.is_digit (str.from_int (-1)) = false` closes by ground `decide`.
+fn render_str_indexof_is_digit_lean(
+    hay_l: &str,
+    needle_l: &str,
+    max_source_bytes: usize,
+) -> Option<String> {
+    let hash = fnv_hex(&format!("indexofisdigit:{hay_l}:{needle_l}"));
+    let rendered = format!(
+        r#"import AySoundness.Firewall
+import AySoundness.StringThy
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — `str.indexof`-ABSENT
+  `str.is_digit ∘ str.from_int` conflict, grounded in the verified, CLASSICAL-FREE
+  `IndexOfThy.indexOf_absent_all_start` (cf. the hand-checked witness
+  `IndexOfThy.str_indexof_is_digit_false`). The assertion
+  `str.is_digit (str.from_int (str.indexof {hay_l} {needle_l} k))` is unsatisfiable:
+  the needle {needle_l} is ABSENT from the haystack {hay_l} (its concrete `matchAt`
+  fails everywhere, closed by `decide`), so `str.indexof = -1` for EVERY start `m`
+  (`indexOf_absent_all_start`, via the constructive `filter_all_false` — NO
+  `Classical.choice`), `str.from_int (-1) = ""`, and `str.is_digit "" = false`.
+  Reconstructed from the frontend parsed ASSERTIONS, resolving the string aliases
+  transitively (ay reduces str.indexof / str.from_int / str.is_digit eagerly). The
+  symbolic start `m` is quantified UNIVERSALLY (`Val = Nat`); the `indexOf … m = -1`
+  step is closed by the absence lemma, never `simp`. Pure Lean 4 core; axioms ⊆
+  {{propext, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.StrIndexofIsDigit_{hash}
+open AySoundness
+
+abbrev Val := Nat
+
+/-- Atom `1 ↦ str.is_digit (str.from_int (str.indexof {hay_l} {needle_l} m))`. -/
+def atomVal (m : Val) (k : Nat) : Bool :=
+  match k with
+  | 1 => IndexOfThy.isDigit (IndexOfThy.fromInt (IndexOfThy.indexOf {hay_l} {needle_l} m))
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1])]
+def lemmas   : List (Cid × Clause) := [(2, [-1])]
+def proof    : List (Cid × Clause × List Int) := [(3, [], [1, 2])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1] = true := by
+  -- Close `indexOf … m = -1` via the CLASSICAL-FREE absence lemma (NOT `simp`).
+  have h1 : IndexOfThy.indexOf {hay_l} {needle_l} m = -1 :=
+    IndexOfThy.indexOf_absent_all_start {hay_l} {needle_l} (by decide) m
+  have ha : atomVal m 1 = false := by
+    simp only [atomVal, h1]
+    decide
+  simp [clauseSat, litSat, List.any_cons, List.any_nil, ha]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- No start makes the absent needle's `str.indexof` a digit through
+    `str.from_int` — via the firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+-- verify: axioms ⊆ {{propext, Quot.sound}} (NO Classical.choice)
+#print axioms no_model
+
+end AySoundness.Emitted.StrIndexofIsDigit_{hash}
+"#,
+    );
+    (rendered.len() <= max_source_bytes.min(MAX_INDEXOF_FIREWALL_SOURCE_BYTES)).then_some(rendered)
 }
 
 // ==== APPENDED BUCKET: b_sets.rs ====

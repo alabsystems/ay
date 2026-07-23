@@ -36,7 +36,9 @@
 //! planning is fail-closed (any unrecognized literal, non-entailed
 //! conclusion, or single-flipped-hypothesis degenerate returns `None` and
 //! the surgery aborts, leaving the proof byte-identical). The caller
-//! additionally gates the whole rebuilt proof through `check_proof_strict`.
+//! additionally gates the whole rebuilt proof through the executor's contextual
+//! strict checker (datatype declarations, selectors, authored assumptions, and
+//! array-diff witness provenance included).
 
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::term::TermData;
@@ -809,7 +811,7 @@ impl Executor {
     /// - only reachable `TheoryLemmaKind::Generic` leaves recognized by
     ///   [`Self::plan_euf_lemma`] are replaced;
     /// - every `Assume` and every unrecognized step is copied byte-for-byte;
-    /// - premise ids and named assume ids are remapped mechanically; and
+    /// - premise ids and valid named assume ids are remapped mechanically; and
     /// - the rebuilt proof is installed atomically only if the whole proof
     ///   passes the strict checker.
     ///
@@ -869,12 +871,34 @@ impl Executor {
             if !reachable[idx] {
                 continue;
             }
-            let ay_core::ProofStep::TheoryLemma { kind, clause, .. } = step else {
-                continue;
+            // Two trust shapes carry certificate-free EUF leaves that
+            // `plan_euf_lemma` can independently re-derive:
+            //   (1) `TheoryLemma{Generic}`  — the lazy EUF engine's fused
+            //       congruence/substitution-chain lemmas; and
+            //   (2) `Step{Trust}`           — an `(or …)`-wrapped
+            //       eq_transitive/eq_congruent leaf the array-extensionality
+            //       lane emits as a raw trust step (it is a `Step`, so the
+            //       TheoryLemma-only classifier/splitter passes never touch
+            //       it, and its residual presence made this pass's whole-proof
+            //       strict gate revert an otherwise-valid rebuild of (1)).
+            // Both are self-contained EUF tautologies (their hypotheses are the
+            // clause's own negated literals), so re-deriving them as a pure
+            // tautology never depends on the original premises. `plan_euf_lemma`
+            // is fail-closed (any non-EUF clause → `None`) and the whole-proof
+            // strict gate below is the backstop, so a mis-recognition reverts.
+            let clause = match step {
+                ay_core::ProofStep::TheoryLemma {
+                    kind: ay_core::TheoryLemmaKind::Generic,
+                    clause,
+                    ..
+                } => clause,
+                ay_core::ProofStep::Step {
+                    rule: AletheRule::Trust,
+                    clause,
+                    ..
+                } => clause,
+                _ => continue,
             };
-            if !matches!(kind, ay_core::TheoryLemmaKind::Generic) {
-                continue;
-            }
             plans[idx] = self.plan_euf_lemma(clause);
         }
         if plans.iter().all(Option::is_none) {
@@ -916,14 +940,27 @@ impl Executor {
             };
             remap.push(rebuilt.add_step(step));
         }
-        for (name, old_id) in &original.named_steps {
-            let Some(&new_id) = remap.get(old_id.0 as usize) else {
-                return;
+        let mut remapped_named = original.named_steps.clone();
+        remapped_named.retain(|_, id| {
+            let old_idx = id.0 as usize;
+            if !matches!(
+                original.steps.get(old_idx),
+                Some(ay_core::ProofStep::Assume(_))
+            ) {
+                return false;
+            }
+            let Some(new_id) = remap.get(old_idx) else {
+                return false;
             };
-            rebuilt.named_steps.insert(name.clone(), new_id);
-        }
+            *id = *new_id;
+            true
+        });
+        rebuilt.named_steps = remapped_named;
 
-        if ay_proof::check_proof_strict(&rebuilt, &self.ctx.terms).is_ok() {
+        if self
+            .check_proof_strict_derivation_with_datatypes(&rebuilt)
+            .is_ok()
+        {
             *proof = rebuilt;
         }
     }
@@ -973,6 +1010,12 @@ mod tests {
             vec![not_bound, not_eq, not_pa, pb],
             TheoryLemmaKind::Generic,
         );
+        proof
+            .named_steps
+            .insert("not_an_assume".to_string(), generic);
+        proof
+            .named_steps
+            .insert("dangling".to_string(), ProofId(u32::MAX));
         let r1 = proof.add_resolution(vec![not_eq, not_pa, pb], bound, generic, h_bound);
         let r2 = proof.add_resolution(vec![not_pa, pb], eq, r1, h_eq);
         let r3 = proof.add_resolution(vec![pb], pa, r2, h_pa);
@@ -980,9 +1023,24 @@ mod tests {
 
         let original_assumes = assume_terms(&proof);
         assert!(ay_proof::check_proof_strict(&proof, terms).is_err());
+        exec.ctx.assertions.extend([bound, eq, pa, not_pb]);
         exec.promote_certified_generic_euf_leaves(&mut proof);
 
         assert_eq!(assume_terms(&proof), original_assumes);
+        assert!(!proof.named_steps.contains_key("not_an_assume"));
+        assert!(!proof.named_steps.contains_key("dangling"));
+        for (name, expected_term) in [
+            ("h_bound", bound),
+            ("h_eq", eq),
+            ("h_pa", pa),
+            ("h_not_pb", not_pb),
+        ] {
+            let id = proof.named_steps[name];
+            assert!(
+                matches!(proof.steps.get(id.0 as usize), Some(ProofStep::Assume(term)) if *term == expected_term),
+                "named assumption {name} must survive with its remapped id"
+            );
+        }
         assert!(proof.steps.iter().all(|step| !matches!(
             step,
             ProofStep::TheoryLemma {
@@ -1051,5 +1109,154 @@ mod tests {
         exec.promote_certified_generic_euf_leaves(&mut proof);
         assert_eq!(format!("{:?}", proof.steps), before);
         assert!(ay_proof::check_proof_strict(&proof, &exec.ctx.terms).is_err());
+    }
+
+    /// Shape 2a — the fused congruence-through-a-shared-witness clause
+    /// `(cl (= (select a1 i0) (select a1 i1)) ¬(= i0 k) ¬(= i1 k))`: the two
+    /// index substitutions `i0 = k` and `i1 = k` chain to `i0 = i1`, which the
+    /// `select` congruence lifts to the conclusion. `plan_euf_lemma` must
+    /// recognize it (its congruence closure entails the positive equality).
+    #[test]
+    fn fused_select_congruence_via_shared_witness_is_planned() {
+        let mut exec = Executor::new();
+        let terms = &mut exec.ctx.terms;
+        let a1 = terms.mk_var("fsc_a1", Sort::Int);
+        let i0 = terms.mk_var("fsc_i0", Sort::Int);
+        let i1 = terms.mk_var("fsc_i1", Sort::Int);
+        let k = terms.mk_var("fsc_k", Sort::Int);
+        let sel0 = terms.mk_app(Symbol::named("select"), [a1, i0], Sort::Int);
+        let sel1 = terms.mk_app(Symbol::named("select"), [a1, i1], Sort::Int);
+        let concl = terms.mk_eq(sel0, sel1);
+        let eq_i0k = terms.mk_eq(i0, k);
+        let not_i0k = terms.mk_not_raw(eq_i0k);
+        let eq_i1k = terms.mk_eq(i1, k);
+        let not_i1k = terms.mk_not_raw(eq_i1k);
+
+        let clause = vec![concl, not_i0k, not_i1k];
+        assert!(
+            exec.plan_euf_lemma(&clause).is_some(),
+            "the fused select congruence through a shared witness must be recognized"
+        );
+    }
+
+    /// NEGATIVE shape 2a — the SAME clause with the second required
+    /// arg-disequality `¬(= i1 k)` DROPPED. Without it `i0 = i1` is not
+    /// entailed, so the conclusion does not follow and `plan_euf_lemma` must
+    /// decline (return `None`) rather than fabricate a bogus congruence.
+    #[test]
+    fn fused_select_congruence_missing_arg_disequality_is_declined() {
+        let mut exec = Executor::new();
+        let terms = &mut exec.ctx.terms;
+        let a1 = terms.mk_var("fscm_a1", Sort::Int);
+        let i0 = terms.mk_var("fscm_i0", Sort::Int);
+        let i1 = terms.mk_var("fscm_i1", Sort::Int);
+        let k = terms.mk_var("fscm_k", Sort::Int);
+        let sel0 = terms.mk_app(Symbol::named("select"), [a1, i0], Sort::Int);
+        let sel1 = terms.mk_app(Symbol::named("select"), [a1, i1], Sort::Int);
+        let concl = terms.mk_eq(sel0, sel1);
+        let eq_i0k = terms.mk_eq(i0, k);
+        let not_i0k = terms.mk_not_raw(eq_i0k);
+
+        let clause = vec![concl, not_i0k];
+        assert!(
+            exec.plan_euf_lemma(&clause).is_none(),
+            "a fused congruence missing a required arg-disequality must be declined"
+        );
+    }
+
+    /// Shape 2b — an `(or …)`-wrapped `eq_transitive` leaf emitted as a raw
+    /// `Step{Trust}` (not a `TheoryLemma`, so the TheoryLemma-only splitter
+    /// passes never touch it). The extended promotion pass must re-derive it as
+    /// checkable EUF steps so no trust step remains.
+    #[test]
+    fn or_wrapped_trust_step_eq_transitive_is_promoted() {
+        let mut exec = Executor::new();
+        let terms = &mut exec.ctx.terms;
+        let a = terms.mk_var("ots_a", Sort::Int);
+        let b = terms.mk_var("ots_b", Sort::Int);
+        let c = terms.mk_var("ots_c", Sort::Int);
+        let eq_ac = terms.mk_eq(a, c);
+        let eq_ab = terms.mk_eq(a, b);
+        let not_ab = terms.mk_not_raw(eq_ab);
+        let eq_bc = terms.mk_eq(b, c);
+        let not_bc = terms.mk_not_raw(eq_bc);
+        // or_term = (or (= a c) (not (= a b)) (not (= b c)))
+        let or_term = terms.mk_app(Symbol::named("or"), [eq_ac, not_ab, not_bc], Sort::Bool);
+        let not_or = terms.mk_not_raw(or_term);
+
+        let mut proof = Proof::new();
+        let t0 = proof.add_rule_step(AletheRule::Trust, vec![or_term], Vec::new(), Vec::new());
+        let h = proof.add_assume(not_or, None);
+        proof.add_resolution(Vec::new(), or_term, t0, h);
+
+        assert!(
+            proof.steps.iter().any(|s| matches!(
+                s,
+                ProofStep::Step {
+                    rule: AletheRule::Trust,
+                    ..
+                }
+            )),
+            "the leaf starts as a Step{{Trust}}"
+        );
+        exec.promote_certified_generic_euf_leaves(&mut proof);
+        assert!(
+            !proof.steps.iter().any(|s| matches!(
+                s,
+                ProofStep::Step {
+                    rule: AletheRule::Trust | AletheRule::Hole,
+                    ..
+                } | ProofStep::TheoryLemma {
+                    kind: TheoryLemmaKind::Generic,
+                    ..
+                }
+            )),
+            "the or-wrapped eq_transitive trust leaf must be replaced (no trust remains)"
+        );
+        assert!(
+            proof.steps.iter().any(|s| matches!(
+                s,
+                ProofStep::Step {
+                    rule: AletheRule::EqTransitive,
+                    ..
+                }
+            )),
+            "the replacement must emit a checkable eq_transitive step"
+        );
+    }
+
+    /// NEGATIVE shape 2b — an `(or …)`-wrapped `Step{Trust}` whose flattened
+    /// disjunction is NOT a valid transitivity tautology (the premises do not
+    /// connect the conclusion endpoints). `plan_euf_lemma` must decline, so the
+    /// pass leaves the proof byte-identical.
+    #[test]
+    fn or_wrapped_trust_step_disconnected_chain_is_left_unchanged() {
+        let mut exec = Executor::new();
+        let terms = &mut exec.ctx.terms;
+        let a = terms.mk_var("otd_a", Sort::Int);
+        let b = terms.mk_var("otd_b", Sort::Int);
+        let c = terms.mk_var("otd_c", Sort::Int);
+        let d = terms.mk_var("otd_d", Sort::Int);
+        let eq_ad = terms.mk_eq(a, d);
+        let eq_ab = terms.mk_eq(a, b);
+        let not_ab = terms.mk_not_raw(eq_ab);
+        let eq_cd = terms.mk_eq(c, d);
+        let not_cd = terms.mk_not_raw(eq_cd);
+        // (or (= a d) (not (= a b)) (not (= c d))) — a—b and c—d are disjoint.
+        let or_term = terms.mk_app(Symbol::named("or"), [eq_ad, not_ab, not_cd], Sort::Bool);
+        let not_or = terms.mk_not_raw(or_term);
+
+        let mut proof = Proof::new();
+        let t0 = proof.add_rule_step(AletheRule::Trust, vec![or_term], Vec::new(), Vec::new());
+        let h = proof.add_assume(not_or, None);
+        proof.add_resolution(Vec::new(), or_term, t0, h);
+
+        let before = format!("{:?}", proof.steps);
+        exec.promote_certified_generic_euf_leaves(&mut proof);
+        assert_eq!(
+            format!("{:?}", proof.steps),
+            before,
+            "a disconnected or-wrapped trust leaf must be left untouched"
+        );
     }
 }

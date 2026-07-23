@@ -973,3 +973,33 @@ fn test_aufnra_select_const_consistent_product_not_wrong_unsat() {
         "consistent SAT formula must not become wrong UNSAT"
     );
 }
+
+/// P0 regression: the combined nested-array/arithmetic path currently derives
+/// a false UNSAT on this satisfiable minimized SV-COMP instance (z3 supplies a
+/// model, and AY's strict proof reconstruction rejects its own refutation).
+/// Until the combination defect is root-caused, the public result boundary must
+/// quarantine the raw UNSAT as Unknown.
+#[test]
+// This minimized ALIA instance is intentionally expensive: the solver must
+// reach the raw refutation before the public-result quarantine can reject it.
+// Leave enough wall-clock headroom for shared CI hosts running parallel builds.
+#[timeout(600_000)]
+fn test_nested_array_alia_false_unsat_is_quarantined() {
+    let input = include_str!("../../../../repros/cs_stateful-1.i_2.MINIMIZED.smt2");
+    assert_eq!(solve_one(input), "unknown");
+}
+
+/// The same authorization boundary must cover `check-sat-assuming`; otherwise
+/// moving a nested-array contradiction into an assumption could bypass the
+/// plain-check quarantine and expose an uncertified UNSAT through the API.
+#[test]
+fn test_nested_array_unsat_assumption_is_quarantined() {
+    let input = r#"
+        (set-logic QF_ALIA)
+        (declare-const a (Array Int (Array Int Int)))
+        (declare-const b (Array Int (Array Int Int)))
+        (assert (= a b))
+        (check-sat-assuming ((not (= a b))))
+    "#;
+    assert_eq!(solve_one(input), "unknown");
+}

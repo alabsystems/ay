@@ -12,7 +12,8 @@
 //! # Architecture
 //!
 //! - `Z3_context` wraps a `ay_dpll::api::Solver` (the term arena + solve engine)
-//! - `Z3_ast` is a 32-bit term handle (wraps `ay_dpll::api::Term`)
+//! - `Z3_ast` is an opaque context-salted encoding of an
+//!   `ay_dpll::api::Term` index
 //! - `Z3_sort` is a heap-allocated sort descriptor
 //! - `Z3_func_decl` is a heap-allocated function declaration
 //! - `Z3_model` is a heap-allocated model from a SAT result
@@ -387,7 +388,7 @@ use ay_dpll::Statistics;
 pub type Z3_context = *mut Z3Context;
 /// Opaque config handle
 pub type Z3_config = *mut Z3Config;
-/// AST handle (wraps AY Term — a Copy 32-bit index)
+/// AST handle (an opaque context-salted encoding of AY's Copy 32-bit term index)
 pub type Z3_ast = u64;
 /// Sort handle (heap-allocated)
 pub type Z3_sort = *mut SortHandle;
@@ -443,22 +444,24 @@ pub type Z3_probe = *mut ProbeHandle;
 
 /// High-bit tag distinguishing a proof-AST handle from an ordinary term handle.
 ///
-/// Ordinary `Z3_ast` values are `TermId + 1`, which (since `TermId` is `u32`)
-/// always fit in the low 32 bits. A proof handle returned by
-/// `Z3_solver_get_proof` sets bit 63 and stores its proof-text index in the low
-/// bits, so it can never alias a real term and `Z3_ast_to_string` can route it
-/// to the stored Alethe text. See `proofs.rs` (#phase3-proof).
+/// Ordinary `Z3_ast` values keep `TermId + 1` in the low 33-bit payload and a
+/// context salt below the reserved top nibble. A proof handle returned by
+/// `Z3_solver_get_proof` sets bit 63, carries the same context salt in bits
+/// 32–58, and stores its proof-text index in the low 32 bits, so it can never
+/// alias a real term or a proof from another context and `Z3_ast_to_string` can
+/// route it to the stored Alethe text. See `proofs.rs` (#phase3-proof).
 pub(crate) const PROOF_AST_TAG: u64 = 1u64 << 63;
 
 /// High-bit tag distinguishing an irrational-algebraic-number AST handle from an
 /// ordinary term handle.
 ///
-/// Ordinary `Z3_ast` values are `TermId + 1` (< 2^32). AY's `Real` AST only
+/// Ordinary term ASTs never set the reserved top nibble. AY's `Real` AST only
 /// encodes `BigRational`, so an irrational result of `Z3_algebraic_root` /
 /// `Z3_algebraic_add` (e.g. √2) has no term representation. Such a result sets
-/// bit 62 and stores its `RealScalar` index in the low bits (in
-/// `Z3Context::algebraic_values`), so it can never alias a real term or a proof
-/// handle (bit 63), and the `Z3_algebraic_*` / `Z3_get_algebraic_number_*` entry
+/// bit 62, carries the context salt in bits 32–58, and stores its `RealScalar`
+/// index in the low 32 bits (in `Z3Context::algebraic_values`), so it can never
+/// alias a real term, a proof handle (bit 63), or an algebraic value from
+/// another context. The `Z3_algebraic_*` / `Z3_get_algebraic_number_*` entry
 /// points route it to the stored exact value. Rational results keep using the
 /// ordinary numeral-AST path.
 pub(crate) const ALGEBRAIC_AST_TAG: u64 = 1u64 << 62;
@@ -489,31 +492,47 @@ pub(crate) const FUNC_DECL_AST_TAG: u64 = 1u64 << 60;
 /// Mask covering every non-term `Z3_ast` tag: proof (63), algebraic (62),
 /// sort (61), func_decl (60) — the reserved top nibble.
 ///
-/// SOUNDNESS: [`ast_to_term`] uses this mask as a poison guard. A tagged
+/// SOUNDNESS: [`checked_ast_to_term`] rejects this mask before decoding. A tagged
 /// handle leaking into a term-consuming entry point must NEVER be silently
 /// `u32`-truncated into a real `Term` id (that would alias an arbitrary
-/// unrelated term — a direct wrong-verdict channel). See [`ast_to_term`].
+/// unrelated term — a direct wrong-verdict channel).
 pub(crate) const HANDLE_TAG_MASK: u64 = 0xF << 60;
 
-/// Per-context discriminator carried by SORT/FUNC-DECL AST handles in bits
-/// 32–59 (28 bits), so a tagged handle minted in one context can NEVER
-/// silently decode in another context (whose tables would map the same low
-/// index to an unrelated sort/decl — a wrong-OBJECT decode real z3 does not
-/// have, since z3 hash-conses per context / interns builtins globally).
+/// Per-context discriminator carried by every indexed tagged AST handle
+/// (proof/algebraic/sort/func-decl) in bits 32–58 (27 bits), so a handle minted
+/// in one context can NEVER silently decode in another context (whose tables
+/// could map the same low index to an unrelated object — a wrong-OBJECT decode
+/// real z3 does not have, since z3 hash-conses per context / interns builtins
+/// globally).
 /// Decode verifies the salt and fails CLOSED (null handle → the caller's
 /// honest error path) on a foreign or forged salt. Salts are never 0, so a
-/// bare-forged `TAG | idx` value also fails closed. The 28-bit space wraps
-/// after ~2.7e8 contexts in one process; a post-wrap collision only matters
+/// bare-forged `TAG | idx` value also fails closed. The 27-bit space wraps
+/// after ~1.3e8 contexts in one process; a post-wrap collision only matters
 /// for a caller already deep in cross-context UB, and is documented here.
-pub(crate) const HANDLE_SALT_MASK: u64 = 0x0FFF_FFFF;
+pub(crate) const HANDLE_SALT_MASK: u64 = 0x07FF_FFFF;
 /// Bit position of the [`HANDLE_SALT_MASK`] field inside a tagged handle.
 pub(crate) const HANDLE_SALT_SHIFT: u32 = 32;
+/// Index payload shared by context-owned tagged ASTs (proof, algebraic, sort,
+/// and func-decl). Bits 32–58 are reserved for the context salt.
+pub(crate) const TAGGED_AST_INDEX_MASK: u64 = u32::MAX as u64;
+
+/// Ordinary term AST payload (`TermId + 1`) occupies bits 0–32. The 33rd bit
+/// is needed for the theoretical `u32::MAX` term id; keeping it avoids a
+/// wrapping alias even though a store of that size is not practical.
+pub(crate) const TERM_AST_PAYLOAD_MASK: u64 = (1u64 << 33) - 1;
+/// Ordinary term ASTs carry the same nonzero context salt in bits 33–59.
+pub(crate) const TERM_AST_SALT_SHIFT: u32 = 33;
+const _: () = {
+    let term_salt_mask = HANDLE_SALT_MASK << TERM_AST_SALT_SHIFT;
+    assert!(TERM_AST_PAYLOAD_MASK & term_salt_mask == 0);
+    assert!((TERM_AST_PAYLOAD_MASK | term_salt_mask) & HANDLE_TAG_MASK == 0);
+};
 
 /// Process-global source of per-context handle salts (see
 /// [`HANDLE_SALT_MASK`]). Starts at 1: salt 0 is reserved as "never valid".
 static NEXT_HANDLE_SALT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
-/// Mint the handle salt for a new context: nonzero, 28-bit.
+/// Mint the handle salt for a new context: nonzero, 27-bit.
 pub(crate) fn next_handle_salt() -> u32 {
     loop {
         let raw = NEXT_HANDLE_SALT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -575,7 +594,7 @@ pub(crate) fn require_fpa_rounding_mode(
     operation: &str,
     ast: Z3_ast,
 ) -> Option<Term> {
-    let term = ast_to_term(ast);
+    let term = require_term_ast(ctx, ast, operation, "rounding-mode operand")?;
     if matches!(
         ctx.solver.sort_of(term),
         Sort::Uninterpreted(name) if name == "RoundingMode"
@@ -815,10 +834,10 @@ pub struct Z3Context {
     /// Incremental parser-context handles created via `Z3_mk_parser_context`.
     /// Arena-owned; freed at `Z3_del_context`.
     pub(crate) parser_context_cache: Vec<*mut ParserContextHandle>,
-    /// This context's nonzero 28-bit handle salt (see [`HANDLE_SALT_MASK`]):
-    /// embedded in every SORT/FUNC-DECL AST handle this context mints and
-    /// verified on decode, so foreign-context tagged handles fail CLOSED
-    /// instead of decoding to an unrelated object.
+    /// This context's nonzero 27-bit handle salt (see [`HANDLE_SALT_MASK`]):
+    /// embedded in every term/SORT/FUNC-DECL AST handle this context mints and
+    /// verified at checked decode boundaries, so foreign-context handles fail
+    /// CLOSED instead of decoding to an unrelated object.
     pub(crate) handle_salt: u32,
     /// Stable semantic sort IDs: same Sort → same ID within a context (#6580).
     pub(crate) sort_ids: HashMap<Sort, c_uint>,
@@ -871,10 +890,11 @@ pub struct Z3Context {
     /// Rendered Alethe proof texts backing proof-AST handles (#phase3-proof).
     ///
     /// `Z3_solver_get_proof` returns an opaque `Z3_ast` handle tagged with
-    /// [`PROOF_AST_TAG`] whose low bits index into this vector. The text is the
-    /// solver's real exporter output (`Solver::export_last_proof_alethe`); it is
-    /// never fabricated. `Z3_ast_to_string` recognizes the tag and returns the
-    /// indexed text. These handles live until `Z3_del_context`.
+    /// [`PROOF_AST_TAG`] and authenticated by this context's handle salt; its
+    /// low bits index into this vector. The text is the solver's real exporter
+    /// output (`Solver::export_last_proof_alethe`); it is never fabricated.
+    /// `Z3_ast_to_string` recognizes the tag and returns the indexed text. These
+    /// handles live until `Z3_del_context`.
     pub(crate) proof_texts: Vec<String>,
     /// Arena of Real-Closed-Field numerals (`Z3_rcf_num` handles). Each is a
     /// `Box::into_raw` of an exact [`rcf::RcfNum`] (an `ay_nra::RealScalar`);
@@ -883,9 +903,10 @@ pub struct Z3Context {
     /// is bookkeeping-only, matching AY's non-RC handle discipline).
     pub(crate) rcf_num_cache: Vec<*mut RcfNum>,
     /// Backing store for irrational algebraic-number ASTs (`Z3_algebraic_*`
-    /// results). A `Z3_ast` tagged with [`ALGEBRAIC_AST_TAG`] indexes this
-    /// vector; the stored [`ay_nra::RealScalar`] is the exact value, read back by
-    /// the algebraic-number entry points (sign / compare / get_poly / interval).
+    /// results). A `Z3_ast` tagged with [`ALGEBRAIC_AST_TAG`] and authenticated
+    /// by this context's handle salt indexes this vector; the stored
+    /// [`ay_nra::RealScalar`] is the exact value, read back by the
+    /// algebraic-number entry points (sign / compare / get_poly / interval).
     /// Rational results keep flowing through the ordinary numeral-AST path.
     pub(crate) algebraic_values: Vec<ay_nra::RealScalar>,
     /// Context-global, theory-internal background axioms asserted into the shared
@@ -2295,45 +2316,149 @@ pub struct ParserContextHandle {
 // Helpers
 // ============================================================================
 
-/// Convert Z3_ast (u64) to AY Term.
-/// Z3_ast uses 1-based encoding so that 0 can serve as the null/error sentinel.
-/// Panics in debug mode on null AST; returns Term(0) defensively in release. (#5519)
-///
-/// SOUNDNESS (poison guard): a TAGGED handle (proof / algebraic / sort /
-/// func_decl — see [`HANDLE_TAG_MASK`]) is NOT a term. Before this guard, the
-/// `as u32` truncation silently aliased such a handle onto an arbitrary REAL
-/// term (e.g. `SORT_AST_TAG | 5` → term 4), so `Z3_solver_assert(sort_ast)`
-/// could assert an unrelated formula — a wrong-verdict channel. Now a tagged
-/// handle maps to the poison id `u32::MAX`: every arena access on it is
-/// out-of-bounds and panics INSIDE the enclosing `ffi_guard_*` (which catches
-/// the unwind and reports `Z3_EXCEPTION` / a null-or-UNDEF sentinel) — the
-/// call fails closed, never a decided verdict. Deliberately no
-/// `debug_assert!`: several callers run `ast_to_term` OUTSIDE any guard while
-/// merely COLLECTING term ids (e.g. `Z3_mk_map`'s argument prefetch), where a
-/// debug-build panic would unwind straight across the `extern "C"` boundary
-/// and abort the process. Building the poison id is safe everywhere; only
-/// dereferencing it (always inside a guard) panics.
+/// Convert AY Term to Z3_ast (u64).
+/// Adds 1 so that TermId 0 has payload 1, reserving 0 as null, and embeds the
+/// owning context's salt. `Z3_ast` is opaque at the C ABI, so the salt changes
+/// no public layout while making same-number cross-context aliases
+/// distinguishable.
 #[inline]
-pub(crate) fn ast_to_term(ast: Z3_ast) -> Term {
-    debug_assert!(ast != 0, "BUG: null Z3_ast (0) passed to ast_to_term");
-    if ast == 0 {
-        // Defensive fallback: map null sentinel to Term(0) rather than
-        // underflowing to u32::MAX which causes silent data corruption.
-        return Term::from_raw(0);
-    }
-    if ast & HANDLE_TAG_MASK != 0 {
-        // Tagged non-term handle: poison, fails closed at first arena access.
-        return Term::from_raw(u32::MAX);
-    }
-    Term::from_raw((ast - 1) as u32)
+pub(crate) fn term_to_ast(ctx: &Z3Context, term: Term) -> Z3_ast {
+    (u64::from(ctx.handle_salt) << TERM_AST_SALT_SHIFT) | (u64::from(term.to_raw()) + 1)
 }
 
-/// Convert AY Term to Z3_ast (u64).
-/// Adds 1 so that TermId 0 maps to Z3_ast 1, reserving 0 as null.
+/// True exactly when an untagged, non-null term AST carries `ctx`'s salt and a
+/// representable nonzero 1-based payload.
 #[inline]
-pub(crate) fn term_to_ast(term: Term) -> Z3_ast {
-    u64::from(term.to_raw()) + 1
+pub(crate) fn term_ast_belongs_to(ctx: &Z3Context, ast: Z3_ast) -> bool {
+    ast != 0
+        && ast & HANDLE_TAG_MASK == 0
+        && ((ast >> TERM_AST_SALT_SHIFT) & HANDLE_SALT_MASK) as u32 == ctx.handle_salt
+        && ast & TERM_AST_PAYLOAD_MASK != 0
 }
+
+/// Decode a term AST only when it is structurally valid, salted for `ctx`, and
+/// names a live entry in that context's term store.
+///
+/// This is the sole term-handle decoder. Keeping the payload conversion behind
+/// the context check makes it impossible for a consumer to accidentally accept
+/// a same-number handle minted by another context.
+#[inline]
+pub(crate) fn checked_ast_to_term(ctx: &Z3Context, ast: Z3_ast) -> Option<Term> {
+    if !term_ast_belongs_to(ctx, ast) {
+        return None;
+    }
+    let payload = ast & TERM_AST_PAYLOAD_MASK;
+    if payload > u64::from(u32::MAX) + 1 {
+        return None;
+    }
+    let term = Term::from_raw((payload - 1) as u32);
+    ctx.solver.is_valid_term(term).then_some(term)
+}
+
+/// Return whether an opaque AST handle names a live object owned by `ctx`.
+///
+/// AST containers may hold ordinary terms as well as the tagged proof,
+/// algebraic, sort, and function-declaration ASTs exposed by the Z3 API.  A
+/// term-only check would incorrectly reject those values; skipping the check
+/// would instead permit a foreign context's indexed handle to alias a local
+/// object.  Dispatch through each kind's authenticated decoder so both cases
+/// fail or succeed for the right reason.
+#[inline]
+pub(crate) fn ast_handle_belongs_to(ctx: &Z3Context, ast: Z3_ast) -> bool {
+    match ast & HANDLE_TAG_MASK {
+        0 => checked_ast_to_term(ctx, ast).is_some(),
+        PROOF_AST_TAG => proof_text_for_ast(ctx, ast).is_some(),
+        ALGEBRAIC_AST_TAG => ast_as_scalar(ctx, ast).is_some(),
+        SORT_AST_TAG => !sort_ast_to_handle(ctx, ast).is_null(),
+        FUNC_DECL_AST_TAG => !func_decl_ast_to_handle(ctx, ast).is_null(),
+        _ => false,
+    }
+}
+
+/// Authenticate any AST kind and record a stable container diagnostic.
+#[inline]
+pub(crate) fn require_ast_handle(
+    ctx: &mut Z3Context,
+    ast: Z3_ast,
+    operation: &str,
+    role: &str,
+) -> bool {
+    let valid = ast_handle_belongs_to(ctx, ast);
+    if !valid {
+        ctx.last_error = Z3_INVALID_ARG;
+        ctx.error_msg = Some(format!(
+            "{operation}: {role} is null, malformed, stale, or belongs to a different context"
+        ));
+    }
+    valid
+}
+
+/// Authenticate a term AST and record a stable FFI diagnostic on failure.
+#[inline]
+pub(crate) fn require_term_ast(
+    ctx: &mut Z3Context,
+    ast: Z3_ast,
+    operation: &str,
+    role: &str,
+) -> Option<Term> {
+    let term = checked_ast_to_term(ctx, ast);
+    if term.is_none() {
+        ctx.last_error = Z3_INVALID_ARG;
+        ctx.error_msg = Some(format!(
+            "{operation}: {role} is null, malformed, stale, or belongs to a different context"
+        ));
+    }
+    term
+}
+
+/// Authenticate a caller-owned sequence of term ASTs under one context.
+pub(crate) fn require_term_asts(
+    ctx: &mut Z3Context,
+    asts: &[Z3_ast],
+    operation: &str,
+) -> Option<Vec<Term>> {
+    asts.iter()
+        .enumerate()
+        .map(|(index, &ast)| require_term_ast(ctx, ast, operation, &format!("argument {index}")))
+        .collect()
+}
+
+/// Decode one AST or return the caller-selected FFI sentinel immediately.
+/// Keeping the fallback at the call site makes each API's failure contract
+/// explicit while sharing the ownership/liveness check.
+macro_rules! require_term_ast_or_return {
+    ($ctx:expr, $ast:expr, $operation:expr, $role:expr $(,)?) => {{
+        let Some(term) = $crate::z3_compat::require_term_ast($ctx, $ast, $operation, $role) else {
+            return;
+        };
+        term
+    }};
+    ($ctx:expr, $ast:expr, $operation:expr, $role:expr, $fallback:expr) => {{
+        let Some(term) = $crate::z3_compat::require_term_ast($ctx, $ast, $operation, $role) else {
+            return $fallback;
+        };
+        term
+    }};
+}
+pub(crate) use require_term_ast_or_return;
+
+/// Decode an AST slice or return the caller-selected FFI sentinel before any
+/// consumer-side mutation occurs.
+macro_rules! require_term_asts_or_return {
+    ($ctx:expr, $asts:expr, $operation:expr $(,)?) => {{
+        let Some(terms) = $crate::z3_compat::require_term_asts($ctx, $asts, $operation) else {
+            return;
+        };
+        terms
+    }};
+    ($ctx:expr, $asts:expr, $operation:expr, $fallback:expr) => {{
+        let Some(terms) = $crate::z3_compat::require_term_asts($ctx, $asts, $operation) else {
+            return $fallback;
+        };
+        terms
+    }};
+}
+pub(crate) use require_term_asts_or_return;
 
 /// Apply the subset of configuration/solver params that AY actually honors.
 ///
@@ -2561,6 +2686,14 @@ pub(crate) const AY_MAX_CHAR: i64 = 196607;
 /// `Char` / finite-domain value is never an unbounded `Int`. See
 /// [`emit_range_axiom`].
 pub(crate) fn record_ast_sort(ctx: &mut Z3Context, ast: Z3_ast, sort: Sort) {
+    let belongs_to_context = term_ast_belongs_to(ctx, ast);
+    debug_assert!(
+        belongs_to_context,
+        "attempted to record a foreign or malformed term AST"
+    );
+    if !belongs_to_context {
+        return;
+    }
     if ast != 0 {
         if sort.is_char() {
             emit_range_axiom(ctx, ast, AY_MAX_CHAR);
@@ -2571,7 +2704,7 @@ pub(crate) fn record_ast_sort(ctx: &mut Z3Context, ast: Z3_ast, sort: Sort) {
             emit_range_axiom(ctx, ast, hi);
         }
     }
-    let idx = ast as usize;
+    let idx = (ast & TERM_AST_PAYLOAD_MASK) as usize;
     if idx >= ctx.ast_sorts.len() {
         ctx.ast_sorts.resize(idx + 1, None);
     }
@@ -2590,7 +2723,10 @@ pub(crate) fn record_ast_sort(ctx: &mut Z3Context, ast: Z3_ast, sort: Sort) {
 /// can never flip unsat→sat; and it is trivially satisfiable, so it introduces
 /// no spurious unsat. For an in-range *literal* it is redundant and folds away.
 fn emit_range_axiom(ctx: &mut Z3Context, ast: Z3_ast, hi_inclusive: i64) {
-    let t = ast_to_term(ast);
+    let Some(t) = checked_ast_to_term(ctx, ast) else {
+        debug_assert!(false, "internal range axiom received an invalid term AST");
+        return;
+    };
     if !ctx.range_bounded.insert((t, hi_inclusive)) {
         return; // this exact range invariant was already emitted for this term
     }
@@ -2627,7 +2763,10 @@ pub(crate) fn bounded_sort_hi(sort: &Sort) -> Option<i64> {
 
 /// Look up sort for an AST handle
 pub(crate) fn lookup_ast_sort(ctx: &Z3Context, ast: Z3_ast) -> Option<&Sort> {
-    let idx = ast as usize;
+    if !term_ast_belongs_to(ctx, ast) {
+        return None;
+    }
+    let idx = (ast & TERM_AST_PAYLOAD_MASK) as usize;
     ctx.ast_sorts.get(idx).and_then(|s| s.as_ref())
 }
 
@@ -2679,7 +2818,7 @@ pub(crate) unsafe fn sort_handle_to_ast(ctx: &mut Z3Context, s: Z3_sort) -> Z3_a
     if ctx.sort_ast_handles[idx].is_null() {
         ctx.sort_ast_handles[idx] = s;
     }
-    SORT_AST_TAG | (u64::from(ctx.handle_salt) << HANDLE_SALT_SHIFT) | u64::from(sort_id)
+    encode_indexed_ast(ctx, SORT_AST_TAG, sort_id as usize).unwrap_or(0)
 }
 
 /// Extract and verify the per-context salt of a tagged handle (see
@@ -2690,14 +2829,45 @@ fn handle_salt_matches(ctx: &Z3Context, a: Z3_ast) -> bool {
     ((a >> HANDLE_SALT_SHIFT) & HANDLE_SALT_MASK) as u32 == ctx.handle_salt
 }
 
+/// Encode an index into one of the context-owned tagged AST arenas.
+///
+/// The top nibble identifies the arena, bits 32–58 authenticate the owning
+/// context, and the low 32 bits hold the arena index. `None` means the arena
+/// has exceeded the representable index space; callers must fail closed before
+/// inserting the value so no two objects can acquire the same handle.
+pub(crate) fn encode_indexed_ast(ctx: &Z3Context, tag: u64, index: usize) -> Option<Z3_ast> {
+    debug_assert_eq!(tag & HANDLE_TAG_MASK, tag);
+    debug_assert_eq!(tag.count_ones(), 1);
+    let index = u32::try_from(index).ok()?;
+    Some(tag | (u64::from(ctx.handle_salt) << HANDLE_SALT_SHIFT) | u64::from(index))
+}
+
+/// Authenticate and decode an index from a context-owned tagged AST arena.
+///
+/// A wrong tag, a foreign/forged context salt, or any bits outside the defined
+/// tag/salt/index fields fails closed. Arena liveness (index in range) remains
+/// the caller's responsibility because each tagged kind has a different store.
+pub(crate) fn decode_indexed_ast(ctx: &Z3Context, a: Z3_ast, tag: u64) -> Option<usize> {
+    debug_assert_eq!(tag & HANDLE_TAG_MASK, tag);
+    debug_assert_eq!(tag.count_ones(), 1);
+    if a & HANDLE_TAG_MASK != tag || !handle_salt_matches(ctx, a) {
+        return None;
+    }
+    let defined_bits =
+        HANDLE_TAG_MASK | (HANDLE_SALT_MASK << HANDLE_SALT_SHIFT) | TAGGED_AST_INDEX_MASK;
+    if a & !defined_bits != 0 {
+        return None;
+    }
+    Some((a & TAGGED_AST_INDEX_MASK) as usize)
+}
+
 /// Decode a SORT-AST handle back to the canonical `SortHandle`, or null if the
 /// value is not a live sort-ast of THIS context (wrong tag, foreign/forged
 /// salt, or dangling index all fail closed to null).
 pub(crate) fn sort_ast_to_handle(ctx: &Z3Context, a: Z3_ast) -> Z3_sort {
-    if a & HANDLE_TAG_MASK != SORT_AST_TAG || !handle_salt_matches(ctx, a) {
+    let Some(idx) = decode_indexed_ast(ctx, a, SORT_AST_TAG) else {
         return ptr::null_mut();
-    }
-    let idx = a as u32 as usize;
+    };
     ctx.sort_ast_handles
         .get(idx)
         .copied()
@@ -2729,7 +2899,7 @@ pub(crate) unsafe fn func_decl_handle_to_ast(ctx: &mut Z3Context, d: Z3_func_dec
         ctx.decl_ast_handles.push(d);
         i
     };
-    FUNC_DECL_AST_TAG | (u64::from(ctx.handle_salt) << HANDLE_SALT_SHIFT) | u64::from(idx)
+    encode_indexed_ast(ctx, FUNC_DECL_AST_TAG, idx as usize).unwrap_or(0)
 }
 
 /// Decode a FUNC-DECL-AST handle back to the canonical `FuncDeclHandle`, or
@@ -2739,10 +2909,9 @@ pub(crate) unsafe fn func_decl_handle_to_ast(ctx: &mut Z3Context, d: Z3_func_dec
 /// (`Z3_is_eq_func_decl` value-compares) — documented divergence from z3's
 /// hash-consed pointer identity.
 pub(crate) fn func_decl_ast_to_handle(ctx: &Z3Context, a: Z3_ast) -> Z3_func_decl {
-    if a & HANDLE_TAG_MASK != FUNC_DECL_AST_TAG || !handle_salt_matches(ctx, a) {
+    let Some(idx) = decode_indexed_ast(ctx, a, FUNC_DECL_AST_TAG) else {
         return ptr::null_mut();
-    }
-    let idx = a as u32 as usize;
+    };
     ctx.decl_ast_handles
         .get(idx)
         .copied()

@@ -157,7 +157,7 @@ pub(crate) const RESERVED_OP_NAMES: &[&str] = &[
 
 /// Check whether `name` is a builtin theory-operator name AY matches
 /// structurally (see [`RESERVED_OP_NAMES`]).
-pub(crate) fn is_reserved_op_name(name: &str) -> bool {
+pub fn is_reserved_op_name(name: &str) -> bool {
     RESERVED_OP_NAMES.contains(&name)
 }
 
@@ -593,6 +593,13 @@ pub struct Context {
     recursive_fun_names: ay_core::kani_compat::DetHashSet<String>,
     /// Datatype definitions: dt_name -> constructor_names
     datatypes: HashMap<String, Vec<String>>,
+    /// The full monomorphic declaration behind each `datatypes` entry, retained
+    /// so an EXACTLY-identical re-declaration can be adopted as a no-op
+    /// (`declare_datatype`), mirroring `try_declare_fun`'s adopt-identical
+    /// embedder contract. Only an exact `DatatypeDec` match is adopted; a
+    /// plain-sort redeclaration (the wrong-UNSAT class) or a DIFFERENT datatype
+    /// of the same name still hits `check_datatype_sort_redeclaration`.
+    monomorphic_datatype_decs: HashMap<String, crate::command::DatatypeDec>,
     /// Constructor to datatype map: ctor_name -> (dt_name, ctor_name)
     constructors: HashMap<String, (String, String)>,
     /// Constructor to selectors map: ctor_name -> selector_names (positional)
@@ -855,6 +862,7 @@ impl Context {
             fail_next_assert_after_macro_adoption: false,
             recursive_fun_names: ay_core::kani_compat::DetHashSet::default(),
             datatypes: HashMap::default(),
+            monomorphic_datatype_decs: HashMap::default(),
             constructors: HashMap::default(),
             ctor_selectors: HashMap::default(),
             ctor_selector_info: HashMap::default(),

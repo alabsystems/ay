@@ -18,6 +18,11 @@ pub struct SolveOpts {
     pub deadline: Option<Instant>,
     /// Per-solve time limit; combines with `deadline` (the earlier wins).
     pub time_limit: Option<Duration>,
+    /// Per-node time limit for a warm LP attempt in branch-and-bound. When the
+    /// limit expires, the node discards its warm-start hint and retries cold
+    /// exactly once under the solve's outer deadline. `None` disables the
+    /// warm-only limit; it never extends the outer deadline.
+    pub node_warm_time_limit: Option<Duration>,
     /// Worker threads a session may use. Advice at L0 (single-threaded).
     pub threads: u32,
     /// When true (default), identical inputs give identical outcomes
@@ -53,6 +58,7 @@ impl Default for SolveOpts {
         Self {
             deadline: None,
             time_limit: None,
+            node_warm_time_limit: None,
             threads: 1,
             determinism: true,
             seed: 0,
@@ -81,6 +87,16 @@ impl SolveOpts {
     #[must_use]
     pub fn with_time_limit(mut self, limit: Duration) -> Self {
         self.time_limit = Some(limit);
+        self
+    }
+
+    /// Set (or disable, with `None`) the per-node warm LP time limit.
+    ///
+    /// A zero duration is normalized to `None`, matching the historical
+    /// zero-means-disabled configuration.
+    #[must_use]
+    pub fn with_node_warm_time_limit(mut self, limit: Option<Duration>) -> Self {
+        self.node_warm_time_limit = limit.filter(|limit| !limit.is_zero());
         self
     }
 
@@ -135,5 +151,38 @@ impl SolveOpts {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_warm_time_limit_defaults_off() {
+        assert_eq!(SolveOpts::new().node_warm_time_limit, None);
+    }
+
+    #[test]
+    fn node_warm_time_limit_builder_normalizes_zero_and_none() {
+        let finite = Duration::from_millis(250);
+        assert_eq!(
+            SolveOpts::new()
+                .with_node_warm_time_limit(Some(finite))
+                .node_warm_time_limit,
+            Some(finite)
+        );
+        assert_eq!(
+            SolveOpts::new()
+                .with_node_warm_time_limit(Some(Duration::ZERO))
+                .node_warm_time_limit,
+            None
+        );
+        assert_eq!(
+            SolveOpts::new()
+                .with_node_warm_time_limit(None)
+                .node_warm_time_limit,
+            None
+        );
     }
 }

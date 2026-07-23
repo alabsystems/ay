@@ -452,7 +452,11 @@ impl Executor {
     /// Solve rewritten mixed assertions (no fp.to_real) through normal SMT dispatch.
     ///
     /// Temporarily swaps in the rewritten assertions, infers the logic from
-    /// them, runs check_sat_internal, then restores the original state.
+    /// them, runs `check_sat_internal` with isolated incremental solver state,
+    /// then restores the original state. The isolation is load-bearing for
+    /// push/pop: these rewritten assertions are an internal FP-refinement
+    /// query, not assertions in the outer SMT scope, so they must never enter
+    /// its persistent SAT/Tseitin state.
     ///
     /// Returns the solve result plus theory models extracted from the mixed
     /// solve (LRA and EUF), which are needed to populate the final merged model.
@@ -473,8 +477,9 @@ impl Executor {
         let inferred_logic = features.infer_logic().to_string();
         self.ctx.set_logic(inferred_logic);
 
-        // Solve the rewritten subproblem
-        let result = self.check_sat_internal();
+        // Solve the rewritten subproblem without registering its temporary
+        // roots in the outer session's persistent incremental state.
+        let result = self.with_isolated_incremental_state(None, |this| this.check_sat_internal());
 
         // Extract theory models from the mixed solve before restoring state.
         // These are needed so the refinement loop can merge them into the

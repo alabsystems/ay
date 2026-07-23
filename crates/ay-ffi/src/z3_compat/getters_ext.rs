@@ -23,10 +23,10 @@ use ay_dpll::api::{FuncDecl, Sort, Term, TermKind};
 use num_bigint::BigInt;
 
 use super::{
-    alloc_sort, ast_to_term, cache_dt_func_decl, cache_string, ffi_guard_ast, ffi_guard_const_ptr,
+    alloc_sort, cache_dt_func_decl, cache_string, ffi_guard_ast, ffi_guard_const_ptr,
     ffi_guard_double, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
-    record_ast_sort, term_to_ast, DatatypeOp, Z3_ast, Z3_context, Z3_func_decl, Z3_pattern,
-    Z3_sort, Z3_string, Z3_symbol, Z3_INVALID_ARG, Z3_IOB,
+    record_ast_sort, require_term_ast_or_return, term_to_ast, DatatypeOp, Z3_ast, Z3_context,
+    Z3_func_decl, Z3_pattern, Z3_sort, Z3_string, Z3_symbol, Z3_INVALID_ARG, Z3_IOB,
 };
 
 // ============================================================================
@@ -70,15 +70,16 @@ pub unsafe extern "C" fn Z3_get_numerator(c: Z3_context, a: Z3_ast) -> Z3_ast {
     // SAFETY: `c` guarded by `ffi_guard_ast`; `a` is a term handle value.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let term = require_term_ast_or_return!(ctx, a, "Z3_get_numerator", "numeral", 0);
             match ctx
                 .solver
-                .numeral_string(ast_to_term(a))
+                .numeral_string(term)
                 .as_deref()
                 .and_then(numeral_parts)
             {
                 Some((num, _den)) => {
                     let t = ctx.solver.int_const_bigint(&num);
-                    let ast = term_to_ast(t);
+                    let ast = term_to_ast(ctx, t);
                     record_ast_sort(ctx, ast, Sort::Int);
                     ast
                 }
@@ -104,15 +105,16 @@ pub unsafe extern "C" fn Z3_get_denominator(c: Z3_context, a: Z3_ast) -> Z3_ast 
     // SAFETY: `c` guarded by `ffi_guard_ast`.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let term = require_term_ast_or_return!(ctx, a, "Z3_get_denominator", "numeral", 0);
             match ctx
                 .solver
-                .numeral_string(ast_to_term(a))
+                .numeral_string(term)
                 .as_deref()
                 .and_then(numeral_parts)
             {
                 Some((_num, den)) => {
                     let t = ctx.solver.int_const_bigint(&den);
-                    let ast = term_to_ast(t);
+                    let ast = term_to_ast(ctx, t);
                     record_ast_sort(ctx, ast, Sort::Int);
                     ast
                 }
@@ -140,7 +142,7 @@ pub unsafe extern "C" fn Z3_get_numeral_double(c: Z3_context, a: Z3_ast) -> c_do
     // SAFETY: `c` guarded by `ffi_guard_double`.
     unsafe {
         ffi_guard_double(c, 0.0, |ctx| {
-            let t = ast_to_term(a);
+            let t = require_term_ast_or_return!(ctx, a, "Z3_get_numeral_double", "numeral", 0.0);
             if matches!(ctx.solver.sort_of(t), Sort::BitVec(_)) {
                 ctx.last_error = Z3_INVALID_ARG;
                 return 0.0;
@@ -189,9 +191,11 @@ pub unsafe extern "C" fn Z3_get_numeral_rational_int64(
     // SAFETY: `c` guarded by `ffi_guard_int`; `num`/`den` null-checked, valid by contract.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
+            let term =
+                require_term_ast_or_return!(ctx, v, "Z3_get_numeral_rational_int64", "numeral", 0);
             if let Some((n, d)) = ctx
                 .solver
-                .numeral_string(ast_to_term(v))
+                .numeral_string(term)
                 .as_deref()
                 .and_then(numeral_parts_i64)
             {
@@ -242,9 +246,10 @@ pub unsafe extern "C" fn Z3_get_numeral_small(
     // SAFETY: as `Z3_get_numeral_rational_int64`, but signals `Z3_INVALID_ARG` on failure.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
+            let term = require_term_ast_or_return!(ctx, a, "Z3_get_numeral_small", "numeral", 0);
             match ctx
                 .solver
-                .numeral_string(ast_to_term(a))
+                .numeral_string(term)
                 .as_deref()
                 .and_then(numeral_parts_i64)
             {
@@ -286,9 +291,16 @@ pub unsafe extern "C" fn Z3_get_numeral_binary_string(c: Z3_context, a: Z3_ast) 
     // SAFETY: `c` guarded by `ffi_guard_const_ptr`.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
+            let term = require_term_ast_or_return!(
+                ctx,
+                a,
+                "Z3_get_numeral_binary_string",
+                "numeral",
+                ptr::null()
+            );
             let value = ctx
                 .solver
-                .numeral_string(ast_to_term(a))
+                .numeral_string(term)
                 .as_deref()
                 .and_then(numeral_parts)
                 // Integral values only: z3 rejects `1/2`.
@@ -325,7 +337,7 @@ pub unsafe extern "C" fn Z3_get_depth(c: Z3_context, a: Z3_ast) -> c_uint {
     // SAFETY: `c` guarded by `ffi_guard_uint`.
     unsafe {
         ffi_guard_uint(c, 0, |ctx| {
-            let root = ast_to_term(a);
+            let root = require_term_ast_or_return!(ctx, a, "Z3_get_depth", "term", 0);
             let mut memo: HashMap<Term, u32> = HashMap::new();
             let mut stack: Vec<(Term, bool)> = vec![(root, false)];
             while let Some((t, processed)) = stack.pop() {
@@ -379,7 +391,8 @@ pub unsafe extern "C" fn Z3_get_index_value(c: Z3_context, a: Z3_ast) -> c_uint 
     // SAFETY: `c` guarded by `ffi_guard_uint`.
     unsafe {
         ffi_guard_uint(c, 0, |ctx| {
-            if let TermKind::Var { name } = ctx.solver.term_kind(ast_to_term(a)) {
+            let term = require_term_ast_or_return!(ctx, a, "Z3_get_index_value", "term", 0);
+            if let TermKind::Var { name } = ctx.solver.term_kind(term) {
                 if let Some(idx) = name
                     .strip_prefix("__db")
                     .and_then(|s| s.parse::<c_uint>().ok())
@@ -452,8 +465,14 @@ pub unsafe extern "C" fn Z3_get_as_array_func_decl(c: Z3_context, _a: Z3_ast) ->
 /// # Safety
 /// `c` must be a valid context pointer.
 #[no_mangle]
-pub unsafe extern "C" fn Z3_is_well_sorted(_c: Z3_context, t: Z3_ast) -> bool {
-    t != 0
+pub unsafe extern "C" fn Z3_is_well_sorted(c: Z3_context, t: Z3_ast) -> bool {
+    // SAFETY: `ffi_guard_int` handles a null context and catches panics.
+    unsafe {
+        ffi_guard_int(c, 0, |ctx| {
+            let _term = require_term_ast_or_return!(ctx, t, "Z3_is_well_sorted", "term", 0);
+            1
+        }) != 0
+    }
 }
 
 // ============================================================================
@@ -880,7 +899,7 @@ pub unsafe extern "C" fn Z3_get_pattern(c: Z3_context, p: Z3_pattern, idx: c_uin
     // SAFETY: `c` guarded by `ffi_guard_ast`.
     unsafe {
         ffi_guard_ast(c, |ctx| match term {
-            Some(t) => term_to_ast(t),
+            Some(t) => term_to_ast(ctx, t),
             None => {
                 ctx.last_error = Z3_IOB;
                 0
@@ -916,11 +935,20 @@ pub unsafe extern "C" fn Z3_get_quantifier_id(c: Z3_context, a: Z3_ast) -> Z3_sy
     }
     // SAFETY: `c` guarded by `ffi_guard_ptr`.
     unsafe {
-        ffi_guard_ptr(c, |ctx| match ctx.solver.quantifier_id(ast_to_term(a)) {
-            Some(name) => super::cache_symbol(ctx, name),
-            None => {
-                ctx.last_error = Z3_INVALID_ARG;
+        ffi_guard_ptr(c, |ctx| {
+            let term = require_term_ast_or_return!(
+                ctx,
+                a,
+                "Z3_get_quantifier_id",
+                "quantifier",
                 ptr::null_mut()
+            );
+            match ctx.solver.quantifier_id(term) {
+                Some(name) => super::cache_symbol(ctx, name),
+                None => {
+                    ctx.last_error = Z3_INVALID_ARG;
+                    ptr::null_mut()
+                }
             }
         })
     }
@@ -946,11 +974,20 @@ pub unsafe extern "C" fn Z3_get_quantifier_skolem_id(c: Z3_context, a: Z3_ast) -
     }
     // SAFETY: `c` guarded by `ffi_guard_ptr`.
     unsafe {
-        ffi_guard_ptr(c, |ctx| match ctx.solver.skolem_id(ast_to_term(a)) {
-            Some(name) => super::cache_symbol(ctx, name),
-            None => {
-                ctx.last_error = Z3_INVALID_ARG;
+        ffi_guard_ptr(c, |ctx| {
+            let term = require_term_ast_or_return!(
+                ctx,
+                a,
+                "Z3_get_quantifier_skolem_id",
+                "quantifier",
                 ptr::null_mut()
+            );
+            match ctx.solver.skolem_id(term) {
+                Some(name) => super::cache_symbol(ctx, name),
+                None => {
+                    ctx.last_error = Z3_INVALID_ARG;
+                    ptr::null_mut()
+                }
             }
         })
     }
@@ -1166,7 +1203,8 @@ pub unsafe extern "C" fn Z3_get_lstring(
     // SAFETY: `c` guarded by `ffi_guard_const_ptr`; `length` written only when non-null.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
-            let t = ast_to_term(s);
+            let t =
+                require_term_ast_or_return!(ctx, s, "Z3_get_lstring", "string term", ptr::null());
             let text = if ctx.solver.is_numeral(t) && matches!(ctx.solver.sort_of(t), Sort::String)
             {
                 ctx.solver.numeral_string(t)
@@ -1207,7 +1245,7 @@ pub unsafe extern "C" fn Z3_get_string_contents(
     // SAFETY: `c` guarded; `contents` valid for `length` writes by contract.
     unsafe {
         ffi_guard_void(c, |ctx| {
-            let t = ast_to_term(s);
+            let t = require_term_ast_or_return!(ctx, s, "Z3_get_string_contents", "string term");
             if ctx.solver.is_numeral(t) && matches!(ctx.solver.sort_of(t), Sort::String) {
                 if let Some(text) = ctx.solver.numeral_string(t) {
                     for (i, ch) in text.chars().take(length as usize).enumerate() {

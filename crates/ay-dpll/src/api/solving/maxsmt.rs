@@ -62,6 +62,15 @@ impl Solver {
         weight: u64,
         group: Option<&str>,
     ) -> Result<usize, SolverError> {
+        if let Some(message) = self
+            .executor
+            .array_ext_witness_registration_error(&[term.0])
+        {
+            return Err(SolverError::InvalidArgument {
+                operation: "assert_soft",
+                message,
+            });
+        }
         self.expect_bool("assert_soft", term)?;
         self.executor.note_api_optimization_mutation();
         let idx = self.soft_constraints.len();

@@ -46,13 +46,18 @@
 //!
 //! BUDGET: wall-clock aware against the live `solve_deadline` (the `-T`
 //! absolute deadline installed at executor creation). A margin is reserved
-//! for final output, each subset solve runs under a per-solve slice so one
-//! stuck subset cannot eat the whole pass, and the loop stops shrinking when
-//! the budget runs low — a fat validated core beats a timeout.
+//! for final output, each subset solve runs under a per-attempt budget
+//! (probe first, then churn caps sized by content and instance —
+//! #uc-minimize-policy P2 + the array ladder) capped by the per-solve slice
+//! so one stuck subset cannot eat the whole pass, and the loop stops
+//! shrinking when the remaining budget no longer covers 2x the live attempt
+//! cap (#uc-minimize-policy P1) — a fat validated core beats a timeout.
 //!
-//! DETERMINISM: the candidate order is instance-derived (parse order of the
-//! combined named/assumption vector; harvest jumps are re-canonicalized into
-//! that order), and the underlying solves are deterministic (#8529 DetHash*,
+//! DETERMINISM: the candidate order is instance-derived (the combined
+//! named/assumption vector stable-sorted by term node-count ascending with
+//! parse-order tie-break — #uc-minimize-policy P3; harvest jumps are
+//! re-canonicalized into that order), and the underlying solves are
+//! deterministic (#8529 DetHash*,
 //! fresh DpllT per subset solve, deterministic ground budgets). Wall-clock
 //! cutoffs are the only nondeterminism and only bind near the deadline.
 //!
@@ -66,9 +71,9 @@
 
 use std::time::Duration;
 
-use ay_core::kani_compat::DetHashSet as HashSet;
+use ay_core::kani_compat::{DetHashMap, DetHashSet as HashSet};
 use ay_core::time::Instant;
-use ay_core::TermId;
+use ay_core::{TermData, TermId, TermStore};
 
 use super::Executor;
 use crate::executor_types::{Result, SolveResult};
@@ -97,26 +102,89 @@ const OVERSHOOT_FUSE: Duration = Duration::from_secs(2);
 /// within a slice — a lost answer still costs more than any reduction gains.
 const ARRAY_SCOPED_RESCUE_CAP: Duration = Duration::from_secs(30);
 
-/// Conservative first-attempt probe budget for array content
-/// (#array-deadline-forward): the first array attempt runs under
-/// `min(slice, max(ARRAY_FIRST_PROBE_FLOOR, 4 x rescue))` instead of the
-/// full slice, so a regression back to deadline-ignoring lanes is detected
-/// after a bounded probe (the widened fuse below aborts the pass), not
-/// after a full slice at competition scale.
-const ARRAY_FIRST_PROBE_FLOOR: Duration = Duration::from_secs(2);
+/// Conservative first-attempt probe budget, ALL content
+/// (#uc-minimize-policy P2, generalizing #array-deadline-forward): the
+/// first attempt runs under `min(slice, max(FIRST_PROBE_FLOOR, 4 x
+/// rescue))` instead of the full slice, so an engine that ignores its
+/// per-solve deadline on this instance is detected after a bounded probe
+/// (the overshoot fuse below aborts the pass), not after a full slice at
+/// competition scale.
+const FIRST_PROBE_FLOOR: Duration = Duration::from_secs(2);
 
-/// Per-attempt budget cap for array content AFTER the probe
-/// (#array-deadline-forward): `min(slice, max(this, 4 x rescue))`. Array
-/// subset attempts are strongly bimodal (measured on the 1200s storecomm
-/// 496-named probe: median attempt 0.43s, EVERY adoption <= 1.3s across all
-/// sampled instances, while undecidable-in-slice attempts churn to the full
-/// 197s slice — 7 churners ate 92% of the pass and the scan stopped at
-/// reduction 6 where cvc5 demonstrates ~224). Capping the churn cost at 10s
-/// (8x the slowest observed adoption; 4 x rescue when the full solve itself
-/// was slow) lets the deletion scan run ~10x more candidates inside the
-/// same wall. The normal slice stays the CEILING (min above) — at small -T
-/// budgets the slice is already tighter than this cap.
-const ARRAY_ATTEMPT_SLICE_CAP: Duration = Duration::from_secs(10);
+/// Post-probe per-attempt churn cap (#uc-minimize-policy P2,
+/// generalizing #array-deadline-forward): subset attempts are strongly
+/// bimodal (measured on the 1200s storecomm 496-named probe: median attempt
+/// 0.43s, EVERY adoption <= 1.3s across all sampled instances, while
+/// undecidable-in-slice attempts churn to the full 197s slice — 7 churners
+/// ate 92% of the pass and the scan stopped at reduction 6 where cvc5
+/// demonstrates ~224). Capping the churn cost at 10s lets the deletion scan
+/// run ~10x more candidates inside the same wall. Array content: the <600
+/// named rung of the size ladder, `min(slice, max(this, 4 x rescue))`
+/// (ARRAY_LADDER_* raise the rung with instance size). Non-array content:
+/// `min(slice, max(this, 4 x costliest-adoption-observed))` — adaptive
+/// difficulty from the only attempt class whose cost is known productive.
+/// The normal slice stays the CEILING (min above) — at small -T budgets the
+/// slice is already tighter than this cap.
+const ATTEMPT_CHURN_CAP: Duration = Duration::from_secs(10);
+
+/// Size-aware array cap ladder (#uc-minimize-policy ladder): adoption cost
+/// grows with instance size (per-attempt array rebuild + final_check work
+/// scale with the named count), so a flat 10s churn cap that is 8x the
+/// slowest SMALL-instance adoption starves the >=1000-named classes into
+/// zero adoptions. Rungs by deduplicated named count: <600 named keeps
+/// ATTEMPT_CHURN_CAP, 600-999 named pays up to 30s, >=1000 named up to
+/// 60s; always `min(slice, max(rung, 4 x rescue))`.
+const ARRAY_LADDER_MEDIUM_CAP: Duration = Duration::from_secs(30);
+const ARRAY_LADDER_LARGE_CAP: Duration = Duration::from_mins(1);
+const ARRAY_LADDER_MEDIUM_NAMED: usize = 600;
+const ARRAY_LADDER_LARGE_NAMED: usize = 1000;
+
+/// One-shot ladder escalation (#uc-minimize-policy ladder): if the first
+/// ARRAY_ESCALATE_AFTER_ATTEMPTS post-probe attempts produced ZERO
+/// adoptions, the rung may be too small for this instance to DECIDE
+/// subsets at all — multiply it by ARRAY_LADDER_ESCALATION_FACTOR exactly
+/// once. Escalation is count-based and cheap to reach when attempts fail
+/// fast; it is harmless there (fast attempts never touch the cap).
+const ARRAY_LADDER_ESCALATION_FACTOR: u32 = 3;
+const ARRAY_ESCALATE_AFTER_ATTEMPTS: u64 = 8;
+
+/// Hopeless-abort, WALL-based (#uc-minimize-policy ladder): end a
+/// zero-adoption pass (answer + padded core kept via the zero-progress
+/// restore) once it has spent `shrink_budget /
+/// ARRAY_HOPELESS_WALL_DIVISOR`, clamped to [ARRAY_HOPELESS_WALL_MIN_BUDGETS,
+/// ARRAY_HOPELESS_WALL_MAX_BUDGETS] x the base post-probe budget, instead
+/// of churning the remaining wall to the deadline. WHY wall and not
+/// attempt count: cap-churning attempts make any useful count threshold
+/// unreachable (probe + 14 x 60s-rung churners exceed every -T budget;
+/// measured on the 1226-named storecomm nf class at -T:120 — every
+/// post-probe attempt ran its full 18.3s budget, result=unknown, and the
+/// pass burned to the headroom stop), while FAST-failing attempts are
+/// healthy scan progress a count threshold would behead (measured
+/// parse-order storecomm 231-named: 45 cheap fails before the first
+/// adoption at attempt 46). The MIN clamp guarantees a few FULL churners'
+/// worth of evidence before declaring hopeless (a loaded machine inflates
+/// attempt costs; measured: the same 231-named instance adopting at
+/// 0.45s/attempt in a quiet window churned 10s attempts under a competing
+/// division run). A pass with ANY adoption is never wall-guarded.
+const ARRAY_HOPELESS_WALL_DIVISOR: u32 = 3;
+const ARRAY_HOPELESS_WALL_MIN_BUDGETS: u32 = 3;
+const ARRAY_HOPELESS_WALL_MAX_BUDGETS: u32 = 8;
+
+/// One-shot tail-first order FLIP, non-array content (#uc-minimize-policy
+/// P3, gate-driven correction): the ascending scan is right when the tiny
+/// members are the deletable ones (measured qg5 gensys_icl001: first chunk
+/// adoption at ATTEMPT 1, final core 77/130 — deeper than cvc5's 83
+/// minimal), and pathological when the tiny prefix is essential (measured
+/// qg5 gensys_icl153/icl630/icl833: chunk collapses to 1 inside the
+/// essential prefix and the scan crawls ~90 cheap-SAT singles without ever
+/// reaching the deletable large members — 0 adoptions where parse order
+/// found 6-13). The two classes separate crisply and EARLY: winners adopt
+/// on attempt 1, losers never adopt. With zero adoptions by this attempt
+/// count (backoff to chunk=1 costs ~6 attempts, plus a handful of essential
+/// singles), reverse the scan once — the deletable large members are then
+/// tried first (measured big-first on the loser class: recovers 6-13
+/// reduction). Deterministic: triggered by attempt count, not wall clock.
+const NON_ARRAY_ORDER_FLIP_AFTER_ATTEMPTS: u64 = 12;
 
 /// Conservative whole-pass budget when NO deadline is installed (interactive
 /// / API use without `-T`): bounded politeness, far above typical EUF
@@ -206,13 +274,40 @@ impl Executor {
         // Canonical instance-derived order: `combined` in parse order,
         // deduplicated by TermId (hash-consed duplicate assert bodies).
         let mut seen: HashSet<TermId> = HashSet::default();
-        let full: Vec<TermId> = combined
+        let mut full: Vec<TermId> = combined
             .iter()
             .copied()
             .filter(|t| seen.insert(*t))
             .collect();
         if full.len() < 2 {
             return result;
+        }
+        // Tail-first candidate order (#uc-minimize-policy P3), NON-ARRAY
+        // content only: stable-sort the candidates by term node-count
+        // ASCENDING, so the deletion scan (which deletes prefix chunks
+        // first) tries the tiny asserts before the huge ones. On the QG
+        // classes the named set splits into tiny per-pair exclusion asserts
+        // and a few huge axiom asserts; when the tiny members are the
+        // deletable ones the first chunk adopts immediately (measured qg5
+        // gensys_icl001: 77/130 final, deeper than cvc5's 83 minimal), and
+        // when they are essential the one-shot order FLIP below rescues the
+        // scan. ARRAY content keeps parse order: sorting was measured
+        // HARMFUL there (storecomm 231-named: parse-order subset attempts
+        // decide in 0.02-0.7s and adopt from attempt 46; sorted-order
+        // attempts churn to the 10s cap undecided and the pass never
+        // adopts) — every array-policy calibration in this file (probe,
+        // churn caps, ladder) was measured in parse order.
+        // DETERMINISM: node counts are a pure function of the parsed terms
+        // and the sort is stable (parse-order tie-break). ORDER
+        // PRESERVATION (verified in this file): every candidate is an
+        // order-preserving filter/slice of `full` — the `start` filter
+        // below, the chunk-deletion concat of `verified` slices, and the
+        // harvest-jump re-canonicalization (`verified.iter().filter(...)`)
+        // — so the sorted order propagates to every attempt.
+        if !features.has_arrays {
+            let mut memo: DetHashMap<TermId, u64> = DetHashMap::default();
+            let terms = &self.ctx.terms;
+            full.sort_by_key(|t| term_node_count(terms, &mut memo, *t));
         }
 
         // Starting point: the certified harvest when it is a genuine smaller
@@ -266,19 +361,111 @@ impl Executor {
         let mut i: usize = 0;
         let mut chunk: usize = (verified.len() / 4).max(1);
         let mut jump: Option<Vec<TermId>> = None;
-        // Headroom discipline: never START an attempt without room for the
-        // costliest attempt observed so far (floor: one slice; for the
-        // scoped engine also the rescue's own cost — a SAT-direction subset
-        // attempt can explore the full search space and pipeline lanes may
-        // ignore the per-solve deadline for long stretches, so the slice is
-        // a soft bound only; measured on QG qg5: attempts overshooting past
-        // the -T line flipped answered instances to unknown). Attempt-
-        // internal deadline-poll granularity beyond that is absorbed by
-        // `margin`; gross violations trip the OVERSHOOT_FUSE below.
-        let mut headroom = slice.max(rescue_elapsed.unwrap_or(Duration::ZERO));
+        // Per-attempt budget policy state (#uc-minimize-policy P1/P2/ladder).
+        let n_named = full.len();
+        let rescue4 = rescue_elapsed.unwrap_or(Duration::ZERO).saturating_mul(4);
+        let base_array_cap = if n_named >= ARRAY_LADDER_LARGE_NAMED {
+            ARRAY_LADDER_LARGE_CAP
+        } else if n_named >= ARRAY_LADDER_MEDIUM_NAMED {
+            ARRAY_LADDER_MEDIUM_CAP
+        } else {
+            ATTEMPT_CHURN_CAP
+        };
+        let mut array_cap = base_array_cap;
+        let mut escalated_at_attempt: Option<u64> = None;
+        let mut max_adoption_cost = Duration::ZERO;
+        let mut order_flipped = false;
+        // Zero-adoption wall guard bound (see the ladder constants),
+        // derived from the PRE-escalation rung so the bound is fixed for
+        // the whole pass.
+        let base_post_probe = std::cmp::min(slice, std::cmp::max(base_array_cap, rescue4));
+        let zero_adoption_wall_cap = (shrink_budget / ARRAY_HOPELESS_WALL_DIVISOR).clamp(
+            base_post_probe.saturating_mul(ARRAY_HOPELESS_WALL_MIN_BUDGETS),
+            base_post_probe.saturating_mul(ARRAY_HOPELESS_WALL_MAX_BUDGETS),
+        );
+        let pass_started = Instant::now();
+        // Headroom re-derivation (#uc-minimize-policy P1): never START an
+        // attempt without room for 2x the LIVE post-probe attempt cap
+        // (attempts are budget-capped by P2/the ladder and the relative
+        // fuse bounds real cost at ~2x budget), grown to the costliest
+        // attempt actually observed. The old rule reserved a full
+        // slice.max(rescue) — measured ~190s of wasted tail per
+        // deadline-bound storecomm file at -T:1200 (walls 991±4 = 1195 −
+        // margin − unspent headroom). Deadline-dishonoring engines (the qg5
+        // overshoot class that motivated the fat reserve) are now caught by
+        // the cheap P2 probe + OVERSHOOT_FUSE pass-abort and by this floor
+        // tracking the observed maximum; gated: zero lost qg5 answers at
+        // -T:60/-T:120. The floor is applied at the top of every iteration
+        // (the cap can grow via ladder escalation / adoption-cost scaling).
+        let mut headroom = Duration::ZERO;
 
         loop {
             let loop_now = Instant::now();
+            // Ladder escalation / hopeless-abort (#uc-minimize-policy
+            // ladder), array content only — see the ARRAY_LADDER_ESCALATION
+            // constants for the rationale. `adopted` is read-only here; the
+            // abort path is exactly the zero-progress restore below.
+            if features.has_arrays && !adopted {
+                // Wall guard first: bounded waste even when every attempt
+                // churns to a large rung (see the ladder constants).
+                if loop_now.saturating_duration_since(pass_started) > zero_adoption_wall_cap {
+                    if trace {
+                        eprintln!(
+                            "c phase-trace uc-minimize fuse=hopeless-wall attempts={attempts}"
+                        );
+                    }
+                    break;
+                }
+                // Escalation stays COUNT-based (design shape); the hopeless
+                // decision is WALL-based only. A count-based hopeless clock
+                // was measured killing a healthy pass: parse-order storecomm
+                // 231-named fast-fails 45 attempts (0.02-0.7s each, cheap
+                // REAL scan progress) before its first adoption at attempt
+                // 46 — any attempt-count hopeless threshold small enough to
+                // bound churner waste beheads that class.
+                if escalated_at_attempt.is_none() && attempts > ARRAY_ESCALATE_AFTER_ATTEMPTS {
+                    array_cap = base_array_cap.saturating_mul(ARRAY_LADDER_ESCALATION_FACTOR);
+                    escalated_at_attempt = Some(attempts);
+                    if trace {
+                        eprintln!("c phase-trace uc-minimize ladder=escalate cap={array_cap:?}");
+                    }
+                }
+            }
+            // One-shot order flip (#uc-minimize-policy P3, see
+            // NON_ARRAY_ORDER_FLIP_AFTER_ATTEMPTS): zero adoptions this
+            // deep into an ascending scan means the tiny prefix is
+            // essential — reverse once so the deletable large members are
+            // tried while budget remains. Safe here: no adoption ever
+            // happened, so no jump is pending and `verified` still equals
+            // the start set; every later candidate is an order-preserving
+            // filter/slice of the REVERSED order, so jump
+            // re-canonicalization stays coherent.
+            if !features.has_arrays
+                && !adopted
+                && !order_flipped
+                && jump.is_none()
+                && attempts >= NON_ARRAY_ORDER_FLIP_AFTER_ATTEMPTS
+            {
+                verified.reverse();
+                i = 0;
+                chunk = (verified.len() / 4).max(1);
+                order_flipped = true;
+                if trace {
+                    eprintln!("c phase-trace uc-minimize order=flip attempts={attempts}");
+                }
+            }
+            // P1 headroom floor: 2x the live post-probe cap (recomputed —
+            // escalation and adoption-cost scaling can raise the cap
+            // mid-pass), never below the costliest observed attempt.
+            let post_probe_budget = std::cmp::min(
+                slice,
+                if features.has_arrays {
+                    std::cmp::max(array_cap, rescue4)
+                } else {
+                    std::cmp::max(ATTEMPT_CHURN_CAP, max_adoption_cost.saturating_mul(4))
+                },
+            );
+            headroom = headroom.max(post_probe_budget.saturating_mul(2));
             if loop_now
                 .checked_add(headroom)
                 .is_none_or(|h| h > shrink_deadline)
@@ -323,30 +510,24 @@ impl Executor {
                 break;
             }
             attempts += 1;
-            // Per-solve slice so one stuck subset cannot eat the pass. Array
-            // content: the FIRST attempt runs under a conservative probe
-            // budget (#array-deadline-forward, see ARRAY_FIRST_PROBE_FLOOR) —
-            // a cheap canary for deadline honoring before committing full
-            // slices; later attempts get the normal slice.
-            let attempt_budget = if features.has_arrays {
-                let floor = if attempts == 1 {
-                    // Conservative probe: the first attempt must demonstrate
-                    // deadline honoring cheaply (see ARRAY_FIRST_PROBE_FLOOR).
-                    ARRAY_FIRST_PROBE_FLOOR
-                } else {
-                    // Post-probe churn cap (see ARRAY_ATTEMPT_SLICE_CAP).
-                    ARRAY_ATTEMPT_SLICE_CAP
-                };
-                std::cmp::min(
-                    slice,
-                    std::cmp::max(
-                        floor,
-                        rescue_elapsed.unwrap_or(Duration::ZERO).saturating_mul(4),
-                    ),
-                )
+            // Per-solve budget policy (#uc-minimize-policy P2 + ladder):
+            // every attempt is capped WELL below the slice so one stuck
+            // subset cannot eat the pass. Attempt 1 is a conservative probe
+            // for ALL content (see FIRST_PROBE_FLOOR) — a cheap canary for
+            // deadline honoring before committing post-probe caps.
+            // Post-probe, array content pays up to the size-aware ladder
+            // rung (see the ARRAY_LADDER_* constants), non-array content up
+            // to 4x the costliest ADOPTION observed (floor
+            // ATTEMPT_CHURN_CAP). Unknown-at-cap keeps the deleted members
+            // — fail-closed, the same direction as a slice timeout.
+            let scaled_floor = if attempts == 1 {
+                std::cmp::max(FIRST_PROBE_FLOOR, rescue4)
+            } else if features.has_arrays {
+                std::cmp::max(array_cap, rescue4)
             } else {
-                slice
+                std::cmp::max(ATTEMPT_CHURN_CAP, max_adoption_cost.saturating_mul(4))
             };
+            let attempt_budget = std::cmp::min(slice, scaled_floor);
             let attempt_started = Instant::now();
             let per_solve_deadline = attempt_started
                 .checked_add(attempt_budget)
@@ -417,15 +598,32 @@ impl Executor {
                 attempt_ended.saturating_duration_since(per_solve_deadline) > OVERSHOOT_FUSE
             };
             headroom = headroom.max(attempt_elapsed);
+            if matches!(sub, Ok(SolveResult::Unsat(_))) {
+                // Adaptive-difficulty signal (#uc-minimize-policy P2): the
+                // post-probe non-array cap scales from the costliest
+                // ADOPTION — the only attempt class whose cost is known to
+                // be productive (churners tell us nothing but the cap).
+                max_adoption_cost = max_adoption_cost.max(attempt_elapsed);
+            }
             if trace {
                 // Per-attempt budget-honoring evidence (#array-deadline-forward
                 // gate: no attempt overshoots its slice by more than the
-                // overshoot fuse).
+                // overshoot fuse). `result` distinguishes a definitive SAT
+                // (the deleted members are jointly essential — scan
+                // convergence is REAL) from an Unknown (undecided at cap —
+                // possibly a deletable member the engine could not decide;
+                // #uc-minimize-policy diagnostic).
                 eprintln!(
-                    "c phase-trace uc-minimize attempt={attempts} budget={:?} elapsed={:?} unsat={}",
+                    "c phase-trace uc-minimize attempt={attempts} budget={:?} elapsed={:?} unsat={} result={}",
                     attempt_budget,
                     attempt_elapsed,
                     matches!(sub, Ok(SolveResult::Unsat(_))),
+                    match &sub {
+                        Ok(SolveResult::Unsat(_)) => "unsat",
+                        Ok(SolveResult::Sat) => "sat",
+                        Ok(SolveResult::Unknown) => "unknown",
+                        Err(_) => "error",
+                    },
                 );
             }
             match sub {
@@ -521,4 +719,57 @@ impl Executor {
         }
         result
     }
+}
+
+/// Memoized term node-count for the tail-first candidate order
+/// (#uc-minimize-policy P3): tree size computed over the hash-consed DAG —
+/// each distinct subterm's size is computed once (memo), shared subterms
+/// COUNT at every occurrence (saturating add, so deeply shared DAGs
+/// saturate instead of overflowing). Deterministic: a pure function of the
+/// parsed term structure. Iterative post-order — assert bodies on the axiom
+/// classes nest deeply enough that recursion would risk the stack.
+fn term_node_count(terms: &TermStore, memo: &mut DetHashMap<TermId, u64>, root: TermId) -> u64 {
+    fn children(data: &TermData, out: &mut Vec<TermId>) {
+        match data {
+            TermData::Const(_) | TermData::Var(..) => {}
+            TermData::App(_, args) => out.extend_from_slice(args),
+            TermData::Let(bindings, body) => {
+                out.extend(bindings.iter().map(|(_, t)| *t));
+                out.push(*body);
+            }
+            TermData::Not(t) => out.push(*t),
+            TermData::Ite(c, t, e) => out.extend([*c, *t, *e]),
+            TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
+                out.push(*body);
+                out.extend(triggers.iter().flatten().copied());
+            }
+            // `TermData` is #[non_exhaustive]; future leaf-or-unknown
+            // variants count as size 1 (still deterministic).
+            _ => {}
+        }
+    }
+    let mut stack: Vec<(TermId, bool)> = vec![(root, false)];
+    let mut kids: Vec<TermId> = Vec::new();
+    while let Some((id, expanded)) = stack.pop() {
+        if memo.contains_key(&id) {
+            continue;
+        }
+        kids.clear();
+        children(terms.get(id), &mut kids);
+        if expanded {
+            let mut n: u64 = 1;
+            for k in &kids {
+                n = n.saturating_add(memo.get(k).copied().unwrap_or(1));
+            }
+            memo.insert(id, n);
+        } else {
+            stack.push((id, true));
+            for k in &kids {
+                if !memo.contains_key(k) {
+                    stack.push((*k, false));
+                }
+            }
+        }
+    }
+    memo.get(&root).copied().unwrap_or(1)
 }

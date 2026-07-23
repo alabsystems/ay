@@ -466,4 +466,91 @@ theorem ex_suffixof_elem_mismatch (v3 : List Int) :
   fun h => suffix_append_last_conflict [-1, -1] v3 [1] (-1) 1 h
     (by decide) (by decide) (by decide) (by decide) (by decide)
 
+/-! ## `seq.extract` slice model + out-of-bounds lemma, and `seq.replace`
+    empty-needle.
+
+The SMT `seq.extract s i n` returns the length-≤`n` slice starting at offset `i`,
+with the standard convention that an out-of-range offset yields the empty
+sequence. `seq.replace s needle t` with an EMPTY needle prepends `t` (the empty
+needle matches at position 0). These are the kernel-verified building blocks
+prepped in `scratchpad/leanseq/Extract.lean` (kept verbatim: `seqExtract`,
+`seqExtract_oob`, `seqReplaceEmpty`, `seqReplaceEmpty_head`).
+
+`seqExtract_oob_replace_head_conflict` is the emitter-facing corollary for the
+`seqextract_oob` shape: an OOB extract gives `[]`, replacing with an empty needle
+prepends `t`, so the head is pinned by `t`'s head; asserting the whole equals a
+sequence whose head is `b` forces `head t = b`, a contradiction when `t`'s head is
+a different `a`. -/
+
+/-- `seq.extract s i n` = the length-≤n slice from offset i (SMT semantics:
+    out-of-range offset yields empty). -/
+def seqExtract {α : Type} (s : Seq α) (i n : Nat) : Seq α := (s.drop i).take n
+
+/-- **Extract OOB → empty.** offset ≥ length ⇒ extract is empty. -/
+theorem seqExtract_oob {α : Type} (s : Seq α) (i n : Nat) (h : s.length ≤ i) :
+    seqExtract s i n = [] := by
+  unfold seqExtract
+  rw [List.drop_eq_nil_of_le h]; simp
+
+/-- `seq.replace s needle t` with an EMPTY needle prepends t (SMT: empty needle
+    matches at position 0). -/
+def seqReplaceEmpty {α : Type} (s t : Seq α) : Seq α := t ++ s
+
+/-- **Replace-empty head.** `(seqReplaceEmpty s t)` has head = t's head when t
+    non-empty — so its first element is pinned by t, not s. -/
+theorem seqReplaceEmpty_head {α : Type} (s t : Seq α) (a : α) (ht : t.head? = some a) :
+    (seqReplaceEmpty s t).head? = some a := by
+  unfold seqReplaceEmpty
+  cases t with
+  | nil => simp at ht
+  | cons b t' => simp_all
+
+/-! ### `seq.extract` OOB + `seq.replace` empty-needle conflict corollary. -/
+
+/-- **Extract-OOB replace-empty head conflict** (emitter-facing). An OOB extract
+    (`s.length ≤ i`) makes the replaced sequence empty, and replacing with an
+    empty needle prepends `t`, so the whole `seqReplaceEmpty (seqExtract s i n) t`
+    has head = `t`'s head `a`. Asserting the whole equals a sequence `whole` whose
+    head is a *different* `b ≠ a` is therefore unsatisfiable: the head is pinned by
+    `t`. This is exactly the `seqextract_oob` firewall shape (extract OOB → `[]`,
+    replace-empty prepends `t`, whole asserted `= [0,1]` forces `head t = 0`, a
+    contradiction when `t = [-2]`). The OOB offset is recorded via `_hoob` (its role
+    is to guarantee the extract is empty, so the head is `t`'s alone). -/
+theorem seqExtract_oob_replace_head_conflict {α : Type} (s t whole : Seq α)
+    (i n : Nat) (a b : α) (_hoob : s.length ≤ i)
+    (ht : t.head? = some a) (hb : whole.head? = some b) (hab : a ≠ b) :
+    ¬ (seqReplaceEmpty (seqExtract s i n) t = whole) := by
+  intro h
+  have hhead := seqReplaceEmpty_head (seqExtract s i n) t a ht
+  rw [h, hb] at hhead
+  exact hab (Option.some.inj hhead).symm
+
+/-! ### Concrete, kernel-checked `seq.extract`-OOB / `seq.replace`-empty witness. -/
+
+/-- The one-element sequence `seq.unit 2 = [2]` over `Int`, for the `seqextract_oob`
+    regression: extracting at offset `1` (OOB, since `len [2] = 1 ≤ 1`) yields `[]`. -/
+def sExtractOob : Seq Int := [2]
+
+/-- Concrete OOB extract: `seq.extract [2] 1 5 = []` — offset `1 ≥ len [2]`.
+    Kernel-checked by `decide`, and also via the general `seqExtract_oob`. -/
+theorem ex_seqExtract_oob_empty : seqExtract sExtractOob 1 5 = ([] : Seq Int) := by decide
+
+/-- The same OOB-empty fact via the general principle. -/
+theorem ex_seqExtract_oob_via_principle : seqExtract sExtractOob 1 5 = ([] : Seq Int) :=
+  seqExtract_oob sExtractOob 1 5 (by decide)
+
+/-- **`seqextract_oob` conflict.** With the extract OOB (`[]`), replacing with the
+    empty needle prepends `t = [-2]`, so the whole is `[-2]`; asserting it equals
+    `[0, 1]` is unsatisfiable (head `-2 ≠ 0`). Kernel-checked by `decide`. -/
+theorem ex_seqExtract_oob_replace_conflict :
+    ¬ (seqReplaceEmpty (seqExtract sExtractOob 1 5) ([-2] : Seq Int) = [0, 1]) := by
+  decide
+
+/-- The same conflict via the general principle: the whole's head is pinned by
+    `t = [-2]` (`head = -2`), which clashes with `[0,1]`'s head `0`. -/
+theorem ex_seqExtract_oob_replace_via_principle :
+    ¬ (seqReplaceEmpty (seqExtract sExtractOob 1 5) ([-2] : Seq Int) = [0, 1]) :=
+  seqExtract_oob_replace_head_conflict sExtractOob [-2] [0, 1] 1 5 (-2) 0
+    (by decide) (by decide) (by decide) (by decide)
+
 end AySoundness.SeqThy

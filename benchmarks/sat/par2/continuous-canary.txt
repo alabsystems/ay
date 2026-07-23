@@ -1,0 +1,10 @@
+# Fully vendored, path-labeled SAT canary for unattended campaigns.
+benchmarks/sat/sat/tiny_sat.cnf
+benchmarks/sat/unsat/at_most_1_of_5.cnf
+benchmarks/sat/unsat/blocked_chain_8.cnf
+benchmarks/sat/unsat/cardinality_8.cnf
+benchmarks/sat/unsat/double_parity_5.cnf
+benchmarks/sat/unsat/graph_coloring_k3_4clique.cnf
+benchmarks/sat/unsat/latin_square_2x2_conflict.cnf
+benchmarks/sat/unsat/php_4_3.cnf
+benchmarks/sat/unsat/tseitin_cycle_11.cnf

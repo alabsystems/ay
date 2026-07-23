@@ -819,7 +819,7 @@ impl Executor {
             // #qf-ax-negated-swap: the swap/storeinv `_np_nf_` shape — one
             // top-level negated equality between two deep store chains, no
             // explicit select witness — needs the same eager-ROW2b rescue so
-            // the fabricated `__ext_diff` select unrolls down both chains.
+            // the fabricated `__ay_ext_diff` select unrolls down both chains.
             // Without it the lazy ArraySolver misses upward select propagation
             // and certifies a witness-less disequality: false SAT.
             || self.has_negated_deep_store_chain_array_equality());

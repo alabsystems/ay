@@ -152,6 +152,7 @@ macro_rules! pipeline_incremental_split_eager_dispatch_split {
                 let Some((lt_atom, gt_atom, is_distinct)) =
                     $crate::executor::theories::create_expression_split_atoms(
                         &mut $self.ctx.terms,
+                        &mut $self.array_ext_witness_cache,
                         split.disequality_term,
                     )
                 else {
@@ -204,6 +205,7 @@ macro_rules! pipeline_incremental_split_eager_dispatch_split {
                     let Some((lt_atom, gt_atom, is_distinct)) =
                         $crate::executor::theories::create_expression_split_atoms(
                             &mut $self.ctx.terms,
+                            &mut $self.array_ext_witness_cache,
                             split.disequality_term,
                         )
                     else {

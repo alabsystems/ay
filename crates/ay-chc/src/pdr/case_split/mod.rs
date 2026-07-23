@@ -16,6 +16,10 @@ use super::model::{InvariantModel, PredicateInterpretation};
 use super::solver::PdrSolver;
 use super::PdrConfig;
 
+const DEFAULT_BRANCH_BUDGET: Duration = Duration::from_secs(4);
+const FUTURE_BRANCH_RESERVE: Duration = Duration::from_secs(2);
+const MERGE_VERIFY_RESERVE: Duration = Duration::from_millis(500);
+
 /// A case constraint for case-splitting on constant arguments.
 ///
 /// Case constraints partition the state space based on equality/disequality
@@ -125,7 +129,7 @@ impl PdrSolver {
         let mut safe_models: Vec<(CaseConstraint, InvariantModel)> = Vec::new();
         let mut had_unknown = false;
 
-        for case in cases {
+        for (case_index, case) in cases.iter().enumerate() {
             // Check wall-clock deadline before starting each branch
             if Self::case_split_deadline_expired(case_split_deadline) {
                 if config.verbose {
@@ -142,20 +146,26 @@ impl PdrSolver {
 
             let mut sub_config = config.clone();
             sub_config.verbose = config.verbose;
-            // Case-split is a preprocessing optimization. Hard branches (e.g., dillig12_m E=1)
-            // can stall here and prevent fallback engines from running at all.
-            // Keep each branch bounded; unresolved branches degrade to Unknown and return None.
-            // Per-branch budget: min(remaining wall-clock, 4s). The cap ensures
-            // hard branches fail fast, leaving budget for TPA/DAR; #4751 raised
-            // it from 2s to 4s — the dillig12_m E=1 branch now converges at
-            // ~3.2s (entry-value bounds + guard-slack step-diff + Houdini
-            // prune) and the total stage wall-clock deadline still bounds the
-            // whole attempt.
+            // Case-split is a preprocessing optimization. Keep every branch
+            // bounded, but make the allocation work-conserving within the
+            // unchanged stage deadline: reserve two seconds for every sibling
+            // still to run and 500ms for merged-model strict verification,
+            // then let the current branch use the remaining slack. This avoids
+            // discarding stage budget when a hard explicit-value case needs a
+            // final certificate recheck and the complement case is cheap
+            // (dillig12_m E=1 / E!=1).
             let remaining = case_split_deadline
                 .map(|d| d.saturating_duration_since(ay_core::time::Instant::now()));
-            let branch_budget = remaining
-                .unwrap_or(Duration::from_secs(4))
-                .min(Duration::from_secs(4));
+            let future_branches = cases.len().saturating_sub(case_index + 1);
+            let branch_budget = Self::case_split_branch_budget(remaining, future_branches);
+            if config.verbose {
+                safe_eprintln!(
+                    "PDR: Case-split: branch budget {:.3}s ({} future case(s), stage remaining {:.3}s)",
+                    branch_budget.as_secs_f64(),
+                    future_branches,
+                    remaining.unwrap_or(branch_budget).as_secs_f64()
+                );
+            }
             sub_config.solve_timeout = Some(branch_budget);
             let _branch_cancel_guard =
                 Self::install_case_split_branch_cancellation(&mut sub_config, branch_budget);
@@ -257,6 +267,27 @@ impl PdrSolver {
 
     fn case_split_deadline_expired(deadline: Option<Instant>) -> bool {
         deadline.is_some_and(|d| Instant::now() >= d)
+    }
+
+    fn case_split_branch_budget(remaining: Option<Duration>, future_branches: usize) -> Duration {
+        let Some(remaining) = remaining else {
+            return DEFAULT_BRANCH_BUDGET;
+        };
+
+        let future_count = u32::try_from(future_branches).unwrap_or(u32::MAX);
+        let reserve = FUTURE_BRANCH_RESERVE
+            .saturating_mul(future_count)
+            .saturating_add(MERGE_VERIFY_RESERVE);
+        if let Some(slack) = remaining.checked_sub(reserve) {
+            if !slack.is_zero() {
+                return slack;
+            }
+        }
+
+        // If the advertised reserves no longer fit, split the remaining
+        // envelope fairly. The enclosing stage deadline is still authoritative.
+        let branch_count = u32::try_from(future_branches.saturating_add(1)).unwrap_or(u32::MAX);
+        remaining / branch_count.max(1)
     }
 
     fn install_case_split_branch_cancellation(

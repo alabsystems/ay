@@ -11,9 +11,8 @@
 
 use ay_core::{AletheRule, ProofStep};
 use ay_proof::{
-    check_proof_collecting_trust, check_proof_partial, check_proof_strict,
-    check_proof_with_quality, export_alethe_with_problem_scope, PartialProofCheck, ProofCheckError,
-    ProofQuality,
+    check_proof_collecting_trust_with_context, check_proof_partial, check_proof_with_quality,
+    export_alethe_with_problem_scope, PartialProofCheck, ProofCheckError, ProofQuality,
 };
 use num_rational::BigRational;
 
@@ -147,7 +146,8 @@ pub(super) fn strict_verdict_from_result(
 /// `Unknown`. This routine consolidates the two existing-but-unwired soundness
 /// paths:
 ///
-/// 1. [`check_proof_collecting_trust`] runs the FULL strict structural check
+/// 1. [`check_proof_collecting_trust_with_context`] runs the FULL strict
+///    structural check
 ///    (every non-trust rule at the strict boundary) but DEFERS each `trust`
 ///    step, returning its conclusion clause. If any non-trust step fails strict
 ///    validation, this errors and we stay [`StrictProofVerdict::Rejected`].
@@ -209,7 +209,21 @@ fn strict_verdict_with_deferred_trust(
     // Re-run strict validation, this time deferring (collecting) trust clauses.
     // A non-trust strict error here means the proof is genuinely unsound → stay
     // Rejected with that error.
-    let collected = match check_proof_collecting_trust(proof, terms) {
+    let datatype_declarations: Vec<(String, Vec<String>)> = resolve_ctx
+        .datatype_iter()
+        .map(|(name, constructors)| (name.to_string(), constructors.to_vec()))
+        .collect();
+    let constructor_selectors: Vec<(String, Vec<String>)> = resolve_ctx
+        .ctor_selectors_iter()
+        .map(|(constructor, selectors)| (constructor.clone(), selectors.clone()))
+        .collect();
+    let collected = match check_proof_collecting_trust_with_context(
+        proof,
+        terms,
+        (!datatype_declarations.is_empty()).then_some(datatype_declarations.as_slice()),
+        (!constructor_selectors.is_empty()).then_some(constructor_selectors.as_slice()),
+        Some(assertions),
+    ) {
         Ok(collected) => collected,
         Err(error) => return StrictProofVerdict::Rejected(error.to_string()),
     };
@@ -310,7 +324,7 @@ fn executor_reconfirms_unsat(resolve_ctx: &ay_frontend::Context) -> bool {
         let Some(proof) = exec.last_proof() else {
             return false;
         };
-        return check_proof_strict(proof, exec.terms()).is_ok();
+        return exec.check_proof_strict_with_datatypes(proof).is_ok();
     }
     true
 }
@@ -398,10 +412,10 @@ fn discharge_trust_clause(
 fn evaluate_proof_artifact_boundary(
     proof: &ay_core::Proof,
     terms: &ay_core::TermStore,
+    strict_quality: Result<ProofQuality, ProofCheckError>,
 ) -> Option<ProofArtifactEvaluation> {
     let diagnostic_quality = check_proof_with_quality(proof, terms).ok()?;
     let (partial_check, _partial_err) = check_proof_partial(proof, terms);
-    let strict_quality = check_proof_strict(proof, terms);
     Some(ProofArtifactEvaluation {
         diagnostic_quality,
         partial_check,
@@ -587,10 +601,14 @@ impl super::Solver {
     pub fn export_last_unsat_artifact(&self) -> Option<UnsatProofArtifact> {
         let proof = self.executor.last_proof()?;
         let terms = self.executor.terms();
-        let assertions = &self.executor.context().assertions;
+        let problem_assertions = self.executor.problem_assertions_for_strict_proof();
+        let mut resolve_ctx = self.executor.context().clone();
+        resolve_ctx.assertions = problem_assertions;
+        let assertions = resolve_ctx.assertions.as_slice();
 
         let alethe = export_alethe_with_problem_scope(proof, terms, assertions);
-        let evaluation = evaluate_proof_artifact_boundary(proof, terms)?;
+        let strict_quality = self.executor.check_proof_strict_with_datatypes(proof);
+        let evaluation = evaluate_proof_artifact_boundary(proof, terms, strict_quality)?;
 
         let restricted_rule_subset_ok =
             check_restricted_rule_subset(&evaluation.diagnostic_quality, proof);
@@ -610,7 +628,7 @@ impl super::Solver {
                 proof,
                 terms,
                 assertions,
-                self.executor.context(),
+                &resolve_ctx,
             )
         };
         let restricted_rule_subset =
@@ -632,8 +650,14 @@ impl super::Solver {
     /// be re-checked OFFLINE by [`ay_proof::re_check_bundle_strict`] — with no
     /// solver run and without trusting this solver. The bundle carries the proof
     /// steps, a checker-only term snapshot (so every embedded `TermId` resolves),
-    /// and the problem's asserted obligation term ids (so a consumer can bind the
-    /// proof's `assume` axioms to the obligation it discharges).
+    /// and the problem's asserted obligation term ids (so the strict checker can
+    /// constrain the proof's `assume` axioms to the claimed obligation).
+    ///
+    /// Offline re-checking establishes the bundle's internal soundness; it does
+    /// not authenticate that the producer supplied the intended external
+    /// problem. A consumer must independently compare the assertions together
+    /// with the datatype, selector, and complete free-symbol declaration
+    /// context described by [`SerializableProofBundle`].
     ///
     /// Returns `None` under the same conditions as
     /// [`export_last_unsat_artifact`](Self::export_last_unsat_artifact): the last
@@ -643,20 +667,28 @@ impl super::Solver {
     pub fn export_last_unsat_bundle(&self) -> Option<ay_proof::SerializableProofBundle> {
         let proof = self.executor.last_proof()?;
         let terms = self.executor.terms();
-        let assertions = self.executor.context().assertions.to_vec();
-        Some(ay_proof::SerializableProofBundle::from_proof(
-            proof, terms, assertions,
+        let assertions = self.executor.problem_assertions_for_strict_proof();
+        let datatype_declarations = self.executor.datatype_decls_for_strict_proof();
+        let constructor_selectors = self.executor.ctor_selector_decls_for_strict_proof();
+        Some(ay_proof::SerializableProofBundle::from_proof_with_context(
+            proof,
+            terms,
+            assertions,
+            datatype_declarations,
+            constructor_selectors,
         ))
     }
 
     /// Render a term to a canonical, store-INDEPENDENT S-expression string
     /// (variables by name; see [`ay_proof::render_term_canonical`]).
     ///
-    /// This is the no-solve counterpart to the bundle: a consumer can render a
-    /// term it built in THIS solver and compare it, at the term level, against a
-    /// term embedded in a [`SerializableProofBundle`] produced by another solver
-    /// — WITHOUT running a solve and without sharing term ids. Used to bind an
-    /// embedded proof's obligation to an independently re-translated one.
+    /// This is a no-solve structural comparison aid: a consumer can render a
+    /// term it built in THIS solver and compare it against a term embedded in a
+    /// [`SerializableProofBundle`] produced by another solver, without sharing
+    /// term ids. Canonical text does not include the complete declaration
+    /// environment, so it is not sufficient to authenticate an external
+    /// obligation by itself; consumers must also compare the bundle's full
+    /// datatype, selector, and free-symbol signature context.
     #[must_use]
     pub fn render_term_canonical(&self, term: super::Term) -> String {
         ay_proof::render_term_canonical(self.executor.terms(), term.id())
@@ -669,8 +701,8 @@ impl super::Solver {
     pub fn export_last_proof_alethe(&self) -> Option<String> {
         let proof = self.executor.last_proof()?;
         let terms = self.executor.terms();
-        let assertions = &self.executor.context().assertions;
-        Some(export_alethe_with_problem_scope(proof, terms, assertions))
+        let assertions = self.executor.problem_assertions_for_strict_proof();
+        Some(export_alethe_with_problem_scope(proof, terms, &assertions))
     }
 
     /// Get diagnostic (non-strict) quality metrics for the last UNSAT proof.
@@ -700,8 +732,7 @@ impl super::Solver {
     #[must_use]
     pub fn last_strict_proof_quality(&self) -> Option<Result<ProofQuality, ProofCheckError>> {
         let proof = self.executor.last_proof()?;
-        let terms = self.executor.terms();
-        Some(check_proof_strict(proof, terms))
+        Some(self.executor.check_proof_strict_with_datatypes(proof))
     }
 
     /// Get partial check result for the last UNSAT proof.

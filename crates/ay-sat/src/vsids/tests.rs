@@ -1005,6 +1005,128 @@ fn test_chb_batch_bump_loaded_repairs_heap() {
 }
 
 #[test]
+fn test_loaded_chb_single_score_decrease_repairs_heap_downward() {
+    let mut vsids = VSIDS::new(4);
+    let vals = make_vals(&[None; 4]);
+    vsids.swap_chb_scores();
+
+    // Seed a valid heap whose root only narrowly leads its first child.
+    // A stale CHB estimate can decrease when its next reward is much lower;
+    // the single-variable repair must therefore support sift-down as well as
+    // the EVSIDS-style sift-up case.
+    vsids.activities.copy_from_slice(&[0.5, 0.49, 0.1, 0.0]);
+    vsids.rebuild_heap();
+    vsids.chb_conflicts = 100;
+    vsids.chb_last_conflict.as_mut().unwrap()[0] = 0;
+
+    vsids.chb_bump_batch(&[0]);
+
+    assert_eq!(
+        vsids.pick_branching_variable(&vals),
+        Some(Variable(1)),
+        "a lowered CHB root must sift below its higher-scored child"
+    );
+}
+
+#[test]
+fn test_loaded_chb_random_batches_preserve_heap_and_position_maps() {
+    // Deterministic xorshift stress for all three repair contracts:
+    // no in-heap touch, one arbitrary key change, and a multi-touch rebuild.
+    // Removed variables continue receiving CHB updates while assigned, then
+    // exercise reinsertion with their final scores.
+    let mut state = 0xD1B5_4A32_D192_ED03u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+
+    for _trial in 0..512 {
+        let n = 16 + (next() % 112) as usize;
+        let mut vsids = VSIDS::new(n);
+        vsids.swap_chb_scores();
+
+        // Frequent ties exercise the variable-index tie-break as scores rise
+        // and fall through the CHB exponential moving average.
+        for score in &mut vsids.activities {
+            *score = (next() % 32) as f64 / 31.0;
+        }
+        vsids.rebuild_heap();
+
+        let mut removed = Vec::new();
+        for var in 0..n {
+            if next().is_multiple_of(5) && vsids.heap.len() > 1 {
+                vsids.remove_from_heap(Variable(var as u32));
+                removed.push(var);
+            }
+        }
+        assert_heap_property_holds(&vsids);
+
+        for round in 0..24 {
+            vsids.chb_conflicts += 1 + next() % 64;
+            vsids.chb_alpha = 0.06 + (next() % 35) as f64 / 100.0;
+
+            let heap_var = vsids.heap[(next() as usize) % vsids.heap.len()] as usize;
+            let mut vars = Vec::new();
+            match round % 4 {
+                // Exactly one in-heap key can move in either direction.
+                0 => vars.push(heap_var),
+                // Many non-heap changes plus exactly one in-heap change must
+                // still select the single-key repair.
+                1 if !removed.is_empty() => {
+                    for _ in 0..3 {
+                        vars.push(removed[(next() as usize) % removed.len()]);
+                    }
+                    vars.push(heap_var);
+                }
+                // Duplicate occurrences conservatively select a full rebuild.
+                2 => {
+                    vars.extend([heap_var, heap_var]);
+                    for _ in 0..3 {
+                        vars.push(vsids.heap[(next() as usize) % vsids.heap.len()] as usize);
+                    }
+                }
+                // Updating only assigned variables must leave the heap intact.
+                _ if !removed.is_empty() => {
+                    for _ in 0..4 {
+                        vars.push(removed[(next() as usize) % removed.len()]);
+                    }
+                }
+                _ => vars.push(heap_var),
+            }
+
+            let conflicts = vsids.chb_conflicts;
+            let last_conflict = vsids.chb_last_conflict.as_mut().unwrap();
+            for &var in &vars {
+                last_conflict[var] = next() % (conflicts + 1);
+            }
+            vsids.chb_bump_batch(&vars);
+            assert_heap_property_holds(&vsids);
+        }
+
+        for var in removed {
+            vsids.insert_into_heap(Variable(var as u32));
+            assert_heap_property_holds(&vsids);
+        }
+
+        let vals = make_vals(&vec![None; n]);
+        let mut previous = None;
+        while let Some(top) = vsids.pick_branching_variable(&vals) {
+            let current = top.index();
+            if let Some(prior) = previous {
+                assert!(
+                    !vsids.var_less(current, prior),
+                    "CHB heap pop order increased: var {current} after var {prior}"
+                );
+            }
+            previous = Some(current);
+            vsids.remove_from_heap(top);
+        }
+    }
+}
+
+#[test]
 fn test_chb_batch_bump_reuses_allocated_arrays() {
     let mut vsids = VSIDS::new(8);
     vsids.chb_bump(Variable(0));
@@ -1153,6 +1275,20 @@ fn assert_heap_property_holds(vsids: &VSIDS) {
         assert_eq!(
             vsids.heap_pos[var], pos as u32,
             "heap_pos inconsistent for var {var}"
+        );
+    }
+    for (var, &pos) in vsids.heap_pos.iter().enumerate() {
+        if pos == INVALID_POS {
+            continue;
+        }
+        assert!(
+            (pos as usize) < vsids.heap.len(),
+            "heap_pos[{var}]={pos} is outside heap.len()={}",
+            vsids.heap.len()
+        );
+        assert_eq!(
+            vsids.heap[pos as usize], var as u32,
+            "heap_pos reverse map inconsistent for var {var}"
         );
     }
 }

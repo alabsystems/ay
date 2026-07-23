@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use super::quantifier_loop::unsupported_arith_mentions_ce_var;
 use super::theories::bv_cnf_dump;
+use super::theories::ArrayExtWitnessRootViolation;
 use super::Executor;
 use crate::ematching::contains_quantifier;
 use crate::executor_types::{Result, SolveResult, StatValue, UnknownReason};
@@ -1130,6 +1131,10 @@ impl Executor {
         // eligible top-level pure-QF_BV check-sat and set true by the BV solver
         // when it actually emits a native-checkable UNSAT DRAT for this solve.
         self.last_bv_drat_self_cert = false;
+        // Preserve the caller-authored roots across solve-time preprocessing so
+        // the post-solve nested-array UNSAT quarantine examines the exact public
+        // problem, not an internally rewritten assertion set.
+        let decision_roots = self.public_solve_roots(&[]);
         // `--self-check` BV DRAT self-certification: arm the eager bit-blast
         // CNF+DRAT export at the self-cert temp paths for a top-level pure-QF_BV
         // query. The arm is a thread-local RAII guard, so all export gating
@@ -1158,6 +1163,9 @@ impl Executor {
         let mut result = result.and_then(|result| {
             bv_cnf_dump::finish_check(dump_transaction, &self.ctx.terms, &dump_roots)?;
             Ok(result)
+        });
+        result = result.map(|solve_result| {
+            self.quarantine_unverified_nested_array_unsat(&decision_roots, solve_result)
         });
         // The eager BV solver finishes its DRAT before returning, while
         // `finish_check` above seals the matching CNF. Verify that finalized
@@ -1727,6 +1735,88 @@ impl Executor {
         Some(SolveResult::Unknown)
     }
 
+    /// Collect every caller-authored root that contributes to a public
+    /// decision query. Soft constraints and arithmetic objectives are part of
+    /// the optimization problem even though they are not hard assertions.
+    pub(in crate::executor) fn public_solve_roots(&self, extra: &[TermId]) -> Vec<TermId> {
+        let mut roots = Vec::with_capacity(
+            self.ctx.assertions.len()
+                + self.ctx.soft_constraints().len()
+                + self.ctx.objectives().len()
+                + extra.len(),
+        );
+        roots.extend_from_slice(&self.ctx.assertions);
+        roots.extend(self.ctx.soft_constraints().iter().map(|soft| soft.term));
+        roots.extend(self.ctx.objectives().iter().map(|objective| objective.term));
+        roots.extend_from_slice(extra);
+        roots
+    }
+
+    /// Fail closed on an UNSAT result for an active nested-array problem.
+    ///
+    /// The current QF_ALIA/AUFLIA combination has a confirmed false-UNSAT
+    /// reproducer over `(Array Int (Array Int Int))`: its default search finds
+    /// a contradictory arithmetic bound, while a reference model satisfies the
+    /// input and AY's strict proof reconstruction cannot certify the conflict.
+    /// Until that combination bug is root-caused, no nested-array refutation is
+    /// authoritative. SAT remains available through the existing mandatory
+    /// model-validation funnel; only UNSAT is quarantined here.
+    ///
+    /// This boundary is shared by plain and assumption-based public checks so a
+    /// caller cannot bypass it by moving the same nested-array formula into an
+    /// assumption literal.
+    pub(in crate::executor) fn quarantine_unverified_nested_array_unsat(
+        &mut self,
+        roots: &[TermId],
+        result: SolveResult,
+    ) -> SolveResult {
+        if !result.is_unsat() || !StaticFeatures::collect(&self.ctx.terms, roots).has_nested_arrays
+        {
+            return result;
+        }
+
+        self.replace_last_result_with_unknown(UnknownReason::Incomplete);
+        self.record_unknown_diagnostic(
+            UnknownReason::Incomplete,
+            "nested-array UNSAT is quarantined pending a trust-free theory-combination proof",
+        );
+        tracing::warn!(
+            "nested-array UNSAT lacked an authoritative theory-combination proof; degrading to Unknown"
+        );
+        SolveResult::Unknown
+    }
+
+    /// Fail closed when caller-authored input captures a solver-generated
+    /// array-extensionality witness from an earlier public query, or contains
+    /// an out-of-range raw `TermId`.
+    pub(in crate::executor) fn reject_array_ext_witness_capture(
+        &mut self,
+        roots: &[TermId],
+    ) -> Option<SolveResult> {
+        let violation = self
+            .array_ext_witness_cache
+            .solve_violation(&self.ctx.terms, roots)?;
+        self.invalidate_last_check_result();
+        self.last_statistics = crate::executor_types::Statistics::default();
+        self.last_statistics.num_assertions = self.ctx.assertions.len() as u64;
+        self.last_unknown_reason = Some(UnknownReason::Incomplete);
+        self.last_result = Some(SolveResult::Unknown);
+        self.set_active_solve_phase("input-preflight", "array-ext-witness-provenance");
+        let detail = match violation {
+            ArrayExtWitnessRootViolation::InvalidTerm(term) => format!(
+                "caller-authored solve input contains out-of-range raw term id {}",
+                term.0
+            ),
+            ArrayExtWitnessRootViolation::CapturedWitness(term) => format!(
+                "caller-authored solve input captures retired array-extensionality witness term {}",
+                term.0
+            ),
+        };
+        self.record_unknown_diagnostic(UnknownReason::Incomplete, detail);
+        self.clear_active_solve_phase();
+        Some(SolveResult::Unknown)
+    }
+
     /// Inner check-sat after stack guard. Separated to keep `check_sat` small.
     fn check_sat_guarded(&mut self) -> Result<SolveResult> {
         self.clear_active_solve_phase();
@@ -1736,7 +1826,10 @@ impl Executor {
         // Native dense-BV fail-closed gate: declarations and derived term
         // widths bypass several constructor-local checks, so validate the full
         // asserted DAG and symbol signatures at the solve boundary.
-        let solve_roots = self.ctx.assertions.clone();
+        let solve_roots = self.public_solve_roots(&[]);
+        if let Some(result) = self.reject_array_ext_witness_capture(&solve_roots) {
+            return Ok(result);
+        }
         if let Some(result) = self.reject_unsupported_bitvector_width(&solve_roots) {
             return Ok(result);
         }
@@ -2525,7 +2618,9 @@ impl Executor {
         // Same for the DT e-graph model export and its derived per-class
         // value assignment (#mv-dt-single-source).
         self.clear_dt_theory_model();
-        self.proof_problem_assertion_provenance = None;
+        // Proof authority is frozen by `begin_public_solve` and deliberately
+        // survives recursive/internal retries. Recapturing the current
+        // assertion window here could authorize generated repair constraints.
         self.quant_expansion_records.clear();
         self.last_proof_rebuild_originals.clear();
         self.last_statistics = crate::executor_types::Statistics::default();
@@ -3158,6 +3253,12 @@ impl Executor {
             // opaque SAT literals, producing false SAT. Return Unknown instead (#8200).
             LogicCategory::QfUfnira => {
                 if features.has_real {
+                    // This route cannot combine the remaining nonlinear Int
+                    // constraints with LRA. Do not attribute that gap to an
+                    // authored div/mod which preprocessing eliminated fully;
+                    // `refine_unsupported_fragment_unknown_reason` stamps the
+                    // structured diagnostic only when an unsupported operator
+                    // actually survives.
                     self.last_unknown_reason = Some(UnknownReason::Incomplete);
                     Ok(SolveResult::Unknown)
                 } else {

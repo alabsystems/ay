@@ -17,8 +17,10 @@
 mod behavior;
 mod bench;
 mod diff;
+mod fetch;
 mod inprocess;
 mod loader;
+mod scoreboard;
 mod symbols;
 
 use std::path::PathBuf;
@@ -30,6 +32,7 @@ const DEFAULT_DIFF_TIMEOUT_SECS: u64 = 10;
 const DEFAULT_BENCH_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_BENCH_JSON: &str = "ay-z3-bench.json";
 const DEFAULT_BENCH_REPORT: &str = "ay-z3-bench.md";
+const DEFAULT_SCOREBOARD_JSON: &str = "ay-z3-scoreboard.json";
 
 fn usage() -> &'static str {
     "\
@@ -39,6 +42,18 @@ USAGE:
   ay-z3-parity symbols [--ay <path>] [--z3 <path>] [--json]
       Audit SYMBOL coverage: nm -gU the libz3 reference set, dlsym each in AY.
       Exit 0 iff no libz3 symbol is missing from AY.
+
+  ay-z3-parity fetch <dest-dir> [--sample N | --all] [--max-mb M]
+                     [--divisions d1,d2,...] [--record ID] [--list]
+      Re-download & DETERMINISTICALLY sample the SMT-LIB corpus from Zenodo
+      (record 11061097 by default) into <dest-dir>/<DIVISION>/. Queries the API
+      for every <DIV>.tar.zst archive, downloads each, verifies its published
+      md5 (a mismatch skips just that division), extracts the zstd tarball, and
+      writes N evenly-spaced .smt2 files (indices floor(i*total/N), '/'->'__').
+      --all samples every file; --max-mb (default 60) skips giant archives
+      (QF_BV/QF_LIA/QF_IDL/AUFBV) unless raised; --divisions is an allowlist;
+      --list prints the available divisions + sizes and downloads nothing.
+      In-tree equivalent of benchmarks/smtlib-sample/fetch-all.sh.
 
   ay-z3-parity diff <corpus-dir-or-file>... [--ay <path>] [--z3 <path>]
                      [--timeout <secs>] [--json] [--oracle declared]
@@ -72,6 +87,44 @@ USAGE:
       auto-populated \"where z3 wins\" section. Exit non-zero iff any
       sat-vs-unsat DISAGREE.
 
+  ay-z3-parity scoreboard <corpus-root> --ay <path> [--ay-cli <path>]
+                     [--z3 <path>] [--jobs <n>] [--timeout <secs>]
+                     [--json-out <path>] [--baseline <path>]
+                     [--divisions <d1,d2,...>]
+      PROGRESS SCOREBOARD across every division subdir under <corpus-root>, on
+      TWO metrics at once: the z3-AGREEMENT metric and AY's OWN fail-closed
+      SELF-CERTIFICATION metric. Each .smt2 is run through AY (the FFI dylib),
+      z3 (libz3), and `ay solve --self-check` (the CLI binary), each in a fresh
+      timeboxed child (reusing the `bench` isolation/timing plumbing). Per
+      division it reports:
+        SOLVED%   = ay-agree / z3-decided
+        SELFCERT% = files AY self-certifies / files AY decides  (the honest,
+                    z3-independent metric)
+        BEYOND    = files AY decides where z3 does not
+        GEO ay/z3 = geomean WALL ratio over decided-by-both (<1 = AY faster)
+        MEM ay/z3 = geomean PEAK-RSS ratio over decided-by-both above 5MB
+                    (<1 = AY leaner); each child's peak RSS is captured via
+                    wait4()/rusage (Darwin bytes, Linux kilobytes, normalized)
+        RATING    = highest tier reached (floors: WALL 10ms, RSS 5MB):
+                    PAR      = DISAGREE 0, AY decides every z3 decision, and
+                               ay_wall <= z3_wall on every decided-by-both file
+                    SUPERIOR = PAR + ay_wall <= 0.5*z3_wall (>=2x) on every such
+                               file + measured ay_rss < 0.8*z3_rss on every one
+                               over 5MB; missing RSS evidence blocks this tier
+                    PERFECT  = SUPERIOR + AY decides 100% of the track's files
+                    below(uN,sM,dK,mJ) / PAR(xN,mM) / SUPERIOR(uN) show blockers
+        DISAGREE  = sat-vs-unsat conflicts (AY vs z3) — MUST be 0
+      Emits a compact per-division table (+ TOTAL) and a JSON certificate
+      (--json-out) with all raw per-division/per-file data. With --baseline
+      <prior scoreboard json>, adds a DELTA column (solved/selfcert/strict vs
+      the baseline) so progress is trackable across runs. Works with z3 absent
+      (z3 columns become n/a; AY still reports decided + self-cert). The `ay`
+      CLI is found via --ay-cli, else a sibling `ay` next to the FFI dylib,
+      else target/release/ay. Self-certification is enabled only when the CLI
+      and FFI build identities prove the same source revision. Exit non-zero
+      (with a prominent WARNING) iff any DISAGREE or any self-check-vs-eval
+      contradiction.
+
   ay-z3-parity behavior [--ay <path>] [--z3 <path>] [--json]
       Audit behavior on the honest-divergence surface: drive the same
       minimal inputs through BOTH libs (char↔BV, transitive closure,
@@ -82,47 +135,78 @@ USAGE:
 
 DEFAULTS:
   --ay        target/debug/libay_ffi.dylib
+  --ay-cli    sibling `ay` next to --ay, else target/release/ay (scoreboard)
   --z3        /opt/homebrew/lib/libz3.dylib
-  --timeout   10 (diff) / 20 (bench)   per-(file,solver) wall-clock seconds
-  --jobs      1    (bench only; parallel worker count)
-  --json-out  ay-z3-bench.json (bench only)
+  --timeout   10 (diff) / 20 (bench, scoreboard)  per-(file,solver) wall seconds
+  --jobs      1    (bench/scoreboard; parallel worker count)
+  --json-out  ay-z3-bench.json (bench) / ay-z3-scoreboard.json (scoreboard)
   --report    ay-z3-bench.md   (bench only)
+  --baseline  (none; scoreboard DELTA column vs a prior scoreboard json)
+  --divisions (all; scoreboard/fetch: comma-separated divisions to include)
+  --sample    500      (fetch; files sampled per division; --all = every file)
+  --max-mb    60       (fetch; skip archives larger than this many MB)
+  --record    11061097 (fetch; Zenodo record id)
 "
 }
 
 struct Parsed {
     ay: PathBuf,
+    ay_cli: Option<PathBuf>,
     z3: PathBuf,
     json: bool,
     timeout: Option<u64>,
     jobs: usize,
     json_out: PathBuf,
+    json_out_set: bool,
     report: PathBuf,
     oracle: Option<String>,
+    baseline: Option<PathBuf>,
+    divisions: Option<Vec<String>>,
     positionals: Vec<PathBuf>,
 }
 
 fn parse(rest: &[String]) -> Result<Parsed, String> {
     let mut ay = PathBuf::from(DEFAULT_AY);
+    let mut ay_cli = None;
     let mut z3 = PathBuf::from(DEFAULT_Z3);
     let mut json = false;
     let mut timeout = None;
     let mut jobs = 1usize;
     let mut json_out = PathBuf::from(DEFAULT_BENCH_JSON);
+    let mut json_out_set = false;
     let mut report = PathBuf::from(DEFAULT_BENCH_REPORT);
     let mut oracle = None;
+    let mut baseline = None;
+    let mut divisions = None;
     let mut positionals = Vec::new();
 
     let mut it = rest.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--ay" => ay = PathBuf::from(it.next().ok_or("--ay needs a path")?),
+            "--ay-cli" => ay_cli = Some(PathBuf::from(it.next().ok_or("--ay-cli needs a path")?)),
             "--z3" => z3 = PathBuf::from(it.next().ok_or("--z3 needs a path")?),
             "--json" => json = true,
             "--json-out" => {
                 json_out = PathBuf::from(it.next().ok_or("--json-out needs a path")?);
+                json_out_set = true;
             }
             "--report" => report = PathBuf::from(it.next().ok_or("--report needs a path")?),
+            "--baseline" => {
+                baseline = Some(PathBuf::from(it.next().ok_or("--baseline needs a path")?));
+            }
+            "--divisions" => {
+                let list = it
+                    .next()
+                    .ok_or("--divisions needs a comma-separated list")?;
+                divisions = Some(
+                    list.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                );
+            }
             "--oracle" => {
                 let val = it.next().ok_or("--oracle needs a value (declared)")?;
                 if val != "declared" {
@@ -154,13 +238,17 @@ fn parse(rest: &[String]) -> Result<Parsed, String> {
     }
     Ok(Parsed {
         ay,
+        ay_cli,
         z3,
         json,
         timeout,
         jobs,
         json_out,
+        json_out_set,
         report,
         oracle,
+        baseline,
+        divisions,
         positionals,
     })
 }
@@ -178,6 +266,12 @@ fn main() -> ExitCode {
     if matches!(cmd, "-h" | "--help" | "help") {
         print!("{}", usage());
         return ExitCode::SUCCESS;
+    }
+
+    // `fetch` has a divergent flag set (--sample/--all/--max-mb/--record/--list)
+    // and needs no dylibs, so it parses its own args ahead of the shared parser.
+    if cmd == "fetch" {
+        return ExitCode::from(fetch::run(rest) as u8);
     }
 
     let parsed = match parse(rest) {
@@ -248,6 +342,40 @@ fn main() -> ExitCode {
                     json_stdout: parsed.json,
                     json_out: parsed.json_out,
                     report_out: parsed.report,
+                })
+            }
+        }
+        "scoreboard" => {
+            if parsed.positionals.is_empty() {
+                eprintln!("error: `scoreboard` needs a corpus root\n\n{}", usage());
+                2
+            } else if parsed.positionals.len() > 1 {
+                eprintln!(
+                    "error: `scoreboard` takes exactly one corpus root (got {})\n\n{}",
+                    parsed.positionals.len(),
+                    usage()
+                );
+                2
+            } else {
+                let json_out = if parsed.json_out_set {
+                    parsed.json_out
+                } else {
+                    PathBuf::from(DEFAULT_SCOREBOARD_JSON)
+                };
+                scoreboard::run(&scoreboard::ScoreboardConfig {
+                    ay: parsed.ay,
+                    ay_cli: parsed.ay_cli,
+                    z3: parsed.z3,
+                    root: parsed
+                        .positionals
+                        .into_iter()
+                        .next()
+                        .expect("one positional"),
+                    timeout_secs: parsed.timeout.unwrap_or(DEFAULT_BENCH_TIMEOUT_SECS),
+                    jobs: parsed.jobs,
+                    json_out,
+                    baseline: parsed.baseline,
+                    divisions: parsed.divisions,
                 })
             }
         }

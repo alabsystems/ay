@@ -179,6 +179,24 @@ pub struct WeConfig {
     pub max_word_len: usize,
     /// Maximum number of fresh variables allocated during the search.
     pub max_fresh_vars: u32,
+    /// Decline the SAT witness materialization for problems with NO word
+    /// equations (pure membership/disequation over the free variables).
+    ///
+    /// Such a problem has a single solved-form leaf: the initial state itself.
+    /// Every UNSAT this fragment can prove is decided by the exhaustive
+    /// emptiness reasoning that runs BEFORE candidate materialization
+    /// (`normalize` conflict, per-membership `is_empty_lang`, and
+    /// `leaf_res_conflict`), so declining materialization is `Unsat`-preserving
+    /// — it turns only the would-be `Sat`/`Exhausted` results into `Exhausted`.
+    /// The witness synthesis it skips (an unbudgeted `find_witness` over the
+    /// complemented-regex intersection) is generated more cheaply downstream —
+    /// by the linear skeleton-word W6 shortcut for the literal-concat regexes,
+    /// and otherwise by the work-budgeted W1b regex construction (which shares
+    /// `find_witness`'s BFS core, so no SAT witness is lost). Off by default;
+    /// the Nielsen pre-pass sets it ONLY for the pure `str.in_re` fragment (no
+    /// `str.len`/`str.++` coupling), where the downstream shortcut applies —
+    /// the length-composition materializer stays live for everything else.
+    pub decline_no_equation_witness: bool,
 }
 
 impl Default for WeConfig {
@@ -188,6 +206,7 @@ impl Default for WeConfig {
             max_solutions: 6,
             max_word_len: 512,
             max_fresh_vars: 128,
+            decline_no_equation_witness: false,
         }
     }
 }
@@ -436,6 +455,16 @@ pub fn solve_word_equations(problem: &WeProblem, cfg: &WeConfig) -> WeOutcome {
                 continue;
             }
             found_leaf = true;
+            // No-equation problems (pure membership/disequation) reach this
+            // leaf directly as the initial state; there are no sibling states.
+            // The emptiness reasoning above has already settled every UNSAT the
+            // fragment can prove, so declining the (unbudgeted) SAT witness
+            // synthesis here is `Unsat`-preserving — the downstream skeleton /
+            // work-budgeted W1b passes generate the witness. Only set for the
+            // pure `str.in_re` fragment (see `decline_no_equation_witness`).
+            if cfg.decline_no_equation_witness && problem.equations.is_empty() {
+                continue;
+            }
             for cand in materialize_candidates(&state, problem, &orig_lens, &mut comp_budget) {
                 let key: Vec<(u32, String)> = cand.clone();
                 if seen_solutions.insert(key) {

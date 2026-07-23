@@ -5526,14 +5526,44 @@ impl Executor {
         let saved_proof_provenance = self.proof_problem_assertion_provenance.clone();
         let saved_statistics = std::mem::take(&mut self.last_statistics);
 
-        self.post_split_verify_depth += 1;
+        // The verification solve is a verdict-only probe.  It must not consume
+        // or overwrite proof state owned by the outer solve.  In particular,
+        // an inner UNSAT calls `build_unsat_proof`, whose `take_proof()` drains
+        // the active tracker.  Sharing that tracker used to discard already
+        // certified array ROW lemmas; the outer proof then rebuilt the same
+        // generated axioms as free `Assume` leaves.
+        let proof_was_enabled = self.proof_tracker.is_enabled();
+        let mut verifier_tracker = crate::proof_tracker::ProofTracker::new();
+        if proof_was_enabled {
+            verifier_tracker.enable();
+        }
+        let saved_proof_tracker = std::mem::replace(&mut self.proof_tracker, verifier_tracker);
+        let saved_last_proof = self.last_proof.take();
+        let saved_last_lrat_certificate = self.last_lrat_certificate.take();
+        let saved_last_proof_term_overrides = self.last_proof_term_overrides.take();
+        let saved_last_proof_quality = self.last_proof_quality.take();
+        let saved_last_clause_trace = self.last_clause_trace.take();
+        let saved_last_var_to_term = self.last_var_to_term.take();
+        let saved_last_trail_provenance = self.last_trail_provenance.take();
+        let saved_last_negations = self.last_negations.take();
+        let saved_last_clausification_proofs = self.last_clausification_proofs.take();
+        let saved_last_original_clause_theory_proofs =
+            self.last_original_clause_theory_proofs.take();
+        let saved_proof_check_result = self.proof_check_result.take();
+        let saved_proof_check_ok = self.proof_check_ok;
+        let saved_last_proof_rebuild_originals =
+            std::mem::take(&mut self.last_proof_rebuild_originals);
+        let saved_verify_depth = self.post_split_verify_depth;
+
+        self.post_split_verify_depth = saved_verify_depth + 1;
         // Suppress model evaluation / counterexample work in the inner solve;
         // we only consume its SAT/UNSAT verdict.
         self.skip_model_eval = true;
         let core_assertions = core.to_vec();
-        let result =
-            self.with_isolated_incremental_state(Some(core_assertions), Self::solve_uf_lia);
-        self.post_split_verify_depth -= 1;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.with_isolated_incremental_state(Some(core_assertions), Self::solve_uf_lia)
+        }));
+        self.post_split_verify_depth = saved_verify_depth;
 
         // Restore caller-visible state regardless of the inner outcome: the verify
         // pass must be transparent to the outer solve's result/model/diagnostics.
@@ -5544,8 +5574,25 @@ impl Executor {
         self.skip_model_eval = saved_skip_model_eval;
         self.proof_problem_assertion_provenance = saved_proof_provenance;
         self.last_statistics = saved_statistics;
+        self.proof_tracker = saved_proof_tracker;
+        self.last_proof = saved_last_proof;
+        self.last_lrat_certificate = saved_last_lrat_certificate;
+        self.last_proof_term_overrides = saved_last_proof_term_overrides;
+        self.last_proof_quality = saved_last_proof_quality;
+        self.last_clause_trace = saved_last_clause_trace;
+        self.last_var_to_term = saved_last_var_to_term;
+        self.last_trail_provenance = saved_last_trail_provenance;
+        self.last_negations = saved_last_negations;
+        self.last_clausification_proofs = saved_last_clausification_proofs;
+        self.last_original_clause_theory_proofs = saved_last_original_clause_theory_proofs;
+        self.proof_check_result = saved_proof_check_result;
+        self.proof_check_ok = saved_proof_check_ok;
+        self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
 
-        matches!(result, Ok(ref r) if r.is_unsat())
+        match result {
+            Ok(result) => matches!(result, Ok(ref r) if r.is_unsat()),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// #relevancy-lazy-routing: whether the eager attempt's wander-abort
@@ -7469,6 +7516,54 @@ impl Executor {
         // A mutated witness invalidates prior validation evidence; the
         // finalize pass re-validates it fail-closed.
         self.last_model_validated = bv_model_validated && !grafted;
+    }
+}
+
+#[cfg(test)]
+mod post_split_verify_tests {
+    use super::*;
+    use ay_core::{ProofStep, TheoryLemmaKind};
+
+    #[test]
+    fn fresh_post_split_verifier_preserves_outer_proof_tracker() {
+        let mut exec = Executor::new();
+        exec.proof_tracker.enable();
+        let outer_lemma = exec.ctx.terms.mk_var("outer_row_lemma", Sort::Bool);
+        exec.proof_tracker
+            .add_theory_lemma_with_kind(
+                vec![outer_lemma],
+                TheoryLemmaKind::ArraySelectStore { index_eq: true },
+            )
+            .expect("proof tracking is enabled");
+        let outer_negation = exec.ctx.terms.mk_not(outer_lemma);
+        let mut outer_negations = HashMap::default();
+        outer_negations.insert(outer_lemma, outer_negation);
+        exec.last_negations = Some(outer_negations.clone());
+        let contradiction = exec.ctx.terms.false_term();
+
+        assert!(
+            exec.verify_post_split_unsat_via_fresh_solve(&[contradiction]),
+            "the isolated verification core must re-derive UNSAT"
+        );
+        assert_eq!(
+            exec.proof_tracker.num_steps(),
+            1,
+            "the nested verifier must not drain the outer proof tracker"
+        );
+        assert_eq!(
+            exec.last_negations,
+            Some(outer_negations),
+            "the nested verifier must not consume the outer SAT negation map"
+        );
+        let proof = exec.proof_tracker.take_proof();
+        assert!(matches!(
+            proof.steps.as_slice(),
+            [ProofStep::TheoryLemma {
+                clause,
+                kind: TheoryLemmaKind::ArraySelectStore { index_eq: true },
+                ..
+            }] if clause == &[outer_lemma]
+        ));
     }
 }
 

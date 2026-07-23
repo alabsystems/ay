@@ -137,9 +137,27 @@ impl Executor {
             return Ok(None);
         }
 
+        let __tr = std::env::var("AY_STR_PREPASS_STATS").ok().as_deref() == Some("1");
+        let __t = std::time::Instant::now();
         let Some(extraction) = self.extract_word_eq_problem() else {
+            if __tr {
+                safe_eprintln!(
+                    "[WORDEQ] extract-bail {:.1}ms",
+                    __t.elapsed().as_secs_f64() * 1e3
+                );
+            }
             return Ok(None);
         };
+        if __tr {
+            safe_eprintln!(
+                "[WORDEQ] extract {:.1}ms eqs={} diseqs={} mem={} vars={}",
+                __t.elapsed().as_secs_f64() * 1e3,
+                extraction.problem.equations.len(),
+                extraction.problem.disequations.len(),
+                extraction.problem.memberships.len(),
+                extraction.problem.num_vars
+            );
+        }
 
         if debug_auflia_enabled() {
             let render = |w: &WeWord| -> String {
@@ -169,7 +187,30 @@ impl Executor {
                 safe_eprintln!("[WORDEQ] var V{i} = {t:?}");
             }
         }
-        let outcome = solve_word_equations(&extraction.problem, &we_config());
+        let __t2 = std::time::Instant::now();
+        // For the pure `str.in_re` fragment (no `str.len`/`str.++` coupling),
+        // decline the unbudgeted SAT witness materialization: its UNSAT
+        // emptiness reasoning still runs (deciding e.g. `instance13338` in
+        // ~15 ms), but a SAT witness is built far more cheaply by the W6
+        // skeleton shortcut / work-budgeted W1b that run right after this pass
+        // (`instance12580`/`instance08792`). Gating on the SAME shape the
+        // shortcut handles keeps the length-composition materializer live for
+        // every membership+length file (e.g. sygus-qgen `query3165`), whose SAT
+        // only that materializer builds.
+        let mut cfg = we_config();
+        cfg.decline_no_equation_witness = self.w6_pure_membership_shape();
+        let outcome = solve_word_equations(&extraction.problem, &cfg);
+        if __tr {
+            safe_eprintln!(
+                "[WORDEQ] solve {:.1}ms -> {}",
+                __t2.elapsed().as_secs_f64() * 1e3,
+                match &outcome {
+                    WeOutcome::Sat(s) => format!("Sat({})", s.len()),
+                    WeOutcome::Unsat => "Unsat".to_string(),
+                    WeOutcome::Exhausted => "Exhausted".to_string(),
+                }
+            );
+        }
         if debug_auflia_enabled() {
             safe_eprintln!(
                 "[WORDEQ] fragment: {} eqs, {} diseqs, {} res, {} vars → {:?}",
@@ -679,7 +720,9 @@ impl Executor {
     ///
     /// No case-splitting is performed (an unforced `or` contributes nothing),
     /// so the closure is pure unit propagation — sound for Unsat extraction.
-    fn forced_literal_closure(&self) -> (Vec<TermId>, Vec<TermId>) {
+    pub(in crate::executor::theories) fn forced_literal_closure(
+        &self,
+    ) -> (Vec<TermId>, Vec<TermId>) {
         self.forced_literal_closure_ext(false)
     }
 
@@ -1271,95 +1314,16 @@ impl Executor {
         if depth > 32 {
             return None;
         }
-        let TermData::App(sym, args) = self.ctx.terms.get(t) else {
-            return None;
+        // One exact translation is shared with ground derivative evaluation.
+        // Size, unroll, and bounded-loop choices remain this lane's policy, so
+        // W1/W1b/W2 construction and word-equation refutation cannot drift.
+        let limits = ay_strings::term_regex::TranslateLimits {
+            max_size: max_we_regex_size(),
+            max_loop: max_we_loop(),
+            bounded_loop_node: ay_strings::we_regex::s1_enabled(),
+            max_depth: 32usize.saturating_sub(depth),
         };
-        let str_const = |t: TermId| -> Option<String> {
-            match self.ctx.terms.get(t) {
-                TermData::Const(Constant::String(s)) => Some(s.clone()),
-                _ => None,
-            }
-        };
-        let translate_all = |args: &[TermId]| -> Option<Vec<WeRegex>> {
-            args.iter()
-                .map(|&a| self.translate_we_regex(a, depth + 1))
-                .collect()
-        };
-        let out = match sym.name() {
-            "re.none" if args.is_empty() => WeRegex::None,
-            "re.all" if args.is_empty() => WeRegex::All,
-            "re.allchar" if args.is_empty() => WeRegex::AnyChar,
-            // SMT-LIB `re.range` semantics (empty language for non-singleton
-            // endpoints or reversed bounds) live in the constructor.
-            "re.range" if args.len() == 2 => {
-                WeRegex::range(&str_const(args[0])?, &str_const(args[1])?)
-            }
-            "str.to_re" | "str.to.re" if args.len() == 1 => WeRegex::lit(&str_const(args[0])?),
-            "re.++" if !args.is_empty() => WeRegex::concat(translate_all(args)?),
-            "re.union" if !args.is_empty() => WeRegex::union(translate_all(args)?),
-            "re.inter" if !args.is_empty() => WeRegex::inter(translate_all(args)?),
-            "re.*" if args.len() == 1 => {
-                WeRegex::star(self.translate_we_regex(args[0], depth + 1)?)
-            }
-            "re.+" if args.len() == 1 => {
-                WeRegex::plus(self.translate_we_regex(args[0], depth + 1)?)
-            }
-            "re.opt" if args.len() == 1 => {
-                WeRegex::opt(self.translate_we_regex(args[0], depth + 1)?)
-            }
-            // re.comp(R): complement over the FULL Unicode string alphabet.
-            // Boolean-closed (Bucket B) — `WeRegex::comp` is exact, so a
-            // complemented regex participates soundly in both witness search
-            // (SAT) and definite-emptiness (UNSAT).
-            "re.comp" if args.len() == 1 => {
-                WeRegex::comp(self.translate_we_regex(args[0], depth + 1)?)
-            }
-            // re.diff(R, S) = R ∩ ¬S.
-            "re.diff" if args.len() == 2 => WeRegex::inter(vec![
-                self.translate_we_regex(args[0], depth + 1)?,
-                WeRegex::comp(self.translate_we_regex(args[1], depth + 1)?),
-            ]),
-            // (_ re.loop lo hi) R = ⋃_{k=lo}^{hi} R^k, unrolled exactly as
-            // R^lo · (R?)^(hi-lo) up to the unroll cap. `lo > hi` is the
-            // empty language. Beyond the cap, S1 (`AY_WE_S1`) translates to
-            // the EXACT bounded-repeat counter node [`WeRegex::loop_bounded`]
-            // instead of bailing (corpus bounds reach 680) — same exactness
-            // contract, so it participates in Unsat soundly; flags-off
-            // behavior is unchanged (bail).
-            "re.loop" if args.len() == 1 => {
-                let Symbol::Indexed(_, indices) = sym else {
-                    return None;
-                };
-                if indices.len() != 2 {
-                    return None;
-                }
-                let (lo, hi) = (indices[0], indices[1]);
-                if lo > hi {
-                    WeRegex::None
-                } else if hi > max_we_loop() {
-                    if !ay_strings::we_regex::s1_enabled() {
-                        return None;
-                    }
-                    let body = self.translate_we_regex(args[0], depth + 1)?;
-                    WeRegex::loop_bounded(body, lo, hi)
-                } else {
-                    let body = self.translate_we_regex(args[0], depth + 1)?;
-                    let mut parts: Vec<WeRegex> = Vec::new();
-                    for _ in 0..lo {
-                        parts.push(body.clone());
-                    }
-                    for _ in lo..hi {
-                        parts.push(WeRegex::opt(body.clone()));
-                    }
-                    WeRegex::concat(parts)
-                }
-            }
-            _ => return None,
-        };
-        if out.size() > max_we_regex_size() {
-            return None;
-        }
-        Some(out)
+        ay_strings::term_regex::translate(&self.ctx.terms, t, &limits)
     }
 
     /// Flatten a string term into a word over `WeSym`, returning `None` when

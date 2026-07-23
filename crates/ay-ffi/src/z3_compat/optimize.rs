@@ -66,13 +66,13 @@ use num_bigint::BigInt;
 use num_rational::BigRational;
 
 use super::{
-    apply_supported_params, ast_to_term, cache_ast_vector, cache_string, cache_symbol,
-    ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint,
-    ffi_guard_void, ffi_read_bounded_parser_file, ffi_read_bounded_parser_text,
-    ffi_read_bounded_text, flatten_statistics, record_ast_sort, term_to_ast, DecisionOwnerFamily,
-    ModelHandle, OptimizeCheckOutcome, OptimizeHandle, OptimizeScopeMarker, ParamDescr,
-    ParamDescrsHandle, SoftRecord, StatsHandle, Z3Context, Z3_ast, Z3_ast_vector, Z3_context,
-    Z3_model, Z3_optimize, Z3_param_descrs, Z3_params, Z3_stats, Z3_string, Z3_symbol,
+    apply_supported_params, cache_ast_vector, cache_string, cache_symbol, ffi_guard_ast,
+    ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
+    ffi_read_bounded_parser_file, ffi_read_bounded_parser_text, ffi_read_bounded_text,
+    flatten_statistics, record_ast_sort, require_term_ast_or_return, term_to_ast,
+    DecisionOwnerFamily, ModelHandle, OptimizeCheckOutcome, OptimizeHandle, OptimizeScopeMarker,
+    ParamDescr, ParamDescrsHandle, SoftRecord, StatsHandle, Z3Context, Z3_ast, Z3_ast_vector,
+    Z3_context, Z3_model, Z3_optimize, Z3_param_descrs, Z3_params, Z3_stats, Z3_string, Z3_symbol,
     Z3_EXCEPTION, Z3_FILE_ACCESS_ERROR, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_FALSE, Z3_L_TRUE,
     Z3_L_UNDEF, Z3_OK, Z3_PK_BOOL, Z3_PK_INVALID, Z3_PK_STRING, Z3_PK_UINT,
 };
@@ -175,7 +175,7 @@ pub unsafe extern "C" fn Z3_optimize_assert(c: Z3_context, o: Z3_optimize, a: Z3
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
     // `ffi_guard_void` handles the null case internally and catches any unwinding panic so it
-    // cannot cross the FFI boundary. `a` is a u64 AST handle (Copy), validated by `ast_to_term`.
+    // cannot cross the FFI boundary. `a` is a u64 AST handle (Copy), authenticated below.
     unsafe {
         ffi_guard_void(c, |ctx| {
             let Some(opt) = o.as_mut() else {
@@ -186,7 +186,7 @@ pub unsafe extern "C" fn Z3_optimize_assert(c: Z3_context, o: Z3_optimize, a: Z3
             if !optimize_handle_is_usable(ctx, opt, "Z3_optimize_assert") {
                 return;
             }
-            let term = ast_to_term(a);
+            let term = require_term_ast_or_return!(ctx, a, "Z3_optimize_assert", "formula");
             if let Err(e) = ctx.solver.try_assert_term(term) {
                 ctx.last_error = Z3_EXCEPTION;
                 ctx.error_msg = Some(format!("{e}"));
@@ -284,7 +284,13 @@ pub unsafe extern "C" fn Z3_optimize_assert_soft(
                 return opt.softs.len() as c_uint;
             };
 
-            let term = ast_to_term(a);
+            let term = require_term_ast_or_return!(
+                ctx,
+                a,
+                "Z3_optimize_assert_soft",
+                "formula",
+                opt.softs.len() as c_uint
+            );
             match ctx.solver.assert_soft(term, w, group.as_deref()) {
                 Ok(idx) => {
                     // Record the soft locally so `to_string` can render the
@@ -767,7 +773,13 @@ unsafe fn optimize_register_objective(
             if !optimize_handle_is_usable(ctx, opt, "Z3_optimize_maximize/minimize") {
                 return 0;
             }
-            let term = ast_to_term(t);
+            let term = require_term_ast_or_return!(
+                ctx,
+                t,
+                "Z3_optimize_maximize/minimize",
+                "objective",
+                0
+            );
             let idx = match sense {
                 ObjectiveSense::Maximize => ctx.solver.maximize(term),
                 ObjectiveSense::Minimize => ctx.solver.minimize(term),
@@ -908,7 +920,7 @@ fn build_finite_numeral(ctx: &mut Z3Context, r: &BigRational, sort: &Sort) -> Z3
         // defensive and emit an Int numeral of the integer part.
         _ => (Sort::Int, ctx.solver.int_const_bigint(&r.to_integer())),
     };
-    let ast = term_to_ast(term);
+    let ast = term_to_ast(ctx, term);
     record_ast_sort(ctx, ast, out_sort);
     ast
 }
@@ -916,7 +928,7 @@ fn build_finite_numeral(ctx: &mut Z3Context, r: &BigRational, sort: &Sort) -> Z3
 /// Build an `Int` numeral AST for the exact integer `v` and record its sort.
 fn int_numeral_ast(ctx: &mut Z3Context, v: &BigInt) -> Z3_ast {
     let term = ctx.solver.int_const_bigint(v);
-    let ast = term_to_ast(term);
+    let ast = term_to_ast(ctx, term);
     record_ast_sort(ctx, ast, Sort::Int);
     ast
 }
@@ -1041,7 +1053,7 @@ pub unsafe extern "C" fn Z3_optimize_assert_and_track(
     t: Z3_ast,
 ) {
     // SAFETY: `ffi_guard_void` handles null `c` and catches panics; `o` is
-    // null-checked via `as_mut`; `a`/`t` are validated by `ast_to_term`.
+    // null-checked via `as_mut`; `a`/`t` are authenticated below.
     unsafe {
         ffi_guard_void(c, |ctx| {
             let Some(opt) = o.as_mut() else {
@@ -1052,8 +1064,14 @@ pub unsafe extern "C" fn Z3_optimize_assert_and_track(
             if !optimize_handle_is_usable(ctx, opt, "Z3_optimize_assert_and_track") {
                 return;
             }
-            let a_term = ast_to_term(a);
-            let t_term = ast_to_term(t);
+            let a_term =
+                require_term_ast_or_return!(ctx, a, "Z3_optimize_assert_and_track", "formula");
+            let t_term = require_term_ast_or_return!(
+                ctx,
+                t,
+                "Z3_optimize_assert_and_track",
+                "tracking literal",
+            );
             // The tracking literal must be Boolean (z3 requires a Boolean atom).
             if ctx.solver.term_sort(t_term) != Sort::Bool {
                 ctx.last_error = Z3_INVALID_ARG;
@@ -1098,7 +1116,11 @@ pub unsafe extern "C" fn Z3_optimize_get_unsat_core(
             let asts = match o.as_ref() {
                 Some(opt) if opt.last_check_outcome == Some(OptimizeCheckOutcome::Unsat) => {
                     match &opt.last_unsat_core {
-                        Some(core) => core.iter().copied().map(term_to_ast).collect(),
+                        Some(core) => core
+                            .iter()
+                            .copied()
+                            .map(|term| term_to_ast(ctx, term))
+                            .collect(),
                         None => Vec::new(),
                     }
                 }
@@ -1153,7 +1175,7 @@ pub unsafe extern "C" fn Z3_optimize_get_objectives(
                 .collect();
             let mut asts = Vec::with_capacity(items.len());
             for (term, sort) in items {
-                let ast = term_to_ast(term);
+                let ast = term_to_ast(ctx, term);
                 if let Some(s) = sort {
                     record_ast_sort(ctx, ast, s);
                 }
@@ -1186,7 +1208,12 @@ pub unsafe extern "C" fn Z3_optimize_get_assertions(
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             let asts = match o.as_ref() {
-                Some(opt) => opt.hard.iter().copied().map(term_to_ast).collect(),
+                Some(opt) => opt
+                    .hard
+                    .iter()
+                    .copied()
+                    .map(|term| term_to_ast(ctx, term))
+                    .collect(),
                 None => {
                     ctx.last_error = Z3_INVALID_ARG;
                     ctx.error_msg = Some("null Z3_optimize handle in get_assertions".to_string());

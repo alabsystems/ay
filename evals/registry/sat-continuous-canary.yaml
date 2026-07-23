@@ -1,0 +1,19 @@
+id: sat-continuous-canary
+version: 1
+description: Fully vendored SAT correctness and PAR-2 canary
+owner: andrewyates.name@gmail.com
+competition: sat-comp
+scoring: sat-comp
+inputs:
+  timeout_sec: 5
+  standard_timeout_sec: 5000
+  benchmarks_dir: benchmarks/sat
+  list_file: benchmarks/sat/par2/continuous-canary.txt
+  runs: 1
+metrics:
+  - solved
+  - total
+  - wrong
+  - par2_avg
+outputs:
+  results_dir: evals/results/sat-continuous-canary/{run_id}

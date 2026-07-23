@@ -602,8 +602,11 @@ fn dt_cert_bridge_route_shadow_withholds() {
     // `AY_DT_CERT_BRIDGE_ROUTE`=shadow: the route still classifies + logs a
     // would-grant (faithfulness runs first and passes), but the grant is
     // WITHHELD — the verdict stays byte-identical to the route being absent.
-    let (verdict, stderr) =
-        solve_with_bridge_route(Some("on"), false, Some("shadow"), BRIDGE_ROUTE_INPUT);
+    // Bound the deliberately hard fallback exactly like the flag-off twin
+    // below; otherwise this one negative control serializes the full suite
+    // behind `ENV_LOCK` for minutes after it has already exercised the route.
+    let input = format!("(set-option :timeout 2000)\n{BRIDGE_ROUTE_INPUT}");
+    let (verdict, stderr) = solve_with_bridge_route(Some("on"), false, Some("shadow"), &input);
     assert_ne!(
         verdict, "sat",
         "shadow bridge route must NOT grant:\n{stderr}"
@@ -646,8 +649,12 @@ fn dt_cert_bridge_route_declines_free_bridge() {
 #[test]
 fn dt_cert_bridge_route_flag_off_byte_identical() {
     // Flag off: the W1 shape is unclaimable exactly as today (multi-binder,
-    // not F2/G) and no bridge-route logging appears anywhere.
-    let (verdict, stderr) = solve_with_bridge_route(Some("on"), false, None, BRIDGE_ROUTE_INPUT);
+    // not F2/G) and no bridge-route logging appears anywhere.  Bound this
+    // negative control: without the bridge route the quantified base is
+    // intentionally hard, and an unbounded child can serialize every sibling
+    // DT-certificate test behind `ENV_LOCK` for minutes.
+    let input = format!("(set-option :timeout 2000)\n{BRIDGE_ROUTE_INPUT}");
+    let (verdict, stderr) = solve_with_bridge_route(Some("on"), false, None, &input);
     assert_ne!(verdict, "sat");
     assert!(
         !stderr.contains("[BRIDGE-ROUTE]"),

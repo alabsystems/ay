@@ -52,10 +52,11 @@
 use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::term::TermData;
 use ay_core::{
-    AletheRule, FarkasAnnotation, Proof, ProofId, ProofStep, Sort, Symbol, TermId, TermStore,
-    TheoryLemmaKind, TheoryLit, TheoryResult, TheorySolver,
+    AletheRule, Constant, FarkasAnnotation, Proof, ProofId, ProofStep, Sort, Symbol, TermId,
+    TermStore, TheoryLemmaKind, TheoryLit, TheoryResult, TheorySolver,
 };
 use ay_frontend::command::Term as FrontendTerm;
+use num_bigint::BigInt;
 
 use super::proof_surface_syntax::{collect_surface_term_overrides, strip_frontend_annotations};
 use super::Executor;
@@ -233,6 +234,22 @@ impl Executor {
         // place (e.g. substitute-and-simplify to `true`), so the raw stack is
         // NOT a usable original source for surface-less assertions.
         let original_stack = self.proof_original_problem_assertions();
+        // Keep an exact, index-aligned view of the immutable authored roots
+        // for repairs that can reason directly over their syntax. In
+        // particular, the complementary-literal repair must assume these
+        // terms, not a comparison-normalized re-elaboration of the parsed
+        // surface. A length mismatch is a provenance failure: leave this view
+        // empty so that repair fails closed.
+        let authored_originals: Vec<(TermId, FrontendTerm)> =
+            if original_stack.len() == parsed_assertions.len() {
+                original_stack
+                    .iter()
+                    .copied()
+                    .zip(parsed_assertions.iter().cloned())
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let mut originals: Vec<(TermId, FrontendTerm)> =
             Vec::with_capacity(parsed_assertions.len());
         for (idx, parsed) in parsed_assertions.iter().enumerate() {
@@ -262,20 +279,15 @@ impl Executor {
         // solve); the trust surgery below reuses this exact `originals` list.
         self.last_proof_rebuild_originals = originals.iter().map(|(c, _)| *c).collect();
 
-        // Also capture the RAW top-level re-interned form of each parsed
-        // original. The fold-to-`false` reconstruction re-interns a folded
-        // assertion RAW so the rebuilt `assume` prints like the problem file:
-        // e.g. `(and b0 (not b0))` elaborates (folds) to `false`, but
-        // `rebuild_complementary_and_collapse` assumes `mk_app("and",
-        // [elaborate(b0), elaborate(not b0)], Bool)` — a distinct id the folded
-        // `canonical` above does NOT cover. Rebuild the same raw top-level app
-        // here (hash-consed identical to what the collapse builds) for the Bool
-        // connective/relation heads those reconstructions use, so the leak-2
-        // gate accepts these genuine premises. A foreign injected axiom is
-        // never a parsed assertion, so it is never added by this loop.
+        // Also capture the recursively RAW re-interned form of each parsed
+        // original. The fold-to-`false` reconstructions assume exact source
+        // syntax, not a shallow top-level app whose children have already
+        // folded (which could silently authorize `(distinct x y z)` for the
+        // actual source `(distinct (ite true x w) y z)`). A foreign injected
+        // axiom is never a parsed assertion, so it is never added here.
         let parsed_forms: Vec<FrontendTerm> = originals.iter().map(|(_, p)| p.clone()).collect();
         for parsed in &parsed_forms {
-            let FrontendTerm::App(head, operands) = strip_frontend_annotations(parsed) else {
+            let FrontendTerm::App(head, _) = strip_frontend_annotations(parsed) else {
                 continue;
             };
             let head = head.clone();
@@ -285,30 +297,9 @@ impl Executor {
             ) {
                 continue;
             }
-            let operands = operands.clone();
-            let mut elaborated = Vec::with_capacity(operands.len());
-            let mut ok = true;
-            for op in &operands {
-                let stripped = strip_frontend_annotations(op).clone();
-                match self.ctx.elaborate_surface_subterm(&stripped) {
-                    Some(t) => elaborated.push(t),
-                    None => {
-                        ok = false;
-                        break;
-                    }
-                }
+            if let Some(raw) = self.raw_intern_surface(parsed) {
+                self.last_proof_rebuild_originals.push(raw);
             }
-            if !ok {
-                continue;
-            }
-            let raw = if head == "not" && elaborated.len() == 1 {
-                self.ctx.terms.mk_not_raw(elaborated[0])
-            } else {
-                self.ctx
-                    .terms
-                    .mk_app(Symbol::named(&head), &elaborated, Sort::Bool)
-            };
-            self.last_proof_rebuild_originals.push(raw);
         }
 
         // Preprocessor fold-to-`false` collapse (`(distinct x x)`, `(= 1 2)`,
@@ -318,7 +309,7 @@ impl Executor {
         // collapse shape carries no trust step, only the misused `false`
         // rule. Fail-closed (whole-proof shape gated); see
         // `try_rebuild_false_collapse`.
-        if self.try_rebuild_false_collapse(proof, &originals) {
+        if self.try_rebuild_false_collapse(proof, &originals, &authored_originals) {
             return;
         }
 
@@ -558,7 +549,9 @@ impl Executor {
         // false proof: it only exists when the complementary pair is really
         // asserted. Runs dead last so every previously-working backbone keeps
         // producing byte-identical output.
-        if self.try_rebuild_with_complementary_literals(proof, &originals) {
+        if !authored_originals.is_empty()
+            && self.try_rebuild_with_complementary_literals(proof, &authored_originals)
+        {
             return;
         }
 
@@ -2431,37 +2424,46 @@ impl Executor {
     ) -> bool {
         let original_terms: Vec<TermId> = originals.iter().map(|(c, _)| *c).collect();
 
-        // (1) Which assume leaves are defective?
+        // (1) Which generated leaves are defective?
         //
         // Only leaves REACHABLE from an empty-clause step matter: the #8821
         // authority gate (`validate_reachable_assumes_in_problem_scope`) walks
         // the dependency cone of the empty clause and ignores everything
-        // outside it, and dead steps are never printed. A defective leaf on a
-        // dead branch (e.g. an abandoned extensionality split whose
-        // `__ext_diff_*` witness assumes survive in the step list) therefore
+        // outside it. A defective leaf on a dead branch (e.g. an abandoned
+        // extensionality split whose
+        // `__ay_ext_diff_*` witness assumes survive in the step list) therefore
         // carries NO authority claim, and must not veto repairing the leaves
-        // that do. Those leaves are copied through verbatim — this pass never
-        // invents a derivation for them.
+        // that do. Unreachable steps are omitted from the rebuilt proof: an
+        // external checker validates every serialized command, not only the
+        // final empty clause's dependency cone.
         let reachable = Self::reachable_step_mask(proof);
         let mut defective: Vec<TermId> = Vec::new();
-        let mut dead_defective: Vec<TermId> = Vec::new();
         for (idx, step) in proof.steps.iter().enumerate() {
-            if let ProofStep::Assume(term) = step {
-                if original_terms.contains(term) {
-                    continue;
-                }
-                if reachable[idx] {
-                    if !defective.contains(term) {
-                        defective.push(*term);
-                    }
-                } else if !dead_defective.contains(term) {
-                    dead_defective.push(*term);
-                }
+            let term = match step {
+                ProofStep::Assume(term) => Some(*term),
+                // The provenance demotion pass runs before this final repair
+                // and converts a generated Assume into an explicit unit
+                // `trust`. It is still repairable only when the same
+                // substitution planner derives that exact unit from authored
+                // premises; arbitrary trust clauses remain untouched.
+                ProofStep::Step {
+                    rule: AletheRule::Trust,
+                    clause,
+                    premises,
+                    ..
+                } if premises.is_empty() && clause.len() == 1 => Some(clause[0]),
+                _ => None,
+            };
+            let Some(term) = term else {
+                continue;
+            };
+            if !reachable[idx] || original_terms.contains(&term) {
+                continue;
+            }
+            if !defective.contains(&term) {
+                defective.push(term);
             }
         }
-        // A term assumed on BOTH a live and a dead branch is repaired once and
-        // remapped everywhere; it is not a pass-through.
-        dead_defective.retain(|t| !defective.contains(t));
         if defective.is_empty() {
             return false;
         }
@@ -2476,6 +2478,7 @@ impl Executor {
             };
             plans.push(plan);
         }
+        let self_contained_surface = plans.iter().any(BridgePlan::uses_ground_evaluate);
 
         // (3) Originals the rebuilt proof will assume: the ones the surviving
         // skeleton already assumed, plus every premise the bridges need.
@@ -2485,7 +2488,10 @@ impl Executor {
                 needed.push(t);
             }
         };
-        for step in &proof.steps {
+        for (idx, step) in proof.steps.iter().enumerate() {
+            if !reachable[idx] {
+                continue;
+            }
             if let ProofStep::Assume(term) = step {
                 if original_terms.contains(term) {
                     push_needed(*term, &mut needed);
@@ -2507,19 +2513,193 @@ impl Executor {
         // derivations, then the surviving skeleton with premises remapped.
         let mut new_proof = Proof::new();
         let mut assume_ids: HashMap<TermId, ProofId> = HashMap::default();
-        for &term in &needed {
-            let id = new_proof.add_assume(term, None);
-            assume_ids.insert(term, id);
-        }
-        // Dead-branch defective leaves are re-emitted UNCHANGED, exactly as
-        // the proof already had them. They stay outside the empty clause's
-        // cone, so they are neither printed nor claimed as authority; keeping
-        // them merely preserves the skeleton this pass promised not to
-        // restructure.
-        let mut passthrough_ids: HashMap<TermId, ProofId> = HashMap::default();
-        for &term in &dead_defective {
-            let id = new_proof.add_assume(term, None);
-            passthrough_ids.insert(term, id);
+        let mut raw_authored_to_record: Vec<TermId> = Vec::new();
+        if self_contained_surface {
+            // A surface override changes printing only; internally-generated
+            // congruence terms still reference the canonical ids. That is not
+            // enough when a nested ground concat was folded during
+            // elaboration: the serialized source and conclusion cease to be
+            // syntactically linked. Reconstruct every needed authored premise
+            // recursively, assume that exact raw term, and explicitly derive
+            // its canonical form before using the ordinary substitution plan.
+            let mut surface_plans: Vec<SurfaceAssumePlan> = Vec::with_capacity(needed.len());
+            for &canonical in &needed {
+                let Some(idx) = original_terms
+                    .iter()
+                    .position(|&original| original == canonical)
+                else {
+                    return false;
+                };
+                let parsed = originals[idx].1.clone();
+                let raw = if is_api_placeholder(&parsed) {
+                    canonical
+                } else {
+                    let Some(raw) = self.raw_intern_surface(&parsed) else {
+                        return false;
+                    };
+                    raw
+                };
+                if !raw_authored_to_record.contains(&raw) {
+                    raw_authored_to_record.push(raw);
+                }
+
+                let canonicalization = if raw == canonical {
+                    SurfaceCanonicalization::Direct
+                } else if matches!(parsed_head(&parsed), Some("distinct")) {
+                    if !Self::is_matching_binary_distinct(&self.ctx.terms, canonical, raw) {
+                        return false;
+                    }
+                    SurfaceCanonicalization::Distinct
+                } else {
+                    let mut budget = EQ_PLAN_BUDGET;
+                    let Some(plan) = self.plan_substitution_bridge_from_source_with_budget(
+                        canonical,
+                        raw,
+                        &original_terms,
+                        &mut budget,
+                    ) else {
+                        return false;
+                    };
+                    SurfaceCanonicalization::Bridge(plan)
+                };
+                surface_plans.push(SurfaceAssumePlan {
+                    canonical,
+                    raw,
+                    canonicalization,
+                });
+            }
+
+            let mut distinct_assumes: Vec<(TermId, TermId, ProofId)> = Vec::new();
+            let mut pending_surface_bridges: Vec<BridgePlan> = Vec::new();
+            for surface in surface_plans {
+                let assume_id = if let Some(&existing) = assume_ids.get(&surface.raw) {
+                    existing
+                } else {
+                    let id = new_proof.add_assume(surface.raw, None);
+                    assume_ids.insert(surface.raw, id);
+                    id
+                };
+                match surface.canonicalization {
+                    SurfaceCanonicalization::Direct => {
+                        assume_ids.insert(surface.canonical, assume_id);
+                    }
+                    SurfaceCanonicalization::Distinct => {
+                        distinct_assumes.push((surface.canonical, surface.raw, assume_id));
+                    }
+                    SurfaceCanonicalization::Bridge(plan) => {
+                        pending_surface_bridges.push(plan);
+                    }
+                }
+            }
+            for (diseq, distinct, assume_id) in distinct_assumes {
+                let Some(unit) = Self::emit_binary_distinct_bridge(
+                    &mut self.ctx.terms,
+                    &mut new_proof,
+                    diseq,
+                    distinct,
+                    assume_id,
+                ) else {
+                    return false;
+                };
+                assume_ids.insert(diseq, unit);
+            }
+            // A raw premise's canonicalization can depend on another
+            // canonical authored equality. Emit in dependency order and fail
+            // closed on a cycle or missing source.
+            while !pending_surface_bridges.is_empty() {
+                let ready = pending_surface_bridges.iter().position(|plan| {
+                    let mut assumed = Vec::new();
+                    for kid in &plan.kids {
+                        kid.collect_assumed(&mut assumed);
+                    }
+                    assumed.iter().all(|term| assume_ids.contains_key(term))
+                });
+                let Some(ready) = ready else {
+                    return false;
+                };
+                let plan = pending_surface_bridges.remove(ready);
+                let Some(unit) = Self::emit_substitution_bridge(
+                    &mut self.ctx.terms,
+                    &mut new_proof,
+                    &plan,
+                    &assume_ids,
+                ) else {
+                    return false;
+                };
+                assume_ids.insert(plan.goal, unit);
+            }
+        } else {
+            let mut distinct_assumes: Vec<(TermId, TermId, ProofId)> = Vec::new();
+            for &term in &needed {
+                let Some(idx) = original_terms.iter().position(|&original| original == term) else {
+                    return false;
+                };
+                let parsed = &originals[idx].1;
+                if matches!(parsed_head(parsed), Some("distinct")) {
+                    // Binary `distinct` elaborates to `(not (= s t))`, but an
+                    // Alethe `assume` must retain the problem's actual surface
+                    // term. Derive the canonical disequality through
+                    // `distinct_elim` + `equiv_pos2`.
+                    let TermData::Not(eq) = self.ctx.terms.get(term) else {
+                        return false;
+                    };
+                    let eq = *eq;
+                    let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(eq) else {
+                        return false;
+                    };
+                    if name != "=" || args.len() != 2 {
+                        return false;
+                    }
+                    let args = args.clone();
+                    let FrontendTerm::App(surface_name, surface_args) =
+                        strip_frontend_annotations(parsed)
+                    else {
+                        return false;
+                    };
+                    if surface_name != "distinct" || surface_args.len() != 2 {
+                        return false;
+                    }
+                    let Some(raw_args) = surface_args
+                        .iter()
+                        .map(|arg| self.raw_intern_surface(arg))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        return false;
+                    };
+                    if raw_args.as_slice() != args.as_slice() {
+                        // `distinct_elim` below proves the canonical
+                        // disequality only for these exact operands. A nested
+                        // source fold needs its own explicit bridge; treating
+                        // the shallow canonical pair as authored would grant
+                        // authority to a term absent from the problem.
+                        return false;
+                    }
+                    let distinct =
+                        self.ctx
+                            .terms
+                            .mk_app(Symbol::named("distinct"), raw_args, Sort::Bool);
+                    if !Self::is_matching_binary_distinct(&self.ctx.terms, term, distinct) {
+                        return false;
+                    }
+                    let id = new_proof.add_assume(distinct, None);
+                    distinct_assumes.push((term, distinct, id));
+                } else {
+                    let id = new_proof.add_assume(term, None);
+                    assume_ids.insert(term, id);
+                }
+            }
+            for (diseq, distinct, assume_id) in distinct_assumes {
+                let Some(unit) = Self::emit_binary_distinct_bridge(
+                    &mut self.ctx.terms,
+                    &mut new_proof,
+                    diseq,
+                    distinct,
+                    assume_id,
+                ) else {
+                    return false;
+                };
+                assume_ids.insert(diseq, unit);
+            }
         }
 
         let mut bridge_unit: HashMap<TermId, ProofId> = HashMap::default();
@@ -2537,10 +2717,13 @@ impl Executor {
 
         let mut remap: Vec<Option<ProofId>> = vec![None; proof.steps.len()];
         for (idx, step) in proof.steps.iter().enumerate() {
+            if !reachable[idx] {
+                continue;
+            }
             let new_id = match step {
                 ProofStep::Assume(term) => match assume_ids.get(term) {
                     Some(&id) => id,
-                    None => match bridge_unit.get(term).or_else(|| passthrough_ids.get(term)) {
+                    None => match bridge_unit.get(term) {
                         Some(&id) => id,
                         None => return false,
                     },
@@ -2578,6 +2761,13 @@ impl Executor {
                     premises,
                     args,
                 } => {
+                    if matches!(rule, AletheRule::Trust) && premises.is_empty() && clause.len() == 1
+                    {
+                        if let Some(&id) = bridge_unit.get(&clause[0]) {
+                            remap[idx] = Some(id);
+                            continue;
+                        }
+                    }
                     let mut mapped = Vec::with_capacity(premises.len());
                     for p in premises {
                         match remap.get(p.0 as usize).copied().flatten() {
@@ -2626,6 +2816,16 @@ impl Executor {
         }
 
         *proof = new_proof;
+        if self_contained_surface {
+            for raw in raw_authored_to_record {
+                self.record_rebuilt_authored_proof_premise(raw);
+            }
+            // Every authored premise is now represented by its own raw term,
+            // with explicit proof steps to the canonical ids. Keeping any
+            // printer override would collapse those distinct terms again.
+            self.last_proof_term_overrides = None;
+            return true;
+        }
         let mut overrides = self.last_proof_term_overrides.take().unwrap_or_default();
         // A substituted leaf carries a STALE surface override: the ordinary
         // export registered "print the substituted form the way the AUTHORED
@@ -2652,6 +2852,14 @@ impl Executor {
             // Placeholder (native-API) surfaces register NO override — the
             // sentinel string is not a printable spelling.
             if is_api_placeholder(&parsed) {
+                continue;
+            }
+            // The raw binary-distinct assume above already carries the exact
+            // source spelling. Overriding its derived canonical `(not (= ...))`
+            // back to `distinct` would make the `equiv_pos2`/resolution bridge
+            // syntactically invalid in the emitted Alethe certificate.
+            if matches!(parsed_head(&parsed), Some("distinct")) {
+                overrides.remove(&term);
                 continue;
             }
             collect_surface_term_overrides(&mut self.ctx, term, &parsed, &mut overrides);
@@ -2715,6 +2923,46 @@ impl Executor {
         goal: TermId,
         original_terms: &[TermId],
     ) -> Option<BridgePlan> {
+        let mut budget = EQ_PLAN_BUDGET;
+        self.plan_substitution_bridge_with_budget(goal, original_terms, &mut budget)
+    }
+
+    /// Budget-injectable implementation used by the adversarial unit tests.
+    /// One shared counter covers every same-head source candidate and every
+    /// argument of this goal; a large assertion set cannot reset the bound by
+    /// making an earlier candidate fail.
+    fn plan_substitution_bridge_with_budget(
+        &mut self,
+        goal: TermId,
+        original_terms: &[TermId],
+        budget: &mut u32,
+    ) -> Option<BridgePlan> {
+        for &source in original_terms {
+            if let Some(plan) = self.plan_substitution_bridge_from_source_with_budget(
+                goal,
+                source,
+                original_terms,
+                budget,
+            ) {
+                return Some(plan);
+            }
+        }
+        None
+    }
+
+    /// Plan one bridge from the exact authored `source` spelling to `goal`.
+    ///
+    /// The ordinary path searches canonical originals for a source. The
+    /// self-contained surface path already reconstructed the exact raw source,
+    /// so it calls this helper directly and still limits all equality premises
+    /// to `original_terms`.
+    fn plan_substitution_bridge_from_source_with_budget(
+        &mut self,
+        goal: TermId,
+        source: TermId,
+        original_terms: &[TermId],
+        budget: &mut u32,
+    ) -> Option<BridgePlan> {
         let (goal_atom, goal_negated) = strip_not_polarity(&self.ctx.terms, goal);
         let TermData::App(goal_sym, goal_args) = self.ctx.terms.get(goal_atom) else {
             return None;
@@ -2724,61 +2972,43 @@ impl Executor {
             return None;
         }
 
-        for &source in original_terms {
-            let (src_atom, src_negated) = strip_not_polarity(&self.ctx.terms, source);
-            if src_negated != goal_negated || src_atom == goal_atom {
-                continue;
-            }
-            let TermData::App(src_sym, src_args) = self.ctx.terms.get(src_atom) else {
-                continue;
-            };
-            if *src_sym != goal_sym || src_args.len() != goal_args.len() {
-                continue;
-            }
-            let src_args = src_args.clone();
-            let mut kids: Vec<EqPlan> = Vec::with_capacity(src_args.len());
-            let mut ok = true;
-            // One shared budget across the whole predicate: a pathological
-            // original set can offer many defining equalities per variable,
-            // and search is bounded so planning stays linear-ish in practice
-            // and always terminates.
-            let mut budget = EQ_PLAN_BUDGET;
-            for (&a, &b) in src_args.iter().zip(goal_args.iter()) {
-                match self.plan_eq(a, b, original_terms, 0, &mut budget) {
-                    Some(plan) => kids.push(plan),
-                    None => {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if !ok {
-                continue;
-            }
-            // `eq_congruent_pred ⊢ (cl ¬(= a1 b1) .. ¬(= an bn) ¬P(a..) P(b..))`.
-            // For a NEGATED leaf the roles swap: the derivation runs from the
-            // asserted `(not P(a..))` to `(not P(b..))`, which is the same
-            // rule with `P(b..)` in the negated slot. The strict checker
-            // accepts either premise orientation at each argument position, so
-            // the SAME equality terms serve both directions.
-            let mut lemma: Vec<TermId> = kids.iter().map(|k| k.neg_eq).collect();
-            if goal_negated {
-                lemma.push(self.ctx.terms.mk_not_raw(goal_atom));
-                lemma.push(src_atom);
-            } else {
-                lemma.push(self.ctx.terms.mk_not_raw(src_atom));
-                lemma.push(goal_atom);
-            }
-            return Some(BridgePlan {
-                goal,
-                goal_negated,
-                source,
-                source_atom: src_atom,
-                lemma,
-                kids,
-            });
+        let (src_atom, src_negated) = strip_not_polarity(&self.ctx.terms, source);
+        if src_negated != goal_negated || src_atom == goal_atom {
+            return None;
         }
-        None
+        let TermData::App(src_sym, src_args) = self.ctx.terms.get(src_atom) else {
+            return None;
+        };
+        if *src_sym != goal_sym || src_args.len() != goal_args.len() {
+            return None;
+        }
+        let src_args = src_args.clone();
+        let mut kids: Vec<EqPlan> = Vec::with_capacity(src_args.len());
+        for (&a, &b) in src_args.iter().zip(goal_args.iter()) {
+            kids.push(self.plan_eq(a, b, original_terms, 0, budget)?);
+        }
+        // `eq_congruent_pred ⊢ (cl ¬(= a1 b1) .. ¬(= an bn) ¬P(a..) P(b..))`.
+        // For a NEGATED leaf the roles swap: the derivation runs from the
+        // asserted `(not P(a..))` to `(not P(b..))`, which is the same
+        // rule with `P(b..)` in the negated slot. The strict checker accepts
+        // either premise orientation at each argument position, so the SAME
+        // equality terms serve both directions.
+        let mut lemma: Vec<TermId> = kids.iter().map(|k| k.neg_eq).collect();
+        if goal_negated {
+            lemma.push(self.ctx.terms.mk_not_raw(goal_atom));
+            lemma.push(src_atom);
+        } else {
+            lemma.push(self.ctx.terms.mk_not_raw(src_atom));
+            lemma.push(goal_atom);
+        }
+        Some(BridgePlan {
+            goal,
+            goal_negated,
+            source,
+            source_atom: src_atom,
+            lemma,
+            kids,
+        })
     }
 
     /// Plan a derivation of `(= a b)` from the original assertions:
@@ -2859,6 +3089,24 @@ impl Executor {
                 kind: EqPlanKind::Symm { assumed: flipped },
             });
         }
+        // Constant-folded concat: preprocessing can turn
+        // `concat(op, concat(lhs, rhs))` into one BV literal after `op/lhs/rhs`
+        // are pinned. Pure EUF congruence cannot relate an application to that
+        // literal, so split the literal according to the concat operand widths:
+        //
+        //   authored pins + eq_congruent  |- a = concat(hi, lo)
+        //   exact ground evaluate         |- concat(hi, lo) = b
+        //   trans                         |- a = b
+        //
+        // The second leg is admitted only when ay-proof's deliberately narrow
+        // strict `evaluate` recognizer independently checks the closed concat.
+        // A missing pin, malformed width, unsupported ground operation, false
+        // fold, or width above 64 therefore fails closed.
+        if let Some(plan) =
+            self.plan_concat_eq_to_constant(a, b, eq, neg_eq, original_terms, depth, budget)
+        {
+            return Some(plan);
+        }
         // Congruence: `a` and `b` are the same function applied to pairwise
         // derivably-equal arguments.
         let congruence = (|| {
@@ -2897,6 +3145,117 @@ impl Executor {
         // something, which is exactly the direction that could launder a
         // formula the problem never asserted.
         self.plan_eq_via_definition(a, b, eq, neg_eq, original_terms, depth, budget)
+    }
+
+    /// Plan a certified equality from a symbolic binary `concat` to its folded
+    /// BV literal. See the call-site comment in [`Self::plan_eq`].
+    #[allow(clippy::too_many_arguments)]
+    fn plan_concat_eq_to_constant(
+        &mut self,
+        a: TermId,
+        b: TermId,
+        eq: TermId,
+        neg_eq: TermId,
+        original_terms: &[TermId],
+        depth: u32,
+        budget: &mut u32,
+    ) -> Option<EqPlan> {
+        let TermData::App(Symbol::Named(name), args) = self.ctx.terms.get(a) else {
+            return None;
+        };
+        if name != "concat" || args.len() != 2 {
+            return None;
+        }
+        let args = args.clone();
+        let TermData::Const(Constant::BitVec { value, width }) = self.ctx.terms.get(b).clone()
+        else {
+            return None;
+        };
+        // A surface-faithful source can already be a fully ground concat tree.
+        // In that case `eq` itself is the exact checked evaluation theorem.
+        // Splitting it and adding `trans(eq, ...)` would make one premise equal
+        // to the conclusion, which both Alethe and our strict checker reject as
+        // redundant. Prefer the direct, independently recognized theorem.
+        if ay_proof::recognize_bv_ground_evaluate(&self.ctx.terms, &[eq]) {
+            return Some(EqPlan {
+                eq,
+                neg_eq,
+                kind: EqPlanKind::BvGroundEvaluate,
+            });
+        }
+        let (Sort::BitVec(high_sort), Sort::BitVec(low_sort)) = (
+            self.ctx.terms.sort(args[0]).clone(),
+            self.ctx.terms.sort(args[1]).clone(),
+        ) else {
+            return None;
+        };
+        if high_sort.width == 0
+            || low_sort.width == 0
+            || width > u64::BITS
+            || high_sort.width > u64::BITS
+            || low_sort.width > u64::BITS
+            || high_sort.width.checked_add(low_sort.width) != Some(width)
+        {
+            return None;
+        }
+
+        let low_mask = (BigInt::from(1_u8) << low_sort.width) - BigInt::from(1_u8);
+        let low_value = &value & low_mask;
+        let high_value = value >> low_sort.width;
+        let high = self.ctx.terms.mk_bitvec(high_value, high_sort.width);
+        let low = self.ctx.terms.mk_bitvec(low_value, low_sort.width);
+
+        let high_plan = self.plan_eq(args[0], high, original_terms, depth + 1, budget)?;
+        let low_plan = self.plan_eq(args[1], low, original_terms, depth + 1, budget)?;
+
+        // `mk_app` deliberately preserves the raw application. The folded
+        // literal is `b`; keeping this intermediate raw is what gives
+        // `eq_congruent` a matching function head on both sides.
+        let raw_ground =
+            self.ctx
+                .terms
+                .mk_app(Symbol::named("concat"), [high, low], Sort::bitvec(width));
+        if !matches!(
+            self.ctx.terms.get(raw_ground),
+            TermData::App(Symbol::Named(n), raw_args)
+                if n == "concat" && raw_args.as_slice() == [high, low]
+        ) {
+            return None;
+        }
+        let congruent_eq = self
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), [a, raw_ground], Sort::Bool);
+        let congruent_neg = self.ctx.terms.mk_not_raw(congruent_eq);
+        let congruent = EqPlan {
+            eq: congruent_eq,
+            neg_eq: congruent_neg,
+            kind: EqPlanKind::Cong {
+                lemma: vec![high_plan.neg_eq, low_plan.neg_eq, congruent_eq],
+                kids: vec![high_plan, low_plan],
+            },
+        };
+
+        let ground_eq = self
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), [raw_ground, b], Sort::Bool);
+        if !ay_proof::recognize_bv_ground_evaluate(&self.ctx.terms, &[ground_eq]) {
+            return None;
+        }
+        let ground = EqPlan {
+            eq: ground_eq,
+            neg_eq: self.ctx.terms.mk_not_raw(ground_eq),
+            kind: EqPlanKind::BvGroundEvaluate,
+        };
+        Some(EqPlan {
+            eq,
+            neg_eq,
+            kind: EqPlanKind::Trans {
+                left: Box::new(congruent),
+                right: Box::new(ground),
+            },
+        })
     }
 
     /// The `trans`-through-a-definition leg of [`Self::plan_eq`].
@@ -2985,6 +3344,55 @@ impl Executor {
         None
     }
 
+    fn is_matching_binary_distinct(terms: &TermStore, diseq: TermId, distinct: TermId) -> bool {
+        let TermData::Not(eq) = terms.get(diseq) else {
+            return false;
+        };
+        let TermData::App(Symbol::Named(eq_name), eq_args) = terms.get(*eq) else {
+            return false;
+        };
+        let TermData::App(Symbol::Named(distinct_name), distinct_args) = terms.get(distinct) else {
+            return false;
+        };
+        eq_name == "="
+            && eq_args.len() == 2
+            && distinct_name == "distinct"
+            && distinct_args.as_slice() == eq_args.as_slice()
+            && terms.sort(diseq) == &Sort::Bool
+            && terms.sort(distinct) == &Sort::Bool
+    }
+
+    /// Derive canonical `(not (= a b))` from the exact authored
+    /// `(distinct a b)` premise.
+    fn emit_binary_distinct_bridge(
+        terms: &mut TermStore,
+        proof: &mut Proof,
+        diseq: TermId,
+        distinct: TermId,
+        assume_id: ProofId,
+    ) -> Option<ProofId> {
+        if !Self::is_matching_binary_distinct(terms, diseq, distinct) {
+            return None;
+        }
+        let equiv = terms.mk_app(Symbol::named("="), [distinct, diseq], Sort::Bool);
+        let not_equiv = terms.mk_not_raw(equiv);
+        let not_distinct = terms.mk_not_raw(distinct);
+        let de = proof.add_rule_step(
+            AletheRule::DistinctElim,
+            vec![equiv],
+            Vec::new(),
+            Vec::new(),
+        );
+        let ep = proof.add_rule_step(
+            AletheRule::EquivPos2,
+            vec![not_equiv, not_distinct, diseq],
+            Vec::new(),
+            Vec::new(),
+        );
+        let r1 = proof.add_resolution(vec![not_distinct, diseq], equiv, ep, de);
+        Some(proof.add_resolution(vec![diseq], distinct, r1, assume_id))
+    }
+
     /// Emit a planned bridge, returning the id of the unit `(cl goal)` step.
     fn emit_substitution_bridge(
         terms: &mut TermStore,
@@ -3052,6 +3460,12 @@ impl Executor {
                     Vec::new(),
                 ))
             }
+            EqPlanKind::BvGroundEvaluate => Some(proof.add_rule_step(
+                AletheRule::Evaluate,
+                vec![plan.eq],
+                Vec::new(),
+                Vec::new(),
+            )),
             EqPlanKind::Cong { lemma, kids } => {
                 let mut kid_units: Vec<(TermId, TermId, ProofId)> = Vec::with_capacity(kids.len());
                 for kid in kids {
@@ -3126,6 +3540,8 @@ enum EqPlanKind {
     Assumed,
     /// The FLIPPED equality is an original assertion; `symm` reorients it.
     Symm { assumed: TermId },
+    /// Closed concat evaluation accepted by the strict `evaluate` recognizer.
+    BvGroundEvaluate,
     /// `eq_congruent` over a shared function symbol.
     Cong {
         lemma: Vec<TermId>,
@@ -3142,7 +3558,7 @@ enum EqPlanKind {
 impl EqPlan {
     fn collect_assumed(&self, out: &mut Vec<TermId>) {
         match &self.kind {
-            EqPlanKind::Refl => {}
+            EqPlanKind::Refl | EqPlanKind::BvGroundEvaluate => {}
             EqPlanKind::Assumed => {
                 if !out.contains(&self.eq) {
                     out.push(self.eq);
@@ -3164,6 +3580,17 @@ impl EqPlan {
             }
         }
     }
+
+    fn uses_ground_evaluate(&self) -> bool {
+        match &self.kind {
+            EqPlanKind::BvGroundEvaluate => true,
+            EqPlanKind::Cong { kids, .. } => kids.iter().any(Self::uses_ground_evaluate),
+            EqPlanKind::Trans { left, right } => {
+                left.uses_ground_evaluate() || right.uses_ground_evaluate()
+            }
+            EqPlanKind::Refl | EqPlanKind::Assumed | EqPlanKind::Symm { .. } => false,
+        }
+    }
 }
 
 /// A planned bridge from an authored predicate assertion to the
@@ -3181,6 +3608,24 @@ struct BridgePlan {
     lemma: Vec<TermId>,
     /// Per-argument equality derivations, aligned with the predicate's args.
     kids: Vec<EqPlan>,
+}
+
+impl BridgePlan {
+    fn uses_ground_evaluate(&self) -> bool {
+        self.kids.iter().any(EqPlan::uses_ground_evaluate)
+    }
+}
+
+struct SurfaceAssumePlan {
+    canonical: TermId,
+    raw: TermId,
+    canonicalization: SurfaceCanonicalization,
+}
+
+enum SurfaceCanonicalization {
+    Direct,
+    Distinct,
+    Bridge(BridgePlan),
 }
 
 #[cfg(test)]

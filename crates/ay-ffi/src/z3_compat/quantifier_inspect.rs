@@ -18,8 +18,8 @@ use ay_dpll::api::TermKind;
 
 use super::quantifiers::{PatternHandle, Z3_pattern};
 use super::{
-    alloc_sort, ast_to_term, cache_symbol, ffi_guard_ast, ffi_guard_int, ffi_guard_ptr,
-    ffi_guard_uint, term_to_ast, Z3_ast, Z3_context, Z3_sort, Z3_symbol,
+    alloc_sort, cache_symbol, ffi_guard_ast, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint,
+    require_term_ast_or_return, term_to_ast, Z3_ast, Z3_context, Z3_sort, Z3_symbol,
 };
 
 /// Return true if the AST is a universal quantifier.
@@ -37,10 +37,9 @@ pub unsafe extern "C" fn Z3_is_quantifier_forall(c: Z3_context, a: Z3_ast) -> bo
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
-            i32::from(matches!(
-                ctx.solver.term_kind(ast_to_term(a)),
-                TermKind::Forall
-            ))
+            let term =
+                require_term_ast_or_return!(ctx, a, "Z3_is_quantifier_forall", "quantifier", 0);
+            i32::from(matches!(ctx.solver.term_kind(term), TermKind::Forall))
         }) != 0
     }
 }
@@ -60,10 +59,9 @@ pub unsafe extern "C" fn Z3_is_quantifier_exists(c: Z3_context, a: Z3_ast) -> bo
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
-            i32::from(matches!(
-                ctx.solver.term_kind(ast_to_term(a)),
-                TermKind::Exists
-            ))
+            let term =
+                require_term_ast_or_return!(ctx, a, "Z3_is_quantifier_exists", "quantifier", 0);
+            i32::from(matches!(ctx.solver.term_kind(term), TermKind::Exists))
         }) != 0
     }
 }
@@ -85,8 +83,10 @@ pub unsafe extern "C" fn Z3_get_quantifier_body(c: Z3_context, a: Z3_ast) -> Z3_
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let children = ctx.solver.term_children(ast_to_term(a));
-            children.first().map_or(0, |&t| term_to_ast(t))
+            let term =
+                require_term_ast_or_return!(ctx, a, "Z3_get_quantifier_body", "quantifier", 0);
+            let children = ctx.solver.term_children(term);
+            children.first().map_or(0, |&t| term_to_ast(ctx, t))
         })
     }
 }
@@ -108,8 +108,10 @@ pub unsafe extern "C" fn Z3_get_quantifier_num_bound(c: Z3_context, a: Z3_ast) -
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_uint(c, 0, |ctx| {
+            let term =
+                require_term_ast_or_return!(ctx, a, "Z3_get_quantifier_num_bound", "quantifier", 0);
             ctx.solver
-                .quantifier_bound_vars(ast_to_term(a))
+                .quantifier_bound_vars(term)
                 .map_or(0, |v| v.len() as c_uint)
         })
     }
@@ -136,7 +138,14 @@ pub unsafe extern "C" fn Z3_get_quantifier_bound_name(
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            match ctx.solver.quantifier_bound_vars(ast_to_term(a)) {
+            let term = require_term_ast_or_return!(
+                ctx,
+                a,
+                "Z3_get_quantifier_bound_name",
+                "quantifier",
+                ptr::null_mut()
+            );
+            match ctx.solver.quantifier_bound_vars(term) {
                 Some(vars) if (i as usize) < vars.len() => {
                     cache_symbol(ctx, vars[i as usize].0.clone())
                 }
@@ -167,7 +176,14 @@ pub unsafe extern "C" fn Z3_get_quantifier_bound_sort(
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            match ctx.solver.quantifier_bound_vars(ast_to_term(a)) {
+            let term = require_term_ast_or_return!(
+                ctx,
+                a,
+                "Z3_get_quantifier_bound_sort",
+                "quantifier",
+                ptr::null_mut()
+            );
+            match ctx.solver.quantifier_bound_vars(term) {
                 Some(vars) if (i as usize) < vars.len() => {
                     alloc_sort(ctx, vars[i as usize].1.clone())
                 }
@@ -192,8 +208,15 @@ pub unsafe extern "C" fn Z3_get_quantifier_num_patterns(c: Z3_context, a: Z3_ast
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_uint(c, 0, |ctx| {
+            let term = require_term_ast_or_return!(
+                ctx,
+                a,
+                "Z3_get_quantifier_num_patterns",
+                "quantifier",
+                0
+            );
             ctx.solver
-                .quantifier_triggers(ast_to_term(a))
+                .quantifier_triggers(term)
                 .map_or(0, |t| t.len() as c_uint)
         })
     }
@@ -220,10 +243,18 @@ pub unsafe extern "C" fn Z3_get_quantifier_pattern_ast(
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            match ctx.solver.quantifier_triggers(ast_to_term(a)) {
+            let term = require_term_ast_or_return!(
+                ctx,
+                a,
+                "Z3_get_quantifier_pattern_ast",
+                "quantifier",
+                ptr::null_mut()
+            );
+            match ctx.solver.quantifier_triggers(term) {
                 Some(triggers) if (i as usize) < triggers.len() => {
                     let handle = Box::into_raw(Box::new(PatternHandle {
                         terms: triggers[i as usize].clone(),
+                        owner_salt: ctx.handle_salt,
                     }));
                     ctx.pattern_cache.push(handle);
                     handle

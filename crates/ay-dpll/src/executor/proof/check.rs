@@ -65,6 +65,10 @@ impl BoundedFirewallArtifacts {
         true
     }
 
+    fn remaining_bytes(&self) -> usize {
+        self.max_bytes.saturating_sub(self.total_bytes)
+    }
+
     fn finish(self) -> Option<Vec<String>> {
         (!self.exceeded).then_some(self.artifacts)
     }
@@ -103,7 +107,7 @@ impl Executor {
     /// Runtime datatype terms carry `Sort::Uninterpreted`, so the proof checker
     /// cannot recover constructor membership from the `TermStore` alone — it is
     /// supplied here, where the `declare-datatype` declarations are known.
-    fn datatype_decls_for_strict_proof(&self) -> Vec<(String, Vec<String>)> {
+    pub(crate) fn datatype_decls_for_strict_proof(&self) -> Vec<(String, Vec<String>)> {
         self.ctx
             .datatype_iter()
             .map(|(name, ctors)| (name.to_string(), ctors.to_vec()))
@@ -341,6 +345,60 @@ impl Executor {
             out.push(lean);
         }
 
+        // OOB `seq.extract` feeding an empty-needle `seq.replace` head conflict:
+        // `(= (seq.replace HAYSTACK (seq.extract S I N) T) WHOLE)` where the
+        // extract offset `I ≥ len S` makes the needle EMPTY (verified
+        // `SeqThy.seqExtract_oob`, for every count `N`), so the replace PREPENDS
+        // `T` (head pinned by `T` for every haystack — `SeqThy.seqReplaceEmpty_head`)
+        // — unsatisfiable when the whole's head differs. ay reduces seq.extract /
+        // seq.replace eagerly (bare trust); reconstruct from the frontend
+        // assertions with the haystack and count quantified universally.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_seq_extract_oob_replace_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            out.push(lean);
+        }
+
+        // `str.indexof`-ABSENT `≥ 0` conflicts: `(>= (str.indexof H N s) 0)` where
+        // the needle `N` is genuinely absent from the ground literal haystack `H`,
+        // so `str.indexof = -1` for EVERY start (verified, CLASSICAL-FREE
+        // `IndexOfThy.indexOf_absent_all_start`) and `-1 ≥ 0` is false. ay reduces
+        // str.indexof eagerly (bare trust); reconstruct from the frontend
+        // assertions with the symbolic start quantified universally.
+        match crate::executor::lean_firewall::emit_str_indexof_absent_ge_firewall_lean_from_parsed(
+            self.ctx.assertions_parsed(),
+            out.remaining_bytes(),
+        ) {
+            Ok(Some(lean)) => {
+                if !out.push(lean) {
+                    return None;
+                }
+            }
+            Ok(None) => {}
+            Err(()) => return None,
+        }
+
+        // `str.indexof`-ABSENT `str.is_digit ∘ str.from_int` conflicts:
+        // `(str.is_digit (str.from_int (str.indexof T W k)))` where `W` is absent
+        // from the (alias-resolved) ground literal haystack `T`, so `str.indexof =
+        // -1`, `str.from_int (-1) = ""`, and `str.is_digit "" = false` (verified,
+        // CLASSICAL-FREE `IndexOfThy.indexOf_absent_all_start`). Reconstruct from
+        // the frontend assertions, resolving string aliases transitively.
+        match crate::executor::lean_firewall::emit_str_indexof_is_digit_firewall_lean_from_parsed(
+            self.ctx.assertions_parsed(),
+            out.remaining_bytes(),
+        ) {
+            Ok(Some(lean)) => {
+                if !out.push(lean) {
+                    return None;
+                }
+            }
+            Ok(None) => {}
+            Err(()) => return None,
+        }
+
         // Small-width bit-vector conflicts: ay bit-blasts BV eagerly (bare-trust
         // refutation), so reconstruct from the frontend assertions and refute the
         // conjunction directly by curried `decide` over a `BitVec w` model.
@@ -401,6 +459,57 @@ impl Executor {
         if let Some(lean) =
             crate::executor::lean_firewall::emit_fp_classification_firewall_lean_from_parsed(
                 self.ctx.assertions_parsed(),
+            )
+        {
+            if !out.push(lean) {
+                return None;
+            }
+        }
+
+        // Floating-point `to_fp` NARROWING underflow / RTN-overflow-asymmetry
+        // conflict: a single `(fp.isInfinite/isNormal ((_ to_fp EB SB) RTN
+        // (fp #b… #b… #b…)))` over a CONCRETE ground source whose RTN-narrowed
+        // class the model classifies otherwise (underflow → subnormal/zero, so NOT
+        // infinite / NOT normal). ay reduces to_fp to bit-vectors and refutes
+        // eagerly (bare-trust); reconstruct from the frontend assertions and ground
+        // the exact-dyadic, reference-battery-validated `FpUnderflow` classifier.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_fp_tofp_underflow_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            if !out.push(lean) {
+                return None;
+            }
+        }
+
+        // Floating-point `fp.rem` SIGN conflict: a single
+        // `(fp.isNegative (fp.rem (fp #b… #b… #b…) (fp #b… #b… #b…)))` over TWO
+        // CONCRETE same-format ground operands whose exact round-to-nearest-even
+        // remainder the model classifies as NOT negative. ay reduces fp.rem to
+        // bit-vectors and refutes eagerly (bare-trust); reconstruct from the
+        // frontend assertions and ground the exact-dyadic, reference-battery-
+        // validated `FpUnderflow` remainder/sign classifier.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_fp_rem_not_negative_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            if !out.push(lean) {
+                return None;
+            }
+        }
+
+        // Floating-point RNE DOT-PRODUCT forward-error proof emission is
+        // deliberately disabled. The Lean `FpErrorBound` declarations prove
+        // fixed-grid `qround` models, but no theorem connects the parsed
+        // IEEE-754 operations and intermediate magnitude bounds to those
+        // models. The hook below therefore declines every threshold, including
+        // guard2's 2.0, until that semantic bridge exists and is reviewed.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_fp_dot_error_bound_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+                &self.ctx.nullary_defined_terms(),
             )
         {
             if !out.push(lean) {
@@ -560,6 +669,7 @@ impl Executor {
             if let Some(lean) =
                 crate::executor::lean_firewall::emit_dt_selector_over_ctor_firewall_lean_from_parsed(
                     self.ctx.assertions_parsed(),
+                    &decls,
                     &ctor_selectors,
                 )
             {
@@ -621,6 +731,30 @@ impl Executor {
                 }
             }
 
+            // Datatype NESTED SELECTOR-GUARDED CASE-SPLIT (bench
+            // `soundness_qf_dt_derived_terms/fuzz_ufdt_falsesat_881.smt2`): two
+            // residual assertions over a binary-recursive constructor `nd` —
+            // `T = nd(selR(ite G T (nd Y _ T)) _ selL(nd Y _ Y))` and
+            // `(or (and ¬V18 ¬G) (distinct (selR T) (nd (lf …) _ Y) (ite V18 T Y) T))`
+            // — jointly unsatisfiable via a NESTED `by_cases`: `G = false` gives an
+            // ACYCLICITY occurs-check; `G = true` forces `T = nd(Y,Y)` (selector
+            // fixpoint) so the first disjunct is false and an inner split on `V18`
+            // makes the `distinct` contain a duplicate (false by reflexivity). The
+            // selectors are modelled as total projections whose leaf-case is dead
+            // (assert1 forces every selected term to be a `node`). Fail-closed on
+            // any shape not exactly this nested selector-guarded template.
+            if let Some(lean) =
+                crate::executor::lean_firewall::emit_dt_nested_selector_casesplit_firewall_lean_from_parsed(
+                    self.ctx.assertions_parsed(),
+                    &ctor_rec,
+                    &ctor_selectors,
+                )
+            {
+                if !out.push(lean) {
+                    return None;
+                }
+            }
+
             // Datatype ENUM-CARDINALITY (pigeonhole): a `(distinct T₀ … T_{n-1})`
             // whose `n` arguments all inhabit one FINITE ENUM datatype (every
             // constructor nullary) with only `k < n` constructors. `n` values of
@@ -659,6 +793,27 @@ impl Executor {
                     &sym_sorts,
                 )
             {
+                if !out.push(lean) {
+                    return None;
+                }
+            }
+
+            // Datatype F3 (`f³ = f` on a 2-element enum): a two-constructor ENUM
+            // datatype, an uninterpreted `fEnum : Enum → Enum`, and the two
+            // assertions `(= (fEnum v1) v2)` and
+            // `(distinct (fEnum v1) (fEnum (fEnum v2)))`. On a two-element type
+            // every self-map satisfies `f x = f (f (f x))`, so `f v1 = v2` forces
+            // `f v1 = f (f v2)`, contradicting the disequality. The uninterpreted
+            // `fEnum` is faithfully modeled by an ARBITRARY `f : En → En` (the F3
+            // theorem holds for all `f`); grounded in the verified
+            // `AySoundness.Datatype.F3.f3_conflict`. Reuses the finite-enum
+            // registry (`enum_datatypes`, k == 2 required) and symbol→sort table
+            // to pin `fEnum`'s type; fail-closed on any other shape.
+            if let Some(lean) = crate::executor::lean_firewall::emit_dt_f3_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+                &enum_datatypes,
+                &sym_sorts,
+            ) {
                 if !out.push(lean) {
                     return None;
                 }
@@ -821,12 +976,13 @@ impl Executor {
     /// semantically validate them against the actual constructor declarations
     /// instead of failing closed.
     ///
-    /// It also supplies the PROBLEM's assertion terms, which strict mode needs
-    /// for `ArrayExtensionality`: that clause is sound only for a witness the
-    /// solver minted fresh, and "fresh" is a statement ABOUT the problem, so the
+    /// It also supplies the complete authored premise scope. Strict mode uses
+    /// that scope both to reject foreign `Assume` steps and to validate
+    /// `ArrayExtensionality`: that clause is sound only for a witness the solver
+    /// minted fresh, and "fresh" is a statement ABOUT the problem, so the
     /// checker verifies it against the problem's own symbols rather than
     /// trusting a name or a solver flag.
-    pub(super) fn check_proof_strict_with_datatypes(
+    pub(crate) fn check_proof_strict_with_datatypes(
         &self,
         proof: &Proof,
     ) -> Result<ProofQuality, ProofCheckError> {
@@ -842,23 +998,66 @@ impl Executor {
         )
     }
 
-    /// The PROBLEM's assertion terms, for the strict checker's extensionality
-    /// freshness test.
+    /// Strictly validate a proof's derivation while deliberately postponing
+    /// authored-premise authorization.
+    ///
+    /// Proof-surgery passes use this as an atomic revert gate while they replace
+    /// one derived lemma inside a larger proof. At that point the proof can still
+    /// contain preprocessing assumptions which a later rewrite will derive from
+    /// authored roots or demote to an explicit trust step. Treating those
+    /// unrelated leaves as an authorization failure here would revert a valid
+    /// local replacement and preserve its trust lemma.
+    ///
+    /// Every current `Assume` is supplied as an allowed premise solely for this
+    /// structural check. This does not weaken the final boundary:
+    /// [`Self::check_proof_strict_with_datatypes`] and the exported bundle still
+    /// validate the finished proof against the independently captured authored
+    /// scope. Including all assumes is also conservative for array witness
+    /// freshness: it can only reject a witness that occurs in a premise.
+    pub(crate) fn check_proof_strict_derivation_with_datatypes(
+        &self,
+        proof: &Proof,
+    ) -> Result<ProofQuality, ProofCheckError> {
+        let decls = self.datatype_decls_for_strict_proof();
+        let selectors = self.ctor_selector_decls_for_strict_proof();
+        let assumptions: Vec<TermId> = proof
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                ProofStep::Assume(term) => Some(*term),
+                _ => None,
+            })
+            .collect();
+        ay_proof::check_proof_strict_with_context(
+            proof,
+            &self.ctx.terms,
+            (!decls.is_empty()).then_some(decls.as_slice()),
+            (!selectors.is_empty()).then_some(selectors.as_slice()),
+            Some(assumptions.as_slice()),
+        )
+    }
+
+    /// The complete authored premise scope for strict proof checking.
     ///
     /// Deliberately NOT `ctx.assertions`: at proof time that stack also carries
     /// the solver's own injected extensionality axioms, which mention every
     /// witness and would make all of them look non-fresh. The authored window
     /// (captured before in-place preprocessing) is preferred when present; the
     /// parsed-prefix and provenance-tracked problem assertions are unioned in.
+    /// `check-sat-assuming` literals and structurally authenticated source terms
+    /// rebuilt during proof repair are included because they can legitimately
+    /// appear as `Assume` leaves. Solver-generated constraints are excluded.
     /// A SUPERSET is always safe here — extra terms can only make the freshness
     /// test stricter, never more permissive.
-    fn problem_assertions_for_strict_proof(&self) -> Vec<TermId> {
-        let mut problem: Vec<TermId> = Vec::new();
+    pub(crate) fn problem_assertions_for_strict_proof(&self) -> Vec<TermId> {
+        let mut problem = self.proof_export_scope_assertions();
         if let Some(authored) = self.self_check_authored_assertions.as_ref() {
-            problem.extend(authored.iter().copied());
+            for &assertion in authored {
+                if !problem.contains(&assertion) {
+                    problem.push(assertion);
+                }
+            }
         }
-        problem.extend(self.proof_original_problem_assertions());
-        problem.extend(self.proof_problem_assertions());
         problem
     }
 
@@ -867,7 +1066,7 @@ impl Executor {
     /// context. Like the distinctness registry, the field positions cannot be
     /// recovered from the `TermStore` (datatype terms carry `Sort::Uninterpreted`),
     /// so they are supplied here for `DatatypeSelectorProject` validation.
-    fn ctor_selector_decls_for_strict_proof(&self) -> Vec<(String, Vec<String>)> {
+    pub(crate) fn ctor_selector_decls_for_strict_proof(&self) -> Vec<(String, Vec<String>)> {
         self.ctx
             .ctor_selectors_iter()
             .map(|(ctor, selectors)| (ctor.clone(), selectors.clone()))
@@ -1102,6 +1301,27 @@ impl Executor {
                 )
             });
             if unvalidated_regex_lemma {
+                return false;
+            }
+            // Same fail-closed re-validation for the str.len length-lemma lane
+            // (#selfcert-strlen). `--self-check` consults the PARTIAL checker, so
+            // a `StringLengthLemma` retagged from an injected length axiom would
+            // otherwise ship on the strength of the emitter's classifier alone.
+            // Re-run the checker's own independent structural re-derivation of the
+            // exact identity: a lemma whose clause carries no universally-valid
+            // str.len theorem is not a tautology, and the UNSAT must degrade to
+            // `unknown` rather than ship on a mislabelled leaf.
+            let unvalidated_str_len_lemma = proof.steps.iter().any(|s| {
+                matches!(
+                    s,
+                    ProofStep::TheoryLemma {
+                        kind: ay_core::TheoryLemmaKind::StringLengthLemma,
+                        clause,
+                        ..
+                    } if !ay_proof::recognize_string_length_lemma(&self.ctx.terms, clause)
+                )
+            });
+            if unvalidated_str_len_lemma {
                 return false;
             }
             // Same fail-closed re-validation for the array extensionality lane

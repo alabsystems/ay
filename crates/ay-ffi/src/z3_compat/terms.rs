@@ -16,10 +16,10 @@ use ay_dpll::api::{Sort, Term};
 use num_bigint::BigInt;
 
 use super::{
-    ast_to_term, cache_func_decl_with_symbol, ffi_count_within_limit, ffi_counts_within_limit,
-    ffi_guard_ast, ffi_guard_ptr, ffi_read_bounded_text, ffi_try_declare_function, lookup_ast_sort,
-    record_ast_sort, term_to_ast, DatatypeOp, SymbolKey, Z3_ast, Z3_context, Z3_func_decl,
-    Z3_params, Z3_sort, Z3_symbol, Z3_INVALID_ARG, Z3_SORT_ERROR,
+    cache_func_decl_with_symbol, ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast,
+    ffi_guard_ptr, ffi_read_bounded_text, ffi_try_declare_function, lookup_ast_sort,
+    record_ast_sort, require_term_ast, require_term_asts, term_to_ast, DatatypeOp, SymbolKey,
+    Z3_ast, Z3_context, Z3_func_decl, Z3_params, Z3_sort, Z3_symbol, Z3_INVALID_ARG, Z3_SORT_ERROR,
 };
 
 // ---- Function declarations and constants ----
@@ -144,7 +144,7 @@ pub unsafe extern "C" fn Z3_mk_const(c: Z3_context, s: Z3_symbol, ty: Z3_sort) -
             }
             let cache_key = (symbol.clone(), sort.clone());
             if let Some(term) = ctx.ffi_const_cache.get(&cache_key).copied() {
-                let ast = term_to_ast(term);
+                let ast = term_to_ast(ctx, term);
                 record_ast_sort(ctx, ast, sort.clone());
                 return ast;
             }
@@ -160,7 +160,7 @@ pub unsafe extern "C" fn Z3_mk_const(c: Z3_context, s: Z3_symbol, ty: Z3_sort) -
                 .insert(term, (identity.clone(), symbol.clone()));
             ctx.ffi_const_terms_by_identity.insert(identity, term);
             ctx.ffi_used_decl_names.insert(display_name.clone());
-            let ast = term_to_ast(term);
+            let ast = term_to_ast(ctx, term);
             record_ast_sort(ctx, ast, sort);
             ast
         })
@@ -232,7 +232,7 @@ pub unsafe extern "C" fn Z3_mk_fresh_const(
             ctx.ffi_const_metadata
                 .insert(term, (identity.clone(), symbol));
             ctx.ffi_const_terms_by_identity.insert(identity, term);
-            let ast = term_to_ast(term);
+            let ast = term_to_ast(ctx, term);
             record_ast_sort(ctx, ast, sort);
             ast
         })
@@ -269,11 +269,11 @@ pub unsafe extern "C" fn Z3_mk_app(
     // single-threaded per context.
     let decl = unsafe { (*d).decl.clone() };
     let dt_op = unsafe { (*d).dt_op.clone() };
-    let term_args: Vec<_> = (0..num_args as usize)
+    let arg_asts: Vec<_> = (0..num_args as usize)
         // SAFETY: The caller's `# Safety` contract guarantees `args` points to at least the
         // declared number of elements. The count was range-checked above, and null-checked
         // before entering this block, so `args.add(i)` stays within the caller's allocation.
-        .map(|i| ast_to_term(unsafe { *args.add(i) }))
+        .map(|i| unsafe { *args.add(i) })
         .collect();
 
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
@@ -282,6 +282,9 @@ pub unsafe extern "C" fn Z3_mk_app(
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let Some(term_args) = require_term_asts(ctx, &arg_asts, "Z3_mk_app") else {
+                return 0;
+            };
             // Datatype constructor/recognizer/accessor applications route through
             // AY's verified datatype builders so the resulting term matches the
             // SMT-LIB elaborator exactly (e.g. nullary constructors resolve to the
@@ -340,7 +343,7 @@ pub unsafe extern "C" fn Z3_mk_app(
                                 let range = inst.range().clone();
                                 match ctx.solver.try_apply(&inst, &term_args) {
                                     Ok(t) => {
-                                        let ast = term_to_ast(t);
+                                        let ast = term_to_ast(ctx, t);
                                         record_ast_sort(ctx, ast, range);
                                         return ast;
                                     }
@@ -361,7 +364,7 @@ pub unsafe extern "C" fn Z3_mk_app(
                     ctx.solver.apply(&decl, &term_args)
                 }
             };
-            let ast = term_to_ast(result);
+            let ast = term_to_ast(ctx, result);
             record_ast_sort(ctx, ast, decl.range().clone());
             ast
         })
@@ -489,7 +492,7 @@ pub unsafe extern "C" fn Z3_mk_true(c: Z3_context) -> Z3_ast {
     unsafe {
         ffi_guard_ast(c, |ctx| {
             let t = ctx.solver.bool_const(true);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -509,7 +512,7 @@ pub unsafe extern "C" fn Z3_mk_false(c: Z3_context) -> Z3_ast {
     unsafe {
         ffi_guard_ast(c, |ctx| {
             let t = ctx.solver.bool_const(false);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -528,8 +531,14 @@ pub unsafe extern "C" fn Z3_mk_eq(c: Z3_context, l: Z3_ast, r: Z3_ast) -> Z3_ast
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.eq(ast_to_term(l), ast_to_term(r));
-            let a = term_to_ast(t);
+            let Some(l) = require_term_ast(ctx, l, "Z3_mk_eq", "left operand") else {
+                return 0;
+            };
+            let Some(r) = require_term_ast(ctx, r, "Z3_mk_eq", "right operand") else {
+                return 0;
+            };
+            let t = ctx.solver.eq(l, r);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -554,11 +563,11 @@ pub unsafe extern "C" fn Z3_mk_distinct(
     if num_args == 0 || args.is_null() {
         return 0;
     }
-    let terms: Vec<_> = (0..num_args as usize)
+    let arg_asts: Vec<_> = (0..num_args as usize)
         // SAFETY: The caller's `# Safety` contract guarantees `args` points to at least the
         // declared number of elements. The count was range-checked above, and null-checked
         // before entering this block, so `args.add(i)` stays within the caller's allocation.
-        .map(|i| ast_to_term(unsafe { *args.add(i) }))
+        .map(|i| unsafe { *args.add(i) })
         .collect();
 
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
@@ -567,8 +576,11 @@ pub unsafe extern "C" fn Z3_mk_distinct(
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let Some(terms) = require_term_asts(ctx, &arg_asts, "Z3_mk_distinct") else {
+                return 0;
+            };
             let t = ctx.solver.distinct(&terms);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -587,8 +599,11 @@ pub unsafe extern "C" fn Z3_mk_not(c: Z3_context, a: Z3_ast) -> Z3_ast {
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.not(ast_to_term(a));
-            let r = term_to_ast(t);
+            let Some(a) = require_term_ast(ctx, a, "Z3_mk_not", "operand") else {
+                return 0;
+            };
+            let t = ctx.solver.not(a);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, Sort::Bool);
             r
         })
@@ -607,10 +622,17 @@ pub unsafe extern "C" fn Z3_mk_ite(c: Z3_context, t1: Z3_ast, t2: Z3_ast, t3: Z3
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx
-                .solver
-                .ite(ast_to_term(t1), ast_to_term(t2), ast_to_term(t3));
-            let r = term_to_ast(t);
+            let Some(t1) = require_term_ast(ctx, t1, "Z3_mk_ite", "condition") else {
+                return 0;
+            };
+            let Some(t2_term) = require_term_ast(ctx, t2, "Z3_mk_ite", "then operand") else {
+                return 0;
+            };
+            let Some(t3) = require_term_ast(ctx, t3, "Z3_mk_ite", "else operand") else {
+                return 0;
+            };
+            let t = ctx.solver.ite(t1, t2_term, t3);
+            let r = term_to_ast(ctx, t);
             if let Some(sort) = lookup_ast_sort(ctx, t2).cloned() {
                 record_ast_sort(ctx, r, sort);
             }
@@ -631,8 +653,14 @@ pub unsafe extern "C" fn Z3_mk_iff(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> Z3_
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.eq(ast_to_term(t1), ast_to_term(t2));
-            let a = term_to_ast(t);
+            let Some(t1) = require_term_ast(ctx, t1, "Z3_mk_iff", "left operand") else {
+                return 0;
+            };
+            let Some(t2) = require_term_ast(ctx, t2, "Z3_mk_iff", "right operand") else {
+                return 0;
+            };
+            let t = ctx.solver.eq(t1, t2);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -651,8 +679,14 @@ pub unsafe extern "C" fn Z3_mk_implies(c: Z3_context, t1: Z3_ast, t2: Z3_ast) ->
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.implies(ast_to_term(t1), ast_to_term(t2));
-            let a = term_to_ast(t);
+            let Some(t1) = require_term_ast(ctx, t1, "Z3_mk_implies", "antecedent") else {
+                return 0;
+            };
+            let Some(t2) = require_term_ast(ctx, t2, "Z3_mk_implies", "consequent") else {
+                return 0;
+            };
+            let t = ctx.solver.implies(t1, t2);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -671,8 +705,14 @@ pub unsafe extern "C" fn Z3_mk_xor(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> Z3_
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.xor(ast_to_term(t1), ast_to_term(t2));
-            let a = term_to_ast(t);
+            let Some(t1) = require_term_ast(ctx, t1, "Z3_mk_xor", "left operand") else {
+                return 0;
+            };
+            let Some(t2) = require_term_ast(ctx, t2, "Z3_mk_xor", "right operand") else {
+                return 0;
+            };
+            let t = ctx.solver.xor(t1, t2);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -690,7 +730,7 @@ pub unsafe extern "C" fn Z3_mk_and(c: Z3_context, num_args: c_uint, args: *const
     if !unsafe { ffi_count_within_limit(c, "Z3_mk_and", num_args) } {
         return 0;
     }
-    let terms: Vec<_> = if num_args == 0 || args.is_null() {
+    let arg_asts: Vec<_> = if num_args == 0 || args.is_null() {
         Vec::new()
     } else {
         (0..num_args as usize)
@@ -698,7 +738,7 @@ pub unsafe extern "C" fn Z3_mk_and(c: Z3_context, num_args: c_uint, args: *const
             // the declared number of elements. The count was range-checked above, and
             // null-checked before entering this block, so `args.add(i)` stays within the
             // caller's allocation.
-            .map(|i| ast_to_term(unsafe { *args.add(i) }))
+            .map(|i| unsafe { *args.add(i) })
             .collect()
     };
 
@@ -708,12 +748,15 @@ pub unsafe extern "C" fn Z3_mk_and(c: Z3_context, num_args: c_uint, args: *const
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let Some(terms) = require_term_asts(ctx, &arg_asts, "Z3_mk_and") else {
+                return 0;
+            };
             if terms.is_empty() {
                 let t = ctx.solver.bool_const(true);
-                return term_to_ast(t);
+                return term_to_ast(ctx, t);
             }
             let t = ctx.solver.and_many(&terms);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -731,7 +774,7 @@ pub unsafe extern "C" fn Z3_mk_or(c: Z3_context, num_args: c_uint, args: *const 
     if !unsafe { ffi_count_within_limit(c, "Z3_mk_or", num_args) } {
         return 0;
     }
-    let terms: Vec<_> = if num_args == 0 || args.is_null() {
+    let arg_asts: Vec<_> = if num_args == 0 || args.is_null() {
         Vec::new()
     } else {
         (0..num_args as usize)
@@ -739,7 +782,7 @@ pub unsafe extern "C" fn Z3_mk_or(c: Z3_context, num_args: c_uint, args: *const 
             // the declared number of elements. The count was range-checked above, and
             // null-checked before entering this block, so `args.add(i)` stays within the
             // caller's allocation.
-            .map(|i| ast_to_term(unsafe { *args.add(i) }))
+            .map(|i| unsafe { *args.add(i) })
             .collect()
     };
 
@@ -749,12 +792,15 @@ pub unsafe extern "C" fn Z3_mk_or(c: Z3_context, num_args: c_uint, args: *const 
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let Some(terms) = require_term_asts(ctx, &arg_asts, "Z3_mk_or") else {
+                return 0;
+            };
             if terms.is_empty() {
                 let t = ctx.solver.bool_const(false);
-                return term_to_ast(t);
+                return term_to_ast(ctx, t);
             }
             let t = ctx.solver.or_many(&terms);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -781,17 +827,21 @@ enum PbCmp {
 /// `c` must be a valid context pointer (or null; handled by the guard).
 unsafe fn mk_pb_ast(
     c: Z3_context,
-    terms: Vec<Term>,
+    term_asts: Vec<Z3_ast>,
     coeffs: Vec<BigInt>,
     k: BigInt,
     cmp: PbCmp,
 ) -> Z3_ast {
-    debug_assert_eq!(terms.len(), coeffs.len());
+    debug_assert_eq!(term_asts.len(), coeffs.len());
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; `ffi_guard_ast`
     // handles the null case internally and catches any unwinding panic so it cannot
     // cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let Some(terms) = require_term_asts(ctx, &term_asts, "pseudo-Boolean constructor")
+            else {
+                return 0;
+            };
             let zero = ctx.solver.int_const(0);
             let summands: Vec<Term> = terms
                 .iter()
@@ -812,26 +862,26 @@ unsafe fn mk_pb_ast(
                 PbCmp::Ge => ctx.solver.ge(sum, bound),
                 PbCmp::Eq => ctx.solver.eq(sum, bound),
             };
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
     }
 }
 
-/// Read `num_args` `Z3_ast` handles into a `Vec<Term>`.
+/// Read `num_args` raw `Z3_ast` handles for later context-aware decoding.
 ///
 /// # Safety
 /// `args` must point to at least `num_args` valid elements (or be null when
 /// `num_args == 0`).
-unsafe fn read_ast_args(num_args: c_uint, args: *const Z3_ast) -> Vec<Term> {
+unsafe fn read_ast_args(num_args: c_uint, args: *const Z3_ast) -> Vec<Z3_ast> {
     if num_args == 0 || args.is_null() {
         return Vec::new();
     }
     (0..num_args as usize)
         // SAFETY: caller guarantees `args` points to at least `num_args` elements;
         // `add(i)` stays in bounds.
-        .map(|i| ast_to_term(unsafe { *args.add(i) }))
+        .map(|i| unsafe { *args.add(i) })
         .collect()
 }
 
@@ -1042,7 +1092,6 @@ pub unsafe extern "C" fn Z3_simplify(c: Z3_context, a: Z3_ast) -> Z3_ast {
     if a == 0 {
         return a;
     }
-    let target = ast_to_term(a);
 
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety`
     // on this extern "C" function requires it to be a valid, non-aliased pointer
@@ -1050,8 +1099,11 @@ pub unsafe extern "C" fn Z3_simplify(c: Z3_context, a: Z3_ast) -> Z3_ast {
     // unwinding panic so it cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let Some(target) = require_term_ast(ctx, a, "Z3_simplify", "input") else {
+                return 0;
+            };
             let result = ctx.solver.simplify(target);
-            term_to_ast(result)
+            term_to_ast(ctx, result)
         })
     }
 }
@@ -1116,11 +1168,8 @@ pub unsafe extern "C" fn Z3_substitute(
     // SAFETY: The caller's `# Safety` contract guarantees `from`/`to` each point
     // to at least `num_exprs` elements. Both were null-checked above, so
     // `from.add(i)`/`to.add(i)` stay within the caller's allocation.
-    let from_terms: Vec<_> = (0..n)
-        .map(|i| ast_to_term(unsafe { *from.add(i) }))
-        .collect();
-    let to_terms: Vec<_> = (0..n).map(|i| ast_to_term(unsafe { *to.add(i) })).collect();
-    let target = ast_to_term(a);
+    let from_asts: Vec<_> = (0..n).map(|i| unsafe { *from.add(i) }).collect();
+    let to_asts: Vec<_> = (0..n).map(|i| unsafe { *to.add(i) }).collect();
 
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
@@ -1128,6 +1177,15 @@ pub unsafe extern "C" fn Z3_substitute(
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let Some(target) = require_term_ast(ctx, a, "Z3_substitute", "input") else {
+                return a;
+            };
+            let Some(from_terms) = require_term_asts(ctx, &from_asts, "Z3_substitute from") else {
+                return a;
+            };
+            let Some(to_terms) = require_term_asts(ctx, &to_asts, "Z3_substitute to") else {
+                return a;
+            };
             // Z3 requires from[i] and to[i] to share a sort. A mismatch is a
             // Z3_SORT_ERROR; report it honestly and leave `a` unchanged rather
             // than fabricating an ill-sorted term.
@@ -1139,7 +1197,7 @@ pub unsafe extern "C" fn Z3_substitute(
                 }
             }
             let result = ctx.solver.substitute(target, &from_terms, &to_terms);
-            term_to_ast(result)
+            term_to_ast(ctx, result)
         })
     }
 }

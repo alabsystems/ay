@@ -35,20 +35,18 @@
 use std::ffi::c_char;
 
 use super::{
-    cache_string, ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_void, SolverCheckOutcome,
-    Z3Context, Z3_ast, Z3_context, Z3_solver, Z3_string, PROOF_AST_TAG, Z3_INVALID_USAGE, Z3_OK,
+    cache_string, decode_indexed_ast, encode_indexed_ast, ffi_guard_ast, ffi_guard_const_ptr,
+    ffi_guard_void, SolverCheckOutcome, Z3Context, Z3_ast, Z3_context, Z3_solver, Z3_string,
+    PROOF_AST_TAG, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_OK,
 };
 
-/// If `a` is a proof-AST handle (carries [`PROOF_AST_TAG`]) that indexes a
-/// stored Alethe proof, return the text. Otherwise `None`.
+/// If `a` is a proof-AST handle owned by `ctx` (tag and context salt match) that
+/// indexes a stored Alethe proof, return the text. Otherwise `None`.
 ///
 /// Used by [`Z3_ast_to_string`](super::Z3_ast_to_string) to route proof handles
 /// to their real exporter text.
 pub(crate) fn proof_text_for_ast(ctx: &Z3Context, a: Z3_ast) -> Option<&str> {
-    if a & PROOF_AST_TAG == 0 {
-        return None;
-    }
-    let index = (a & !PROOF_AST_TAG) as usize;
+    let index = decode_indexed_ast(ctx, a, PROOF_AST_TAG)?;
     ctx.proof_texts.get(index).map(String::as_str)
 }
 
@@ -70,7 +68,15 @@ pub(crate) fn proof_text_for_ast(ctx: &Z3Context, a: Z3_ast) -> Option<&str> {
 /// `s`, when non-null, must point to a valid `Z3SolverHandle` owned by the
 /// context's handle arena (single-threaded per context, so no race).
 unsafe fn last_proof_alethe_or_error(ctx: &mut Z3Context, s: Z3_solver) -> Option<String> {
-    // SAFETY: null-checked by `as_ref`; validity per the fn contract.
+    if s.is_null() || !ctx.solver_handle_cache.contains(&s) {
+        ctx.last_error = Z3_INVALID_ARG;
+        ctx.error_msg = Some(
+            "Z3_solver_get_proof: solver handle is null or belongs to a different context"
+                .to_string(),
+        );
+        return None;
+    }
+    // SAFETY: membership in this context's owning arena was checked above.
     let handle = unsafe { s.as_ref() };
     // `last_check_outcome` is the public authority. The backend may retain an
     // UNSAT proof candidate that a later consumer/trust gate rejected, so the
@@ -168,9 +174,17 @@ pub unsafe extern "C" fn Z3_solver_get_proof(c: Z3_context, s: Z3_solver) -> Z3_
     unsafe {
         ffi_guard_ast(c, |ctx| match last_proof_alethe_or_error(ctx, s) {
             Some(text) => {
-                let index = ctx.proof_texts.len() as u64;
+                let Some(ast) = encode_indexed_ast(ctx, PROOF_AST_TAG, ctx.proof_texts.len())
+                else {
+                    ctx.last_error = Z3_INVALID_USAGE;
+                    ctx.error_msg = Some(
+                        "Z3_solver_get_proof: proof handle arena exhausted its representable index space"
+                            .to_string(),
+                    );
+                    return 0;
+                };
                 ctx.proof_texts.push(text);
-                PROOF_AST_TAG | index
+                ast
             }
             None => 0,
         })

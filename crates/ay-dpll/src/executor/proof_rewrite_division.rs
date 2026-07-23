@@ -15,8 +15,10 @@
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::term::Symbol;
 use ay_core::term::TermData;
-use ay_core::{AletheRule, Constant, Proof, ProofStep};
-use ay_core::{TermId, TermStore};
+use ay_core::{
+    AletheRule, Constant, FarkasAnnotation, Proof, ProofStep, TermId, TermStore, TheoryLemmaKind,
+    TheoryLit,
+};
 use num_bigint::BigInt;
 
 use super::Executor;
@@ -371,6 +373,66 @@ impl Executor {
             None
         }
 
+        /// An arithmetic equality rewritten by preprocessing into the
+        /// conjunction of its two non-strict directions.
+        ///
+        /// Recognition is semantic, not just syntactic: every target conjunct
+        /// must form a checker-accepted `[1, 1]` Farkas clause
+        /// `(cl (not equality) bound)`. This prevents a merely similar
+        /// generated conjunction from acquiring proof authority.
+        fn find_equality_bounds(
+            terms: &mut TermStore,
+            leaves: &[(TermId, TermId, Vec<u32>)],
+            target: TermId,
+        ) -> Option<(TermId, Vec<u32>, TermId, Vec<TermId>)> {
+            let TermData::App(Symbol::Named(name), bounds) = terms.get(target) else {
+                return None;
+            };
+            if name != "and" || bounds.len() < 2 {
+                return None;
+            }
+            let bounds = bounds.clone();
+            let unique: HashSet<TermId> = bounds.iter().copied().collect();
+            if unique.len() != bounds.len() {
+                return None;
+            }
+
+            for (root, equality, path) in leaves {
+                let TermData::App(Symbol::Named(eq), args) = terms.get(*equality) else {
+                    continue;
+                };
+                if eq != "="
+                    || args.len() != 2
+                    || !matches!(
+                        terms.sort(args[0]),
+                        ay_core::Sort::Int | ay_core::Sort::Real
+                    )
+                    || terms.sort(args[0]) != terms.sort(args[1])
+                {
+                    continue;
+                }
+                let farkas = FarkasAnnotation::from_ints(&[1, 1]);
+                let every_bound_is_entailed = bounds.iter().all(|&bound| {
+                    let lits = [
+                        TheoryLit::new(*equality, true),
+                        TheoryLit::new(bound, false),
+                    ];
+                    // This certificate is exported as stock Alethe
+                    // `la_generic`, whose arithmetic fragment is linear.
+                    // The broader checker can also justify nonlinear atoms
+                    // through congruence, which Carcara's rule cannot.
+                    ay_core::proof_validation::verify_farkas_conflict_lits_linear(
+                        terms, &lits, &farkas,
+                    )
+                    .is_ok()
+                });
+                if every_bound_is_entailed {
+                    return Some((*root, path.clone(), *equality, bounds));
+                }
+            }
+            None
+        }
+
         enum Derivation {
             // Direct conjunct of the root's and-tree.
             Conjunct(TermId, Vec<u32>),
@@ -394,6 +456,14 @@ impl Executor {
                 l_path: Vec<u32>,
                 atom_is_first: bool,
                 negated: bool,
+            },
+            // Arithmetic equality split into an `and` of entailed non-strict
+            // bounds. Each implication is independently Farkas-checked.
+            EqualityBounds {
+                e_root: TermId,
+                e_path: Vec<u32>,
+                equality: TermId,
+                bounds: Vec<TermId>,
             },
         }
 
@@ -480,6 +550,20 @@ impl Executor {
                         e_root,
                         e_path,
                         c_term,
+                    },
+                );
+                continue;
+            }
+            if let Some((e_root, e_path, equality, bounds)) =
+                find_equality_bounds(terms, all_leaves, *term)
+            {
+                derivable.insert(
+                    idx,
+                    Derivation::EqualityBounds {
+                        e_root,
+                        e_path,
+                        equality,
+                        bounds,
                     },
                 );
                 continue;
@@ -705,6 +789,59 @@ impl Executor {
                             vec![after_e, l_id],
                             Vec::new(),
                         )
+                    }
+                    Derivation::EqualityBounds {
+                        e_root,
+                        e_path,
+                        equality,
+                        bounds,
+                    } => {
+                        let e_assume = *root_assumes
+                            .entry(*e_root)
+                            .or_insert_with(|| new_proof.add_assume(*e_root, None));
+                        let e_id =
+                            emit_conjunct_chain(terms, &mut new_proof, e_assume, *e_root, e_path);
+                        let not_equality = terms.mk_not(*equality);
+                        let mut bound_units = Vec::with_capacity(bounds.len());
+                        for &bound in bounds {
+                            let farkas = FarkasAnnotation::from_ints(&[1, 1]);
+                            let lemma = new_proof.add_step(ProofStep::TheoryLemma {
+                                theory: "LRA".to_string(),
+                                clause: vec![not_equality, bound],
+                                farkas: Some(farkas),
+                                kind: TheoryLemmaKind::LraFarkas,
+                                lia: None,
+                            });
+                            bound_units.push(new_proof.add_resolution(
+                                vec![bound],
+                                *equality,
+                                lemma,
+                                e_id,
+                            ));
+                        }
+
+                        let mut clause = Vec::with_capacity(bounds.len() + 1);
+                        clause.push(target);
+                        for &bound in bounds {
+                            clause.push(terms.mk_not(bound));
+                        }
+                        let mut current = new_proof.add_rule_step(
+                            AletheRule::AndNeg,
+                            clause.clone(),
+                            Vec::new(),
+                            vec![target],
+                        );
+                        for (&bound, &unit) in bounds.iter().zip(&bound_units) {
+                            let not_bound = terms.mk_not(bound);
+                            let Some(position) = clause.iter().position(|&lit| lit == not_bound)
+                            else {
+                                unreachable!("equality-bound conjunction lost a child")
+                            };
+                            let _ = clause.remove(position);
+                            current =
+                                new_proof.add_resolution(clause.clone(), bound, current, unit);
+                        }
+                        current
                     }
                 };
                 id_map.push(derived_id);

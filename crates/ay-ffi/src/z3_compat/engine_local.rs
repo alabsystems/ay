@@ -52,9 +52,10 @@ use super::solver::{
     auxiliary_query_acceptance_is_supported, solve_lbool_with_acceptance, DimacsEncoder,
 };
 use super::{
-    ast_to_term, cache_func_entry, cache_string, ensure_cross_context_translation_semantics,
+    cache_func_entry, cache_string, ensure_cross_context_translation_semantics,
     ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast, ffi_guard_const_ptr,
-    ffi_guard_int, ffi_guard_ptr, ffi_guard_void, record_ast_sort, term_to_ast,
+    ffi_guard_int, ffi_guard_ptr, ffi_guard_void, record_ast_sort, require_term_ast,
+    require_term_ast_or_return, require_term_asts_or_return, term_to_ast,
     transfer_cross_context_ffi_metadata, DatatypeOp, DecisionOwnerFamily, OptimizeHandle,
     ParamDescrsHandle, SoftRecord, Z3_ast, Z3_ast_map, Z3_ast_vector, Z3_context, Z3_func_decl,
     Z3_func_interp, Z3_goal, Z3_model, Z3_optimize, Z3_param_descrs, Z3_solver, Z3_string,
@@ -96,7 +97,7 @@ fn algebraic_number_bound(
     };
     let emit = |ctx: &mut super::Z3Context, r: BigRational| -> Z3_ast {
         let term = ctx.solver.rational_const_bigint(r.numer(), r.denom());
-        let ast = term_to_ast(term);
+        let ast = term_to_ast(ctx, term);
         record_ast_sort(ctx, ast, Sort::Real);
         ctx.last_error = Z3_OK;
         ast
@@ -343,7 +344,12 @@ pub unsafe extern "C" fn Z3_get_implied_equalities(
             ) {
                 return Z3_L_UNDEF;
             }
-            let mut term_vec: Vec<Term> = term_asts.iter().map(|&a| ast_to_term(a)).collect();
+            let mut term_vec = require_term_asts_or_return!(
+                ctx,
+                &term_asts,
+                "Z3_get_implied_equalities",
+                Z3_L_UNDEF
+            );
             let n = term_vec.len();
 
             // Check-time expansion of recursive definitions (P1.1). This
@@ -529,7 +535,9 @@ unsafe fn qe_project_core(
         return 0;
     }
 
-    let body_term = ast_to_term(body);
+    let Some(body_term) = require_term_ast(ctx, body, "Z3_qe_model_project", "body formula") else {
+        return 0;
+    };
     let mut from: Vec<Term> = Vec::new();
     let mut to: Vec<Term> = Vec::new();
     // (bound-var ast, value-term ast) pairs actually substituted, for the witness.
@@ -539,7 +547,9 @@ unsafe fn qe_project_core(
         if b == 0 {
             continue;
         }
-        let bt = ast_to_term(b);
+        let Some(bt) = require_term_ast(ctx, b, "Z3_qe_model_project", "bound variable") else {
+            return 0;
+        };
         let Some(name) = ctx.solver.var_name(bt) else {
             continue; // not a named constant — nothing to project
         };
@@ -552,7 +562,7 @@ unsafe fn qe_project_core(
             if let Some(value_term) = model_value_to_term(&mut ctx.solver, &val, &sort) {
                 from.push(bt);
                 to.push(value_term);
-                witness_pairs.push((b, term_to_ast(value_term)));
+                witness_pairs.push((b, term_to_ast(ctx, value_term)));
             }
             // else: value not representable as a term → leave `bt` free (partial).
         }
@@ -572,7 +582,7 @@ unsafe fn qe_project_core(
     }
 
     ctx.last_error = Z3_OK;
-    term_to_ast(simplified)
+    term_to_ast(ctx, simplified)
 }
 
 /// Read a `Z3_app`/`Z3_ast` bound array (`num_bounds` elements) into a Vec.
@@ -711,6 +721,15 @@ pub unsafe extern "C" fn Z3_datatype_update_field(
     // SAFETY: `ffi_guard_ast` guards `c`; `field_access` null-checked below.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let t_term =
+                require_term_ast_or_return!(ctx, t, "Z3_datatype_update_field", "datatype term", 0);
+            let value_term = require_term_ast_or_return!(
+                ctx,
+                value,
+                "Z3_datatype_update_field",
+                "replacement value",
+                0
+            );
             // The accessor must be a datatype field accessor; extract its field name.
             let field_name = match field_access.as_ref() {
                 Some(h) => match &h.dt_op {
@@ -731,7 +750,6 @@ pub unsafe extern "C" fn Z3_datatype_update_field(
                 }
             };
 
-            let t_term = ast_to_term(t);
             // `t` must be a datatype term so we can find its constructor + siblings.
             let Sort::Datatype(dt) = ctx.solver.term_sort(t_term) else {
                 ctx.last_error = Z3_INVALID_ARG;
@@ -755,7 +773,6 @@ pub unsafe extern "C" fn Z3_datatype_update_field(
             };
 
             // Rebuild the constructor: value at the accessed field, sel_i(t) elsewhere.
-            let value_term = ast_to_term(value);
             let mut args: Vec<Term> = Vec::with_capacity(ctor.fields.len());
             for f in &ctor.fields {
                 if f.name == field_name {
@@ -777,7 +794,7 @@ pub unsafe extern "C" fn Z3_datatype_update_field(
             match ctx.solver.try_datatype_constructor(&dt, &ctor.name, &args) {
                 Ok(updated) => {
                     ctx.last_error = Z3_OK;
-                    term_to_ast(updated)
+                    term_to_ast(ctx, updated)
                 }
                 Err(e) => {
                     ctx.last_error = Z3_INVALID_ARG;
@@ -828,6 +845,10 @@ pub unsafe extern "C" fn Z3_func_interp_add_entry(
                     Some("Z3_func_interp_add_entry: null func_interp handle".to_string());
                 return;
             }
+            let _arg_terms =
+                require_term_asts_or_return!(ctx, &entry_args, "Z3_func_interp_add_entry");
+            let _value_term =
+                require_term_ast_or_return!(ctx, value, "Z3_func_interp_add_entry", "entry value",);
             // Allocate the entry in the context's owning arena, then reference it
             // from the interpretation handle (separate allocation from `ctx`).
             let entry = cache_func_entry(ctx, entry_args, value);
@@ -855,6 +876,12 @@ pub unsafe extern "C" fn Z3_func_interp_set_else(
     unsafe {
         ffi_guard_void(c, |ctx| {
             if let Some(fi_h) = f.as_mut() {
+                let _term = require_term_ast_or_return!(
+                    ctx,
+                    else_value,
+                    "Z3_func_interp_set_else",
+                    "default value",
+                );
                 fi_h.else_ast = else_value;
                 ctx.last_error = Z3_OK;
             } else {
@@ -901,9 +928,15 @@ pub unsafe extern "C" fn Z3_goal_to_dimacs_string(
                     return ptr::null();
                 }
             };
+            let formula_terms = require_term_asts_or_return!(
+                ctx,
+                &formulas,
+                "Z3_goal_to_dimacs_string",
+                ptr::null()
+            );
             let mut enc = DimacsEncoder::new(ctx);
-            for a in &formulas {
-                enc.assert_formula(ast_to_term(*a));
+            for term in formula_terms {
+                enc.assert_formula(term);
             }
             let text = enc.render(include_names);
             cache_string(ctx, text)

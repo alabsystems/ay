@@ -188,13 +188,48 @@ impl Executor {
 
     /// Serialize an explicit assertion list as a self-contained SMT-LIB2 script
     /// (declarations + named assertions + `(check-sat)`), self-contained and
-    /// re-parsable. Used to re-solve a captured assertion set in a fresh batch
-    /// solver. (#transpose)
+    /// re-parsable. For native datatypes, "self-contained" is syntactic only:
+    /// the emitted script is a fail-visible UF over-approximation, not an
+    /// oracle-equivalent datatype encoding. Used to re-solve a captured
+    /// assertion set in a fresh batch solver. (#transpose)
     pub(crate) fn to_smtlib2_for(&self, assertions: &[TermId]) -> String {
         let mut out = String::new();
+        let (plain_sorts, datatype_sorts) = self.referenced_uninterpreted_sorts(assertions);
+        if !datatype_sorts.is_empty() {
+            // Fail-visible header (#dump-self-contained): the carrier sorts of
+            // native datatypes are serialized below as PLAIN uninterpreted
+            // sorts and their member operations as plain functions, so an
+            // external solver sees a UF over-abstraction of the original
+            // query (constructor/selector/tester axioms are NOT included).
+            out.push_str(
+                "; WARNING: NOT oracle-equivalent for external solvers (e.g. z3).\n\
+                 ; The following sorts are native DATATYPE sorts whose constructor/\n\
+                 ; selector/tester semantics are NOT captured by this script; they are\n\
+                 ; declared below as uninterpreted sorts, so this script is a UF\n\
+                 ; over-abstraction of the original query: `unsat` here implies the\n\
+                 ; original is unsat, but `sat` here is INCONCLUSIVE.\n",
+            );
+            for name in &datatype_sorts {
+                out.push_str(&format!(";   datatype sort: {}\n", quote_symbol(name)));
+            }
+        }
         out.push_str("(set-option :produce-unsat-cores true)\n(set-logic ALL)\n");
+        // Self-containment (#dump-self-contained): every uninterpreted sort
+        // referenced by a declaration or an assertion term must be declared,
+        // or the script is unusable as a standalone repro (neither ay's own
+        // parser nor z3 accepts an undeclared sort name).
+        for name in plain_sorts.iter().chain(datatype_sorts.iter()) {
+            out.push_str(&format!("(declare-sort {} 0)\n", quote_symbol(name)));
+        }
         let mut declared: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (name, info) in self.ctx.symbols_iter() {
+            // A native theory constructor is an App(Named(..)) in the core
+            // DAG, but it is not a user declaration.  Public declaration
+            // paths reject these names; keep the serializer fail-closed if a
+            // trusted/internal path nevertheless registered one.
+            if ay_frontend::is_reserved_op_name(name) {
+                continue;
+            }
             declared.insert(name.to_string());
             if info.arg_sorts.is_empty() {
                 out.push_str(&format!(
@@ -248,6 +283,9 @@ impl Executor {
         // Z3 declares every symbol — including 0-arity constants — with
         // `declare-fun` (e.g. `(declare-fun x () Int)`), so match that shape.
         for (name, info) in self.ctx.symbols_iter() {
+            if ay_frontend::is_reserved_op_name(name) {
+                continue;
+            }
             declared.insert(name.to_string());
             let args: Vec<String> = info.arg_sorts.iter().map(format_sort).collect();
             out.push_str(&format!(
@@ -276,6 +314,21 @@ impl Executor {
         declared: &mut std::collections::HashSet<String>,
         out: &mut Vec<String>,
     ) {
+        self.collect_undeclared_symbol_decls_with_bindings(
+            term_id,
+            declared,
+            out,
+            &std::collections::HashSet::new(),
+        );
+    }
+
+    fn collect_undeclared_symbol_decls_with_bindings(
+        &self,
+        term_id: TermId,
+        declared: &mut std::collections::HashSet<String>,
+        out: &mut Vec<String>,
+        bound: &std::collections::HashSet<String>,
+    ) {
         use ay_core::term::Symbol;
         match self.ctx.terms.get(term_id) {
             TermData::App(Symbol::Named(name), args) => {
@@ -303,33 +356,156 @@ impl Executor {
                     }
                 }
                 for &a in args {
-                    self.collect_undeclared_symbol_decls(a, declared, out);
+                    self.collect_undeclared_symbol_decls_with_bindings(a, declared, out, bound);
                 }
             }
             TermData::App(_, args) => {
                 for &a in args {
-                    self.collect_undeclared_symbol_decls(a, declared, out);
+                    self.collect_undeclared_symbol_decls_with_bindings(a, declared, out, bound);
                 }
             }
-            TermData::Not(inner) => self.collect_undeclared_symbol_decls(*inner, declared, out),
-            TermData::Ite(c, t, e) => {
-                self.collect_undeclared_symbol_decls(*c, declared, out);
-                self.collect_undeclared_symbol_decls(*t, declared, out);
-                self.collect_undeclared_symbol_decls(*e, declared, out);
+            TermData::Not(inner) => {
+                self.collect_undeclared_symbol_decls_with_bindings(*inner, declared, out, bound)
             }
-            TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
-                self.collect_undeclared_symbol_decls(*body, declared, out);
+            TermData::Ite(c, t, e) => {
+                self.collect_undeclared_symbol_decls_with_bindings(*c, declared, out, bound);
+                self.collect_undeclared_symbol_decls_with_bindings(*t, declared, out, bound);
+                self.collect_undeclared_symbol_decls_with_bindings(*e, declared, out, bound);
+            }
+            TermData::Forall(vars, body, triggers) | TermData::Exists(vars, body, triggers) => {
+                let mut nested_bound = bound.clone();
+                nested_bound.extend(vars.iter().map(|(name, _)| name.clone()));
+                self.collect_undeclared_symbol_decls_with_bindings(
+                    *body,
+                    declared,
+                    out,
+                    &nested_bound,
+                );
                 for trig_set in triggers {
                     for &t in trig_set {
-                        self.collect_undeclared_symbol_decls(t, declared, out);
+                        self.collect_undeclared_symbol_decls_with_bindings(
+                            t,
+                            declared,
+                            out,
+                            &nested_bound,
+                        );
                     }
                 }
             }
             TermData::Let(bindings, body) => {
                 for (_, t) in bindings {
-                    self.collect_undeclared_symbol_decls(*t, declared, out);
+                    // SMT-LIB `let` bindings are simultaneous: each right-hand
+                    // side is evaluated outside the new binder scope.
+                    self.collect_undeclared_symbol_decls_with_bindings(*t, declared, out, bound);
                 }
-                self.collect_undeclared_symbol_decls(*body, declared, out);
+                let mut nested_bound = bound.clone();
+                nested_bound.extend(bindings.iter().map(|(name, _)| name.clone()));
+                self.collect_undeclared_symbol_decls_with_bindings(
+                    *body,
+                    declared,
+                    out,
+                    &nested_bound,
+                );
+            }
+            TermData::Var(name, _) => {
+                // Programmatic callers can intentionally create a free
+                // `fresh_var` without registering it for model extraction.
+                // It is still a free constant in the formula and must be
+                // declared in a self-contained dump. Quantifier/let binders
+                // are tracked lexically above and must not leak out as global
+                // declarations.
+                if !bound.contains(name)
+                    && !declared.contains(name)
+                    && !ay_frontend::is_reserved_symbol(name)
+                {
+                    declared.insert(name.clone());
+                    out.push(format!(
+                        "(declare-const {} {})\n",
+                        quote_symbol(name),
+                        format_sort(self.ctx.terms.sort(term_id))
+                    ));
+                }
+            }
+            TermData::Const(_) => {}
+            _ => {}
+        }
+    }
+
+    /// Collect the names of every uninterpreted sort referenced by the current
+    /// declarations or by the given assertion terms (including quantifier
+    /// bound-variable sorts and sorts nested inside `Array`/`Seq`), split into
+    /// (plain uninterpreted, datatype-backed) name sets. Datatype-backed names
+    /// are the term-level `Sort::Uninterpreted` carriers of declared datatypes
+    /// (`as_term_sort` lowers `Sort::Datatype(dt)` to `Uninterpreted(dt.name)`);
+    /// serializing them as `declare-sort` loses constructor semantics, so the
+    /// caller marks those scripts fail-visible. (#dump-self-contained)
+    fn referenced_uninterpreted_sorts(
+        &self,
+        assertions: &[TermId],
+    ) -> (
+        std::collections::BTreeSet<String>,
+        std::collections::BTreeSet<String>,
+    ) {
+        let mut names = std::collections::BTreeSet::new();
+        for (_, info) in self.ctx.symbols_iter() {
+            collect_uninterpreted_sort_names(&info.sort, &mut names);
+            for s in &info.arg_sorts {
+                collect_uninterpreted_sort_names(s, &mut names);
+            }
+        }
+        let mut visited = std::collections::HashSet::new();
+        for &a in assertions {
+            self.collect_term_sort_names(a, &mut visited, &mut names);
+        }
+        let datatype_names: std::collections::HashSet<&str> =
+            self.ctx.datatype_iter().map(|(name, _)| name).collect();
+        let (datatype_backed, plain) = names
+            .into_iter()
+            .partition(|n| datatype_names.contains(n.as_str()));
+        (plain, datatype_backed)
+    }
+
+    /// Walk a term DAG and collect uninterpreted-sort names from every
+    /// subterm's sort (plus quantifier binder sorts). The visited set keys on
+    /// `TermId` (terms are hash-consed), keeping the walk linear in DAG size.
+    fn collect_term_sort_names(
+        &self,
+        term_id: TermId,
+        visited: &mut std::collections::HashSet<TermId>,
+        out: &mut std::collections::BTreeSet<String>,
+    ) {
+        if !visited.insert(term_id) {
+            return;
+        }
+        collect_uninterpreted_sort_names(self.ctx.terms.sort(term_id), out);
+        match self.ctx.terms.get(term_id) {
+            TermData::App(_, args) => {
+                for &a in args {
+                    self.collect_term_sort_names(a, visited, out);
+                }
+            }
+            TermData::Not(inner) => self.collect_term_sort_names(*inner, visited, out),
+            TermData::Ite(c, t, e) => {
+                self.collect_term_sort_names(*c, visited, out);
+                self.collect_term_sort_names(*t, visited, out);
+                self.collect_term_sort_names(*e, visited, out);
+            }
+            TermData::Forall(vars, body, triggers) | TermData::Exists(vars, body, triggers) => {
+                for (_, sort) in vars {
+                    collect_uninterpreted_sort_names(sort, out);
+                }
+                self.collect_term_sort_names(*body, visited, out);
+                for trig_set in triggers {
+                    for &t in trig_set {
+                        self.collect_term_sort_names(t, visited, out);
+                    }
+                }
+            }
+            TermData::Let(bindings, body) => {
+                for (_, t) in bindings {
+                    self.collect_term_sort_names(*t, visited, out);
+                }
+                self.collect_term_sort_names(*body, visited, out);
             }
             TermData::Const(_) | TermData::Var(_, _) => {}
             _ => {}
@@ -371,6 +547,23 @@ impl Executor {
                 self.format_term(*else_br)
             ),
             TermData::App(sym, args) => {
+                // Constant arrays have a named internal application node so
+                // the array theory can match them structurally.  SMT-LIB's
+                // portable surface form is a qualified `const` identifier,
+                // not `(const-array value)` and never a declared user
+                // function.  Include the result sort to make the index sort
+                // explicit and keep dumps accepted by AY and external SMT-LIB
+                // consumers.
+                if let (Symbol::Named(n), [value]) = (sym, args.as_slice()) {
+                    if n == "const-array" && matches!(self.ctx.terms.sort(term_id), Sort::Array(_))
+                    {
+                        return format!(
+                            "((as const {}) {})",
+                            format_sort(self.ctx.terms.sort(term_id)),
+                            self.format_term(*value)
+                        );
+                    }
+                }
                 // Lambda arrays are stored internally as
                 // `App("lambda-array", [var, body])`; print the SMT-LIB/z3
                 // standard binder shape `(lambda ((x S)) body)` (multi-arg
@@ -545,6 +738,24 @@ impl Executor {
         let saved_validated = self.last_model_validated;
         let saved_assumption_core = self.last_assumption_core.clone();
         let saved_core_term_to_name = self.last_core_term_to_name.clone();
+        // Proof artifacts are one coherent snapshot: a probe proof must never
+        // be paired with the restored result/assumption scope from the public
+        // query. `check_sat_assuming` clears or replaces every field below.
+        let saved_proof = self.last_proof.take();
+        let saved_lrat_certificate = self.last_lrat_certificate.take();
+        let saved_proof_term_overrides = self.last_proof_term_overrides.take();
+        let saved_proof_quality = self.last_proof_quality.take();
+        let saved_proof_rebuild_originals = std::mem::take(&mut self.last_proof_rebuild_originals);
+        let saved_clause_trace = self.last_clause_trace.take();
+        let saved_var_to_term = self.last_var_to_term.take();
+        let saved_trail_provenance = self.last_trail_provenance.take();
+        let saved_clausification_proofs = self.last_clausification_proofs.take();
+        let saved_original_clause_theory_proofs = self.last_original_clause_theory_proofs.take();
+        let saved_quant_expansion_records = std::mem::take(&mut self.quant_expansion_records);
+        let saved_proof_check_result = self.proof_check_result.take();
+        let saved_proof_check_ok = self.proof_check_ok;
+        let saved_proof_problem_assertion_provenance =
+            self.proof_problem_assertion_provenance.clone();
 
         let outcome = self.get_consequences_inner(assumptions, variables);
 
@@ -555,6 +766,20 @@ impl Executor {
         self.last_model_validated = saved_validated;
         self.last_assumption_core = saved_assumption_core;
         self.last_core_term_to_name = saved_core_term_to_name;
+        self.last_proof = saved_proof;
+        self.last_lrat_certificate = saved_lrat_certificate;
+        self.last_proof_term_overrides = saved_proof_term_overrides;
+        self.last_proof_quality = saved_proof_quality;
+        self.last_proof_rebuild_originals = saved_proof_rebuild_originals;
+        self.last_clause_trace = saved_clause_trace;
+        self.last_var_to_term = saved_var_to_term;
+        self.last_trail_provenance = saved_trail_provenance;
+        self.last_clausification_proofs = saved_clausification_proofs;
+        self.last_original_clause_theory_proofs = saved_original_clause_theory_proofs;
+        self.quant_expansion_records = saved_quant_expansion_records;
+        self.proof_check_result = saved_proof_check_result;
+        self.proof_check_ok = saved_proof_check_ok;
+        self.proof_problem_assertion_provenance = saved_proof_problem_assertion_provenance;
 
         outcome
     }
@@ -648,6 +873,21 @@ impl Executor {
         let saved_validated = self.last_model_validated;
         let saved_assumption_core = self.last_assumption_core.clone();
         let saved_core_term_to_name = self.last_core_term_to_name.clone();
+        let saved_proof = self.last_proof.take();
+        let saved_lrat_certificate = self.last_lrat_certificate.take();
+        let saved_proof_term_overrides = self.last_proof_term_overrides.take();
+        let saved_proof_quality = self.last_proof_quality.take();
+        let saved_proof_rebuild_originals = std::mem::take(&mut self.last_proof_rebuild_originals);
+        let saved_clause_trace = self.last_clause_trace.take();
+        let saved_var_to_term = self.last_var_to_term.take();
+        let saved_trail_provenance = self.last_trail_provenance.take();
+        let saved_clausification_proofs = self.last_clausification_proofs.take();
+        let saved_original_clause_theory_proofs = self.last_original_clause_theory_proofs.take();
+        let saved_quant_expansion_records = std::mem::take(&mut self.quant_expansion_records);
+        let saved_proof_check_result = self.proof_check_result.take();
+        let saved_proof_check_ok = self.proof_check_ok;
+        let saved_proof_problem_assertion_provenance =
+            self.proof_problem_assertion_provenance.clone();
 
         let outcome = self.get_abduct_inner(name, goal);
 
@@ -657,6 +897,20 @@ impl Executor {
         self.last_model_validated = saved_validated;
         self.last_assumption_core = saved_assumption_core;
         self.last_core_term_to_name = saved_core_term_to_name;
+        self.last_proof = saved_proof;
+        self.last_lrat_certificate = saved_lrat_certificate;
+        self.last_proof_term_overrides = saved_proof_term_overrides;
+        self.last_proof_quality = saved_proof_quality;
+        self.last_proof_rebuild_originals = saved_proof_rebuild_originals;
+        self.last_clause_trace = saved_clause_trace;
+        self.last_var_to_term = saved_var_to_term;
+        self.last_trail_provenance = saved_trail_provenance;
+        self.last_clausification_proofs = saved_clausification_proofs;
+        self.last_original_clause_theory_proofs = saved_original_clause_theory_proofs;
+        self.quant_expansion_records = saved_quant_expansion_records;
+        self.proof_check_result = saved_proof_check_result;
+        self.proof_check_ok = saved_proof_check_ok;
+        self.proof_problem_assertion_provenance = saved_proof_problem_assertion_provenance;
 
         outcome
     }
@@ -1185,11 +1439,46 @@ impl Executor {
     }
 }
 
+/// Collect uninterpreted-sort names referenced by `sort`, recursing through
+/// compound sorts (`Array`, `Seq`, datatype fields). `RoundingMode` is the
+/// FP theory's built-in sort spelled as `Sort::Uninterpreted` internally; it
+/// must not be re-declared in a serialized script. (#dump-self-contained)
+fn collect_uninterpreted_sort_names(sort: &Sort, out: &mut std::collections::BTreeSet<String>) {
+    match sort {
+        Sort::Uninterpreted(name) | Sort::TypeVar(name) => {
+            if name != "RoundingMode" {
+                out.insert(name.clone());
+            }
+        }
+        Sort::Array(arr) => {
+            collect_uninterpreted_sort_names(&arr.index_sort, out);
+            collect_uninterpreted_sort_names(&arr.element_sort, out);
+        }
+        Sort::Seq(elem) => collect_uninterpreted_sort_names(elem, out),
+        // Term-level sorts are `as_term_sort`-lowered (`Datatype` ->
+        // `Uninterpreted`), but declaration metadata can still carry the full
+        // definition; record the carrier name and any field sorts.
+        Sort::Datatype(dt) => {
+            out.insert(dt.name.clone());
+            for ctor in &dt.constructors {
+                for field in &ctor.fields {
+                    collect_uninterpreted_sort_names(&field.sort, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Conservative classifier: is `name` a built-in SMT-LIB operator stored as
 /// `App(Symbol::Named)` that must NOT be re-declared in a serialized script?
 /// (#transpose)
 fn is_builtin_operator(name: &str) -> bool {
-    if name.starts_with("(_ ") {
+    // Keep the dump classifier tied to the frontend's drift-checked list of
+    // operators whose semantics are selected structurally by name.  A stale
+    // local list used to fabricate `(declare-fun const-array ...)`, which the
+    // frontend correctly rejects as a reserved-symbol forgery.
+    if ay_frontend::is_reserved_op_name(name) || name.starts_with("(_ ") {
         return true;
     }
     matches!(

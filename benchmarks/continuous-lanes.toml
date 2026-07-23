@@ -1,0 +1,237 @@
+# Executable lanes for the continuous benchmark service.
+#
+# Official competition/track coverage lives in continuous-2025-2026.toml.
+# This file contains only locally executable ay-bench adapters.  The service
+# runs all `canary` lanes each cycle, then one `rolling` lane, preserving the
+# resource envelope and scorecard emitted by the native Rust runner.
+
+schema_version = 1
+interval_hours = 4
+
+[retention]
+# Keep about four months of six-times-daily raw development evidence. Runs
+# requested with --official are never pruned by this policy.
+max_runs = 720
+
+[git]
+remote = "origin"
+base_branch = "main"
+# Only the service's own publication namespaces are excluded.  Every other
+# remote head is classified as ancestor, patch-equivalent, unique, or
+# conflicted on every cycle.
+exclude = [
+  "continuous/*",
+  "benchmark-results/*",
+]
+
+[build]
+timeout_sec = 3600
+commands = [
+  ["{cargo}", "fmt", "--check", "--all"],
+  ["python3", "-m", "unittest", "scripts.tests.test_continuous_benchmark", "scripts.tests.test_sat_soundness_gate_resources"],
+  ["python3", "scripts/continuous_benchmark.py", "--repo", ".", "audit"],
+  ["systemd-analyze", "verify", "deploy/systemd/ay-continuous-benchmark.service", "deploy/systemd/ay-continuous-benchmark.timer"],
+  ["{cargo}", "check", "--workspace", "--all-targets"],
+  ["{cargo}", "test", "-p", "ay-bench"],
+  ["{cargo}", "test", "-p", "ay-sat"],
+  ["{cargo}", "test", "-p", "ay-dpll"],
+  ["{cargo}", "test", "-p", "ay-chc"],
+  ["{cargo}", "test", "-p", "ay-milp"],
+  ["{cargo}", "build", "--release", "-p", "ay", "--features", "bench"],
+  ["bash", "scripts/ci/sat_soundness_gate.sh", "{ay}", "drat", "10"],
+  ["bash", "scripts/ci/smt_soundness_gate.sh", "{target}/release/libay_ffi.so", "{target}/release/ay-z3-parity", "5"],
+]
+
+[[lane]]
+id = "sat-par2-canary"
+kind = "canary"
+eval_id = "sat-continuous-canary"
+timeout_sec = 5
+runs = 1
+official = false
+min_benchmarks = 9
+requires_paths = [
+  "evals/registry/sat-continuous-canary.yaml",
+  "benchmarks/sat/par2/continuous-canary.txt",
+]
+competition_refs = ["satcomp-2025-main", "satcomp-2026-main"]
+
+[[lane]]
+id = "chccomp-2025-extra-small-lia"
+kind = "rolling"
+eval_id = "chccomp-2025-extra-small-lia"
+enabled = false
+timeout_sec = 20
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 20
+requires_paths = ["benchmarks/chc-comp/2025/extra-small-lia"]
+blocked_reason = "The 20 present files have no authoritative expected/reference labels; generic scoring would count unverified answers as solved."
+competition_refs = ["chccomp-2025-lia-lin"]
+
+[[lane]]
+id = "chccomp-2025-lia-lin"
+kind = "rolling"
+eval_id = "chccomp-2025-lia-lin"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 100
+requires_paths = [
+  "benchmarks/chc/chc-comp25-benchmarks/LIA-Lin.set",
+]
+competition_refs = ["chccomp-2025-lia-lin"]
+
+[[lane]]
+id = "smtcomp-qf-lra"
+kind = "rolling"
+eval_id = "smt-smtcomp-qf-lra"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 100
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/smtcomp/QF_LRA"]
+competition_refs = ["smtcomp-2025-single-query"]
+
+[[lane]]
+id = "smtcomp-2025-local-soundness"
+kind = "rolling"
+eval_id = "smt-local-suite"
+timeout_sec = 10
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 100
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/smt"]
+competition_refs = [
+  "smtcomp-2025-single-query",
+  "smtcomp-2025-model-validation",
+]
+
+[[lane]]
+id = "smtcomp-qf-lia"
+kind = "rolling"
+eval_id = "smt-smtcomp-qf-lia"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 100
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/smtcomp/QF_LIA"]
+competition_refs = ["smtcomp-2025-single-query"]
+
+[[lane]]
+id = "smtcomp-qf-bv"
+kind = "rolling"
+eval_id = "smt-smtcomp-qf-bv"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 100
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/smtcomp/QF_BV"]
+competition_refs = ["smtcomp-2025-single-query"]
+
+[[lane]]
+id = "smtcomp-qf-abv"
+kind = "rolling"
+eval_id = "smt-smtcomp-qf-abv"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 100
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/smtcomp/QF_ABV"]
+competition_refs = ["smtcomp-2025-single-query"]
+
+[[lane]]
+id = "smtcomp-qf-alia"
+kind = "rolling"
+eval_id = "smt-smtcomp-qf-alia"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 100
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/smtcomp/QF_ALIA"]
+competition_refs = ["smtcomp-2025-single-query"]
+
+[[lane]]
+id = "smtcomp-qf-auflia"
+kind = "rolling"
+eval_id = "smt-smtcomp-qf-auflia"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 100
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/smtcomp/QF_AUFLIA"]
+competition_refs = ["smtcomp-2025-single-query"]
+
+[[lane]]
+id = "smtcomp-qf-uf"
+kind = "rolling"
+eval_id = "smt-smtcomp-qf-uf"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 100
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/smtcomp/QF_UF"]
+competition_refs = ["smtcomp-2025-single-query"]
+
+[[lane]]
+id = "sat-par2-heldout"
+kind = "rolling"
+eval_id = "sat-par2-heldout"
+timeout_sec = 20
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 400
+requires_paths = [
+  "benchmarks/sat/par2/heldout.txt",
+  "benchmarks/sat/par2/heldout",
+]
+competition_refs = ["satcomp-2025-main", "satcomp-2026-main"]
+
+# Competition-time lanes are deliberately separate from the four-hour proxy
+# rotation.  Enable them explicitly after the exact corpus and checker packet
+# are frozen; different timeout/proof/resource envelopes are not comparable.
+[[lane]]
+id = "satcomp-2025-main-official"
+kind = "official"
+eval_id = "sat-par2-heldout"
+runs = 1
+official = true
+enabled = false
+requires_paths = [
+  "benchmarks/sat/par2/heldout.txt",
+  "benchmarks/sat/par2/heldout",
+]
+blocked_reason = "Exact 400-instance SAT-COMP 2025 packet is not mapped to this eval yet."
+competition_refs = ["satcomp-2025-main"]
+
+[[lane]]
+id = "chccomp-2025-lia-lin-official"
+kind = "official"
+eval_id = "chccomp-2025-lia-lin"
+runs = 1
+official = true
+enabled = false
+requires_paths = [
+  "benchmarks/chc/chc-comp25-benchmarks/LIA-Lin.set",
+]
+blocked_reason = "Enable only with the full pinned corpus and checker/reference packet."
+competition_refs = ["chccomp-2025-lia-lin"]

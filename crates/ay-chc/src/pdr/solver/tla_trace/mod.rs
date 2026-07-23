@@ -397,6 +397,58 @@ impl PdrSolver {
         model: InvariantModel,
         stage: &'static str,
     ) -> Option<PdrResult> {
+        // Non-scalarized candidates can preserve the strict gate's concrete
+        // failure for candidate repair. This avoids repeating the expensive
+        // failed verification before the first weakening round and leaves the
+        // existing deadline for the mandatory repaired-candidate recheck.
+        if self.array_scalarization_maps.is_empty() {
+            let previous_strict_proofs = self.config.strict_proofs;
+            self.config.strict_proofs = true;
+            let failure = self.verify_model_fresh_with_failure(&model);
+            self.config.strict_proofs = previous_strict_proofs;
+
+            let Some(failure) = failure else {
+                return Some(self.finish_with_result_trace(PdrResult::Safe(model)));
+            };
+
+            let memory = self
+                .array_scalarization_memory_report()
+                .diagnostic_summary();
+            tracing::warn!(
+                stage,
+                transform_memory = %memory,
+                "PDR Safe result failed strict final validation; demoting to Unknown"
+            );
+            if self.config.verbose {
+                safe_eprintln!(
+                    "PDR: {stage} Safe result failed strict final validation; demoting to Unknown (#9227); {memory}"
+                );
+            }
+            let _ = self.finish_with_result_trace(PdrResult::Unknown);
+            self.strict_validation_demotions = self.strict_validation_demotions.saturating_add(1);
+            if self.config.verbose {
+                safe_eprintln!(
+                    "PDR: {stage} demoted by strict validation; continuing discovery (#4751)"
+                );
+            }
+
+            // The returned wrapper is constructible only after the modified
+            // model has passed the same fresh-context strict verifier. Publish
+            // that already-verified model directly: a third redundant check
+            // could lose a completed proof to a cancellation race.
+            if let Some(repaired) = self.repair_demoted_candidate_after_failure(model, failure) {
+                if self.config.verbose {
+                    safe_eprintln!(
+                        "PDR: {stage}: repaired demoted candidate passed strict re-verification; finalizing (#4751 L4)"
+                    );
+                }
+                return Some(self.finish_with_result_trace(PdrResult::Safe(repaired.into_model())));
+            }
+            return None;
+        }
+
+        // Array-scalarized models require translation and a verifier over the
+        // original problem, so keep their existing fail-closed path.
         match self.finish_safe_with_result_trace(model.clone(), stage) {
             PdrResult::Unknown => {
                 self.strict_validation_demotions =
@@ -405,22 +457,6 @@ impl PdrSolver {
                     safe_eprintln!(
                         "PDR: {stage} demoted by strict validation; continuing discovery (#4751)"
                     );
-                }
-                // #4751 L4: counterexample-guided candidate repair. The strict
-                // verifier's concrete counterexamples identify the falsified
-                // ("poison") conjuncts; dropping them from the CANDIDATE only
-                // (frames untouched) is always sound, and the repaired model
-                // still goes through the full unmodified strict gate below.
-                if let Some(repaired) = self.repair_demoted_candidate(model) {
-                    if self.config.verbose {
-                        safe_eprintln!(
-                            "PDR: {stage}: repaired demoted candidate passes strict re-verification; finalizing (#4751 L4)"
-                        );
-                    }
-                    match self.finish_safe_with_result_trace(repaired, stage) {
-                        PdrResult::Unknown => return None,
-                        result => return Some(result),
-                    }
                 }
                 None
             }

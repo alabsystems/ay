@@ -15,12 +15,12 @@
 use std::ffi::{c_int, c_uint};
 use std::ptr;
 
-use ay_dpll::api::TermKind;
+use ay_dpll::api::{Term, TermKind};
 
 use super::{
-    alloc_sort, ast_to_term, cache_func_decl_with_params, cache_func_decl_with_symbol,
-    cache_symbol_key, ffi_guard_ast, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint,
-    parse_indexed_name, term_to_ast, Z3_ast, Z3_context, Z3_func_decl, Z3_sort, Z3_symbol,
+    alloc_sort, cache_func_decl_with_params, cache_func_decl_with_symbol, cache_symbol_key,
+    ffi_guard_ast, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, parse_indexed_name,
+    require_term_ast_or_return, term_to_ast, Z3_ast, Z3_context, Z3_func_decl, Z3_sort, Z3_symbol,
     Z3_APP_AST, Z3_IOB, Z3_L_FALSE, Z3_L_TRUE, Z3_L_UNDEF, Z3_NUMERAL_AST, Z3_PARAMETER_INT,
     Z3_QUANTIFIER_AST, Z3_UNKNOWN_AST, Z3_VAR_AST,
 };
@@ -48,8 +48,8 @@ fn is_debruijn_bound_var_name(name: &str) -> bool {
 /// The name of a declared constant (a core `Var` that is NOT a `__db` bound
 /// variable), or `None` for anything else. A declared constant is a nullary
 /// application in z3 terms.
-fn declared_const_name(ctx: &super::Z3Context, a: Z3_ast) -> Option<String> {
-    match ctx.solver.term_kind(ast_to_term(a)) {
+fn declared_const_name(ctx: &super::Z3Context, term: Term) -> Option<String> {
+    match ctx.solver.term_kind(term) {
         TermKind::Var { name } if !is_debruijn_bound_var_name(&name) => Some(name),
         _ => None,
     }
@@ -67,27 +67,71 @@ pub unsafe extern "C" fn Z3_get_ast_kind(c: Z3_context, a: Z3_ast) -> c_uint {
     if a == 0 {
         return Z3_UNKNOWN_AST;
     }
-    // Tagged non-term handles never reach the term arena (the `ast_to_term`
-    // poison guard would fail the call closed); report their kind directly.
-    // Dispatch order: bit 63 (proof), bit 62 (algebraic), bit 61 (sort),
-    // bit 60 (func_decl).
-    match a & super::HANDLE_TAG_MASK {
-        0 => {}
-        super::SORT_AST_TAG => return super::Z3_SORT_AST,
-        super::FUNC_DECL_AST_TAG => return super::Z3_FUNC_DECL_AST,
-        // Proof / algebraic handles have no faithful term kind in AY
-        // (z3 renders both as apps, but AY's are opaque text/value handles);
-        // report UNKNOWN honestly rather than fabricate. Before the poison
-        // guard these truncation-aliased onto an arbitrary term's kind.
-        _ => return Z3_UNKNOWN_AST,
-    }
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
     // `ffi_guard_uint` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_uint(c, Z3_UNKNOWN_AST, |ctx| {
-            match ctx.solver.term_kind(ast_to_term(a)) {
+            // Tagged non-term handles never reach the term arena. Authenticate
+            // each arena lookup before reporting even its kind: otherwise a
+            // foreign sort/decl handle would be accepted as a local object.
+            match a & super::HANDLE_TAG_MASK {
+                super::SORT_AST_TAG => {
+                    if super::sort_ast_to_handle(ctx, a).is_null() {
+                        ctx.last_error = super::Z3_INVALID_ARG;
+                        ctx.error_msg =
+                            Some("Z3_get_ast_kind: invalid or foreign sort AST handle".to_string());
+                        return Z3_UNKNOWN_AST;
+                    }
+                    ctx.last_error = super::Z3_OK;
+                    return super::Z3_SORT_AST;
+                }
+                super::FUNC_DECL_AST_TAG => {
+                    if super::func_decl_ast_to_handle(ctx, a).is_null() {
+                        ctx.last_error = super::Z3_INVALID_ARG;
+                        ctx.error_msg = Some(
+                            "Z3_get_ast_kind: invalid or foreign func-decl AST handle".to_string(),
+                        );
+                        return Z3_UNKNOWN_AST;
+                    }
+                    ctx.last_error = super::Z3_OK;
+                    return super::Z3_FUNC_DECL_AST;
+                }
+                super::PROOF_AST_TAG => {
+                    if super::proof_text_for_ast(ctx, a).is_none() {
+                        ctx.last_error = super::Z3_INVALID_ARG;
+                        ctx.error_msg = Some(
+                            "Z3_get_ast_kind: invalid or foreign proof AST handle".to_string(),
+                        );
+                    } else {
+                        ctx.last_error = super::Z3_OK;
+                    }
+                    // AY's proof handle has no faithful term kind.
+                    return Z3_UNKNOWN_AST;
+                }
+                super::ALGEBRAIC_AST_TAG => {
+                    if super::algebraic::ast_as_scalar(ctx, a).is_none() {
+                        ctx.last_error = super::Z3_INVALID_ARG;
+                        ctx.error_msg = Some(
+                            "Z3_get_ast_kind: invalid or foreign algebraic AST handle".to_string(),
+                        );
+                    } else {
+                        ctx.last_error = super::Z3_OK;
+                    }
+                    // AY's opaque algebraic handle has no faithful term kind.
+                    return Z3_UNKNOWN_AST;
+                }
+                0 => {}
+                _ => {
+                    ctx.last_error = super::Z3_INVALID_ARG;
+                    ctx.error_msg = Some("Z3_get_ast_kind: malformed AST tag".to_string());
+                    return Z3_UNKNOWN_AST;
+                }
+            }
+            let term =
+                require_term_ast_or_return!(ctx, a, "Z3_get_ast_kind", "AST", Z3_UNKNOWN_AST);
+            match ctx.solver.term_kind(term) {
                 TermKind::Const => Z3_NUMERAL_AST,
                 TermKind::App { .. } | TermKind::Not | TermKind::Ite => Z3_APP_AST,
                 // A declared constant (`Z3_mk_const`) is a NULLARY APPLICATION in
@@ -117,7 +161,12 @@ pub unsafe extern "C" fn Z3_is_numeral_ast(c: Z3_context, a: Z3_ast) -> bool {
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
     // `ffi_guard_int` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
-    unsafe { ffi_guard_int(c, 0, |ctx| i32::from(ctx.solver.is_numeral(ast_to_term(a)))) != 0 }
+    unsafe {
+        ffi_guard_int(c, 0, |ctx| {
+            let term = require_term_ast_or_return!(ctx, a, "Z3_is_numeral_ast", "AST", 0);
+            i32::from(ctx.solver.is_numeral(term))
+        }) != 0
+    }
 }
 
 /// Return true if the AST is an application node.
@@ -135,12 +184,13 @@ pub unsafe extern "C" fn Z3_is_app(c: Z3_context, a: Z3_ast) -> bool {
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
+            let term = require_term_ast_or_return!(ctx, a, "Z3_is_app", "AST", 0);
             // A declared constant is a nullary application; the core stores it as
             // a `Var`, so `solver.is_app` alone would miss it (breaking z3py's
             // `is_app`/`to_app`). A numeral is also an application in z3.
-            let is_app = ctx.solver.is_app(ast_to_term(a))
-                || ctx.solver.is_numeral(ast_to_term(a))
-                || declared_const_name(ctx, a).is_some();
+            let is_app = ctx.solver.is_app(term)
+                || ctx.solver.is_numeral(term)
+                || declared_const_name(ctx, term).is_some();
             i32::from(is_app)
         }) != 0
     }
@@ -173,12 +223,13 @@ pub unsafe extern "C" fn Z3_to_app(c: Z3_context, a: Z3_ast) -> Z3_ast {
                 ctx.error_msg = Some("Z3_to_app: argument is not an application AST".to_string());
                 return 0;
             }
-            if ctx.solver.is_app(ast_to_term(a))
-                || ctx.solver.is_numeral(ast_to_term(a))
+            let term = require_term_ast_or_return!(ctx, a, "Z3_to_app", "AST", 0);
+            if ctx.solver.is_app(term)
+                || ctx.solver.is_numeral(term)
                 // A declared constant is a nullary application: z3's `Z3_to_app`
                 // is a type-checked identity cast that succeeds on it, and stock
                 // z3py depends on that (`m[x]`, `decl()`, quantifier construction).
-                || declared_const_name(ctx, a).is_some()
+                || declared_const_name(ctx, term).is_some()
             {
                 a
             } else {
@@ -207,7 +258,8 @@ pub unsafe extern "C" fn Z3_get_app_num_args(c: Z3_context, a: Z3_ast) -> c_uint
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_uint(c, 0, |ctx| {
-            ctx.solver.app_num_args(ast_to_term(a)) as c_uint
+            let term = require_term_ast_or_return!(ctx, a, "Z3_get_app_num_args", "application", 0);
+            ctx.solver.app_num_args(term) as c_uint
         })
     }
 }
@@ -229,8 +281,9 @@ pub unsafe extern "C" fn Z3_get_app_arg(c: Z3_context, a: Z3_ast, i: c_uint) -> 
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            match ctx.solver.app_arg(ast_to_term(a), i as usize) {
-                Some(t) => term_to_ast(t),
+            let term = require_term_ast_or_return!(ctx, a, "Z3_get_app_arg", "application", 0);
+            match ctx.solver.app_arg(term, i as usize) {
+                Some(t) => term_to_ast(ctx, t),
                 None => 0,
             }
         })
@@ -257,11 +310,17 @@ pub unsafe extern "C" fn Z3_get_app_decl(c: Z3_context, a: Z3_ast) -> Z3_func_de
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
-            let term = ast_to_term(a);
+            let term = require_term_ast_or_return!(
+                ctx,
+                a,
+                "Z3_get_app_decl",
+                "application",
+                ptr::null_mut()
+            );
             // A declared constant is a nullary application; its decl is a 0-arity
             // function named after the constant, ranging over its sort. z3py's
             // `x.decl()` returns exactly this, so it must not be NULL.
-            if let Some(const_name) = declared_const_name(ctx, a) {
+            if let Some(const_name) = declared_const_name(ctx, term) {
                 let range = ctx.solver.term_sort(term);
                 if let Some((identity, symbol)) = ctx.ffi_const_metadata.get(&term).cloned() {
                     return cache_func_decl_with_symbol(
@@ -455,7 +514,14 @@ pub unsafe extern "C" fn Z3_get_bool_value(c: Z3_context, a: Z3_ast) -> c_int {
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_int(c, Z3_L_UNDEF, |ctx| {
-            match ctx.solver.bool_value(ast_to_term(a)) {
+            let term = require_term_ast_or_return!(
+                ctx,
+                a,
+                "Z3_get_bool_value",
+                "Boolean term",
+                Z3_L_UNDEF
+            );
+            match ctx.solver.bool_value(term) {
                 Some(true) => Z3_L_TRUE,
                 Some(false) => Z3_L_FALSE,
                 None => Z3_L_UNDEF,
@@ -485,7 +551,8 @@ pub unsafe extern "C" fn Z3_get_numeral_int(c: Z3_context, a: Z3_ast, v: *mut c_
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
-            if let Some(s) = ctx.solver.numeral_string(ast_to_term(a)) {
+            let term = require_term_ast_or_return!(ctx, a, "Z3_get_numeral_int", "numeral", 0);
+            if let Some(s) = ctx.solver.numeral_string(term) {
                 if let Ok(val) = s.parse::<c_int>() {
                     *v = val;
                     return 1;
@@ -513,7 +580,8 @@ pub unsafe extern "C" fn Z3_get_numeral_uint(c: Z3_context, a: Z3_ast, v: *mut c
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
-            if let Some(s) = ctx.solver.numeral_string(ast_to_term(a)) {
+            let term = require_term_ast_or_return!(ctx, a, "Z3_get_numeral_uint", "numeral", 0);
+            if let Some(s) = ctx.solver.numeral_string(term) {
                 if let Ok(val) = s.parse::<c_uint>() {
                     *v = val;
                     return 1;
@@ -541,7 +609,8 @@ pub unsafe extern "C" fn Z3_get_numeral_int64(c: Z3_context, a: Z3_ast, v: *mut 
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
-            if let Some(s) = ctx.solver.numeral_string(ast_to_term(a)) {
+            let term = require_term_ast_or_return!(ctx, a, "Z3_get_numeral_int64", "numeral", 0);
+            if let Some(s) = ctx.solver.numeral_string(term) {
                 if let Ok(val) = s.parse::<i64>() {
                     *v = val;
                     return 1;
@@ -569,7 +638,8 @@ pub unsafe extern "C" fn Z3_get_numeral_uint64(c: Z3_context, a: Z3_ast, v: *mut
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
-            if let Some(s) = ctx.solver.numeral_string(ast_to_term(a)) {
+            let term = require_term_ast_or_return!(ctx, a, "Z3_get_numeral_uint64", "numeral", 0);
+            if let Some(s) = ctx.solver.numeral_string(term) {
                 if let Ok(val) = s.parse::<u64>() {
                     *v = val;
                     return 1;

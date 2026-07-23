@@ -186,6 +186,76 @@ fn rejects_non_distinctness_shapes() {
     assert!(matches!(err, ProofCheckError::InvalidTheoryLemma { .. }));
 }
 
+#[test]
+fn rejects_indexed_homonyms_of_datatype_distinctness_symbols() {
+    let mut terms = TermStore::new();
+    let red = ctor(&mut terms, "red", "Color");
+    let green = ctor(&mut terms, "green", "Color");
+    let decls = two_datatypes();
+
+    let indexed_eq = terms.mk_app(Symbol::indexed("=", vec![0]), vec![red, green], Sort::Bool);
+    let indexed_eq_lit = terms.mk_not_raw(indexed_eq);
+    validate(&terms, vec![indexed_eq_lit], Some(&decls))
+        .expect_err("an indexed `=` is an uninterpreted homonym, not equality");
+
+    let indexed_red = terms.mk_app(
+        Symbol::indexed("red", vec![0]),
+        Vec::new(),
+        Sort::Uninterpreted("Color".to_string()),
+    );
+    let indexed_green = terms.mk_app(
+        Symbol::indexed("green", vec![0]),
+        Vec::new(),
+        Sort::Uninterpreted("Color".to_string()),
+    );
+    let indexed_ctor_lit = neq(&mut terms, indexed_red, indexed_green);
+    validate(&terms, vec![indexed_ctor_lit], Some(&decls))
+        .expect_err("indexed constructor homonyms are not declared constructors");
+
+    let genuine_lit = neq(&mut terms, red, green);
+    let indexed_or = terms.mk_app(
+        Symbol::indexed("or", vec![0]),
+        vec![genuine_lit],
+        Sort::Bool,
+    );
+    validate(&terms, vec![indexed_or], Some(&decls))
+        .expect_err("an indexed `or` must not be flattened as a proof clause");
+}
+
+#[test]
+fn rejects_ill_sorted_datatype_distinctness_terms() {
+    let mut terms = TermStore::new();
+    let red = ctor(&mut terms, "red", "Color");
+    let green_wrong_carrier = terms.mk_app(
+        Symbol::named("green"),
+        Vec::new(),
+        Sort::Uninterpreted("Light".to_string()),
+    );
+    let mismatched = terms.mk_app(
+        Symbol::named("="),
+        vec![red, green_wrong_carrier],
+        Sort::Bool,
+    );
+    let mismatched_lit = terms.mk_not_raw(mismatched);
+    let decls = two_datatypes();
+    validate(&terms, vec![mismatched_lit], Some(&decls))
+        .expect_err("constructor equality operands must have one carrier sort");
+
+    let red_wrong_carrier = terms.mk_app(
+        Symbol::named("red"),
+        Vec::new(),
+        Sort::Uninterpreted("Other".to_string()),
+    );
+    let green_wrong_carrier = terms.mk_app(
+        Symbol::named("green"),
+        Vec::new(),
+        Sort::Uninterpreted("Other".to_string()),
+    );
+    let wrong_carrier_lit = neq(&mut terms, red_wrong_carrier, green_wrong_carrier);
+    validate(&terms, vec![wrong_carrier_lit], Some(&decls))
+        .expect_err("registered names at another carrier sort are not constructors of Color");
+}
+
 // ---- Datatype selector-projection (`DatatypeSelectorProject`) validation ----
 
 /// `(declare-datatype Pair ((mk (fst Int) (snd Int))))` selector registry:
@@ -356,4 +426,58 @@ fn project_fails_closed_without_registry() {
         err,
         ProofCheckError::UnsupportedTheoryLemmaKind { .. }
     ));
+}
+
+#[test]
+fn project_rejects_indexed_homonyms() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Int);
+    let b = terms.mk_var("b", Sort::Int);
+    let pair = mk_pair(&mut terms, a, b);
+    let sels = pair_selectors();
+
+    let indexed_selector = terms.mk_app(Symbol::indexed("fst", vec![0]), vec![pair], Sort::Int);
+    let indexed_selector_lit = eq(&mut terms, indexed_selector, a);
+    validate_project(&terms, vec![indexed_selector_lit], Some(&sels))
+        .expect_err("an indexed selector homonym is not a declared selector");
+
+    let indexed_ctor = terms.mk_app(
+        Symbol::indexed("mk", vec![0]),
+        vec![a, b],
+        Sort::Uninterpreted("Pair".to_string()),
+    );
+    let fst_indexed_ctor = sel(&mut terms, "fst", indexed_ctor);
+    let indexed_ctor_lit = eq(&mut terms, fst_indexed_ctor, a);
+    validate_project(&terms, vec![indexed_ctor_lit], Some(&sels))
+        .expect_err("an indexed constructor homonym is not a declared constructor");
+
+    let fst = sel(&mut terms, "fst", pair);
+    let indexed_eq = terms.mk_app(Symbol::indexed("=", vec![0]), vec![fst, a], Sort::Bool);
+    validate_project(&terms, vec![indexed_eq], Some(&sels))
+        .expect_err("an indexed `=` is not a selector-projection equality");
+}
+
+#[test]
+fn project_rejects_ill_sorted_constructor_selector_and_equality_apps() {
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Int);
+    let b = terms.mk_var("b", Sort::Int);
+    let sels = pair_selectors();
+
+    let wrong_carrier_ctor = terms.mk_app(Symbol::named("mk"), vec![a, b], Sort::Int);
+    let selector_over_wrong_carrier = sel(&mut terms, "fst", wrong_carrier_ctor);
+    let wrong_carrier_lit = eq(&mut terms, selector_over_wrong_carrier, a);
+    validate_project(&terms, vec![wrong_carrier_lit], Some(&sels))
+        .expect_err("a constructor application must have a datatype carrier sort");
+
+    let pair = mk_pair(&mut terms, a, b);
+    let bool_selector = terms.mk_app(Symbol::named("fst"), vec![pair], Sort::Bool);
+    let mismatched_equality = terms.mk_app(Symbol::named("="), vec![bool_selector, a], Sort::Bool);
+    validate_project(&terms, vec![mismatched_equality], Some(&sels))
+        .expect_err("selector result and projected field must have the same sort");
+
+    let fst = sel(&mut terms, "fst", pair);
+    let non_bool_equality = terms.mk_app(Symbol::named("="), vec![fst, a], Sort::Int);
+    validate_project(&terms, vec![non_bool_equality], Some(&sels))
+        .expect_err("a projection equality must itself have sort Bool");
 }

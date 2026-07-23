@@ -46,7 +46,7 @@ use ay_core::Sort;
 use ay_frontend::{Command, Objective, ObjectiveDirection};
 
 use crate::api::types::{
-    NativeReplayEventKind, ObjectiveValue, SolveResult, Term, VerifiedSolveResult,
+    NativeReplayEventKind, ObjectiveValue, SolveResult, SolverError, Term, VerifiedSolveResult,
 };
 use crate::api::Solver;
 use crate::executor::optimization::ObjectiveOutcome;
@@ -60,6 +60,13 @@ impl Solver {
     /// accepted here but rejected at [`optimize_check`](Self::optimize_check)
     /// time, mirroring the SMT-LIB `(maximize ...)` flow.
     pub fn maximize(&mut self, term: Term) -> usize {
+        self.try_maximize(term)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible variant of [`maximize`](Self::maximize).
+    #[must_use = "this returns a Result that must be checked"]
+    pub fn try_maximize(&mut self, term: Term) -> Result<usize, SolverError> {
         self.register_objective(term, ObjectiveDirection::Maximize)
     }
 
@@ -67,12 +74,32 @@ impl Solver {
     ///
     /// Returns the objective's index. See [`maximize`](Self::maximize).
     pub fn minimize(&mut self, term: Term) -> usize {
+        self.try_minimize(term)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible variant of [`minimize`](Self::minimize).
+    #[must_use = "this returns a Result that must be checked"]
+    pub fn try_minimize(&mut self, term: Term) -> Result<usize, SolverError> {
         self.register_objective(term, ObjectiveDirection::Minimize)
     }
 
     /// Shared registration: push an objective onto the executor context and
     /// return its index (the new declaration-order position).
-    fn register_objective(&mut self, term: Term, direction: ObjectiveDirection) -> usize {
+    fn register_objective(
+        &mut self,
+        term: Term,
+        direction: ObjectiveDirection,
+    ) -> Result<usize, SolverError> {
+        if let Some(message) = self
+            .executor
+            .array_ext_witness_registration_error(&[term.0])
+        {
+            return Err(SolverError::InvalidArgument {
+                operation: "register_objective",
+                message,
+            });
+        }
         self.executor.note_api_optimization_mutation();
         let ctx = self.executor.context_mut();
         let idx = ctx.objectives().len();
@@ -80,7 +107,7 @@ impl Solver {
             direction,
             term: term.0,
         });
-        idx
+        Ok(idx)
     }
 
     /// Return the number of registered optimization objectives.

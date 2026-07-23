@@ -821,6 +821,11 @@ pub struct RunArgs {
     /// CLI override for number of runs per benchmark.
     /// `None` means use the YAML registry value, then fall back to 1.
     pub runs: Option<u32>,
+    /// Zero-based deterministic shard cursor. Must be paired with
+    /// `shard_size`; stale cursors are normalized after corpus preflight.
+    pub shard_index: Option<usize>,
+    /// Maximum number of benchmarks selected for this invocation.
+    pub shard_size: Option<usize>,
     /// CLI override for reference solvers as (name, path) pairs, in the
     /// order given on the command line. Empty means fall back to the YAML
     /// spec's single `reference_solver` name.
@@ -892,7 +897,7 @@ fn run_single_eval(
     ay_path: &Path,
     pinned_ay: &crate::environment::PinnedSolver,
     environment: &crate::environment::Environment,
-) -> Result<serde_json::Value> {
+) -> Result<(serde_json::Value, Option<serde_json::Value>)> {
     let inputs = spec.inputs.as_ref();
 
     // Determine timeout
@@ -992,6 +997,7 @@ fn run_single_eval(
         quiet: args.quiet,
         with_features: args.with_features,
         file_list,
+        shard: shard_selection(args)?,
         runs,
         reference_solvers,
         run_class: args.run_class.clone(),
@@ -1006,6 +1012,12 @@ fn run_single_eval(
     };
 
     let results = crate::native::run_native(&native_args)?;
+    let shard = results
+        .settings
+        .shard
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?;
 
     // Print comparison summaries if reference solvers were used
     if let Some(references) = results.references.as_deref() {
@@ -1047,9 +1059,21 @@ fn run_single_eval(
     // Score before publication. Any failure drops the TempDir and removes
     // partial evidence; a successful run keeps its already-unique directory.
     let score = score_and_print(&results_path, eval_id, timeout, args.competition)?;
-    // Persist only after the primary evidence is complete and scoreable.
-    if let Err(e) = persist_results(&root, eval_id, &results, args.with_features) {
-        eprintln!("[{eval_id}] warning: failed to persist results to store: {e:#}");
+    let partial_shard = results.settings.shard.as_ref().is_some_and(|metadata| {
+        metadata.selected_benchmark_count < metadata.corpus_benchmark_count
+    });
+    // Persist only complete evals in the comparable result store. A partial
+    // shard is independently scoreable evidence, but the current store key has
+    // no campaign/shard identity; inserting it would manufacture misleading
+    // added/removed diffs and mix repeated shards from one commit.
+    if !partial_shard {
+        if let Err(e) = persist_results(&root, eval_id, &results, args.with_features) {
+            eprintln!("[{eval_id}] warning: failed to persist results to store: {e:#}");
+        }
+    } else if !args.quiet {
+        eprintln!(
+            "[{eval_id}] partial shard evidence is not inserted into the comparable result store"
+        );
     }
     let published_dir = run_dir.keep();
     if !args.quiet {
@@ -1058,7 +1082,7 @@ fn run_single_eval(
             published_dir.display()
         );
     }
-    Ok(score)
+    Ok((score, shard))
 }
 
 fn bench_results_root(repo_root: &Path) -> PathBuf {
@@ -1156,6 +1180,24 @@ fn effective_runs(args: &RunArgs, inputs: Option<&EvalInputs>) -> Result<u32> {
     Ok(runs)
 }
 
+fn shard_selection(args: &RunArgs) -> Result<Option<crate::native::NativeShardSelection>> {
+    match (args.shard_index, args.shard_size) {
+        (None, None) => Ok(None),
+        (Some(index), Some(size)) if (1..=crate::native::MAX_NATIVE_SHARD_SIZE).contains(&size) => {
+            Ok(Some(crate::native::NativeShardSelection { index, size }))
+        }
+        (Some(_), Some(size)) => Err(BenchError::InvalidArgs {
+            reason: format!(
+                "shard_size must be in 1..={}, got {size}",
+                crate::native::MAX_NATIVE_SHARD_SIZE
+            ),
+        }),
+        _ => Err(BenchError::InvalidArgs {
+            reason: "shard_index and shard_size must be provided together".to_string(),
+        }),
+    }
+}
+
 fn solver_args_for_eval(domain: &str, args: &RunArgs) -> Vec<String> {
     let mut solver_args = Vec::new();
     if domain == "sat" {
@@ -1195,7 +1237,7 @@ fn persist_results(
         )));
     }
 
-    let store_path = StorePath::default_at(repo_root);
+    let store_path = StorePath::configured_at(repo_root);
     let mut store = ResultsStore::open(store_path.as_path())?;
     let rows = build_rows(commit_hash, eval_id, results, with_features)?;
     store.upsert_rows(&rows)?;
@@ -1386,6 +1428,7 @@ fn classify_verifier(
 
 pub fn cmd_run(args: RunArgs) -> Result<()> {
     validate_run_class(args.run_class.as_deref())?;
+    shard_selection(&args)?;
     let evals = discover_evals()?;
     if evals.is_empty() {
         return Err(BenchError::msg("no eval specs found in evals/registry/"));
@@ -1447,11 +1490,17 @@ pub fn cmd_run(args: RunArgs) -> Result<()> {
             &pinned_ay,
             &environment,
         ) {
-            Ok(score) => all_scores.push(serde_json::json!({
-                "eval_id": eval_id,
-                "competition": infer_competition(eval_id).name(),
-                "score": score,
-            })),
+            Ok((score, shard)) => {
+                let mut row = serde_json::json!({
+                    "eval_id": eval_id,
+                    "competition": infer_competition(eval_id).name(),
+                    "score": score,
+                });
+                if let Some(shard) = shard {
+                    row["shard"] = shard;
+                }
+                all_scores.push(row);
+            }
             Err(e) => {
                 eprintln!("[{eval_id}] error: {e:#}");
                 failures.push(format!("{eval_id}: {e:#}"));
@@ -1596,7 +1645,7 @@ pub fn cmd_diff(args: DiffArgs) -> Result<bool> {
     let base_hash = crate::db::resolve_rev(&root, &args.base).unwrap_or_else(|| args.base.clone());
     let head_hash = crate::db::resolve_rev(&root, &args.head).unwrap_or_else(|| args.head.clone());
 
-    let store_path = StorePath::default_at(&root);
+    let store_path = StorePath::configured_at(&root);
     if !store_path.as_path().exists() {
         return Err(BenchError::msg(format!(
             "no persistent results store at {} — run `ay-bench run <eval>` first",
@@ -1986,6 +2035,8 @@ mod tests {
             timeout: None,
             output: None,
             runs: None,
+            shard_index: None,
+            shard_size: None,
             reference_solvers: Vec::new(),
             run_class: None,
             quiet: true,
@@ -2447,6 +2498,8 @@ inputs:
             timeout: None,
             output: None,
             runs: None,
+            shard_index: None,
+            shard_size: None,
             reference_solvers: Vec::new(),
             run_class: None,
             quiet: true,
@@ -2472,6 +2525,41 @@ inputs:
         assert!(validate_run_class(Some("laptop")).is_ok());
         let error = validate_run_class(Some("desktop")).expect_err("invalid class");
         assert!(error.to_string().contains("desktop"));
+    }
+
+    #[test]
+    fn shard_selection_requires_a_complete_bounded_pair() {
+        let none = test_run_args();
+        assert_eq!(shard_selection(&none).unwrap(), None);
+
+        let missing_size = RunArgs {
+            shard_index: Some(0),
+            ..test_run_args()
+        };
+        assert!(shard_selection(&missing_size).is_err());
+
+        let missing_index = RunArgs {
+            shard_size: Some(64),
+            ..test_run_args()
+        };
+        assert!(shard_selection(&missing_index).is_err());
+
+        let zero = RunArgs {
+            shard_index: Some(0),
+            shard_size: Some(0),
+            ..test_run_args()
+        };
+        assert!(shard_selection(&zero).is_err());
+
+        let selected = RunArgs {
+            shard_index: Some(7),
+            shard_size: Some(64),
+            ..test_run_args()
+        };
+        assert_eq!(
+            shard_selection(&selected).unwrap(),
+            Some(crate::native::NativeShardSelection { index: 7, size: 64 })
+        );
     }
 
     #[test]
@@ -2629,6 +2717,7 @@ inputs:
                     planner: "test".to_string(),
                 }),
                 resource_enforcement: Some(crate::resource::ENFORCEMENT_AY_MEMORY_V1.to_string()),
+                shard: None,
             },
             comparison: None,
             comparisons: None,

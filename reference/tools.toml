@@ -61,6 +61,6 @@ kind   = "checker"
 groups = ["audit", "smt"]
 source = "cargo"                    # cargo install --git <url> [--rev <commit>]
 url    = "https://github.com/ufmg-smite/carcara"
-commit = "81f0df827297245f1370353924784325d8adab51"  # upstream main, 2026-07-20
+commit = "9a352eea6c935ad35cb8ec22e521a7620ec5d474"  # upstream main, 2026-07-22; checked array rules
 bin    = "carcara"                  # lands in ~/.cargo/bin
 verify = ["carcara", "--version"]

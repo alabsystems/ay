@@ -239,6 +239,31 @@ pub(crate) struct NativeSettings {
     pub resource_plan: Option<crate::resource::ResourcePlan>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_enforcement: Option<String>,
+    /// Deterministic bounded slice of the fully preflighted corpus.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shard: Option<NativeShardMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct NativeShardMetadata {
+    /// Caller-provided cursor. This can exceed `shard_count` after a corpus
+    /// shrinks; `shard_index` records the normalized shard actually executed.
+    pub requested_index: usize,
+    pub shard_index: usize,
+    pub shard_size: usize,
+    pub shard_count: usize,
+    pub corpus_benchmark_count: usize,
+    pub selected_benchmark_count: usize,
+    /// Hash of the fully preflighted, sorted normalized benchmark identifiers.
+    /// Selected benchmark content hashes remain authoritative in `items`.
+    pub corpus_path_inventory_sha256: String,
+    pub selector: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeShardSelection {
+    pub index: usize,
+    pub size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -475,6 +500,7 @@ const PROOF_ARTIFACT_LIMIT_BYTES: u64 = 1024 * 1024;
 const MAX_BENCHMARK_RUNS: u32 = 10_000;
 const MAX_REFERENCE_SOLVERS: usize = 16;
 const MAX_REFERENCE_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const MAX_NATIVE_SHARD_SIZE: usize = 4096;
 
 /// Decompress a compressed benchmark to a temporary file under the same
 /// enforced RSS and wall-clock envelope as a solver child.
@@ -2340,6 +2366,9 @@ pub(crate) struct NativeRunArgs<'a> {
     pub with_features: bool,
     /// Pre-built file list. If set, skips directory discovery.
     pub file_list: Option<Vec<PathBuf>>,
+    /// Optional bounded shard selected after complete corpus preflight and
+    /// canonical normalized-ID sorting.
+    pub shard: Option<NativeShardSelection>,
     /// Number of runs per benchmark. The median-time run is selected.
     pub runs: u32,
     /// Reference solvers for comparison as (name, path) pairs, run in order.
@@ -2558,6 +2587,77 @@ fn preflight_native_benchmarks(args: &NativeRunArgs<'_>) -> Result<(PathBuf, Vec
     Ok((corpus_root, benchmarks))
 }
 
+fn apply_native_shard(
+    corpus_root: &Path,
+    benchmarks: Vec<PathBuf>,
+    selection: NativeShardSelection,
+) -> Result<(Vec<PathBuf>, NativeShardMetadata)> {
+    use sha2::{Digest as _, Sha256};
+
+    if selection.size == 0 || selection.size > MAX_NATIVE_SHARD_SIZE {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "native shard size must be in 1..={MAX_NATIVE_SHARD_SIZE}, got {}",
+                selection.size
+            ),
+        });
+    }
+    if benchmarks.is_empty() {
+        return Err(BenchError::msg(
+            "cannot select a shard from an empty benchmark corpus",
+        ));
+    }
+
+    let shard_count = (benchmarks.len() - 1) / selection.size + 1;
+    let shard_index = selection.index % shard_count;
+    let start = shard_index
+        .checked_mul(selection.size)
+        .ok_or_else(|| BenchError::msg("native shard start index overflow"))?;
+    let end = start
+        .checked_add(selection.size)
+        .map(|value| value.min(benchmarks.len()))
+        .ok_or_else(|| BenchError::msg("native shard end index overflow"))?;
+
+    let mut inventory = Sha256::new();
+    for benchmark in &benchmarks {
+        let benchmark_id = benchmark_identifier(benchmark, corpus_root)?;
+        let length = u64::try_from(benchmark_id.len())
+            .map_err(|_| BenchError::msg("benchmark identifier length overflow"))?;
+        inventory.update(length.to_be_bytes());
+        inventory.update(benchmark_id.as_bytes());
+    }
+    let selected = benchmarks[start..end].to_vec();
+    let metadata = NativeShardMetadata {
+        requested_index: selection.index,
+        shard_index,
+        shard_size: selection.size,
+        shard_count,
+        corpus_benchmark_count: benchmarks.len(),
+        selected_benchmark_count: selected.len(),
+        corpus_path_inventory_sha256: format!("sha256:{:x}", inventory.finalize()),
+        selector: "sorted-normalized-id-contiguous-v1",
+    };
+    Ok((selected, metadata))
+}
+
+fn validate_shard_feature_storage(
+    with_features: bool,
+    shard: Option<&NativeShardMetadata>,
+) -> Result<()> {
+    if with_features
+        && shard.is_some_and(|metadata| {
+            metadata.selected_benchmark_count < metadata.corpus_benchmark_count
+        })
+    {
+        return Err(BenchError::InvalidArgs {
+            reason: "--with-features cannot be combined with a partial corpus shard: \
+                     shard feature rows have no campaign-aware persistent store"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_reference_solvers(reference_solvers: &[(String, PathBuf)]) -> Result<()> {
     if reference_solvers.len() > MAX_REFERENCE_SOLVERS {
         return Err(BenchError::InvalidArgs {
@@ -2701,6 +2801,14 @@ pub(crate) fn run_native(args: &NativeRunArgs<'_>) -> Result<NativeResults> {
             args.benchmarks_dir.display()
         )));
     }
+    let (benchmarks, shard) = match args.shard {
+        Some(selection) => {
+            let (selected, metadata) = apply_native_shard(&corpus_root, benchmarks, selection)?;
+            (selected, Some(metadata))
+        }
+        None => (benchmarks, None),
+    };
+    validate_shard_feature_storage(args.with_features, shard.as_ref())?;
     validate_reference_solvers(&args.reference_solvers)?;
     let owned_ay_pinned = if args.pinned_ay.is_none() {
         Some(crate::environment::PinnedSolver::capture(
@@ -2982,6 +3090,7 @@ pub(crate) fn run_native(args: &NativeRunArgs<'_>) -> Result<NativeResults> {
             resource_enforcement: args.resources.as_ref().map(|_| {
                 crate::resource::ENFORCEMENT_AY_MEMORY_RSS_V1.to_string()
             }),
+            shard,
         },
         comparison,
         comparisons: first_comparison_items,
@@ -3237,6 +3346,7 @@ mod tests {
             quiet: true,
             with_features: false,
             file_list: Some(file_list),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: None,
@@ -3263,6 +3373,86 @@ mod tests {
         let error = preflight_native_benchmarks(&make_args(vec![first.clone(), first]))
             .expect_err("duplicate IDs must fail");
         assert!(error.to_string().contains("duplicate native benchmark ID"));
+    }
+
+    #[test]
+    fn native_shards_are_bounded_deterministic_and_complete() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut benchmarks = Vec::new();
+        for name in ["e.smt2", "a.smt2", "d.smt2", "b.smt2", "c.smt2"] {
+            let path = temp.path().join(name);
+            std::fs::write(&path, "(check-sat)\n").expect("benchmark");
+            benchmarks.push(path.canonicalize().expect("canonical benchmark"));
+        }
+        benchmarks.sort();
+        let corpus_root = temp.path().canonicalize().expect("canonical corpus");
+
+        let mut covered = Vec::new();
+        let mut inventory = None;
+        for index in 0..3 {
+            let (selected, metadata) = apply_native_shard(
+                &corpus_root,
+                benchmarks.clone(),
+                NativeShardSelection { index, size: 2 },
+            )
+            .expect("select shard");
+            assert!(selected.len() <= 2);
+            assert_eq!(metadata.shard_index, index);
+            assert_eq!(metadata.shard_count, 3);
+            assert_eq!(metadata.corpus_benchmark_count, 5);
+            assert_eq!(metadata.selected_benchmark_count, selected.len());
+            if let Some(expected) = inventory.as_ref() {
+                assert_eq!(&metadata.corpus_path_inventory_sha256, expected);
+            } else {
+                inventory = Some(metadata.corpus_path_inventory_sha256.clone());
+            }
+            covered.extend(selected);
+        }
+        covered.sort();
+        assert_eq!(covered, benchmarks);
+
+        let (wrapped, metadata) = apply_native_shard(
+            &corpus_root,
+            benchmarks,
+            NativeShardSelection { index: 8, size: 2 },
+        )
+        .expect("normalize stale cursor");
+        assert_eq!(metadata.requested_index, 8);
+        assert_eq!(metadata.shard_index, 2);
+        assert_eq!(wrapped.len(), 1);
+
+        assert!(apply_native_shard(
+            &corpus_root,
+            vec![temp.path().join("a.smt2")],
+            NativeShardSelection { index: 0, size: 0 },
+        )
+        .is_err());
+        assert!(apply_native_shard(
+            &corpus_root,
+            vec![temp.path().join("a.smt2")],
+            NativeShardSelection {
+                index: 0,
+                size: MAX_NATIVE_SHARD_SIZE + 1,
+            },
+        )
+        .is_err());
+
+        let full = NativeShardMetadata {
+            requested_index: 0,
+            shard_index: 0,
+            shard_size: 64,
+            shard_count: 1,
+            corpus_benchmark_count: 5,
+            selected_benchmark_count: 5,
+            corpus_path_inventory_sha256: "sha256:test".to_string(),
+            selector: "sorted-normalized-id-contiguous-v1",
+        };
+        assert!(validate_shard_feature_storage(true, Some(&full)).is_ok());
+        let partial = NativeShardMetadata {
+            selected_benchmark_count: 2,
+            ..full
+        };
+        assert!(validate_shard_feature_storage(true, Some(&partial)).is_err());
     }
 
     #[cfg(unix)]
@@ -3794,6 +3984,7 @@ mod tests {
             quiet: true,
             with_features: false,
             file_list: Some(vec![PathBuf::from("unused.smt2")]),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: None,
@@ -3835,6 +4026,7 @@ mod tests {
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark]),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: None,
@@ -3852,6 +4044,61 @@ mod tests {
         let item = results.items.first().expect("result item");
         assert_eq!(item.result, "sat");
         assert!(!item.solver_env.contains_key("AY_BENCH_UNRECORDED_SENTINEL"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_run_executes_only_selected_shard_and_records_full_inventory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let solver = write_solver_script(&temp, "solver.sh", "test solver", "sat");
+        let mut benchmarks = Vec::new();
+        for name in ["e.smt2", "a.smt2", "d.smt2", "b.smt2", "c.smt2"] {
+            let path = temp.path().join(name);
+            std::fs::write(&path, "(check-sat)\n").expect("benchmark");
+            benchmarks.push(path);
+        }
+
+        let results = run_native(&NativeRunArgs {
+            ay: &solver,
+            benchmarks_dir: temp.path(),
+            timeout_sec: 1.0,
+            domain: "smt",
+            quiet: true,
+            with_features: false,
+            file_list: Some(benchmarks),
+            shard: Some(NativeShardSelection { index: 1, size: 2 }),
+            runs: 1,
+            reference_solvers: Vec::new(),
+            run_class: None,
+            solver_args: Vec::new(),
+            sat_track: None,
+            sat_ai_class: None,
+            sat_variant: None,
+            environment: None,
+            pinned_ay: None,
+            artifact_output_dir: None,
+            resources: Some(test_resources()),
+        })
+        .expect("run native shard");
+
+        let paths: Vec<_> = results
+            .items
+            .iter()
+            .map(|item| {
+                Path::new(&item.benchmark_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("benchmark file name")
+            })
+            .collect();
+        assert_eq!(paths, ["c.smt2", "d.smt2"]);
+        let shard = results.settings.shard.expect("shard metadata");
+        assert_eq!(shard.requested_index, 1);
+        assert_eq!(shard.shard_index, 1);
+        assert_eq!(shard.shard_count, 3);
+        assert_eq!(shard.corpus_benchmark_count, 5);
+        assert_eq!(shard.selected_benchmark_count, 2);
+        assert!(shard.corpus_path_inventory_sha256.starts_with("sha256:"));
     }
 
     #[test]
@@ -4009,6 +4256,7 @@ mod tests {
             quiet: true,
             with_features: true,
             file_list: Some(vec![compressed]),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: None,
@@ -4222,6 +4470,7 @@ mod tests {
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark]),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: None,
@@ -4317,6 +4566,7 @@ mod tests {
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark]),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: None,
@@ -4412,6 +4662,7 @@ mod tests {
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark]),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: None,
@@ -4471,6 +4722,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark]),
+            shard: None,
             runs: 1,
             reference_solvers: vec![("fake-ref.sh".to_string(), reference.clone())],
             run_class: None,
@@ -4530,6 +4782,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark.clone()]),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: None,
@@ -4629,6 +4882,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark.clone()]),
+            shard: None,
             runs: 1,
             reference_solvers: vec![(crate::native::reference_display_name(&reference), reference)],
             run_class: None,
@@ -4694,6 +4948,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark.clone()]),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: None,
@@ -4830,6 +5085,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark]),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: None,
@@ -4898,6 +5154,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark]),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: None,
@@ -5287,6 +5544,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark]),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: None,
@@ -5331,6 +5589,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark]),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: None,
@@ -5395,6 +5654,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark]),
+            shard: None,
             runs: 1,
             reference_solvers: vec![
                 ("agree-ref".to_string(), agreeing.clone()),
@@ -5478,6 +5738,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark]),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: Some("laptop".to_string()),
@@ -5513,6 +5774,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
             quiet: true,
             with_features: false,
             file_list: Some(vec![tmp.path().join("unused.smt2")]),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: Some("desktop".to_string()),
@@ -5544,6 +5806,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
                 quiet: true,
                 with_features: false,
                 file_list: Some(vec![tmp.path().join("unused.smt2")]),
+                shard: None,
                 runs: 1,
                 reference_solvers: Vec::new(),
                 run_class: None,
@@ -5586,6 +5849,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark]),
+            shard: None,
             runs: 1,
             reference_solvers: Vec::new(),
             run_class: None,
@@ -5631,6 +5895,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
             quiet: true,
             with_features: false,
             file_list: Some(vec![benchmark]),
+            shard: None,
             runs: 1,
             reference_solvers: vec![("fake-ref.sh".to_string(), reference)],
             run_class: Some("replay".to_string()),

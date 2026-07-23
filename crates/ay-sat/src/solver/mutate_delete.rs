@@ -461,6 +461,9 @@ impl Solver {
         if !self.arena.is_active(clause_idx) {
             return DeleteResult::Skipped;
         }
+        if self.is_pending_theory_conflict_clause(clause_idx) {
+            return DeleteResult::Skipped;
+        }
         if !self.lrat_clause_unit_rederivations_ready_for_delete(clause_idx) {
             return DeleteResult::Skipped;
         }

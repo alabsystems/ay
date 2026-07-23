@@ -1,0 +1,12 @@
+[Unit]
+Description=Run AY continuous benchmarks roughly every four hours
+
+[Timer]
+OnCalendar=*-*-* 00/4:00:00
+RandomizedDelaySec=15min
+Persistent=true
+AccuracySec=1min
+Unit=ay-continuous-benchmark.service
+
+[Install]
+WantedBy=timers.target

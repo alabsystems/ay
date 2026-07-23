@@ -77,12 +77,12 @@ use ay_dpll::api::{Sort, Term, TermKind};
 use super::model_params::Z3_model_eval;
 use super::solver::{check_solver_handle, is_unit_literal, DimacsEncoder, Z3_solver_get_model};
 use super::{
-    ast_to_term, cache_ast_vector, cache_func_decl_with_symbol, ffi_count_within_limit,
-    ffi_counts_within_limit, ffi_guard_ast, ffi_guard_int, ffi_guard_ptr, ffi_guard_void,
-    ffi_try_declare_function, record_ast_sort, term_to_ast, ParamDescr, ParamDescrsHandle,
-    SymbolKey, Z3Context, Z3_ast, Z3_ast_vector, Z3_context, Z3_func_decl, Z3_param_descrs,
-    Z3_solver, Z3_sort, Z3_symbol, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_TRUE,
-    Z3_L_UNDEF, Z3_OK, Z3_PK_UINT, Z3_SORT_ERROR,
+    cache_ast_vector, cache_func_decl_with_symbol, ffi_count_within_limit, ffi_counts_within_limit,
+    ffi_guard_ast, ffi_guard_int, ffi_guard_ptr, ffi_guard_void, ffi_try_declare_function,
+    record_ast_sort, require_term_ast, require_term_ast_or_return, term_to_ast, ParamDescr,
+    ParamDescrsHandle, SymbolKey, Z3Context, Z3_ast, Z3_ast_vector, Z3_context, Z3_func_decl,
+    Z3_param_descrs, Z3_solver, Z3_sort, Z3_symbol, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_INVALID_USAGE,
+    Z3_L_TRUE, Z3_L_UNDEF, Z3_OK, Z3_PK_UINT, Z3_SORT_ERROR,
 };
 
 // ============================================================================
@@ -366,9 +366,29 @@ pub(crate) unsafe fn user_propagator_check(
                 )
             };
         }
+        // Convert registered terms to ASTs under a SCOPED context borrow,
+        // released before the raw model-eval calls below (the surrounding
+        // section's no-outstanding-borrow invariant).
+        let term_asts: Vec<(Term, Z3_ast)> = {
+            // SAFETY: same invariant as ffi_guard_*: `c` is a live context
+            // pointer and no other borrow is outstanding in this block.
+            let Some(ctx) = (unsafe { c.as_mut() }) else {
+                return unsafe {
+                    propagator_unknown(
+                        c,
+                        s,
+                        "user propagator: context unavailable for term \
+                         conversion — fail-closed",
+                    )
+                };
+            };
+            registered
+                .iter()
+                .map(|&t| (t, term_to_ast(ctx, t)))
+                .collect()
+        };
         let mut raw_values: Vec<(Term, Z3_ast, Z3_ast)> = Vec::with_capacity(registered.len());
-        for &t in &registered {
-            let t_ast = term_to_ast(t);
+        for &(t, t_ast) in &term_asts {
             let mut v: Z3_ast = 0;
             // SAFETY: no outstanding context borrow; `model` is a live handle
             // from this context's arena; `&mut v` is a valid out-slot.
@@ -393,7 +413,13 @@ pub(crate) unsafe fn user_propagator_check(
         let classified = unsafe {
             ffi_guard_int(c, 0, |ctx| {
                 for &(t, t_ast, v_ast) in &raw_values {
-                    let v_term = ast_to_term(v_ast);
+                    let v_term = require_term_ast_or_return!(
+                        ctx,
+                        v_ast,
+                        "user propagator model-value classification",
+                        "model value",
+                        0
+                    );
                     let is_value =
                         ctx.solver.is_numeral(v_term) || ctx.solver.bool_value(v_term).is_some();
                     let sort = ctx.solver.term_sort(t);
@@ -602,22 +628,33 @@ fn build_lemma(
     eqs: &[(Z3_ast, Z3_ast)],
     conseq: Z3_ast,
 ) -> Option<Term> {
-    if conseq == 0 {
-        return None;
-    }
-    let mut just: Vec<Term> = Vec::with_capacity(fixed.len() + eqs.len());
+    // Authenticate every caller-originating handle before interning any lemma
+    // nodes, keeping failure atomic even when a later justification is invalid.
+    let mut fixed_terms: Vec<(Term, Term)> = Vec::with_capacity(fixed.len());
     for &f in fixed {
         let &v = values.get(&f)?;
-        let eq = ctx.solver.eq(ast_to_term(f), ast_to_term(v));
-        just.push(eq);
+        let f_term = require_term_ast(ctx, f, "user propagator consequence", "fixed term")?;
+        let v_term = require_term_ast(ctx, v, "user propagator consequence", "fixed value")?;
+        fixed_terms.push((f_term, v_term));
     }
+    let mut equality_terms: Vec<(Term, Term)> = Vec::with_capacity(eqs.len());
     for &(l, r) in eqs {
-        if l == 0 || r == 0 {
-            return None;
-        }
-        just.push(ctx.solver.eq(ast_to_term(l), ast_to_term(r)));
+        let l_term = require_term_ast(ctx, l, "user propagator consequence", "equality lhs")?;
+        let r_term = require_term_ast(ctx, r, "user propagator consequence", "equality rhs")?;
+        equality_terms.push((l_term, r_term));
     }
-    let conseq_term = ast_to_term(conseq);
+    let conseq_term = require_term_ast(ctx, conseq, "user propagator consequence", "consequence")?;
+    let mut just: Vec<Term> = Vec::with_capacity(fixed.len() + eqs.len());
+    just.extend(
+        fixed_terms
+            .into_iter()
+            .map(|(fixed_term, value_term)| ctx.solver.eq(fixed_term, value_term)),
+    );
+    just.extend(
+        equality_terms
+            .into_iter()
+            .map(|(lhs, rhs)| ctx.solver.eq(lhs, rhs)),
+    );
     Some(if just.is_empty() {
         conseq_term
     } else {
@@ -637,7 +674,6 @@ fn build_lemma(
 /// borrow; `s`, when non-null, a live solver handle. Callback contract as in
 /// [`user_propagator_check`].
 unsafe fn register_terms_and_fire_created(c: Z3_context, s: Z3_solver, queue: Vec<Z3_ast>) -> bool {
-    let _ = c;
     let mut queue = queue;
     let mut changed = false;
     // Defensive bound on recursive registration cascades.
@@ -655,7 +691,19 @@ unsafe fn register_terms_and_fire_created(c: Z3_context, s: Z3_solver, queue: Ve
         let Some(prop) = handle.propagator.as_mut() else {
             return changed;
         };
-        let term = ast_to_term(ast);
+        let term = {
+            // SAFETY: callers guarantee `c` is live and no context borrow is
+            // outstanding. This borrow ends before `created_eh` can re-enter.
+            let Some(ctx) = (unsafe { c.as_mut() }) else {
+                return changed;
+            };
+            let Some(term) =
+                require_term_ast(ctx, ast, "Z3_solver_propagate_register", "registered term")
+            else {
+                return changed;
+            };
+            term
+        };
         if prop.registered.contains(&term) {
             continue;
         }
@@ -912,7 +960,7 @@ pub unsafe extern "C" fn Z3_solver_congruence_explain(
             if a == b {
                 // Congruent with the empty explanation.
                 let t = ctx.solver.bool_const(true);
-                let ast = term_to_ast(t);
+                let ast = term_to_ast(ctx, t);
                 record_ast_sort(ctx, ast, Sort::Bool);
                 ast
             } else {
@@ -994,7 +1042,7 @@ pub unsafe extern "C" fn Z3_solver_cube(
                         .into_iter()
                         .map(|(atom, positive)| {
                             let t = if positive { atom } else { ctx.solver.not(atom) };
-                            let ast = term_to_ast(t);
+                            let ast = term_to_ast(ctx, t);
                             record_ast_sort(ctx, ast, Sort::Bool);
                             ast
                         })
@@ -1167,19 +1215,28 @@ pub unsafe extern "C" fn Z3_solver_get_levels(
                 .into_iter()
                 .filter(|&t| is_unit_literal(ctx, t))
                 .collect();
+            let mut queried_terms: Vec<Option<Term>> = Vec::with_capacity(sz as usize);
             for i in 0..sz as usize {
-                let level = queried
-                    .get(i)
-                    .copied()
-                    .filter(|&a| a != 0)
-                    .map(ast_to_term)
-                    .map_or(c_uint::MAX, |t| {
-                        if unit_set.contains(&t) {
-                            0
-                        } else {
-                            c_uint::MAX
-                        }
-                    });
+                let ast = queried.get(i).copied().unwrap_or(0);
+                if ast == 0 {
+                    queried_terms.push(None);
+                } else {
+                    let Some(term) =
+                        require_term_ast(ctx, ast, "Z3_solver_get_levels", "queried literal")
+                    else {
+                        return;
+                    };
+                    queried_terms.push(Some(term));
+                }
+            }
+            for (i, term) in queried_terms.into_iter().enumerate() {
+                let level = term.map_or(c_uint::MAX, |t| {
+                    if unit_set.contains(&t) {
+                        0
+                    } else {
+                        c_uint::MAX
+                    }
+                });
                 // SAFETY: `levels` was null-checked when `sz > 0`; the caller's
                 // contract guarantees it points to at least `sz` elements, so
                 // `levels.add(i)` is in-bounds and writable.
@@ -1265,14 +1322,26 @@ pub unsafe extern "C" fn Z3_solver_solve_for(
                 flatten_top_conjuncts(ctx, a, &mut conjuncts);
             }
             let queried: Vec<Z3_ast> = (*variables).asts.clone();
+            let mut queried_terms: Vec<Option<Term>> = Vec::with_capacity(queried.len());
+            for &var_ast in &queried {
+                if var_ast == 0 {
+                    queried_terms.push(None);
+                    continue;
+                }
+                let Some(term) =
+                    require_term_ast(ctx, var_ast, "Z3_solver_solve_for", "queried variable")
+                else {
+                    return;
+                };
+                queried_terms.push(Some(term));
+            }
             let mut solved_vars: Vec<Z3_ast> = Vec::new();
             let mut solved_terms: Vec<Z3_ast> = Vec::new();
             let mut solved_guards: Vec<Z3_ast> = Vec::new();
-            for &var_ast in &queried {
-                if var_ast == 0 {
+            for (&var_ast, v) in queried.iter().zip(queried_terms) {
+                let Some(v) = v else {
                     continue;
-                }
-                let v = ast_to_term(var_ast);
+                };
                 if !matches!(ctx.solver.term_kind(v), TermKind::Var { .. }) {
                     continue; // not a variable: honestly unsolved, dropped
                 }
@@ -1302,10 +1371,10 @@ pub unsafe extern "C" fn Z3_solver_solve_for(
                 }
                 if let Some(t) = solution {
                     let sort = ctx.solver.sort_of(t);
-                    let t_ast = term_to_ast(t);
+                    let t_ast = term_to_ast(ctx, t);
                     record_ast_sort(ctx, t_ast, sort);
                     let tru = ctx.solver.bool_const(true);
-                    let tru_ast = term_to_ast(tru);
+                    let tru_ast = term_to_ast(ctx, tru);
                     record_ast_sort(ctx, tru_ast, Sort::Bool);
                     solved_vars.push(var_ast);
                     solved_terms.push(t_ast);
@@ -1607,11 +1676,6 @@ pub unsafe extern "C" fn Z3_solver_propagate_register(c: Z3_context, s: Z3_solve
     // SAFETY: `ffi_guard_void` guards `c`; `s` is only null-checked here.
     unsafe {
         ffi_guard_void(c, |ctx| {
-            if e == 0 {
-                ctx.last_error = Z3_INVALID_ARG;
-                ctx.error_msg = Some("Z3_solver_propagate_register: null AST".to_string());
-                return;
-            }
             // SAFETY: scoped read-only null-check of the handle.
             let has_prop = s.as_ref().is_some_and(|h| h.propagator.is_some());
             if !has_prop {
@@ -1623,6 +1687,12 @@ pub unsafe extern "C" fn Z3_solver_propagate_register(c: Z3_context, s: Z3_solve
                 );
                 return;
             }
+            let _term = require_term_ast_or_return!(
+                ctx,
+                e,
+                "Z3_solver_propagate_register",
+                "registered term",
+            );
             ctx.last_error = Z3_OK;
             valid = true;
         });

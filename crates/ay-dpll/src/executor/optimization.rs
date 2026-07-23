@@ -221,8 +221,10 @@ impl Executor {
         // first ordinary `check_sat` probe. Apply the dense-BV boundary to the
         // hard and soft DAGs up front so native oversized terms cannot make
         // that preprocessing needlessly expand an unsupported problem.
-        let mut solve_roots = self.ctx.assertions.clone();
-        solve_roots.extend(softs.iter().map(|soft| soft.term));
+        let solve_roots = self.public_solve_roots(&[]);
+        if let Some(result) = self.reject_array_ext_witness_capture(&solve_roots) {
+            return Ok(result);
+        }
         if let Some(result) = self.reject_unsupported_bitvector_width(&solve_roots) {
             return Ok(result);
         }
@@ -1387,8 +1389,10 @@ impl Executor {
         // ordinary guarded boundary. Scan both hard assertions and objective
         // DAGs here so a native oversized BV objective cannot reach model
         // construction or the finite-domain binary search.
-        let mut solve_roots = self.ctx.assertions.clone();
-        solve_roots.extend(self.ctx.objectives().iter().map(|objective| objective.term));
+        let solve_roots = self.public_solve_roots(&[]);
+        if let Some(result) = self.reject_array_ext_witness_capture(&solve_roots) {
+            return Ok(result);
+        }
         if let Some(result) = self.reject_unsupported_bitvector_width(&solve_roots) {
             return Ok(result);
         }
@@ -1403,7 +1407,7 @@ impl Executor {
         // deadline-aware theory probes (e.g. the IntSat fixpoint) ran
         // unbounded inside the blocking-constraint loop.
         let previous_deadline = self.install_timeout_deadline_for_call();
-        let result = self.optimize_check_sat_inner();
+        let mut result = self.optimize_check_sat_inner();
         self.restore_timeout_deadline_after_call(previous_deadline);
         if result.is_err() {
             // Any objective lane can fail after successful assumption probes.
@@ -1411,6 +1415,9 @@ impl Executor {
             // an errored PUBLIC optimization query admits none of them.
             self.invalidate_last_check_result();
         }
+        result = result.map(|solve_result| {
+            self.quarantine_unverified_nested_array_unsat(&solve_roots, solve_result)
+        });
         result
     }
 

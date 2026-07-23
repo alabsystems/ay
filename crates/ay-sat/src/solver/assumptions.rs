@@ -572,13 +572,10 @@ impl Solver {
             // rediscovered the identical theory conflict forever (livelock on
             // pushed pure-theory-UNSAT prefixes). Consume it here exactly like
             // the theory-backend fixpoint does, with the same #8480 staleness
-            // validation (discard when backtracking un-falsified it).
-            let assume_pending_conflict = self.take_pending_theory_conflict().filter(|cr| {
-                self.arena
-                    .literals(cr.0 as usize)
-                    .iter()
-                    .all(|&lit| self.lit_val(lit) < 0)
-            });
+            // validation. The centralized drain also skips every stale queue
+            // head before returning a later live conflict, so a stale clause
+            // cannot hide a live one long enough for a new decision.
+            let assume_pending_conflict = self.take_live_pending_theory_conflict();
 
             // Propagate — search-specialized BCP (no probe/vivify overhead).
             if let Some(conflict_ref) = assume_pending_conflict.or_else(|| self.search_propagate())
@@ -861,6 +858,21 @@ impl Solver {
                                 .declare_assume_unknown_with_reason(SatUnknownReason::TheoryStop);
                         }
                     }
+                }
+
+                // A theory callback may add clauses directly and still return
+                // `Continue`. In particular, a false or true-above-root unit
+                // is queued for mandatory root installation, while an
+                // unassigned unit is both queued and immediately enqueued.
+                // Re-enter the top-of-loop pending-work/BCP path before any
+                // restart, decision, or SAT completion. This also makes an
+                // empty lemma fail closed instead of validating a model
+                // against formula state the search never consumed.
+                if self.has_empty_clause
+                    || !self.pending_theory_conflicts.is_empty()
+                    || self.qhead < self.trail.len()
+                {
+                    continue;
                 }
 
                 // All assumptions set, continue with regular solving

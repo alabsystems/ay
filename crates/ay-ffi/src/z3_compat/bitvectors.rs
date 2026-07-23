@@ -13,8 +13,8 @@ use std::ffi::c_uint;
 use ay_dpll::api::Sort;
 
 use super::{
-    ast_to_term, ffi_guard_ast, lookup_ast_sort, record_ast_sort, term_to_ast, Z3Context, Z3_ast,
-    Z3_context, MAX_FFI_BITVECTOR_WIDTH, Z3_INVALID_ARG,
+    ffi_guard_ast, lookup_ast_sort, record_ast_sort, require_term_ast_or_return, term_to_ast,
+    Z3Context, Z3_ast, Z3_context, MAX_FFI_BITVECTOR_WIDTH, Z3_INVALID_ARG,
 };
 
 fn accept_bv_width(ctx: &mut Z3Context, operation: &str, width: u32) -> bool {
@@ -52,8 +52,12 @@ macro_rules! bv_binary_op {
             // unwinding panic so it cannot cross the FFI boundary.
             unsafe {
                 ffi_guard_ast(c, |ctx| {
-                    let t = ctx.solver.$method(ast_to_term(t1), ast_to_term(t2));
-                    let a = term_to_ast(t);
+                    let t1_term =
+                        require_term_ast_or_return!(ctx, t1, stringify!($name), "left operand", 0);
+                    let t2_term =
+                        require_term_ast_or_return!(ctx, t2, stringify!($name), "right operand", 0);
+                    let t = ctx.solver.$method(t1_term, t2_term);
+                    let a = term_to_ast(ctx, t);
                     if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
                         record_ast_sort(ctx, a, sort);
                     }
@@ -93,9 +97,11 @@ pub unsafe extern "C" fn Z3_mk_bvnand(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> 
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let and_t = ctx.solver.bvand(ast_to_term(t1), ast_to_term(t2));
+            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_bvnand", "left operand", 0);
+            let t2_term = require_term_ast_or_return!(ctx, t2, "Z3_mk_bvnand", "right operand", 0);
+            let and_t = ctx.solver.bvand(t1_term, t2_term);
             let t = ctx.solver.bvnot(and_t);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
                 record_ast_sort(ctx, a, sort);
             }
@@ -116,9 +122,11 @@ pub unsafe extern "C" fn Z3_mk_bvnor(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> Z
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let or_t = ctx.solver.bvor(ast_to_term(t1), ast_to_term(t2));
+            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_bvnor", "left operand", 0);
+            let t2_term = require_term_ast_or_return!(ctx, t2, "Z3_mk_bvnor", "right operand", 0);
+            let or_t = ctx.solver.bvor(t1_term, t2_term);
             let t = ctx.solver.bvnot(or_t);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
                 record_ast_sort(ctx, a, sort);
             }
@@ -139,9 +147,11 @@ pub unsafe extern "C" fn Z3_mk_bvxnor(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> 
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let xor_t = ctx.solver.bvxor(ast_to_term(t1), ast_to_term(t2));
+            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_bvxnor", "left operand", 0);
+            let t2_term = require_term_ast_or_return!(ctx, t2, "Z3_mk_bvxnor", "right operand", 0);
+            let xor_t = ctx.solver.bvxor(t1_term, t2_term);
             let t = ctx.solver.bvnot(xor_t);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
                 record_ast_sort(ctx, a, sort);
             }
@@ -165,8 +175,12 @@ macro_rules! bv_compare_op {
             // unwinding panic so it cannot cross the FFI boundary.
             unsafe {
                 ffi_guard_ast(c, |ctx| {
-                    let t = ctx.solver.$method(ast_to_term(t1), ast_to_term(t2));
-                    let a = term_to_ast(t);
+                    let t1 =
+                        require_term_ast_or_return!(ctx, t1, stringify!($name), "left operand", 0);
+                    let t2 =
+                        require_term_ast_or_return!(ctx, t2, stringify!($name), "right operand", 0);
+                    let t = ctx.solver.$method(t1, t2);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::Bool);
                     a
                 })
@@ -198,8 +212,9 @@ pub unsafe extern "C" fn Z3_mk_bvnot(c: Z3_context, t1: Z3_ast) -> Z3_ast {
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.bvnot(ast_to_term(t1));
-            let a = term_to_ast(t);
+            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_bvnot", "operand", 0);
+            let t = ctx.solver.bvnot(t1_term);
+            let a = term_to_ast(ctx, t);
             if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
                 record_ast_sort(ctx, a, sort);
             }
@@ -220,8 +235,9 @@ pub unsafe extern "C" fn Z3_mk_bvneg(c: Z3_context, t1: Z3_ast) -> Z3_ast {
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.bvneg(ast_to_term(t1));
-            let a = term_to_ast(t);
+            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_bvneg", "operand", 0);
+            let t = ctx.solver.bvneg(t1_term);
+            let a = term_to_ast(ctx, t);
             if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
                 record_ast_sort(ctx, a, sort);
             }
@@ -258,8 +274,10 @@ pub unsafe extern "C" fn Z3_mk_concat(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> 
             if !accept_bv_width(ctx, "Z3_mk_concat", result_width) {
                 return 0;
             }
-            let t = ctx.solver.bvconcat(ast_to_term(t1), ast_to_term(t2));
-            let a = term_to_ast(t);
+            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_concat", "left operand", 0);
+            let t2_term = require_term_ast_or_return!(ctx, t2, "Z3_mk_concat", "right operand", 0);
+            let t = ctx.solver.bvconcat(t1_term, t2_term);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::bitvec(result_width));
             a
         })
@@ -308,8 +326,9 @@ pub unsafe extern "C" fn Z3_mk_extract(
             if !accept_bv_width(ctx, "Z3_mk_extract", width) {
                 return 0;
             }
-            let t = ctx.solver.bvextract(ast_to_term(t1), high, low);
-            let a = term_to_ast(t);
+            let t1 = require_term_ast_or_return!(ctx, t1, "Z3_mk_extract", "operand", 0);
+            let t = ctx.solver.bvextract(t1, high, low);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::bitvec(width));
             a
         })
@@ -339,8 +358,9 @@ pub unsafe extern "C" fn Z3_mk_sign_ext(c: Z3_context, i: c_uint, t1: Z3_ast) ->
             if !accept_bv_width(ctx, "Z3_mk_sign_ext", result_width) {
                 return 0;
             }
-            let t = ctx.solver.bvsignext(ast_to_term(t1), i);
-            let a = term_to_ast(t);
+            let t1 = require_term_ast_or_return!(ctx, t1, "Z3_mk_sign_ext", "operand", 0);
+            let t = ctx.solver.bvsignext(t1, i);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::bitvec(result_width));
             a
         })
@@ -370,8 +390,9 @@ pub unsafe extern "C" fn Z3_mk_zero_ext(c: Z3_context, i: c_uint, t1: Z3_ast) ->
             if !accept_bv_width(ctx, "Z3_mk_zero_ext", result_width) {
                 return 0;
             }
-            let t = ctx.solver.bvzeroext(ast_to_term(t1), i);
-            let a = term_to_ast(t);
+            let t1 = require_term_ast_or_return!(ctx, t1, "Z3_mk_zero_ext", "operand", 0);
+            let t = ctx.solver.bvzeroext(t1, i);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::bitvec(result_width));
             a
         })
@@ -401,8 +422,9 @@ pub unsafe extern "C" fn Z3_mk_repeat(c: Z3_context, i: c_uint, t1: Z3_ast) -> Z
             if !accept_bv_width(ctx, "Z3_mk_repeat", result_width) {
                 return 0;
             }
-            let t = ctx.solver.bvrepeat(ast_to_term(t1), i);
-            let a = term_to_ast(t);
+            let t1 = require_term_ast_or_return!(ctx, t1, "Z3_mk_repeat", "operand", 0);
+            let t = ctx.solver.bvrepeat(t1, i);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::bitvec(result_width));
             a
         })
@@ -421,8 +443,9 @@ pub unsafe extern "C" fn Z3_mk_rotate_left(c: Z3_context, i: c_uint, t1: Z3_ast)
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.bvrotl(ast_to_term(t1), i);
-            let a = term_to_ast(t);
+            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_rotate_left", "operand", 0);
+            let t = ctx.solver.bvrotl(t1_term, i);
+            let a = term_to_ast(ctx, t);
             if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
                 record_ast_sort(ctx, a, sort);
             }
@@ -443,8 +466,9 @@ pub unsafe extern "C" fn Z3_mk_rotate_right(c: Z3_context, i: c_uint, t1: Z3_ast
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.bvrotr(ast_to_term(t1), i);
-            let a = term_to_ast(t);
+            let t1_term = require_term_ast_or_return!(ctx, t1, "Z3_mk_rotate_right", "operand", 0);
+            let t = ctx.solver.bvrotr(t1_term, i);
+            let a = term_to_ast(ctx, t);
             if let Some(sort) = lookup_ast_sort(ctx, t1).cloned() {
                 record_ast_sort(ctx, a, sort);
             }
@@ -467,11 +491,13 @@ pub unsafe extern "C" fn Z3_mk_bvcomp(c: Z3_context, t1: Z3_ast, t2: Z3_ast) -> 
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let eq_term = ctx.solver.eq(ast_to_term(t1), ast_to_term(t2));
+            let t1 = require_term_ast_or_return!(ctx, t1, "Z3_mk_bvcomp", "left operand", 0);
+            let t2 = require_term_ast_or_return!(ctx, t2, "Z3_mk_bvcomp", "right operand", 0);
+            let eq_term = ctx.solver.eq(t1, t2);
             let one = ctx.solver.bv_const(1, 1);
             let zero = ctx.solver.bv_const(0, 1);
             let t = ctx.solver.ite(eq_term, one, zero);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::bitvec(1));
             a
         })
@@ -494,12 +520,13 @@ pub unsafe extern "C" fn Z3_mk_bv2int(c: Z3_context, t1: Z3_ast, is_signed: bool
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let t1 = require_term_ast_or_return!(ctx, t1, "Z3_mk_bv2int", "operand", 0);
             let t = if is_signed {
-                ctx.solver.bv2int_signed(ast_to_term(t1))
+                ctx.solver.bv2int_signed(t1)
             } else {
-                ctx.solver.bv2int(ast_to_term(t1))
+                ctx.solver.bv2int(t1)
             };
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Int);
             a
         })
@@ -521,8 +548,9 @@ pub unsafe extern "C" fn Z3_mk_int2bv(c: Z3_context, n: c_uint, t1: Z3_ast) -> Z
             if !accept_bv_width(ctx, "Z3_mk_int2bv", n) {
                 return 0;
             }
-            let t = ctx.solver.int2bv(ast_to_term(t1), n);
-            let a = term_to_ast(t);
+            let t1 = require_term_ast_or_return!(ctx, t1, "Z3_mk_int2bv", "operand", 0);
+            let t = ctx.solver.int2bv(t1, n);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::bitvec(n));
             a
         })

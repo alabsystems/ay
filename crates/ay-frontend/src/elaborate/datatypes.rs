@@ -373,6 +373,17 @@ impl Context {
     ) -> Result<()> {
         // Validate datatype name and all constructor/selector names
         Self::validate_datatype_names(Some(name), datatype_dec)?;
+        // IDEMPOTENT re-declaration: adopt an EXACTLY-identical datatype
+        // re-declaration as a no-op, mirroring `try_declare_fun`'s adopt-identical
+        // embedder contract (an embedder that sets up its datatypes once and then
+        // re-asserts a canonical declaration before each selector/match use should
+        // not have to track what it already declared). SOUND — only an exact
+        // `DatatypeDec` match is adopted; a plain-sort redeclaration (the
+        // wrong-UNSAT class) or a DIFFERENT datatype of the same name still falls
+        // through to `check_datatype_sort_redeclaration` below.
+        if self.monomorphic_datatype_decs.get(name) == Some(datatype_dec) {
+            return Ok(());
+        }
         // Reject re-declaring an existing sort name (#reserved-ops reverse
         // gate; see `check_datatype_sort_redeclaration`).
         self.check_datatype_sort_redeclaration(name)?;
@@ -405,6 +416,10 @@ impl Context {
             .map(|c| c.name.clone())
             .collect();
         self.datatypes.insert(name.to_string(), ctor_names);
+        // Retain the full declaration so an exactly-identical re-declaration is
+        // adopted as a no-op above (removed on scope pop alongside `datatypes`).
+        self.monomorphic_datatype_decs
+            .insert(name.to_string(), datatype_dec.clone());
 
         // Track datatype and its sort in current scope for push/pop.
         self.track_scoped_datatype(name.to_string());

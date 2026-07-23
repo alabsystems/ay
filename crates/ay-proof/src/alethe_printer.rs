@@ -48,6 +48,33 @@ pub enum AlethePrintError {
         /// Exact fail-closed structural reason.
         reason: String,
     },
+    /// A checked internal ROW lemma has no sound translation to the supported
+    /// external array-rule shape.
+    #[error("invalid array proof step {id}: {reason}")]
+    InvalidArrayStep {
+        /// Identifier of the unsupported or malformed ROW step.
+        id: ProofId,
+        /// Exact fail-closed reason.
+        reason: String,
+    },
+    /// Surface rewriting changed a congruence step into a shape the external
+    /// checker cannot justify, and no exact certified bridge applied.
+    #[error("invalid surface congruence step {id}: {reason}")]
+    InvalidCongruenceStep {
+        /// Identifier of the malformed step.
+        id: ProofId,
+        /// Exact fail-closed reason.
+        reason: String,
+    },
+    /// Surface syntax changed a checked internal rule into an external
+    /// resolution/tautology whose pivot or connective no longer matches.
+    #[error("invalid surface proof step {id}: {reason}")]
+    InvalidSurfaceStep {
+        /// Identifier of the malformed step.
+        id: ProofId,
+        /// Exact fail-closed reason.
+        reason: String,
+    },
     /// An `la_generic` / `lia_generic` step is missing its Farkas coefficient
     /// annotation. Carcara rejects these rules without `:args`, and the
     /// printer will not silently fall back to `:rule trust`.
@@ -65,6 +92,23 @@ pub enum AlethePrintError {
         kind: &'static str,
         /// 0-based index of the offending step in the proof.
         step: u32,
+    },
+    /// AY's internal array-extensionality certificate has no sound stock
+    /// Alethe/Carcara rendering yet.
+    ///
+    /// Carcara's `arrays_ext` rule requires a disequality premise and a unit
+    /// conclusion whose index is the rule's exact choice term. AY instead
+    /// stores a two-literal conservative-extension clause over a separately
+    /// declared fresh witness; the internal `array_ext_diff_intro` provenance
+    /// is only a comment in Alethe output. Emitting `:rule extensionality` (or
+    /// merely renaming it to `arrays_ext`) would therefore be unverifiable.
+    #[error(
+        "array extensionality lemma {id} has no verifiable Alethe/Carcara translation; \
+         refusing to emit the unsupported `extensionality` rule"
+    )]
+    UnsupportedArrayExtensionality {
+        /// Identifier of the theory-lemma step that cannot be rendered.
+        id: ProofId,
     },
     /// The synthesized-default emission work budget was exhausted (#A2b).
     ///
@@ -758,8 +802,9 @@ impl<'a> AlethePrinter<'a> {
     /// Format a proof step as an Alethe command.
     ///
     /// Returns `Err(AlethePrintError)` when the step cannot be rendered as a
-    /// verifiable rule — currently this only fires for `LraFarkas` / `LiaGeneric`
-    /// theory lemmas that are missing their `FarkasAnnotation` (#8821). The
+    /// verifiable rule — including `LraFarkas` / `LiaGeneric` theory lemmas
+    /// missing their `FarkasAnnotation` (#8821) and array-extensionality lemmas
+    /// whose internal witness provenance has no stock Alethe translation. The
     /// caller is responsible for deciding how to handle the error: tests /
     /// `try_export_alethe` surface it directly; the backwards-compatible
     /// `export_alethe` path emits a clearly-marked unverifiable document and
@@ -780,7 +825,7 @@ impl<'a> AlethePrinter<'a> {
                 pivot,
                 clause1,
                 clause2,
-            } => Ok(self.format_resolution_step(id, clause, *pivot, *clause1, *clause2)),
+            } => self.format_resolution_step(id, clause, *pivot, *clause1, *clause2),
             ProofStep::TheoryLemma {
                 theory,
                 clause,
@@ -825,7 +870,7 @@ impl<'a> AlethePrinter<'a> {
                 clause,
                 premises,
                 args,
-            } => Ok(self.format_generic_step(id, rule, clause, premises, args)),
+            } => self.format_generic_step(id, rule, clause, premises, args),
             ProofStep::Anchor {
                 end_step,
                 variables,
@@ -899,7 +944,7 @@ impl<'a> AlethePrinter<'a> {
         pivot: TermId,
         clause1: ProofId,
         clause2: ProofId,
-    ) -> String {
+    ) -> Result<String, AlethePrintError> {
         // A binary `(distinct a b)` literal is AY's internal spelling of
         // `(not (= a b))`, but Carcara's resolution treats it as an opaque
         // atom, so a resolution that cancels `(distinct a b)` against an
@@ -907,24 +952,87 @@ impl<'a> AlethePrinter<'a> {
         // Bridge it honestly with `distinct_elim` (+ `symm` for the swapped
         // argument order) before falling through to the generic rendering.
         if let Some(text) = self.distinct_eq_resolution_bridge(id, clause, clause1, clause2) {
-            return text;
+            return Ok(text);
+        }
+        if self.surface_resolution_needs_distinct_bridge(clause, Some(pivot), clause1, clause2) {
+            return Err(AlethePrintError::InvalidSurfaceStep {
+                id,
+                reason:
+                    "a printed distinct/equality pivot cannot be bridged to the authored operands"
+                        .to_string(),
+            });
         }
         if let Some((left, right)) =
             self.surface_order_resolution_pair(clause, pivot, clause1, clause2)
         {
-            return format!(
+            return Ok(format!(
                 "(step {id}.ord (cl (not {left}) (not {right})) :rule la_generic :args (1 1))\n\
                  (step {id} {} :rule resolution :premises ({clause1} {id}.ord {clause2}))",
                 self.format_clause(clause)
-            );
+            ));
         }
 
         // Omit :args — Carcara infers an ordinary syntactic pivot from the
         // premises.
-        format!(
+        Ok(format!(
             "(step {id} {} :rule resolution :premises ({clause1} {clause2}))",
             self.format_clause(clause)
-        )
+        ))
+    }
+
+    /// Whether an internally complementary pivot prints as `distinct` versus
+    /// equality but the exact surface-operand bridge could not be built.
+    fn surface_resolution_needs_distinct_bridge(
+        &self,
+        clause: &[TermId],
+        pivot: Option<TermId>,
+        clause1: ProofId,
+        clause2: ProofId,
+    ) -> bool {
+        let clauses = self.proof_clauses.borrow();
+        let (Some(c1), Some(c2)) = (clauses.get(&clause1), clauses.get(&clause2)) else {
+            return false;
+        };
+        let expected: HashSet<TermId> = clause.iter().copied().collect();
+        for (left_index, &left) in c1.iter().enumerate() {
+            for (right_index, &right) in c2.iter().enumerate() {
+                if !self.are_boolean_complements(left, right)
+                    || pivot.is_some_and(|pivot| {
+                        !(left == pivot
+                            || right == pivot
+                            || self.are_boolean_complements(left, pivot)
+                            || self.are_boolean_complements(right, pivot))
+                    })
+                {
+                    continue;
+                }
+                let mut resolvent = HashSet::default();
+                resolvent.extend(
+                    c1.iter()
+                        .enumerate()
+                        .filter_map(|(index, &literal)| (index != left_index).then_some(literal)),
+                );
+                resolvent.extend(
+                    c2.iter()
+                        .enumerate()
+                        .filter_map(|(index, &literal)| (index != right_index).then_some(literal)),
+                );
+                if resolvent != expected {
+                    continue;
+                }
+
+                let left = self.format_term(left);
+                let right = self.format_term(right);
+                if (split_application(&left, "distinct").is_some()
+                    && split_application(&right, "=").is_some())
+                    || (split_application(&right, "distinct").is_some()
+                        && split_application(&left, "=").is_some())
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Honestly rebuild a resolution that cancels a binary `(distinct a b)`
@@ -1102,6 +1210,28 @@ impl<'a> AlethePrinter<'a> {
         farkas: Option<&ay_core::FarkasAnnotation>,
         kind: &ay_core::TheoryLemmaKind,
     ) -> Result<String, AlethePrintError> {
+        // Fail closed until the internal conservative-extension certificate is
+        // translated to Carcara's actual `arrays_ext` proof shape. The current
+        // `array_ext_diff_intro` renders only as a comment, while
+        // `TheoryLemmaKind::ArrayExtensionality.alethe_rule()` is the unknown
+        // rule name `extensionality`; neither conveys the fresh-witness choice
+        // obligation to an external checker.
+        if matches!(kind, ay_core::TheoryLemmaKind::ArrayExtensionality) {
+            return Err(AlethePrintError::UnsupportedArrayExtensionality { id });
+        }
+        if let ay_core::TheoryLemmaKind::ArraySelectStore { index_eq } = kind {
+            return self.format_array_select_store(id, clause, *index_eq);
+        }
+        if kind.alethe_rule() == "eq_congruent" {
+            match self.surface_eq_congruent_bridge(id, clause, &[], &[]) {
+                Ok(Some(text)) => return Ok(text),
+                Ok(None) => {}
+                Err(reason) => {
+                    return Err(AlethePrintError::InvalidCongruenceStep { id, reason });
+                }
+            }
+        }
+
         let clause_str = self.format_clause(clause);
         if let Some(farkas) = farkas {
             let rule = kind.alethe_rule();
@@ -1204,6 +1334,388 @@ impl<'a> AlethePrinter<'a> {
             "(step {id} {clause_str} :rule {})",
             kind.alethe_rule()
         ))
+    }
+
+    /// Lower AY's internally checked ROW1/ROW2 lemmas to the array rules
+    /// supported by the pinned Carcara dialect.
+    ///
+    /// Unit ROW1 is a direct `arrays_idx` theorem. Conditional ROW1 transports
+    /// that theorem across an assumed index equality with `cong` and `trans`.
+    /// ROW2 assumes the index disequality and uses `arrays_row`. Both guarded
+    /// cases are discharged through local subproofs, and ROW2 restores AY's
+    /// positive guard (rather than leaving a double negation) with `not_not`
+    /// plus resolution. Reversed row equalities get an explicit `symm`/`trans`
+    /// derivation; malformed surface overrides fail closed.
+    fn format_array_select_store(
+        &self,
+        id: ProofId,
+        clause: &[TermId],
+        index_eq: bool,
+    ) -> Result<String, AlethePrintError> {
+        use crate::checker::ArraySelectStorePrinterTerms as Row;
+
+        let Some(shape) =
+            crate::checker::array_select_store_printer_terms(self.terms, clause, index_eq)
+        else {
+            return Err(AlethePrintError::InvalidArrayStep {
+                id,
+                reason: format!(
+                    "ROW lemma {} is outside the checked top-level arrays_idx/arrays_row subset",
+                    self.format_clause(clause)
+                ),
+            });
+        };
+
+        let invalid_surface = |reason: String| AlethePrintError::InvalidArrayStep { id, reason };
+        match shape {
+            Row::Row1 {
+                row,
+                select,
+                base_array,
+                store_index,
+                value: value_term,
+                read_index,
+                guard,
+                packed_or,
+            } => {
+                let base = self.format_term(base_array);
+                let store_index = self.format_term(store_index);
+                let value = self.format_term(value_term);
+                let read_index = self.format_term(read_index);
+                let printed_select = self.format_term(select);
+                let Some(select_args) = split_application(&printed_select, "select") else {
+                    return Err(invalid_surface(
+                        "ROW1 select surface is not a select application".to_string(),
+                    ));
+                };
+                let [printed_store, printed_read_index] = select_args.as_slice() else {
+                    return Err(invalid_surface(
+                        "ROW1 select surface has malformed arity".to_string(),
+                    ));
+                };
+                let Some(store_args) = split_application(printed_store, "store") else {
+                    return Err(invalid_surface(
+                        "ROW1 select surface does not read a store".to_string(),
+                    ));
+                };
+                let [printed_base, printed_store_index, stored_value] = store_args.as_slice()
+                else {
+                    return Err(invalid_surface(
+                        "ROW1 store surface has malformed arity".to_string(),
+                    ));
+                };
+                if printed_base != &base
+                    || printed_store_index != &store_index
+                    || printed_read_index != &read_index
+                {
+                    return Err(invalid_surface(
+                        "ROW1 select/store surface override changes the certified array or index"
+                            .to_string(),
+                    ));
+                }
+                let needs_value_bridge = stored_value != &value;
+                if needs_value_bridge {
+                    let canonical_is_numeric = matches!(
+                        self.terms.get(value_term),
+                        TermData::Const(Constant::Int(_) | Constant::Rational(_))
+                    );
+                    let surface_values_match = canonical_is_numeric
+                        && crate::la_generic_signs::parse_numeric_constant(stored_value)
+                            .zip(crate::la_generic_signs::parse_numeric_constant(&value))
+                            .is_some_and(|(stored, canonical)| stored == canonical);
+                    if !surface_values_match {
+                        return Err(invalid_surface(
+                            "ROW1 store-value surface mismatch is not an equivalent numeric literal"
+                                .to_string(),
+                        ));
+                    }
+                }
+
+                let canonical_row = format!("(= {printed_select} {value})");
+                let reversed_row = format!("(= {value} {printed_select})");
+                let printed_row = self.format_term(row);
+                if printed_row != canonical_row && printed_row != reversed_row {
+                    return Err(invalid_surface(
+                        "ROW1 equality surface override is neither the certified orientation nor its symmetry"
+                            .to_string(),
+                    ));
+                }
+
+                let Some(guard) = guard else {
+                    if !needs_value_bridge {
+                        if printed_row == canonical_row {
+                            return Ok(format!(
+                                "(step {id} (cl {canonical_row}) :rule arrays_idx)"
+                            ));
+                        }
+                        return Ok(format!(
+                            "(step {id}.idx (cl {canonical_row}) :rule arrays_idx)\n\
+                             (step {id} (cl {reversed_row}) :rule symm :premises ({id}.idx))"
+                        ));
+                    }
+
+                    let stored_row = format!("(= {printed_select} {stored_value})");
+                    if printed_row == canonical_row {
+                        return Ok(format!(
+                            "(step {id}.idx (cl {stored_row}) :rule arrays_idx)\n\
+                             (step {id}.val (cl (= {stored_value} {value})) :rule la_generic :args (1))\n\
+                             (step {id} (cl {canonical_row}) :rule trans :premises ({id}.idx {id}.val))"
+                        ));
+                    }
+                    return Ok(format!(
+                        "(step {id}.idx (cl {stored_row}) :rule arrays_idx)\n\
+                         (step {id}.val (cl (= {stored_value} {value})) :rule la_generic :args (1))\n\
+                         (step {id}.base (cl {canonical_row}) :rule trans :premises ({id}.idx {id}.val))\n\
+                         (step {id} (cl {reversed_row}) :rule symm :premises ({id}.base))"
+                    ));
+                };
+
+                let printed_guard = self.format_term(guard);
+                let guard_forward = format!("(not (= {store_index} {read_index}))");
+                let guard_reverse = format!("(not (= {read_index} {store_index}))");
+                let assumed_equality = if printed_guard == guard_forward {
+                    format!("(= {store_index} {read_index})")
+                } else if printed_guard == guard_reverse {
+                    format!("(= {read_index} {store_index})")
+                } else {
+                    return Err(invalid_surface(
+                        "conditional ROW1 guard surface override changes the certified index pair"
+                            .to_string(),
+                    ));
+                };
+                let same_index_select = format!("(select {printed_store} {store_index})");
+                let flat_id = packed_or.map_or_else(|| id.to_string(), |_| format!("{id}.flat"));
+                let stored_row = format!("(= {same_index_select} {stored_value})");
+                let (cong_row, cong_to_same) = if printed_guard == guard_forward {
+                    (
+                        format!("(= {same_index_select} {printed_select})"),
+                        format!(
+                            "(step {id}.congs (cl (= {printed_select} {same_index_select})) :rule symm :premises ({id}.cong))"
+                        ),
+                    )
+                } else {
+                    (
+                        format!("(= {printed_select} {same_index_select})"),
+                        String::new(),
+                    )
+                };
+                let cong_premise = if printed_guard == guard_forward {
+                    format!("{id}.congs")
+                } else {
+                    format!("{id}.cong")
+                };
+                let mut output = format!(
+                    "(anchor :step {flat_id})\n\
+                     (assume {id}.h {assumed_equality})\n\
+                     (step {id}.idx (cl {stored_row}) :rule arrays_idx)\n\
+                     (step {id}.cong (cl {cong_row}) :rule cong :premises ({id}.h))"
+                );
+                if !cong_to_same.is_empty() {
+                    output.push('\n');
+                    output.push_str(&cong_to_same);
+                }
+                if needs_value_bridge {
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut output,
+                        format_args!(
+                            "\n(step {id}.val (cl (= {stored_value} {value})) :rule la_generic :args (1))\n\
+                             (step {id}.base (cl {canonical_row}) :rule trans :premises ({cong_premise} {id}.idx {id}.val))"
+                        ),
+                    );
+                } else {
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut output,
+                        format_args!(
+                            "\n(step {id}.base (cl {canonical_row}) :rule trans :premises ({cong_premise} {id}.idx))"
+                        ),
+                    );
+                }
+                if printed_row != canonical_row {
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut output,
+                        format_args!(
+                            "\n(step {id}.row (cl {reversed_row}) :rule symm :premises ({id}.base))"
+                        ),
+                    );
+                }
+                let _ = std::fmt::Write::write_fmt(
+                    &mut output,
+                    format_args!(
+                        "\n(step {flat_id} (cl {printed_guard} {printed_row}) :rule subproof :discharge ({id}.h))"
+                    ),
+                );
+                self.finish_array_packed_or(
+                    id,
+                    packed_or,
+                    flat_id.as_str(),
+                    printed_guard.as_str(),
+                    printed_row.as_str(),
+                    output,
+                )
+            }
+            Row::Row2 {
+                row,
+                select_store,
+                select_base,
+                base_array,
+                store_index,
+                value: _,
+                read_index,
+                guard,
+                packed_or,
+            } => {
+                let base = self.format_term(base_array);
+                let store_index = self.format_term(store_index);
+                let read_index = self.format_term(read_index);
+                let printed_select_store = self.format_term(select_store);
+                let printed_select_base = self.format_term(select_base);
+                let Some(store_select_args) = split_application(&printed_select_store, "select")
+                else {
+                    return Err(invalid_surface(
+                        "ROW2 store-side surface is not a select application".to_string(),
+                    ));
+                };
+                let [printed_store, printed_store_read_index] = store_select_args.as_slice() else {
+                    return Err(invalid_surface(
+                        "ROW2 store-side select has malformed arity".to_string(),
+                    ));
+                };
+                let Some(store_args) = split_application(printed_store, "store") else {
+                    return Err(invalid_surface(
+                        "ROW2 store-side select does not read a store".to_string(),
+                    ));
+                };
+                let [printed_base, printed_store_index, _printed_value] = store_args.as_slice()
+                else {
+                    return Err(invalid_surface(
+                        "ROW2 store surface has malformed arity".to_string(),
+                    ));
+                };
+                let Some(base_select_args) = split_application(&printed_select_base, "select")
+                else {
+                    return Err(invalid_surface(
+                        "ROW2 base-side surface is not a select application".to_string(),
+                    ));
+                };
+                let [printed_select_base_array, printed_base_read_index] =
+                    base_select_args.as_slice()
+                else {
+                    return Err(invalid_surface(
+                        "ROW2 base-side select has malformed arity".to_string(),
+                    ));
+                };
+                if printed_base != &base
+                    || printed_store_index != &store_index
+                    || printed_store_read_index != &read_index
+                    || printed_select_base_array != &base
+                    || printed_base_read_index != &read_index
+                {
+                    return Err(invalid_surface(
+                        "ROW2 select surface override changes the certified array or indices"
+                            .to_string(),
+                    ));
+                }
+                let canonical_row = format!("(= {printed_select_store} {printed_select_base})");
+                let reversed_row = format!("(= {printed_select_base} {printed_select_store})");
+                let printed_row = self.format_term(row);
+                if printed_row != canonical_row && printed_row != reversed_row {
+                    return Err(invalid_surface(
+                        "ROW2 equality surface override is neither the certified orientation nor its symmetry"
+                            .to_string(),
+                    ));
+                }
+
+                let printed_guard = self.format_term(guard);
+                let guard_forward = format!("(= {store_index} {read_index})");
+                let guard_reverse = format!("(= {read_index} {store_index})");
+                let assumed_disequality = if printed_guard == guard_forward {
+                    format!("(not {guard_forward})")
+                } else if printed_guard == guard_reverse {
+                    format!("(not {guard_reverse})")
+                } else {
+                    return Err(invalid_surface(
+                        "ROW2 guard surface override changes the certified index pair".to_string(),
+                    ));
+                };
+
+                let row_derivation = if printed_row == canonical_row {
+                    format!(
+                        "(step {id}.row (cl {canonical_row}) :rule arrays_row :premises ({id}.h))"
+                    )
+                } else {
+                    format!(
+                        "(step {id}.base (cl {canonical_row}) :rule arrays_row :premises ({id}.h))\n\
+                         (step {id}.row (cl {reversed_row}) :rule symm :premises ({id}.base))"
+                    )
+                };
+                let flat_id = packed_or.map_or_else(|| id.to_string(), |_| format!("{id}.flat"));
+                let output = format!(
+                    "(anchor :step {id}.sp)\n\
+                     (assume {id}.h {assumed_disequality})\n\
+                     {row_derivation}\n\
+                     (step {id}.sp (cl (not {assumed_disequality}) {printed_row}) :rule subproof :discharge ({id}.h))\n\
+                     (step {id}.nn (cl (not (not {assumed_disequality})) {printed_guard}) :rule not_not)\n\
+                     (step {flat_id} (cl {printed_guard} {printed_row}) :rule resolution :premises ({id}.sp {id}.nn))"
+                );
+                self.finish_array_packed_or(
+                    id,
+                    packed_or,
+                    flat_id.as_str(),
+                    printed_guard.as_str(),
+                    printed_row.as_str(),
+                    output,
+                )
+            }
+        }
+    }
+
+    /// Restore a unit `(or guard row)` when AY's internally checked array
+    /// lemma stores the disjunction as one clause term. The flat theorem is
+    /// first derived under `flat_id`; two `or_neg` tautologies then introduce
+    /// the exact original or-term without changing the premise identity seen
+    /// by downstream steps.
+    fn finish_array_packed_or(
+        &self,
+        id: ProofId,
+        packed_or: Option<TermId>,
+        flat_id: &str,
+        first: &str,
+        second: &str,
+        mut output: String,
+    ) -> Result<String, AlethePrintError> {
+        let Some(packed_or) = packed_or else {
+            return Ok(output);
+        };
+        let packed = self.format_term(packed_or);
+        let Some(children) = split_application(&packed, "or") else {
+            return Err(AlethePrintError::InvalidArrayStep {
+                id,
+                reason: "packed ROW surface override is no longer an or-term".to_string(),
+            });
+        };
+        let [child0, child1] = children.as_slice() else {
+            return Err(AlethePrintError::InvalidArrayStep {
+                id,
+                reason: "packed ROW or-term must have exactly two children".to_string(),
+            });
+        };
+        if !((child0 == first && child1 == second) || (child0 == second && child1 == first)) {
+            return Err(AlethePrintError::InvalidArrayStep {
+                id,
+                reason: "packed ROW or-term children differ from the certified flat clause"
+                    .to_string(),
+            });
+        }
+        let _ = std::fmt::Write::write_fmt(
+            &mut output,
+            format_args!(
+                "\n(step {id}.o0 (cl {packed} (not {child0})) :rule or_neg :args (0))\n\
+                 (step {id}.r0 (cl {child1} {packed}) :rule resolution :premises ({flat_id} {id}.o0))\n\
+                 (step {id}.o1 (cl {packed} (not {child1})) :rule or_neg :args (1))\n\
+                 (step {id} (cl {packed}) :rule resolution :premises ({id}.r0 {id}.o1))"
+            ),
+        );
+        Ok(output)
     }
 
     /// Rebuild an `eq_transitive` theory-lemma step into spec-valid Alethe
@@ -1360,7 +1872,7 @@ impl<'a> AlethePrinter<'a> {
         clause: &[TermId],
         premises: &[ProofId],
         args: &[TermId],
-    ) -> String {
+    ) -> Result<String, AlethePrintError> {
         // A `th_resolution`/`resolution` step that cancels a printed
         // `(distinct a b)` literal against an equality unit clause is not
         // spec-valid Alethe over the printed premise (Carcara sees the
@@ -1379,7 +1891,47 @@ impl<'a> AlethePrinter<'a> {
             if let Some(text) =
                 self.distinct_eq_resolution_bridge(id, clause, premises[0], premises[1])
             {
-                return text;
+                return Ok(text);
+            }
+            if self.surface_resolution_needs_distinct_bridge(
+                clause,
+                args.first().copied(),
+                premises[0],
+                premises[1],
+            ) {
+                return Err(AlethePrintError::InvalidSurfaceStep {
+                    id,
+                    reason: "a printed distinct/equality pivot cannot be bridged to the authored operands"
+                        .to_string(),
+                });
+            }
+        }
+        // A comparison may carry the authored `>=`/`>` spelling while its
+        // canonical internal term is the equivalent argument-reversed
+        // `<=`/`<` application. If that term is the left side of a `cong`
+        // conclusion, the global override would otherwise make the printed
+        // applications have different operators. Re-establish the canonical
+        // application with `comp_simplify`, apply same-operator congruence,
+        // then compose the equalities.
+        if matches!(rule, ay_core::AletheRule::Cong) {
+            if let Some(text) = self.surface_order_cong_bridge(id, clause, premises, args) {
+                return Ok(text);
+            }
+            if self.surface_cong_has_different_order_operators(clause) {
+                return Err(AlethePrintError::InvalidCongruenceStep {
+                    id,
+                    reason: "surface rewriting gives the two congruence applications different order operators"
+                        .to_string(),
+                });
+            }
+        }
+        if matches!(rule, ay_core::AletheRule::EqCongruent) {
+            match self.surface_eq_congruent_bridge(id, clause, premises, args) {
+                Ok(Some(text)) => return Ok(text),
+                Ok(None) => {}
+                Err(reason) => {
+                    return Err(AlethePrintError::InvalidCongruenceStep { id, reason });
+                }
             }
         }
         // Surface-syntax implication resugar: elaboration desugars
@@ -1394,7 +1946,7 @@ impl<'a> AlethePrinter<'a> {
         //   implies_neg2: (cl (=> A B) (not B))
         if premises.is_empty() {
             if let Some(text) = self.resugar_implies_tautology(id, rule, clause, args) {
-                return text;
+                return Ok(text);
             }
             // Equality-split extraction: elaboration lowers an arithmetic
             // equality `(= L R)` to the conjunction `(and (<= ..) (<= ..))`
@@ -1404,13 +1956,13 @@ impl<'a> AlethePrinter<'a> {
             // The spec-correct rule for the printed shape is a certified
             // `la_generic` orientation lemma (#relu-trust-glue).
             if let Some(text) = self.resugar_equality_split_and_pos(id, rule, clause) {
-                return text;
+                return Ok(text);
             }
             // `and_pos` whose `(not (and ...))` gate literal was traced as its
             // De Morgan surface `(or (not A1) .. (not An))`: re-slot to the
             // spec-shaped `(cl (not (and ...)) Ak)` Carcara requires.
             if let Some(text) = self.resugar_and_pos_not_and(id, rule, clause, args) {
-                return text;
+                return Ok(text);
             }
             // Clausification tautologies over a source term whose PRINTED
             // form diverges from the internal canonical form (surface-syntax
@@ -1421,7 +1973,24 @@ impl<'a> AlethePrinter<'a> {
             // tautology, `not_not` bridge steps for each stripped literal,
             // and a final resolution restoring the exact traced clause.
             if let Some(text) = self.format_surface_tautology(id, rule, clause, args) {
-                return text;
+                return Ok(text);
+            }
+            if matches!(rule, ay_core::AletheRule::AndPos(_))
+                && clause.iter().copied().any(|literal| {
+                    let TermData::Not(source) = self.terms.get(literal) else {
+                        return false;
+                    };
+                    matches!(
+                        self.terms.get(*source),
+                        TermData::App(Symbol::Named(name), _) if name == "and"
+                    ) && split_application(&self.format_term(*source), "and").is_none()
+                })
+            {
+                return Err(AlethePrintError::InvalidSurfaceStep {
+                    id,
+                    reason: "and_pos source no longer prints as an and-term and no certified surface bridge applies"
+                        .to_string(),
+                });
             }
         }
         // An `or` decomposition step whose premise assume PRINTS as a De
@@ -1431,7 +2000,7 @@ impl<'a> AlethePrinter<'a> {
         // rule for the printed shape is `not_and`.
         if matches!(rule, ay_core::AletheRule::Or) && premises.len() == 1 {
             if let Some(text) = self.resugar_not_and_decomposition(id, clause, premises[0]) {
-                return text;
+                return Ok(text);
             }
         }
         let clause_str = self.format_clause(clause);
@@ -1450,7 +2019,357 @@ impl<'a> AlethePrinter<'a> {
             );
         }
         result.push(')');
-        result
+        Ok(result)
+    }
+
+    /// Repair the exact surface-normalization shape
+    ///
+    /// ```text
+    /// internal: (= (<= k x) (<= k y))
+    /// printed:  (= (>= x k) (<= k y))
+    /// ```
+    ///
+    /// A direct printed `cong` is invalid because its applications have
+    /// different operators. The bridge proves the authored/canonical
+    /// comparison equality with `comp_simplify`, retains the original
+    /// same-operator `cong`, and joins them with `trans`.
+    ///
+    /// This is deliberately fail-closed: it applies only to one positive unit
+    /// equality, one matching unit-equality premise, exactly one differing
+    /// application argument, and an exact argument-reversed order override on
+    /// the conclusion's left side. Every other `cong` remains byte-unchanged.
+    fn surface_order_cong_bridge(
+        &self,
+        id: ProofId,
+        clause: &[TermId],
+        premises: &[ProofId],
+        args: &[TermId],
+    ) -> Option<String> {
+        let [conclusion] = clause else {
+            return None;
+        };
+        let [premise] = premises else {
+            return None;
+        };
+        if !args.is_empty() {
+            return None;
+        }
+
+        let overrides = self.term_overrides?;
+        if overrides.contains_key(conclusion) {
+            return None;
+        }
+        let TermData::App(Symbol::Named(eq), equality_args) = self.terms.get(*conclusion) else {
+            return None;
+        };
+        if eq != "=" {
+            return None;
+        }
+        let [left, right] = equality_args.as_slice() else {
+            return None;
+        };
+        if overrides.contains_key(right) {
+            return None;
+        }
+        let uses_skolem_override = {
+            let skolem_overrides = self.skolem_overrides.borrow();
+            skolem_overrides.contains_key(conclusion)
+                || skolem_overrides.contains_key(left)
+                || skolem_overrides.contains_key(right)
+        };
+        if uses_skolem_override {
+            return None;
+        }
+
+        let TermData::App(left_symbol, left_args) = self.terms.get(*left) else {
+            return None;
+        };
+        let TermData::App(right_symbol, right_args) = self.terms.get(*right) else {
+            return None;
+        };
+        if left_symbol != right_symbol {
+            return None;
+        }
+        let Symbol::Named(op) = left_symbol else {
+            return None;
+        };
+        if !matches!(op.as_str(), "<=" | "<" | ">=" | ">") {
+            return None;
+        }
+        let [left_arg0, left_arg1] = left_args.as_slice() else {
+            return None;
+        };
+        let [right_arg0, right_arg1] = right_args.as_slice() else {
+            return None;
+        };
+
+        let mut differing_args = None;
+        for (&left_arg, &right_arg) in left_args.iter().zip(right_args.iter()) {
+            if left_arg == right_arg {
+                continue;
+            }
+            if differing_args.replace((left_arg, right_arg)).is_some() {
+                return None;
+            }
+        }
+        let (differing_left, differing_right) = differing_args?;
+
+        let premise_literal = {
+            let clauses = self.proof_clauses.borrow();
+            let premise_clause = clauses.get(premise)?;
+            let [premise_literal] = premise_clause.as_slice() else {
+                return None;
+            };
+            *premise_literal
+        };
+        let TermData::App(Symbol::Named(premise_op), premise_args) =
+            self.terms.get(premise_literal)
+        else {
+            return None;
+        };
+        if premise_op != "=" {
+            return None;
+        }
+        let [premise_left, premise_right] = premise_args.as_slice() else {
+            return None;
+        };
+        if !((*premise_left == differing_left && *premise_right == differing_right)
+            || (*premise_left == differing_right && *premise_right == differing_left))
+        {
+            return None;
+        }
+
+        let op = Self::format_symbol(left_symbol);
+        let canonical_left = format!(
+            "({op} {} {})",
+            self.format_term(*left_arg0),
+            self.format_term(*left_arg1)
+        );
+        let canonical_right = format!(
+            "({op} {} {})",
+            self.format_term(*right_arg0),
+            self.format_term(*right_arg1)
+        );
+        let printed_left = overrides.get(left)?.clone();
+        if surface_order_reversal(&printed_left).as_deref() != Some(canonical_left.as_str()) {
+            return None;
+        }
+        let printed_right = self.format_term(*right);
+        if printed_right != canonical_right {
+            return None;
+        }
+
+        // Congruence is checked over the PRINTED premise too. Require it to be
+        // exactly the equality between the one differing argument pair.
+        let differing_left = self.format_term(differing_left);
+        let differing_right = self.format_term(differing_right);
+        let printed_premise = self.format_term(premise_literal);
+        let premise_forward = format!("(= {differing_left} {differing_right})");
+        let premise_reverse = format!("(= {differing_right} {differing_left})");
+        if printed_premise != premise_forward && printed_premise != premise_reverse {
+            return None;
+        }
+
+        let final_equality = format!("(= {printed_left} {printed_right})");
+        if self.format_term(*conclusion) != final_equality {
+            return None;
+        }
+        Some(format!(
+            "(step {id}.norm (cl (= {printed_left} {canonical_left})) :rule comp_simplify)\n\
+             (step {id}.cong (cl (= {canonical_left} {canonical_right})) :rule cong :premises ({premise}))\n\
+             (step {id} (cl {final_equality}) :rule trans :premises ({id}.norm {id}.cong))"
+        ))
+    }
+
+    /// Detect the externally invalid fallback the order-normalization bridge
+    /// is meant to prevent. If the two printed applications use different
+    /// comparison operators, a plain `cong` can never justify the equality.
+    fn surface_cong_has_different_order_operators(&self, clause: &[TermId]) -> bool {
+        let [conclusion] = clause else {
+            return false;
+        };
+        let Some([left, right]) = split_application(&self.format_term(*conclusion), "=")
+            .and_then(|args| <[String; 2]>::try_from(args).ok())
+        else {
+            return false;
+        };
+        matches!(
+            (
+                surface_order_operator(left.as_str()),
+                surface_order_operator(right.as_str())
+            ),
+            (Some(left_op), Some(right_op)) if left_op != right_op
+        )
+    }
+
+    /// Repair the exact `eq_congruent` surface mismatch produced when an
+    /// authored multiplication keeps source operand order in one application
+    /// while canonical interning uses the commuted order everywhere else.
+    ///
+    /// The ordinary internal hypothesis is reflexive, e.g.
+    /// `¬((* c 16) = (* c 16))`, but the printed conclusion needs
+    /// `(* 16 c) = (* c 16)`. Prove that one AC equality with `aci_simp`, use
+    /// it in a corrected `eq_congruent`, weaken it with the original reflexive
+    /// hypothesis, then resolve back to the exact original printed clause.
+    ///
+    /// Any other printed argument/hypothesis mismatch fails closed.
+    fn surface_eq_congruent_bridge(
+        &self,
+        id: ProofId,
+        clause: &[TermId],
+        premises: &[ProofId],
+        args: &[TermId],
+    ) -> Result<Option<String>, String> {
+        if self.term_overrides.is_none() {
+            return Ok(None);
+        }
+        if clause.len() < 2 {
+            return Ok(None);
+        }
+        let Some((&conclusion, hypotheses)) = clause.split_last() else {
+            return Ok(None);
+        };
+        let TermData::App(Symbol::Named(eq), equality_args) = self.terms.get(conclusion) else {
+            return Ok(None);
+        };
+        if eq != "=" {
+            return Ok(None);
+        }
+        let [left, right] = equality_args.as_slice() else {
+            return Ok(None);
+        };
+        let TermData::App(left_symbol, left_internal_args) = self.terms.get(*left) else {
+            return Ok(None);
+        };
+        let TermData::App(right_symbol, right_internal_args) = self.terms.get(*right) else {
+            return Ok(None);
+        };
+        if left_symbol != right_symbol || left_internal_args.len() != right_internal_args.len() {
+            return Ok(None);
+        }
+
+        let operator = Self::format_symbol(left_symbol);
+        let printed_left = self.format_term(*left);
+        let printed_right = self.format_term(*right);
+        let Some(left_args) = split_application(&printed_left, &operator) else {
+            return Err(format!(
+                "surface left application no longer uses the certified operator {operator}"
+            ));
+        };
+        let Some(right_args) = split_application(&printed_right, &operator) else {
+            return Err(format!(
+                "surface right application no longer uses the certified operator {operator}"
+            ));
+        };
+        if left_args.len() != right_args.len() || hypotheses.len() != left_args.len() {
+            return Err(
+                "surface eq_congruent arity no longer matches its equality hypotheses".to_string(),
+            );
+        }
+        if !premises.is_empty() || !args.is_empty() {
+            return Err(
+                "surface-mutated eq_congruent carries unsupported premises or arguments"
+                    .to_string(),
+            );
+        }
+
+        let mut printed_clause: Vec<String> =
+            clause.iter().map(|&term| self.format_term(term)).collect();
+        let mut mismatch: Option<(usize, String, String, String)> = None;
+        for (index, hypothesis) in hypotheses.iter().enumerate() {
+            let printed_hypothesis = self.format_term(*hypothesis);
+            let Some(not_args) = split_application(&printed_hypothesis, "not") else {
+                return Err("eq_congruent hypothesis is not a printed negation".to_string());
+            };
+            let [negated_equality] = not_args.as_slice() else {
+                return Err("eq_congruent hypothesis has malformed negation arity".to_string());
+            };
+            let Some(equality) = split_application(negated_equality, "=") else {
+                return Err("eq_congruent hypothesis does not negate an equality".to_string());
+            };
+            let [hyp_left, hyp_right] = equality.as_slice() else {
+                return Err("eq_congruent hypothesis has malformed equality arity".to_string());
+            };
+            let expected_left = &left_args[index];
+            let expected_right = &right_args[index];
+            if (hyp_left == expected_left && hyp_right == expected_right)
+                || (hyp_left == expected_right && hyp_right == expected_left)
+            {
+                continue;
+            }
+            if mismatch.is_some() {
+                return Err(
+                    "more than one surface eq_congruent hypothesis mismatches its arguments"
+                        .to_string(),
+                );
+            }
+            mismatch = Some((
+                index,
+                printed_hypothesis,
+                hyp_left.clone(),
+                hyp_right.clone(),
+            ));
+        }
+        let Some((index, original_hypothesis, hyp_left, hyp_right)) = mismatch else {
+            return Ok(None);
+        };
+        if hyp_left != hyp_right {
+            return Err(
+                "surface eq_congruent mismatch is not the exact reflexive-hypothesis shape"
+                    .to_string(),
+            );
+        }
+        if !matches!(
+            self.terms.sort(left_internal_args[index]),
+            Sort::Int | Sort::Real
+        ) || self.terms.sort(left_internal_args[index])
+            != self.terms.sort(right_internal_args[index])
+        {
+            return Err(
+                "surface eq_congruent AC bridge is restricted to Int/Real multiplication"
+                    .to_string(),
+            );
+        }
+
+        let expected_left = &left_args[index];
+        let expected_right = &right_args[index];
+        let Some(left_mul) = split_application(expected_left, "*") else {
+            return Err(
+                "surface eq_congruent mismatch is not a multiplication operand swap".to_string(),
+            );
+        };
+        let Some(right_mul) = split_application(expected_right, "*") else {
+            return Err(
+                "surface eq_congruent mismatch is not a multiplication operand swap".to_string(),
+            );
+        };
+        let ([left_a, left_b], [right_a, right_b]) = (left_mul.as_slice(), right_mul.as_slice())
+        else {
+            return Err(
+                "surface eq_congruent AC bridge requires binary multiplication".to_string(),
+            );
+        };
+        if left_a != right_b
+            || left_b != right_a
+            || (hyp_left.as_str() != expected_left.as_str()
+                && hyp_left.as_str() != expected_right.as_str())
+        {
+            return Err(
+                "surface eq_congruent mismatch is not the exact commuted reflexive premise"
+                    .to_string(),
+            );
+        }
+
+        let ac_equality = format!("(= {expected_left} {expected_right})");
+        printed_clause[index] = format!("(not {ac_equality})");
+        let corrected_clause = format!("(cl {})", printed_clause.join(" "));
+        let original_clause = self.format_clause(clause);
+        Ok(Some(format!(
+            "(step {id}.ac (cl {ac_equality}) :rule aci_simp)\n\
+             (step {id}.eqc {corrected_clause} :rule eq_congruent)\n\
+             (step {id}.acw (cl {ac_equality} {original_hypothesis}) :rule weakening :premises ({id}.ac))\n\
+             (step {id} {original_clause} :rule resolution :premises ({id}.eqc {id}.acw))"
+        )))
     }
 
     /// Detect an or_pos/or_neg tautology whose source or-term carries a
@@ -2529,6 +3448,24 @@ fn surface_order_negation(s: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Equivalent argument-reversed spelling of a binary arithmetic order.
+fn surface_order_reversal(s: &str) -> Option<String> {
+    for (op, reversed) in [("<=", ">="), ("<", ">"), (">=", "<="), (">", "<")] {
+        if let Some(args) = split_application(s, op) {
+            if args.len() == 2 {
+                return Some(format!("({reversed} {} {})", args[1], args[0]));
+            }
+        }
+    }
+    None
+}
+
+fn surface_order_operator(s: &str) -> Option<&'static str> {
+    ["<=", "<", ">=", ">"]
+        .into_iter()
+        .find(|operator| split_application(s, operator).is_some())
 }
 
 /// Split a rendered single-binder quantifier into its binder token and body.

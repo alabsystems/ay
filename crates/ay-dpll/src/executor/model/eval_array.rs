@@ -291,6 +291,34 @@ impl Executor {
                         || self.evaluate_term(model, args[1]),
                     );
                 }
+                TermData::App(sym, args)
+                    if sym.name() == "select"
+                        && args.len() == 2
+                        && matches!(self.ctx.terms.sort(current_array), Sort::Array(_)) =>
+                {
+                    // Nested-array read (#nested-array-row wrong-SAT, QF_AUFNIA):
+                    // `current_array` is itself `(select B j)` whose ELEMENT
+                    // sort is another array, so this select denotes an ARRAY
+                    // value — the inner array `B[j]`. The store-walk above only
+                    // reduces `store`/`const-array`/`lambda` heads, so without
+                    // this arm the inner select is treated as an opaque base:
+                    // `evaluate_select` returns Unknown and the caller's
+                    // arith/BV-model fallback launders the solver's
+                    // unconstrained opaque value for a read that the store
+                    // structure actually FORCES (e.g. `select(select(store(m,b,
+                    // store(a,o,V)),b),o)` is V, not free). Resolve the inner
+                    // select to the concrete inner-array term it denotes and
+                    // keep peeling. Resolution is exact-or-nothing: on any
+                    // undecidable index it returns None and we fall through to
+                    // the existing sound opaque handling.
+                    match self.resolve_array_valued_select(model, args[0], args[1], def_visited) {
+                        Some(inner) if inner != current_array => {
+                            current_array = inner;
+                            continue;
+                        }
+                        _ => break,
+                    }
+                }
                 _ => break,
             }
         }
@@ -395,6 +423,99 @@ impl Executor {
         // (b) the index is a UF application whose BV value wasn't formatted
         //     as a string key in the array model.
         self.bv_select_fallback(model, current_array, &index_val)
+    }
+
+    /// Resolve an ARRAY-valued `(select outer_arr outer_idx)` — a read of a
+    /// nested array whose element sort is itself an array — to the concrete
+    /// inner-array term it denotes under `model`.
+    ///
+    /// Peels `outer_arr`'s store chain at the model value of `outer_idx`
+    /// (chasing array-variable definitional equalities and nested selects),
+    /// and returns the stored array-valued term, or a `const-array`'s element
+    /// array term. Resolution is exact-or-nothing: an unknown index, a
+    /// non-exact index comparison, or an opaque base array-of-array variable
+    /// with no structural definition all yield `None`, so the caller retains
+    /// its existing sound opaque handling. Because a `Some` result is the
+    /// array value FORCED by the store structure under the model, feeding it
+    /// back into the select walk can only make a store-determined read
+    /// concrete — never manufacture a value inconsistent with the stores.
+    fn resolve_array_valued_select(
+        &self,
+        model: &Model,
+        outer_arr: TermId,
+        outer_idx: TermId,
+        def_visited: &mut HashSet<TermId>,
+    ) -> Option<TermId> {
+        // A binder-dependent nested array denotes a different array per beta
+        // instance; no ambient TermId resolution is valid then.
+        if super::dt_model::scoped_term_binding_active()
+            && super::dt_model::term_depends_on_scoped_binding(&self.ctx.terms, outer_arr)
+        {
+            return None;
+        }
+        let idx_val = self.evaluate_term(model, outer_idx);
+        if matches!(idx_val, EvalValue::Unknown) {
+            return None;
+        }
+        let mut arr = outer_arr;
+        let mut visited = HashSet::default();
+        loop {
+            if !visited.insert(arr) {
+                return None; // structural cycle in a malformed term DAG
+            }
+            match self.ctx.terms.get(arr) {
+                TermData::App(sym, args) if sym.name() == "store" && args.len() == 3 => {
+                    let store_idx_val = self.evaluate_term(model, args[1]);
+                    match Self::eval_values_equal_exact(&idx_val, &store_idx_val) {
+                        // ROW1: this write determines the read — its value is
+                        // the inner array term.
+                        Some(true) => return Some(args[2]),
+                        // ROW2: distinct index — peel and continue.
+                        Some(false) => {
+                            arr = args[0];
+                            continue;
+                        }
+                        // Undecided overwrite: cannot prove which cell wins.
+                        None => return None,
+                    }
+                }
+                TermData::App(sym, args) if sym.name() == "const-array" && args.len() == 1 => {
+                    return Some(args[0]);
+                }
+                TermData::App(sym, args)
+                    if sym.name() == "select"
+                        && args.len() == 2
+                        && matches!(self.ctx.terms.sort(arr), Sort::Array(_)) =>
+                {
+                    // A deeper nesting level: resolve it first, then continue
+                    // peeling the array it denotes.
+                    match self.resolve_array_valued_select(model, args[0], args[1], def_visited) {
+                        Some(inner) if inner != arr => {
+                            arr = inner;
+                            continue;
+                        }
+                        _ => return None,
+                    }
+                }
+                TermData::Var(_, _) => {
+                    // Opaque array-of-array base: only a structural definition
+                    // (`(= v (store ...))` / `(= v (const-array ...))`) pins the
+                    // inner array. A genuinely free base has no concrete inner
+                    // array, so return None (caller falls back soundly).
+                    if !def_visited.insert(arr) {
+                        return None; // definitional cycle
+                    }
+                    match self.array_variable_definition_excluding(arr, def_visited) {
+                        Some(def) if def != arr => {
+                            arr = def;
+                            continue;
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// Return true when exact bit-blasted select evidence conflicts with the

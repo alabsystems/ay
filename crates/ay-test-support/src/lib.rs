@@ -7,9 +7,9 @@
 //!
 //! Nested Cargo builds run from immutable snapshots and bind their output to
 //! exact workspace bytes, selected external Cargo package trees, Cargo/rustc,
-//! configuration, deterministic environment inputs, and an inventoried set of
-//! build tools. Returned executables are frozen and provenance-checked before
-//! every execution.
+//! configuration, deterministic environment inputs (including an explicit
+//! Cargo job cap), and an inventoried set of build tools. Returned executables
+//! are frozen and provenance-checked before every execution.
 //!
 //! This is deliberately not a claim of total platform hermeticity. The running
 //! kernel, dynamic loader, dynamic system libraries, and platform SDK contents
@@ -96,6 +96,10 @@ static UNIQUE_PATH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 const EXACT_PROVENANCE_SCHEMA: &str = "ay-exact-binary-provenance-v1";
 const EXACT_PROVENANCE_FLAG: &str = "--provenance";
+const CARGO_BUILD_JOBS_ENV: &str = "CARGO_BUILD_JOBS";
+const NBCORE_ENV: &str = "NBCORE";
+const OOM_GUARD_PARENT_LEASE_ENV: &str = "AY_OOM_GUARD_PARENT_LEASE";
+const PARENT_NESTED_CARGO_LOCK_FILE: &str = "ay-test-parent-nested-cargo-v1.lock";
 
 /// Shared isolated target name for exact-source AY CLI integration tests.
 pub const AY_CLI_TARGET_NAME: &str = "ay-test-ay-cli";
@@ -147,6 +151,100 @@ fn canonicalize_existing_parent(path: PathBuf) -> PathBuf {
         .map_or(path.clone(), |parent| parent.join(name))
 }
 
+fn cargo_target_root_from(workspace: &Path, configured: Option<&OsStr>) -> PathBuf {
+    let configured = configured.filter(|value| !value.is_empty());
+    let Some(configured) = configured else {
+        return canonicalize_existing_parent(workspace.join("target"));
+    };
+    let path = PathBuf::from(configured);
+    let configured_root = if path.is_absolute() {
+        path
+    } else {
+        workspace.join(path)
+    };
+    let configured_root = canonicalize_existing_parent(configured_root);
+    let mut hasher = Sha256::new();
+    hash_component(
+        &mut hasher,
+        b"schema",
+        b"ay-test-target-workspace-namespace-v1",
+    );
+    hash_os_component(&mut hasher, b"workspace", workspace.as_os_str());
+    configured_root
+        .join("ay-test-workspaces-v1")
+        .join(finish_source_identity(hasher))
+}
+
+/// Select the writable outer Cargo target root for test build artifacts.
+///
+/// An explicit `CARGO_TARGET_DIR` controls only artifact storage. Exact-source
+/// nested builds still receive a sanitized environment and an explicit,
+/// source-and-build-bound `--target-dir` below this root. Relative overrides
+/// are resolved against the canonical workspace.
+#[must_use]
+pub fn cargo_target_root(workspace: &Path) -> PathBuf {
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    cargo_target_root_from(&workspace, std::env::var_os("CARGO_TARGET_DIR").as_deref())
+}
+
+fn prepare_selected_cargo_target_root(target_root: PathBuf) -> PathBuf {
+    let parent = target_root
+        .parent()
+        .expect("Cargo target root should have a parent");
+    filesystem::create_dir_all(parent).unwrap_or_else(|error| {
+        panic!(
+            "failed to create Cargo target namespace {}: {error}",
+            parent.display()
+        )
+    });
+    for directory in [parent, target_root.as_path()] {
+        filesystem::create_dir_all(directory).unwrap_or_else(|error| {
+            panic!(
+                "failed to create Cargo target directory {}: {error}",
+                directory.display()
+            )
+        });
+        let metadata = filesystem::symlink_metadata(directory).unwrap_or_else(|error| {
+            panic!(
+                "failed to inspect Cargo target directory {}: {error}",
+                directory.display()
+            )
+        });
+        assert!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "Cargo target directory is not a real directory: {}",
+            directory.display()
+        );
+    }
+    target_root
+        .canonicalize()
+        .expect("Cargo target root should be canonicalizable")
+}
+
+fn prepare_cargo_target_root(workspace: &Path) -> PathBuf {
+    prepare_selected_cargo_target_root(cargo_target_root(workspace))
+}
+
+fn isolated_cargo_target_dir_for_outer_in(
+    target_root: &Path,
+    target_name: &str,
+    outer_exe: Option<&Path>,
+) -> PathBuf {
+    let primary = canonicalize_existing_parent(target_root.join(target_name));
+    let outer_exe = outer_exe.map(|path| canonicalize_existing_parent(path.to_path_buf()));
+    if outer_exe
+        .as_deref()
+        .is_some_and(|executable| executable.starts_with(&primary))
+    {
+        return canonicalize_existing_parent(
+            target_root.join(format!("{target_name}-nested-{}", std::process::id())),
+        );
+    }
+    primary
+}
+
 /// Select an isolated nested Cargo target without sharing the outer test
 /// process's target lock. `target_name` must be one path component.
 pub fn isolated_cargo_target_dir_for_outer(
@@ -162,22 +260,8 @@ pub fn isolated_cargo_target_dir_for_outer(
                 .is_some_and(|name| name == target_name),
         "isolated Cargo target name must be one non-empty path component"
     );
-    let workspace = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    let primary = canonicalize_existing_parent(workspace.join("target").join(target_name));
-    let outer_exe = outer_exe.map(|path| canonicalize_existing_parent(path.to_path_buf()));
-    if outer_exe
-        .as_deref()
-        .is_some_and(|executable| executable.starts_with(&primary))
-    {
-        return canonicalize_existing_parent(
-            workspace
-                .join("target")
-                .join(format!("{target_name}-nested-{}", std::process::id())),
-        );
-    }
-    primary
+    let target_root = cargo_target_root(workspace);
+    isolated_cargo_target_dir_for_outer_in(&target_root, target_name, outer_exe)
 }
 
 /// Select an isolated nested Cargo target for the current executable.
@@ -1225,9 +1309,32 @@ const TOOL_SELECTION_ENV_PASSTHROUGH: &[&str] = &[
 struct InventoriedBuildContext {
     cargo: PathBuf,
     rustc: PathBuf,
+    cargo_scheduling: NestedCargoScheduling,
     environment: BTreeMap<OsString, OsString>,
     execution_environment: BTreeMap<OsString, OsString>,
     identity: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NestedCargoScheduling {
+    CargoDefault,
+    ExplicitPerInvocation { jobs: usize },
+    ParentEnvelopeSerialized { jobs: usize },
+}
+
+impl NestedCargoScheduling {
+    fn jobs(self) -> Option<usize> {
+        match self {
+            Self::CargoDefault => None,
+            Self::ExplicitPerInvocation { jobs } | Self::ParentEnvelopeSerialized { jobs } => {
+                Some(jobs)
+            }
+        }
+    }
+
+    fn serializes_parent_envelope(self) -> bool {
+        matches!(self, Self::ParentEnvelopeSerialized { .. })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1326,6 +1433,142 @@ fn sanitized_build_environment_from(
         environment.insert("PATH".into(), normalized_absolute_path(Some(&path)));
     }
     environment
+}
+
+fn ambient_value<'a>(ambient: &'a [(OsString, OsString)], name: &str) -> Option<&'a OsStr> {
+    ambient
+        .iter()
+        .find_map(|(key, value)| (key == OsStr::new(name)).then_some(value.as_os_str()))
+}
+
+fn positive_job_count(name: &str, value: &OsStr) -> usize {
+    let value = value
+        .to_str()
+        .unwrap_or_else(|| panic!("{name} must be a positive UTF-8 integer"));
+    let jobs = value
+        .parse::<usize>()
+        .unwrap_or_else(|_| panic!("{name} must be a positive integer, got {value:?}"));
+    assert!(jobs > 0, "{name} must be positive");
+    jobs
+}
+
+fn nested_cargo_scheduling_from_ambient(ambient: &[(OsString, OsString)]) -> NestedCargoScheduling {
+    let configured = ambient_value(ambient, CARGO_BUILD_JOBS_ENV)
+        .map(|value| positive_job_count(CARGO_BUILD_JOBS_ENV, value));
+    let Some(parent_lease) = ambient_value(ambient, OOM_GUARD_PARENT_LEASE_ENV) else {
+        return configured.map_or(NestedCargoScheduling::CargoDefault, |jobs| {
+            NestedCargoScheduling::ExplicitPerInvocation { jobs }
+        });
+    };
+    assert_eq!(
+        parent_lease.to_str(),
+        Some("1"),
+        "{OOM_GUARD_PARENT_LEASE_ENV} must be exactly 1 when present"
+    );
+    let jobs = configured.unwrap_or_else(|| {
+        panic!("{CARGO_BUILD_JOBS_ENV} is required under the parent OOM-guard lease")
+    });
+    let nbcore = ambient_value(ambient, NBCORE_ENV)
+        .unwrap_or_else(|| panic!("{NBCORE_ENV} is required under the parent OOM-guard lease"));
+    let nbcore = positive_job_count(NBCORE_ENV, nbcore);
+    assert_eq!(
+        jobs, nbcore,
+        "{CARGO_BUILD_JOBS_ENV}={jobs} does not match {NBCORE_ENV}={nbcore}"
+    );
+    NestedCargoScheduling::ParentEnvelopeSerialized { jobs }
+}
+
+fn current_nested_cargo_scheduling() -> NestedCargoScheduling {
+    nested_cargo_scheduling_from_ambient(&std::env::vars_os().collect::<Vec<_>>())
+}
+
+fn parent_nested_cargo_lock_path(target_root: &Path) -> PathBuf {
+    target_root.join(PARENT_NESTED_CARGO_LOCK_FILE)
+}
+
+fn assert_parent_nested_cargo_lock_file(path: &Path, file: &filesystem::File) {
+    let path_metadata = filesystem::symlink_metadata(path).unwrap_or_else(|error| {
+        panic!(
+            "failed to inspect parent nested-Cargo lock {}: {error}",
+            path.display()
+        )
+    });
+    assert!(
+        path_metadata.is_file() && !path_metadata.file_type().is_symlink(),
+        "parent nested-Cargo lock is not a real file: {}",
+        path.display()
+    );
+    let file_metadata = file.metadata().unwrap_or_else(|error| {
+        panic!(
+            "failed to inspect open parent nested-Cargo lock {}: {error}",
+            path.display()
+        )
+    });
+    assert!(
+        file_metadata.is_file(),
+        "open parent nested-Cargo lock is not a file: {}",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        assert_eq!(
+            (path_metadata.dev(), path_metadata.ino()),
+            (file_metadata.dev(), file_metadata.ino()),
+            "parent nested-Cargo lock path changed while opening: {}",
+            path.display()
+        );
+        assert_eq!(
+            file_metadata.nlink(),
+            1,
+            "parent nested-Cargo lock has unexpected hard links: {}",
+            path.display()
+        );
+    }
+}
+
+fn open_parent_nested_cargo_lock(target_root: &Path) -> filesystem::File {
+    let path = parent_nested_cargo_lock_path(target_root);
+    match filesystem::symlink_metadata(&path) {
+        Ok(metadata) => assert!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "parent nested-Cargo lock is not a real file: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "failed to inspect parent nested-Cargo lock {}: {error}",
+            path.display()
+        ),
+    }
+    let file = filesystem::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to open parent nested-Cargo lock {}: {error}",
+                path.display()
+            )
+        });
+    assert_parent_nested_cargo_lock_file(&path, &file);
+    file
+}
+
+fn acquire_parent_nested_cargo_lock(target_root: &Path) -> filesystem::File {
+    let path = parent_nested_cargo_lock_path(target_root);
+    let file = open_parent_nested_cargo_lock(target_root);
+    file.lock().unwrap_or_else(|error| {
+        panic!(
+            "failed to acquire parent nested-Cargo lock {}: {error}",
+            path.display()
+        )
+    });
+    assert_parent_nested_cargo_lock_file(&path, &file);
+    file
 }
 
 fn run_with_environment(
@@ -2244,9 +2487,12 @@ fn shared_checker_artifact_group(spec: WorkspaceBinarySpec<'_>) -> bool {
         )
 }
 
-fn workspace_invocation_identity(spec: WorkspaceBinarySpec<'_>) -> String {
+fn workspace_invocation_identity(
+    spec: WorkspaceBinarySpec<'_>,
+    cargo_scheduling: NestedCargoScheduling,
+) -> String {
     let mut hasher = Sha256::new();
-    hash_component(&mut hasher, b"schema", b"ay-test-cargo-invocation-v1");
+    hash_component(&mut hasher, b"schema", b"ay-test-cargo-invocation-v2");
     if shared_checker_artifact_group(spec) {
         // These two whitelisted packages have distinct output filenames and
         // identical feature/binding requirements. Their build context binds
@@ -2276,12 +2522,61 @@ fn workspace_invocation_identity(spec: WorkspaceBinarySpec<'_>) -> String {
             SourceBinding::ExactProvenance => b"exact-provenance",
         },
     );
+    match cargo_scheduling {
+        NestedCargoScheduling::CargoDefault => {
+            hash_component(&mut hasher, b"cargo-jobs-mode", b"cargo-default");
+        }
+        NestedCargoScheduling::ExplicitPerInvocation { jobs } => {
+            hash_component(&mut hasher, b"cargo-jobs-mode", b"explicit-per-invocation");
+            hash_component(&mut hasher, b"cargo-jobs", jobs.to_string().as_bytes());
+        }
+        NestedCargoScheduling::ParentEnvelopeSerialized { jobs } => {
+            hash_component(
+                &mut hasher,
+                b"cargo-jobs-mode",
+                b"parent-envelope-serialized-v1",
+            );
+            hash_component(&mut hasher, b"cargo-jobs", jobs.to_string().as_bytes());
+        }
+    }
     finish_build_identity(hasher)
+}
+
+fn nested_cargo_build_arguments(
+    spec: WorkspaceBinarySpec<'_>,
+    target_dir: &Path,
+    cargo_scheduling: NestedCargoScheduling,
+) -> Vec<OsString> {
+    let mut arguments = vec![OsString::from("build")];
+    if let Some(jobs) = cargo_scheduling.jobs() {
+        arguments.push("--jobs".into());
+        arguments.push(jobs.to_string().into());
+    }
+    arguments.extend(
+        [
+            "--locked",
+            "--offline",
+            "-p",
+            spec.package,
+            "--bin",
+            spec.binary,
+            "--target-dir",
+        ]
+        .into_iter()
+        .map(OsString::from),
+    );
+    arguments.push(target_dir.as_os_str().to_owned());
+    if !spec.features.is_empty() {
+        arguments.push("--features".into());
+        arguments.push(spec.features.join(",").into());
+    }
+    arguments
 }
 
 fn inventoried_build_context(
     build_workspace: &Path,
     source_workspace: &Path,
+    target_root: &Path,
     spec: WorkspaceBinarySpec<'_>,
     source_identity: &str,
 ) -> InventoriedBuildContext {
@@ -2290,8 +2585,9 @@ fn inventoried_build_context(
     let tools = selected_external_build_tools();
     let tool_path = publish_tool_path(&tools);
     let tool_identity = tool_set_identity(&tools);
-    let mut environment =
-        sanitized_build_environment_from(std::env::vars_os(), &cargo_home, &toolchain.rustc);
+    let ambient = std::env::vars_os().collect::<Vec<_>>();
+    let cargo_scheduling = nested_cargo_scheduling_from_ambient(&ambient);
+    let mut environment = sanitized_build_environment_from(ambient, &cargo_home, &toolchain.rustc);
     environment.insert("PATH".into(), tool_path.as_os_str().to_owned());
 
     #[cfg(not(windows))]
@@ -2364,13 +2660,14 @@ fn inventoried_build_context(
     );
 
     let mut hasher = Sha256::new();
-    hash_component(&mut hasher, b"schema", b"ay-test-build-v2");
+    hash_component(&mut hasher, b"schema", b"ay-test-build-v4");
     hash_os_component(&mut hasher, b"build-workspace", build_workspace.as_os_str());
     hash_os_component(
         &mut hasher,
         b"source-workspace",
         source_workspace.as_os_str(),
     );
+    hash_os_component(&mut hasher, b"cargo-target-root", target_root.as_os_str());
     hash_component(&mut hasher, b"source-identity", source_identity.as_bytes());
     hash_file_input(&mut hasher, b"cargo", &toolchain.cargo);
     hash_component(&mut hasher, b"cargo-version", &cargo_version);
@@ -2403,7 +2700,7 @@ fn inventoried_build_context(
         source_config_policy.as_bytes(),
     );
     hash_environment(&mut hasher, &environment);
-    let invocation_identity = workspace_invocation_identity(spec);
+    let invocation_identity = workspace_invocation_identity(spec, cargo_scheduling);
     hash_component(
         &mut hasher,
         b"cargo-invocation",
@@ -2413,6 +2710,7 @@ fn inventoried_build_context(
     InventoriedBuildContext {
         cargo: toolchain.cargo,
         rustc: toolchain.rustc,
+        cargo_scheduling,
         environment,
         execution_environment,
         identity: finish_build_identity(hasher),
@@ -2422,13 +2720,19 @@ fn inventoried_build_context(
 fn assert_inventoried_build_context(
     build_workspace: &Path,
     source_workspace: &Path,
+    target_root: &Path,
     spec: WorkspaceBinarySpec<'_>,
     source_identity: &str,
     expected: &InventoriedBuildContext,
     operation: &str,
 ) {
-    let actual =
-        inventoried_build_context(build_workspace, source_workspace, spec, source_identity);
+    let actual = inventoried_build_context(
+        build_workspace,
+        source_workspace,
+        target_root,
+        spec,
+        source_identity,
+    );
     assert_eq!(
         &actual, expected,
         "semantic build inputs changed during {operation}; refusing an ambiguously built binary"
@@ -2496,14 +2800,13 @@ fn frozen_artifact_identity(path: &Path) -> String {
 }
 
 fn publish_frozen_artifact(
-    workspace: &Path,
+    target_root: &Path,
     binary_path: &Path,
     binary: &str,
     source_identity: &str,
     build_identity: &str,
 ) -> (PathBuf, String) {
-    let target_root = workspace.join("target");
-    filesystem::create_dir_all(&target_root).unwrap_or_else(|error| {
+    filesystem::create_dir_all(target_root).unwrap_or_else(|error| {
         panic!(
             "failed to create target root {}: {error}",
             target_root.display()
@@ -2750,11 +3053,27 @@ fn build_workspace_binary_from_snapshot(
     snapshot: SourceSnapshot,
 ) -> BuiltWorkspaceBinary {
     let source_identity = snapshot.source_identity.clone();
-    let build_context =
-        inventoried_build_context(&snapshot.root, &workspace, spec, &source_identity);
+    let target_root = prepare_cargo_target_root(&workspace);
+    let expected_cargo_scheduling = current_nested_cargo_scheduling();
+    let parent_nested_cargo_lock = expected_cargo_scheduling
+        .serializes_parent_envelope()
+        .then(|| acquire_parent_nested_cargo_lock(&target_root));
+    let build_context = inventoried_build_context(
+        &snapshot.root,
+        &workspace,
+        &target_root,
+        spec,
+        &source_identity,
+    );
+    assert_eq!(
+        build_context.cargo_scheduling, expected_cargo_scheduling,
+        "nested Cargo scheduling environment changed while acquiring the parent-envelope lock"
+    );
     let build_identity = build_context.identity.clone();
     let target_name = build_bound_target_name(spec.target_name, &source_identity, &build_identity);
-    let target_dir = isolated_cargo_target_dir(&workspace, &target_name);
+    let outer_exe = std::env::current_exe().ok();
+    let target_dir =
+        isolated_cargo_target_dir_for_outer_in(&target_root, &target_name, outer_exe.as_deref());
     let binary_path = cargo_binary_path(&target_dir, spec.binary);
 
     eprintln!(
@@ -2768,20 +3087,11 @@ fn build_workspace_binary_from_snapshot(
         .current_dir(&snapshot.root)
         .env_clear()
         .envs(&build_context.environment)
-        .args([
-            "build",
-            "--locked",
-            "--offline",
-            "-p",
-            spec.package,
-            "--bin",
-            spec.binary,
-            "--target-dir",
-        ])
-        .arg(&target_dir);
-    if !spec.features.is_empty() {
-        command.arg("--features").arg(spec.features.join(","));
-    }
+        .args(nested_cargo_build_arguments(
+            spec,
+            &target_dir,
+            build_context.cargo_scheduling,
+        ));
     if matches!(
         spec.source_binding,
         SourceBinding::AyVersion | SourceBinding::ExactProvenance
@@ -2817,11 +3127,13 @@ fn build_workspace_binary_from_snapshot(
     assert_inventoried_build_context(
         &snapshot.root,
         &workspace,
+        &target_root,
         spec,
         &source_identity,
         &build_context,
         &format!("isolated cargo build for {}/{}", spec.package, spec.binary),
     );
+    drop(parent_nested_cargo_lock);
     assert!(
         binary_path.is_file(),
         "isolated cargo build did not produce {}",
@@ -2829,7 +3141,7 @@ fn build_workspace_binary_from_snapshot(
     );
 
     let (artifact_path, artifact_identity) = publish_frozen_artifact(
-        &workspace,
+        &target_root,
         &binary_path,
         spec.binary,
         &source_identity,
@@ -2990,6 +3302,85 @@ mod tests {
     }
 
     #[test]
+    fn cargo_target_root_honors_outer_storage_without_changing_fallback() {
+        let workspace = tempfile::tempdir().expect("temporary workspace");
+        let workspace = workspace.path().canonicalize().unwrap();
+        assert_eq!(
+            cargo_target_root_from(&workspace, None),
+            workspace.join("target")
+        );
+        assert_eq!(
+            cargo_target_root_from(&workspace, Some(OsStr::new(""))),
+            workspace.join("target"),
+            "an empty override must preserve the existing fallback"
+        );
+
+        let absolute = tempfile::tempdir().expect("absolute target root");
+        let configured = cargo_target_root_from(&workspace, Some(absolute.path().as_os_str()));
+        assert_eq!(
+            configured,
+            cargo_target_root_from(&workspace, Some(absolute.path().as_os_str())),
+            "one workspace must select a stable shared target namespace"
+        );
+        assert!(
+            configured.starts_with(
+                absolute
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("ay-test-workspaces-v1")
+            ),
+            "configured target must remain below the explicit storage root"
+        );
+        assert!(
+            cargo_target_root_from(&workspace, Some(OsStr::new("outer-target")))
+                .starts_with(workspace.join("outer-target/ay-test-workspaces-v1"))
+        );
+
+        let other_workspace = tempfile::tempdir().expect("other temporary workspace");
+        assert_ne!(
+            configured,
+            cargo_target_root_from(
+                &other_workspace.path().canonicalize().unwrap(),
+                Some(absolute.path().as_os_str())
+            ),
+            "shared outer storage must retain worktree isolation"
+        );
+    }
+
+    #[test]
+    fn configured_target_root_preserves_nested_lock_avoidance() {
+        let target_root = tempfile::tempdir().expect("temporary target root");
+        let primary = isolated_cargo_target_dir_for_outer_in(target_root.path(), "exact", None);
+        assert_eq!(primary, target_root.path().join("exact"));
+
+        let outer_exe = primary.join("debug/deps/running-test");
+        let nested =
+            isolated_cargo_target_dir_for_outer_in(target_root.path(), "exact", Some(&outer_exe));
+        assert_ne!(nested, primary);
+        assert_eq!(
+            nested.file_name().and_then(OsStr::to_str),
+            Some(format!("exact-nested-{}", std::process::id()).as_str())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_target_root_rejects_symlinked_managed_namespace() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempfile::tempdir().expect("temporary configured root");
+        let redirect = tempfile::tempdir().expect("temporary redirect");
+        let namespace = base.path().join("ay-test-workspaces-v1");
+        symlink(redirect.path(), &namespace).expect("create namespace symlink");
+        let selected = namespace.join("workspace-key");
+        assert!(
+            std::panic::catch_unwind(|| prepare_selected_cargo_target_root(selected)).is_err(),
+            "managed target namespace symlinks must fail closed"
+        );
+    }
+
+    #[test]
     fn only_distinct_whitelisted_checkers_share_an_invocation_target() {
         let lrat = WorkspaceBinarySpec {
             workspace: Path::new("."),
@@ -3016,9 +3407,11 @@ mod tests {
             source_binding: SourceBinding::ExactProvenance,
         };
 
-        let lrat_identity = workspace_invocation_identity(lrat);
-        let drat_identity = workspace_invocation_identity(drat);
-        let other_identity = workspace_invocation_identity(colliding_other_package);
+        let parent_scheduling = NestedCargoScheduling::ParentEnvelopeSerialized { jobs: 3 };
+        let lrat_identity = workspace_invocation_identity(lrat, parent_scheduling);
+        let drat_identity = workspace_invocation_identity(drat, parent_scheduling);
+        let other_identity =
+            workspace_invocation_identity(colliding_other_package, parent_scheduling);
         assert_eq!(
             lrat_identity, drat_identity,
             "the distinct standalone checker outputs should reuse compiled dependencies"
@@ -3035,6 +3428,155 @@ mod tests {
             build_bound_target_name("checker", "source", &lrat_identity),
             build_bound_target_name("checker", "source", &other_identity)
         );
+        assert_ne!(
+            lrat_identity,
+            workspace_invocation_identity(
+                lrat,
+                NestedCargoScheduling::ParentEnvelopeSerialized { jobs: 2 }
+            ),
+            "Cargo exposes its job count to build scripts, so the cap is an artifact input"
+        );
+        assert_ne!(
+            lrat_identity,
+            workspace_invocation_identity(lrat, NestedCargoScheduling::CargoDefault),
+            "an explicit cap and Cargo's host-dependent default must not share provenance"
+        );
+        assert_ne!(
+            lrat_identity,
+            workspace_invocation_identity(
+                lrat,
+                NestedCargoScheduling::ExplicitPerInvocation { jobs: 3 }
+            ),
+            "serialized parent-envelope scheduling must be explicit in provenance"
+        );
+    }
+
+    #[test]
+    fn nested_cargo_job_cap_is_strict_and_parent_authenticated() {
+        fn environment(entries: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+            entries
+                .iter()
+                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                .collect()
+        }
+
+        assert_eq!(
+            nested_cargo_scheduling_from_ambient(&[]),
+            NestedCargoScheduling::CargoDefault
+        );
+        assert_eq!(
+            nested_cargo_scheduling_from_ambient(&environment(&[(CARGO_BUILD_JOBS_ENV, "3")])),
+            NestedCargoScheduling::ExplicitPerInvocation { jobs: 3 }
+        );
+        assert_eq!(
+            nested_cargo_scheduling_from_ambient(&environment(&[
+                (OOM_GUARD_PARENT_LEASE_ENV, "1"),
+                (CARGO_BUILD_JOBS_ENV, "3"),
+                (NBCORE_ENV, "3"),
+            ])),
+            NestedCargoScheduling::ParentEnvelopeSerialized { jobs: 3 }
+        );
+
+        for entries in [
+            vec![(CARGO_BUILD_JOBS_ENV, "")],
+            vec![(CARGO_BUILD_JOBS_ENV, "0")],
+            vec![(CARGO_BUILD_JOBS_ENV, "-1")],
+            vec![(CARGO_BUILD_JOBS_ENV, "many")],
+            vec![(OOM_GUARD_PARENT_LEASE_ENV, "0")],
+            vec![(OOM_GUARD_PARENT_LEASE_ENV, "1")],
+            vec![
+                (OOM_GUARD_PARENT_LEASE_ENV, "1"),
+                (CARGO_BUILD_JOBS_ENV, "3"),
+            ],
+            vec![
+                (OOM_GUARD_PARENT_LEASE_ENV, "1"),
+                (CARGO_BUILD_JOBS_ENV, "3"),
+                (NBCORE_ENV, "2"),
+            ],
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| {
+                    nested_cargo_scheduling_from_ambient(&environment(&entries))
+                })
+                .is_err(),
+                "invalid nested Cargo resource environment must fail closed: {entries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_cargo_command_explicitly_applies_validated_job_cap() {
+        let spec = WorkspaceBinarySpec {
+            workspace: Path::new("."),
+            target_name: "exact",
+            package: "example-package",
+            binary: "example-binary",
+            features: &["one", "two"],
+            source_binding: SourceBinding::IdentityTarget,
+        };
+        let capped = nested_cargo_build_arguments(
+            spec,
+            Path::new("exact-target"),
+            NestedCargoScheduling::ParentEnvelopeSerialized { jobs: 3 },
+        );
+        assert_eq!(
+            capped,
+            [
+                "build",
+                "--jobs",
+                "3",
+                "--locked",
+                "--offline",
+                "-p",
+                "example-package",
+                "--bin",
+                "example-binary",
+                "--target-dir",
+                "exact-target",
+                "--features",
+                "one,two",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+
+        let uncapped = nested_cargo_build_arguments(
+            spec,
+            Path::new("exact-target"),
+            NestedCargoScheduling::CargoDefault,
+        );
+        assert!(
+            !uncapped
+                .iter()
+                .any(|argument| argument == OsStr::new("--jobs")),
+            "ordinary tests without a configured cap retain Cargo's default"
+        );
+    }
+
+    #[test]
+    fn parent_nested_cargo_lock_excludes_a_second_file_handle() {
+        let target_root = tempfile::tempdir().expect("temporary target root");
+        let expected_path = target_root.path().join(PARENT_NESTED_CARGO_LOCK_FILE);
+        assert_eq!(
+            parent_nested_cargo_lock_path(target_root.path()),
+            expected_path
+        );
+
+        let first = acquire_parent_nested_cargo_lock(target_root.path());
+        let second = open_parent_nested_cargo_lock(target_root.path());
+        let error = second
+            .try_lock()
+            .expect_err("a second nested Cargo handle must not enter the parent envelope");
+        assert!(
+            matches!(error, filesystem::TryLockError::WouldBlock),
+            "lock contention must fail nonblockingly: {error}"
+        );
+
+        drop(first);
+        second
+            .try_lock()
+            .expect("dropping the first handle must release the nested Cargo lock");
     }
 
     #[test]
@@ -3100,6 +3642,12 @@ mod tests {
                 OsString::from("CARGO_PROFILE_DEV_OPT_LEVEL"),
                 OsString::from("3"),
             ),
+            (OsString::from(CARGO_BUILD_JOBS_ENV), OsString::from("3")),
+            (
+                OsString::from(OOM_GUARD_PARENT_LEASE_ENV),
+                OsString::from("1"),
+            ),
+            (OsString::from(NBCORE_ENV), OsString::from("3")),
         ];
         let environment = sanitized_build_environment_from(
             ambient,
@@ -3140,6 +3688,9 @@ mod tests {
             "CARGO_TARGET_DIR",
             "CARGO_BUILD_TARGET",
             "CARGO_PROFILE_DEV_OPT_LEVEL",
+            CARGO_BUILD_JOBS_ENV,
+            OOM_GUARD_PARENT_LEASE_ENV,
+            NBCORE_ENV,
         ] {
             assert!(
                 !environment.contains_key(OsStr::new(removed)),

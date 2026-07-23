@@ -125,6 +125,39 @@ const AM1_PROBE_TIME_SHARE: f64 = 0.07;
 /// Skip the pass when the level-qualified active original set exceeds this:
 /// the O(n) probes plus greedy clique cover would dominate the level phase.
 const AM1_PROBE_MAX_ACTIVE: usize = 2000;
+/// Reiteration cap for the OVERLAPPING weighted clique cover (#am1-overlap,
+/// CGSS2 try_am1s port). Each pass peels one min-weight layer per am1 and
+/// reuses selectors across cliques until their residual weight is spent; the
+/// scan reiterates over the surviving residuals. CGSS2 converges in ~6 passes
+/// on the auctions family (148 am1s, avg size 33, paying 99.8% of the optimum
+/// lb up front); the cap only guards a pathological dense graph from spinning
+/// — hitting it merely leaves some lb to the ordinary core loop, never wrong.
+const AM1_PROBE_MAX_ITERS: u32 = 64;
+/// Distinct-soft-weight count at/above which the overlapping weighted clique
+/// cover replaces the disjoint one (#am1-overlap gate; see `am1_overlap`).
+const AM1_OVERLAP_MIN_DISTINCT_WEIGHTS: usize = 20;
+
+/// #am1-maxcover kill switch (env A/B). DEFAULT ON: for the overlapping AM1
+/// clique cover (`adapt_am1`, gated on the >= 20-distinct-weight family) score
+/// BOTH candidate growth orderings — the landed shared-neighbour reorder and
+/// CGSS2's ascending-degree order (try_am1s am1s_order=1) — and keep the plan
+/// with the higher lower bound. A higher clique-cover lb is a strictly better
+/// VALID bound (both plans are the same sound per-layer peel over the same
+/// direct-conflict graph, only the clique partition differs), so this can only
+/// raise install lb, never lower it. Motivation: the shared-neighbour order
+/// fragments the dense mutual-conflict cliques of combinatorial auctions (whose
+/// hard clauses are all binary, so the whole conflict graph is direct edges and
+/// a UP probe adds nothing) — on auctions_wt-cat_reg_60_150_0004 it pays install
+/// lb 112419 where the ascending-degree order pays 113275 (99.8% of the 113503
+/// optimum, matching cgss). The shared order still WINS elsewhere
+/// (cat_paths_60_150_0004: +171), so neither dominates and max-of-both is the
+/// safe choice. `AY_AB_MAXSAT_AM1_MAXCOVER=0` restores the shared-only landed
+/// cover bit-identically; low-weight/unweighted is untouched (overlap gate).
+fn am1_maxcover_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_AM1_MAXCOVER").as_deref() != Ok("0"))
+}
 
 /// Active-soft cap for the EAGER initial probe (#maxsat-am1-probe eager init).
 /// The failed sweep itself is uncapped (only the hit-rate abort bounds it), so
@@ -804,6 +837,25 @@ pub(crate) struct OllEngine {
     /// lane must never activate on uniform (in particular unweighted)
     /// instances, whose behavior must be identical to the lane-free engine.
     lp_eligible: bool,
+    /// #am1-overlap gate: enable the OVERLAPPING weighted clique cover (a
+    /// selector reused across every entailed am1 until its weight is spent,
+    /// with reiteration — CGSS2 try_am1s) over the plain disjoint cover, iff
+    /// the instance has enough DISTINCT soft weights to be OLL-dust-prone.
+    /// The dust pathology the overlap cures is CAUSED by many distinct
+    /// weights (each per-w_min core split leaves a residual = weight
+    /// difference that re-spawns), so the distinct-weight count is the direct
+    /// predictor. Measured cleanly on the mse24 weighted families: the
+    /// instances the overlap SPEEDS UP or FLIPS all have >= 32 distinct soft
+    /// weights (auctions cat_reg/cat_paths 32-175, warehouses 1245-2482,
+    /// css-refactoring 71-110), while the ones it REGRESSED — turning a
+    /// sub-second solve into seconds, or a 58s solve into a timeout — all have
+    /// <= 15 (auctions cat_sched 4-15, rna-alignment 2). The overlap's extra
+    /// disjunction softs only pay off when the disjoint cover leaves real
+    /// clique-cover lower bound on the table; below the gate the disjoint
+    /// cover already suffices and the extra structure is pure overhead on
+    /// AY's (vs CGSS2's) heavier per-SAT-call cost. Off => the am1 covers are
+    /// bit-identical to the pre-overlap engine.
+    am1_overlap: bool,
     /// #lp-boost: lane disabled (dry rounds exhausted or caps exceeded).
     lp_disabled: bool,
     /// Consecutive LP rounds without an effective-lb improvement.
@@ -1232,13 +1284,19 @@ impl OllEngine {
         // uniform instance into merged non-uniform weights): uniform-weight
         // instances — the unweighted track in particular — must behave
         // bit-identically to the lane-free engine.
-        let lp_eligible = {
+        let distinct_weights = {
             let mut distinct: Vec<Weight> =
                 soft_weights.iter().copied().filter(|&w| w > 0).collect();
             distinct.sort_unstable();
             distinct.dedup();
-            distinct.len() >= 2
+            distinct.len()
         };
+        let lp_eligible = distinct_weights >= 2;
+        // #am1-overlap gate (see the field doc): winners had >= 32 distinct
+        // soft weights, regressors <= 15 — gate at 20 (clear of both, margin
+        // above the loss band so a borderline instance stays on the safe,
+        // bit-identical disjoint path).
+        let am1_overlap = distinct_weights >= AM1_OVERLAP_MIN_DISTINCT_WEIGHTS;
 
         let mut engine = OllEngine {
             sat,
@@ -1275,6 +1333,7 @@ impl OllEngine {
             sel_to_soft: HashMap::new(),
             boost_lb: 0,
             lp_eligible,
+            am1_overlap,
             lp_disabled: false,
             lp_dry_rounds: 0,
             lp_last_run_cores: 0,
@@ -1510,98 +1569,279 @@ impl OllEngine {
             .map(|(l, ns)| (*l, ns.iter().copied().collect()))
             .collect();
 
-        let mut order: Vec<Literal> = adj.keys().copied().collect();
-        order.sort_unstable_by_key(|l| (std::cmp::Reverse(adj[l].len()), *l));
-
-        let mut used: HashSet<Literal> = HashSet::new();
-        for &seed in &order {
-            if used.contains(&seed) {
-                continue;
-            }
-            let mut clique = vec![seed];
-            let mut cands: Vec<Literal> = adj[&seed]
-                .iter()
-                .copied()
-                .filter(|n| !used.contains(n) && unit_w.contains_key(n))
-                .collect();
-            cands.sort_unstable();
-            cands.dedup();
-            // Prefer candidates sharing the most neighbors with the seed:
-            // in one-hot/domain encodings (frb: 25 disjoint 13-cliques plus
-            // random CSP cross-edges) plain id order lets a cross-edge
-            // vertex enter first and fragment the true clique — greedy then
-            // finds covers worth lb=254 where the clean partition is worth
-            // the optimum 300. Guarded to sparse graphs where the
-            // intersection scan is cheap; skipping it only costs bound
-            // quality, never correctness.
-            if edges <= 200_000 {
-                let seed_adj = &adj_sets[&seed];
-                let mut scored: Vec<(usize, Literal)> = cands
-                    .iter()
-                    .map(|&n| {
-                        let shared = adj_sets
-                            .get(&n)
-                            .map_or(0, |s| s.intersection(seed_adj).count());
-                        (shared, n)
-                    })
-                    .collect();
-                scored.sort_unstable_by_key(|&(shared, l)| (std::cmp::Reverse(shared), l));
-                cands = scored.into_iter().map(|(_, l)| l).collect();
-            }
-            for n in cands {
-                if n != seed
-                    && clique
-                        .iter()
-                        .all(|m| adj_sets.get(&n).is_some_and(|s| s.contains(m)))
-                {
-                    clique.push(n);
+        // OVERLAPPING iterated weighted clique cover (#am1-overlap, CGSS2
+        // try_am1s port, cgss2.cpp:1258-1402). The former cover was DISJOINT
+        // (the `used` set retired every clique member) and ran a SINGLE pass,
+        // so on a dense weighted conflict graph — combinatorial auctions, where
+        // one high-value bid conflicts with many pairwise-disjoint rivals in
+        // different combinations — it paid only the disjoint-partition bound
+        // (auctions_wt-cat_reg_60_150_0004: lb 107639) and left the rest to
+        // ~850 dust cores at solve time. CGSS2 instead REUSES a selector across
+        // every am1 it fits until its residual weight is spent, and REITERATES
+        // over the survivors; on that instance that pays 148 am1s worth lb
+        // 113291 (99.8% of the 113503 optimum) up front, so the core loop then
+        // closes only the last ~212. Soundness is unchanged from the disjoint
+        // peel: every am1 is a genuine direct-binary conflict clique, so
+        // peeling one minimum-weight layer applies the same exact identity
+        //   Σ_i d·[l_i violated] = d·(k−1) + d·[all violated]
+        // (lb += d·(k−1) plus one disjunction soft at weight d for the residual
+        // "all violated" term); reuse only decomposes a member's soft weight
+        // across the distinct entailed am1s it belongs to. For a UNIFORM-weight
+        // clique (one-hot domains: frb) the single peel exhausts every member,
+        // so nothing is reused and the cover is bit-identical to the disjoint
+        // one — the reuse changes only the non-uniform-weight case. Bounded by
+        // AM1_PROBE_MAX_ITERS; the shared-neighbour candidate order (below) is
+        // kept so a cross-edge cannot fragment a clean clique. Gated on the
+        // instance's distinct-weight count (#am1-overlap): below the gate the
+        // else-branch runs the original DISJOINT cover bit-identically.
+        if self.am1_overlap {
+            // #am1-maxcover: the overlapping cover's lb depends on the candidate
+            // growth order. Score the landed shared-neighbour order and CGSS2's
+            // ascending-degree order as pure plans (no engine mutation) and keep
+            // the higher-lb one — a strictly better VALID bound (see
+            // `am1_maxcover_enabled`). With the flag off, only the shared plan is
+            // computed and applied, bit-identically to the pre-#am1-maxcover
+            // cover. `plan_overlap_cover` performs the same sound per-layer peel
+            // the inline loop used; applying its plan (add lb, register the
+            // disjunction softs, replace the residual unit weights) reproduces
+            // that loop's effect exactly for a given ordering.
+            let unit_w0 = unit_w.clone();
+            let shared_plan = Self::plan_overlap_cover(&unit_w0, &adj, &adj_sets, edges, true);
+            let (lb_add, disjunctions, final_uw, groups) = if am1_maxcover_enabled() {
+                let ascdeg_plan = Self::plan_overlap_cover(&unit_w0, &adj, &adj_sets, edges, false);
+                if ascdeg_plan.0 > shared_plan.0 {
+                    ascdeg_plan
+                } else {
+                    shared_plan
                 }
-            }
-            if clique.len() < 2 {
-                continue;
-            }
-
-            // Iterated extraction (CGSS/RC2 style): peel the clique level
-            // by level so the full unavoidable cost — sum of weights minus
-            // the maximum — lands in the lower bound, not just
-            // w_min * (k - 1). Each level applies the exact identity
-            //   sum_i w[l_i violated] over an AM1 group
-            //   = d * (k - 1) + d * [all violated] + residuals
-            // with d the level's minimum remaining weight, emitting one
-            // disjunction soft per level.
-            for &m in &clique {
-                used.insert(m);
-            }
-            let mut members: Vec<(Literal, Weight)> = clique
-                .iter()
-                .filter_map(|m| unit_w.get(m).map(|&w| (*m, w)))
-                .collect();
-            members.sort_unstable_by_key(|&(l, w)| (w, l));
-            for &(m, _) in &members {
-                merged.remove(&vec![m]);
-                unit_w.remove(&m);
-            }
-            while members.len() >= 2 {
-                let d = members[0].1;
-                self.preproc_cost = self
-                    .preproc_cost
-                    .saturating_add(d.saturating_mul(members.len() as Weight - 1));
-                let mut disjunction: Vec<Literal> = members.iter().map(|&(l, _)| l).collect();
-                disjunction.sort_unstable();
+            } else {
+                shared_plan
+            };
+            self.preproc_cost = self.preproc_cost.saturating_add(lb_add);
+            self.stats.am1_groups = self.stats.am1_groups.saturating_add(groups);
+            for (disjunction, d) in disjunctions {
                 let entry = merged.entry(disjunction).or_insert(0);
                 *entry = entry.saturating_add(d);
-                for e in members.iter_mut() {
-                    e.1 -= d;
+            }
+            unit_w = final_uw;
+            // Reconcile each participating unit's `merged` entry with the residual
+            // weight the peels left (the disjoint cover expressed this as the max-
+            // weight survivor re-add). Only vertices with edges were ever touched;
+            // fully-spent ones drop out, the rest keep their residual.
+            for &lit in adj.keys() {
+                if let Some(&w) = unit_w.get(&lit) {
+                    if w == 0 {
+                        merged.remove(&vec![lit]);
+                    } else {
+                        merged.insert(vec![lit], w);
+                    }
                 }
-                members.retain(|&(_, w)| w > 0);
             }
-            if let Some(&(m, w)) = members.first() {
-                // Max-weight member's residual survives as a unit soft.
-                let entry = merged.entry(vec![m]).or_insert(0);
-                *entry = entry.saturating_add(w);
+        } else {
+            // DISJOINT single-pass cover (pre-#am1-overlap behavior, used
+            // below the distinct-weight gate): each unit is claimed by one
+            // clique and full-peeled; the max-weight survivor's residual is
+            // re-added as a unit. Bit-identical to the pre-overlap engine.
+            let mut order: Vec<Literal> = adj.keys().copied().collect();
+            order.sort_unstable_by_key(|l| (std::cmp::Reverse(adj[l].len()), *l));
+            let mut used: HashSet<Literal> = HashSet::new();
+            for &seed in &order {
+                if used.contains(&seed) {
+                    continue;
+                }
+                let mut clique = vec![seed];
+                let mut cands: Vec<Literal> = adj[&seed]
+                    .iter()
+                    .copied()
+                    .filter(|n| !used.contains(n) && unit_w.contains_key(n))
+                    .collect();
+                cands.sort_unstable();
+                cands.dedup();
+                if edges <= 200_000 {
+                    let seed_adj = &adj_sets[&seed];
+                    let mut scored: Vec<(usize, Literal)> = cands
+                        .iter()
+                        .map(|&n| {
+                            let shared = adj_sets
+                                .get(&n)
+                                .map_or(0, |s| s.intersection(seed_adj).count());
+                            (shared, n)
+                        })
+                        .collect();
+                    scored.sort_unstable_by_key(|&(shared, l)| (std::cmp::Reverse(shared), l));
+                    cands = scored.into_iter().map(|(_, l)| l).collect();
+                }
+                for n in cands {
+                    if n != seed
+                        && clique
+                            .iter()
+                            .all(|m| adj_sets.get(&n).is_some_and(|s| s.contains(m)))
+                    {
+                        clique.push(n);
+                    }
+                }
+                if clique.len() < 2 {
+                    continue;
+                }
+                for &m in &clique {
+                    used.insert(m);
+                }
+                let mut members: Vec<(Literal, Weight)> = clique
+                    .iter()
+                    .filter_map(|m| unit_w.get(m).map(|&w| (*m, w)))
+                    .collect();
+                members.sort_unstable_by_key(|&(l, w)| (w, l));
+                for &(m, _) in &members {
+                    merged.remove(&vec![m]);
+                    unit_w.remove(&m);
+                }
+                while members.len() >= 2 {
+                    let d = members[0].1;
+                    self.preproc_cost = self
+                        .preproc_cost
+                        .saturating_add(d.saturating_mul(members.len() as Weight - 1));
+                    let mut disjunction: Vec<Literal> = members.iter().map(|&(l, _)| l).collect();
+                    disjunction.sort_unstable();
+                    let entry = merged.entry(disjunction).or_insert(0);
+                    *entry = entry.saturating_add(d);
+                    for e in members.iter_mut() {
+                        e.1 -= d;
+                    }
+                    members.retain(|&(_, w)| w > 0);
+                }
+                if let Some(&(m, w)) = members.first() {
+                    let entry = merged.entry(vec![m]).or_insert(0);
+                    *entry = entry.saturating_add(w);
+                }
+                self.stats.am1_groups = self.stats.am1_groups.saturating_add(1);
             }
-            self.stats.am1_groups = self.stats.am1_groups.saturating_add(1);
         }
+    }
+
+    /// Pure overlapping weighted clique-cover PLAN (#am1-maxcover). Simulates the
+    /// same sound per-layer peel as the landed overlap cover on a CLONE of the
+    /// unit weights and returns `(lb_added, disjunction softs to register, final
+    /// residual unit weights, #groups)` WITHOUT touching engine state, so two
+    /// candidate orderings can be scored and the higher-lb plan applied.
+    ///
+    /// `shared` selects the candidate growth order used to extend each clique:
+    /// `true` reproduces the landed shared-neighbour reorder (descending shared
+    /// neighbours with the seed, guarded to sparse graphs — the pre-#am1-maxcover
+    /// behaviour); `false` uses CGSS2's ascending-degree order (try_am1s
+    /// am1s_order=1 / cmp_conns_increasing_n). Seed order is ascending degree in
+    /// both. Every peel obeys the identity lb += d·(k−1) plus one disjunction
+    /// soft (the clique) at weight d, so ANY returned lb is a valid lower bound
+    /// regardless of ordering — max-of-both is therefore always sound.
+    ///
+    /// Applying a plan (add `lb_added` to preproc_cost, `merged.entry(disj) +=
+    /// d` for each disjunction, overwrite the participating units with the final
+    /// residuals) reproduces the inline cover's effect for that ordering exactly;
+    /// with `shared = true` and the plan applied, the result is bit-identical to
+    /// the pre-#am1-maxcover inline loop.
+    fn plan_overlap_cover(
+        unit_w0: &HashMap<Literal, Weight>,
+        adj: &HashMap<Literal, Vec<Literal>>,
+        adj_sets: &HashMap<Literal, HashSet<Literal>>,
+        edges: usize,
+        shared: bool,
+    ) -> (
+        Weight,
+        Vec<(Vec<Literal>, Weight)>,
+        HashMap<Literal, Weight>,
+        u64,
+    ) {
+        let mut unit_w = unit_w0.clone();
+        let mut lb_added: Weight = 0;
+        let mut disjunctions: Vec<(Vec<Literal>, Weight)> = Vec::new();
+        let mut groups: u64 = 0;
+        let mut iters = 0u32;
+        loop {
+            iters += 1;
+            let mut order: Vec<Literal> = adj
+                .keys()
+                .copied()
+                .filter(|l| unit_w.get(l).is_some_and(|&w| w > 0))
+                .collect();
+            // Seed low-degree vertices first (CGSS2 am1s_order=1), id tiebreak.
+            order.sort_unstable_by_key(|l| (adj[l].len(), *l));
+            let mut progressed = false;
+            for seed in order {
+                if unit_w.get(&seed).is_none_or(|&w| w == 0) {
+                    continue;
+                }
+                let mut cands: Vec<Literal> = adj[&seed]
+                    .iter()
+                    .copied()
+                    .filter(|n| unit_w.get(n).is_some_and(|&w| w > 0))
+                    .collect();
+                cands.sort_unstable();
+                cands.dedup();
+                if edges <= 200_000 {
+                    if shared {
+                        // Prefer candidates sharing the most neighbours with the
+                        // seed: in one-hot/domain encodings a low-degree cross-edge
+                        // vertex entering first fragments the true clique. Guarded
+                        // to sparse graphs where the intersection scan is cheap.
+                        let seed_adj = &adj_sets[&seed];
+                        let mut scored: Vec<(usize, Literal)> = cands
+                            .iter()
+                            .map(|&n| {
+                                let sh = adj_sets
+                                    .get(&n)
+                                    .map_or(0, |s| s.intersection(seed_adj).count());
+                                (sh, n)
+                            })
+                            .collect();
+                        scored.sort_unstable_by_key(|&(sh, l)| (std::cmp::Reverse(sh), l));
+                        cands = scored.into_iter().map(|(_, l)| l).collect();
+                    } else {
+                        // CGSS2 ascending-degree candidate order: grows tight
+                        // cliques over the dense mutual-conflict graphs of
+                        // combinatorial auctions where the shared reorder fragments.
+                        cands.sort_unstable_by_key(|n| (adj[n].len(), *n));
+                    }
+                }
+                let mut clique = vec![seed];
+                for n in cands {
+                    if n != seed
+                        && clique
+                            .iter()
+                            .all(|m| adj_sets.get(&n).is_some_and(|s| s.contains(m)))
+                    {
+                        clique.push(n);
+                    }
+                }
+                let members: Vec<(Literal, Weight)> = clique
+                    .iter()
+                    .filter_map(|m| unit_w.get(m).map(|&w| (*m, w)))
+                    .filter(|&(_, w)| w > 0)
+                    .collect();
+                if members.len() < 2 {
+                    continue;
+                }
+                // Peel one minimum-weight layer; reiteration handles the rest.
+                let d = members
+                    .iter()
+                    .map(|&(_, w)| w)
+                    .min()
+                    .expect("members is non-empty");
+                lb_added = lb_added.saturating_add(d.saturating_mul(members.len() as Weight - 1));
+                let mut disjunction: Vec<Literal> = members.iter().map(|&(l, _)| l).collect();
+                disjunction.sort_unstable();
+                disjunctions.push((disjunction, d));
+                for &(m, _) in &members {
+                    if let Some(w) = unit_w.get_mut(&m) {
+                        *w -= d.min(*w);
+                    }
+                }
+                groups += 1;
+                progressed = true;
+            }
+            if !progressed || iters >= AM1_PROBE_MAX_ITERS {
+                break;
+            }
+        }
+        (lb_added, disjunctions, unit_w, groups)
     }
 
     /// #maxsat-am1-probe: at a post-solve stratification level change, mine
@@ -1623,8 +1863,9 @@ impl OllEngine {
     ///      most one of `s, s'` is satisfied in every model.
     ///
     /// The edges feed the SAME exact iterated-peeling accounting as
-    /// `adapt_am1` (`relax_am1_clique`): a clique of k selectors forces >= k−1
-    /// violations, so lb += d·(k−1) at each peel level d, plus one disjunction
+    /// `adapt_am1` (`relax_am1_clique_layer`): a clique of k selectors forces
+    /// >= k−1 violations, so lb += d·(k−1) at each peel level d, plus one
+    /// disjunction
     /// soft (s_1 ∨ … ∨ s_k) at weight d for the residual "all violated" term.
     ///
     /// SOUNDNESS. Every reported implication is UP-derived, hence a logical
@@ -1778,31 +2019,142 @@ impl OllEngine {
             }
         }
 
-        // Greedy clique cover over the semantic edges, then exact peel
-        // accounting per clique.
-        let cliques = Self::greedy_clique_cover(&adj);
+        // OVERLAPPING iterated weighted clique cover (#am1-overlap, CGSS2
+        // try_am1s port, cgss2.cpp:1258-1402). The former cover was DISJOINT
+        // (a selector claimed by one clique could never join another) and ran
+        // a SINGLE pass, so on a dense conflict graph — combinatorial auctions,
+        // where one high-value bid conflicts with many pairwise-disjoint rivals
+        // in different combinations — it paid only a fraction of the clique-
+        // cover lower bound (auctions_wt-cat_reg_60_150_0004: 7 disjoint
+        // cliques, lb 107639) and left the rest to ~850 dust cores. CGSS2
+        // instead REUSES a selector across every am1 it fits until its residual
+        // weight is spent and REITERATES over the surviving residuals; on the
+        // same instance that pays 148 am1s worth lb 113291 (99.8% of the
+        // 113503 optimum) in ~6 passes, so the core loop closes the last 212 in
+        // ~34 cores. Soundness is unchanged from relax_am1_clique's per-layer
+        // identity: every am1 is UP-entailed (symmetric edges in `adj`, valid
+        // under any later clause addition), and reusing a selector merely
+        // decomposes its soft weight across the distinct entailed am1s it
+        // belongs to — each weight slice `d` pays lb += d·(k−1) with the same
+        // cost-preserving disjunction selector. Bounded by AM1_PROBE_MAX_ITERS,
+        // the outer time share, and should_stop; missing an am1 costs only lb.
+        let groups_before = self.stats.am1_probe_groups;
+        let mut iters = 0u32;
+        if self.am1_overlap {
+            loop {
+                iters += 1;
+                // Seed order: ascending degree, id tiebreak (CGSS2 am1s_order=1,
+                // cmp_conns_increasing). Only selectors with residual weight and
+                // a live edge can still seed an am1.
+                let mut order: Vec<Literal> = adj
+                    .keys()
+                    .copied()
+                    .filter(|l| self.active.get(l).is_some_and(|&w| w > 0))
+                    .collect();
+                order.sort_unstable_by_key(|l| (adj[l].len(), *l));
+                let mut progressed = false;
+                for seed in order {
+                    if self.active.get(&seed).is_none_or(|&w| w == 0) {
+                        continue;
+                    }
+                    let mut clique = vec![seed];
+                    let mut cands: Vec<Literal> = adj[&seed]
+                        .iter()
+                        .copied()
+                        .filter(|n| self.active.get(n).is_some_and(|&w| w > 0))
+                        .collect();
+                    cands.sort_unstable_by_key(|n| (adj[n].len(), *n));
+                    for n in cands {
+                        if clique.iter().all(|m| adj[&n].contains(m)) {
+                            clique.push(n);
+                        }
+                    }
+                    if clique.len() >= 2 {
+                        self.relax_am1_clique_layer(&clique);
+                        progressed = true;
+                    }
+                }
+                if !progressed || iters >= AM1_PROBE_MAX_ITERS || should_stop() {
+                    break;
+                }
+            }
+        } else {
+            // Disjoint single-pass cover (pre-#am1-overlap behavior): each
+            // selector is claimed by the first clique that fits it. Kept for
+            // instances below the distinct-weight gate, where the overlap's
+            // extra disjunction softs cost more than the lb they buy.
+            iters = 1;
+            for clique in Self::greedy_clique_cover(&adj) {
+                self.relax_am1_clique(&clique);
+            }
+        }
         if debug_trace() {
             eprintln!(
-                "c am1-probe: probes={} failed={} edge_nodes={} cliques={} lb={} ub={}",
+                "c am1-probe: probes={} failed={} edge_nodes={} groups={} iters={} lb={} ub={}",
                 probes.len(),
                 failed.len(),
                 adj.len(),
-                cliques.len(),
+                self.stats.am1_probe_groups - groups_before,
+                iters,
                 self.lb,
                 self.ub,
             );
         }
-        for clique in cliques {
-            self.relax_am1_clique(&clique);
-        }
         *am1_probe_spent += t0.elapsed();
     }
 
-    /// Greedy disjoint-clique cover over a symmetric conflict graph
-    /// (`adapt_am1`'s degree-ordered greedy, standalone for the semantic AM1
-    /// edges). Vertices are consumed by the first clique that claims them;
-    /// only cliques of size >= 2 are returned. Missing a clique costs
-    /// lower-bound quality, never correctness.
+    /// Peel ONE minimum-weight layer of an entailed AM1 clique (#am1-overlap,
+    /// CGSS2 relaxes exactly one layer per am1 found, then reiterates — the
+    /// driver in run_am1_probe supplies the reiteration and the vertex reuse
+    /// across cliques). `members` are the clique's still-active selectors with
+    /// positive residual weight; fewer than two and nothing is done. `d` is
+    /// their minimum residual weight: lb += d·(k−1), one disjunction soft over
+    /// the members is emitted at weight `d`, and `d` is subtracted from each
+    /// member (spent members leave `active`).
+    ///
+    /// Identity preservation (the entailed AM1 forces "at most one satisfied"):
+    /// Δlb = d·(k−1); the plain-selector sum loses d·Σ_i[s_i falsified] and
+    /// gains d·[all s_i falsified] from the new disjunction selector, and
+    /// (k−1) − Σ_i[falsified] + [all falsified] = 0 for both feasible cases
+    /// (exactly one satisfied → Σ=k−1, all-false term 0; none satisfied →
+    /// Σ=k, all-false term 1). So cost(A) is unchanged for every model and lb
+    /// stays valid, independently of which OTHER am1s a member also joins —
+    /// reuse only decomposes the member's soft weight across disjoint slices.
+    fn relax_am1_clique_layer(&mut self, clique: &[Literal]) {
+        let members: Vec<(Literal, Weight)> = clique
+            .iter()
+            .filter_map(|&m| self.active.get(&m).map(|&w| (m, w)))
+            .filter(|&(_, w)| w > 0)
+            .collect();
+        if members.len() < 2 {
+            return;
+        }
+        let d = members
+            .iter()
+            .map(|&(_, w)| w)
+            .min()
+            .expect("members is non-empty");
+        self.lb = self
+            .lb
+            .saturating_add(d.saturating_mul(members.len() as Weight - 1));
+        let disjunction: Vec<Literal> = members.iter().map(|&(l, _)| l).collect();
+        self.install_am1_disjunction(&disjunction, d);
+        for &(m, _) in &members {
+            if let Some(w) = self.active.get_mut(&m) {
+                *w -= d.min(*w);
+                if *w == 0 {
+                    self.active.remove(&m);
+                }
+            }
+        }
+        self.stats.am1_probe_groups = self.stats.am1_probe_groups.saturating_add(1);
+    }
+
+    /// Greedy DISJOINT clique cover over a symmetric conflict graph (the
+    /// pre-#am1-overlap probe cover, used below the distinct-weight gate).
+    /// Vertices are consumed by the first clique that claims them; only
+    /// cliques of size >= 2 are returned. Missing a clique costs lower-bound
+    /// quality, never correctness.
     fn greedy_clique_cover(adj: &HashMap<Literal, HashSet<Literal>>) -> Vec<Vec<Literal>> {
         let mut order: Vec<Literal> = adj.keys().copied().collect();
         order.sort_unstable_by_key(|l| (std::cmp::Reverse(adj[l].len()), *l));
@@ -1818,8 +2170,6 @@ impl OllEngine {
                 .copied()
                 .filter(|n| !used.contains(n))
                 .collect();
-            // Densest candidates first, id tiebreak — same bias adapt_am1 uses
-            // so overlapping cliques peel the richest structure first.
             cands.sort_unstable_by_key(|n| {
                 (std::cmp::Reverse(adj.get(n).map_or(0, |s| s.len())), *n)
             });
@@ -1841,21 +2191,14 @@ impl OllEngine {
         cliques
     }
 
-    /// Exact iterated-peeling relaxation of one semantic AM1 clique (the same
-    /// accounting as install-time `adapt_am1`, applied to live `active`
-    /// residuals). Members sorted weight-ascending; while >= 2 remain, the
-    /// minimum residual `d` pays lb += d·(members−1) and emits one disjunction
-    /// soft over the members at weight `d`, then `d` is subtracted from each
-    /// member's residual (exhausted members leave). The maximum-weight member
-    /// keeps its surviving residual in `active`.
-    ///
-    /// Identity preservation (per peel level, under the entailed AM1
-    /// "at most one satisfied"): Δlb = d·(k−1); the plain-selector sum loses
-    /// d·Σ_i[s_i falsified] and gains d·[all s_i falsified] from the new
-    /// disjunction selector, and (k−1) − Σ_i[falsified] + [all falsified] = 0
-    /// for both feasible cases (exactly one satisfied → Σ=k−1, all-false term
-    /// 0; none satisfied → Σ=k, all-false term 1). So cost(A) is unchanged for
-    /// every model and lb stays valid.
+    /// Exact iterated FULL-peel relaxation of one disjoint AM1 clique (the
+    /// pre-#am1-overlap probe relaxation, used below the distinct-weight gate).
+    /// Members sorted weight-ascending; while >= 2 remain, the minimum residual
+    /// `d` pays lb += d·(members−1) and emits one disjunction soft at weight
+    /// `d`, then `d` is subtracted from each (spent members leave). The
+    /// maximum-weight member keeps its surviving residual in `active`. Same
+    /// per-level identity as `relax_am1_clique_layer`, iterated over the whole
+    /// clique in one call.
     fn relax_am1_clique(&mut self, clique: &[Literal]) {
         let mut members: Vec<(Literal, Weight)> = clique
             .iter()

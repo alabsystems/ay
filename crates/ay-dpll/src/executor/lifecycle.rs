@@ -211,6 +211,9 @@ impl Executor {
     /// queries are the sole case that may retain algorithmic enumeration state;
     /// the previously emitted result/model/certificate are still always cleared.
     pub(crate) fn begin_public_solve(&mut self, preserve_pareto_enumeration: bool) {
+        self.array_ext_witness_cache
+            .begin_public_solve(&self.ctx.terms);
+        let authored_assertions = self.ctx.assertions.clone();
         let pareto_state = if preserve_pareto_enumeration {
             self.pareto_state.take()
         } else {
@@ -220,6 +223,11 @@ impl Executor {
         if preserve_pareto_enumeration {
             self.pareto_state = pareto_state;
         }
+        // Freeze proof authority once, at the public-query boundary. Recursive
+        // retries and optimization/probe solves may temporarily replace or
+        // extend `ctx.assertions`; they must inherit these roots rather than
+        // recapturing their generated working set as authored input.
+        self.install_proof_source_provenance(&authored_assertions);
     }
 
     /// Native API assertions bypass `Command::Assert`, so they must manually
@@ -467,6 +475,7 @@ impl Executor {
             pareto_state: None,
             independent_gate_disabled: false,
             array_ext_shadow: ArrayExtShadow::default(),
+            array_ext_witness_cache: ArrayExtWitnessCache::default(),
             // M-A2 lazy-persistent-combiner shadow: OFF by default (§5 A2).
             #[cfg(debug_assertions)]
             auflia_persistent_shadow: false,
@@ -963,6 +972,26 @@ impl Executor {
         &self.ctx.terms
     }
 
+    /// Describe why caller-authored roots cannot be registered safely.
+    ///
+    /// This immediate API gate covers both the current query's active
+    /// extensionality witnesses and identities retired by earlier queries.
+    pub(crate) fn array_ext_witness_registration_error(&self, roots: &[TermId]) -> Option<String> {
+        match self
+            .array_ext_witness_cache
+            .registration_violation(&self.ctx.terms, roots)?
+        {
+            theories::ArrayExtWitnessRootViolation::InvalidTerm(term) => Some(format!(
+                "caller-authored input contains out-of-range raw term id {}",
+                term.0
+            )),
+            theories::ArrayExtWitnessRootViolation::CapturedWitness(term) => Some(format!(
+                "caller-authored input captures solver-generated array-extensionality witness term {}",
+                term.0
+            )),
+        }
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn has_proof_problem_assertion_provenance(&self) -> bool {
@@ -1002,6 +1031,7 @@ impl Executor {
     /// are preserved.
     pub fn reset(&mut self) {
         self.ctx = Context::new();
+        self.array_ext_witness_cache.clear();
         self.last_result = None;
         self.last_model = None;
         self.last_assumptions = None;

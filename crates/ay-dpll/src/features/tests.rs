@@ -558,6 +558,35 @@ fn test_extend_with_declarations_sets_has_uf_7442() {
     );
 }
 
+#[test]
+fn test_collect_marks_nested_array_sorts() {
+    let mut terms = TermStore::new();
+    let flat = terms.mk_var("flat", Sort::array(Sort::Int, Sort::Int));
+    let nested = terms.mk_var(
+        "nested",
+        Sort::array(Sort::Int, Sort::array(Sort::Int, Sort::Int)),
+    );
+
+    let flat_features = StaticFeatures::collect(&terms, &[flat]);
+    assert!(flat_features.has_arrays);
+    assert!(!flat_features.has_nested_arrays);
+
+    let nested_features = StaticFeatures::collect(&terms, &[nested]);
+    assert!(nested_features.has_arrays);
+    assert!(nested_features.has_nested_arrays);
+
+    // An array hidden behind a datatype field is still nested array state. The
+    // public wrong-UNSAT quarantine must not be bypassable merely by wrapping
+    // the inner array in a tuple/record carrier.
+    let boxed_array =
+        Sort::struct_type("ArrayBox", [("payload", Sort::array(Sort::Int, Sort::Int))]);
+    let nested_via_datatype =
+        terms.mk_var("nested_via_datatype", Sort::array(Sort::Int, boxed_array));
+    let datatype_features = StaticFeatures::collect(&terms, &[nested_via_datatype]);
+    assert!(datatype_features.has_arrays);
+    assert!(datatype_features.has_nested_arrays);
+}
+
 /// extend_with_declarations does NOT mark builtin symbols as UF (#7442).
 #[test]
 fn test_extend_with_declarations_skips_builtins_7442() {

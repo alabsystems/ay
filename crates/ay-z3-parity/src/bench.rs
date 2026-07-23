@@ -36,17 +36,17 @@ use crate::loader;
 
 /// Minimum wall time (seconds) used when forming AY/z3 ratios, to keep timer
 /// granularity on trivially fast files from fabricating huge ratios.
-const RATIO_FLOOR_SECS: f64 = 0.0001; // 0.1 ms
+pub(crate) const RATIO_FLOOR_SECS: f64 = 0.0001; // 0.1 ms
 
 /// A >2x speed win/loss is only counted when the SLOWER side took at least
 /// this long; below it, both solvers are effectively instant and the ratio is
 /// scheduling noise, so the file counts as a tie.
-const WIN_LOSS_MIN_SECS: f64 = 0.010; // 10 ms
+pub(crate) const WIN_LOSS_MIN_SECS: f64 = 0.010; // 10 ms
 
 /// Grace period past the timeout before the child is SIGKILLed. The child
 /// self-reports eval-only wall time; any result whose eval time exceeds the
 /// budget is recorded as a timeout regardless of the grace.
-const KILL_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const KILL_GRACE: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Child mode: `bench-one <lib> <file>`
@@ -121,7 +121,7 @@ pub(crate) fn run_child(lib_path: &Path, file: &Path) -> i32 {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
-enum OutcomeKind {
+pub(crate) enum OutcomeKind {
     /// Ordered verdict tokens, one per `(check-sat)`.
     Verdicts(Vec<Verdict>),
     /// Exceeded the wall-clock budget (killed, or self-reported over budget).
@@ -133,15 +133,20 @@ enum OutcomeKind {
 }
 
 #[derive(Clone, Debug)]
-struct BenchOutcome {
-    kind: OutcomeKind,
+pub(crate) struct BenchOutcome {
+    pub(crate) kind: OutcomeKind,
     /// Eval-only wall time as self-reported by the child; for timeouts this
     /// is clamped to the budget, for crashes it is the parent-observed span.
-    wall: Duration,
+    pub(crate) wall: Duration,
+    /// Peak resident set size of the child process (BYTES), captured by
+    /// `wait4`/`rusage` when the child was reaped cleanly. `None` for a
+    /// SIGKILLed timeout, a harness spawn/wait error, or a non-unix host where
+    /// per-child `rusage` is unavailable.
+    pub(crate) peak_rss: Option<u64>,
 }
 
 impl BenchOutcome {
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match &self.kind {
             OutcomeKind::Verdicts(v) if v.is_empty() => "-".to_string(),
             OutcomeKind::Verdicts(v) => v.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(","),
@@ -152,7 +157,7 @@ impl BenchOutcome {
     }
 
     /// Failure detail (crash signal / harness error), `None` for normal runs.
-    fn detail(&self) -> Option<&str> {
+    pub(crate) fn detail(&self) -> Option<&str> {
         match &self.kind {
             OutcomeKind::Crash(d) | OutcomeKind::InputError(d) => Some(d.as_str()),
             _ => None,
@@ -160,20 +165,29 @@ impl BenchOutcome {
     }
 
     /// Decisive = produced at least one verdict and no `unknown`.
-    fn decided(&self) -> bool {
+    pub(crate) fn decided(&self) -> bool {
         matches!(&self.kind, OutcomeKind::Verdicts(v)
             if !v.is_empty() && v.iter().all(|x| *x != Verdict::Unknown))
     }
 
+    /// The single decisive verdict list, if decided. Used by the scoreboard to
+    /// compare AY's self-check answer against AY's own eval answer.
+    pub(crate) fn verdicts(&self) -> Option<&[Verdict]> {
+        match &self.kind {
+            OutcomeKind::Verdicts(v) if !v.is_empty() => Some(v),
+            _ => None,
+        }
+    }
+
     /// Ran to completion but produced no verdict at all (typically an
     /// `(error ...)`-only output, e.g. an unsupported logic or command).
-    fn no_verdict(&self) -> bool {
+    pub(crate) fn no_verdict(&self) -> bool {
         matches!(&self.kind, OutcomeKind::Verdicts(v) if v.is_empty())
     }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Category {
+pub(crate) enum Category {
     AgreeSat,
     AgreeUnsat,
     /// Both produced the identical multi-check verdict list mixing sat+unsat.
@@ -197,7 +211,7 @@ enum Category {
 }
 
 impl Category {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Category::AgreeSat => "AGREE-sat",
             Category::AgreeUnsat => "AGREE-unsat",
@@ -219,7 +233,7 @@ impl Category {
 
 /// Classify one file's paired outcomes. Soundness first: any positional
 /// sat-vs-unsat conflict is DISAGREE even if other checks also diverged.
-fn categorize(ay: &BenchOutcome, z3: &BenchOutcome) -> Category {
+pub(crate) fn categorize(ay: &BenchOutcome, z3: &BenchOutcome) -> Category {
     // Disagreement is only observable when both sides produced verdicts.
     if let (OutcomeKind::Verdicts(av), OutcomeKind::Verdicts(zv)) = (&ay.kind, &z3.kind) {
         for (a, z) in av.iter().zip(zv.iter()) {
@@ -282,33 +296,153 @@ fn categorize(ay: &BenchOutcome, z3: &BenchOutcome) -> Category {
 // Running one (file, solver) pair in a child process
 // ---------------------------------------------------------------------------
 
-/// Spawn `bench-one` for one (library, file) pair with a hard timebox.
+/// Raw result of running one child process under a hard timebox — the shared
+/// plumbing behind both the `bench-one` runner and the scoreboard's `ay
+/// solve --self-check` runner. Interpreting the exit code / stdout into a
+/// verdict is left to the caller, since the two child protocols differ.
+pub(crate) struct RawRun {
+    /// True iff the child was SIGKILLed for exceeding the deadline.
+    pub(crate) killed: bool,
+    /// Exit code if the child exited normally; `None` if it died by signal.
+    pub(crate) code: Option<i32>,
+    /// Human-readable status (`exit status: N` / `signal: 6`) for messages.
+    pub(crate) status_str: String,
+    /// Everything the child wrote to stdout.
+    pub(crate) stdout: Vec<u8>,
+    /// Parent-observed wall time from spawn to reap (used as a fallback when
+    /// the child does not self-report an eval time).
+    pub(crate) observed: Duration,
+    /// Peak resident set size of the reaped child in BYTES (from `wait4`'s
+    /// `rusage.ru_maxrss`), or `None` when the child was killed / never reaped
+    /// cleanly / the host cannot report per-child `rusage`.
+    pub(crate) max_rss: Option<u64>,
+    /// Set iff spawning or waiting on the child failed at the harness level
+    /// (not the solver's fault).
+    pub(crate) harness_error: Option<String>,
+}
+
+/// Peak resident set size from a reaped child's `rusage`, normalized to BYTES.
 ///
-/// The child self-reports eval-only wall time on its first stdout line; a
-/// result over budget is a timeout even if the child finished in the grace
-/// window. A SIGKILLed child is a timeout; any other abnormal exit is a crash.
-fn run_one(exe: &Path, lib: &Path, file: &Path, timeout: Duration) -> BenchOutcome {
-    let spawn_t0 = Instant::now();
-    let mut child = match Command::new(exe)
-        .arg("bench-one")
-        .arg(lib)
-        .arg(file)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
+/// `ru_maxrss` unit differs by platform: Darwin/macOS reports BYTES, while
+/// Linux (and the other BSD-derived Unixes) report KILOBYTES. We normalize to
+/// bytes so callers compare like with like regardless of host.
+#[cfg(unix)]
+fn rusage_max_rss_bytes(usage: &libc::rusage) -> u64 {
+    let raw = u64::try_from(usage.ru_maxrss).unwrap_or(0);
+    #[cfg(target_os = "macos")]
     {
+        raw // Darwin: already bytes.
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        raw.saturating_mul(1024) // Linux/BSD: kilobytes -> bytes.
+    }
+}
+
+/// Non-blocking reap of `child` that, on unix, ALSO captures the child's peak
+/// RSS by reaping through `wait4` (which fills a `rusage`) rather than the
+/// std `try_wait` (which throws the `rusage` away). Returns `Ok(None)` while
+/// the child is still running. On non-unix hosts there is no per-child
+/// `rusage`, so it falls back to `Child::try_wait` and reports no RSS.
+///
+/// Reaping the pid directly is sound here: we only ever call this on our own
+/// child, we stop the moment it is reaped (so the pid cannot be recycled under
+/// us), and `std::process::Child` performs no reap on drop, so there is no
+/// double-wait.
+#[cfg(unix)]
+fn try_reap_with_rss(
+    child: &mut std::process::Child,
+) -> std::io::Result<Option<(std::process::ExitStatus, Option<u64>)>> {
+    use std::os::unix::process::ExitStatusExt as _;
+    let pid = child.id() as libc::pid_t;
+    let mut status: libc::c_int = 0;
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: `wait4` is called on our own child pid with `WNOHANG`; `status`
+    // and `usage` are initialized, properly aligned, writable out-parameters
+    // that remain alive for the call.
+    let r = unsafe { libc::wait4(pid, &raw mut status, libc::WNOHANG, &raw mut usage) };
+    if r == pid {
+        Ok(Some((
+            std::process::ExitStatus::from_raw(status),
+            Some(rusage_max_rss_bytes(&usage)),
+        )))
+    } else if r == 0 {
+        Ok(None) // still running
+    } else {
+        let err = std::io::Error::last_os_error();
+        // A signal interrupted the syscall — not a failure; poll again.
+        if err.raw_os_error() == Some(libc::EINTR) {
+            Ok(None)
+        } else {
+            Err(err)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn try_reap_with_rss(
+    child: &mut std::process::Child,
+) -> std::io::Result<Option<(std::process::ExitStatus, Option<u64>)>> {
+    child.try_wait().map(|opt| opt.map(|status| (status, None)))
+}
+
+/// SIGKILL a timed-out child and every process it spawned. Because the child
+/// is a process-group leader (see [`spawn_timeboxed`]), signalling the negative
+/// group id reaches its forked grandchildren too, so nothing survives to hold
+/// the stdout pipe open or keep consuming CPU.
+fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `kill(2)` with a negative pid targets the process group led
+        // by `child`; SIGKILL is uncatchable, so the whole subtree dies.
+        let pid = child.id() as i32;
+        if pid > 0 {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    // Also signal the leader directly (a no-op if the group kill already got
+    // it; the only path on non-unix).
+    let _ = child.kill();
+}
+
+/// Spawn `cmd` with a hard timebox and drain its stdout. `stdin`/`stderr` are
+/// nulled and `stdout` is piped; a reader thread drains the pipe so a chatty
+/// child cannot block, while the main loop polls for exit and SIGKILLs the
+/// child's whole process group at `timeout + KILL_GRACE`. This is the
+/// crash/timeout isolation the whole campaign relies on — a fresh child per
+/// (file, solver) means no runaway or aborting solve can bias or abort the run.
+pub(crate) fn spawn_timeboxed(mut cmd: Command, timeout: Duration) -> RawRun {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // Make the child a process-group leader so a timeout can SIGKILL its WHOLE
+    // subtree, not just the leader. `ay solve` forks a solve worker; killing
+    // only the leader would orphan that worker (reparented to init), where it
+    // keeps burning a core AND holds the stdout pipe open — hanging the reader
+    // thread below and stalling the entire campaign.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    let spawn_t0 = Instant::now();
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return BenchOutcome {
-                kind: OutcomeKind::InputError(format!("spawn failed: {e}")),
-                wall: Duration::ZERO,
+            return RawRun {
+                killed: false,
+                code: None,
+                status_str: String::new(),
+                stdout: Vec::new(),
+                observed: Duration::ZERO,
+                max_rss: None,
+                harness_error: Some(format!("spawn failed: {e}")),
             }
         }
     };
 
-    // Reader thread drains stdout so a chatty child can never block on a full
-    // pipe; the main loop polls for exit and enforces the deadline.
     let mut stdout = child.stdout.take().expect("stdout piped");
     let reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -318,37 +452,73 @@ fn run_one(exe: &Path, lib: &Path, file: &Path, timeout: Duration) -> BenchOutco
 
     let deadline = spawn_t0 + timeout + KILL_GRACE;
     let mut killed = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
+    let (status, max_rss) = loop {
+        match try_reap_with_rss(&mut child) {
+            Ok(Some((status, rss))) => break (status, rss),
             Ok(None) => {
                 if Instant::now() >= deadline && !killed {
-                    let _ = child.kill();
+                    kill_group(&mut child);
                     killed = true;
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
             Err(e) => {
-                let _ = child.kill();
+                kill_group(&mut child);
                 let _ = child.wait();
                 let _ = reader.join();
-                return BenchOutcome {
-                    kind: OutcomeKind::InputError(format!("wait failed: {e}")),
-                    wall: spawn_t0.elapsed(),
+                return RawRun {
+                    killed,
+                    code: None,
+                    status_str: String::new(),
+                    stdout: Vec::new(),
+                    observed: spawn_t0.elapsed(),
+                    max_rss: None,
+                    harness_error: Some(format!("wait failed: {e}")),
                 };
             }
         }
     };
     let bytes = reader.join().unwrap_or_default();
-    let text = String::from_utf8_lossy(&bytes);
+    RawRun {
+        killed,
+        code: status.code(),
+        status_str: status.to_string(),
+        stdout: bytes,
+        observed: spawn_t0.elapsed(),
+        max_rss,
+        harness_error: None,
+    }
+}
 
-    if killed {
+/// Spawn `bench-one` for one (library, file) pair with a hard timebox.
+///
+/// The child self-reports eval-only wall time on its first stdout line; a
+/// result over budget is a timeout even if the child finished in the grace
+/// window. A SIGKILLed child is a timeout; any other abnormal exit is a crash.
+pub(crate) fn run_one(exe: &Path, lib: &Path, file: &Path, timeout: Duration) -> BenchOutcome {
+    let mut cmd = Command::new(exe);
+    cmd.arg("bench-one").arg(lib).arg(file);
+    let raw = spawn_timeboxed(cmd, timeout);
+    // Peak RSS is only a clean, comparable measurement for a child reaped
+    // normally; a killed timeout or a harness error carries no usable figure.
+    let peak_rss = raw.max_rss;
+
+    if let Some(err) = raw.harness_error {
+        return BenchOutcome {
+            kind: OutcomeKind::InputError(err),
+            wall: raw.observed,
+            peak_rss: None,
+        };
+    }
+    if raw.killed {
         return BenchOutcome {
             kind: OutcomeKind::Timeout,
             wall: timeout,
+            peak_rss: None,
         };
     }
-    match status.code() {
+    let text = String::from_utf8_lossy(&raw.stdout);
+    match raw.code {
         Some(0) => {
             let mut lines = text.splitn(2, '\n');
             let wall_ns: Option<u128> = lines
@@ -358,33 +528,141 @@ fn run_one(exe: &Path, lib: &Path, file: &Path, timeout: Duration) -> BenchOutco
             let output = lines.next().unwrap_or("");
             let wall = wall_ns
                 .map(|ns| Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX)))
-                .unwrap_or_else(|| spawn_t0.elapsed());
+                .unwrap_or(raw.observed);
             if wall > timeout {
                 // Finished inside the kill grace but over budget: a timeout.
                 BenchOutcome {
                     kind: OutcomeKind::Timeout,
                     wall: timeout,
+                    peak_rss: None,
                 }
             } else {
                 BenchOutcome {
                     kind: OutcomeKind::Verdicts(verdicts_of(output)),
                     wall,
+                    peak_rss,
                 }
             }
         }
         Some(3) | Some(4) => BenchOutcome {
-            kind: OutcomeKind::InputError(format!("bench-one exited {status}")),
-            wall: spawn_t0.elapsed(),
+            kind: OutcomeKind::InputError(format!("bench-one exited {}", raw.status_str)),
+            wall: raw.observed,
+            peak_rss,
         },
         Some(code) => BenchOutcome {
             kind: OutcomeKind::Crash(format!("exit code {code}")),
-            wall: spawn_t0.elapsed(),
+            wall: raw.observed,
+            peak_rss,
         },
         None => BenchOutcome {
-            kind: OutcomeKind::Crash(format!("killed by signal ({status})")),
-            wall: spawn_t0.elapsed(),
+            kind: OutcomeKind::Crash(format!("killed by signal ({})", raw.status_str)),
+            wall: raw.observed,
+            peak_rss,
         },
     }
+}
+
+/// AY's fail-closed self-certification verdict for one file, obtained by
+/// running the `ay` CLI binary as `ay solve --self-check <file>` in a fresh,
+/// timeboxed child (same isolation as [`run_one`]). AY emits `sat`/`unsat`
+/// only when its own in-tree checker confirms the answer, else `unknown`; the
+/// scoreboard reads these tokens straight from stdout.
+#[derive(Clone, Debug)]
+pub(crate) enum SelfCheck {
+    /// Verdict tokens parsed from AY's stdout (may be empty or contain
+    /// `unknown` — both mean "not self-certified").
+    Verdicts(Vec<Verdict>),
+    /// Exceeded the wall-clock budget.
+    Timeout,
+    /// The `ay` process died by signal with no usable verdict.
+    Crash(String),
+    /// The harness could not spawn/await the `ay` binary at all.
+    Error(String),
+}
+
+impl SelfCheck {
+    /// Failure detail (crash signal / harness error), `None` otherwise.
+    pub(crate) fn detail(&self) -> Option<&str> {
+        match self {
+            SelfCheck::Crash(d) | SelfCheck::Error(d) => Some(d.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The decisive verdict list, if self-certified.
+    pub(crate) fn verdicts(&self) -> Option<&[Verdict]> {
+        match self {
+            SelfCheck::Verdicts(v) if !v.is_empty() && v.iter().all(|x| *x != Verdict::Unknown) => {
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn label(&self) -> String {
+        match self {
+            SelfCheck::Verdicts(v) if v.is_empty() => "-".to_string(),
+            SelfCheck::Verdicts(v) => v.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(","),
+            SelfCheck::Timeout => "timeout".to_string(),
+            SelfCheck::Crash(_) => "crash".to_string(),
+            SelfCheck::Error(_) => "error".to_string(),
+        }
+    }
+}
+
+/// Extract self-check verdict tokens from the `ay` CLI's stdout. Unlike the
+/// FFI eval, the CLI interleaves `c `-prefixed comment lines (e.g.
+/// `c writing Alethe proof ... on unsat`) and `(:reason-unknown ...)` s-exprs
+/// that would poison a whole-blob token scan, so we match ONLY lines whose
+/// trimmed content is exactly a verdict token — the shape a check-sat answer
+/// actually prints on.
+fn selfcheck_verdicts(output: &str) -> Vec<Verdict> {
+    output
+        .lines()
+        .filter_map(|l| match l.trim() {
+            "sat" => Some(Verdict::Sat),
+            "unsat" => Some(Verdict::Unsat),
+            "unknown" => Some(Verdict::Unknown),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Run `ay solve --self-check --competition <file>` in a timeboxed child and
+/// read AY's self-certification verdict from stdout.
+///
+/// `--competition` keeps the fail-closed `--self-check` gate and every
+/// soundness default, but turns OFF the redundant runtime validation, the
+/// post-solve proof re-check, and — crucially — the default proof-certificate
+/// emission, so the run neither wastes time nor writes `*.alethe` artifacts
+/// into the corpus directory next to each input.
+pub(crate) fn run_selfcheck(ay_cli: &Path, file: &Path, timeout: Duration) -> SelfCheck {
+    let mut cmd = Command::new(ay_cli);
+    cmd.arg("solve")
+        .arg("--self-check")
+        .arg("--competition")
+        .arg(file);
+    interpret_selfcheck_raw(spawn_timeboxed(cmd, timeout), timeout)
+}
+
+fn interpret_selfcheck_raw(raw: RawRun, timeout: Duration) -> SelfCheck {
+    if let Some(err) = raw.harness_error {
+        return SelfCheck::Error(err);
+    }
+    if raw.killed || raw.observed > timeout {
+        return SelfCheck::Timeout;
+    }
+    match raw.code {
+        Some(0) => {}
+        Some(code) => {
+            return SelfCheck::Error(format!("ay solve exited {code} ({})", raw.status_str));
+        }
+        None => {
+            return SelfCheck::Crash(format!("killed by signal ({})", raw.status_str));
+        }
+    }
+    let text = String::from_utf8_lossy(&raw.stdout);
+    SelfCheck::Verdicts(selfcheck_verdicts(&text))
 }
 
 // ---------------------------------------------------------------------------
@@ -529,7 +807,7 @@ impl DivStats {
     }
 }
 
-fn median(sorted: &[f64]) -> Option<f64> {
+pub(crate) fn median(sorted: &[f64]) -> Option<f64> {
     if sorted.is_empty() {
         return None;
     }
@@ -541,7 +819,7 @@ fn median(sorted: &[f64]) -> Option<f64> {
     })
 }
 
-fn geomean(values: &[f64]) -> Option<f64> {
+pub(crate) fn geomean(values: &[f64]) -> Option<f64> {
     if values.is_empty() {
         return None;
     }
@@ -549,13 +827,13 @@ fn geomean(values: &[f64]) -> Option<f64> {
     Some((sum / values.len() as f64).exp())
 }
 
-fn ratio_of(ay: &BenchOutcome, z3: &BenchOutcome) -> f64 {
+pub(crate) fn ratio_of(ay: &BenchOutcome, z3: &BenchOutcome) -> f64 {
     let a = ay.wall.as_secs_f64().max(RATIO_FLOOR_SECS);
     let z = z3.wall.as_secs_f64().max(RATIO_FLOOR_SECS);
     a / z
 }
 
-fn fmt_ratio(r: Option<f64>) -> String {
+pub(crate) fn fmt_ratio(r: Option<f64>) -> String {
     match r {
         None => "-".to_string(),
         Some(v) if v >= 100.0 => format!("{v:.0}"),
@@ -563,7 +841,7 @@ fn fmt_ratio(r: Option<f64>) -> String {
     }
 }
 
-fn fmt_ms(d: Duration) -> String {
+pub(crate) fn fmt_ms(d: Duration) -> String {
     format!("{:.1}", d.as_secs_f64() * 1000.0)
 }
 
@@ -582,14 +860,14 @@ fn parse_declared_status(text: &str) -> Option<&str> {
 }
 
 /// Declared `:status` of a benchmark file, if annotated.
-fn declared_status(file: &Path) -> Option<String> {
+pub(crate) fn declared_status(file: &Path) -> Option<String> {
     let text = std::fs::read_to_string(file).ok()?;
     parse_declared_status(&text).map(str::to_string)
 }
 
 /// SHA-256 of a file via the system `shasum`/`sha256sum` tool — re-runnable
 /// by any auditor with the same command.
-fn sha256_of(path: &Path) -> Option<String> {
+pub(crate) fn sha256_of(path: &Path) -> Option<String> {
     for (cmd, args) in [("shasum", vec!["-a", "256"]), ("sha256sum", vec![])] {
         let out = Command::new(cmd).args(&args).arg(path).output();
         if let Ok(out) = out {
@@ -606,7 +884,7 @@ fn sha256_of(path: &Path) -> Option<String> {
 
 /// UTC timestamp `YYYY-MM-DDTHH:MM:SSZ` from the system clock (Howard
 /// Hinnant's civil-from-days algorithm; no chrono dependency).
-fn utc_now_iso() -> String {
+pub(crate) fn utc_now_iso() -> String {
     let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -627,7 +905,7 @@ fn utc_now_iso() -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-fn host_info() -> serde_json::Value {
+pub(crate) fn host_info() -> serde_json::Value {
     let cpu = Command::new("sysctl")
         .args(["-n", "machdep.cpu.brand_string"])
         .output()
@@ -1545,18 +1823,21 @@ mod tests {
         BenchOutcome {
             kind: OutcomeKind::Verdicts(v.to_vec()),
             wall: Duration::from_millis(5),
+            peak_rss: None,
         }
     }
     fn timeout() -> BenchOutcome {
         BenchOutcome {
             kind: OutcomeKind::Timeout,
             wall: Duration::from_secs(20),
+            peak_rss: None,
         }
     }
     fn crash() -> BenchOutcome {
         BenchOutcome {
             kind: OutcomeKind::Crash("signal 6".into()),
             wall: Duration::from_millis(1),
+            peak_rss: None,
         }
     }
 
@@ -1660,10 +1941,12 @@ mod tests {
         let fast = BenchOutcome {
             kind: OutcomeKind::Verdicts(vec![Verdict::Sat]),
             wall: Duration::from_nanos(200),
+            peak_rss: None,
         };
         let slow = BenchOutcome {
             kind: OutcomeKind::Verdicts(vec![Verdict::Sat]),
             wall: Duration::from_micros(20),
+            peak_rss: None,
         };
         // Both below the floor: ratio clamps to 1 rather than 100x.
         assert!((ratio_of(&slow, &fast) - 1.0).abs() < 1e-9);
@@ -1675,6 +1958,7 @@ mod tests {
         let mk = |ms: u64| BenchOutcome {
             kind: OutcomeKind::Verdicts(vec![Verdict::Sat]),
             wall: Duration::from_millis(ms),
+            peak_rss: None,
         };
         // 1ms vs 4ms: 4x apart but both trivial — a tie, not a win.
         let ay = mk(1);
@@ -1747,5 +2031,52 @@ mod tests {
         assert!(!verdicts(&[Sat, Unknown]).decided());
         assert!(!verdicts(&[]).decided());
         assert!(!timeout().decided());
+    }
+
+    fn selfcheck_raw(code: Option<i32>, stdout: &str, observed: Duration) -> RawRun {
+        RawRun {
+            killed: false,
+            code,
+            status_str: code.map_or_else(|| "signal: 6".to_string(), |code| code.to_string()),
+            stdout: stdout.as_bytes().to_vec(),
+            observed,
+            max_rss: None,
+            harness_error: None,
+        }
+    }
+
+    #[test]
+    fn selfcheck_requires_a_clean_zero_exit_before_accepting_verdicts() {
+        let timeout = Duration::from_secs(1);
+        assert!(matches!(
+            interpret_selfcheck_raw(selfcheck_raw(Some(0), "unsat\n", Duration::from_millis(1)), timeout),
+            SelfCheck::Verdicts(verdicts) if verdicts == [Verdict::Unsat]
+        ));
+        assert!(matches!(
+            interpret_selfcheck_raw(
+                selfcheck_raw(Some(1), "unsat\n", Duration::from_millis(1)),
+                timeout
+            ),
+            SelfCheck::Error(_)
+        ));
+        assert!(matches!(
+            interpret_selfcheck_raw(
+                selfcheck_raw(None, "unsat\n", Duration::from_millis(1)),
+                timeout
+            ),
+            SelfCheck::Crash(_)
+        ));
+    }
+
+    #[test]
+    fn selfcheck_result_finishing_in_kill_grace_is_still_a_timeout() {
+        let timeout = Duration::from_secs(1);
+        assert!(matches!(
+            interpret_selfcheck_raw(
+                selfcheck_raw(Some(0), "sat\n", timeout + Duration::from_millis(1)),
+                timeout
+            ),
+            SelfCheck::Timeout
+        ));
     }
 }

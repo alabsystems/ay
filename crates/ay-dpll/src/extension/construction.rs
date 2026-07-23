@@ -10,7 +10,7 @@
 //!
 //! Extracted from `mod.rs` to keep that file under the 1,200-line target.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
@@ -20,6 +20,7 @@ use ay_core::{
 };
 use ay_sat::{Literal, Variable};
 
+use super::types::{build_unassigned_freelist_state, unassigned_skip_enabled, UNASSIGNED_NIL};
 use super::{
     BoundRefinementHandoff, NativeTheoryPropagationControl, NativeTheoryPropagationDispatch,
     ProofContext, TheoryAxiomKey, TheoryExtension,
@@ -264,6 +265,16 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             .filter_map(|&atom| term_to_var.get(&atom).map(|&sat_var| (sat_var, atom)))
             .collect();
 
+        // #skip-assigned: allocate the free-list backing storage only when the
+        // flag is armed (empty otherwise). Sized to cover every SAT variable id.
+        let unassigned_skip = unassigned_skip_enabled();
+        let num_var_slots = usize::try_from(var_to_term.keys().copied().max().unwrap_or(0))
+            .ok()
+            .and_then(|max_var_id| max_var_id.checked_add(1))
+            .expect("SAT variable id must fit the host free-list index space");
+        let (sat_var_to_seed_pos, unassigned_prev, unassigned_next, unassigned_linked) =
+            build_unassigned_freelist_state(unassigned_skip, &seed_index, num_var_slots);
+
         Self {
             theory,
             terms: None,
@@ -284,6 +295,14 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             level_trail_positions: Vec::new(),
             has_checked: false,
             theory_decision_idx: Cell::new(0),
+            unassigned_skip,
+            sat_var_to_seed_pos,
+            unassigned_prev: RefCell::new(unassigned_prev),
+            unassigned_next: RefCell::new(unassigned_next),
+            unassigned_linked: RefCell::new(unassigned_linked),
+            unassigned_head: Cell::new(UNASSIGNED_NIL),
+            unassigned_dirty: Cell::new(true),
+            unassigned_scan_pos: Cell::new(0),
             pending_axiom_clauses: Vec::new(),
             pending_axiom_terms: Vec::new(),
             pending_axiom_farkas: Vec::new(),
@@ -578,6 +597,19 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             .filter_map(|&atom| term_to_var.get(&atom).map(|&sat_var| (sat_var, atom)))
             .collect();
 
+        // #skip-assigned: allocate the free-list backing storage only when the
+        // flag is armed (empty otherwise). `max_var_id` is the largest SAT var
+        // id present, so `max_var_id + 1` slots cover every variable id.
+        let unassigned_skip = unassigned_skip_enabled();
+        let (sat_var_to_seed_pos, unassigned_prev, unassigned_next, unassigned_linked) =
+            build_unassigned_freelist_state(
+                unassigned_skip,
+                &seed_index,
+                max_var_id
+                    .checked_add(1)
+                    .expect("SAT variable id must fit the host free-list index space"),
+            );
+
         // Build ITE relevancy guard map (#8125, #8065).
         // Scan all terms for Boolean ITE nodes `(ite cond then_t else_t)`
         // where `then_t` or `else_t` is a theory atom with a SAT variable.
@@ -851,6 +883,14 @@ impl<'a, T: TheorySolver> TheoryExtension<'a, T> {
             level_trail_positions: Vec::new(),
             has_checked: false,
             theory_decision_idx: Cell::new(0),
+            unassigned_skip,
+            sat_var_to_seed_pos,
+            unassigned_prev: RefCell::new(unassigned_prev),
+            unassigned_next: RefCell::new(unassigned_next),
+            unassigned_linked: RefCell::new(unassigned_linked),
+            unassigned_head: Cell::new(UNASSIGNED_NIL),
+            unassigned_dirty: Cell::new(true),
+            unassigned_scan_pos: Cell::new(0),
             pending_axiom_clauses,
             pending_axiom_terms,
             pending_axiom_farkas,

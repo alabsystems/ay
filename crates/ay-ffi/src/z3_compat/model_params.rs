@@ -33,11 +33,11 @@ use ay_dpll::api::{FpSpecialKind, FuncDecl, Model, ModelValue, Solver, Sort, Ter
 use num_traits::Signed;
 
 use super::{
-    alloc_sort, ast_to_term, cache_ast_vector, cache_func_decl, cache_func_decl_with_symbol,
-    cache_func_entry, cache_func_interp, cache_string, ffi_guard_ast, ffi_guard_const_ptr,
-    ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, record_ast_sort, term_to_ast,
-    ModelHandle, ParamsHandle, Z3Context, Z3_ast, Z3_ast_vector, Z3_context, Z3_func_decl,
-    Z3_func_entry, Z3_func_interp, Z3_model, Z3_params, Z3_sort, Z3_symbol,
+    alloc_sort, cache_ast_vector, cache_func_decl, cache_func_decl_with_symbol, cache_func_entry,
+    cache_func_interp, cache_string, ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int,
+    ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, record_ast_sort, require_term_ast_or_return,
+    term_to_ast, ModelHandle, ParamsHandle, Z3Context, Z3_ast, Z3_ast_vector, Z3_context,
+    Z3_func_decl, Z3_func_entry, Z3_func_interp, Z3_model, Z3_params, Z3_sort, Z3_symbol,
 };
 
 // ---- Snapshot-model helpers ----
@@ -1116,13 +1116,13 @@ pub unsafe extern "C" fn Z3_model_eval(
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
             let handle = &*m;
-            let term = ast_to_term(t);
+            let term = require_term_ast_or_return!(ctx, t, "Z3_model_eval", "term", 0);
             let Some(result_term) = eval_term_under_model(ctx, handle, term, model_completion)
             else {
                 return 0;
             };
             let result_sort = ctx.solver.term_sort(result_term);
-            let result_ast = term_to_ast(result_term);
+            let result_ast = term_to_ast(ctx, result_term);
             record_ast_sort(ctx, result_ast, result_sort);
             *v = result_ast;
             1
@@ -1334,6 +1334,13 @@ pub unsafe extern "C" fn Z3_model_get_const_interp(
             // exactly the value AST the caller stored.
             for (udecl, uast) in &(*m).user_const_interps {
                 if *uast != 0 && udecl.name() == name {
+                    let _term = require_term_ast_or_return!(
+                        ctx,
+                        *uast,
+                        "Z3_model_get_const_interp",
+                        "stored interpretation",
+                        0
+                    );
                     return *uast;
                 }
             }
@@ -1353,7 +1360,7 @@ pub unsafe extern "C" fn Z3_model_get_const_interp(
             let sort = resolve_entry_sort(&declared, &name, &val);
             match model_value_to_term(&mut ctx.solver, &val, &sort) {
                 Some(term) => {
-                    let ast = term_to_ast(term);
+                    let ast = term_to_ast(ctx, term);
                     record_ast_sort(ctx, ast, sort);
                     ast
                 }
@@ -1442,7 +1449,7 @@ fn build_func_interp_handle(ctx: &mut Z3Context, fi: &FuncInterp) -> Z3_func_int
     // else value
     let else_ast = match model_value_to_term(&mut ctx.solver, &fi.else_value, &fi.result_sort) {
         Some(term) => {
-            let ast = term_to_ast(term);
+            let ast = term_to_ast(ctx, term);
             record_ast_sort(ctx, ast, fi.result_sort.clone());
             ast
         }
@@ -1461,7 +1468,7 @@ fn build_func_interp_handle(ctx: &mut Z3Context, fi: &FuncInterp) -> Z3_func_int
         for (arg_val, param_sort) in row_args.iter().zip(&fi.param_sorts) {
             match model_value_to_term(&mut ctx.solver, arg_val, param_sort) {
                 Some(term) => {
-                    let ast = term_to_ast(term);
+                    let ast = term_to_ast(ctx, term);
                     record_ast_sort(ctx, ast, param_sort.clone());
                     arg_asts.push(ast);
                 }
@@ -1476,7 +1483,7 @@ fn build_func_interp_handle(ctx: &mut Z3Context, fi: &FuncInterp) -> Z3_func_int
         }
         let value_ast = match model_value_to_term(&mut ctx.solver, row_value, &fi.result_sort) {
             Some(term) => {
-                let ast = term_to_ast(term);
+                let ast = term_to_ast(ctx, term);
                 record_ast_sort(ctx, ast, fi.result_sort.clone());
                 ast
             }
@@ -1661,7 +1668,22 @@ pub unsafe extern "C" fn Z3_func_interp_get_else(c: Z3_context, f: Z3_func_inter
         return 0;
     }
     // SAFETY: `f` is dereferenced inside the guarded closure.
-    unsafe { ffi_guard_ast(c, |_ctx| (*f).else_ast) }
+    unsafe {
+        ffi_guard_ast(c, |ctx| {
+            let ast = (*f).else_ast;
+            if ast == 0 {
+                return 0;
+            }
+            let _term = require_term_ast_or_return!(
+                ctx,
+                ast,
+                "Z3_func_interp_get_else",
+                "stored default value",
+                0
+            );
+            ast
+        })
+    }
 }
 
 /// Return the arity (number of arguments) of the interpretation.
@@ -1702,7 +1724,19 @@ pub unsafe extern "C" fn Z3_func_entry_get_value(c: Z3_context, e: Z3_func_entry
         return 0;
     }
     // SAFETY: `e` is dereferenced inside the guarded closure.
-    unsafe { ffi_guard_ast(c, |_ctx| (*e).value) }
+    unsafe {
+        ffi_guard_ast(c, |ctx| {
+            let ast = (*e).value;
+            let _term = require_term_ast_or_return!(
+                ctx,
+                ast,
+                "Z3_func_entry_get_value",
+                "stored entry value",
+                0
+            );
+            ast
+        })
+    }
 }
 
 /// Return the number of arguments in a finite-map entry.
@@ -1739,9 +1773,19 @@ pub unsafe extern "C" fn Z3_func_entry_get_arg(
     }
     // SAFETY: `e` is dereferenced inside the guarded closure.
     unsafe {
-        ffi_guard_ast(c, |_ctx| {
+        ffi_guard_ast(c, |ctx| {
             let args = &(*e).args;
-            args.get(i as usize).copied().unwrap_or(0)
+            let Some(&ast) = args.get(i as usize) else {
+                return 0;
+            };
+            let _term = require_term_ast_or_return!(
+                ctx,
+                ast,
+                "Z3_func_entry_get_arg",
+                "stored entry argument",
+                0
+            );
+            ast
         })
     }
 }
@@ -1917,7 +1961,7 @@ pub unsafe extern "C" fn Z3_model_get_sort_universe(
                     for token in tokens {
                         let val = ModelValue::Uninterpreted(token);
                         if let Some(term) = model_value_to_term(&mut ctx.solver, &val, &sort) {
-                            let ast = term_to_ast(term);
+                            let ast = term_to_ast(ctx, term);
                             record_ast_sort(ctx, ast, sort.clone());
                             asts.push(ast);
                         }

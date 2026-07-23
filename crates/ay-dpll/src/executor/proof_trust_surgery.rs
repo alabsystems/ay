@@ -302,6 +302,36 @@ mod surface_let_tests {
         );
         assert!(executor.raw_intern_surface(&character).is_none());
     }
+
+    #[test]
+    fn raw_intern_preserves_a_folded_ite_source() {
+        use ay_frontend::command::Constant as SurfaceConstant;
+
+        let mut executor = Executor::new();
+        let surface = FrontendTerm::App(
+            "ite".to_string(),
+            vec![
+                FrontendTerm::Const(SurfaceConstant::True),
+                FrontendTerm::Const(SurfaceConstant::Numeral("1".to_string())),
+                FrontendTerm::Const(SurfaceConstant::Numeral("2".to_string())),
+            ],
+        );
+        let canonical = executor
+            .ctx
+            .elaborate_surface_subterm(&surface)
+            .expect("ground ite elaborates");
+        let raw = executor
+            .raw_intern_surface(&surface)
+            .expect("ground ite raw-interns");
+
+        assert_ne!(raw, canonical, "raw source must not inherit ite folding");
+        assert!(matches!(
+            executor.ctx.terms.get(raw),
+            TermData::Ite(condition, then_term, else_term)
+                if executor.ctx.terms.is_true(*condition)
+                    && then_term != else_term
+        ));
+    }
 }
 
 fn atom_of(terms: &ay_core::TermStore, lit: TermId) -> TermId {
@@ -885,6 +915,7 @@ impl Executor {
         // two repairable classes get bridge plans; anything else that is not
         // an original assertion aborts.
         let mut assume_plans: HashMap<usize, AssumePlan> = HashMap::default();
+        let mut kept_surface_sensitive_assume = false;
         for (idx, step) in proof.steps.iter().enumerate() {
             if !live[idx] {
                 continue;
@@ -928,9 +959,45 @@ impl Executor {
                 Ok(Some(plan)) => {
                     assume_plans.insert(idx, plan);
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    let surface = self
+                        .last_proof_term_overrides
+                        .as_ref()
+                        .and_then(|overrides| overrides.get(&term))
+                        .cloned();
+                    if let Some(surface) = surface {
+                        // The surface collector installs a whole-term entry
+                        // for every assertion, including terms whose raw
+                        // source tree is already the canonical tree modulo
+                        // binary-equality orientation (which Carcara permits
+                        // implicitly). Purging those redundant spellings is
+                        // harmless and is required by the ordinary
+                        // trichotomy repair. Veto only when recursive raw
+                        // interning proves that the surviving Assume actually
+                        // depends on another rewrite (or cannot represent the
+                        // source without a binder-aware derivation).
+                        let raw = self.raw_intern_surface(&parsed);
+                        let print_faithful = raw.is_some_and(|raw| {
+                            surface == ay_proof::format_term_alethe(&self.ctx.terms, raw)
+                                && eq_flip_equivalent(&self.ctx.terms, raw, term)
+                        });
+                        kept_surface_sensitive_assume |= !print_faithful;
+                    }
+                }
                 Err(()) => return false,
             }
+        }
+        // Trichotomy and assume-bridge repairs clear the entire surface
+        // override map. A surviving original Assume that depended on one of
+        // those spellings would then cease to match the authored premise
+        // (implication, xor, binary-distinct, and nested-rewrite surfaces are
+        // deliberately outside the bridge classifier). Keep the old proof
+        // visible instead of silently stripping its premise identity.
+        let will_purge_overrides = ite_lifts.is_empty()
+            && or_units.is_empty()
+            && (!trichotomies.is_empty() || !assume_plans.is_empty());
+        if kept_surface_sensitive_assume && will_purge_overrides {
+            return false;
         }
         // See the exclusivity note above: assume bridges assume the override
         // purge, ite lifts require the overrides. Fail closed on the mix.
@@ -1019,27 +1086,15 @@ impl Executor {
                 AssumePlan::Distinct { conjs, .. }
                 | AssumePlan::AndBounds { conjs, .. }
                 | AssumePlan::QuantExpansion { conjs, .. } => conjs,
-                // An `AndDistinct` unit pattern is remapped onto the plan's
-                // derived per-conjunct unit — but ONLY when the OLD `and_pos`
-                // step's not-and literal is not the genuine `(not (and ...))`
-                // term (the exporter's de Morganized or-shape no external
-                // checker accepts as `and_pos`). Otherwise the historical
-                // behavior — keep the step, remap consumers onto the derived
-                // conjunction unit — is preserved byte-for-byte.
-                AssumePlan::AndDistinct {
-                    and_term, conjs, ..
-                } => {
-                    let ProofStep::Step { clause: ap, .. } = &proof.steps[p_idx] else {
-                        continue;
-                    };
-                    let genuine_not_and = ap.first().is_some_and(|&l| {
-                        matches!(self.ctx.terms.get(l), TermData::Not(inner) if *inner == *and_term)
-                    });
-                    if genuine_not_and {
-                        continue;
-                    }
-                    conjs
-                }
+                // An `AndDistinct` pattern is always remapped onto the plan's
+                // independently derived per-conjunct unit. Even when the old
+                // clause internally contains a genuine `not(and ...)`, a
+                // surface override can print that literal as its De Morgan
+                // disjunction, which is not a valid external `and_pos`
+                // conclusion. Dropping the old premiseless tautology is safe:
+                // the consumer check below requires every use to be one of
+                // these exact unit-extraction patterns.
+                AssumePlan::AndDistinct { conjs, .. } => conjs,
                 // A `Literal` assume has no `and_pos` pattern to recognize:
                 // consumers are remapped onto the derived unit directly.
                 AssumePlan::Literal { .. } => continue,
@@ -2010,6 +2065,34 @@ impl Executor {
             return false;
         }
 
+        // The assume-bridge plans above reconstruct these terms directly from
+        // parsed problem assertions, then validate the exact bridge that uses
+        // each one. They are therefore genuine authored premises even when
+        // recursive raw interning gives them a different id from both the
+        // folded canonical assertion and the shallow top-level raw form
+        // captured by the ordinary original-rebuild setup. Collect only those
+        // typed plan fields; never infer authority by scanning the rebuilt
+        // proof's Assume leaves.
+        let mut rebuilt_authored_premises: Vec<TermId> = assume_plans
+            .values()
+            .filter_map(|plan| match plan {
+                AssumePlan::Distinct { raw, .. } | AssumePlan::Literal { raw, .. } => Some(*raw),
+                AssumePlan::AndBounds { raw_and, .. } | AssumePlan::AndDistinct { raw_and, .. } => {
+                    Some(*raw_and)
+                }
+                AssumePlan::QuantExpansion { .. } => None,
+            })
+            .collect();
+        // The defined-equality ite-lift variant likewise re-interns the exact
+        // parsed defining equality as `orig`; the ordinary variant uses its
+        // canonical original directly and needs no additional registration.
+        rebuilt_authored_premises.extend(
+            ite_lifts
+                .values()
+                .filter(|plan| plan.defining_source.is_some())
+                .map(|plan| plan.orig),
+        );
+
         // Success. Override-purge discipline: every term the trichotomy /
         // assume-bridge surgery prints is raw-interned or canonical; a stale
         // surface override collected during the ordinary export could corrupt
@@ -2100,6 +2183,9 @@ impl Executor {
                 collect(&mut self.ctx, originals, t, &mut overrides);
             }
             self.last_proof_term_overrides = Some(overrides);
+        }
+        for premise in rebuilt_authored_premises {
+            self.record_rebuilt_authored_proof_premise(premise);
         }
         true
     }
@@ -2373,6 +2459,16 @@ impl Executor {
                     TermData::App(Symbol::Named(eop), eargs)
                         if eop == "=" && eargs.as_slice() == ordered
                 ) {
+                    continue;
+                }
+                let Some(authored_raw) = self.raw_intern_surface(&stripped) else {
+                    continue;
+                };
+                if authored_raw != p_raw {
+                    // The lift below treats `p_raw` as an authored premise.
+                    // Nested folds inside the condition, either branch, or
+                    // the defined side need their own derivation; a
+                    // whole-term print override is not proof authority.
                     continue;
                 }
                 for &(bound, _) in originals {
@@ -3079,16 +3175,11 @@ impl Executor {
             let Some((_, parsed)) = originals.iter().find(|(c, _)| c == term) else {
                 continue; // non-original assumes are the sibling trigger's job
             };
-            // A surface override makes the assume print with the problem
-            // file's own spelling: not a defect. Only override-less assumes
-            // print canonically (and only those can mismatch the premise).
-            if self
-                .last_proof_term_overrides
-                .as_ref()
-                .is_some_and(|m| m.contains_key(term))
-            {
-                continue;
-            }
+            // A whole-term override can make the Assume itself match while
+            // leaving its downstream canonical `and_pos`/distinct steps
+            // inconsistent with that printed spelling (notably a
+            // deduplicated conjunction). Classification, not the presence of
+            // an override, decides whether a bridge is required.
             let parsed = parsed.clone();
             if matches!(self.classify_assume(*term, &parsed, true), Ok(Some(_))) {
                 return true;
@@ -3132,6 +3223,18 @@ impl Executor {
                 for op in operands {
                     xs.push(self.ctx.elaborate_surface_subterm(op).ok_or(())?);
                 }
+                let raw_xs = operands
+                    .iter()
+                    .map(|op| self.raw_intern_surface(op))
+                    .collect::<Option<Vec<TermId>>>()
+                    .ok_or(())?;
+                if raw_xs != xs {
+                    // The bridge below proves only the `distinct_elim` of
+                    // these exact operands. A nested source rewrite needs its
+                    // own derivation; never authorize the canonicalized
+                    // shallow surrogate as an authored premise.
+                    return Err(());
+                }
                 // The exported assume must be the pairwise `i < j` expansion
                 // (exactly the `distinct_elim` conjunct order).
                 let TermData::App(Symbol::Named(name), conjs) = self.ctx.terms.get(term) else {
@@ -3163,7 +3266,7 @@ impl Executor {
                 let raw = self
                     .ctx
                     .terms
-                    .mk_app(Symbol::named("distinct"), xs.clone(), Sort::Bool);
+                    .mk_app(Symbol::named("distinct"), raw_xs, Sort::Bool);
                 if !matches!(
                     self.ctx.terms.get(raw),
                     TermData::App(Symbol::Named(op), args) if op == "distinct" && args.len() == xs.len()
@@ -3310,7 +3413,7 @@ impl Executor {
     /// where elaboration folds it (e.g. `(= c c)` -> `true`). The sort is
     /// taken from the term's own elaboration. `None` fail-closed on binders
     /// or anything that does not elaborate.
-    fn raw_intern_surface(&mut self, surf: &FrontendTerm) -> Option<TermId> {
+    pub(super) fn raw_intern_surface(&mut self, surf: &FrontendTerm) -> Option<TermId> {
         let stripped = strip_frontend_annotations(surf);
         match stripped {
             FrontendTerm::Symbol(_) | FrontendTerm::Const(_) => {
@@ -3324,6 +3427,13 @@ impl Executor {
                     .collect::<Option<Vec<TermId>>>()?;
                 if head == "not" && raw_args.len() == 1 {
                     return Some(self.ctx.terms.mk_not_raw(raw_args[0]));
+                }
+                if head == "ite" && raw_args.len() == 3 {
+                    return Some(
+                        self.ctx
+                            .terms
+                            .mk_ite_raw(raw_args[0], raw_args[1], raw_args[2]),
+                    );
                 }
                 let sort = self.ctx.terms.sort(elab).clone();
                 Some(self.ctx.terms.mk_app(Symbol::named(head), raw_args, sort))
@@ -3398,10 +3508,26 @@ impl Executor {
                     else {
                         return Ok(None);
                     };
-                    let raw =
-                        self.ctx
-                            .terms
-                            .mk_app(Symbol::named("distinct"), xs.clone(), Sort::Bool);
+                    let Some(raw_xs) = ops
+                        .iter()
+                        .map(|op| self.raw_intern_surface(op))
+                        .collect::<Option<Vec<TermId>>>()
+                    else {
+                        return Ok(None);
+                    };
+                    // `distinct_elim` below bridges the raw `distinct` only
+                    // when its operands are the exact canonical operands used
+                    // by the expansion. If a nested source operand itself
+                    // folds/reorders, admitting the canonicalized term as an
+                    // authored premise would be a provenance violation; such
+                    // a case needs an additional explicit rewrite proof.
+                    if raw_xs != xs {
+                        return Err(());
+                    }
+                    let raw = self
+                        .ctx
+                        .terms
+                        .mk_app(Symbol::named("distinct"), raw_xs, Sort::Bool);
                     if !matches!(
                         self.ctx.terms.get(raw),
                         TermData::App(Symbol::Named(op), args)
@@ -3594,14 +3720,15 @@ impl Executor {
     /// visible rather than fabricating an unchecked derivation.
     ///
     /// The collapse's assume holds the FOLDED canonical term (`false`), so
-    /// the derivation is rebuilt from the parsed ORIGINAL assertion whose
-    /// canonical form is the assumed term, with every operand re-elaborated
-    /// and the folded application re-interned RAW (so the new assume prints
-    /// like the problem file, exactly the `classify_assume` discipline).
+    /// shape dispatch uses the parsed ORIGINAL assertion whose canonical form
+    /// is that assumed term. Repairs either use the immutable, index-aligned
+    /// authored root directly or reconstruct exact raw source syntax; a
+    /// normalized re-elaboration is never admitted as premise authority.
     pub(super) fn try_rebuild_false_collapse(
         &mut self,
         proof: &mut Proof,
         originals: &[(TermId, FrontendTerm)],
+        authored_originals: &[(TermId, FrontendTerm)],
     ) -> bool {
         // (1) Recognize the whole-proof collapse shape on the LIVE steps.
         let live = live_steps(proof);
@@ -3726,7 +3853,7 @@ impl Executor {
         // original assertion(s) it came from and pick the certified
         // derivation by the ORIGINAL surface shape. First recognized shape
         // wins; no match keeps the proof byte-identical.
-        for (canonical, parsed) in originals {
+        for (original_idx, (canonical, parsed)) in originals.iter().enumerate() {
             if *canonical != x {
                 continue;
             }
@@ -3751,19 +3878,24 @@ impl Executor {
             let FrontendTerm::App(head, operands) = stripped else {
                 continue;
             };
-            let ok = match head.as_str() {
-                "distinct" if operands.len() >= 2 => {
-                    self.rebuild_duplicate_distinct_collapse(proof, operands)
-                }
-                "=" if operands.len() == 2 => {
-                    self.rebuild_ground_equality_collapse(proof, operands)
-                }
-                "and" if operands.len() >= 2 => {
-                    self.rebuild_complementary_and_collapse(proof, operands)
-                        || self.rebuild_linear_and_collapse(proof, operands)
-                }
-                _ => false,
-            };
+            let ok =
+                match head.as_str() {
+                    "distinct" if operands.len() >= 2 => {
+                        self.rebuild_duplicate_distinct_collapse(proof, operands)
+                    }
+                    "=" if operands.len() == 2 => {
+                        self.rebuild_ground_equality_collapse(proof, operands)
+                    }
+                    "and" if operands.len() >= 2 => {
+                        let authored_root = authored_originals.get(original_idx).and_then(
+                            |(root, authored_parsed)| (authored_parsed == parsed).then_some(*root),
+                        );
+                        authored_root.is_some_and(|root| {
+                            self.rebuild_complementary_and_collapse(proof, root, operands.len())
+                        }) || self.rebuild_linear_and_collapse(proof, operands)
+                    }
+                    _ => false,
+                };
             if ok {
                 return true;
             }
@@ -3985,24 +4117,19 @@ impl Executor {
     fn rebuild_complementary_and_collapse(
         &mut self,
         proof: &mut Proof,
-        operands: &[FrontendTerm],
+        authored_root: TermId,
+        surface_arity: usize,
     ) -> bool {
-        let mut conjs = Vec::with_capacity(operands.len());
-        for op in operands {
-            let Some(t) = self.ctx.elaborate_surface_subterm(op) else {
-                return false;
-            };
-            conjs.push(t);
-        }
-        let conjs = &conjs[..];
-        // Re-intern the folded conjunction RAW (see the distinct emitter).
-        let x = self
-            .ctx
-            .terms
-            .mk_app(Symbol::named("and"), conjs, Sort::Bool);
+        // The assumption authority is the immutable, index-aligned problem
+        // root. Never rebuild this premise by elaborating the parsed operands:
+        // comparison normalization can turn an authored
+        // `(and (not (> x 10)) (> x 10))` into the derived
+        // `(and (not (< 10 x)) (< 10 x))`, which is equivalent but is not an
+        // asserted formula. Parsed syntax is used only to verify the arity.
+        let x = authored_root;
         if !matches!(
             self.ctx.terms.get(x),
-            TermData::App(Symbol::Named(op), a) if op == "and" && a.len() == conjs.len()
+            TermData::App(Symbol::Named(op), a) if op == "and" && a.len() == surface_arity
         ) {
             return false;
         }
@@ -4078,6 +4205,14 @@ impl Executor {
             return false;
         };
         new_proof.add_resolution(Vec::new(), pos_term, neg_unit, pos_unit);
+        if !matches!(
+            ay_proof::check_proof_strict(&new_proof, &self.ctx.terms),
+            Ok(quality) if quality.trust_count == 0
+        ) || ay_proof::validate_reachable_assumes_in_problem_scope(&new_proof, &[authored_root])
+            .is_err()
+        {
+            return false;
+        }
         *proof = new_proof;
         true
     }
@@ -4257,6 +4392,11 @@ impl Executor {
             current = new_proof.add_resolution(clause[k + 1..].to_vec(), c, current, uid);
         }
         *proof = new_proof;
+        // `x` is recursively raw-interned from the parsed conjunction above,
+        // and the independently checked Farkas rebuild has now succeeded.
+        // Record that exact source term so the final exporter accepts the
+        // rebuilt Assume without granting authority to any generated leaf.
+        self.record_rebuilt_authored_proof_premise(x);
         true
     }
 

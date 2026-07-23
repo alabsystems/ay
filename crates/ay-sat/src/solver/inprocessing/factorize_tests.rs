@@ -146,12 +146,13 @@ fn verify_lrat_fixture(dimacs: &str, proof: &str) {
     );
 }
 
-fn repo_root_for_factor_artifacts() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+fn target_root_for_factor_artifacts() -> std::path::PathBuf {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
         .expect("crate should live under repo/crates/ay-sat")
-        .to_path_buf()
+        .to_path_buf();
+    ay_test_support::cargo_target_root(&workspace)
 }
 
 fn producer_revision_for_factor_artifact() -> String {
@@ -796,7 +797,7 @@ fn test_factor_lrat_dry_run_sidecar_persists_export_artifacts_for_checker() {
     let proof = render_factor_lrat_dry_run_replay(sidecar, &[7, 8]);
     verify_lrat_fixture(&dimacs, &proof);
 
-    let artifact_dir = repo_root_for_factor_artifacts().join("target/9285");
+    let artifact_dir = target_root_for_factor_artifacts().join("9285");
     std::fs::create_dir_all(&artifact_dir).expect("create factor sidecar artifact dir");
     let cnf_path = artifact_dir.join("minimal-factor-unsat-core.cnf");
     let lrat_path = artifact_dir.join("factor-dry-run-with-unsat-core.lrat");
@@ -911,7 +912,7 @@ fn test_factor_lrat_transaction_artifact_persists_signed_checker_obligations() {
     let proof = render_factor_lrat_dry_run_replay(sidecar, &[7, 8]);
     verify_lrat_fixture(&dimacs, &proof);
 
-    let artifact_dir = repo_root_for_factor_artifacts().join("target/9108");
+    let artifact_dir = target_root_for_factor_artifacts().join("9108");
     std::fs::create_dir_all(&artifact_dir).expect("create factor transaction artifact dir");
     let cnf_path = artifact_dir.join("minimal-factor-unsat-core.cnf");
     let lrat_path = artifact_dir.join("factor-transaction-with-unsat-core.lrat");
@@ -1047,7 +1048,7 @@ fn test_factor_lrat_rejected_live_output_still_checks_original_fixture() {
     );
     verify_lrat_fixture(&dimacs, &proof);
 
-    let artifact_dir = repo_root_for_factor_artifacts().join("target/9305");
+    let artifact_dir = target_root_for_factor_artifacts().join("9305");
     std::fs::create_dir_all(&artifact_dir).expect("create factor live artifact dir");
     let cnf_path = artifact_dir.join("minimal-factor-live.cnf");
     let lrat_path = artifact_dir.join("factor-live-proof.lrat");

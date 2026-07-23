@@ -1276,6 +1276,15 @@ impl Executor {
             return self.solve_strings();
         }
 
+        // The equation subset is sound independently of the arithmetic atoms.
+        // Keep this exact refutation before the SLIA witness cascade; resource
+        // limits, proof mode, and re-entrant solves all fail open internally.
+        if self.pivot_enum_depth == 0 {
+            if let Some(result) = self.try_word_eq_constant_propagation()? {
+                return Ok(result);
+            }
+        }
+
         // Prefix/suffix witness pre-pass.
         //
         // A variable constrained only by `str.prefixof(p, z)` and
@@ -1398,6 +1407,25 @@ impl Executor {
         // only from exhaustive Nielsen closure of the equation subset.
         if self.pivot_enum_depth == 0 {
             if let Some(result) = self.try_word_equation_nielsen()? {
+                return Ok(result);
+            }
+        }
+
+        // W1b for the variables whose derivative search converges within a
+        // cheap work budget — after the exact UNSAT deciders, before W6.
+        if self.pivot_enum_depth == 0 {
+            if let Some(result) = self.try_regex_construct_witnesses_cheap()? {
+                return Ok(result);
+            }
+        }
+
+        // W1b regex witness CONSTRUCTION (split out of the regex×length
+        // pre-pass so it runs after every EXACT pass). It only produces SAT
+        // candidates, so charging its derivative product search to formulas
+        // the exact passes already decide is pure overhead; the candidates,
+        // the pinning and the full model validation are unchanged.
+        if self.pivot_enum_depth == 0 {
+            if let Some(result) = self.try_regex_construct_witnesses()? {
                 return Ok(result);
             }
         }

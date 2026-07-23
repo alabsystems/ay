@@ -286,6 +286,44 @@ fn test_case_split_deadline_expired_helper_is_fail_closed() {
 }
 
 #[test]
+fn test_case_split_branch_budget_uses_stage_slack_without_spending_reserves() {
+    let first = PdrSolver::case_split_branch_budget(Some(Duration::from_secs(8)), 1);
+    assert_eq!(
+        first,
+        Duration::from_millis(5_500),
+        "first branch may use slack after reserving 2s for its sibling and 500ms for merge"
+    );
+
+    let last = PdrSolver::case_split_branch_budget(Some(Duration::from_millis(2_500)), 0);
+    assert_eq!(
+        last,
+        Duration::from_secs(2),
+        "last branch must leave the merged-model verification reserve intact"
+    );
+}
+
+#[test]
+fn test_case_split_branch_budget_is_bounded_and_fair_when_reserves_do_not_fit() {
+    assert_eq!(
+        PdrSolver::case_split_branch_budget(None, 7),
+        Duration::from_secs(4),
+        "an unbounded caller retains the established per-branch default"
+    );
+
+    let remaining = Duration::from_secs(2);
+    let budget = PdrSolver::case_split_branch_budget(Some(remaining), 1);
+    assert_eq!(
+        budget,
+        Duration::from_secs(1),
+        "a tight envelope is shared fairly rather than underflowing"
+    );
+    assert!(
+        budget <= remaining,
+        "a branch allocation must never exceed the enclosing stage envelope"
+    );
+}
+
+#[test]
 fn test_case_split_branch_cancellation_preserves_caller_token() {
     let caller_token = CancellationToken::new();
     let mut config = test_config();

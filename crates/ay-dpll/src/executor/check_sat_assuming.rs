@@ -29,6 +29,10 @@ impl Executor {
     /// which returns `VerifiedSolveResult`. Part of #5787 (Phase 6).
     pub(crate) fn check_sat_assuming(&mut self, assumptions: &[TermId]) -> Result<SolveResult> {
         self.last_sat_certificate = None;
+        // Keep the original assertion+assumption roots for the shared
+        // nested-array UNSAT authorization boundary. The inner solver may
+        // rewrite either collection while deriving its raw result.
+        let decision_roots = self.public_solve_roots(assumptions);
         let export_requested = bv_cnf_dump::requested();
         let mut dump_roots = if export_requested {
             self.ctx.assertions.clone()
@@ -45,10 +49,11 @@ impl Executor {
         let result = self.check_sat_assuming_with_controls(assumptions);
         self.restore_timeout_deadline_after_call(previous_deadline);
         self.record_z3_resource_statistics(solve_started_at);
-        result.and_then(|result| {
+        let result = result.and_then(|result| {
             bv_cnf_dump::finish_check(dump_transaction, &self.ctx.terms, &dump_roots)?;
             Ok(result)
-        })
+        })?;
+        Ok(self.quarantine_unverified_nested_array_unsat(&decision_roots, result))
     }
 
     /// `check-sat-assuming` entry for USER-FACING queries (the SMT-LIB
@@ -339,7 +344,9 @@ impl Executor {
         self.last_unknown_reason = None;
         self.last_statistics = Statistics::default();
         self.last_statistics.num_assertions = self.ctx.assertions.len() as u64;
-        self.proof_problem_assertion_provenance = None;
+        // Keep the immutable authority snapshot installed at the public-query
+        // boundary. Core minimization and scoped subset re-solves must not
+        // promote their temporary assertion windows to authored premises.
         self.quant_expansion_records.clear();
         self.last_proof_rebuild_originals.clear();
         self.skip_model_eval = false;
@@ -362,6 +369,19 @@ impl Executor {
     ) -> Result<SolveResult> {
         self.reset_solve_session_state();
 
+        // Establish the new proof session before any route-independent
+        // preprocessing emits certified axioms. In particular, RM finite-domain
+        // coverage below records theory lemmas through the shared axiom site;
+        // resetting afterward used to erase those certificates and later
+        // reconstruct the generated roots as unauthorized free assumptions.
+        if matches!(
+            self.ctx.get_option("produce-proofs"),
+            Some(OptionValue::Bool(true))
+        ) {
+            self.proof_tracker.enable();
+        }
+        self.proof_tracker.reset_session();
+
         // Store assumptions for potential get-unsat-assumptions call
         self.last_assumptions = Some(assumptions.to_vec());
 
@@ -371,8 +391,10 @@ impl Executor {
         if self.should_abort_theory_loop() {
             return Ok(SolveResult::Unknown);
         }
-        let mut solve_roots = self.ctx.assertions.clone();
-        solve_roots.extend_from_slice(assumptions);
+        let solve_roots = self.public_solve_roots(assumptions);
+        if let Some(result) = self.reject_array_ext_witness_capture(&solve_roots) {
+            return Ok(result);
+        }
         if let Some(result) = self.reject_unsupported_bitvector_width(&solve_roots) {
             return Ok(result);
         }
@@ -418,6 +440,15 @@ impl Executor {
         match self.rm_domain_axioms(&rm_roots) {
             crate::executor::rm_domain::RmDomainAxioms::NoMention => {}
             crate::executor::rm_domain::RmDomainAxioms::Axioms(axioms) => {
+                // Freeze the caller-authored base before adding these theory
+                // axioms. Native API assertions have no parsed-source prefix,
+                // so the legacy fallback otherwise treats the current
+                // assertion stack as authored; after this scoped solve restores
+                // the stack, strict export correctly sees the generated roots
+                // as foreign assumptions. Keeping explicit provenance here
+                // makes proof reconstruction derive/certify them instead.
+                let authored_assertions = self.ctx.assertions.clone();
+                self.install_proof_source_provenance(&authored_assertions);
                 for axiom in axioms {
                     self.push_array_axiom_assertion_site(axiom, "rm_domain_coverage");
                 }
@@ -428,18 +459,6 @@ impl Executor {
                 return Ok(SolveResult::Unknown);
             }
         }
-
-        // Sync proof tracker with :produce-proofs option (matches check_sat_internal)
-        if matches!(
-            self.ctx.get_option("produce-proofs"),
-            Some(OptionValue::Bool(true))
-        ) {
-            self.proof_tracker.enable();
-        }
-
-        // Reset proof content for new solving session (keep scope tracking
-        // for incremental push/pop balance) (#5992)
-        self.proof_tracker.reset_session();
 
         // Use the base assertions from context, assumptions are passed separately
         let base_assertions = self.ctx.assertions.clone();

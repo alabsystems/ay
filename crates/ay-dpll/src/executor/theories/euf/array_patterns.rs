@@ -7,6 +7,9 @@
 //! Congruence axioms are in `array_congruence`. ROW/ROW2b axioms are in `array_row`.
 
 use super::super::super::Executor;
+use super::super::{
+    array_extensionality_witness, deep_array_extensionality_witness, ArrayExtWitnessBinding,
+};
 use super::pigeonhole_core::EnumDiseqEdges;
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
@@ -2508,7 +2511,7 @@ impl Executor {
     /// that is itself read by a `select` — the
     /// `(select (store OPERAND idx val) k)` nested pattern. In that situation the
     /// inner ROW/congruence decomposition over the nested store already pins the
-    /// relevant inner-array index; the additional outer `__ext_diff` Skolem only
+    /// relevant inner-array index; the additional outer `__ay_ext_diff` Skolem only
     /// injects spurious index equalities that combine with unrelated top-level
     /// index literals into a wrong-UNSAT (#r3-nested-arrayext).
     ///
@@ -2518,13 +2521,12 @@ impl Executor {
     ///   - some `(select (store OP ..) ..)` term exists in the problem where
     ///     `OP` is `lhs` or `rhs`.
     ///
-    /// SOUNDNESS: the suppressed clause is the array-extensionality tautology
-    /// `(= lhs rhs) ∨ select(lhs,k) != select(rhs,k)`. Removing a tautology can
-    /// only lose completeness (a missed refutation), never manufacture a wrong
-    /// verdict — so this can NEVER introduce a new wrong-UNSAT or wrong-SAT on a
-    /// pair that was genuinely refutable by other means. The nested ROW/store
-    /// congruence axioms still decompose the store-of-array, closing any genuine
-    /// nested-array UNSAT.
+    /// SOUNDNESS: with `k` fresh, `(= lhs rhs) ∨ select(lhs,k) != select(rhs,k)`
+    /// is a conservative, equisatisfiable extension of the original array
+    /// problem — not a tautology for an arbitrary pre-existing `k`. Suppressing
+    /// that solver aid leaves the original formula unchanged and can only lose
+    /// refutational completeness. The nested ROW/store congruence axioms still
+    /// decompose the store-of-array, closing any genuine nested-array UNSAT.
     fn nested_array_outer_ext_redundant(&self, lhs: TermId, rhs: TermId) -> bool {
         // Value (element) sort must itself be an array — the NESTED case.
         let Sort::Array(arr) = self.ctx.terms.sort(lhs).clone() else {
@@ -2697,7 +2699,7 @@ impl Executor {
         // #qf-ax-negated-swap: a top-level NEGATED ARRAY equality (e.g.
         // `(not (= a1 a2))` in the storeinv `_np_` variants) also supplies the
         // witness — `add_array_extensionality_axioms` fabricates the
-        // `__ext_diff` select-disequality Skolem for exactly this atom, and
+        // `__ay_ext_diff` select-disequality Skolem for exactly this atom, and
         // the storeinv refutation then needs the same eager ROW2b/decomposition
         // unroll as the explicit-witness `_sf_` variants. Without this, the
         // two-base `_np_` shape (positive store-store equality + negated base
@@ -2757,7 +2759,7 @@ impl Executor {
             // #qf-ax-negated-swap: include NEGATED store-store equalities
             // (`(assert (not (= chain1 chain2)))`, the swap/storeinv `_np_`
             // shape) so the eager-ROW2b assertion budget scales with the chain
-            // depth the fabricated `__ext_diff` witness has to unroll through.
+            // depth the fabricated `__ay_ext_diff` witness has to unroll through.
             let eq_term = match self.ctx.terms.get(assertion) {
                 TermData::Not(inner) => *inner,
                 _ => assertion,
@@ -2786,8 +2788,8 @@ impl Executor {
     /// This is the SMT-COMP QF_AX swap/storeinv `_np_nf_` shape: the whole
     /// benchmark is one negated equality between two nested store chains, with
     /// NO explicit select-disequality witness anywhere — the only witness is
-    /// the `__ext_diff` Skolem fabricated by `add_array_extensionality_axioms`.
-    /// Refuting it requires unrolling `select(chain, __ext_diff)` down BOTH
+    /// the `__ay_ext_diff` Skolem fabricated by `add_array_extensionality_axioms`.
+    /// Refuting it requires unrolling `select(chain, __ay_ext_diff)` down BOTH
     /// chains (ROW2b upward propagation), which the lazy runtime ArraySolver's
     /// event-driven queues never trigger for unnamed nested stores — leaving a
     /// model that satisfies ROW1/ROW2 locally but violates extensionality
@@ -3000,13 +3002,14 @@ impl Executor {
     ///
     /// For every equality atom `(= a b)` in the term store where a, b have
     /// `Sort::Array(...)`, creates:
-    ///   - A fresh Skolem variable `__ext_diff_N` with the array's index sort
-    ///   - Select terms `(select a __ext_diff_N)` and `(select b __ext_diff_N)`
+    ///   - A fresh Skolem variable `__ay_ext_diff_N` with the array's index sort
+    ///   - Select terms `(select a __ay_ext_diff_N)` and `(select b __ay_ext_diff_N)`
     ///   - The extensionality clause: `(= a b) ∨ ¬(= (select a k) (select b k))`
     ///
-    /// This is a valid tautology in the theory of arrays. Adding it before
-    /// Tseitin encoding ensures the SAT solver has the atoms needed to enforce
-    /// the extensionality axiom: if `a ≠ b`, the diff witness must differ.
+    /// Freshness makes this a conservative, equisatisfiable extension of the
+    /// original array problem (it is not a tautology for an arbitrary fixed
+    /// `k`). Adding it before Tseitin encoding gives the SAT solver the atoms
+    /// needed to enforce extensionality: if `a ≠ b`, the diff witness differs.
     pub(in crate::executor) fn add_array_extensionality_axioms(&mut self) {
         self.add_array_extensionality_axioms_up_to(self.ctx.terms.len());
     }
@@ -3078,7 +3081,7 @@ impl Executor {
                         // `(not (= (select (store n i c) j) (store c i e)))`), because
                         // the eager fixpoint fabricated a wrong-UNSAT on that shape.
                         // That was a NEUTRALIZATION, not a root-cause fix; the actual
-                        // cause — the redundant OUTER `__ext_diff` Skolem for the
+                        // cause — the redundant OUTER `__ay_ext_diff` Skolem for the
                         // nested `(n1, n2)` pair, whose index equalities unit-forced a
                         // level-0 conflict against an unrelated index disequality — is
                         // fixed by `nested_array_outer_ext_redundant` below.
@@ -3111,7 +3114,7 @@ impl Executor {
         // through aliases:
         //   e_l = select(A, k), e_r = select(B, k), e_l != e_r
         // Treat this as a direct select disequality so extensionality does not
-        // fabricate a redundant `__ext_diff_*` for the same array pair.
+        // fabricate a redundant `__ay_ext_diff_*` for the same array pair.
         let base_diseqs: Vec<(TermId, TermId)> = top_level_disequalities.iter().copied().collect();
         for (a, b) in base_diseqs {
             if let (Some(&sel_a), Some(&sel_b)) = (select_alias.get(&a), select_alias.get(&b)) {
@@ -3127,7 +3130,7 @@ impl Executor {
 
         // For each unique array pair with a negation, create extensionality axiom
         let mut seen_pairs: HashSet<(TermId, TermId)> = HashSet::default();
-        for (eq_term, lhs, rhs, index_sort) in array_eq_pairs {
+        for (eq_term, lhs, rhs, _index_sort) in array_eq_pairs {
             // #8615: Check interrupt between extensionality axiom pairs.
             if should_stop() {
                 return;
@@ -3169,17 +3172,18 @@ impl Executor {
             // are about to add extensionality for is over a NESTED array (its
             // value sort is itself an array) AND one of `lhs`/`rhs` is the BASE of
             // a `store` that is itself read by a `select` (the nested
-            // store-of-array then selected pattern), the fresh outer `__ext_diff`
+            // store-of-array then selected pattern), the fresh outer `__ay_ext_diff`
             // Skolem is REDUNDANT and HARMFUL: the inner ROW/congruence machinery
             // over the nested store already pins the relevant inner-array index,
-            // while the extra outer Skolem generates `(= i2 __ext_diff)`-style
+            // while the extra outer Skolem generates `(= i2 __ay_ext_diff)`-style
             // index equalities that — combined with an UNRELATED top-level index
             // disequality (e.g. `i0 != i1`) — unit-force a spurious level-0
-            // conflict over `select(lhs,__ext_diff) != select(rhs,__ext_diff)`
-            // (the #8741 failure mode one array level up). Suppressing the
-            // tautological extensionality Skolem is sound (a tautology removed can
-            // only lose completeness, never flip a verdict); the nested ROW
-            // decomposition still closes any genuine nested-array UNSAT.
+            // conflict over `select(lhs,__ay_ext_diff) != select(rhs,__ay_ext_diff)`
+            // (the #8741 failure mode one array level up). Suppressing this
+            // fresh-witness conservative extension is sound: it leaves the
+            // original formula unchanged and can only lose refutational
+            // completeness. The nested ROW decomposition still closes any
+            // genuine nested-array UNSAT.
             //
             // #nested-ext-deep-witness (completeness restoration): plain
             // suppression left the nested pair with NO witness machinery at
@@ -3197,41 +3201,67 @@ impl Executor {
             // index-equality interplay cannot unit-force the #8741 array-level
             // spurious conflict the suppressed OUTER Skolem caused.
             if self.nested_array_outer_ext_redundant(lhs, rhs) {
-                let pair_key = if lhs.0 <= rhs.0 {
-                    (lhs, rhs)
-                } else {
-                    (rhs, lhs)
-                };
                 let mut sel_a = lhs;
                 let mut sel_b = rhs;
                 let mut level = 0usize;
+                let mut witness_failed = false;
+                let mut witness_bindings = Vec::new();
                 while let Sort::Array(arr) = self.ctx.terms.sort(sel_a).clone() {
-                    let skolem_name = format!(
-                        "__ext_diff_deep_{}_{}_{}",
-                        pair_key.0 .0, pair_key.1 .0, level
-                    );
-                    let diff_var = self.ctx.terms.mk_var(skolem_name, arr.index_sort.clone());
+                    let Some(diff_var) = deep_array_extensionality_witness(
+                        &mut self.ctx.terms,
+                        &mut self.array_ext_witness_cache,
+                        lhs,
+                        rhs,
+                        level,
+                        arr.index_sort.clone(),
+                    ) else {
+                        // A reserved-name sort collision can only come from an
+                        // internal invariant violation. Skip the optional axiom
+                        // rather than constructing a wrong-sorted witness.
+                        witness_failed = true;
+                        break;
+                    };
+                    witness_bindings.push(ArrayExtWitnessBinding {
+                        witness: diff_var,
+                        array_a: sel_a,
+                        array_b: sel_b,
+                    });
                     sel_a = self.ctx.terms.mk_select(sel_a, diff_var);
                     sel_b = self.ctx.terms.mk_select(sel_b, diff_var);
                     level += 1;
                     if level > 8 {
                         // Defensive depth cap; array sorts this deep do not
                         // occur in practice. Falling out mid-chain is still
-                        // sound: the clause below stays a tautology.
+                        // sound: the truncated fresh-witness chain remains a
+                        // conservative, equisatisfiable extension.
                         break;
                     }
+                }
+                if witness_failed {
+                    continue;
                 }
                 let sel_eq = self.ctx.terms.mk_eq(sel_a, sel_b);
                 let not_sel_eq = self.ctx.terms.mk_not(sel_eq);
                 let ext_clause = self.ctx.terms.mk_or(vec![eq_term, not_sel_eq]);
+                self.array_ext_witness_cache.record_generated_clause(
+                    &self.ctx.terms,
+                    ext_clause,
+                    witness_bindings,
+                );
                 self.push_array_axiom_assertion_site(ext_clause, "deep_ext_axiom");
                 self.array_ext_shadow.record(eq_term, lhs, rhs, not_sel_eq);
                 continue;
             }
 
-            // Create fresh Skolem diff variable with the array's index sort
-            let skolem_name = format!("__ext_diff_{}_{}", lhs.0, rhs.0);
-            let diff_var = self.ctx.terms.mk_var(skolem_name, index_sort);
+            // Create/reuse the reserved Skolem with the array's index sort.
+            let Some(diff_var) = array_extensionality_witness(
+                &mut self.ctx.terms,
+                &mut self.array_ext_witness_cache,
+                lhs,
+                rhs,
+            ) else {
+                continue;
+            };
 
             // Create select(a, diff) and select(b, diff)
             let sel_a = self.ctx.terms.mk_select(lhs, diff_var);
@@ -3245,8 +3275,17 @@ impl Executor {
 
             // Create extensionality clause: (= a b) ∨ ¬(= (select a diff) (select b diff))
             let ext_clause = self.ctx.terms.mk_or(vec![eq_term, not_sel_eq]);
+            self.array_ext_witness_cache.record_generated_clause(
+                &self.ctx.terms,
+                ext_clause,
+                vec![ArrayExtWitnessBinding {
+                    witness: diff_var,
+                    array_a: lhs,
+                    array_b: rhs,
+                }],
+            );
 
-            // Add as an assertion (it's a tautology, so it preserves equivalence)
+            // Add the fresh-witness conservative extension as an assertion.
             self.push_array_axiom_assertion_site(ext_clause, "ext_axiom");
 
             // D1 shadow (lazy-extensionality campaign): record this EAGER witness
@@ -3340,8 +3379,8 @@ impl Executor {
         // a fresh store-base decomposition Skolem — the existing witness
         // already decomposes the equality. Introducing a parallel Skolem
         // plus the decomp clause combines with array-congruence-store
-        // chains to unit-force both `(= i1 __ext_diff)` and
-        // `(= i2 __ext_diff)` at level 0, collapsing to spurious UNSAT
+        // chains to unit-force both `(= i1 __ay_ext_diff)` and
+        // `(= i2 __ay_ext_diff)` at level 0, collapsing to spurious UNSAT
         // on satisfiable formulas like the #8741 minimal repro.
         let top_level_disequalities = self.collect_top_level_disequalities();
         let mut selects_by_array: HashMap<TermId, HashMap<TermId, TermId>> = HashMap::default();
@@ -3527,6 +3566,7 @@ impl Executor {
         // Returns true if new axioms were added.
         let terms = &mut self.ctx.terms;
         let assertions = &mut self.ctx.assertions;
+        let witness_cache = &mut self.array_ext_witness_cache;
 
         let mut add_decomp =
             |named_x: TermId,
@@ -3573,14 +3613,19 @@ impl Executor {
                 let not_xy_eq = terms.mk_not(xy_eq);
 
                 // Create extensionality Skolem for the base pair (once per pair).
-                if let Sort::Array(ref arr_sort) = terms.sort(base_a).clone() {
-                    let index_sort = arr_sort.index_sort.clone();
-                    // Reuse the canonical extensionality witness name for the same
+                if let Sort::Array(_) = terms.sort(base_a).clone() {
+                    // Reuse the cache-owned extensionality witness for the same
                     // base-array pair instead of introducing a parallel store-base
                     // decomposition witness. This keeps the array proof search on a
                     // single distinguishing index for `(base_a, base_b)` (#6282).
-                    let skolem_name = format!("__ext_diff_{}_{}", base_pair.0 .0, base_pair.1 .0);
-                    let diff_var = terms.mk_var(skolem_name, index_sort);
+                    let Some(diff_var) = array_extensionality_witness(
+                        terms,
+                        witness_cache,
+                        base_pair.0,
+                        base_pair.1,
+                    ) else {
+                        return;
+                    };
                     let base_eq = terms.mk_eq(base_a, base_b);
 
                     if seen.insert(base_pair) {
@@ -3590,6 +3635,15 @@ impl Executor {
                         let sel_eq = terms.mk_eq(sel_a, sel_b);
                         let not_sel_eq = terms.mk_not(sel_eq);
                         let ext_axiom = terms.mk_or(vec![base_eq, not_sel_eq]);
+                        witness_cache.record_generated_clause(
+                            terms,
+                            ext_axiom,
+                            vec![ArrayExtWitnessBinding {
+                                witness: diff_var,
+                                array_a: base_a,
+                                array_b: base_b,
+                            }],
+                        );
                         if ay_core::debug_channel_active(ay_core::DebugChannel::ArrayAxiomSite) {
                             eprintln!(
                                 "[array_axiom] site=sbd_ext axiom=#{} data={:?}",
@@ -3603,7 +3657,8 @@ impl Executor {
                     // Decomposition:
                     //   [¬def_x ∨ ¬def_y ∨] ¬(= X Y) ∨ (= idx_a diff) ∨ [opt: (= idx_b diff)] ∨ (= A B)
                     // #qfax-sbd-guard: the alias guards make the clause a
-                    // genuine theory tautology modulo the Skolem definition;
+                    // theory-valid consequence of the alias definitions and
+                    // the fresh-witness extensionality constraint;
                     // they resolve away when the defining equalities are
                     // asserted top-level units (the storeinv/swap `_sf_`
                     // benchmarks), preserving the intended refutations.
@@ -3721,10 +3776,9 @@ impl Executor {
     ///       tautology; or
     ///   (b) the standard extensionality skolemization
     ///       `(= A B) ∨ ¬(= (select A d) (select B d))` with the pair's
-    ///       canonical `__ext_diff_{a}_{b}` Skolem (same construction and
-    ///       naming as `add_array_extensionality_axioms`, so hash-consing
-    ///       reuses one witness per pair).
-    /// Tautologies and skolemized extensionality preserve satisfiability in
+    ///       same cache-owned current-query witness used by
+    ///       `add_array_extensionality_axioms` (one identity per pair).
+    /// ROW tautologies and fresh-witness extensionality preserve satisfiability in
     /// both directions, so this pass can NEVER flip a genuine sat to unsat
     /// (the `storeinv_invalid_*`/`swap_invalid_*` `:status sat` siblings stay
     /// sat) nor a genuine unsat to sat.
@@ -3878,22 +3932,37 @@ impl Executor {
             push_witness(kv, &mut witnesses);
         }
         // (b) extensionality Skolems for top-level array disequalities. Reuse
-        // the canonical per-pair witness name so the axiom generator and this
+        // the cache-owned per-pair witness so the axiom generator and this
         // pass agree on ONE distinguishing index per pair.
         for &(eq_term, a, b) in &neg_array_eqs {
-            let Sort::Array(arr) = self.ctx.terms.sort(a).clone() else {
+            let Sort::Array(_) = self.ctx.terms.sort(a).clone() else {
                 continue;
             };
             if self.ctx.terms.sort(a) != self.ctx.terms.sort(b) {
                 continue;
             }
-            let skolem_name = format!("__ext_diff_{}_{}", a.0, b.0);
-            let diff_var = self.ctx.terms.mk_var(skolem_name, arr.index_sort.clone());
+            let Some(diff_var) = array_extensionality_witness(
+                &mut self.ctx.terms,
+                &mut self.array_ext_witness_cache,
+                a,
+                b,
+            ) else {
+                continue;
+            };
             let sel_a = self.ctx.terms.mk_select(a, diff_var);
             let sel_b = self.ctx.terms.mk_select(b, diff_var);
             let sel_eq = self.ctx.terms.mk_eq(sel_a, sel_b);
             let not_sel_eq = self.ctx.terms.mk_not(sel_eq);
             let ext_clause = self.ctx.terms.mk_or(vec![eq_term, not_sel_eq]);
+            self.array_ext_witness_cache.record_generated_clause(
+                &self.ctx.terms,
+                ext_clause,
+                vec![ArrayExtWitnessBinding {
+                    witness: diff_var,
+                    array_a: a,
+                    array_b: b,
+                }],
+            );
             self.push_array_axiom_assertion_site(ext_clause, "witness_row_ext");
             push_witness(diff_var, &mut witnesses);
         }

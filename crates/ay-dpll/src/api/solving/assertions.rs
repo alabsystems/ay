@@ -4,7 +4,8 @@
 
 //! Assertion stack management: assert, push, pop, scopes, reset.
 
-use ay_core::Sort;
+use ay_core::term::Symbol;
+use ay_core::{Sort, TermData, TermId};
 use ay_frontend::command::Term as ParsedTerm;
 use ay_frontend::Command;
 
@@ -32,6 +33,15 @@ impl Solver {
     /// [`assert_term`]: Solver::assert_term
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_assert_term(&mut self, term: Term) -> Result<(), SolverError> {
+        if let Some(message) = self
+            .executor
+            .array_ext_witness_registration_error(&[term.0])
+        {
+            return Err(SolverError::InvalidArgument {
+                operation: "assert_term",
+                message,
+            });
+        }
         let sort = self.terms().sort(term.0).clone();
         if sort != Sort::Bool {
             return Err(SolverError::SortMismatch {
@@ -43,11 +53,20 @@ impl Solver {
 
         self.executor.note_api_assertion_mutation();
 
+        // Match the parsed-SMT macro finder at the native API boundary.  A
+        // pure top-level `forall X. f(X) = body` over a fresh declared UF is
+        // an exact definition: later native applications can be expanded by
+        // construction, while model output emits the lambda body.  Every
+        // refusal below keeps the original quantified assertion unchanged.
+        let asserted_term = self
+            .try_adopt_native_definitional_forall(term.0)
+            .unwrap_or(term.0);
+
         // Keep assertions_parsed aligned with assertions for proof-rewrite
         // invariants when assertions are added via the native API path.
         let ctx = self.executor.context_mut();
         ctx.add_assertion_with_parsed(
-            term.0,
+            asserted_term,
             ParsedTerm::Symbol("__ay_api_assertion__".to_string()),
         );
         self.record_native_replay_event(NativeReplayEventKind::Assert {
@@ -82,6 +101,15 @@ impl Solver {
     /// [`try_get_unsat_core`]: Solver::try_get_unsat_core
     #[must_use = "this returns a Result that must be checked"]
     pub fn try_assert_named(&mut self, term: Term, name: &str) -> Result<(), SolverError> {
+        if let Some(message) = self
+            .executor
+            .array_ext_witness_registration_error(&[term.0])
+        {
+            return Err(SolverError::InvalidArgument {
+                operation: "assert_named",
+                message,
+            });
+        }
         let sort = self.terms().sort(term.0).clone();
         if sort != Sort::Bool {
             return Err(SolverError::SortMismatch {
@@ -247,11 +275,11 @@ impl Solver {
     pub fn try_reset_assertions(&mut self) -> Result<(), SolverError> {
         self.executor.execute(&Command::ResetAssertions)?;
         self.scope_level = 0;
-        // Preserve declarations and API-level definitions. ResetAssertions
-        // clears assertions/scopes but deliberately retains the context's term
-        // store, so definition parameter/body TermIds remain valid. Clearing
-        // this map silently changed a formerly-defined function into an
-        // uninterpreted one after reset-assertions.
+        // Preserve explicit API-level definitions.  Definitions adopted from
+        // asserted foralls lose their justification here and must disappear,
+        // matching the frontend context's adopted-macro reset.
+        self.defined_funs
+            .retain(|_, definition| !definition.assertion_derived);
         self.last_assumptions = None;
         self.last_unknown_reason = None;
         self.last_executor_error = None;
@@ -260,5 +288,114 @@ impl Solver {
         self.core_tracker = crate::api::types::CoreEvolutionTracker::new();
         self.record_native_replay_event(NativeReplayEventKind::ResetAssertions);
         Ok(())
+    }
+
+    /// Adopt a native, already-elaborated definitional forall as an exact
+    /// macro, returning the tautology that replaces its discharged assertion.
+    ///
+    /// This is deliberately stricter than syntactic recognition alone.  The
+    /// declared function must have no earlier constrained use and no other raw
+    /// application may already exist in the native term arena.  The latter is
+    /// essential for a handle-based API: a caller can retain any prebuilt term
+    /// and assert it after adoption, bypassing expansion in `try_apply`.
+    fn try_adopt_native_definitional_forall(&mut self, assertion: TermId) -> Option<TermId> {
+        if self.scope_level != 0 {
+            return None;
+        }
+        let TermData::Forall(vars, body, _) = self.terms().get(assertion).clone() else {
+            return None;
+        };
+        if vars.is_empty() {
+            return None;
+        }
+        for i in 0..vars.len() {
+            for j in (i + 1)..vars.len() {
+                if vars[i].0 == vars[j].0 {
+                    return None;
+                }
+            }
+        }
+        let TermData::App(Symbol::Named(eq), sides) = self.terms().get(body).clone() else {
+            return None;
+        };
+        if eq != "=" || sides.len() != 2 {
+            return None;
+        }
+
+        let exact_head = |solver: &Self, candidate: TermId| {
+            let TermData::App(Symbol::Named(name), args) = solver.terms().get(candidate) else {
+                return None;
+            };
+            if args.len() != vars.len()
+                || args
+                    .iter()
+                    .zip(vars.iter())
+                    .any(|(&arg, (var_name, sort))| {
+                        !matches!(
+                            solver.terms().get(arg),
+                            TermData::Var(name, _) if name == var_name
+                        ) || solver.terms().sort(arg) != sort
+                    })
+            {
+                return None;
+            }
+            Some((name.clone(), args.clone(), candidate))
+        };
+        let (name, param_terms, head, definition_body) =
+            match (exact_head(self, sides[0]), exact_head(self, sides[1])) {
+                (Some((name, params, head)), None) => (name, params, head, sides[1]),
+                (None, Some((name, params, head))) => (name, params, head, sides[0]),
+                _ => return None,
+            };
+        if self.defined_funs.contains_key(&name) {
+            return None;
+        }
+        let (domain, range) = self.native_fun_signatures.get(&name)?.clone();
+        if domain.len() != vars.len()
+            || domain
+                .iter()
+                .zip(vars.iter())
+                .any(|(declared, (_, bound))| declared.as_term_sort() != *bound)
+            || range.as_term_sort() != *self.terms().sort(definition_body)
+        {
+            return None;
+        }
+
+        // Native Terms are persistent handles.  Refuse if any second raw
+        // application was built before the definition; otherwise that stale
+        // term could later constrain an uninterpreted `f` independently of the
+        // adopted macro.  Trigger references reuse `head` through hash-consing.
+        if self.terms().term_ids().any(|id| {
+            id != head
+                && matches!(
+                    self.terms().get(id),
+                    TermData::App(Symbol::Named(other), _) if other == &name
+                )
+        }) {
+            return None;
+        }
+
+        let params: Vec<(String, Sort)> = vars.clone();
+        if !self
+            .executor
+            .context_mut()
+            .try_register_native_adopted_macro_interp(&name, &params, definition_body)
+        {
+            return None;
+        }
+        self.defined_funs.insert(
+            name,
+            super::super::DefinedFun {
+                params: params
+                    .iter()
+                    .zip(param_terms)
+                    .map(|((name, _), term)| (name.clone(), term))
+                    .collect(),
+                body: definition_body,
+                return_sort: range.as_term_sort(),
+                assertion_derived: true,
+            },
+        );
+        Some(self.terms().true_term())
     }
 }

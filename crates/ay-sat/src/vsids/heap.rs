@@ -480,6 +480,12 @@ impl VSIDS {
                     "BUG: batch repair requested sift for non-heap var {var}"
                 );
                 self.sift_up(pos as usize);
+                // Unlike EVSIDS, a CHB update is an exponential moving
+                // average and can lower the score when the new reward is
+                // below the previous estimate. Repair both directions: after
+                // `sift_up`, the variable's current position is the only
+                // place that can still violate a child edge.
+                self.sift_down(self.heap_pos[var] as usize);
             }
             batch::BatchHeapRepair::Rebuild => self.rebuild_heap(),
         }

@@ -1001,15 +1001,16 @@ pub(in crate::executor) fn reconcile_lia_select_congruence(
         // substituted variable). If solved-form members disagree among
         // themselves, leave the group alone (validation backstop).
         //
-        // Internal witness-index reads (`__ay_arr2lia_wit_*`, `__ext_diff_*`:
-        // solver-minted extensionality/bridge skolems) never carry authority:
+        // Internal witness-index reads (`__ay_arr2lia_wit_*`,
+        // `__ay_ext_diff_*`: solver-minted extensionality/bridge skolems)
+        // never carry authority:
         // class-merge repairs can MOVE the witness variable onto a program
         // cell AFTER its read value was committed for a different cell, so
         // the stale witness read would otherwise veto (solved-form conflict)
         // or overwrite the genuinely constrained program read (#A1 chain).
         // They still RECEIVE the group's reconciled value below.
         let index_is_internal_witness = |index: TermId| match terms.get(index) {
-            TermData::Var(name, _) => name.starts_with("__ay_") || name.starts_with("__ext_diff_"),
+            TermData::Var(name, _) => name.starts_with("__ay_"),
             _ => false,
         };
         let mut preferred: Option<num_bigint::BigInt> = None;

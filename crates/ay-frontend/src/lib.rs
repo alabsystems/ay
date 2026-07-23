@@ -41,8 +41,8 @@ pub use command::{
     SUPPORTED_TACTIC_NAMES,
 };
 pub use elaborate::{
-    is_reserved_symbol, CommandResult, Context, ElaborateError, IntroKind, Objective,
-    ObjectiveDirection, OptionValue, SoftAssertion, SymbolInfo,
+    is_reserved_op_name, is_reserved_symbol, CommandResult, Context, ElaborateError, IntroKind,
+    Objective, ObjectiveDirection, OptionValue, SoftAssertion, SymbolInfo,
 };
 pub use parser::{parse, CommandStream, CommandStreamItem};
 pub use sexp::{ParseError, SExpr};

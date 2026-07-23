@@ -3,6 +3,9 @@
 // Licensed under the Apache License, Version 2.0
 
 use super::*;
+use crate::executor::theories::{
+    array_extensionality_witness, deep_array_extensionality_witness, ArrayExtWitnessBinding,
+};
 use ay_core::{AletheRule, ProofId, Sort};
 use ay_frontend::parse;
 use ay_proof::check_proof_partial;
@@ -180,6 +183,10 @@ fn shadowed_store_generic_lemma_expands_to_strict_primitives() {
         vec![lemma, assumption],
         Vec::new(),
     );
+    // The strict/revert gate authenticates every Assume against the active
+    // problem. Model this fixture as a check-sat-assuming refutation instead
+    // of relying on the pre-authority-check behavior that admitted any leaf.
+    exec.last_assumptions = Some(vec![not_compact]);
     exec.split_shadowed_store_equality_lemmas(&mut proof);
 
     let named = proof
@@ -263,6 +270,7 @@ fn shadowed_store_expansion_handles_deduplicated_index_and_value_equality() {
         vec![lemma, assumption],
         Vec::new(),
     );
+    exec.last_assumptions = Some(vec![not_compact]);
     exec.split_shadowed_store_equality_lemmas(&mut proof);
 
     assert!(proof
@@ -515,7 +523,7 @@ fn test_qf_array_row1_collapse_is_strict_checkable() {
         "array ROW1 collapse must not fall back to trust; got:\n{text}"
     );
     assert!(
-        text.contains("read_over_write_pos"),
+        text.contains(":rule arrays_idx"),
         "reconstructed proof should carry the ROW1 read-over-write lemma; got:\n{text}"
     );
     match ay_proof::check_proof_strict(proof, &exec.ctx.terms) {
@@ -1413,6 +1421,41 @@ fn test_prune_to_empty_clause_derivation_removes_unreachable_steps() {
     }
 }
 
+#[test]
+fn test_prune_remaps_only_reachable_named_assumptions() {
+    use ay_core::{AletheRule, TermId};
+
+    let unreachable_term = TermId::new(1);
+    let reachable_term = TermId::new(2);
+    let mut proof = Proof::new();
+    let _unreachable = proof.add_assume(unreachable_term, Some("unreachable".to_string()));
+    let reachable = proof.add_assume(reachable_term, Some("reachable".to_string()));
+    let helper = proof.add_rule_step(AletheRule::Trust, vec![], vec![], vec![]);
+    proof
+        .named_steps
+        .insert("not_an_assume".to_string(), helper);
+    proof
+        .named_steps
+        .insert("dangling".to_string(), ProofId(u32::MAX));
+    proof.add_rule_step(
+        AletheRule::ThResolution,
+        vec![],
+        vec![reachable, helper],
+        vec![],
+    );
+
+    crate::executor::proof_resolution::prune_to_empty_clause_derivation(&mut proof);
+
+    assert!(!proof.named_steps.contains_key("unreachable"));
+    assert!(!proof.named_steps.contains_key("not_an_assume"));
+    assert!(!proof.named_steps.contains_key("dangling"));
+    let remapped = proof.named_steps["reachable"];
+    assert_eq!(remapped, ProofId(0));
+    assert!(
+        matches!(proof.steps.get(remapped.0 as usize), Some(ProofStep::Assume(term)) if *term == reachable_term)
+    );
+}
+
 /// Pruning a proof with no empty clause should be a no-op.
 #[test]
 fn test_prune_no_empty_clause_is_noop() {
@@ -1448,6 +1491,36 @@ fn test_prune_all_reachable_is_noop() {
     assert_eq!(proof.len(), 3);
     crate::executor::proof_resolution::prune_to_empty_clause_derivation(&mut proof);
     assert_eq!(proof.len(), 3, "all-reachable proof should not change");
+}
+
+#[test]
+fn test_prune_all_reachable_sanitizes_named_metadata() {
+    use ay_core::{AletheRule, TermId};
+
+    let p = TermId::new(1);
+    let not_p = TermId::new(2);
+    let mut proof = Proof::new();
+    let p_step = proof.add_assume(p, Some("p".to_string()));
+    let not_p_step = proof.add_assume(not_p, Some("not_p".to_string()));
+    let final_step = proof.add_rule_step(
+        AletheRule::ThResolution,
+        vec![],
+        vec![p_step, not_p_step],
+        vec![],
+    );
+    proof
+        .named_steps
+        .insert("not_an_assume".to_string(), final_step);
+    proof
+        .named_steps
+        .insert("dangling".to_string(), ProofId(u32::MAX));
+
+    crate::executor::proof_resolution::prune_to_empty_clause_derivation(&mut proof);
+
+    assert_eq!(proof.named_steps["p"], p_step);
+    assert_eq!(proof.named_steps["not_p"], not_p_step);
+    assert!(!proof.named_steps.contains_key("not_an_assume"));
+    assert!(!proof.named_steps.contains_key("dangling"));
 }
 
 #[test]
@@ -1702,9 +1775,14 @@ fn self_check_rejects_strict_refutation_from_non_problem_assumptions() {
     proof.add_resolution(Vec::new(), p, p_assumption, not_p_assumption);
 
     assert!(
-        exec.check_proof_strict_with_datatypes(&proof).is_ok(),
+        exec.check_proof_strict_derivation_with_datatypes(&proof)
+            .is_ok(),
         "regression fixture must be a valid derivation independent of its authority"
     );
+    assert!(matches!(
+        exec.check_proof_strict_with_datatypes(&proof),
+        Err(ay_proof::ProofCheckError::UnauthorizedAssumption { .. })
+    ));
     exec.run_internal_proof_check(&proof);
     exec.last_proof = Some(proof);
 
@@ -2329,7 +2407,7 @@ fn test_array_row2_indirect_store_proof_structure() {
 /// A QF_AX model that satisfies every AUTHORED assertion must self-certify as
 /// `sat`, even though `--self-check` forces proof production on and the eager
 /// array lane then leaves its injected ROW/extensionality axioms — over fresh
-/// `__ay_*` / `__ext_diff_*` symbols that carry no model value — inside the
+/// `__ay_*` symbols that carry no model value — inside the
 /// validation window. Those axioms are solver-generated, not part of the user's
 /// claim; before #selfcert-authored they counted as "unverified" and degraded
 /// EVERY QF_AX sat to `unknown` (0/60 self-certified on the SMT-LIB sample).
@@ -2453,8 +2531,8 @@ fn qf_s_ground_regex_refutation_self_certifies_from_authored_assertions() {
     // exported as `assume (str.in_re "/mod/forum/" R)` (a preprocessing
     // artifact, NOT a problem premise) plus a `:rule trust` lemma, so
     // `--self-check` degraded the UNSAT to `unknown`. Now the leaf is DERIVED
-    // from the authored assertion by `eq_congruent_pred` and the refutation is
-    // a `string_ground_eval` lemma the checker decides outright.
+    // from the authored assertion by congruence/equivalence steps and the
+    // refutation is a `string_ground_eval` lemma the checker decides outright.
     let input = r#"
         (set-option :produce-proofs true)
         (set-logic QF_S)
@@ -2470,6 +2548,7 @@ fn qf_s_ground_regex_refutation_self_certifies_from_authored_assertions() {
     assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
 
     let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
+    let text = exec.get_proof();
     match ay_proof::check_proof_strict(proof, &exec.ctx.terms) {
         Ok(quality) => assert_eq!(quality.trust_count, 0, "strict: zero trust steps"),
         Err(e) => panic!("ground-regex refutation must pass strict check, got {e:?}"),
@@ -2487,12 +2566,13 @@ fn qf_s_ground_regex_refutation_self_certifies_from_authored_assertions() {
     assert!(
         proof.steps.iter().any(|s| matches!(
             s,
-            ProofStep::TheoryLemma {
-                kind: TheoryLemmaKind::EufCongruentPred,
+            ProofStep::Step {
+                rule: AletheRule::Cong,
                 ..
             }
         )),
-        "the substituted leaf must be bridged, not assumed"
+        "the substituted leaf must be bridged, not assumed; got:\n{text}\n{:#?}",
+        proof.steps
     );
 
     // Every `assume` must be an AUTHORED assertion.
@@ -2506,13 +2586,12 @@ fn qf_s_ground_regex_refutation_self_certifies_from_authored_assertions() {
         }
     }
 
-    let text = exec.get_proof();
     assert!(
         !text.contains(":rule trust"),
         "ground-regex refutation must not fall back to trust; got:\n{text}"
     );
     assert!(
-        text.contains(":rule string_ground_eval") && text.contains(":rule eq_congruent_pred"),
+        text.contains(":rule string_ground_eval") && text.contains(":rule cong"),
         "expected the ground-eval lemma and the congruence bridge; got:\n{text}"
     );
     assert!(
@@ -2619,6 +2698,81 @@ fn qf_s_symbolic_regex_intersection_that_is_non_empty_stays_sat() {
 }
 
 #[test]
+fn qf_slia_str_len_axiom_refutation_self_certifies() {
+    // A QF_SLIA length contradiction: len(a)=2, len(b)=3, but
+    // len(a ++ b)=4. The solver injects the concat-length axiom
+    // `len(a ++ b) = len(a) + len(b)` (a universally valid str.len theorem, no
+    // authored premise), which drives the `2 + 3 != 4` refutation. Before
+    // #selfcert-strlen that axiom surfaced as a foreign `assume` the #8821 gate
+    // rejected, degrading the (correct) UNSAT to `unknown` under `--self-check`.
+    // Now the leaf carries `StringLengthLemma` and the checker re-derives the
+    // exact identity itself.
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_SLIA)
+        (declare-const a String)
+        (declare-const b String)
+        (assert (= (str.len a) 2))
+        (assert (= (str.len b) 3))
+        (assert (= (str.len (str.++ a b)) 4))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
+
+    let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
+    let text = exec.get_proof();
+    assert!(
+        proof.steps.iter().any(|s| matches!(
+            s,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::StringLengthLemma,
+                ..
+            }
+        )),
+        "the injected concat-length axiom must carry the strict-checkable \
+         StringLengthLemma kind, not a foreign assume; got:\n{text}\n{:#?}",
+        proof.steps
+    );
+    match ay_proof::check_proof_strict(proof, &exec.ctx.terms) {
+        Ok(quality) => assert_eq!(quality.trust_count, 0, "strict: zero trust steps"),
+        Err(e) => panic!("str.len length refutation must pass strict check, got {e:?}"),
+    }
+    assert!(
+        text.contains(":rule string_length_lemma"),
+        "expected the certified length lemma; got:\n{text}"
+    );
+    assert!(
+        exec.unsat_proof_self_certified(),
+        "the str.len length refutation must now self-certify"
+    );
+}
+
+#[test]
+fn qf_slia_consistent_str_len_stays_sat() {
+    // Soundness twin: promoting the injected length axioms must never
+    // manufacture a wrong UNSAT. len(a)=2, len(b)=3, len(a ++ b)=5 is
+    // SATISFIABLE (2 + 3 = 5), and must stay SAT.
+    let input = r#"
+        (set-logic QF_SLIA)
+        (declare-const a String)
+        (declare-const b String)
+        (assert (= (str.len a) 2))
+        (assert (= (str.len b) 3))
+        (assert (= (str.len (str.++ a b)) 5))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    assert_eq!(
+        exec.execute_all(&commands).unwrap(),
+        vec!["sat"],
+        "a consistent length constraint must stay SAT"
+    );
+}
+
+#[test]
 fn qf_ax_store_flat_refutation_self_certifies_from_authored_assertions() {
     // The QF_AX `storecomm_*_sf_*` family, verbatim in shape: two store chains
     // build the same array by permuted writes at pairwise-distinct indices, and
@@ -2716,7 +2870,9 @@ fn ext_axiom_fixture() -> (Executor, Proof, TermId, TermId, TermId) {
     let array_sort = Sort::array(Sort::Int, Sort::Int);
     let a = exec.ctx.terms.mk_var("ext_a", array_sort.clone());
     let b = exec.ctx.terms.mk_var("ext_b", array_sort);
-    let k = exec.ctx.terms.mk_var("__ext_diff_1_2", Sort::Int);
+    let k =
+        array_extensionality_witness(&mut exec.ctx.terms, &mut exec.array_ext_witness_cache, a, b)
+            .expect("fixture must mint an active witness");
     let eq_ab = exec.ctx.terms.mk_eq(a, b);
     let not_eq_ab = exec.ctx.terms.mk_not(eq_ab);
     let sel_a = exec.ctx.terms.mk_select(a, k);
@@ -2724,6 +2880,15 @@ fn ext_axiom_fixture() -> (Executor, Proof, TermId, TermId, TermId) {
     let sel_eq = exec.ctx.terms.mk_eq(sel_a, sel_b);
     let not_sel_eq = exec.ctx.terms.mk_not(sel_eq);
     let ext_axiom = exec.ctx.terms.mk_or(vec![eq_ab, not_sel_eq]);
+    assert!(exec.array_ext_witness_cache.record_generated_clause(
+        &exec.ctx.terms,
+        ext_axiom,
+        vec![ArrayExtWitnessBinding {
+            witness: k,
+            array_a: a,
+            array_b: b,
+        }],
+    ));
 
     // The problem asserted the disequality; the extensionality axiom is the
     // SOLVER's own injection, appended AFTER the problem's parsed prefix (the
@@ -2789,8 +2954,152 @@ fn injected_extensionality_axiom_is_promoted_with_a_witness_introduction() {
 }
 
 #[test]
+fn injected_deep_extensionality_axiom_promotes_every_witness_link() {
+    let mut exec = Executor::new();
+    let inner_sort = Sort::array(Sort::Int, Sort::Int);
+    let outer_sort = Sort::array(Sort::Int, inner_sort.clone());
+    let a = exec.ctx.terms.mk_var("deep_ext_a", outer_sort.clone());
+    let b = exec.ctx.terms.mk_var("deep_ext_b", outer_sort);
+    let k0 = deep_array_extensionality_witness(
+        &mut exec.ctx.terms,
+        &mut exec.array_ext_witness_cache,
+        a,
+        b,
+        0,
+        Sort::Int,
+    )
+    .expect("outer deep witness");
+    let a1 = exec.ctx.terms.mk_select(a, k0);
+    let b1 = exec.ctx.terms.mk_select(b, k0);
+    let k1 = deep_array_extensionality_witness(
+        &mut exec.ctx.terms,
+        &mut exec.array_ext_witness_cache,
+        a,
+        b,
+        1,
+        Sort::Int,
+    )
+    .expect("inner deep witness");
+    let a2 = exec.ctx.terms.mk_select(a1, k1);
+    let b2 = exec.ctx.terms.mk_select(b1, k1);
+    let eq_ab = exec.ctx.terms.mk_eq(a, b);
+    let not_eq_ab = exec.ctx.terms.mk_not(eq_ab);
+    let leaf_eq = exec.ctx.terms.mk_eq(a2, b2);
+    let not_leaf_eq = exec.ctx.terms.mk_not(leaf_eq);
+    let ext_axiom = exec.ctx.terms.mk_or(vec![eq_ab, not_leaf_eq]);
+    assert!(exec.array_ext_witness_cache.record_generated_clause(
+        &exec.ctx.terms,
+        ext_axiom,
+        vec![
+            ArrayExtWitnessBinding {
+                witness: k0,
+                array_a: a,
+                array_b: b,
+            },
+            ArrayExtWitnessBinding {
+                witness: k1,
+                array_a: a1,
+                array_b: b1,
+            },
+        ],
+    ));
+    exec.ctx
+        .add_assertion_with_parsed(not_eq_ab, parsed_placeholder());
+    exec.ctx.assertions.push(ext_axiom);
+
+    let mut proof = Proof::new();
+    proof.add_assume(not_eq_ab, None);
+    proof.add_theory_lemma("array", vec![ext_axiom]);
+    exec.promote_array_extensionality_axioms(&mut proof);
+
+    let intros: Vec<Vec<TermId>> = proof
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            ProofStep::Step {
+                rule: AletheRule::ArrayExtDiffIntro,
+                args,
+                ..
+            } => Some(args.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(intros, vec![vec![k0, a, b], vec![k1, a1, b1]]);
+    assert!(proof.steps.iter().any(|step| matches!(
+        step,
+        ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::ArrayExtensionality,
+            ..
+        }
+    )));
+    assert!(
+        exec.unsat_proof_extensionality_certified(&proof),
+        "the whole deep witness chain must pass strict provenance validation"
+    );
+}
+
+#[test]
+fn injected_deep_extensionality_axiom_never_partially_promotes() {
+    let mut exec = Executor::new();
+    let inner_sort = Sort::array(Sort::Int, Sort::Int);
+    let outer_sort = Sort::array(Sort::Int, inner_sort);
+    let a = exec.ctx.terms.mk_var("partial_ext_a", outer_sort.clone());
+    let b = exec.ctx.terms.mk_var("partial_ext_b", outer_sort);
+    let k0 = deep_array_extensionality_witness(
+        &mut exec.ctx.terms,
+        &mut exec.array_ext_witness_cache,
+        a,
+        b,
+        0,
+        Sort::Int,
+    )
+    .expect("outer deep witness");
+    let a1 = exec.ctx.terms.mk_select(a, k0);
+    let b1 = exec.ctx.terms.mk_select(b, k0);
+    let k1 = deep_array_extensionality_witness(
+        &mut exec.ctx.terms,
+        &mut exec.array_ext_witness_cache,
+        a,
+        b,
+        1,
+        Sort::Int,
+    )
+    .expect("inner deep witness");
+    let a2 = exec.ctx.terms.mk_select(a1, k1);
+    let b2 = exec.ctx.terms.mk_select(b1, k1);
+    let eq_ab = exec.ctx.terms.mk_eq(a, b);
+    let leaf_eq = exec.ctx.terms.mk_eq(a2, b2);
+    let not_leaf_eq = exec.ctx.terms.mk_not(leaf_eq);
+    let ext_axiom = exec.ctx.terms.mk_or(vec![eq_ab, not_leaf_eq]);
+    assert!(exec.array_ext_witness_cache.record_generated_clause(
+        &exec.ctx.terms,
+        ext_axiom,
+        vec![ArrayExtWitnessBinding {
+            witness: k0,
+            array_a: a,
+            array_b: b,
+        }],
+    ));
+
+    let mut proof = Proof::new();
+    proof.add_theory_lemma("array", vec![ext_axiom]);
+    exec.promote_array_extensionality_axioms(&mut proof);
+    assert!(proof.steps.iter().all(|step| !matches!(
+        step,
+        ProofStep::Step {
+            rule: AletheRule::ArrayExtDiffIntro,
+            ..
+        }
+    )));
+    assert!(matches!(
+        proof.steps.as_slice(),
+        [ProofStep::TheoryLemma { kind, .. }] if kind.is_trust()
+    ));
+}
+
+#[test]
 fn promoted_extensionality_is_rejected_when_the_witness_is_not_fresh() {
-    // SOUNDNESS CRUX. The problem itself constrains `__ext_diff_1_2`, so the
+    // SOUNDNESS CRUX. The problem itself constrains `__ay_ext_diff_1_2`, so the
     // clause is no longer a conservative extension and the gate must refuse it
     // even though the promotion produced a perfectly-shaped introduction.
     let (mut exec, mut proof, _a, _b, k) = ext_axiom_fixture();
@@ -2907,6 +3216,15 @@ fn one_witness_shared_by_two_array_pairs_is_never_promoted() {
     let sel_eq = exec.ctx.terms.mk_eq(sel_a, sel_c);
     let not_sel_eq = exec.ctx.terms.mk_not(sel_eq);
     let second_axiom = exec.ctx.terms.mk_or(vec![eq_ac, not_sel_eq]);
+    assert!(exec.array_ext_witness_cache.record_generated_clause(
+        &exec.ctx.terms,
+        second_axiom,
+        vec![ArrayExtWitnessBinding {
+            witness: k,
+            array_a: a,
+            array_b: c,
+        }],
+    ));
     exec.ctx.assertions.push(second_axiom);
     proof.add_theory_lemma("array", vec![second_axiom]);
 

@@ -453,7 +453,7 @@ impl Executor {
         // authored Assumes.
         if self.produce_proofs_enabled() {
             let authored_assertions = self.ctx.assertions.clone();
-            self.install_quantifier_proof_source_provenance(&authored_assertions);
+            self.install_proof_source_provenance(&authored_assertions);
         }
 
         // (#choose-synth-watermark) Fix the ORIGINAL-problem term boundary before

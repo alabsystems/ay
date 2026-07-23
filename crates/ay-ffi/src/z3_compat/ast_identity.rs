@@ -71,14 +71,15 @@ pub unsafe extern "C" fn Z3_get_ast_hash(_c: Z3_context, a: Z3_ast) -> c_uint {
 
 /// Convert a func_decl to an AST (Z3's `Z3_func_decl_to_ast`).
 ///
-/// Returns a value-canonical tagged handle (`FUNC_DECL_AST_TAG | idx`, interned
-/// on the declaration's semantic identity): two handles for the same
-/// name/domain/range/params/dt-op mint the SAME ast, so `Z3_is_eq_ast` /
-/// `Z3_get_ast_id` / hashing behave like z3's hash-consed decl asts.
+/// Returns a value-canonical, context-salted tagged handle, interned on the
+/// declaration's semantic identity: two handles for the same
+/// name/domain/range/params/dt-op in one context mint the SAME ast, so
+/// `Z3_is_eq_ast` / `Z3_get_ast_id` / hashing behave like z3's hash-consed decl
+/// asts.
 /// `Z3_to_func_decl` round-trips to the canonical `Z3_func_decl`. The tag
 /// keeps the handle disjoint from every term; leaking it into a term-consuming
-/// entry point fails closed via the `ast_to_term` poison guard. A null decl
-/// returns the null AST (`0`).
+/// entry point fails closed via authenticated term-handle decoding. A null decl
+/// returns the null AST (`0`), as does a declaration owned by another context.
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `d`, when non-null, a valid func_decl
@@ -91,7 +92,20 @@ pub unsafe extern "C" fn Z3_func_decl_to_ast(c: Z3_context, d: Z3_func_decl) -> 
     // SAFETY: `c` is the caller-supplied context pointer; `ffi_guard_ast`
     // handles the null case and catches panics. `d` is null-checked above and
     // owned by the context arena per the safety contract.
-    unsafe { super::ffi_guard_ast(c, |ctx| super::func_decl_handle_to_ast(ctx, d)) }
+    unsafe {
+        super::ffi_guard_ast(c, |ctx| {
+            if !ctx.func_decl_cache.contains(&d) {
+                ctx.last_error = super::Z3_INVALID_ARG;
+                ctx.error_msg = Some(
+                    "Z3_func_decl_to_ast: declaration handle belongs to a different context"
+                        .to_string(),
+                );
+                return 0;
+            }
+            ctx.last_error = super::Z3_OK;
+            super::func_decl_handle_to_ast(ctx, d)
+        })
+    }
 }
 
 /// Check if two func_decl handles are equal (pointer equality).

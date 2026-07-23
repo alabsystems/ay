@@ -9,6 +9,7 @@
 
 use crate::api::proofs::strict_verdict_from_result;
 use crate::api::*;
+use ay_core::{AletheRule, ProofStep, Symbol, TheoryLemmaKind};
 
 /// pure Boolean contradiction: p AND NOT p.
 /// The proof should be trust-free and restricted-rule-subset.
@@ -137,6 +138,324 @@ fn bundle_export_roundtrip_offline_recheck_lia() {
         "proof assume axioms must match the bundle obligation assertions \
          (assume={assume_set:?}, obligation={oblig_set:?})"
     );
+}
+
+#[test]
+fn assuming_unsat_artifact_and_bundle_use_the_complete_authored_scope() {
+    #[allow(deprecated)]
+    let mut solver = Solver::new(Logic::QfUf);
+    solver.set_produce_proofs(true);
+
+    let p = solver.declare_const("assuming_bundle_p", Sort::Bool);
+    let not_p = solver.not(p);
+    solver.assert_term(p);
+    assert!(solver.check_sat_assuming(&[not_p]).is_unsat());
+
+    let strict = solver
+        .last_strict_proof_quality()
+        .expect("proof must be available")
+        .expect("the temporary authored assumption must be in strict scope");
+    assert!(strict.is_complete());
+
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("artifact must be present after assumption-based UNSAT");
+    assert!(matches!(
+        artifact.strict_verdict,
+        StrictProofVerdict::Verified(ref quality) if quality.is_complete()
+    ));
+
+    let bundle = solver
+        .export_last_unsat_bundle()
+        .expect("bundle must be present after assumption-based UNSAT");
+    assert!(bundle.obligation_assertions.contains(&p.0));
+    assert!(bundle.obligation_assertions.contains(&not_p.0));
+    let recheck = re_check_bundle_strict(&bundle)
+        .expect("offline checking must authenticate the temporary assumption");
+    assert!(recheck.quality.is_complete());
+
+    use std::collections::BTreeSet;
+    let assume_set: BTreeSet<u32> = recheck.assume_terms.iter().map(|term| term.0).collect();
+    let obligation_set: BTreeSet<u32> = bundle
+        .obligation_assertions
+        .iter()
+        .map(|term| term.0)
+        .collect();
+    assert_eq!(assume_set, obligation_set);
+}
+
+#[test]
+fn assuming_rounding_mode_domain_axioms_remain_certified() {
+    #[allow(deprecated)]
+    let mut solver = Solver::new(Logic::All);
+    solver.set_produce_proofs(true);
+
+    let rm_sort = Sort::Uninterpreted("RoundingMode".to_string());
+    let modes: Vec<Term> = (0..6)
+        .map(|index| solver.declare_const(&format!("proof_rm_{index}"), rm_sort.clone()))
+        .collect();
+    let six_distinct = solver.distinct(&modes);
+    assert!(solver.check_sat_assuming(&[six_distinct]).is_unsat());
+
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("RM assumption proof must be available");
+    assert!(
+        matches!(artifact.strict_verdict, StrictProofVerdict::Verified(ref quality)
+            if quality.is_complete()),
+        "generated RM domain coverage must remain a certified lemma: {:?}",
+        artifact.strict_verdict
+    );
+
+    let bundle = solver
+        .export_last_unsat_bundle()
+        .expect("RM assumption bundle must be available");
+    let recheck = re_check_bundle_strict(&bundle)
+        .expect("offline checking must accept certified RM coverage");
+    assert!(recheck.quality.is_complete());
+    assert_eq!(bundle.obligation_assertions, vec![six_distinct.0]);
+    assert_eq!(recheck.assume_terms, vec![six_distinct.0]);
+}
+
+/// A datatype-valued store disequality must be discharged through a
+/// provenance-bound array-extensionality schema and remain independently
+/// checkable after export.
+/// Storing the value already present at an index leaves the array unchanged, so
+/// the asserted disequality is UNSAT. The equality is built as a raw core term
+/// because the public frontend correctly simplifies this identity eagerly;
+/// this regression targets the late executor lane used by internally generated
+/// array terms after frontend elaboration.
+#[test]
+fn bundle_export_rechecks_datatype_array_extensionality() {
+    #[allow(deprecated)]
+    let mut solver = Solver::new(Logic::All);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-datatype D ((left) (right)))
+            (declare-const base (Array Int D))
+            (declare-const i Int)
+            "#,
+        )
+        .expect("datatype-array declarations must parse");
+
+    let base = solver
+        .executor
+        .context()
+        .symbol_info_by_identity("base")
+        .and_then(|info| info.term)
+        .expect("base must be declared");
+    let index = solver
+        .executor
+        .context()
+        .symbol_info_by_identity("i")
+        .and_then(|info| info.term)
+        .expect("index must be declared");
+    let left = solver
+        .executor
+        .context()
+        .symbol_info_by_identity("left")
+        .and_then(|info| info.term)
+        .expect("left constructor must have a term");
+    let terms = &mut solver.executor.context_mut().terms;
+    let array_sort = terms.sort(base).clone();
+    let element_sort = terms.sort(left).clone();
+    let selected = terms.mk_app(Symbol::named("select"), vec![base, index], element_sort);
+    let selected_is_left = terms.mk_app(Symbol::named("="), vec![selected, left], Sort::Bool);
+    let stored = terms.mk_app(Symbol::named("store"), vec![base, index, left], array_sort);
+    let arrays_equal = terms.mk_app(Symbol::named("="), vec![stored, base], Sort::Bool);
+    let arrays_disequal = terms.mk_not(arrays_equal);
+    solver.assert_term(Term(selected_is_left));
+    solver.assert_term(Term(arrays_disequal));
+
+    assert!(
+        solver.check_sat().is_unsat(),
+        "storing the existing cell value cannot change an array"
+    );
+    let proof = solver
+        .executor
+        .last_proof()
+        .expect("proof must be present after UNSAT");
+    let terms = solver.executor.terms();
+    let introductions: Vec<(TermId, TermId, TermId)> = proof
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            ProofStep::Step {
+                rule: AletheRule::ArrayExtDiffIntro,
+                clause,
+                premises,
+                args,
+            } if clause.is_empty() && premises.is_empty() => match args.as_slice() {
+                [witness, array_a, array_b] => Some((*witness, *array_a, *array_b)),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let certified_extensionality_is_present = proof.steps.iter().any(|step| {
+        let ProofStep::TheoryLemma {
+            clause,
+            kind: TheoryLemmaKind::ArrayExtensionality,
+            ..
+        } = step
+        else {
+            return false;
+        };
+        let raw_is_bound = ay_proof::recognize_array_extensionality_chain(terms, clause)
+            .is_some_and(|bindings| {
+                bindings.iter().all(|&(array_a, array_b, witness)| {
+                    introductions
+                        .iter()
+                        .any(|&(introduced_witness, introduced_a, introduced_b)| {
+                            witness == introduced_witness
+                                && ((array_a == introduced_a && array_b == introduced_b)
+                                    || (array_a == introduced_b && array_b == introduced_a))
+                        })
+                })
+            });
+        raw_is_bound
+            || introductions.iter().any(|&(witness, array_a, array_b)| {
+                ay_proof::recognize_folded_array_extensionality(
+                    terms, clause, array_a, array_b, witness,
+                )
+            })
+    });
+    let extensionality_debug: Vec<_> = proof
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            ProofStep::TheoryLemma {
+                clause,
+                kind: TheoryLemmaKind::ArrayExtensionality,
+                ..
+            } => Some((
+                clause
+                    .iter()
+                    .map(|&term| render_term_canonical(terms, term))
+                    .collect::<Vec<_>>(),
+                ay_proof::recognize_array_extensionality_chain(terms, clause),
+                introductions
+                    .iter()
+                    .map(|&(witness, array_a, array_b)| {
+                        ay_proof::recognize_folded_array_extensionality(
+                            terms, clause, array_a, array_b, witness,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            _ => None,
+        })
+        .collect();
+    let assume_debug: Vec<_> = proof
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            ProofStep::Assume(term) => Some(render_term_canonical(terms, *term)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        certified_extensionality_is_present,
+        "the exported proof must contain a provenance-bound \
+         array-extensionality lemma; extensionality={extensionality_debug:#?}; \
+         introductions={introductions:#?}; assumes={assume_debug:#?}",
+    );
+
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("artifact must be present after UNSAT");
+    assert!(
+        matches!(&artifact.strict_verdict, StrictProofVerdict::Verified(quality)
+            if quality.is_complete()),
+        "array-extensionality proof must be strict-verified: {:?}\n{}",
+        artifact.strict_verdict,
+        artifact.alethe,
+    );
+
+    let bundle = solver
+        .export_last_unsat_bundle()
+        .expect("bundle must be present after UNSAT");
+    let json = serde_json::to_string(&bundle).expect("bundle serializes to JSON");
+    let restored: SerializableProofBundle =
+        serde_json::from_str(&json).expect("bundle deserializes from JSON");
+    let recheck = re_check_bundle_strict(&restored)
+        .expect("offline strict re-check must accept array extensionality");
+    assert!(
+        recheck.quality.is_complete(),
+        "offline array-extensionality proof must be trust/hole-free: {}",
+        recheck.quality,
+    );
+    use std::collections::BTreeSet;
+    let assume_set: BTreeSet<u32> = recheck.assume_terms.iter().map(|term| term.0).collect();
+    let obligation_set: BTreeSet<u32> = restored
+        .obligation_assertions
+        .iter()
+        .map(|term| term.0)
+        .collect();
+    assert_eq!(
+        assume_set, obligation_set,
+        "offline proof assumptions must equal the serialized obligation"
+    );
+}
+
+/// Datatype declarations are part of the serialized proof obligation. Without
+/// them an offline checker cannot distinguish a valid constructor-disjointness
+/// lemma from the same syntactic clause over unrelated uninterpreted symbols.
+#[test]
+fn bundle_export_rechecks_datatype_declaration_context() {
+    #[allow(deprecated)]
+    let mut solver = Solver::new(Logic::All);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-datatype D ((left) (right)))
+            (declare-const value D)
+            (assert (= value left))
+            (assert (= value right))
+            "#,
+        )
+        .expect("datatype disjointness fixture must parse");
+
+    assert!(solver.check_sat().is_unsat());
+    let proof = solver
+        .executor
+        .last_proof()
+        .expect("proof must be present after UNSAT");
+    assert!(
+        proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::DatatypeDistinct,
+                ..
+            }
+        )),
+        "fixture must exercise strict datatype constructor disjointness"
+    );
+    let strict = solver
+        .last_strict_proof_quality()
+        .expect("strict verdict must be available")
+        .expect("live strict check must receive datatype declarations");
+    assert!(strict.is_complete());
+
+    let bundle = solver
+        .export_last_unsat_bundle()
+        .expect("bundle must be present after UNSAT");
+    assert_eq!(
+        bundle.datatype_declarations,
+        vec![(
+            "D".to_string(),
+            vec!["left".to_string(), "right".to_string()]
+        )]
+    );
+    let json = serde_json::to_string(&bundle).expect("bundle serializes to JSON");
+    let restored: SerializableProofBundle =
+        serde_json::from_str(&json).expect("bundle deserializes from JSON");
+    let recheck = re_check_bundle_strict(&restored)
+        .expect("offline strict re-check must use serialized datatype declarations");
+    assert!(recheck.quality.is_complete());
 }
 
 /// Simple QF_UF contradiction: a=b, b=c, NOT(a=c).
@@ -427,6 +746,64 @@ fn conjunctive_lia_unsat_proof_is_strict_verified() {
         artifact.quality,
         artifact.alethe,
     );
+}
+
+/// Comparison normalization must not become proof authority. The solver may
+/// internally rewrite `>=`/`>` into swapped `<=`/`<` terms, but a rebuilt
+/// complementary-literal refutation must still assume the exact authored
+/// conjunction and remain offline-checkable against that obligation.
+#[test]
+fn normalized_complementary_conjunction_uses_authored_bundle_premise() {
+    #[allow(deprecated)]
+    let mut solver = Solver::new(Logic::QfLia);
+    solver.set_produce_proofs(true);
+    solver
+        .parse_smtlib2(
+            r#"
+            (declare-const x Int)
+            (assert (and (>= x 0) (not (> x 10)) (> x 10)))
+            "#,
+        )
+        .expect("comparison-normalization fixture must parse");
+
+    assert!(solver.check_sat().is_unsat());
+    let authored = solver.executor.proof_original_problem_assertions();
+    assert_eq!(authored.len(), 1, "fixture has one authored assertion");
+
+    let proof = solver
+        .last_proof()
+        .expect("proof must be present after UNSAT");
+    let assumed: Vec<_> = proof
+        .steps
+        .iter()
+        .filter_map(|step| match step {
+            ProofStep::Assume(term) => Some(*term),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        assumed, authored,
+        "the refutation must assume the authored conjunction, not its normalized derivative"
+    );
+
+    let artifact = solver
+        .export_last_unsat_artifact()
+        .expect("artifact must be present after UNSAT");
+    assert!(
+        matches!(
+            artifact.strict_verdict,
+            StrictProofVerdict::Verified(ref quality) if quality.is_complete()
+        ),
+        "authored-root refutation must pass strict checking: {:?}",
+        artifact.strict_verdict
+    );
+
+    let bundle = solver
+        .export_last_unsat_bundle()
+        .expect("bundle must be present after UNSAT");
+    let recheck = re_check_bundle_strict(&bundle)
+        .expect("offline checking must authenticate the authored conjunction");
+    assert_eq!(recheck.assume_terms, authored);
 }
 
 /// Regression (#trust slice-bounds gap, second export hole): preprocessing

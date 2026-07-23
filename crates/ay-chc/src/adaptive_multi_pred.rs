@@ -483,8 +483,20 @@ impl AdaptivePortfolio {
                                 query_count
                             );
                         }
+                        // Ship the HONEST empty certificate, not the
+                        // back-translated model we just found does not
+                        // per-rule validate (its inlined-predicate
+                        // interpretations are unreconstructable — the
+                        // witness-completeness gap noted above). The proof is
+                        // the query-only exhaustive discharge, so mirror the
+                        // ScalarAcyclicBmcExhaustive contract: an empty model
+                        // routes the downstream discharge gate to the acyclic
+                        // BMC re-validation (complete for this acyclic
+                        // scalar/BV/finite-DT DAG) instead of re-checking a
+                        // known-incomplete invariant and spuriously demoting a
+                        // genuinely-proved Safe to unknown.
                         return Some((
-                            PortfolioResult::Safe(translated_model),
+                            PortfolioResult::Safe(InvariantModel::default()),
                             ValidationEvidence::CheckedQueryOnlyDischarge { query_count },
                         ));
                     }

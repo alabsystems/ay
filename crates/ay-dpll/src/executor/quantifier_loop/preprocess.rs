@@ -541,14 +541,14 @@ pub(super) fn collect_entailed_foralls(
 }
 
 impl Executor {
-    /// Freeze the immutable user-assertion scope before quantifier
-    /// preprocessing creates solver-visible replacements.
+    /// Freeze the immutable user-assertion scope before preprocessing creates
+    /// solver-visible replacements or theory axioms.
     ///
     /// With this provenance active, proof bootstrap may still *see* temporary
     /// assertions, but they are not authorized as problem Assumes. A producer
     /// must derive them from these original roots (as the certified
     /// single-forall Skolem lane below does) or proof export fails closed.
-    pub(super) fn install_quantifier_proof_source_provenance(
+    pub(in crate::executor) fn install_proof_source_provenance(
         &mut self,
         original_assertions: &[TermId],
     ) {

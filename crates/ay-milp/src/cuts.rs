@@ -671,6 +671,71 @@ mod modk_tests {
     }
 }
 
+/// Whether `separate_cover_view` reduces its greedy cover to a MINIMAL cover
+/// before lifting. DEFAULT-OFF: the reduction is sound and produces a stronger
+/// (facet-candidate) cut, but measured across the home corpus it moved no node
+/// count down and regressed gen/qiu — a deeper cut is not a better branch on
+/// these instances. `AY_MILP_COVER_MINIMAL=1` opts in; the default is
+/// byte-identical to the pre-reduction separator.
+fn cover_minimal_enabled() -> bool {
+    std::env::var_os("AY_MILP_COVER_MINIMAL").is_some_and(|v| v != "0")
+}
+
+/// Reduce `cover` (indices into `items`, whose `.1` is the exact-representable
+/// knapsack weight `a'_j`) to a MINIMAL cover against capacity `exact_rhs`, in
+/// exact arithmetic. Drops the LEAST-violating members first — largest `1 − v_j`,
+/// `items[i].3` being `v_j` — so the deepest, most-fractional core survives, and
+/// only while the remainder is STILL a cover (`Σ_{C'} a' > b'`); never below two
+/// members. Returns the kept item indices (a subset of `cover`, order preserved).
+///
+/// SOUNDNESS: every returned set `C'` satisfies `Σ_{C'} a' > b'` by construction —
+/// the subtraction guard is checked in `BigRational` before each drop — so the
+/// cover inequality `Σ_{C'} y_j ≤ |C'| − 1` it feeds is valid, exactly as the
+/// full cover's was. Pure and deterministic; guarded directly by
+/// `minimal_cover_stays_a_cover_and_keeps_every_point`.
+fn minimal_cover(
+    cover: &[usize],
+    items: &[(u32, f64, bool, f64)],
+    exact_rhs: &BigRational,
+) -> Vec<usize> {
+    // Exact weight of every member; bail to the input unchanged if any is not
+    // exactly representable (the caller has already proven the whole set a cover).
+    let mut w: Vec<BigRational> = Vec::with_capacity(cover.len());
+    for &i in cover {
+        match exact(items[i].1) {
+            Some(a) => w.push(a),
+            None => return cover.to_vec(),
+        }
+    }
+    let mut running: BigRational = w.iter().fold(BigRational::zero(), |acc, a| acc + a);
+    // Least-violating first: those members buy the least violation, so dropping
+    // them keeps the deepest cut.
+    let mut drop_order: Vec<usize> = (0..cover.len()).collect();
+    drop_order.sort_by(|&p, &q| {
+        (1.0 - items[cover[q]].3)
+            .partial_cmp(&(1.0 - items[cover[p]].3))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut keep = vec![true; cover.len()];
+    let mut kept = cover.len();
+    for pos in drop_order {
+        if kept <= 2 {
+            break; // never fall below a 2-item cover
+        }
+        let reduced = &running - &w[pos];
+        if reduced > *exact_rhs {
+            running = reduced;
+            keep[pos] = false;
+            kept -= 1;
+        }
+    }
+    cover
+        .iter()
+        .zip(&keep)
+        .filter_map(|(&i, &k)| k.then_some(i))
+        .collect()
+}
+
 /// Cover + sequential-lifting separation for ONE knapsack view `Σ a·x <= ub`
 /// (the body previously inlined in `separate`; negative coefficients are
 /// complemented into a true knapsack below, exactly as before).
@@ -819,6 +884,36 @@ fn separate_cover_view(
         return; // not a cover under exact arithmetic: drop it
     }
 
+    // MINIMAL-COVER REDUCTION — sound, textbook-stronger, and DEFAULT-OFF because
+    // it does not pay on this corpus (see `cover_minimal_enabled`). The greedy
+    // above adds items in increasing (1−v) order and stops the instant the running
+    // weight tips over `b'`, but a lighter, more-fractional member added earlier
+    // can be REDUNDANT: the rest of the cover already exceeds `b'` without it. A
+    // non-minimal cover is dominated — its base inequality `Σ_C y ≤ |C|−1` is less
+    // violated (violation is `1 − Σ_C(1−v)`, every extra member only adds to that
+    // sum) and its sequential lifting is weaker (a bigger `|C|` is a looser bound
+    // for every `alpha`). `minimal_cover` drops redundant members while the
+    // remainder stays a cover in EXACT arithmetic. Removing member `i` lowers
+    // `Σ(1−v)` by `1−v_i ≥ 0`, so the reduced cover is at-least-as-violated, and
+    // `Σ_{C'} a > b'` is re-checked exactly at every drop, so it stays a genuine
+    // cover. SOUND either way: it only shrinks the set a valid cut is written over.
+    //
+    // MEASURED default-off. Enabling it is byte-changing but NOT a win: on the home
+    // corpus it left every proof intact (all 268 tests, gt2 21166, misc07 2810,
+    // pk1 11 @ 357,325 nodes byte-identical, mas76 40005.054142) yet moved no node
+    // count down and REGRESSED gen (11 → 43 nodes) and qiu — a deeper cut is not a
+    // better branch. This is the cover family's exhaustion, remeasured with a fresh
+    // independent lever; the strengthening is kept, tested, and gated for the
+    // instance class where a facet-minimal cover would earn its perturbation.
+    if cover_minimal_enabled() && cover.len() > 2 {
+        let reduced = minimal_cover(&cover, &items, &exact_rhs);
+        if reduced.len() < cover.len() {
+            // `weight`/`slack` and `exact_weight` are not read past this point
+            // (their guards ran above); `cover` is what the lifting reads.
+            cover = reduced;
+        }
+    }
+
     // SEQUENTIAL LIFTING, when the data is small integers (this family's
     // dense rows are): a plain cover talks only about its own members, and
     // on a dense row that leaves most of the columns unconstrained — the
@@ -936,6 +1031,59 @@ fn separate_cover_view(
 mod cover_view_tests {
     use super::*;
     use crate::model::Sense;
+    use ay_test_support::env::{lock_env, ScopedEnvVar};
+
+    #[test]
+    fn enabled_minimal_cover_reaches_separator_and_keeps_every_integer_point() {
+        let _env_lock = lock_env();
+        let mut model = Model::new();
+        let cols: Vec<Col> = (0..3).map(|_| model.add_binary_col()).collect();
+        let coeffs = [(cols[0].0, 4.0), (cols[1].0, 6.0), (cols[2].0, 6.0)];
+        model.add_row(
+            f64::NEG_INFINITY,
+            10.0,
+            &[(cols[0], 4.0), (cols[1], 6.0), (cols[2], 6.0)],
+        );
+        let lp_point = [0.99, 0.98, 0.97];
+
+        let mut unreduced = Vec::new();
+        {
+            let _disabled = ScopedEnvVar::unset("AY_MILP_COVER_MINIMAL");
+            separate_cover_view(&model, &lp_point, &coeffs, 10.0, &mut unreduced);
+        }
+        let mut reduced = Vec::new();
+        {
+            let _enabled = ScopedEnvVar::set("AY_MILP_COVER_MINIMAL", "1");
+            separate_cover_view(&model, &lp_point, &coeffs, 10.0, &mut reduced);
+        }
+
+        assert_eq!(unreduced.len(), 1, "the control must emit its full cover");
+        assert_eq!(unreduced[0].coeffs.len(), 3);
+        assert_eq!(unreduced[0].ub, 2.0);
+        assert_eq!(reduced.len(), 1, "the enabled path must still emit a cut");
+        assert_eq!(
+            reduced[0].coeffs,
+            vec![(cols[1], 1.0), (cols[2], 1.0)],
+            "the redundant weight-4 member must be removed before lifting"
+        );
+        assert_eq!(reduced[0].ub, 1.0);
+
+        for mask in 0u8..8 {
+            let point: Vec<f64> = (0..3).map(|bit| f64::from((mask >> bit) & 1)).collect();
+            let model_activity = 4.0 * point[0] + 6.0 * point[1] + 6.0 * point[2];
+            if model_activity <= 10.0 {
+                let cut_activity: f64 = reduced[0]
+                    .coeffs
+                    .iter()
+                    .map(|&(col, a)| a * point[col.index()])
+                    .sum();
+                assert!(
+                    cut_activity <= reduced[0].ub,
+                    "minimal cover deleted feasible point {mask:03b}"
+                );
+            }
+        }
+    }
 
     /// COVER CUTS MUST FIRE ON `>=` ROWS — AND MUST NOT DELETE AN INTEGER POINT.
     ///
@@ -1072,6 +1220,85 @@ mod cover_view_tests {
         assert!(
             fired > 0,
             "the sweep never produced a cut — the guard is not guarding anything"
+        );
+    }
+
+    /// `minimal_cover` must return a set that is STILL a cover (`Σ a' > b'`), must
+    /// never grow it, must stop at two members, and — the property that makes it
+    /// sound — the cover inequality it feeds must keep every integer-feasible
+    /// point. Random small knapsacks, a deliberately NON-minimal greedy cover fed
+    /// in, then the reduced cover's inequality checked against every 0/1 point of
+    /// the knapsack. Also asserts the reduction actually fires (a shrink happens),
+    /// so the guard cannot pass vacuously.
+    #[test]
+    fn minimal_cover_stays_a_cover_and_keeps_every_point() {
+        let mut seed = 0x51ed_c0de_u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) as i64
+        };
+        const N: usize = 10;
+        let mut shrinks = 0usize;
+        for _ in 0..2000 {
+            // A knapsack `Σ a_j y_j <= b`, small integer weights.
+            let a: Vec<f64> = (0..N).map(|_| (1 + rnd() % 12) as f64).collect();
+            let total: f64 = a.iter().sum();
+            if total < 4.0 {
+                continue;
+            }
+            let b = (2 + rnd() % (total as i64 - 2).max(1)) as f64;
+            // `items` in the frame `separate_cover_view` builds: (col, |a|, comp?, v).
+            let v: Vec<f64> = (0..N).map(|_| (rnd() % 101) as f64 / 100.0).collect();
+            let items: Vec<(u32, f64, bool, f64)> =
+                (0..N).map(|j| (j as u32, a[j], false, v[j])).collect();
+            // A greedy cover over ALL items (guaranteed a cover: it is the whole
+            // set whenever total > b), intentionally not minimized.
+            let mut order: Vec<usize> = (0..N).collect();
+            order.sort_by(|&p, &q| {
+                (1.0 - v[p])
+                    .partial_cmp(&(1.0 - v[q]))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut cover = Vec::new();
+            let mut w = 0.0;
+            for &i in &order {
+                if w > b {
+                    break;
+                }
+                cover.push(i);
+                w += a[i];
+            }
+            if w <= b || cover.len() < 3 {
+                continue; // not a (reducible) cover
+            }
+            let exact_rhs = exact(b).unwrap();
+            let reduced = minimal_cover(&cover, &items, &exact_rhs);
+            // Never grows, never drops below two, stays a genuine cover.
+            assert!(reduced.len() <= cover.len());
+            assert!(reduced.len() >= 2);
+            if reduced.len() < cover.len() {
+                shrinks += 1;
+            }
+            let cw: f64 = reduced.iter().map(|&i| a[i]).sum();
+            assert!(cw > b + 1e-9, "reduced set is not a cover: {cw} <= {b}");
+            // The cover inequality `Σ_{C'} y <= |C'| - 1` deletes no feasible point.
+            let rhs = (reduced.len() - 1) as f64;
+            for code in 0..(1u32 << N) {
+                let p: Vec<f64> = (0..N).map(|t| f64::from((code >> t) & 1)).collect();
+                let load: f64 = (0..N).map(|j| a[j] * p[j]).sum();
+                if load > b + 1e-9 {
+                    continue; // infeasible for the knapsack
+                }
+                let act: f64 = reduced.iter().map(|&i| p[i]).sum();
+                assert!(
+                    act <= rhs + 1e-9,
+                    "minimal cover deleted feasible point {code:010b}: {act} > {rhs}"
+                );
+            }
+        }
+        assert!(
+            shrinks > 0,
+            "minimal_cover never shrank a cover — guard is vacuous"
         );
     }
 }

@@ -63,6 +63,29 @@ fn deny_not_in(terms: &mut TermStore, x: TermId, r: TermId) -> TermId {
     in_re(terms, x, r)
 }
 
+/// The clause literal `(not (= x c))` — its falsity is the singleton
+/// hypothesis `x = c`, i.e. `x ∈ {c}`. This is the surface-rewrite form of
+/// `(not (str.in_re x (str.to_re c)))`.
+fn deny_eq(terms: &mut TermStore, x: TermId, c: &str) -> TermId {
+    let konst = terms.mk_string(c.to_string());
+    let e = terms.mk_eq(x, konst);
+    terms.mk_not(e)
+}
+
+/// The argument-reversed surface spelling `(not (= c x))`.
+fn deny_eq_const_left(terms: &mut TermStore, c: &str, x: TermId) -> TermId {
+    let konst = terms.mk_string(c.to_string());
+    let e = terms.mk_app(Symbol::named("="), [konst, x], Sort::Bool);
+    terms.mk_not(e)
+}
+
+/// The clause literal `(= x c)` — its falsity is the hypothesis `x ≠ c`,
+/// i.e. `x ∈ ¬{c}`.
+fn assert_eq_lit(terms: &mut TermStore, x: TermId, c: &str) -> TermId {
+    let konst = terms.mk_string(c.to_string());
+    terms.mk_eq(x, konst)
+}
+
 fn str_var(terms: &mut TermStore, name: &str) -> TermId {
     terms.mk_var(name, Sort::String)
 }
@@ -124,6 +147,92 @@ fn automatark_shape_prefix_vs_constant_is_empty() {
     let l1 = deny_in(&mut terms, x, r1);
     let l2 = deny_in(&mut terms, x, r2);
     assert!(recognize_regex_intersect_empty(&terms, &[l1, l2]));
+}
+
+#[test]
+fn disjoint_string_eq_singletons_intersect_empty() {
+    // Surface-rewrite form of two disjoint singleton memberships:
+    // `(not (= X "abc")) ∨ (not (= X "xyz"))`. X cannot equal two distinct
+    // constants, so `{abc} ∩ {xyz} = ∅` and the clause is a tautology.
+    let mut terms = TermStore::new();
+    let x = str_var(&mut terms, "X");
+    let l1 = deny_eq(&mut terms, x, "abc");
+    let l2 = deny_eq(&mut terms, x, "xyz");
+    assert!(
+        recognize_regex_intersect_empty(&terms, &[l1, l2]),
+        "distinct equality singletons must be recognized as an empty intersection"
+    );
+}
+
+#[test]
+fn reversed_string_eq_singletons_intersect_empty() {
+    // Both argument orders are semantically identical and occur after surface
+    // rewrites. Exercise the constant-left recognizer arm explicitly.
+    let mut terms = TermStore::new();
+    let x = str_var(&mut terms, "X");
+    let l1 = deny_eq_const_left(&mut terms, "abc", x);
+    let l2 = deny_eq(&mut terms, x, "xyz");
+    assert!(recognize_regex_intersect_empty(&terms, &[l1, l2]));
+}
+
+#[test]
+fn nonconstant_string_equalities_are_not_singleton_constraints() {
+    // There is no ground singleton language when both sides vary. Treating
+    // these as singleton memberships could fabricate emptiness, so the
+    // recognizer must leave the shape unsupported.
+    let mut terms = TermStore::new();
+    let x = str_var(&mut terms, "X");
+    let y = str_var(&mut terms, "Y");
+    let z = str_var(&mut terms, "Z");
+    let eq_xy = terms.mk_app(Symbol::named("="), [x, y], Sort::Bool);
+    let eq_xz = terms.mk_app(Symbol::named("="), [x, z], Sort::Bool);
+    let l1 = terms.mk_not(eq_xy);
+    let l2 = terms.mk_not(eq_xz);
+    assert!(!recognize_regex_intersect_empty(&terms, &[l1, l2]));
+}
+
+#[test]
+fn equal_string_eq_singletons_are_not_empty() {
+    // The SAME constant twice: `{abc} ∩ {abc} = {abc} ≠ ∅`. `X = "abc"` is
+    // perfectly satisfiable, so the clause is NOT a tautology and must be
+    // rejected (fail-closed: only genuinely empty intersections pass).
+    let mut terms = TermStore::new();
+    let x = str_var(&mut terms, "X");
+    let l1 = deny_eq(&mut terms, x, "abc");
+    let l2 = deny_eq(&mut terms, x, "abc");
+    assert!(!recognize_regex_intersect_empty(&terms, &[l1, l2]));
+}
+
+#[test]
+fn string_eq_singleton_against_its_complement_is_empty() {
+    // Excluded middle in singleton form: `(not (= X "abc")) ∨ (= X "abc")`
+    // denies `X ∈ {abc}` and `X ∈ ¬{abc}`, whose intersection is empty. This
+    // exercises the `positive == false` (complement) path for the equality form.
+    let mut terms = TermStore::new();
+    let x = str_var(&mut terms, "X");
+    let deny = deny_eq(&mut terms, x, "abc");
+    let assert_pos = assert_eq_lit(&mut terms, x, "abc");
+    assert!(recognize_regex_intersect_empty(&terms, &[deny, assert_pos]));
+}
+
+#[test]
+fn instance13716_mixed_membership_and_eq_singletons_is_empty() {
+    // The exact shape of automatark instance13716 after surface rewrites:
+    // `(not (str.in_re X R0)) ∨ (not (= X c1)) ∨ (not (= X c2)) ∨ (str.in_re X R3)`
+    // with c1 ≠ c2. The two disjoint equality singletons ALONE make the group's
+    // denied intersection empty (R0 and ¬R3 are only weakening), so the whole
+    // clause is a tautology — the case the self-check holdout needs.
+    let mut terms = TermStore::new();
+    let x = str_var(&mut terms, "X");
+    let digit = range(&mut terms, "0", "9");
+    let digit2 = range(&mut terms, "0", "9");
+    let r0 = concat(&mut terms, vec![digit, digit2]);
+    let r3 = to_re(&mut terms, "phone");
+    let l0 = deny_in(&mut terms, x, r0);
+    let l1 = deny_eq(&mut terms, x, "rank");
+    let l2 = deny_eq(&mut terms, x, "user");
+    let l3 = deny_not_in(&mut terms, x, r3);
+    assert!(recognize_regex_intersect_empty(&terms, &[l0, l1, l2, l3]));
 }
 
 #[test]

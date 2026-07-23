@@ -96,6 +96,9 @@ pub(crate) fn prune_to_empty_clause_derivation(proof: &mut Proof) {
     }
 
     if keep.iter().all(|&k| k) {
+        proof
+            .named_steps
+            .retain(|_, id| matches!(proof.steps.get(id.0 as usize), Some(ProofStep::Assume(_))));
         return;
     }
 
@@ -152,5 +155,24 @@ pub(crate) fn prune_to_empty_clause_derivation(proof: &mut Proof) {
         }
     }
 
+    // Named steps are printer metadata for source assumptions.  Pruning must
+    // keep that metadata in lockstep with the positional step ids: retaining a
+    // stale id can make a later proof-rebuild pass abort or print the wrong
+    // assumption.  Drop names for pruned, dangling, or non-assume steps and
+    // remap the surviving assumptions exactly as premises were remapped above.
+    let mut new_named_steps = proof.named_steps.clone();
+    new_named_steps.retain(|_, id| {
+        let old_idx = id.0 as usize;
+        if !matches!(proof.steps.get(old_idx), Some(ProofStep::Assume(_))) {
+            return false;
+        }
+        let Some(&new_idx) = remap.get(&id.0) else {
+            return false;
+        };
+        *id = ProofId(new_idx);
+        true
+    });
+
     proof.steps = new_steps;
+    proof.named_steps = new_named_steps;
 }

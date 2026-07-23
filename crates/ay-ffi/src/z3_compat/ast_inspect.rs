@@ -21,19 +21,19 @@ use num_bigint::BigInt;
 use num_traits::{Signed, Zero};
 
 use super::{
-    ast_to_term, cache_ast_vector, cache_string, ffi_guard_ast, ffi_guard_const_ptr,
+    cache_ast_vector, cache_string, ffi_guard_ast, ffi_guard_const_ptr,
     ffi_guard_const_ptr_keep_error, ffi_guard_ptr, ffi_guard_uint, ffi_guard_uint_keep_error,
-    ffi_guard_void, Z3_ast, Z3_ast_vector, Z3_context, Z3_func_decl, MAX_FFI_CONTAINER_ELEMENTS,
-    MAX_FFI_DECIMAL_PRECISION, Z3_INVALID_ARG, Z3_OP_ABS, Z3_OP_ADD, Z3_OP_AND, Z3_OP_BADD,
-    Z3_OP_BAND, Z3_OP_BASHR, Z3_OP_BLSHR, Z3_OP_BMUL, Z3_OP_BNEG, Z3_OP_BNOT, Z3_OP_BOR,
-    Z3_OP_BSDIV, Z3_OP_BSHL, Z3_OP_BSMOD, Z3_OP_BSREM, Z3_OP_BSUB, Z3_OP_BUDIV, Z3_OP_BUREM,
-    Z3_OP_BXOR, Z3_OP_CONCAT, Z3_OP_CONST_ARRAY, Z3_OP_DISTINCT, Z3_OP_DIV, Z3_OP_EQ,
-    Z3_OP_EXTRACT, Z3_OP_FALSE, Z3_OP_GE, Z3_OP_GT, Z3_OP_IDIV, Z3_OP_IFF, Z3_OP_IMPLIES,
-    Z3_OP_IS_INT, Z3_OP_ITE, Z3_OP_LE, Z3_OP_LT, Z3_OP_MOD, Z3_OP_MUL, Z3_OP_NOT, Z3_OP_OR,
-    Z3_OP_POWER, Z3_OP_REPEAT, Z3_OP_ROTATE_LEFT, Z3_OP_ROTATE_RIGHT, Z3_OP_SELECT, Z3_OP_SGEQ,
-    Z3_OP_SGT, Z3_OP_SIGN_EXT, Z3_OP_SLEQ, Z3_OP_SLT, Z3_OP_STORE, Z3_OP_SUB, Z3_OP_TO_INT,
-    Z3_OP_TO_REAL, Z3_OP_TRUE, Z3_OP_UGEQ, Z3_OP_UGT, Z3_OP_ULEQ, Z3_OP_ULT, Z3_OP_UMINUS,
-    Z3_OP_UNINTERPRETED, Z3_OP_XOR, Z3_OP_ZERO_EXT,
+    ffi_guard_void, require_ast_handle, require_term_ast_or_return, Z3_ast, Z3_ast_vector,
+    Z3_context, Z3_func_decl, MAX_FFI_CONTAINER_ELEMENTS, MAX_FFI_DECIMAL_PRECISION,
+    Z3_INVALID_ARG, Z3_OP_ABS, Z3_OP_ADD, Z3_OP_AND, Z3_OP_BADD, Z3_OP_BAND, Z3_OP_BASHR,
+    Z3_OP_BLSHR, Z3_OP_BMUL, Z3_OP_BNEG, Z3_OP_BNOT, Z3_OP_BOR, Z3_OP_BSDIV, Z3_OP_BSHL,
+    Z3_OP_BSMOD, Z3_OP_BSREM, Z3_OP_BSUB, Z3_OP_BUDIV, Z3_OP_BUREM, Z3_OP_BXOR, Z3_OP_CONCAT,
+    Z3_OP_CONST_ARRAY, Z3_OP_DISTINCT, Z3_OP_DIV, Z3_OP_EQ, Z3_OP_EXTRACT, Z3_OP_FALSE, Z3_OP_GE,
+    Z3_OP_GT, Z3_OP_IDIV, Z3_OP_IFF, Z3_OP_IMPLIES, Z3_OP_IS_INT, Z3_OP_ITE, Z3_OP_LE, Z3_OP_LT,
+    Z3_OP_MOD, Z3_OP_MUL, Z3_OP_NOT, Z3_OP_OR, Z3_OP_POWER, Z3_OP_REPEAT, Z3_OP_ROTATE_LEFT,
+    Z3_OP_ROTATE_RIGHT, Z3_OP_SELECT, Z3_OP_SGEQ, Z3_OP_SGT, Z3_OP_SIGN_EXT, Z3_OP_SLEQ, Z3_OP_SLT,
+    Z3_OP_STORE, Z3_OP_SUB, Z3_OP_TO_INT, Z3_OP_TO_REAL, Z3_OP_TRUE, Z3_OP_UGEQ, Z3_OP_UGT,
+    Z3_OP_ULEQ, Z3_OP_ULT, Z3_OP_UMINUS, Z3_OP_UNINTERPRETED, Z3_OP_XOR, Z3_OP_ZERO_EXT,
 };
 
 // ---- AST string conversion ----
@@ -59,9 +59,18 @@ pub unsafe extern "C" fn Z3_get_numeral_string(c: Z3_context, a: Z3_ast) -> *con
     // `ffi_guard_const_ptr` handles the null case internally and catches any unwinding panic
     // so it cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_const_ptr(c, |ctx| match ctx.solver.numeral_string(ast_to_term(a)) {
-            Some(s) => cache_string(ctx, s),
-            None => ptr::null(),
+        ffi_guard_const_ptr(c, |ctx| {
+            let term = require_term_ast_or_return!(
+                ctx,
+                a,
+                "Z3_get_numeral_string",
+                "numeral",
+                ptr::null()
+            );
+            match ctx.solver.numeral_string(term) {
+                Some(s) => cache_string(ctx, s),
+                None => ptr::null(),
+            }
         })
     }
 }
@@ -89,7 +98,14 @@ pub unsafe extern "C" fn Z3_get_numeral_decimal_string(
     // so it cannot cross the FFI boundary.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
-            match ctx.solver.numeral_string(ast_to_term(a)) {
+            let term = require_term_ast_or_return!(
+                ctx,
+                a,
+                "Z3_get_numeral_decimal_string",
+                "numeral",
+                ptr::null()
+            );
+            match ctx.solver.numeral_string(term) {
                 Some(s) => {
                     // If it's a rational (contains '/'), convert to decimal via scaled BigInt division
                     if let Some((num_s, den_s)) = s.split_once('/') {
@@ -152,20 +168,21 @@ pub unsafe extern "C" fn Z3_ast_to_string(c: Z3_context, a: Z3_ast) -> *const c_
                 return ptr::null();
             }
             // Proof-AST handles (from Z3_solver_get_proof) carry the high-bit
-            // tag and index into the context's stored Alethe proof texts. For
-            // these, Z3_ast_to_string returns the solver's real proof artifact
+            // tag, context salt, and index into the stored Alethe proof texts.
+            // For these, Z3_ast_to_string returns the solver's real proof artifact
             // (#phase3-proof), never the generic `(ast ...)` placeholder.
             if let Some(text) = super::proof_text_for_ast(ctx, a) {
                 return cache_string(ctx, text.to_string());
             }
             // Algebraic-number handles (from Z3_algebraic_root / Z3_algebraic_*
-            // arithmetic) carry the bit-62 tag and index the context's exact
-            // RealScalar store; they are not arena terms, so the formatter
-            // below cannot render them. Print z3's exact `root-obj` form (e.g.
+            // arithmetic) carry the bit-62 tag, context salt, and index into
+            // the context's exact RealScalar store; they are not arena terms,
+            // so the formatter below cannot render them. Print z3's exact
+            // `root-obj` form (e.g.
             // `(root-obj (+ (^ x 2) (- 2)) 2)` for √2) computed from the
             // stored value's defining polynomial — never `(null)` and never a
             // lossy decimal guess.
-            if super::algebraic::is_algebraic_ast(a) {
+            if a & super::HANDLE_TAG_MASK == super::ALGEBRAIC_AST_TAG {
                 if let Some(text) = super::algebraic::ast_as_scalar(ctx, a)
                     .as_ref()
                     .and_then(ay_nra::rcf_api::root_obj_string)
@@ -173,7 +190,10 @@ pub unsafe extern "C" fn Z3_ast_to_string(c: Z3_context, a: Z3_ast) -> *const c_
                     return cache_string(ctx, text);
                 }
                 // Dangling/foreign algebraic index: no rendering (null), the
-                // pre-existing honest failure shape.
+                // honest failure shape.
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg =
+                    Some("Z3_ast_to_string: invalid or foreign algebraic AST handle".to_string());
                 return ptr::null();
             }
             // Sort-AST handles (from Z3_sort_to_ast): render the SMT-LIB sort
@@ -182,7 +202,10 @@ pub unsafe extern "C" fn Z3_ast_to_string(c: Z3_context, a: Z3_ast) -> *const c_
             if a & super::HANDLE_TAG_MASK == super::SORT_AST_TAG {
                 let handle = super::sort_ast_to_handle(ctx, a);
                 if handle.is_null() {
-                    return ptr::null(); // dangling/foreign: honest null
+                    ctx.last_error = Z3_INVALID_ARG;
+                    ctx.error_msg =
+                        Some("Z3_ast_to_string: invalid or foreign sort AST handle".to_string());
+                    return ptr::null();
                 }
                 // SAFETY: non-null handles in `sort_ast_handles` are live
                 // arena allocations owned by this context (enclosing unsafe).
@@ -195,7 +218,11 @@ pub unsafe extern "C" fn Z3_ast_to_string(c: Z3_context, a: Z3_ast) -> *const c_
             if a & super::HANDLE_TAG_MASK == super::FUNC_DECL_AST_TAG {
                 let handle = super::func_decl_ast_to_handle(ctx, a);
                 if handle.is_null() {
-                    return ptr::null(); // dangling/foreign: honest null
+                    ctx.last_error = Z3_INVALID_ARG;
+                    ctx.error_msg = Some(
+                        "Z3_ast_to_string: invalid or foreign func-decl AST handle".to_string(),
+                    );
+                    return ptr::null();
                 }
                 // SAFETY: non-null handles in `decl_ast_handles` are live
                 // arena allocations owned by this context (enclosing unsafe).
@@ -220,7 +247,8 @@ pub unsafe extern "C" fn Z3_ast_to_string(c: Z3_context, a: Z3_ast) -> *const c_
             // formatter (e.g. `(+ x (* 2 y))`), matching z3's `sexpr()` output.
             // A foreign/stale handle yields `None` -> null (the Python layer
             // falls back); it never panics across the FFI boundary.
-            match ctx.solver.format_term_checked(ast_to_term(a)) {
+            let term = require_term_ast_or_return!(ctx, a, "Z3_ast_to_string", "AST", ptr::null());
+            match ctx.solver.format_term_checked(term) {
                 Some(s) => cache_string(ctx, super::ffi_surface_text(ctx, &s)),
                 None => ptr::null(),
             }
@@ -482,10 +510,16 @@ pub unsafe extern "C" fn Z3_ast_vector_get(_c: Z3_context, v: Z3_ast_vector, i: 
     // `ffi_guard_ast` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(_c, |_ctx| {
+        ffi_guard_ast(_c, |ctx| {
             let vec = &(*v).asts;
             match vec.get(i as usize) {
-                Some(&ast) => ast,
+                Some(&0) => 0,
+                Some(&ast) => {
+                    if !require_ast_handle(ctx, ast, "Z3_ast_vector_get", "stored element") {
+                        return 0;
+                    }
+                    ast
+                }
                 None => 0,
             }
         })
@@ -506,7 +540,10 @@ pub unsafe extern "C" fn Z3_ast_vector_push(_c: Z3_context, v: Z3_ast_vector, a:
     // `ffi_guard_void` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_void(_c, |_ctx| {
+        ffi_guard_void(_c, |ctx| {
+            if !require_ast_handle(ctx, a, "Z3_ast_vector_push", "element") {
+                return;
+            }
             (*v).asts.push(a);
         });
     }
@@ -526,7 +563,10 @@ pub unsafe extern "C" fn Z3_ast_vector_set(_c: Z3_context, v: Z3_ast_vector, i: 
     // `ffi_guard_void` handles the null case internally and catches any unwinding panic so it
     // cannot cross the FFI boundary.
     unsafe {
-        ffi_guard_void(_c, |_ctx| {
+        ffi_guard_void(_c, |ctx| {
+            if !require_ast_handle(ctx, a, "Z3_ast_vector_set", "element") {
+                return;
+            }
             let vec = &mut (*v).asts;
             if (i as usize) < vec.len() {
                 vec[i as usize] = a;

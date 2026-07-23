@@ -345,12 +345,13 @@ fn verify_lrat_fixture(dimacs: &str, proof: &str) {
     }
 }
 
-fn repo_root_for_decompose_artifacts() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+fn target_root_for_decompose_artifacts() -> std::path::PathBuf {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
         .expect("crate should live under repo/crates/ay-sat")
-        .to_path_buf()
+        .to_path_buf();
+    ay_test_support::cargo_target_root(&workspace)
 }
 
 fn producer_revision_for_decompose_artifact() -> String {
@@ -720,8 +721,7 @@ fn test_lrat_decompose_equivalence_chain_preflight_exports_checker_sidecar() {
     let replay = render_decompose_lrat_dry_run_replay(sidecar);
     verify_lrat_fixture(&dimacs, &replay);
 
-    let artifact_dir = repo_root_for_decompose_artifacts()
-        .join("target")
+    let artifact_dir = target_root_for_decompose_artifacts()
         .join("sat-preflight-artifacts")
         .join("decompose-9296");
     std::fs::create_dir_all(&artifact_dir).expect("create decompose sidecar artifact dir");

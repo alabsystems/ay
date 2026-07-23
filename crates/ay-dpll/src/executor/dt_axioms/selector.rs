@@ -14,6 +14,7 @@ use ay_core::term::Symbol;
 use ay_core::{Sort, TermData, TermId, TermStore};
 
 use super::SelectorList;
+use crate::executor::theories::{array_extensionality_witness, ArrayExtWitnessBinding};
 use crate::executor::Executor;
 
 /// Warm-start recursive-datatype unroll depth for the eager DT axiom pass.
@@ -45,6 +46,23 @@ type CtorAppInfo = (TermId, Vec<TermId>, SelectorList);
 type CtorBinding = (String, Vec<TermId>, SelectorList);
 /// Constructor args and selectors (for nested resolution)
 type CtorArgsAndSelectors = (Vec<TermId>, SelectorList);
+
+#[derive(Clone, Copy)]
+enum DtSelectFoldMode {
+    /// Keep the existing compact operational form.
+    Operational,
+    /// Retain every McCarthy/array-ITE branch so the strict proof checker can
+    /// independently reconstruct the exact fold from the source array term.
+    ProofShape,
+}
+
+/// Cap the distinct DAG states visited while folding array selects and their
+/// synthesized datatype selector/tester projections. Standalone select folds
+/// apply the cap per call; the datatype-array congruence pass shares one counter
+/// across its complete run so its equality-by-index/field product cannot
+/// multiply the budget. Exhaustion suppresses the unfinished pass emission
+/// rather than retrying with a fresh counter.
+const DT_SELECT_FOLD_WORK_BUDGET: usize = 100_000;
 
 fn mk_eq_same_sort(terms: &mut TermStore, lhs: TermId, rhs: TermId) -> Option<TermId> {
     if terms.sort(lhs) != terms.sort(rhs) {
@@ -1071,6 +1089,7 @@ impl Executor {
                 &datatype_ctors,
                 0,
                 MAX_RECURSIVE_DT_DEPTH,
+                usize::MAX,
                 &mut axioms,
                 &mut seen_pairs,
             );
@@ -1093,10 +1112,11 @@ impl Executor {
         datatype_ctors: &HashMap<String, Vec<String>>,
         depth: usize,
         max_depth: usize,
+        max_axioms: usize,
         axioms: &mut Vec<TermId>,
         seen_pairs: &mut HashSet<(TermId, TermId)>,
     ) {
-        if depth >= max_depth || x == y {
+        if depth >= max_depth || x == y || axioms.len() >= max_axioms {
             return;
         }
         // Canonical (min,max) key so `(x,y)` and `(y,x)` dedup to one
@@ -1206,11 +1226,16 @@ impl Executor {
         let rhs = self.ctx.terms.mk_and(conjuncts);
         // Bool-Bool equality is the biconditional `(= x y) <=> rhs` (#6869).
         let biconditional = self.ctx.terms.mk_eq(eq_xy, rhs);
-        axioms.push(biconditional);
+        if axioms.len() < max_axioms {
+            axioms.push(biconditional);
+        }
 
         // Recurse into datatype-valued fields so nested record/enum structure is
         // also connected. Bounded by `max_depth`; only adds further tautologies.
         for (fi, fj, nested_dt) in nested {
+            if axioms.len() >= max_axioms {
+                break;
+            }
             self.emit_dt_value_eq_congruence(
                 fi,
                 fj,
@@ -1218,6 +1243,7 @@ impl Executor {
                 datatype_ctors,
                 depth + 1,
                 max_depth,
+                max_axioms,
                 axioms,
                 seen_pairs,
             );
@@ -1547,6 +1573,20 @@ impl Executor {
         &mut self,
         base_assertions: &HashSet<TermId>,
     ) -> Vec<TermId> {
+        let mut select_fold_work = 0usize;
+        self.dt_array_equality_read_congruence_axioms_with_fold_work(
+            base_assertions,
+            &mut select_fold_work,
+        )
+    }
+
+    /// Budget-injectable implementation used by the aggregate-work regression.
+    /// Production always enters with zero work through the public wrapper above.
+    fn dt_array_equality_read_congruence_axioms_with_fold_work(
+        &mut self,
+        base_assertions: &HashSet<TermId>,
+        select_fold_work: &mut usize,
+    ) -> Vec<TermId> {
         /// Cap on emitted implications (equalities x observed indices).
         const MAX_READ_CONGRUENCE_AXIOMS: usize = 50_000;
         /// Recursion bound for datatype-valued constructor fields (mirrors the
@@ -1783,6 +1823,9 @@ impl Executor {
         let mut axioms: Vec<TermId> = Vec::new();
         let mut seen_pairs: HashSet<(TermId, TermId)> = HashSet::default();
         'outer: for (eq_term, x, y, idx_key, elem_sort) in eq_atoms {
+            if axioms.len() >= MAX_READ_CONGRUENCE_AXIOMS {
+                break;
+            }
             let Some(indices) = indices_by_sort.get(&idx_key).cloned() else {
                 continue;
             };
@@ -1795,7 +1838,7 @@ impl Executor {
             // constraint, so a finite-cardinality pigeonhole (`distinct A B C` over
             // a 2-inhabitant datatype) or a forced-equal-but-claimed-distinct pair
             // escapes as a false SAT / degrades. Mint ONE FRESH witness `w'` per
-            // equality atom and Skolemize the existential difference:
+            // canonical array pair and Skolemize the existential difference:
             //   `(not (= X Y)) => (not (= (select X w') (select Y w')))`
             // — in any model where X != Y they differ at SOME index, and the fresh
             // `w'` can be set to it, so this is SOUND (a Skolem, never a false
@@ -1804,28 +1847,76 @@ impl Executor {
             // the read pair relays the datatype-value inequality down to a field
             // inequality (`(mk a) != (mk b) <=> a != b`), so the pigeonhole's
             // forced-equal fills contradict the witnessed difference -> UNSAT.
-            if let Sort::Array(arr) = self.ctx.terms.sort(x) {
-                let index_sort = arr.index_sort.clone();
-                let w = self.ctx.terms.mk_fresh_var("dt_diseq_witness", index_sort);
-                let fx = self.dt_fold_select(x, w, &elem_sort, 0);
-                let fy = self.dt_fold_select(y, w, &elem_sort, 0);
-                if fx != fy {
-                    if let Some(veq) = mk_eq_same_sort(&mut self.ctx.terms, fx, fy) {
+            if matches!(self.ctx.terms.sort(x), Sort::Array(_))
+                && axioms.len() < MAX_READ_CONGRUENCE_AXIOMS
+            {
+                if let Some(w) = array_extensionality_witness(
+                    &mut self.ctx.terms,
+                    &mut self.array_ext_witness_cache,
+                    x,
+                    y,
+                ) {
+                    // This pass runs after ordinary ROW preprocessing, so retain
+                    // the operational fold while also preserving its exact
+                    // McCarthy/array-ITE structure for independent strict proof
+                    // reconstruction. A folded term supplied by this emitter is
+                    // never authority by itself.
+                    let Some(fx) = self.dt_fold_select_for_extensionality_with_work(
+                        x,
+                        w,
+                        &elem_sort,
+                        select_fold_work,
+                    ) else {
+                        return axioms;
+                    };
+                    let Some(fy) = self.dt_fold_select_for_extensionality_with_work(
+                        y,
+                        w,
+                        &elem_sort,
+                        select_fold_work,
+                    ) else {
+                        return axioms;
+                    };
+                    if fx != fy && self.ctx.terms.sort(fx) == self.ctx.terms.sort(fy) {
+                        let veq = self.ctx.terms.mk_eq_coerce_no_ite_expand(fx, fy);
                         let not_eq = self.ctx.terms.mk_not(eq_term);
                         let not_veq = self.ctx.terms.mk_not(veq);
-                        axioms.push(self.ctx.terms.mk_implies(not_eq, not_veq));
-                        // Relay the value inequality to field inequalities.
-                        let mut diseq_seen: HashSet<(TermId, TermId)> = HashSet::default();
-                        self.emit_dt_value_eq_congruence(
-                            fx,
-                            fy,
-                            &dt_name,
-                            &datatype_ctors,
-                            0,
-                            MAX_READ_CONGRUENCE_DT_DEPTH,
-                            &mut axioms,
-                            &mut diseq_seen,
-                        );
+                        let folded_ext = self.ctx.terms.mk_implies(not_eq, not_veq);
+                        let binding = ArrayExtWitnessBinding {
+                            witness: w,
+                            array_a: x,
+                            array_b: y,
+                        };
+                        // Require BOTH an independently recognized folded schema
+                        // and exact generation-site witness identity before the
+                        // operational clause can enter the solver.
+                        if ay_proof::recognize_folded_array_extensionality(
+                            &self.ctx.terms,
+                            &[folded_ext],
+                            x,
+                            y,
+                            w,
+                        ) && self.array_ext_witness_cache.record_generated_clause(
+                            &self.ctx.terms,
+                            folded_ext,
+                            vec![binding],
+                        ) {
+                            axioms.push(folded_ext);
+                            // Relay the value inequality to field inequalities.
+                            let mut diseq_seen: HashSet<(TermId, TermId)> = HashSet::default();
+                            self.emit_dt_value_eq_congruence(
+                                fx,
+                                fy,
+                                &dt_name,
+                                &datatype_ctors,
+                                0,
+                                MAX_READ_CONGRUENCE_DT_DEPTH,
+                                MAX_READ_CONGRUENCE_AXIOMS,
+                                &mut axioms,
+                                &mut diseq_seen,
+                            );
+                            debug_assert!(axioms.len() <= MAX_READ_CONGRUENCE_AXIOMS);
+                        }
                     }
                 }
             }
@@ -1833,8 +1924,16 @@ impl Executor {
                 if axioms.len() >= MAX_READ_CONGRUENCE_AXIOMS {
                     break 'outer;
                 }
-                let fold_x = self.dt_fold_select(x, i, &elem_sort, 0);
-                let fold_y = self.dt_fold_select(y, i, &elem_sort, 0);
+                let Some(fold_x) =
+                    self.dt_fold_select_with_work(x, i, &elem_sort, 0, select_fold_work)
+                else {
+                    return axioms;
+                };
+                let Some(fold_y) =
+                    self.dt_fold_select_with_work(y, i, &elem_sort, 0, select_fold_work)
+                else {
+                    return axioms;
+                };
                 if fold_x == fold_y {
                     continue;
                 }
@@ -1861,7 +1960,7 @@ impl Executor {
                 // sel_k(b)` / `is-C(a) = is-C(b)` are congruence over TOTAL
                 // functions, and the folds apply only valid selector-of-
                 // constructor / selector-over-ite identities — never a false-UNSAT.
-                self.emit_dt_read_field_congruence(
+                if !self.emit_dt_read_field_congruence(
                     eq_term,
                     fold_x,
                     fold_y,
@@ -1870,9 +1969,14 @@ impl Executor {
                     &indices_by_sort,
                     0,
                     MAX_READ_CONGRUENCE_DT_DEPTH,
+                    MAX_READ_CONGRUENCE_AXIOMS,
+                    select_fold_work,
                     &mut axioms,
                     &mut seen_pairs,
-                );
+                ) {
+                    return axioms;
+                }
+                debug_assert!(axioms.len() <= MAX_READ_CONGRUENCE_AXIOMS);
             }
         }
         // Datatype-VALUE equalities `(= x y)` with a constructor/ite operand:
@@ -1883,7 +1987,7 @@ impl Executor {
             if axioms.len() >= MAX_READ_CONGRUENCE_AXIOMS {
                 break;
             }
-            self.emit_dt_read_field_congruence(
+            if !self.emit_dt_read_field_congruence(
                 eq_term,
                 x,
                 y,
@@ -1892,9 +1996,14 @@ impl Executor {
                 &indices_by_sort,
                 0,
                 MAX_READ_CONGRUENCE_DT_DEPTH,
+                MAX_READ_CONGRUENCE_AXIOMS,
+                select_fold_work,
                 &mut axioms,
                 &mut seen_pairs,
-            );
+            ) {
+                return axioms;
+            }
+            debug_assert!(axioms.len() <= MAX_READ_CONGRUENCE_AXIOMS);
         }
         axioms
     }
@@ -2007,27 +2116,83 @@ impl Executor {
         }
     }
 
-    /// Fold `(select arr idx)` through store chains, `ite`, and const-arrays,
-    /// returning a term SEMANTICALLY EQUAL to the raw select. Helper for
-    /// [`Self::dt_array_equality_read_congruence_axioms`]: the array ROW pass
-    /// has already run by the time that pass synthesizes selects, and a
-    /// datatype-element select carries no bits, so an unfolded
-    /// `(select (store a i (C v)) i)` would never reduce to `(C v)`.
+    /// Operational select folding with a caller-owned work counter. The
+    /// datatype-array congruence pass uses one counter for its whole run so a
+    /// large equality/index product cannot reset the per-fold budget.
     ///
-    /// SOUNDNESS: every rewrite is a valid array identity —
-    /// `(select (store b i v) i) = v` (ROW1), `(select (store b i v) j) =
-    /// (select b j)` when `i,j` are distinct constants (ROW2), the general
-    /// McCarthy `(ite (= i j) v (select b j))`, and `(select (ite g A B) j) =
-    /// (ite g (select A j) (select B j))` — so the folded term denotes the same
-    /// value in every model. Falls back to the raw select at the recursion
-    /// bound or on any other array head.
-    fn dt_fold_select(
+    /// Every rewrite is a valid array identity: ROW1, ROW2 for distinct
+    /// constant indices, the general McCarthy store/select identity, or
+    /// select-through-array-ITE. The returned term is therefore semantically
+    /// equal to the raw select; `None` makes the caller fall back or fail
+    /// closed when the aggregate work/depth bound is exhausted.
+    fn dt_fold_select_with_work(
         &mut self,
         arr: TermId,
         idx: TermId,
         elem_sort: &Sort,
         depth: usize,
-    ) -> TermId {
+        work: &mut usize,
+    ) -> Option<TermId> {
+        let mut memo = HashMap::default();
+        self.dt_fold_select_with_mode(
+            arr,
+            idx,
+            elem_sort,
+            depth,
+            DtSelectFoldMode::Operational,
+            &mut memo,
+            work,
+        )
+    }
+
+    /// Proof-shape-preserving counterpart of [`Self::dt_fold_select`].
+    ///
+    /// The semantic folds are identical, but symbolic store and array-ITE
+    /// branches remain explicit even when `TermStore::mk_ite` could collapse or
+    /// normalize them. That gives the strict proof checker one deterministic
+    /// structure to reconstruct independently from `(array, witness)`.
+    #[cfg(test)]
+    fn dt_fold_select_for_extensionality(
+        &mut self,
+        arr: TermId,
+        idx: TermId,
+        elem_sort: &Sort,
+    ) -> Option<TermId> {
+        let mut work = 0usize;
+        self.dt_fold_select_for_extensionality_with_work(arr, idx, elem_sort, &mut work)
+    }
+
+    /// Proof-shape select folding with a caller-owned aggregate work counter.
+    fn dt_fold_select_for_extensionality_with_work(
+        &mut self,
+        arr: TermId,
+        idx: TermId,
+        elem_sort: &Sort,
+        work: &mut usize,
+    ) -> Option<TermId> {
+        let mut memo = HashMap::default();
+        self.dt_fold_select_with_mode(
+            arr,
+            idx,
+            elem_sort,
+            0,
+            DtSelectFoldMode::ProofShape,
+            &mut memo,
+            work,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dt_fold_select_with_mode(
+        &mut self,
+        arr: TermId,
+        idx: TermId,
+        elem_sort: &Sort,
+        depth: usize,
+        mode: DtSelectFoldMode,
+        memo: &mut HashMap<(TermId, usize), TermId>,
+        work: &mut usize,
+    ) -> Option<TermId> {
         /// Bound on store-chain / ite nesting to fold through.
         const FOLD_BOUND: usize = 64;
         enum Head {
@@ -2035,56 +2200,108 @@ impl Executor {
             Ite(TermId, TermId, TermId),
             Other,
         }
-        if depth >= FOLD_BOUND {
-            return self.ctx.terms.mk_app(
-                Symbol::named("select"),
-                vec![arr, idx],
-                elem_sort.clone(),
-            );
+        if let Some(&folded) = memo.get(&(arr, depth)) {
+            return Some(folded);
         }
+        if *work >= DT_SELECT_FOLD_WORK_BUDGET {
+            return None;
+        }
+        *work += 1;
+
+        let folded = if depth >= FOLD_BOUND {
+            self.ctx
+                .terms
+                .mk_app(Symbol::named("select"), vec![arr, idx], elem_sort.clone())
         // Const-array fold: `(select ((as const _) v) i) = v` for EVERY index i
         // (#dt-array-extensionality-witness). Without this, a const-array over a
         // datatype element hits `Head::Other` below and stays an opaque select —
         // so a const-array equality whose contradiction lives at the (symbolic
         // witness) index could never surface the field disagreement. The const
         // fill is index-independent, so this is sound in every model.
-        if let Some(fill) = self.ctx.terms.get_const_array(arr) {
-            return fill;
-        }
-        let head = match self.ctx.terms.get(arr) {
-            TermData::App(Symbol::Named(n), args) if n == "store" && args.len() == 3 => {
-                Head::Store(args[0], args[1], args[2])
+        } else if let Some(fill) = self.ctx.terms.get_const_array(arr) {
+            fill
+        } else {
+            let head = match self.ctx.terms.get(arr) {
+                TermData::App(Symbol::Named(n), args) if n == "store" && args.len() == 3 => {
+                    Head::Store(args[0], args[1], args[2])
+                }
+                TermData::Ite(g, th, el) => Head::Ite(*g, *th, *el),
+                _ => Head::Other,
+            };
+            match head {
+                Head::Store(base, sidx, sval) => {
+                    if sidx == idx {
+                        sval // ROW1 (hash-consed identical index)
+                    } else {
+                        let i_const = matches!(self.ctx.terms.get(idx), TermData::Const(_));
+                        let s_const = matches!(self.ctx.terms.get(sidx), TermData::Const(_));
+                        if i_const && s_const {
+                            // Distinct constant indices -> read through (ROW2).
+                            self.dt_fold_select_with_mode(
+                                base,
+                                idx,
+                                elem_sort,
+                                depth + 1,
+                                mode,
+                                memo,
+                                work,
+                            )?
+                        } else {
+                            // Symbolic: exact McCarthy expansion.
+                            let base_read = self.dt_fold_select_with_mode(
+                                base,
+                                idx,
+                                elem_sort,
+                                depth + 1,
+                                mode,
+                                memo,
+                                work,
+                            )?;
+                            let cond = self.ctx.terms.mk_eq(idx, sidx);
+                            match mode {
+                                DtSelectFoldMode::Operational => {
+                                    self.ctx.terms.mk_ite(cond, sval, base_read)
+                                }
+                                DtSelectFoldMode::ProofShape => {
+                                    self.ctx.terms.mk_ite_raw(cond, sval, base_read)
+                                }
+                            }
+                        }
+                    }
+                }
+                Head::Ite(g, th, el) => {
+                    let tr = self.dt_fold_select_with_mode(
+                        th,
+                        idx,
+                        elem_sort,
+                        depth + 1,
+                        mode,
+                        memo,
+                        work,
+                    )?;
+                    let er = self.dt_fold_select_with_mode(
+                        el,
+                        idx,
+                        elem_sort,
+                        depth + 1,
+                        mode,
+                        memo,
+                        work,
+                    )?;
+                    match mode {
+                        DtSelectFoldMode::Operational => self.ctx.terms.mk_ite(g, tr, er),
+                        DtSelectFoldMode::ProofShape => self.ctx.terms.mk_ite_raw(g, tr, er),
+                    }
+                }
+                Head::Other => self.ctx.terms.mk_app(
+                    Symbol::named("select"),
+                    vec![arr, idx],
+                    elem_sort.clone(),
+                ),
             }
-            TermData::Ite(g, th, el) => Head::Ite(*g, *th, *el),
-            _ => Head::Other,
         };
-        match head {
-            Head::Store(base, sidx, sval) => {
-                if sidx == idx {
-                    return sval; // ROW1 (hash-consed identical index)
-                }
-                let i_const = matches!(self.ctx.terms.get(idx), TermData::Const(_));
-                let s_const = matches!(self.ctx.terms.get(sidx), TermData::Const(_));
-                if i_const && s_const {
-                    // Distinct constant indices -> read straight through (ROW2).
-                    return self.dt_fold_select(base, idx, elem_sort, depth + 1);
-                }
-                // Symbolic: exact McCarthy expansion (sound in every model).
-                let base_read = self.dt_fold_select(base, idx, elem_sort, depth + 1);
-                let cond = self.ctx.terms.mk_eq(idx, sidx);
-                self.ctx.terms.mk_ite(cond, sval, base_read)
-            }
-            Head::Ite(g, th, el) => {
-                let tr = self.dt_fold_select(th, idx, elem_sort, depth + 1);
-                let er = self.dt_fold_select(el, idx, elem_sort, depth + 1);
-                self.ctx.terms.mk_ite(g, tr, er)
-            }
-            Head::Other => {
-                self.ctx
-                    .terms
-                    .mk_app(Symbol::named("select"), vec![arr, idx], elem_sort.clone())
-            }
-        }
+        memo.insert((arr, depth), folded);
+        Some(folded)
     }
 
     /// Emit guarded field/tester congruence `(=> guard (= sel(a) sel(b)))` /
@@ -2097,7 +2314,6 @@ impl Executor {
     /// [`Self::dt_array_equality_read_congruence_axioms`]; soundness argued
     /// there (congruence over total selectors/testers).
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn emit_dt_read_field_congruence(
         &mut self,
         guard: TermId,
@@ -2108,29 +2324,43 @@ impl Executor {
         indices_by_sort: &HashMap<String, Vec<TermId>>,
         depth: usize,
         max_depth: usize,
+        max_axioms: usize,
+        select_fold_work: &mut usize,
         axioms: &mut Vec<TermId>,
         seen: &mut HashSet<(TermId, TermId)>,
-    ) {
-        if depth >= max_depth || a == b {
-            return;
+    ) -> bool {
+        if depth >= max_depth || a == b || axioms.len() >= max_axioms {
+            return true;
         }
         let key = if a.0 <= b.0 { (a, b) } else { (b, a) };
         if !seen.insert(key) {
-            return;
+            return true;
         }
         let Some(ctors) = datatype_ctors.get(dt_name).cloned() else {
-            return;
+            return true;
         };
         if ctors.is_empty() {
-            return;
+            return true;
         }
         // Multi-constructor: folded tester agreement `is-C(a) = is-C(b)` for
         // every constructor (this also discharges cross-constructor disjointness
         // — mismatched tags force `guard` false).
         if ctors.len() > 1 {
             for ctor in &ctors {
-                let ta = self.dt_fold_tester(ctor, a, 0);
-                let tb = self.dt_fold_tester(ctor, b, 0);
+                if axioms.len() >= max_axioms {
+                    return true;
+                }
+                let mut memo = HashMap::default();
+                let Some(ta) =
+                    self.dt_fold_tester_with_work(ctor, a, 0, &mut memo, select_fold_work)
+                else {
+                    return false;
+                };
+                let Some(tb) =
+                    self.dt_fold_tester_with_work(ctor, b, 0, &mut memo, select_fold_work)
+                else {
+                    return false;
+                };
                 if ta != tb {
                     let eq = self.ctx.terms.mk_eq(ta, tb);
                     axioms.push(self.ctx.terms.mk_implies(guard, eq));
@@ -2141,12 +2371,39 @@ impl Executor {
         // (selectors are total, so this is unconditional congruence).
         let mut nested: Vec<(TermId, TermId, String)> = Vec::new();
         for ctor in &ctors {
+            if axioms.len() >= max_axioms {
+                return true;
+            }
             let Some(selectors) = self.selector_signature_in(dt_name, ctor) else {
                 continue;
             };
             for (sel_name, sel_sort) in &selectors {
-                let fa = self.dt_fold_selector(sel_name, sel_sort, dt_name, a, 0);
-                let fb = self.dt_fold_selector(sel_name, sel_sort, dt_name, b, 0);
+                if axioms.len() >= max_axioms {
+                    return true;
+                }
+                let mut memo = HashMap::default();
+                let Some(fa) = self.dt_fold_selector_with_work(
+                    sel_name,
+                    sel_sort,
+                    dt_name,
+                    a,
+                    0,
+                    &mut memo,
+                    select_fold_work,
+                ) else {
+                    return false;
+                };
+                let Some(fb) = self.dt_fold_selector_with_work(
+                    sel_name,
+                    sel_sort,
+                    dt_name,
+                    b,
+                    0,
+                    &mut memo,
+                    select_fold_work,
+                ) else {
+                    return false;
+                };
                 if fa == fb {
                     continue;
                 }
@@ -2173,6 +2430,9 @@ impl Executor {
                         if let Some(indices) = indices_by_sort.get(&idx_key).cloned() {
                             let elem_sort = arr.element_sort.clone();
                             for j in indices {
+                                if axioms.len() >= max_axioms {
+                                    return true;
+                                }
                                 // FOLD the inner select through const-array / ROW /
                                 // ite (`dt_fold_select`): when `fa` is a folded
                                 // const-array (e.g. `f1(c1(inner))` reduced to the
@@ -2182,8 +2442,24 @@ impl Executor {
                                 // carries no bits and never reduces (nested const
                                 // class). A bare-Var field array folds to the raw
                                 // select unchanged (sound no-op).
-                                let sel_a = self.dt_fold_select(fa, j, &elem_sort, 0);
-                                let sel_b = self.dt_fold_select(fb, j, &elem_sort, 0);
+                                let Some(sel_a) = self.dt_fold_select_with_work(
+                                    fa,
+                                    j,
+                                    &elem_sort,
+                                    0,
+                                    select_fold_work,
+                                ) else {
+                                    return false;
+                                };
+                                let Some(sel_b) = self.dt_fold_select_with_work(
+                                    fb,
+                                    j,
+                                    &elem_sort,
+                                    0,
+                                    select_fold_work,
+                                ) else {
+                                    return false;
+                                };
                                 if sel_a == sel_b {
                                     continue;
                                 }
@@ -2200,7 +2476,10 @@ impl Executor {
             }
         }
         for (fa, fb, ndt) in nested {
-            self.emit_dt_read_field_congruence(
+            if axioms.len() >= max_axioms {
+                break;
+            }
+            if !self.emit_dt_read_field_congruence(
                 guard,
                 fa,
                 fb,
@@ -2209,10 +2488,15 @@ impl Executor {
                 indices_by_sort,
                 depth + 1,
                 max_depth,
+                max_axioms,
+                select_fold_work,
                 axioms,
                 seen,
-            );
+            ) {
+                return false;
+            }
         }
+        true
     }
 
     /// Fold a selector application `sel_name(t)` through `ite` and constructor
@@ -2221,15 +2505,19 @@ impl Executor {
     /// args[k]` when `sel_name` is `C`'s k-th selector (else the value is
     /// unspecified, so the raw app is kept). Needed because these synthesized
     /// projections postdate the selector-over-ite / selector-of-constructor
-    /// rewrite passes. SOUND: only valid datatype identities are applied.
-    fn dt_fold_selector(
+    /// rewrite passes. SOUND: only valid datatype identities are applied. The
+    /// caller supplies the pass-wide work counter and a per-selector memo so a
+    /// shared ITE DAG is visited once.
+    fn dt_fold_selector_with_work(
         &mut self,
         sel_name: &str,
         sel_sort: &Sort,
         dt_name: &str,
         t: TermId,
         depth: usize,
-    ) -> TermId {
+        memo: &mut HashMap<(TermId, usize), TermId>,
+        work: &mut usize,
+    ) -> Option<TermId> {
         /// Bound on ite nesting to fold through.
         const FOLD_BOUND: usize = 64;
         enum Head {
@@ -2237,80 +2525,127 @@ impl Executor {
             Ctor(String),
             Other,
         }
+        if let Some(&folded) = memo.get(&(t, depth)) {
+            return Some(folded);
+        }
+        if *work >= DT_SELECT_FOLD_WORK_BUDGET {
+            return None;
+        }
+        *work += 1;
+
         let mk_raw = |terms: &mut TermStore| {
             terms.mk_app(Symbol::named(sel_name), vec![t], sel_sort.clone())
         };
-        if depth >= FOLD_BOUND {
-            return mk_raw(&mut self.ctx.terms);
-        }
-        let head = match self.ctx.terms.get(t) {
-            TermData::Ite(g, x, y) => Head::Ite(*g, *x, *y),
-            TermData::App(Symbol::Named(n), _) if self.ctx.is_constructor(n).is_some() => {
-                Head::Ctor(n.clone())
-            }
-            _ => Head::Other,
-        };
-        match head {
-            Head::Ite(g, x, y) => {
-                let fx = self.dt_fold_selector(sel_name, sel_sort, dt_name, x, depth + 1);
-                let fy = self.dt_fold_selector(sel_name, sel_sort, dt_name, y, depth + 1);
-                self.ctx.terms.mk_ite(g, fx, fy)
-            }
-            Head::Ctor(cn) => {
-                let args = match self.ctx.terms.get(t) {
-                    TermData::App(_, args) => args.clone(),
-                    _ => return mk_raw(&mut self.ctx.terms),
-                };
-                if let Some(selectors) = self.selector_signature_in(dt_name, &cn) {
-                    if let Some(pos) = selectors.iter().position(|(sn, _)| sn == sel_name) {
-                        if pos < args.len() {
-                            return args[pos];
-                        }
+        let folded = if depth >= FOLD_BOUND {
+            mk_raw(&mut self.ctx.terms)
+        } else {
+            let head = match self.ctx.terms.get(t) {
+                TermData::Ite(g, x, y) => Head::Ite(*g, *x, *y),
+                TermData::App(Symbol::Named(n), _) if self.ctx.is_constructor(n).is_some() => {
+                    Head::Ctor(n.clone())
+                }
+                _ => Head::Other,
+            };
+            match head {
+                Head::Ite(g, x, y) => {
+                    let fx = self.dt_fold_selector_with_work(
+                        sel_name,
+                        sel_sort,
+                        dt_name,
+                        x,
+                        depth + 1,
+                        memo,
+                        work,
+                    )?;
+                    let fy = self.dt_fold_selector_with_work(
+                        sel_name,
+                        sel_sort,
+                        dt_name,
+                        y,
+                        depth + 1,
+                        memo,
+                        work,
+                    )?;
+                    self.ctx.terms.mk_ite(g, fx, fy)
+                }
+                Head::Ctor(cn) => {
+                    let args = match self.ctx.terms.get(t) {
+                        TermData::App(_, args) => args.clone(),
+                        _ => Vec::new(),
+                    };
+                    let selected = self
+                        .selector_signature_in(dt_name, &cn)
+                        .and_then(|selectors| selectors.iter().position(|(sn, _)| sn == sel_name))
+                        .and_then(|pos| args.get(pos).copied());
+                    match selected {
+                        Some(field) => field,
+                        None => mk_raw(&mut self.ctx.terms),
                     }
                 }
-                mk_raw(&mut self.ctx.terms)
+                Head::Other => mk_raw(&mut self.ctx.terms),
             }
-            Head::Other => mk_raw(&mut self.ctx.terms),
-        }
+        };
+        memo.insert((t, depth), folded);
+        Some(folded)
     }
 
     /// Fold a tester `is-ctor_name(t)` through `ite` and constructor heads to a
     /// Bool term semantically equal to the raw tester: `is-C(ite g x y) = ite g
     /// is-C(x) is-C(y)`; `is-C(D(..)) = (C == D)` as a bool literal. SOUND:
-    /// valid datatype identities only.
-    fn dt_fold_tester(&mut self, ctor_name: &str, t: TermId, depth: usize) -> TermId {
+    /// valid datatype identities only. The caller supplies the pass-wide work
+    /// counter and a per-tester memo so a shared ITE DAG is visited once.
+    fn dt_fold_tester_with_work(
+        &mut self,
+        ctor_name: &str,
+        t: TermId,
+        depth: usize,
+        memo: &mut HashMap<(TermId, usize), TermId>,
+        work: &mut usize,
+    ) -> Option<TermId> {
         const FOLD_BOUND: usize = 64;
         enum Head {
             Ite(TermId, TermId, TermId),
             Ctor(String),
             Other,
         }
-        let tester = format!("is-{ctor_name}");
-        if depth >= FOLD_BOUND {
-            return self
-                .ctx
-                .terms
-                .mk_app(Symbol::named(&tester), vec![t], Sort::Bool);
+        if let Some(&folded) = memo.get(&(t, depth)) {
+            return Some(folded);
         }
-        let head = match self.ctx.terms.get(t) {
-            TermData::Ite(g, x, y) => Head::Ite(*g, *x, *y),
-            TermData::App(Symbol::Named(n), _) if self.ctx.is_constructor(n).is_some() => {
-                Head::Ctor(n.clone())
+        if *work >= DT_SELECT_FOLD_WORK_BUDGET {
+            return None;
+        }
+        *work += 1;
+
+        let folded = if depth >= FOLD_BOUND {
+            let tester = format!("is-{ctor_name}");
+            self.ctx
+                .terms
+                .mk_app(Symbol::named(&tester), vec![t], Sort::Bool)
+        } else {
+            let head = match self.ctx.terms.get(t) {
+                TermData::Ite(g, x, y) => Head::Ite(*g, *x, *y),
+                TermData::App(Symbol::Named(n), _) if self.ctx.is_constructor(n).is_some() => {
+                    Head::Ctor(n.clone())
+                }
+                _ => Head::Other,
+            };
+            match head {
+                Head::Ite(g, x, y) => {
+                    let fx = self.dt_fold_tester_with_work(ctor_name, x, depth + 1, memo, work)?;
+                    let fy = self.dt_fold_tester_with_work(ctor_name, y, depth + 1, memo, work)?;
+                    self.ctx.terms.mk_ite(g, fx, fy)
+                }
+                Head::Ctor(cn) => self.ctx.terms.mk_bool(cn == ctor_name),
+                Head::Other => {
+                    let tester = format!("is-{ctor_name}");
+                    self.ctx
+                        .terms
+                        .mk_app(Symbol::named(&tester), vec![t], Sort::Bool)
+                }
             }
-            _ => Head::Other,
         };
-        match head {
-            Head::Ite(g, x, y) => {
-                let fx = self.dt_fold_tester(ctor_name, x, depth + 1);
-                let fy = self.dt_fold_tester(ctor_name, y, depth + 1);
-                self.ctx.terms.mk_ite(g, fx, fy)
-            }
-            Head::Ctor(cn) => self.ctx.terms.mk_bool(cn == ctor_name),
-            Head::Other => self
-                .ctx
-                .terms
-                .mk_app(Symbol::named(&tester), vec![t], Sort::Bool),
-        }
+        memo.insert((t, depth), folded);
+        Some(folded)
     }
 
     pub(in crate::executor) fn dt_store_value_injectivity_axioms(
@@ -3865,5 +4200,311 @@ impl Executor {
         }
 
         extra
+    }
+}
+
+#[cfg(test)]
+mod array_disequality_witness_tests {
+    use super::*;
+    use crate::executor::theories::ARRAY_EXT_WITNESS_PREFIX;
+    use ay_core::{AletheRule, Proof, ProofStep, TheoryLemmaKind};
+
+    #[test]
+    fn proof_shape_fold_memoizes_a_shared_array_ite_dag() {
+        let mut exec = Executor::new();
+        let array_sort = Sort::array(Sort::Int, Sort::Int);
+        let base = exec.ctx.terms.mk_var("shared_fold_base", array_sort);
+        let guard = exec.ctx.terms.mk_var("shared_fold_guard", Sort::Bool);
+        let index = exec.ctx.terms.mk_var("shared_fold_index", Sort::Int);
+        let mut array = base;
+        for _ in 0..40 {
+            array = exec.ctx.terms.mk_ite_raw(guard, array, array);
+        }
+
+        let before = exec.ctx.terms.len();
+        let folded = exec
+            .dt_fold_select_for_extensionality(array, index, &Sort::Int)
+            .expect("the linear shared DAG must fit the fold work budget");
+        let added = exec.ctx.terms.len() - before;
+
+        assert!(matches!(exec.ctx.terms.get(folded), TermData::Ite(..)));
+        assert!(
+            added <= 64,
+            "memoized depth-40 fold should stay linear, added {added} terms"
+        );
+    }
+
+    #[test]
+    fn selector_and_tester_folds_memoize_a_shared_ite_diamond() {
+        const LEVELS: usize = 32;
+        const UNIQUE_STATES_PER_FOLD: usize = 2 * LEVELS + 3;
+
+        let input = r#"
+            (set-logic ALL)
+            (declare-datatype D ((left (value Int)) (right)))
+            (declare-const seed D)
+        "#;
+        let commands = ay_frontend::parse(input).expect("selector-diamond fixture must parse");
+        let mut exec = Executor::new();
+        for command in &commands {
+            exec.execute(command).expect("fixture must elaborate");
+        }
+
+        let seed = exec
+            .ctx
+            .symbol_info_by_identity("seed")
+            .and_then(|info| info.term)
+            .expect("seed must be a declared constant");
+        let dt_name = exec.dt_name_of(seed).expect("seed must have datatype sort");
+        let dt_sort = exec.ctx.terms.sort(seed).clone();
+        let payload = exec.ctx.terms.mk_int(7.into());
+        let left = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("left"), vec![payload], dt_sort);
+        let right = exec
+            .ctx
+            .symbol_info_by_identity("right")
+            .and_then(|info| info.term)
+            .expect("right must be a nullary constructor");
+
+        // Two nodes per layer point to the same pair below. The term DAG is
+        // linear in LEVELS, while a tree walk takes exponential time.
+        let (mut x, mut y) = (left, right);
+        for level in 0..LEVELS {
+            let gx = exec
+                .ctx
+                .terms
+                .mk_var(format!("selector_diamond_x_{level}"), Sort::Bool);
+            let gy = exec
+                .ctx
+                .terms
+                .mk_var(format!("selector_diamond_y_{level}"), Sort::Bool);
+            let next_x = exec.ctx.terms.mk_ite_raw(gx, x, y);
+            let next_y = exec.ctx.terms.mk_ite_raw(gy, x, y);
+            x = next_x;
+            y = next_y;
+        }
+        let root_guard = exec.ctx.terms.mk_var("selector_diamond_root", Sort::Bool);
+        let root = exec.ctx.terms.mk_ite_raw(root_guard, x, y);
+
+        // Seed just enough shared aggregate budget for one selector fold and
+        // one tester fold. Without memoization, the first diamond walk alone
+        // exhausts this allowance long before reaching depth 32.
+        let expected_work = 2 * UNIQUE_STATES_PER_FOLD;
+        let mut work = DT_SELECT_FOLD_WORK_BUDGET - expected_work;
+        let mut selector_memo = HashMap::default();
+        let _ = exec
+            .dt_fold_selector_with_work(
+                "value",
+                &Sort::Int,
+                &dt_name,
+                root,
+                0,
+                &mut selector_memo,
+                &mut work,
+            )
+            .expect("memoized selector diamond must fit its exact state budget");
+        let mut tester_memo = HashMap::default();
+        let _ = exec
+            .dt_fold_tester_with_work("left", root, 0, &mut tester_memo, &mut work)
+            .expect("memoized tester diamond must share the aggregate allowance");
+
+        assert_eq!(work, DT_SELECT_FOLD_WORK_BUDGET);
+        let mut exhausted_memo = HashMap::default();
+        assert!(exec
+            .dt_fold_tester_with_work("left", root, 0, &mut exhausted_memo, &mut work)
+            .is_none());
+    }
+
+    #[test]
+    fn datatype_array_fold_budget_is_aggregate_across_extensionality_and_reads() {
+        let input = r#"
+            (set-logic ALL)
+            (declare-datatype D ((only)))
+            (declare-const a (Array Int D))
+            (declare-const b (Array Int D))
+        "#;
+        let commands = ay_frontend::parse(input).expect("aggregate-budget fixture must parse");
+        let mut exec = Executor::new();
+        for command in &commands {
+            exec.execute(command).expect("fixture must elaborate");
+        }
+
+        let a = exec
+            .ctx
+            .symbol_info_by_identity("a")
+            .and_then(|info| info.term)
+            .expect("a must be a declared constant");
+        let b = exec
+            .ctx
+            .symbol_info_by_identity("b")
+            .and_then(|info| info.term)
+            .expect("b must be a declared constant");
+        let equality = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), vec![a, b], Sort::Bool);
+        let base_assertions: HashSet<TermId> = [equality].into_iter().collect();
+
+        // The two proof-shape extensionality folds consume two units. The first
+        // equality-at-index fold consumes the final unit; its peer must observe
+        // exhaustion and stop the pass rather than receiving a reset budget or
+        // falling back to an unbudgeted raw select.
+        let mut work = DT_SELECT_FOLD_WORK_BUDGET - 3;
+        let axioms = exec
+            .dt_array_equality_read_congruence_axioms_with_fold_work(&base_assertions, &mut work);
+
+        assert_eq!(work, DT_SELECT_FOLD_WORK_BUDGET);
+        assert_eq!(
+            axioms.len(),
+            1,
+            "only the completed extensionality clause may precede exhaustion"
+        );
+        assert!(exec
+            .array_ext_witness_cache
+            .generated_clause_bindings(&exec.ctx.terms, axioms[0])
+            .is_some());
+    }
+
+    #[test]
+    fn datatype_array_disequality_certifies_folded_extensionality_provenance() {
+        let input = r#"
+            (set-logic ALL)
+            (declare-datatype D ((left) (right)))
+            (declare-const base (Array Int D))
+            (declare-const i Int)
+        "#;
+        let commands = ay_frontend::parse(input).expect("datatype-array fixture must parse");
+        let mut exec = Executor::new();
+        for command in &commands {
+            exec.execute(command).expect("fixture must elaborate");
+        }
+
+        // Build the raw equality consumed by this late executor pass. The
+        // frontend may simplify a source-level store/equality before the pass
+        // runs, which would turn this focused generation-site test into a test
+        // of unrelated preprocessing.
+        let base = exec
+            .ctx
+            .symbol_info_by_identity("base")
+            .and_then(|info| info.term)
+            .expect("base must be a declared constant");
+        let index = exec
+            .ctx
+            .symbol_info_by_identity("i")
+            .and_then(|info| info.term)
+            .expect("i must be a declared constant");
+        let left = exec
+            .ctx
+            .symbol_info_by_identity("left")
+            .and_then(|info| info.term)
+            .expect("the nullary constructor must have a term");
+        let array_sort = exec.ctx.terms.sort(base).clone();
+        let stored =
+            exec.ctx
+                .terms
+                .mk_app(Symbol::named("store"), vec![base, index, left], array_sort);
+        let equality = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("="), vec![stored, base], Sort::Bool);
+        let disequality = exec.ctx.terms.mk_not(equality);
+        let base_assertions: HashSet<TermId> = [disequality].into_iter().collect();
+        let axioms = exec.dt_array_equality_read_congruence_axioms(&base_assertions);
+        let (clause, array_a, array_b, witness) = axioms
+            .iter()
+            .find_map(|&clause| {
+                let recorded = exec
+                    .array_ext_witness_cache
+                    .generated_clause_bindings(&exec.ctx.terms, clause)?;
+                let [binding] = recorded else {
+                    return None;
+                };
+                ay_proof::recognize_folded_array_extensionality(
+                    &exec.ctx.terms,
+                    &[clause],
+                    binding.array_a,
+                    binding.array_b,
+                    binding.witness,
+                )
+                .then_some((
+                    clause,
+                    binding.array_a,
+                    binding.array_b,
+                    binding.witness,
+                ))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "the DT lane must authenticate its folded extensionality clause; \
+                     axioms={axioms:?} cache={:?}",
+                    exec.array_ext_witness_cache
+                )
+            });
+
+        assert!(
+            ay_proof::recognize_array_extensionality_chain(&exec.ctx.terms, &[clause]).is_none(),
+            "the store fixture must exercise the folded schema, not the raw fallback"
+        );
+
+        let recorded = exec
+            .array_ext_witness_cache
+            .generated_clause_bindings(&exec.ctx.terms, clause)
+            .expect("the generation site must authenticate the exact clause");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].witness, witness);
+        assert_eq!(
+            [recorded[0].array_a, recorded[0].array_b]
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            [array_a, array_b].into_iter().collect::<HashSet<_>>()
+        );
+        assert!(exec
+            .array_ext_witness_cache
+            .is_active_witness(&exec.ctx.terms, witness));
+        assert!(matches!(
+            exec.ctx.terms.get(witness),
+            TermData::Var(name, _) if name.starts_with(ARRAY_EXT_WITNESS_PREFIX)
+        ));
+
+        let reversed = array_extensionality_witness(
+            &mut exec.ctx.terms,
+            &mut exec.array_ext_witness_cache,
+            array_b,
+            array_a,
+        )
+        .expect("the canonical reversed pair must reuse its witness");
+        assert_eq!(reversed, witness);
+        let repeated = exec.dt_array_equality_read_congruence_axioms(&base_assertions);
+        assert!(repeated.iter().any(|&candidate| candidate == clause));
+        assert_eq!(
+            exec.array_ext_witness_cache
+                .pair_witness(&exec.ctx.terms, array_a, array_b),
+            Some(witness)
+        );
+
+        let mut proof = Proof::new();
+        proof.add_theory_lemma("arrays", vec![clause]);
+        exec.promote_array_extensionality_axioms(&mut proof);
+        assert!(proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::TheoryLemma {
+                kind: TheoryLemmaKind::ArrayExtensionality,
+                ..
+            }
+        )));
+        assert!(proof.steps.iter().any(|step| matches!(
+            step,
+            ProofStep::Step {
+                rule: AletheRule::ArrayExtDiffIntro,
+                args,
+                ..
+            } if args.as_slice() == [witness, array_a, array_b]
+                || args.as_slice() == [witness, array_b, array_a]
+        )));
+        let problem: Vec<TermId> = base_assertions.iter().copied().collect();
+        ay_proof::validate_array_extensionality_provenance(&proof, &exec.ctx.terms, &problem)
+            .expect("the promoted folded clause must pass strict provenance validation");
     }
 }

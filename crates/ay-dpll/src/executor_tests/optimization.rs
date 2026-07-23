@@ -800,6 +800,22 @@ fn optimize_check_sat_honors_set_timeout_deadline() {
     );
 }
 
+#[test]
+fn nested_array_false_unsat_with_objective_is_quarantined() {
+    let repro = include_str!("../../../../repros/cs_stateful-1.i_2.MINIMIZED.smt2");
+    let input = repro.replacen("(check-sat)", "(minimize 0)\n(check-sat)", 1);
+    let commands = parse(&input).expect("nested-array optimization repro parses");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("nested-array optimization repro executes");
+    assert_eq!(
+        outputs.first().map(String::as_str),
+        Some("unknown"),
+        "optimization must not bypass the nested-array UNSAT quarantine"
+    );
+}
+
 // --- BOX multi-objective tests (Z3 `(set-option :opt.priority box)`) ---
 
 /// Helper: run an SMT-LIB string and return the `(check-sat)` verdict followed

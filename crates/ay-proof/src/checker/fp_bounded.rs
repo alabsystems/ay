@@ -94,6 +94,228 @@ pub fn recognize_fp_classification_op(terms: &TermStore, clause: &[TermId]) -> O
     Some(FpOp::StructuralEq)
 }
 
+/// Recognize an exact IEEE-754 rounding-mode finite-domain axiom.
+///
+/// This is the public producer/checker handshake for
+/// `TheoryLemmaKind::FpRoundingModeDomain`: producers may promote a derived
+/// assertion only when this function accepts it, and strict mode independently
+/// calls the same validator again. An accepted clause must contain at least one
+/// exact fixed-domain theorem (other literals are ordinary clause weakening):
+///
+/// * the conjunction of all ten pairwise disequalities among `RNE`, `RNA`,
+///   `RTP`, `RTN`, and `RTZ`, or one exact distinct pair produced when that
+///   conjunction is flattened at the assertion boundary; or
+/// * a five-way disjunction saying one non-literal `RoundingMode` term equals
+///   each of those five values exactly once; or
+/// * the negation of the complete 15-edge pairwise-distinct conjunction over
+///   exactly six `RoundingMode` terms (the five-value pigeonhole theorem).
+///
+/// Partial domains, extra values, aliases, duplicate cases, and non-RM terms
+/// fail closed.
+#[must_use]
+pub fn recognize_fp_rounding_mode_domain(terms: &TermStore, clause: &[TermId]) -> bool {
+    validate_fp_rounding_mode_domain(terms, ProofId(0), clause).is_ok()
+}
+
+fn rm_literal_index(terms: &TermStore, term: TermId) -> Option<usize> {
+    if !matches!(terms.sort(term), Sort::Uninterpreted(name) if name == "RoundingMode") {
+        return None;
+    }
+    let TermData::App(symbol, args) = terms.get(term) else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    match symbol.name() {
+        "RNE" => Some(0),
+        "RNA" => Some(1),
+        "RTP" => Some(2),
+        "RTN" => Some(3),
+        "RTZ" => Some(4),
+        _ => None,
+    }
+}
+
+fn binary_equality(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
+    if terms.sort(term) != &Sort::Bool {
+        return None;
+    }
+    let TermData::App(symbol, args) = terms.get(term) else {
+        return None;
+    };
+    (symbol.name() == "=" && args.len() == 2).then(|| (args[0], args[1]))
+}
+
+fn is_rm_pairwise_disequality(terms: &TermStore, term: TermId) -> bool {
+    let TermData::Not(equality) = terms.get(term) else {
+        return false;
+    };
+    let Some((lhs, rhs)) = binary_equality(terms, *equality) else {
+        return false;
+    };
+    matches!(
+        (rm_literal_index(terms, lhs), rm_literal_index(terms, rhs)),
+        (Some(i), Some(j)) if i != j
+    )
+}
+
+fn is_exact_rm_distinctness(terms: &TermStore, term: TermId) -> bool {
+    let TermData::App(symbol, conjuncts) = terms.get(term) else {
+        return false;
+    };
+    if symbol.name() != "and" || conjuncts.len() != 10 {
+        return false;
+    }
+
+    let mut pairs = [[false; 5]; 5];
+    for &conjunct in conjuncts {
+        let TermData::Not(equality) = terms.get(conjunct) else {
+            return false;
+        };
+        let Some((lhs, rhs)) = binary_equality(terms, *equality) else {
+            return false;
+        };
+        let (Some(mut i), Some(mut j)) =
+            (rm_literal_index(terms, lhs), rm_literal_index(terms, rhs))
+        else {
+            return false;
+        };
+        if i == j {
+            return false;
+        }
+        if i > j {
+            std::mem::swap(&mut i, &mut j);
+        }
+        if std::mem::replace(&mut pairs[i][j], true) {
+            return false;
+        }
+    }
+
+    (0..5).all(|i| ((i + 1)..5).all(|j| pairs[i][j]))
+}
+
+fn is_exact_rm_coverage(terms: &TermStore, term: TermId) -> bool {
+    let TermData::App(symbol, disjuncts) = terms.get(term) else {
+        return false;
+    };
+    if symbol.name() != "or" || disjuncts.len() != 5 {
+        return false;
+    }
+
+    let mut covered = [false; 5];
+    let mut subject = None;
+    for &disjunct in disjuncts {
+        let Some((lhs, rhs)) = binary_equality(terms, disjunct) else {
+            return false;
+        };
+        let (mode, candidate) = match (rm_literal_index(terms, lhs), rm_literal_index(terms, rhs)) {
+            (Some(mode), None) => (mode, rhs),
+            (None, Some(mode)) => (mode, lhs),
+            _ => return false,
+        };
+        if !matches!(terms.sort(candidate), Sort::Uninterpreted(name) if name == "RoundingMode")
+            || std::mem::replace(&mut covered[mode], true)
+        {
+            return false;
+        }
+        match subject {
+            Some(existing) if existing != candidate => return false,
+            None => subject = Some(candidate),
+            _ => {}
+        }
+    }
+
+    subject.is_some() && covered.into_iter().all(std::convert::identity)
+}
+
+fn is_exact_rm_six_term_pigeonhole(terms: &TermStore, term: TermId) -> bool {
+    let TermData::Not(distinct) = terms.get(term) else {
+        return false;
+    };
+    let TermData::App(symbol, conjuncts) = terms.get(*distinct) else {
+        return false;
+    };
+    if terms.sort(*distinct) != &Sort::Bool || symbol.name() != "and" || conjuncts.len() != 15 {
+        return false;
+    }
+
+    let mut subjects = Vec::with_capacity(6);
+    let mut pairs = Vec::with_capacity(15);
+    for &conjunct in conjuncts {
+        let TermData::Not(equality) = terms.get(conjunct) else {
+            return false;
+        };
+        let Some((mut lhs, mut rhs)) = binary_equality(terms, *equality) else {
+            return false;
+        };
+        if lhs == rhs
+            || !matches!(terms.sort(lhs), Sort::Uninterpreted(name) if name == "RoundingMode")
+            || !matches!(terms.sort(rhs), Sort::Uninterpreted(name) if name == "RoundingMode")
+        {
+            return false;
+        }
+        if lhs.0 > rhs.0 {
+            std::mem::swap(&mut lhs, &mut rhs);
+        }
+        if pairs.contains(&(lhs, rhs)) {
+            return false;
+        }
+        pairs.push((lhs, rhs));
+        if !subjects.contains(&lhs) {
+            subjects.push(lhs);
+        }
+        if !subjects.contains(&rhs) {
+            subjects.push(rhs);
+        }
+    }
+    if subjects.len() != 6 {
+        return false;
+    }
+
+    for (index, &lhs) in subjects.iter().enumerate() {
+        for &rhs in &subjects[index + 1..] {
+            let pair = if lhs.0 < rhs.0 {
+                (lhs, rhs)
+            } else {
+                (rhs, lhs)
+            };
+            if !pairs.contains(&pair) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Strictly validate the complete fixed-domain schema for SMT-LIB
+/// `RoundingMode`.
+pub(crate) fn validate_fp_rounding_mode_domain(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+) -> Result<(), ProofCheckError> {
+    if clause.is_empty() || clause.iter().any(|term| terms.sort(*term) != &Sort::Bool) {
+        return Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "fp_rm_domain must be a non-empty Boolean clause".to_string(),
+        });
+    }
+    if clause.iter().any(|&literal| {
+        is_rm_pairwise_disequality(terms, literal)
+            || is_exact_rm_distinctness(terms, literal)
+            || is_exact_rm_coverage(terms, literal)
+            || is_exact_rm_six_term_pigeonhole(terms, literal)
+    }) {
+        Ok(())
+    } else {
+        Err(ProofCheckError::InvalidTheoryLemma {
+            step: step_id,
+            reason: "fp_rm_domain contains no exact canonical-mode disequality, complete five-value distinctness/coverage schema, or complete six-term pigeonhole theorem".to_string(),
+        })
+    }
+}
+
 /// Validate an `FpClassification` lemma in strict mode by exhaustive bounded
 /// evaluation over its FP variables.
 ///

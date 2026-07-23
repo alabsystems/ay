@@ -73,6 +73,7 @@ mod strings_w5;
 mod strings_w6;
 mod strings_w7;
 mod strings_word_eq;
+mod strings_word_prop;
 
 pub(crate) use split_incremental::BoundRefinementReplayKey;
 pub(crate) use split_incremental::{SharedRescuePairCounter, DEFAULT_RESCUE_PAIR_BUDGET};
@@ -80,6 +81,322 @@ pub(crate) use split_incremental::{SharedRescuePairCounter, DEFAULT_RESCUE_PAIR_
 use ay_core::term::{Symbol, TermData};
 use ay_core::{Sort, TermId, TermStore};
 use ay_sat::{Solver as SatSolver, Variable as SatVariable};
+
+/// Reserved namespace for array-extensionality difference witnesses.
+///
+/// Names are freshly minted with `TermStore::mk_internal_symbol`; exact
+/// pair-to-witness reuse is owned by `ArrayExtWitnessCache`, not by textual
+/// interning. This makes every public decision query a fresh Skolem scope.
+#[cfg(test)]
+pub(in crate::executor) const ARRAY_EXT_WITNESS_PREFIX: &str = "__ay_ext_diff!";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ArrayExtWitnessKey {
+    Pair(TermId, TermId),
+    Deep(TermId, TermId, usize),
+}
+
+#[derive(Debug, Clone)]
+struct ArrayExtWitnessIdentity {
+    term: TermId,
+    name: String,
+    var_id: u32,
+    sort: Sort,
+}
+
+/// Exact solver-recorded binding used to justify one generated
+/// extensionality clause.
+///
+/// The cache only records a binding while `witness` is an exact active
+/// identity. Consumers must still validate the clause schema; this registry
+/// proves origin, not logical shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArrayExtWitnessBinding {
+    pub(crate) witness: TermId,
+    pub(crate) array_a: TermId,
+    pub(crate) array_b: TermId,
+}
+
+/// A caller-authored root is unsafe to register or solve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArrayExtWitnessRootViolation {
+    /// The raw `TermId` is outside the owning store.
+    InvalidTerm(TermId),
+    /// The DAG captures an exact solver-generated witness identity.
+    CapturedWitness(TermId),
+}
+
+impl ArrayExtWitnessIdentity {
+    fn still_matches(&self, terms: &TermStore) -> bool {
+        self.term.index() < terms.len()
+            && terms.sort(self.term) == &self.sort
+            && matches!(
+                terms.get(self.term),
+                TermData::Var(name, var_id)
+                    if name == &self.name && var_id == &self.var_id
+            )
+    }
+}
+
+/// Per-public-query provenance and reuse table for array difference witnesses.
+///
+/// Active entries are shared by every generator and internal retry in one
+/// public query. `begin_public_solve` retires them before the next query, so a
+/// native caller cannot constrain an old raw `TermId` and make it the next
+/// query's Skolem. Retired identities remain exact (name + Var id + sort), so a
+/// speculative TermStore rollback that recycles a numeric `TermId` cannot
+/// taint the replacement term.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ArrayExtWitnessCache {
+    active: ay_core::kani_compat::DetHashMap<ArrayExtWitnessKey, ArrayExtWitnessIdentity>,
+    retired: ay_core::kani_compat::DetHashMap<TermId, ArrayExtWitnessIdentity>,
+    generated_clauses: ay_core::kani_compat::DetHashMap<TermId, Vec<ArrayExtWitnessBinding>>,
+}
+
+impl ArrayExtWitnessCache {
+    fn ordered(lhs: TermId, rhs: TermId) -> (TermId, TermId) {
+        if lhs.0 <= rhs.0 {
+            (lhs, rhs)
+        } else {
+            (rhs, lhs)
+        }
+    }
+
+    fn mint(&mut self, terms: &mut TermStore, sort: Sort) -> Option<ArrayExtWitnessIdentity> {
+        let name = loop {
+            let candidate = terms.mk_internal_symbol("ext_diff");
+            if !terms.has_var_name(&candidate) {
+                break candidate;
+            }
+        };
+        let term = terms.mk_var(name.clone(), sort.clone());
+        let TermData::Var(actual_name, var_id) = terms.get(term) else {
+            return None;
+        };
+        if actual_name != &name || terms.sort(term) != &sort {
+            return None;
+        }
+        Some(ArrayExtWitnessIdentity {
+            term,
+            name,
+            var_id: *var_id,
+            sort,
+        })
+    }
+
+    fn get_or_mint(
+        &mut self,
+        terms: &mut TermStore,
+        key: ArrayExtWitnessKey,
+        sort: Sort,
+    ) -> Option<TermId> {
+        if let Some(existing) = self.active.get(&key).cloned() {
+            if existing.still_matches(terms) {
+                return (existing.sort == sort).then_some(existing.term);
+            }
+            // A speculative rollback recycled this numeric TermId. Drop the
+            // stale cache entry before minting a new identity.
+            self.active.remove(&key);
+        }
+        let witness = self.mint(terms, sort)?;
+        let term = witness.term;
+        self.active.insert(key, witness);
+        Some(term)
+    }
+
+    fn pair(&mut self, terms: &mut TermStore, lhs: TermId, rhs: TermId) -> Option<TermId> {
+        if terms.sort(lhs) != terms.sort(rhs) {
+            return None;
+        }
+        let Sort::Array(array_sort) = terms.sort(lhs).clone() else {
+            return None;
+        };
+        let (lhs, rhs) = Self::ordered(lhs, rhs);
+        self.get_or_mint(
+            terms,
+            ArrayExtWitnessKey::Pair(lhs, rhs),
+            array_sort.index_sort,
+        )
+    }
+
+    fn deep(
+        &mut self,
+        terms: &mut TermStore,
+        root_lhs: TermId,
+        root_rhs: TermId,
+        level: usize,
+        index_sort: Sort,
+    ) -> Option<TermId> {
+        let (root_lhs, root_rhs) = Self::ordered(root_lhs, root_rhs);
+        self.get_or_mint(
+            terms,
+            ArrayExtWitnessKey::Deep(root_lhs, root_rhs, level),
+            index_sort,
+        )
+    }
+
+    /// Retire the preceding public query's witnesses and clear pair reuse.
+    pub(crate) fn begin_public_solve(&mut self, terms: &TermStore) {
+        self.generated_clauses.clear();
+        for witness in std::mem::take(&mut self.active).into_values() {
+            if witness.still_matches(terms) {
+                self.retired.insert(witness.term, witness);
+            }
+        }
+    }
+
+    /// Clear provenance when the owning `TermStore` is replaced by `(reset)`.
+    pub(crate) fn clear(&mut self) {
+        self.active.clear();
+        self.retired.clear();
+        self.generated_clauses.clear();
+    }
+
+    /// Whether `witness` is an exact identity minted in the current public
+    /// query. Numeric `TermId` equality alone is deliberately insufficient.
+    pub(crate) fn is_active_witness(&self, terms: &TermStore, witness: TermId) -> bool {
+        self.active
+            .values()
+            .any(|identity| identity.term == witness && identity.still_matches(terms))
+    }
+
+    fn is_retired_witness(&self, terms: &TermStore, witness: TermId) -> bool {
+        self.retired
+            .get(&witness)
+            .is_some_and(|identity| identity.still_matches(terms))
+    }
+
+    /// Record an extensionality clause and its ordered witness dependency
+    /// chain at the generation site.
+    ///
+    /// Every witness must still be active with exact identity provenance. The
+    /// proof layer independently recognizes the clause shape before consuming
+    /// this record, so a malformed or stale record cannot certify a step.
+    pub(crate) fn record_generated_clause(
+        &mut self,
+        terms: &TermStore,
+        clause: TermId,
+        bindings: Vec<ArrayExtWitnessBinding>,
+    ) -> bool {
+        if bindings.is_empty()
+            || bindings
+                .iter()
+                .any(|binding| !self.is_active_witness(terms, binding.witness))
+        {
+            self.generated_clauses.remove(&clause);
+            return false;
+        }
+        self.generated_clauses.insert(clause, bindings);
+        true
+    }
+
+    /// Exact active bindings recorded for `clause`, if none became stale.
+    pub(crate) fn generated_clause_bindings(
+        &self,
+        terms: &TermStore,
+        clause: TermId,
+    ) -> Option<&[ArrayExtWitnessBinding]> {
+        let bindings = self.generated_clauses.get(&clause)?;
+        bindings
+            .iter()
+            .all(|binding| self.is_active_witness(terms, binding.witness))
+            .then_some(bindings.as_slice())
+    }
+
+    /// Exact active provenance for proof promotion.
+    #[cfg(test)]
+    pub(crate) fn matches_pair(
+        &self,
+        terms: &TermStore,
+        witness: TermId,
+        lhs: TermId,
+        rhs: TermId,
+    ) -> bool {
+        let (lhs, rhs) = Self::ordered(lhs, rhs);
+        self.active
+            .get(&ArrayExtWitnessKey::Pair(lhs, rhs))
+            .is_some_and(|identity| identity.term == witness && identity.still_matches(terms))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pair_witness(
+        &self,
+        terms: &TermStore,
+        lhs: TermId,
+        rhs: TermId,
+    ) -> Option<TermId> {
+        let (lhs, rhs) = Self::ordered(lhs, rhs);
+        let identity = self.active.get(&ArrayExtWitnessKey::Pair(lhs, rhs))?;
+        identity.still_matches(terms).then_some(identity.term)
+    }
+
+    fn violation_in_roots(
+        &self,
+        terms: &TermStore,
+        roots: &[TermId],
+        include_active: bool,
+    ) -> Option<ArrayExtWitnessRootViolation> {
+        let mut seen = ay_core::kani_compat::DetHashSet::default();
+        let mut pending = roots.to_vec();
+        while let Some(term) = pending.pop() {
+            if !seen.insert(term) {
+                continue;
+            }
+            if term.index() >= terms.len() {
+                return Some(ArrayExtWitnessRootViolation::InvalidTerm(term));
+            }
+            if self.is_retired_witness(terms, term)
+                || (include_active && self.is_active_witness(terms, term))
+            {
+                return Some(ArrayExtWitnessRootViolation::CapturedWitness(term));
+            }
+            pending.extend(terms.children(term));
+        }
+        None
+    }
+
+    /// Reject registration of caller-authored DAGs that capture either a
+    /// current-query or prior-query witness.
+    pub(crate) fn registration_violation(
+        &self,
+        terms: &TermStore,
+        roots: &[TermId],
+    ) -> Option<ArrayExtWitnessRootViolation> {
+        self.violation_in_roots(terms, roots, true)
+    }
+
+    /// Reject a solve DAG that captures a witness retired at its public query
+    /// boundary. Active witnesses belong to internal retries of this query.
+    pub(crate) fn solve_violation(
+        &self,
+        terms: &TermStore,
+        roots: &[TermId],
+    ) -> Option<ArrayExtWitnessRootViolation> {
+        self.violation_in_roots(terms, roots, false)
+    }
+}
+
+/// Create or reuse the correctly-sorted witness for an unordered array pair.
+pub(in crate::executor) fn array_extensionality_witness(
+    terms: &mut TermStore,
+    cache: &mut ArrayExtWitnessCache,
+    lhs: TermId,
+    rhs: TermId,
+) -> Option<TermId> {
+    cache.pair(terms, lhs, rhs)
+}
+
+/// Create or reuse one level of a nested-array deep witness chain.
+pub(in crate::executor) fn deep_array_extensionality_witness(
+    terms: &mut TermStore,
+    cache: &mut ArrayExtWitnessCache,
+    root_lhs: TermId,
+    root_rhs: TermId,
+    level: usize,
+    index_sort: Sort,
+) -> Option<TermId> {
+    cache.deep(terms, root_lhs, root_rhs, level, index_sort)
+}
 
 /// Result of array axiom generation for QF_ABV
 pub(in crate::executor) struct ArrayAxiomResult {
@@ -233,10 +550,24 @@ pub(in crate::executor) fn parse_expression_split_disequality(
 
 pub(in crate::executor) fn create_expression_split_atoms(
     terms: &mut TermStore,
+    witness_cache: &mut ArrayExtWitnessCache,
     disequality_term: TermId,
 ) -> Option<(TermId, TermId, bool)> {
     let (lhs, rhs, is_distinct) = parse_expression_split_disequality(terms, disequality_term)?;
-    let (left_atom, right_atom) = create_expression_split_pair_atoms(terms, lhs, rhs)?;
+    let mut bindings = Vec::new();
+    let (left_atom, right_atom, leaf_lhs, leaf_rhs) =
+        create_expression_split_pair_atoms(terms, witness_cache, lhs, rhs, &mut bindings)?;
+    if !bindings.is_empty() {
+        // Materialize the logical extensionality clause even though the split
+        // encoder may lower it directly to SAT literals. Hash-consing lets a
+        // proof reconstructed in this shape recover the exact generation-site
+        // binding chain instead of trusting a symbol name.
+        let root_eq = terms.mk_eq(lhs, rhs);
+        let leaf_eq = terms.mk_eq(leaf_lhs, leaf_rhs);
+        let not_leaf_eq = terms.mk_not(leaf_eq);
+        let ext_clause = terms.mk_or(vec![root_eq, not_leaf_eq]);
+        witness_cache.record_generated_clause(terms, ext_clause, bindings);
+    }
     Some((left_atom, right_atom, is_distinct))
 }
 
@@ -250,8 +581,8 @@ pub(in crate::executor) fn create_expression_split_atoms(
 /// * `Real` → `lhs < rhs` / `lhs > rhs`.
 /// * `Array` → **extensionality skolemization**. `A ≠ B ⟹ select(A,k) ≠
 ///   select(B,k)` for a FRESH difference index `k`. We mint that skolem (one
-///   per array pair — the deterministic `__ext_diff_{a}_{b}` name is interned
-///   by `mk_var`, so repeated splits on the same pair reuse the same witness
+///   per canonical array pair and public query — the witness cache owns exact
+///   identity provenance, so repeated splits on the same pair reuse it
 ///   and `encode_and_add_split_clause`'s key-dedup keeps the clause count
 ///   bounded), form `select(A,k)` / `select(B,k)`, and RECURSE on that
 ///   (element-sorted) disequality. For the common `(Array I Int)` this
@@ -267,9 +598,11 @@ pub(in crate::executor) fn create_expression_split_atoms(
 /// caller then surfaces `Unknown(ExpressionSplit)` exactly as before.
 fn create_expression_split_pair_atoms(
     terms: &mut TermStore,
+    witness_cache: &mut ArrayExtWitnessCache,
     lhs: TermId,
     rhs: TermId,
-) -> Option<(TermId, TermId)> {
+    bindings: &mut Vec<ArrayExtWitnessBinding>,
+) -> Option<(TermId, TermId, TermId, TermId)> {
     if terms.sort(lhs) != terms.sort(rhs) {
         return None;
     }
@@ -278,7 +611,7 @@ fn create_expression_split_pair_atoms(
         Sort::Real => {
             let lt_atom = terms.mk_lt(lhs, rhs);
             let gt_atom = terms.mk_gt(lhs, rhs);
-            Some((lt_atom, gt_atom))
+            Some((lt_atom, gt_atom, lhs, rhs))
         }
         Sort::Int => {
             // For integers, use non-strict inequalities with adjusted bounds
@@ -290,25 +623,28 @@ fn create_expression_split_pair_atoms(
             let rhs_plus_one = terms.mk_add(vec![rhs, pos_one]);
             let le_atom = terms.mk_le(lhs, rhs_minus_one);
             let ge_atom = terms.mk_ge(lhs, rhs_plus_one);
-            Some((le_atom, ge_atom))
+            Some((le_atom, ge_atom, lhs, rhs))
         }
-        Sort::Array(arr) => {
+        Sort::Array(_) => {
             // Extensionality expression-split for Array-sorted disequalities.
             // `create_expression_split_atoms` previously returned `None` here,
             // bailing `Unknown(ExpressionSplit)` on satisfiable AUFLIA bases
             // whose only unsplittable disequalities were between arrays
             // (`seq_array(s1) ≠ seq_array(s2)`, `seq_array(s) ≠ store(a,i,v)`).
             //
-            // Mint the fresh difference index using the SAME `__ext_diff_{}_{}`
-            // discipline as the eager fixpoint so the witness is shared/deduped,
+            // Mint the fresh difference index using the SAME per-query canonical
+            // pair cache as the eager fixpoint so it is shared/deduped,
             // then reduce to the element-sorted split (recurses for nested
             // arrays; bottoms out in Int/Real).
-            let index_sort = arr.index_sort;
-            let skolem_name = format!("__ext_diff_{}_{}", lhs.0, rhs.0);
-            let diff_var = terms.mk_var(skolem_name, index_sort);
+            let diff_var = array_extensionality_witness(terms, witness_cache, lhs, rhs)?;
+            bindings.push(ArrayExtWitnessBinding {
+                witness: diff_var,
+                array_a: lhs,
+                array_b: rhs,
+            });
             let sel_lhs = terms.mk_select(lhs, diff_var);
             let sel_rhs = terms.mk_select(rhs, diff_var);
-            create_expression_split_pair_atoms(terms, sel_lhs, sel_rhs)
+            create_expression_split_pair_atoms(terms, witness_cache, sel_lhs, sel_rhs, bindings)
         }
         _ => None,
     }

@@ -42,11 +42,11 @@ const CONST_COLLECT_STACK_SIZE: usize = 1024 * 1024;
 /// backtracks the decision that forced the equality atom true.
 ///
 /// The canonical trigger: array extensionality Skolems. LIA assigns the
-/// fresh Skolem `__ext_diff = 0` whose sole reason chain is
-/// `{(= 0 __ext_diff) = true}` after a `NeedModelEqualities` round forces
+/// fresh Skolem `__ay_ext_diff = 0` whose sole reason chain is
+/// `{(= 0 __ay_ext_diff) = true}` after a `NeedModelEqualities` round forces
 /// the equality atom at the SAT layer. The bridge then would propagate
-/// `__ext_diff = 0` back into EUF with the same atom as its reason, which
-/// collides with a pre-existing top-level `(= 0 __ext_diff) = false`
+/// `__ay_ext_diff = 0` back into EUF with the same atom as its reason, which
+/// collides with a pre-existing top-level `(= 0 __ay_ext_diff) = false`
 /// assertion and produces false-UNSAT.
 fn reasons_are_self_evidencing(
     terms: &TermStore,

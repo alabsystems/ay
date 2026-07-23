@@ -175,9 +175,11 @@ fn test_expression_split_array_extensionality_skolemizes_diff_index() {
     let b = terms.mk_var("B", arr_sort);
     let eq = terms.mk_eq(a, b);
     let not_eq = terms.mk_not(eq);
+    let mut witness_cache = ArrayExtWitnessCache::default();
 
     let (le_atom, ge_atom, is_distinct) =
-        create_expression_split_atoms(&mut terms, not_eq).expect("array diseq must split");
+        create_expression_split_atoms(&mut terms, &mut witness_cache, not_eq)
+            .expect("array diseq must split");
     // `not (= A B)` is asserted true when the diseq holds, so the guard is a
     // distinct-style guard.
     assert!(is_distinct);
@@ -196,8 +198,8 @@ fn test_expression_split_array_extensionality_skolemizes_diff_index() {
     // k is a fresh extensionality skolem of the array's index sort (Int).
     match terms.get(k) {
         TermData::Var(name, _) => assert!(
-            name.starts_with("__ext_diff_"),
-            "difference index should be an __ext_diff skolem, got {name}"
+            name.starts_with(ARRAY_EXT_WITNESS_PREFIX),
+            "difference index should be an AY-internal extensionality skolem, got {name}"
         ),
         other => panic!("expected skolem var, got {other:?}"),
     }
@@ -230,11 +232,14 @@ fn test_expression_split_array_extensionality_dedups_skolem() {
     let b = terms.mk_var("B", arr_sort);
     let eq = terms.mk_eq(a, b);
     let not_eq = terms.mk_not(eq);
+    let mut witness_cache = ArrayExtWitnessCache::default();
 
-    let first = create_expression_split_atoms(&mut terms, not_eq).expect("split");
+    let first =
+        create_expression_split_atoms(&mut terms, &mut witness_cache, not_eq).expect("split");
     let len_after_first = terms.len();
-    let second = create_expression_split_atoms(&mut terms, not_eq).expect("split");
-    // Repeated splits on the SAME array disequality reuse the interned skolem
+    let second =
+        create_expression_split_atoms(&mut terms, &mut witness_cache, not_eq).expect("split");
+    // Repeated splits on the SAME array disequality reuse the cache-owned skolem
     // and interned atoms — no fresh terms — so the split-clause dedup in
     // `encode_and_add_split_clause` keeps the clause count bounded across the
     // Nelson-Oppen fixpoint rounds.
@@ -247,6 +252,39 @@ fn test_expression_split_array_extensionality_dedups_skolem() {
 }
 
 #[test]
+fn test_array_extensionality_witness_is_canonical_reserved_and_sort_checked() {
+    let mut terms = TermStore::new();
+    let index_sort = Sort::Uninterpreted("Index".to_string());
+    let arr_sort = Sort::array(index_sort.clone(), Sort::Int);
+    let a = terms.mk_var("A", arr_sort.clone());
+    let b = terms.mk_var("B", arr_sort);
+    let mut witness_cache = ArrayExtWitnessCache::default();
+
+    let forward = array_extensionality_witness(&mut terms, &mut witness_cache, a, b)
+        .expect("well-sorted array witness");
+    let reverse = array_extensionality_witness(&mut terms, &mut witness_cache, b, a)
+        .expect("reversed pair must reuse witness");
+    assert_eq!(forward, reverse, "unordered pair must have one witness");
+    assert_eq!(terms.sort(forward), &index_sort);
+    let TermData::Var(name, _) = terms.get(forward) else {
+        panic!("array witness must be a variable");
+    };
+    assert!(name.starts_with(ARRAY_EXT_WITNESS_PREFIX));
+    assert!(witness_cache.matches_pair(&terms, forward, a, b));
+
+    let c = terms.mk_var("C", Sort::array(Sort::Bool, Sort::Int));
+    let d = terms.mk_var("D", Sort::array(Sort::Bool, Sort::Int));
+    let preexisting = terms.mk_var("__ay_ext_diff!preexisting", Sort::Bool);
+    let wrong_sorted = terms.mk_var("__ay_ext_diff!wrong-sort", Sort::Int);
+    assert_eq!(terms.sort(wrong_sorted), &Sort::Int);
+    let bool_witness = array_extensionality_witness(&mut terms, &mut witness_cache, c, d)
+        .expect("cache must mint a fresh correctly-sorted identity");
+    assert_eq!(terms.sort(bool_witness), &Sort::Bool);
+    assert_ne!(bool_witness, preexisting, "must not adopt an existing name");
+    assert_ne!(bool_witness, wrong_sorted, "must not adopt a wrong sort");
+}
+
+#[test]
 fn test_expression_split_returns_none_for_unsplittable_sort() {
     let mut terms = TermStore::new();
     // A Bool-sorted disequality has no arithmetic/extensional branch split.
@@ -254,8 +292,80 @@ fn test_expression_split_returns_none_for_unsplittable_sort() {
     let q = terms.mk_var("q", Sort::Bool);
     let eq = terms.mk_eq(p, q);
     let not_eq = terms.mk_not(eq);
+    let mut witness_cache = ArrayExtWitnessCache::default();
     assert!(
-        create_expression_split_atoms(&mut terms, not_eq).is_none(),
+        create_expression_split_atoms(&mut terms, &mut witness_cache, not_eq).is_none(),
         "Bool disequality must not produce an expression split"
     );
+}
+
+#[test]
+fn test_array_extensionality_cache_retires_exact_identity_and_checks_raw_roots() {
+    let mut terms = TermStore::new();
+    let arr_sort = Sort::array(Sort::Int, Sort::Int);
+    let a = terms.mk_var("A", arr_sort.clone());
+    let b = terms.mk_var("B", arr_sort);
+    let mut cache = ArrayExtWitnessCache::default();
+    let witness = cache.pair(&mut terms, a, b).expect("witness");
+    let select = terms.mk_select(a, witness);
+
+    assert_eq!(
+        cache.registration_violation(&terms, &[select]),
+        Some(ArrayExtWitnessRootViolation::CapturedWitness(witness))
+    );
+    cache.begin_public_solve(&terms);
+    assert!(!cache.is_active_witness(&terms, witness));
+    assert_eq!(
+        cache.solve_violation(&terms, &[select]),
+        Some(ArrayExtWitnessRootViolation::CapturedWitness(witness))
+    );
+    assert_eq!(
+        cache.solve_violation(&terms, &[TermId(u32::MAX)]),
+        Some(ArrayExtWitnessRootViolation::InvalidTerm(TermId(u32::MAX)))
+    );
+}
+
+#[test]
+fn test_deep_extensionality_clause_records_active_binding_chain() {
+    let mut terms = TermStore::new();
+    let inner_sort = Sort::array(Sort::Bool, Sort::Int);
+    let outer_sort = Sort::array(Sort::Int, inner_sort);
+    let a = terms.mk_var("A", outer_sort.clone());
+    let b = terms.mk_var("B", outer_sort);
+    let mut cache = ArrayExtWitnessCache::default();
+
+    let outer_witness = cache
+        .deep(&mut terms, a, b, 0, Sort::Int)
+        .expect("outer witness");
+    let inner_a = terms.mk_select(a, outer_witness);
+    let inner_b = terms.mk_select(b, outer_witness);
+    let inner_witness = cache
+        .deep(&mut terms, a, b, 1, Sort::Bool)
+        .expect("inner witness");
+    let leaf_a = terms.mk_select(inner_a, inner_witness);
+    let leaf_b = terms.mk_select(inner_b, inner_witness);
+    let root_eq = terms.mk_eq(a, b);
+    let leaf_eq = terms.mk_eq(leaf_a, leaf_b);
+    let not_leaf_eq = terms.mk_not(leaf_eq);
+    let clause = terms.mk_or(vec![root_eq, not_leaf_eq]);
+    let bindings = vec![
+        ArrayExtWitnessBinding {
+            witness: outer_witness,
+            array_a: a,
+            array_b: b,
+        },
+        ArrayExtWitnessBinding {
+            witness: inner_witness,
+            array_a: inner_a,
+            array_b: inner_b,
+        },
+    ];
+
+    assert!(cache.record_generated_clause(&terms, clause, bindings.clone()));
+    assert_eq!(
+        cache.generated_clause_bindings(&terms, clause),
+        Some(bindings.as_slice())
+    );
+    assert!(cache.is_active_witness(&terms, outer_witness));
+    assert!(cache.is_active_witness(&terms, inner_witness));
 }

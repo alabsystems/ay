@@ -8,6 +8,7 @@
 mod test_abduction;
 mod test_annotated_core;
 mod test_api_health;
+mod test_array_ext_witness_api;
 mod test_bool_eq;
 mod test_bv;
 mod test_bv_api_simplification;
@@ -31,6 +32,7 @@ mod test_model_parse_fp_dt;
 mod test_native_replay;
 mod test_proof_access;
 mod test_proof_artifact;
+mod test_query_dump;
 mod test_solver_scope;
 mod test_solving_assumptions;
 mod test_solving_controls;

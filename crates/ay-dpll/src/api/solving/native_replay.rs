@@ -24,12 +24,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::api::types::{
-    LimitKind, Logic, NativeReplayArtifact, NativeReplayAssertion,
+    FuncDecl, LimitKind, Logic, NativeReplayArtifact, NativeReplayAssertion,
     NativeReplayCheckedReplaySummary, NativeReplayDeclaration, NativeReplayEvent,
     NativeReplayEventKind, NativeReplayEvidenceManifest, NativeReplayFunctionDeclaration,
     NativeReplayMetadata, NativeReplayModelSummary, NativeReplayProofSummary,
     NativeReplayResourceUsage, NativeReplaySolveSummary, NativeReplaySolverIdentity,
-    NativeReplayStatistics, NativeReplayTermNode, NativeReplayUnknownProgress,
+    NativeReplayStatistics, NativeReplayTermNode, NativeReplayUnknownProgress, Term,
     NATIVE_REPLAY_EVIDENCE_MANIFEST_SCHEMA, NATIVE_REPLAY_SCHEMA,
 };
 use crate::api::{Solver, SolverError};
@@ -249,6 +249,7 @@ impl Solver {
         artifact: &NativeReplayArtifact,
     ) -> Result<crate::api::types::SolveDetails, SolverError> {
         let logic = Logic::from_str(artifact.logic.as_deref().unwrap_or("ALL"))?;
+        validate_native_replay_identity_tables(artifact)?;
         let mut solver = Self::try_new(logic)?;
         if let Some(timeout_ms) = artifact.timeout_ms {
             solver.set_timeout(Some(Duration::from_millis(
@@ -273,9 +274,22 @@ impl Solver {
         // order. Preserve it here instead of cloning/sorting the entire slice.
         for node in &artifact.terms {
             if term_map.contains_key(&node.id) {
-                continue;
+                return Err(native_replay_artifact_error(format!(
+                    "duplicate term node id {}",
+                    node.id.0
+                )));
             }
             let replayed = rebuild_term_node(&mut solver, node, &declarations, &term_map)?;
+            let actual_sort = solver.terms().sort(replayed);
+            if actual_sort != &node.sort {
+                return Err(SolverError::InvalidArgument {
+                    operation: "native_replay",
+                    message: format!(
+                        "term {} records sort {}, but reconstruction produced {actual_sort}",
+                        node.id.0, node.sort
+                    ),
+                });
+            }
             term_map.insert(node.id, replayed);
         }
 
@@ -284,16 +298,16 @@ impl Solver {
         for assertion in assertions {
             let term = map_term(assertion.term, &term_map)?;
             if let Some(name) = assertion.name {
-                solver.try_assert_named(crate::api::types::Term(term), &name)?;
+                solver.try_assert_named(Term(term), &name)?;
             } else {
-                solver.try_assert_term(crate::api::types::Term(term))?;
+                solver.try_assert_term(Term(term))?;
             }
         }
 
         if let Some(assumptions) = final_check_sat_assumptions(&artifact.events) {
             let assumptions = assumptions
                 .iter()
-                .map(|&term| map_term(term, &term_map).map(crate::api::types::Term))
+                .map(|&term| map_term(term, &term_map).map(Term))
                 .collect::<Result<Vec<_>, SolverError>>()?;
             Ok(solver.check_sat_assuming_with_details(&assumptions).solve)
         } else {
@@ -994,6 +1008,102 @@ fn limit_phase(limit: LimitKind) -> String {
     .to_string()
 }
 
+/// Authenticate the two identity tables before replaying any node.
+///
+/// Artifact term IDs are graph identities, while declaration names are solver
+/// identities. Allowing either table to be last-wins (or allowing two term IDs
+/// to declare one name) can collapse distinct variables and change the replayed
+/// formula. Export produces one canonical entry in each table, so every
+/// ambiguity or metadata mismatch is malformed input and fails closed.
+fn validate_native_replay_identity_tables(
+    artifact: &NativeReplayArtifact,
+) -> Result<(), SolverError> {
+    let mut node_ids = HashSet::default();
+    let mut nodes = HashMap::default();
+    for node in &artifact.terms {
+        if !node_ids.insert(node.id) {
+            return Err(native_replay_artifact_error(format!(
+                "duplicate term node id {}",
+                node.id.0
+            )));
+        }
+        if node.is_datatype_constructor && !matches!(node.data, TermData::Var(..)) {
+            return Err(native_replay_artifact_error(format!(
+                "term {} claims datatype-constructor identity but is not a variable node",
+                node.id.0
+            )));
+        }
+        nodes.insert(node.id, node);
+    }
+
+    let mut declaration_terms = HashSet::default();
+    let mut declaration_names = HashSet::default();
+    for declaration in &artifact.declarations {
+        if !declaration_terms.insert(declaration.term) {
+            return Err(native_replay_artifact_error(format!(
+                "duplicate declaration for term {}",
+                declaration.term.0
+            )));
+        }
+        if !declaration_names.insert(declaration.name.as_str()) {
+            return Err(native_replay_artifact_error(format!(
+                "duplicate native constant declaration name `{}`",
+                declaration.name
+            )));
+        }
+        let Some(node) = nodes.get(&declaration.term) else {
+            return Err(native_replay_artifact_error(format!(
+                "declaration `{}` references missing term {}",
+                declaration.name, declaration.term.0
+            )));
+        };
+        let TermData::Var(node_name, _) = &node.data else {
+            return Err(native_replay_artifact_error(format!(
+                "declaration `{}` targets non-variable term {}",
+                declaration.name, declaration.term.0
+            )));
+        };
+        if node_name != &declaration.name {
+            return Err(native_replay_artifact_error(format!(
+                "declaration `{}` disagrees with term {} variable identity `{node_name}`",
+                declaration.name, declaration.term.0
+            )));
+        }
+        if declaration.sort.as_term_sort() != node.sort {
+            return Err(native_replay_artifact_error(format!(
+                "declaration `{}` lowers to sort {}, but term {} records {}",
+                declaration.name,
+                declaration.sort.as_term_sort(),
+                declaration.term.0,
+                node.sort
+            )));
+        }
+        if node.is_datatype_constructor {
+            return Err(native_replay_artifact_error(format!(
+                "term {} cannot be both a native constant and a datatype constructor",
+                declaration.term.0
+            )));
+        }
+    }
+
+    let mut function_names = HashSet::default();
+    for declaration in &artifact.function_declarations {
+        if !function_names.insert(declaration.name.as_str()) {
+            return Err(native_replay_artifact_error(format!(
+                "duplicate native function declaration name `{}`",
+                declaration.name
+            )));
+        }
+        if declaration_names.contains(declaration.name.as_str()) {
+            return Err(native_replay_artifact_error(format!(
+                "symbol `{}` is declared as both a constant and a function",
+                declaration.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn reason_phase(reason: &crate::UnknownReason) -> &'static str {
     match reason {
         crate::UnknownReason::Timeout
@@ -1024,7 +1134,7 @@ fn rebuild_term_node(
         },
         TermData::Var(name, _) => {
             if let Some(decl) = declarations.get(&node.id) {
-                Ok(solver.declare_const(&decl.name, decl.sort.clone()).0)
+                Ok(solver.try_declare_const(&decl.name, decl.sort.clone())?.0)
             } else if node.is_datatype_constructor {
                 // Nullary datatype constructors are stored as Vars. Reuse the
                 // term registered by the replayed datatype declaration so
@@ -1041,6 +1151,14 @@ fn rebuild_term_node(
                         ))
                     })
             } else {
+                if ay_frontend::is_reserved_symbol(name) {
+                    return Err(SolverError::InvalidArgument {
+                        operation: "native_replay",
+                        message: format!(
+                            "artifact contains undeclared variable in reserved namespace `{name}`"
+                        ),
+                    });
+                }
                 Ok(solver
                     .terms_mut()
                     .mk_fresh_named_var(name.clone(), node.sort.clone()))
@@ -1048,9 +1166,7 @@ fn rebuild_term_node(
         }
         TermData::App(symbol, args) => {
             let mapped = map_terms(args, term_map)?;
-            Ok(solver
-                .terms_mut()
-                .mk_app(symbol.clone(), mapped, node.sort.clone()))
+            rebuild_application(solver, node, symbol, args, mapped)
         }
         TermData::Let(bindings, body) => {
             let mapped_bindings = bindings
@@ -1058,18 +1174,42 @@ fn rebuild_term_node(
                 .map(|(name, term)| Ok((name.clone(), map_term(*term, term_map)?)))
                 .collect::<Result<Vec<_>, SolverError>>()?;
             let mapped_body = map_term(*body, term_map)?;
+            if solver.terms().sort(mapped_body) != &node.sort {
+                return Err(native_replay_term_error(
+                    node.id,
+                    "let expression result sort does not match its body",
+                ));
+            }
+            validate_replay_let(solver, node.id, &mapped_bindings, mapped_body)?;
             Ok(solver.terms_mut().mk_let(mapped_bindings, mapped_body))
         }
-        TermData::Not(inner) => Ok(solver.terms_mut().mk_not(map_term(*inner, term_map)?)),
+        TermData::Not(inner) => {
+            let inner = map_term(*inner, term_map)?;
+            require_replay_sort(solver, node.id, inner, &Sort::Bool, "not operand")?;
+            Ok(solver.terms_mut().mk_not(inner))
+        }
         TermData::Ite(cond, then_term, else_term) => {
             let cond = map_term(*cond, term_map)?;
             let then_term = map_term(*then_term, term_map)?;
             let else_term = map_term(*else_term, term_map)?;
+            require_replay_sort(solver, node.id, cond, &Sort::Bool, "ite condition")?;
+            let then_sort = solver.terms().sort(then_term);
+            let else_sort = solver.terms().sort(else_term);
+            if then_sort != else_sort || then_sort != &node.sort {
+                return Err(native_replay_term_error(
+                    node.id,
+                    format!(
+                        "ite branch sorts must match the recorded result sort (then {then_sort}, else {else_sort}, result {})",
+                        node.sort
+                    ),
+                ));
+            }
             Ok(solver.terms_mut().mk_ite(cond, then_term, else_term))
         }
         TermData::Forall(vars, body, triggers) => {
             let body = map_term(*body, term_map)?;
             let triggers = map_triggers(triggers, term_map)?;
+            validate_replay_quantifier(solver, node.id, vars, body, &triggers)?;
             Ok(solver
                 .terms_mut()
                 .mk_forall_with_triggers(vars.clone(), body, triggers))
@@ -1077,12 +1217,774 @@ fn rebuild_term_node(
         TermData::Exists(vars, body, triggers) => {
             let body = map_term(*body, term_map)?;
             let triggers = map_triggers(triggers, term_map)?;
+            validate_replay_quantifier(solver, node.id, vars, body, &triggers)?;
             Ok(solver
                 .terms_mut()
                 .mk_exists_with_triggers(vars.clone(), body, triggers))
         }
         _ => unreplayable_term("future term kind", node.id),
     }
+}
+
+fn rebuild_application(
+    solver: &mut Solver,
+    node: &NativeReplayTermNode,
+    symbol: &Symbol,
+    raw_args: &[TermId],
+    mapped_args: Vec<TermId>,
+) -> Result<TermId, SolverError> {
+    let term_count = solver.terms().len();
+    if let Some((&raw, &mapped)) = raw_args
+        .iter()
+        .zip(&mapped_args)
+        .find(|(_, mapped)| mapped.index() >= term_count)
+    {
+        return Err(native_replay_term_error(
+            node.id,
+            format!(
+                "application argument {} mapped to invalid replay term {}",
+                raw.0, mapped.0
+            ),
+        ));
+    }
+
+    match symbol {
+        Symbol::Named(name) => {
+            // `const-array` is stored as a named application in the native
+            // term DAG, but its SMT-LIB surface form is a qualified `const`
+            // identifier.  Reconstruct it directly: the value alone does not
+            // carry the array's index sort, so recover that authority from the
+            // recorded result sort and let the fallible native constructor
+            // rebuild the exact node.
+            if name == "const-array" {
+                return rebuild_const_array(solver, node, &mapped_args);
+            }
+
+            // A programmatic declaration owns its exact symbol identity even
+            // when the spelling resembles one of the core encodings used for
+            // higher-order array operators. In particular, native nullary UFs
+            // are registered in the frontend as constant-like symbols, but
+            // `try_apply` still represents their calls as zero-argument Apps.
+            // Authenticate registered declarations before interpreting the
+            // `as-array[...]` / `map[...]` encodings.
+            let declaration = solver
+                .executor
+                .context()
+                .symbol_info_by_identity(name)
+                .cloned();
+            if let Some(declaration) = declaration {
+                let is_native_function = solver.native_fun_signatures.contains_key(name);
+                if declaration.term.is_some() && !is_native_function {
+                    return Err(native_replay_term_error(
+                        node.id,
+                        format!("application head `{name}` denotes a registered nullary constant"),
+                    ));
+                }
+                let actual_domain: Vec<Sort> = mapped_args
+                    .iter()
+                    .map(|&arg| solver.terms().sort(arg).clone())
+                    .collect();
+                let function = replayed_function_declaration(
+                    solver,
+                    node.id,
+                    name,
+                    &declaration,
+                    &actual_domain,
+                    &node.sort,
+                )?;
+                let args: Vec<Term> = mapped_args.iter().copied().map(Term).collect();
+                let rebuilt = solver.try_apply(&function, &args).map_err(|error| {
+                    native_replay_term_error(
+                        node.id,
+                        format!(
+                            "registered application `{name}` does not match its declaration: {error}"
+                        ),
+                    )
+                })?;
+                return validate_rebuilt_application(solver, node, symbol, &mapped_args, rebuilt.0);
+            }
+
+            if let Some(function) = name
+                .strip_prefix("as-array[")
+                .and_then(|name| name.strip_suffix(']'))
+            {
+                return rebuild_as_array(solver, node, function, &mapped_args);
+            }
+            if let Some(function) = name
+                .strip_prefix("map[")
+                .and_then(|name| name.strip_suffix(']'))
+            {
+                return rebuild_array_map(solver, node, function, &mapped_args);
+            }
+        }
+        Symbol::Indexed(_, _) => {}
+        _ => return unreplayable_term("future application symbol", node.id),
+    }
+
+    rebuild_builtin_application(solver, node, symbol, &mapped_args)
+}
+
+fn rebuild_const_array(
+    solver: &mut Solver,
+    node: &NativeReplayTermNode,
+    args: &[TermId],
+) -> Result<TermId, SolverError> {
+    let [value] = args else {
+        return Err(native_replay_term_error(
+            node.id,
+            format!(
+                "`const-array` requires exactly one value argument, got {}",
+                args.len()
+            ),
+        ));
+    };
+    let Sort::Array(array) = &node.sort else {
+        return Err(native_replay_term_error(
+            node.id,
+            "`const-array` must have an array result sort",
+        ));
+    };
+
+    let rebuilt = solver
+        .try_const_array(array.index_sort.clone(), Term(*value))
+        .map_err(|error| {
+            native_replay_term_error(
+                node.id,
+                format!("cannot reconstruct `const-array`: {error}"),
+            )
+        })?;
+    let actual_sort = solver.terms().sort(rebuilt.0);
+    if actual_sort != &node.sort {
+        return Err(native_replay_term_error(
+            node.id,
+            format!(
+                "`const-array` records result sort {}, but its value reconstructs {actual_sort}",
+                node.sort
+            ),
+        ));
+    }
+    Ok(rebuilt.0)
+}
+
+fn rebuild_as_array(
+    solver: &mut Solver,
+    node: &NativeReplayTermNode,
+    function: &str,
+    args: &[TermId],
+) -> Result<TermId, SolverError> {
+    if !args.is_empty() {
+        return Err(native_replay_term_error(
+            node.id,
+            format!("`as-array[{function}]` requires zero arguments"),
+        ));
+    }
+    let Sort::Array(array) = &node.sort else {
+        return Err(native_replay_term_error(
+            node.id,
+            format!("`as-array[{function}]` must have an array result sort"),
+        ));
+    };
+    authenticate_function_signature(
+        solver,
+        node.id,
+        function,
+        std::slice::from_ref(&array.index_sort),
+        &array.element_sort,
+    )?;
+    Ok(solver.terms_mut().mk_as_array(function, node.sort.clone()))
+}
+
+fn rebuild_array_map(
+    solver: &mut Solver,
+    node: &NativeReplayTermNode,
+    function: &str,
+    args: &[TermId],
+) -> Result<TermId, SolverError> {
+    if args.is_empty() {
+        return Err(native_replay_term_error(
+            node.id,
+            format!("`map[{function}]` requires at least one array argument"),
+        ));
+    }
+    let Sort::Array(result) = &node.sort else {
+        return Err(native_replay_term_error(
+            node.id,
+            format!("`map[{function}]` must have an array result sort"),
+        ));
+    };
+    let mut domain = Vec::with_capacity(args.len());
+    for &arg in args {
+        let Sort::Array(array) = solver.terms().sort(arg) else {
+            return Err(native_replay_term_error(
+                node.id,
+                format!("`map[{function}]` argument {} is not an array", arg.0),
+            ));
+        };
+        if array.index_sort != result.index_sort {
+            return Err(native_replay_term_error(
+                node.id,
+                format!(
+                    "`map[{function}]` argument {} has the wrong index sort",
+                    arg.0
+                ),
+            ));
+        }
+        domain.push(array.element_sort.clone());
+    }
+    authenticate_function_signature(solver, node.id, function, &domain, &result.element_sort)?;
+    Ok(solver
+        .terms_mut()
+        .mk_array_map(function, args.to_vec(), node.sort.clone()))
+}
+
+fn authenticate_function_signature(
+    solver: &mut Solver,
+    node: TermId,
+    name: &str,
+    domain: &[Sort],
+    range: &Sort,
+) -> Result<(), SolverError> {
+    let mut arguments = Vec::with_capacity(domain.len());
+    for sort in domain {
+        arguments.push(
+            solver
+                .try_fresh_var("native_replay_validation", sort.clone())
+                .map_err(|error| {
+                    native_replay_term_error(
+                        node,
+                        format!("cannot validate function `{name}`: {error}"),
+                    )
+                })?,
+        );
+    }
+    let registered = solver
+        .executor
+        .context()
+        .symbol_info_by_identity(name)
+        .cloned();
+    if let Some(registered) = registered {
+        let declaration =
+            replayed_function_declaration(solver, node, name, &registered, domain, range)?;
+        solver
+            .try_apply(&declaration, &arguments)
+            .map_err(|error| {
+                native_replay_term_error(
+                    node,
+                    format!("function `{name}` does not match a replayed declaration: {error}"),
+                )
+            })?;
+        return Ok(());
+    }
+
+    let bindings: Vec<(String, TermId)> = arguments
+        .iter()
+        .enumerate()
+        .map(|(index, argument)| (format!("native_replay_function_arg_{index}"), argument.0))
+        .collect();
+    let parsed = ay_frontend::Term::App(
+        name.to_string(),
+        bindings
+            .iter()
+            .map(|(name, _)| ay_frontend::Term::Symbol(name.clone()))
+            .collect(),
+    );
+    let application = solver
+        .executor
+        .context_mut()
+        .elaborate_surface_subterm_with_bindings(&parsed, &bindings)
+        .ok_or_else(|| {
+            native_replay_term_error(
+                node,
+                format!("function `{name}` is neither declared nor a valid named builtin"),
+            )
+        })?;
+    let actual_range = solver.terms().sort(application);
+    if actual_range != range {
+        return Err(native_replay_term_error(
+            node,
+            format!("function `{name}` has result sort {actual_range}, expected {range}"),
+        ));
+    }
+    Ok(())
+}
+
+fn replayed_function_declaration(
+    solver: &Solver,
+    node: TermId,
+    name: &str,
+    registered: &ay_frontend::SymbolInfo,
+    actual_domain: &[Sort],
+    actual_range: &Sort,
+) -> Result<FuncDecl, SolverError> {
+    let Some((declared_domain, declared_range)) = solver.native_fun_signatures.get(name) else {
+        if registered.arg_sorts != actual_domain || &registered.sort != actual_range {
+            return Err(native_replay_term_error(
+                node,
+                format!("registered datatype member `{name}` has a different signature"),
+            ));
+        }
+        return Ok(FuncDecl::new(
+            name.to_string(),
+            registered.arg_sorts.clone(),
+            registered.sort.clone(),
+        ));
+    };
+    if declared_domain.len() != actual_domain.len() {
+        return Err(native_replay_term_error(
+            node,
+            format!(
+                "function `{name}` expects {} arguments, got {}",
+                declared_domain.len(),
+                actual_domain.len()
+            ),
+        ));
+    }
+    let mut type_bindings: HashMap<String, Sort> = HashMap::default();
+    let domain_matches = declared_domain
+        .iter()
+        .zip(actual_domain)
+        .all(|(declared, actual)| bind_native_replay_sort(declared, actual, &mut type_bindings));
+    if !domain_matches || !bind_native_replay_sort(declared_range, actual_range, &mut type_bindings)
+    {
+        return Err(native_replay_term_error(
+            node,
+            format!("function `{name}` has a different replayed signature"),
+        ));
+    }
+    Ok(FuncDecl::new(
+        name.to_string(),
+        declared_domain
+            .iter()
+            .map(|sort| instantiate_native_replay_sort(sort, &type_bindings))
+            .collect(),
+        instantiate_native_replay_sort(declared_range, &type_bindings),
+    ))
+}
+
+fn bind_native_replay_sort(
+    declared: &Sort,
+    actual: &Sort,
+    bindings: &mut HashMap<String, Sort>,
+) -> bool {
+    match declared {
+        Sort::TypeVar(name) => match bindings.get(name) {
+            Some(bound) => bound == actual,
+            None => {
+                bindings.insert(name.clone(), actual.clone());
+                true
+            }
+        },
+        Sort::Array(declared) => match actual {
+            Sort::Array(actual) => {
+                bind_native_replay_sort(&declared.index_sort, &actual.index_sort, bindings)
+                    && bind_native_replay_sort(
+                        &declared.element_sort,
+                        &actual.element_sort,
+                        bindings,
+                    )
+            }
+            _ => false,
+        },
+        Sort::Seq(declared) => match actual {
+            Sort::Seq(actual) => bind_native_replay_sort(declared, actual, bindings),
+            _ => false,
+        },
+        _ => declared.as_term_sort() == actual.clone(),
+    }
+}
+
+fn instantiate_native_replay_sort(sort: &Sort, bindings: &HashMap<String, Sort>) -> Sort {
+    match sort {
+        Sort::TypeVar(name) => bindings.get(name).cloned().unwrap_or_else(|| sort.clone()),
+        Sort::Array(array) => Sort::array(
+            instantiate_native_replay_sort(&array.index_sort, bindings),
+            instantiate_native_replay_sort(&array.element_sort, bindings),
+        ),
+        Sort::Seq(element) => Sort::seq(instantiate_native_replay_sort(element, bindings)),
+        _ => sort.clone(),
+    }
+}
+
+fn rebuild_builtin_application(
+    solver: &mut Solver,
+    node: &NativeReplayTermNode,
+    symbol: &Symbol,
+    args: &[TermId],
+) -> Result<TermId, SolverError> {
+    let bindings: Vec<(String, TermId)> = args
+        .iter()
+        .enumerate()
+        .map(|(index, &arg)| (format!("native_replay_arg_{index}"), arg))
+        .collect();
+    let parsed_args = bindings
+        .iter()
+        .map(|(name, _)| ay_frontend::Term::Symbol(name.clone()))
+        .collect();
+    let parsed = match symbol {
+        Symbol::Named(name) => ay_frontend::Term::App(name.clone(), parsed_args),
+        Symbol::Indexed(name, indices) => ay_frontend::Term::IndexedApp(
+            name.clone(),
+            indices
+                .iter()
+                .map(|index| ay_frontend::Index::Numeral(index.to_string()))
+                .collect(),
+            parsed_args,
+        ),
+        _ => return unreplayable_term("future application symbol", node.id),
+    };
+    let rebuilt = solver
+        .executor
+        .context_mut()
+        .elaborate_surface_subterm_with_bindings(&parsed, &bindings)
+        .ok_or_else(|| {
+            native_replay_term_error(
+                node.id,
+                format!("unrecognized or ill-sorted builtin application `{symbol}`"),
+            )
+        })?;
+    let actual_sort = solver.terms().sort(rebuilt);
+    if actual_sort != &node.sort {
+        return Err(native_replay_term_error(
+            node.id,
+            format!(
+                "builtin application `{symbol}` records result sort {}, but validation produced {actual_sort}",
+                node.sort
+            ),
+        ));
+    }
+    Ok(rebuilt)
+}
+
+fn validate_rebuilt_application(
+    solver: &Solver,
+    node: &NativeReplayTermNode,
+    expected_symbol: &Symbol,
+    expected_args: &[TermId],
+    rebuilt: TermId,
+) -> Result<TermId, SolverError> {
+    let actual_sort = solver.terms().sort(rebuilt);
+    let exact_shape = matches!(
+        solver.terms().get(rebuilt),
+        TermData::App(actual_symbol, actual_args)
+            if actual_symbol == expected_symbol && actual_args == expected_args
+    );
+    if actual_sort != &node.sort || !exact_shape {
+        return Err(native_replay_term_error(
+            node.id,
+            format!(
+                "registered application `{expected_symbol}` did not reconstruct its exact recorded signature"
+            ),
+        ));
+    }
+    Ok(rebuilt)
+}
+
+fn native_replay_term_error(node: TermId, message: impl Into<String>) -> SolverError {
+    SolverError::InvalidArgument {
+        operation: "native_replay",
+        message: format!("cannot rebuild term {}: {}", node.0, message.into()),
+    }
+}
+
+fn native_replay_artifact_error(message: impl Into<String>) -> SolverError {
+    SolverError::InvalidArgument {
+        operation: "native_replay",
+        message: message.into(),
+    }
+}
+
+fn require_replay_sort(
+    solver: &Solver,
+    node: TermId,
+    term: TermId,
+    expected: &Sort,
+    role: &str,
+) -> Result<(), SolverError> {
+    let actual = solver.terms().sort(term);
+    if actual != expected {
+        return Err(native_replay_term_error(
+            node,
+            format!("{role} must have sort {expected}, got {actual}"),
+        ));
+    }
+    Ok(())
+}
+
+const NATIVE_REPLAY_BINDER_SCAN_BUDGET: usize = 100_000;
+
+fn validate_replay_let(
+    solver: &Solver,
+    node: TermId,
+    bindings: &[(String, TermId)],
+    body: TermId,
+) -> Result<(), SolverError> {
+    let mut names = HashSet::default();
+    if let Some((name, _)) = bindings.iter().find(|(name, _)| !names.insert(name)) {
+        return Err(native_replay_term_error(
+            node,
+            format!("let expression repeats binding `{name}`"),
+        ));
+    }
+    let expected: Vec<(String, Sort)> = bindings
+        .iter()
+        .map(|(name, value)| (name.clone(), solver.terms().sort(*value).clone()))
+        .collect();
+    validate_bound_name_occurrences(solver.terms(), node, &expected, &[body])?;
+    Ok(())
+}
+
+fn validate_replay_quantifier(
+    solver: &Solver,
+    node: TermId,
+    vars: &[(String, Sort)],
+    body: TermId,
+    triggers: &[Vec<TermId>],
+) -> Result<(), SolverError> {
+    require_replay_sort(solver, node, body, &Sort::Bool, "quantifier body")?;
+    let mut names = HashSet::default();
+    if let Some((name, _)) = vars.iter().find(|(name, _)| !names.insert(name)) {
+        return Err(native_replay_term_error(
+            node,
+            format!("quantifier repeats binding `{name}`"),
+        ));
+    }
+
+    let mut roots = Vec::with_capacity(1 + triggers.iter().map(Vec::len).sum::<usize>());
+    roots.push(body);
+    for multi_trigger in triggers {
+        if multi_trigger.is_empty() {
+            return Err(native_replay_term_error(
+                node,
+                "quantifier contains an empty trigger group",
+            ));
+        }
+        for &trigger in multi_trigger {
+            if !matches!(solver.terms().get(trigger), TermData::App(_, _)) {
+                return Err(native_replay_term_error(
+                    node,
+                    "quantifier trigger is not an application",
+                ));
+            }
+            roots.push(trigger);
+        }
+    }
+
+    let expected: Vec<(String, Sort)> = vars
+        .iter()
+        .map(|(name, sort)| (name.clone(), sort.as_term_sort()))
+        .collect();
+    let coverage = validate_bound_name_occurrences(solver.terms(), node, &expected, &roots)?;
+    if coverage
+        .iter()
+        .skip(1)
+        .any(|contains_bound| !contains_bound)
+    {
+        return Err(native_replay_term_error(
+            node,
+            "quantifier trigger contains no variable bound by this quantifier",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct NativeReplayShadowScope {
+    parent: Option<usize>,
+    names: HashSet<usize>,
+}
+
+struct NativeReplayBinderScan<'a> {
+    terms: &'a TermStore,
+    owner: TermId,
+    expected: HashMap<String, (usize, Sort)>,
+    scopes: Vec<NativeReplayShadowScope>,
+    shadow_cache: HashMap<(usize, usize), bool>,
+    work: usize,
+}
+
+impl<'a> NativeReplayBinderScan<'a> {
+    fn new(
+        terms: &'a TermStore,
+        owner: TermId,
+        bindings: &[(String, Sort)],
+    ) -> Result<Self, SolverError> {
+        let mut scan = Self {
+            terms,
+            owner,
+            expected: HashMap::default(),
+            scopes: Vec::new(),
+            shadow_cache: HashMap::default(),
+            work: 0,
+        };
+        for (index, (name, sort)) in bindings.iter().enumerate() {
+            scan.charge()?;
+            scan.expected.insert(name.clone(), (index, sort.clone()));
+        }
+        Ok(scan)
+    }
+
+    fn charge(&mut self) -> Result<(), SolverError> {
+        if self.work >= NATIVE_REPLAY_BINDER_SCAN_BUDGET {
+            return Err(native_replay_term_error(
+                self.owner,
+                format!(
+                    "binder validation exceeds {NATIVE_REPLAY_BINDER_SCAN_BUDGET} aggregate work units"
+                ),
+            ));
+        }
+        self.work += 1;
+        Ok(())
+    }
+
+    /// Add one lexical scope containing only names relevant to the outer
+    /// binder. The linked representation avoids cloning a binder-sized bitset
+    /// at every nested quantifier; shadow lookups consume the same aggregate
+    /// work budget as term traversal.
+    fn extend_scope<'b>(
+        &mut self,
+        parent: Option<usize>,
+        names: impl IntoIterator<Item = &'b str>,
+    ) -> Result<Option<usize>, SolverError> {
+        let mut shadowed = HashSet::default();
+        for name in names {
+            self.charge()?;
+            if let Some(&(index, _)) = self.expected.get(name) {
+                shadowed.insert(index);
+            }
+        }
+        if shadowed.is_empty() {
+            return Ok(parent);
+        }
+        let id = self.scopes.len();
+        self.scopes.push(NativeReplayShadowScope {
+            parent,
+            names: shadowed,
+        });
+        Ok(Some(id))
+    }
+
+    fn is_shadowed(&mut self, scope: Option<usize>, target: usize) -> Result<bool, SolverError> {
+        let Some(mut current) = scope else {
+            return Ok(false);
+        };
+        if let Some(&cached) = self.shadow_cache.get(&(current, target)) {
+            return Ok(cached);
+        }
+
+        let mut traversed = Vec::new();
+        let result = loop {
+            if let Some(&cached) = self.shadow_cache.get(&(current, target)) {
+                break cached;
+            }
+            self.charge()?;
+            traversed.push(current);
+            let frame = &self.scopes[current];
+            if frame.names.contains(&target) {
+                break true;
+            }
+            let Some(parent) = frame.parent else {
+                break false;
+            };
+            current = parent;
+        };
+        for scope_id in traversed {
+            self.shadow_cache.insert((scope_id, target), result);
+        }
+        Ok(result)
+    }
+
+    /// Scan one body or trigger once against the complete binder name map.
+    /// The memo key includes lexical shadow scope because a hash-consed DAG
+    /// node may be reached both inside and outside a nested same-name binder.
+    fn scan_root(&mut self, root: TermId) -> Result<bool, SolverError> {
+        let mut found = false;
+        let mut seen = HashSet::default();
+        let mut pending = vec![(root, None)];
+
+        while let Some((term, scope)) = pending.pop() {
+            if !seen.insert((term, scope)) {
+                continue;
+            }
+            self.charge()?;
+            match self.terms.get(term).clone() {
+                TermData::Const(_) => {}
+                TermData::Var(candidate, _) => {
+                    if let Some((index, expected)) = self.expected.get(&candidate).cloned() {
+                        if !self.is_shadowed(scope, index)? {
+                            let actual = self.terms.sort(term);
+                            if actual != &expected {
+                                return Err(native_replay_term_error(
+                                    self.owner,
+                                    format!(
+                                        "bound variable `{candidate}` is declared as {expected} but occurs as {actual}"
+                                    ),
+                                ));
+                            }
+                            found = true;
+                        }
+                    }
+                }
+                TermData::App(_, args) => {
+                    pending.extend(args.into_iter().map(|arg| (arg, scope)));
+                }
+                TermData::Not(inner) => pending.push((inner, scope)),
+                TermData::Ite(condition, then_term, else_term) => {
+                    pending.push((condition, scope));
+                    pending.push((then_term, scope));
+                    pending.push((else_term, scope));
+                }
+                TermData::Let(bindings, body) => {
+                    pending.extend(bindings.iter().map(|(_, value)| (*value, scope)));
+                    let nested =
+                        self.extend_scope(scope, bindings.iter().map(|(name, _)| name.as_str()))?;
+                    pending.push((body, nested));
+                }
+                TermData::Forall(vars, body, triggers) | TermData::Exists(vars, body, triggers) => {
+                    let nested =
+                        self.extend_scope(scope, vars.iter().map(|(name, _)| name.as_str()))?;
+                    pending.push((body, nested));
+                    pending.extend(
+                        triggers
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .map(|trigger| (trigger, nested)),
+                    );
+                }
+                _ => {
+                    return Err(native_replay_term_error(
+                        self.owner,
+                        "binder validation encountered an unsupported future term kind",
+                    ));
+                }
+            }
+        }
+        Ok(found)
+    }
+}
+
+/// Validate all unshadowed occurrences against the complete binder signature
+/// in one traversal per body/trigger root, under one aggregate work envelope.
+/// Returns bound-variable coverage for each root in the same order.
+fn validate_bound_name_occurrences(
+    terms: &TermStore,
+    owner: TermId,
+    expected: &[(String, Sort)],
+    roots: &[TermId],
+) -> Result<Vec<bool>, SolverError> {
+    let mut scan = NativeReplayBinderScan::new(terms, owner, expected)?;
+    let mut root_cache = HashMap::default();
+    roots
+        .iter()
+        .map(|&root| {
+            if let Some(&found) = root_cache.get(&root) {
+                return Ok(found);
+            }
+            let found = scan.scan_root(root)?;
+            root_cache.insert(root, found);
+            Ok(found)
+        })
+        .collect()
 }
 
 fn map_term(id: TermId, term_map: &HashMap<TermId, TermId>) -> Result<TermId, SolverError> {

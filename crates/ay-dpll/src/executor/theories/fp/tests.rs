@@ -1527,6 +1527,32 @@ fn fp_to_real_guided_presolve_two_vars() {
     assert_eq!(results, vec!["sat"]);
 }
 
+// The Real-guided fp.to_real solve temporarily replaces the outer assertions
+// with a rewritten FP-free subproblem. Its SAT/theory state must be private to
+// that probe: after popping the fp.to_real scope, `r` is free to take a value
+// inconsistent with the popped FP conversion.
+#[test]
+#[timeout(60_000)]
+fn fp_to_real_rewritten_subsolve_does_not_leak_across_pop() {
+    let results = run_script(
+        r#"
+(set-logic QF_FPLRA)
+(declare-const x (_ FloatingPoint 8 24))
+(declare-const r Real)
+(assert (>= r 0.0))
+(check-sat)
+(push)
+(assert (fp.eq x (fp #b0 #b01111111 #b00000000000000000000000)))
+(assert (= r (fp.to_real x)))
+(check-sat)
+(pop)
+(assert (= r 2.0))
+(check-sat)
+"#,
+    );
+    assert_eq!(results, vec!["sat", "sat", "sat"]);
+}
+
 // Push/pop incremental soundness regression (#8714).
 //
 // Ported-test-only analog of Z3 PR #9028 (FPA push/pop soundness). Z3's bug was

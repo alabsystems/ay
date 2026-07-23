@@ -11,7 +11,10 @@
 mod check;
 
 use ay_core::term::TermData;
-use ay_core::{AletheRule, Proof, ProofId, ProofStep, Sort, Symbol, TheoryLemmaKind};
+use ay_core::{
+    AletheRule, FarkasAnnotation, Proof, ProofId, ProofStep, Sort, Symbol, TheoryLemmaKind,
+    TheoryLit,
+};
 use ay_core::{TermId, TermStore};
 use ay_frontend::command::{
     Constant as FrontendConstant, Index as FrontendIndex, Term as FrontendTerm,
@@ -37,7 +40,22 @@ use super::Executor;
 /// pp-family: 2s solves whose emission ground for 300s+ without completing).
 /// Deterministic (work units, not wall time). Never applied to explicit
 /// `--proof`, `--strict-proofs`, `--self-check`, or `(get-proof)`.
-const DEFAULT_ALETHE_EMISSION_WORK_BUDGET: u64 = 2_000_000_000;
+///
+/// Calibration (#A2b-recal): store-chain (dis)equality UNSAT proofs render the
+/// array-extensionality witness (`__ay_arr2lia_k` choice term inside a nested
+/// read-over-write `ite`) as a tree, not a DAG, so a handful of proof steps
+/// balloon to hundreds of MB of surface — measured 821 MB / ~1 GB on the
+/// QF_ALIA `ios_t1_*` family, at which point the whole best-effort document is
+/// discarded anyway (whole-document rejection on exhaustion). At 2 GB the
+/// "bounded time" contract failed: `ios_*00004` ground out a full 821 MB proof
+/// (~2.8s) and `ios_*00005` rendered ~1 GB before giving up (~5.9s), both AFTER
+/// a sub-0.2s UNSAT verdict. A best-effort text certificate over tens of MB is
+/// impractical for any downstream checker, so bound rendering to 64 MiB of
+/// surface: normal proofs (KB–single-digit MB — every carcara-checked test
+/// proof included) are untouched and still fully emitted; only the pathological
+/// tree-expansions truncate early to the honest "no proof certificate emitted"
+/// warning. The verdict is already out and unchanged either way.
+const DEFAULT_ALETHE_EMISSION_WORK_BUDGET: u64 = 64 * 1024 * 1024;
 
 /// Insert `root` and every nested `and`-conjunct beneath it into `set`.
 ///
@@ -214,6 +232,15 @@ impl Executor {
 
         crate::executor::proof_resolution::prune_to_empty_clause_derivation(&mut proof);
 
+        // RoundingMode finite-domain certification. The core represents
+        // SMT-LIB's built-in five-element sort as uninterpreted and injects its
+        // domain axioms before solving. SAT reconstruction can surface those
+        // roots either as Generic theory lemmas or as premiseless `trust`
+        // leaves. Promote only exact instances accepted by the proof checker's
+        // own five-mode recognizer; every other generated leaf remains trust.
+        self.rebuild_rounding_mode_pigeonhole_refutation(&mut proof);
+        Self::promote_rounding_mode_domain_lemmas(&self.ctx.terms, &mut proof);
+
         // Contextual ROW2 repair (#trust-count→0): the eager array lane can
         // record the context-dependent unit `select(store(a,i,v),j)=select(a,j)`
         // and let SAT use the separate `i≠j` assertion.  A unit ROW2 equality
@@ -250,12 +277,39 @@ impl Executor {
         // exact-IEEE evaluation). SOUND + fail-closed; see method.
         Self::promote_fp_classification_lemmas(&self.ctx.terms, &mut proof);
 
+        // RoundingMode finite-domain proof promotion. The solve path injects
+        // exact five-value distinctness/coverage axioms because the core stores
+        // `RoundingMode` as an uninterpreted sort. Those formulas are FP-theory
+        // theorems, not authored assumptions. Promote only units accepted by
+        // the strict checker's exact schema recognizer; malformed or partial
+        // lookalikes remain trust/unauthorized and fail closed.
+        Self::promote_fp_rounding_mode_domain_axioms(&self.ctx.terms, &mut proof);
+
+        // Packed propositional clauses introduced by top-level connective
+        // flattening are generated tautologies, not authored assumptions.
+        // Promote only units accepted by the strict checker's structural
+        // complement/and-projection recognizer. This is deliberately separate
+        // from the RM-domain rule: one certifies Boolean clausification, the
+        // other certifies the fixed IEEE domain.
+        Self::promote_bool_tautology_leaves(&self.ctx.terms, &mut proof);
+
+        // str.len length-axiom promotion (#selfcert-strlen): the solver injects
+        // universally-valid str.len theorems (concat-length sum, empty↔zero,
+        // non-negativity, constant/equal length, containment bounds) during
+        // QF_SLIA/QF_S preprocessing. Being no authored premise, they surfaced as
+        // foreign `assume` leaves the #8821 provenance gate rejected, degrading a
+        // correct UNSAT to `unknown`. Re-tag each such leaf as the strict
+        // checker's independently re-derived `StringLengthLemma` rule; malformed
+        // lookalikes stay `assume` and fail closed.
+        Self::promote_string_length_lemma_axioms(&self.ctx.terms, &mut proof);
+
         // Array read-over-write collapse (#trust-count→0): an assertion that is
         // the negation of a ROW1 instance folds to `false` during elaboration,
         // degenerating the UNSAT proof to a single empty-clause `trust` step.
         // Reconstruct the assume + strict-checkable `ArraySelectStore` lemma +
         // resolution from the parsed assertion. SOUND + fail-closed; see method.
         self.promote_array_row_collapse(&mut proof);
+        self.promote_array_row_value_mismatch(&mut proof);
 
         // Datatype selector-projection collapse (#trust-count→0): an assertion
         // `(not (= (sel_i (C a..)) a_i))` folds to `false` during elaboration,
@@ -344,6 +398,11 @@ impl Executor {
         // itself carries eq_congruent/eq_transitive/eq_congruent_pred plus an
         // explicit weakening for unused conflict literals. Atomic strict
         // validation prevents partial promotion from masking any other trust.
+        // Pre-promote authenticated array-extensionality leaves first: they are
+        // conservative-extension lemmas, not unrelated trust, and otherwise
+        // make this EUF pass's whole-proof strict gate reject a valid rebuild.
+        // The final extensionality pass below remains after every surgery.
+        self.promote_array_extensionality_axioms(&mut proof);
         self.promote_certified_generic_euf_leaves(&mut proof);
 
         // Shadowed-store equality expansion: the eager array fixpoint uses the
@@ -372,10 +431,27 @@ impl Executor {
         // proof content — an `array_ext_diff_intro` step binding `k` to the
         // pair it was minted for — which `ay-proof` then independently checks
         // (bound once, not self-referential, and FRESH against the problem's
-        // own symbols). MUST run last: it appends steps that must survive every
-        // prune, and matches the axiom in whichever shape the passes above left
-        // it. Fail-closed; see `proof_array_ext`.
+        // own symbols). This second, idempotent call runs last: it appends steps
+        // that must survive every prune and matches the axiom in whichever shape
+        // the passes above left it. Fail-closed; see `proof_array_ext`.
         self.promote_array_extensionality_axioms(&mut proof);
+
+        // Final RM authority boundary. Late proof surgery may retain the
+        // solver's weakened six-term conflict clause even after the injected
+        // domain/Boolean assumptions above were individually certified. The
+        // exact checker recognizes its load-bearing literal only when it is the
+        // complete K6 pairwise-distinct negation over the five-value RM domain.
+        // Re-run the same producer/checker predicate here, after every surgery;
+        // malformed, partial, or wrong-sort conflicts remain Generic and fail
+        // strict validation.
+        Self::promote_fp_rounding_mode_domain_axioms(&self.ctx.terms, &mut proof);
+
+        // Final str.len length-axiom boundary (#selfcert-strlen): mirror the RM
+        // boundary above — a late collapse/rebuild pass can re-materialize an
+        // injected length axiom as an `assume` leaf, so re-run the promotion here,
+        // after every surgery and immediately before proof validation, so no
+        // certified length theorem is left as a foreign assume.
+        Self::promote_string_length_lemma_axioms(&self.ctx.terms, &mut proof);
 
         // Proof validation (#4393): validates all non-Hole steps via partial
         // checker. Replaces the old check_proof + Hole-skip pattern that skipped
@@ -670,12 +746,12 @@ impl Executor {
                     // lemmas whose unit certificate does not fully verify keep
                     // the pre-existing flow (Farkas reconstruction, then the
                     // demote pass) untouched.
-                    let unit = ay_core::FarkasAnnotation::from_ints(&vec![1i64; clause.len()]);
-                    let conflict: Vec<ay_core::TheoryLit> = clause
+                    let unit = FarkasAnnotation::from_ints(&vec![1i64; clause.len()]);
+                    let conflict: Vec<TheoryLit> = clause
                         .iter()
                         .map(|&lit| {
                             let (inner, neg) = strip_not_local(terms, lit);
-                            ay_core::TheoryLit::new(inner, neg)
+                            TheoryLit::new(inner, neg)
                         })
                         .collect();
                     if ay_core::proof_validation::verify_farkas_conflict_lits_linear(
@@ -1089,7 +1165,10 @@ impl Executor {
         });
         proof.steps = new_steps;
         proof.named_steps = remapped_named;
-        if self.check_proof_strict_with_datatypes(proof).is_err() {
+        if self
+            .check_proof_strict_derivation_with_datatypes(proof)
+            .is_err()
+        {
             proof.steps = original;
             proof.named_steps = original_named;
         }
@@ -1132,6 +1211,82 @@ impl Executor {
         }
     }
 
+    /// Replace a reconstructed Tseitin proof of a caller-authored
+    /// `RoundingMode` pigeonhole with its direct strict certificate.
+    fn rebuild_rounding_mode_pigeonhole_refutation(&mut self, proof: &mut Proof) {
+        let legitimate = self.proof_legit_assume_set();
+        let candidates: Vec<_> = proof
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                ProofStep::Assume(term) if legitimate.contains(term) => Some(*term),
+                _ => None,
+            })
+            .collect();
+
+        let mut certificate = None;
+        for assumption in candidates {
+            let negated = self.ctx.terms.mk_not_raw(assumption);
+            if ay_proof::recognize_rounding_mode_domain(&self.ctx.terms, &[negated]) {
+                certificate = Some((assumption, negated));
+                break;
+            }
+        }
+        let Some((assumption, negated)) = certificate else {
+            return;
+        };
+
+        // The independently checked theorem says that more than five values of
+        // the fixed five-element sort cannot be pairwise distinct. Rebuild the
+        // noisy SAT/Tseitin chain as the direct two-premise refutation, retaining
+        // only the caller-authored assumption as proof authority.
+        let mut rebuilt = Proof::new();
+        let assume_id = rebuilt.add_assume(assumption, None);
+        let lemma_id = rebuilt.add_theory_lemma_with_kind(
+            "FP",
+            vec![negated],
+            TheoryLemmaKind::RoundingModeDomain,
+        );
+        rebuilt.add_resolution(Vec::new(), assumption, assume_id, lemma_id);
+        *proof = rebuilt;
+    }
+
+    /// Promote exact SMT-LIB `RoundingMode` domain axioms to their
+    /// strict-checkable theory kind.
+    fn promote_rounding_mode_domain_lemmas(terms: &TermStore, proof: &mut Proof) {
+        for step in &mut proof.steps {
+            let trust_clause = match step {
+                ProofStep::TheoryLemma { kind, clause, .. } if kind.is_trust() => {
+                    if ay_proof::recognize_rounding_mode_domain(terms, clause) {
+                        *kind = TheoryLemmaKind::RoundingModeDomain;
+                    }
+                    None
+                }
+                ProofStep::Step {
+                    rule: AletheRule::Trust,
+                    clause,
+                    premises,
+                    args,
+                } if premises.is_empty()
+                    && args.is_empty()
+                    && ay_proof::recognize_rounding_mode_domain(terms, clause) =>
+                {
+                    Some(clause.clone())
+                }
+                _ => None,
+            };
+            if let Some(clause) = trust_clause {
+                *step = ProofStep::TheoryLemma {
+                    theory: "FP".to_string(),
+                    clause,
+                    farkas: None,
+                    kind: TheoryLemmaKind::RoundingModeDomain,
+                    lia: None,
+                };
+            }
+        }
+    }
+
     /// Finalize-time promotion of `Generic` integer-divisibility conflicts to the
     /// strict-checkable `LiaGeneric` + [`ay_core::LiaAnnotation::Divisibility`]
     /// (#trust-count→0).
@@ -1170,6 +1325,129 @@ impl Executor {
                 }
             }
         }
+    }
+
+    /// Promote exact fixed-domain `RoundingMode` axioms from generic/injected
+    /// proof leaves to an independently checked FP theory rule.
+    fn promote_fp_rounding_mode_domain_axioms(terms: &TermStore, proof: &mut Proof) {
+        for step in &mut proof.steps {
+            match step {
+                ProofStep::TheoryLemma { kind, clause, .. }
+                    if kind.is_trust()
+                        && ay_proof::recognize_fp_rounding_mode_domain(terms, clause) =>
+                {
+                    *kind = TheoryLemmaKind::FpRoundingModeDomain;
+                }
+                ProofStep::Assume(term)
+                    if ay_proof::recognize_fp_rounding_mode_domain(terms, &[*term]) =>
+                {
+                    let term = *term;
+                    *step = ProofStep::TheoryLemma {
+                        theory: "FP".to_string(),
+                        clause: vec![term],
+                        farkas: None,
+                        kind: TheoryLemmaKind::FpRoundingModeDomain,
+                        lia: None,
+                    };
+                }
+                _ => {}
+            }
+        }
+        proof
+            .named_steps
+            .retain(|_, id| matches!(proof.steps.get(id.0 as usize), Some(ProofStep::Assume(_))));
+    }
+
+    /// Promote solver-generated packed Boolean tautology leaves to the strict
+    /// checker's independently revalidated `BoolTautology` rule.
+    fn promote_bool_tautology_leaves(terms: &TermStore, proof: &mut Proof) {
+        for step in &mut proof.steps {
+            match step {
+                ProofStep::TheoryLemma { kind, clause, .. }
+                    if kind.is_trust() && ay_proof::recognize_bool_tautology(terms, clause) =>
+                {
+                    *kind = TheoryLemmaKind::BoolTautology;
+                }
+                ProofStep::Assume(term) if ay_proof::recognize_bool_tautology(terms, &[*term]) => {
+                    let term = *term;
+                    *step = ProofStep::TheoryLemma {
+                        theory: "Bool".to_string(),
+                        clause: vec![term],
+                        farkas: None,
+                        kind: TheoryLemmaKind::BoolTautology,
+                        lia: None,
+                    };
+                }
+                _ => {}
+            }
+        }
+        proof
+            .named_steps
+            .retain(|_, id| matches!(proof.steps.get(id.0 as usize), Some(ProofStep::Assume(_))));
+    }
+
+    /// Promote the solver's injected `str.len` length axioms
+    /// (`collect_str_len_axioms_from_roots`) from foreign `assume` leaves to the
+    /// strict checker's independently re-derived `StringLengthLemma` rule.
+    ///
+    /// These facts — concat-length sum, empty↔zero-length, non-negativity,
+    /// constant length, equal-length congruence, and containment length bounds —
+    /// are UNIVERSALLY VALID `str.len` theorems, not authored premises, so being
+    /// `assume`d they were rejected by the #8821 provenance gate and the whole
+    /// (correct) UNSAT degraded to `unknown` under `--self-check` /
+    /// `--strict-proofs`. Each is a theory tautology, so re-tagging the leaf as a
+    /// unit `TheoryLemma` with the SAME clause `[t]` keeps every downstream
+    /// resolution/DRUP linkage intact while giving the leaf a checkable rule.
+    /// `ay_proof::recognize_string_length_lemma` is the EXACT precondition of the
+    /// strict validator (structural, fail-closed on any near-miss), so a leaf
+    /// that is not a genuine length theorem is left an `assume` and still fails
+    /// closed. SOUND: an accepted clause is valid under every model
+    /// (#selfcert-strlen).
+    fn promote_string_length_lemma_axioms(terms: &TermStore, proof: &mut Proof) {
+        for step in &mut proof.steps {
+            match step {
+                ProofStep::TheoryLemma { kind, clause, .. }
+                    if kind.is_trust()
+                        && ay_proof::recognize_string_length_lemma(terms, clause) =>
+                {
+                    *kind = TheoryLemmaKind::StringLengthLemma;
+                }
+                ProofStep::Assume(term)
+                    if ay_proof::recognize_string_length_lemma(terms, &[*term]) =>
+                {
+                    let term = *term;
+                    *step = ProofStep::TheoryLemma {
+                        theory: "STRINGS".to_string(),
+                        clause: vec![term],
+                        farkas: None,
+                        kind: TheoryLemmaKind::StringLengthLemma,
+                        lia: None,
+                    };
+                }
+                ProofStep::Step {
+                    rule: AletheRule::Trust,
+                    clause,
+                    premises,
+                    args,
+                } if premises.is_empty()
+                    && args.is_empty()
+                    && ay_proof::recognize_string_length_lemma(terms, clause) =>
+                {
+                    let clause = clause.clone();
+                    *step = ProofStep::TheoryLemma {
+                        theory: "STRINGS".to_string(),
+                        clause,
+                        farkas: None,
+                        kind: TheoryLemmaKind::StringLengthLemma,
+                        lia: None,
+                    };
+                }
+                _ => {}
+            }
+        }
+        proof
+            .named_steps
+            .retain(|_, id| matches!(proof.steps.get(id.0 as usize), Some(ProofStep::Assume(_))));
     }
 
     /// Whether `clause` is a single negated GROUND arithmetic equality
@@ -1250,9 +1528,10 @@ impl Executor {
                     // LiaAnnotation, not these coefficients.
                     *lia = Some(ay_core::LiaAnnotation::Divisibility);
                     if farkas.is_none() {
-                        *farkas = Some(ay_core::FarkasAnnotation::new(vec![
-                            num_rational::Rational64::from(1),
-                        ]));
+                        *farkas =
+                            Some(FarkasAnnotation::new(vec![num_rational::Rational64::from(
+                                1,
+                            )]));
                     }
                 }
             }
@@ -1326,6 +1605,130 @@ impl Executor {
                 TheoryLemmaKind::ArraySelectStore { index_eq: true },
             );
             proof.add_resolution(vec![], eq_t, assume_id, lemma_id);
+            return;
+        }
+    }
+
+    /// Reconstruct a ROW1 value-mismatch refutation erased by eager folding.
+    ///
+    /// For an authored assertion
+    /// `(= (select (store a i stored) i) compared)`, simplification replaces
+    /// the select with `stored`. If the two values are arithmetically
+    /// inconsistent, surface rewriting can otherwise print the resulting
+    /// arithmetic lemma as though it directly refuted the unfurled select.
+    /// Rebuild the missing theory boundary explicitly:
+    ///
+    /// 1. assume the exact raw authored equality;
+    /// 2. derive `select(store(a,i,stored),i) = stored` by ROW1;
+    /// 3. derive that the two equalities cannot both hold by a checked Farkas
+    ///    certificate; and
+    /// 4. resolve to the empty clause.
+    ///
+    /// Every recognition or checker failure is a no-op.
+    fn promote_array_row_value_mismatch(&mut self, proof: &mut Proof) {
+        if !Self::proof_derives_empty_clause(proof) {
+            return;
+        }
+        let parsed: Vec<FrontendTerm> = self.ctx.assertions_parsed().to_vec();
+        for assertion in &parsed {
+            let Some((array, index, stored, compared, select_on_left)) =
+                match_row1_value_mismatch(assertion)
+            else {
+                continue;
+            };
+            let (Some(array), Some(index), Some(stored), Some(compared)) = (
+                self.ctx.elaborate_surface_subterm(array),
+                self.ctx.elaborate_surface_subterm(index),
+                self.ctx.elaborate_surface_subterm(stored),
+                self.ctx.elaborate_surface_subterm(compared),
+            ) else {
+                continue;
+            };
+            let Sort::Array(array_sort) = self.ctx.terms.sort(array).clone() else {
+                continue;
+            };
+            if self.ctx.terms.sort(index) != &array_sort.index_sort
+                || self.ctx.terms.sort(stored) != &array_sort.element_sort
+                || self.ctx.terms.sort(compared) != &array_sort.element_sort
+                || !matches!(&array_sort.element_sort, Sort::Int | Sort::Real)
+            {
+                continue;
+            }
+
+            let store = self.ctx.terms.mk_store(array, index, stored);
+            let select = self.ctx.terms.mk_app(
+                Symbol::named("select"),
+                [store, index],
+                array_sort.element_sort,
+            );
+            let row_equality =
+                self.ctx
+                    .terms
+                    .mk_app(Symbol::named("="), [select, stored], Sort::Bool);
+            let authored_equality = if select_on_left {
+                self.ctx
+                    .terms
+                    .mk_app(Symbol::named("="), [select, compared], Sort::Bool)
+            } else {
+                self.ctx
+                    .terms
+                    .mk_app(Symbol::named("="), [compared, select], Sort::Bool)
+            };
+            // The premise admitted below must be the exact recursively raw
+            // SMT-LIB source, not merely a semantically equivalent equality
+            // rebuilt from canonicalized children. Nested folds/reorderings
+            // need their own explicit proof bridge; this narrow ROW1 repair
+            // declines them.
+            let Some(raw_authored_equality) = self.raw_intern_surface(assertion) else {
+                continue;
+            };
+            if raw_authored_equality != authored_equality {
+                continue;
+            }
+            let not_authored = self.ctx.terms.mk_not_raw(authored_equality);
+            let not_row = self.ctx.terms.mk_not_raw(row_equality);
+            let farkas = FarkasAnnotation::from_ints(&[1, 1]);
+            let conflict = [
+                TheoryLit::new(authored_equality, true),
+                TheoryLit::new(row_equality, true),
+            ];
+            if ay_core::proof_validation::verify_farkas_conflict_lits_linear(
+                &self.ctx.terms,
+                &conflict,
+                &farkas,
+            )
+            .is_err()
+            {
+                continue;
+            }
+
+            let mut rebuilt = Proof::new();
+            let authored_id = rebuilt.add_assume(authored_equality, None);
+            let row_id = rebuilt.add_theory_lemma_with_kind(
+                "array",
+                vec![row_equality],
+                TheoryLemmaKind::ArraySelectStore { index_eq: true },
+            );
+            let conflict_id = rebuilt.add_step(ProofStep::TheoryLemma {
+                theory: "LRA".to_string(),
+                clause: vec![not_authored, not_row],
+                farkas: Some(farkas),
+                kind: TheoryLemmaKind::LraFarkas,
+                lia: None,
+            });
+            let without_authored =
+                rebuilt.add_resolution(vec![not_row], authored_equality, conflict_id, authored_id);
+            rebuilt.add_resolution(vec![], row_equality, without_authored, row_id);
+
+            let Ok(quality) = self.check_proof_strict_derivation_with_datatypes(&rebuilt) else {
+                continue;
+            };
+            if quality.trust_count != 0 {
+                continue;
+            }
+            *proof = rebuilt;
+            self.record_rebuilt_authored_proof_premise(raw_authored_equality);
+            self.last_proof_term_overrides = None;
             return;
         }
     }
@@ -1750,9 +2153,9 @@ impl Executor {
                 // coefficient per literal to render `lia_generic` (#8821), so
                 // attach the trivial `[1]` for the single literal — purely for
                 // rendering, mirroring the divisibility promotion.
-                farkas: Some(ay_core::FarkasAnnotation::new(vec![
-                    num_rational::Rational64::from(1),
-                ])),
+                farkas: Some(FarkasAnnotation::new(vec![num_rational::Rational64::from(
+                    1,
+                )])),
                 kind: TheoryLemmaKind::LiaGeneric,
                 lia: Some(ay_core::LiaAnnotation::LinearIdentity),
             });
@@ -2037,9 +2440,9 @@ impl Executor {
         let bridge_lem = proof.add_step(ProofStep::TheoryLemma {
             theory: "LIA".to_string(),
             clause: vec![bridge],
-            farkas: Some(ay_core::FarkasAnnotation::new(vec![
-                num_rational::Rational64::from(1),
-            ])),
+            farkas: Some(FarkasAnnotation::new(vec![num_rational::Rational64::from(
+                1,
+            )])),
             kind: TheoryLemmaKind::LiaGeneric,
             lia: Some(ay_core::LiaAnnotation::LinearIdentity),
         });
@@ -2106,9 +2509,9 @@ impl Executor {
             theory: "LIA".to_string(),
             clause: vec![div_neg],
             farkas: div_farkas.or_else(|| {
-                Some(ay_core::FarkasAnnotation::new(vec![
-                    num_rational::Rational64::from(1),
-                ]))
+                Some(FarkasAnnotation::new(vec![num_rational::Rational64::from(
+                    1,
+                )]))
             }),
             kind: TheoryLemmaKind::LiaGeneric,
             lia: Some(ay_core::LiaAnnotation::Divisibility),
@@ -2572,7 +2975,7 @@ impl Executor {
     /// original source assertions; proof reconstruction may re-intern the
     /// exact parsed source form; check-sat-assuming adds another authored
     /// source. Derived temporary constraints are intentionally absent.
-    fn proof_export_scope_assertions(&self) -> Vec<TermId> {
+    pub(crate) fn proof_export_scope_assertions(&self) -> Vec<TermId> {
         let mut scope = self.proof_problem_assertions();
         for assertion in self.proof_original_problem_assertions() {
             if !scope.contains(&assertion) {
@@ -2605,7 +3008,7 @@ impl Executor {
     /// authored proof premise. Callers must finish their structural and strict
     /// lemma-recognizer gates before recording it; arbitrary solver-derived
     /// terms never enter this set.
-    fn record_rebuilt_authored_proof_premise(&mut self, premise: TermId) {
+    pub(super) fn record_rebuilt_authored_proof_premise(&mut self, premise: TermId) {
         if !self.last_proof_rebuild_originals.contains(&premise) {
             self.last_proof_rebuild_originals.push(premise);
         }
@@ -2966,6 +3369,7 @@ fn plan_shadowed_store_equality_proof(
             value_eq,
         });
     }
+
     None
 }
 
@@ -3393,7 +3797,7 @@ struct RelationalCongruencePlan {
     /// The arithmetic bridge clause `(cl ¬(= (f A) (f B)) ¬(R (f A) (f B)))`.
     la_clause: Vec<TermId>,
     /// Its solver-synthesized Farkas certificate.
-    la_farkas: ay_core::FarkasAnnotation,
+    la_farkas: FarkasAnnotation,
     /// The certified kind reported by the Farkas reconstruction.
     la_kind: TheoryLemmaKind,
 }
@@ -3646,7 +4050,7 @@ struct LiaValuePlan {
     /// is the arithmetic conflict literal `¬(arith on (f B))`.
     la_clause: Vec<TermId>,
     /// Its solver-synthesized Farkas certificate.
-    la_farkas: ay_core::FarkasAnnotation,
+    la_farkas: FarkasAnnotation,
 }
 
 /// `(R a b)` with `R` a linear-arithmetic comparison.
@@ -3879,6 +4283,57 @@ fn match_row1_negation(asrt: &FrontendTerm) -> Option<(&str, &str, &str)> {
         if store_idx == select_idx && store_val == compared_val {
             return Some((arr, store_idx, store_val));
         }
+    }
+    None
+}
+
+/// Match an authored ROW1 value comparison
+/// `(= (select (store a i stored) i) compared)` (either equality
+/// orientation), where the store and select indices are the exact same
+/// surface term and `stored` differs syntactically from `compared`.
+///
+/// The returned components are elaborated independently by the caller so the
+/// select-over-store application itself can be rebuilt without triggering the
+/// eager ROW1 fold.
+fn match_row1_value_mismatch(
+    assertion: &FrontendTerm,
+) -> Option<(
+    &FrontendTerm,
+    &FrontendTerm,
+    &FrontendTerm,
+    &FrontendTerm,
+    bool,
+)> {
+    let FrontendTerm::App(eq, args) = assertion else {
+        return None;
+    };
+    if eq != "=" || args.len() != 2 {
+        return None;
+    }
+    for (select_position, compared_position) in [(0usize, 1usize), (1, 0)] {
+        let FrontendTerm::App(select, select_args) = &args[select_position] else {
+            continue;
+        };
+        if select != "select" || select_args.len() != 2 {
+            continue;
+        }
+        let FrontendTerm::App(store, store_args) = &select_args[0] else {
+            continue;
+        };
+        if store != "store"
+            || store_args.len() != 3
+            || store_args[1] != select_args[1]
+            || store_args[2] == args[compared_position]
+        {
+            continue;
+        }
+        return Some((
+            &store_args[0],
+            &store_args[1],
+            &store_args[2],
+            &args[compared_position],
+            select_position == 0,
+        ));
     }
     None
 }

@@ -615,6 +615,15 @@ static TEST_CAMPAIGN_STATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
     (std::sync::Mutex::new(false), std::sync::Condvar::new());
 
 #[cfg(test)]
+fn build_sandbox_test_lease_path() -> Option<PathBuf> {
+    if std::env::var_os("AY_CONTINUOUS_BUILD_SANDBOX").as_deref() != Some(std::ffi::OsStr::new("1"))
+    {
+        return None;
+    }
+    Some(std::env::temp_dir().join(format!("ay-bench-test-lease-{}.lock", std::process::id())))
+}
+
+#[cfg(test)]
 #[derive(Debug)]
 struct TestCampaignLease;
 
@@ -669,6 +678,14 @@ impl GlobalHarnessLease {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        #[cfg(test)]
+        if let Some(path) = build_sandbox_test_lease_path() {
+            // The complete cargo-test process is already inside the
+            // controller's host-leased, RSS-capped build namespace. Exercise
+            // nested harness logic against _oom_guard's explicit test seam
+            // instead of asking test code to mutate the read-only host lock.
+            command.arg("--test-lock-path").arg(path);
+        }
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -2794,6 +2811,24 @@ mod tests {
             "zero-job regression"
         )
         .is_err());
+    }
+
+    #[test]
+    fn build_sandbox_uses_only_the_explicit_test_lease_seam() {
+        let marked = std::env::var_os("AY_CONTINUOUS_BUILD_SANDBOX").as_deref()
+            == Some(std::ffi::OsStr::new("1"));
+        let path = build_sandbox_test_lease_path();
+        assert_eq!(path.is_some(), marked);
+        if let Some(path) = path {
+            assert!(path.is_absolute());
+            assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+            let name = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .expect("test lease filename");
+            assert!(name.starts_with("ay-bench-test-lease-"));
+            assert!(!name.starts_with("ay-oom-guard-"));
+        }
     }
 
     #[test]

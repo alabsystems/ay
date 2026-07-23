@@ -439,6 +439,89 @@ fn adapter_constant_identity_must_be_unique() {
     let _ = solver.declare_const_with_fresh_identity("x", "__private_x", Sort::Bool);
 }
 
+/// The verification-consumer `__upgraded` prophecy path may refine an opaque
+/// `Uninterpreted("T")` placeholder to the concrete same-named `Datatype`.
+/// This one narrow metadata upgrade reuses the existing core term.
+#[test]
+fn native_constant_refines_uninterpreted_to_same_named_datatype() {
+    let mut solver = Solver::try_new(Logic::All).unwrap();
+    let opaque = solver.declare_const("opt", Sort::Uninterpreted("OptionInt".to_string()));
+    let option_int = Sort::Datatype(DatatypeSort::new(
+        "OptionInt",
+        vec![
+            DatatypeConstructor::unit("None"),
+            DatatypeConstructor::new(
+                "Some",
+                vec![DatatypeField::new("option_some_value", Sort::Int)],
+            ),
+        ],
+    ));
+    let refined = solver.declare_const("opt", option_int.clone());
+    // Both surface sorts lower to `Uninterpreted("OptionInt")`, so the same
+    // underlying core identity is reused rather than a fresh term minted.
+    assert_eq!(opaque, refined);
+    // The more informative datatype surface sort is adopted.
+    assert_eq!(solver.term_sort(refined), option_int);
+    // The reverse spelling likewise reuses the term, but MUST retain the more
+    // informative datatype rather than downgrading its schema.
+    let back = solver.declare_const("opt", Sort::Uninterpreted("OptionInt".to_string()));
+    assert_eq!(back, refined);
+    assert_eq!(solver.term_sort(back), option_int);
+}
+
+#[test]
+#[should_panic(expected = "already declared with sort")]
+fn native_constant_rejects_int_char_same_core_redeclaration() {
+    let mut solver = Solver::try_new(Logic::All).unwrap();
+    let _ = solver.declare_const("codepoint", Sort::Int);
+    let _ = solver.declare_const("codepoint", Sort::Char);
+}
+
+#[test]
+#[should_panic(expected = "already declared with sort")]
+fn native_constant_rejects_finite_domains_with_different_cardinality() {
+    let mut solver = Solver::try_new(Logic::All).unwrap();
+    let _ = solver.declare_const("fd", Sort::FiniteDomain("FD".to_string(), 3));
+    let _ = solver.declare_const("fd", Sort::FiniteDomain("FD".to_string(), 4));
+}
+
+#[test]
+#[should_panic(expected = "already declared with sort")]
+fn native_constant_rejects_type_variable_as_uninterpreted_same_name() {
+    let mut solver = Solver::try_new(Logic::All).unwrap();
+    let _ = solver.declare_const("generic", Sort::TypeVar("T".to_string()));
+    let _ = solver.declare_const("generic", Sort::Uninterpreted("T".to_string()));
+}
+
+#[test]
+#[should_panic(expected = "already declared with sort")]
+fn native_constant_rejects_arrays_whose_surface_elements_differ() {
+    let mut solver = Solver::try_new(Logic::All).unwrap();
+    let chars = Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Char)));
+    let ints = Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Int)));
+    let _ = solver.declare_const("array", chars);
+    let _ = solver.declare_const("array", ints);
+}
+
+#[test]
+#[should_panic(expected = "already declared with sort")]
+fn native_constant_rejects_conflicting_same_named_datatype_schema() {
+    let mut solver = Solver::try_new(Logic::All).unwrap();
+    let first = Sort::Datatype(DatatypeSort::new(
+        "Choice",
+        vec![DatatypeConstructor::unit("A")],
+    ));
+    let conflicting = Sort::Datatype(DatatypeSort::new(
+        "Choice",
+        vec![
+            DatatypeConstructor::unit("A"),
+            DatatypeConstructor::unit("B"),
+        ],
+    ));
+    let _ = solver.declare_const("choice", first);
+    let _ = solver.declare_const("choice", conflicting);
+}
+
 #[test]
 fn adapter_display_name_cannot_alias_later_native_constant() {
     let mut solver = Solver::try_new(Logic::All).unwrap();
@@ -541,4 +624,146 @@ fn repeated_native_function_declaration_is_an_exact_no_op() {
         solver.try_get_model().is_ok(),
         "an exact primary redeclaration must preserve the preceding result"
     );
+}
+
+#[test]
+fn native_definitional_forall_adopts_exact_macro_and_prints_model() {
+    let mut solver = Solver::try_new(Logic::Uflia).unwrap();
+    let predicate = solver
+        .try_declare_fun("native_positive", &[Sort::Int], Sort::Bool)
+        .unwrap();
+    let parameter = solver.fresh_var("native_definition_x", Sort::Int);
+    let application = solver.try_apply(&predicate, &[parameter]).unwrap();
+    let zero = solver.int_const(0);
+    let positive = solver.try_gt(parameter, zero).unwrap();
+    let definition = solver.try_eq(application, positive).unwrap();
+    let axiom = solver
+        .try_forall_with_triggers(&[parameter], definition, &[&[application]])
+        .unwrap();
+
+    solver.try_assert_term(axiom).unwrap();
+    assert!(solver.defined_funs["native_positive"].assertion_derived);
+    assert_eq!(solver.assertions(), vec![Term(solver.terms().true_term())]);
+
+    // Later applications use the exact body rather than a disconnected UF.
+    let one = solver.int_const(1);
+    let at_one = solver.try_apply(&predicate, &[one]).unwrap();
+    solver.try_assert_term(at_one).unwrap();
+    let result = solver.check_sat();
+    assert!(
+        result.is_sat() && result.was_model_validated(),
+        "exact definitional macro should have a certified SAT model: {result:?}"
+    );
+    let model = solver.try_get_model_str().unwrap();
+    assert!(model.contains("define-fun native_positive"), "{model}");
+    assert!(model.contains("native_definition_x"), "{model}");
+}
+
+#[test]
+fn native_definitional_forall_refuses_an_earlier_constrained_use() {
+    let mut solver = Solver::try_new(Logic::Uflia).unwrap();
+    let predicate = solver
+        .try_declare_fun("native_constrained", &[Sort::Int], Sort::Bool)
+        .unwrap();
+    let zero = solver.int_const(0);
+    let at_zero = solver.try_apply(&predicate, &[zero]).unwrap();
+    solver.try_assert_term(at_zero).unwrap();
+
+    let parameter = solver.fresh_var("native_constrained_x", Sort::Int);
+    let application = solver.try_apply(&predicate, &[parameter]).unwrap();
+    let body = solver.try_gt(parameter, zero).unwrap();
+    let equality = solver.try_eq(application, body).unwrap();
+    let axiom = solver.try_forall(&[parameter], equality).unwrap();
+    solver.try_assert_term(axiom).unwrap();
+
+    assert!(!solver.defined_funs.contains_key("native_constrained"));
+    assert_eq!(solver.assertions().last(), Some(&axiom));
+}
+
+#[test]
+fn native_definitional_forall_refuses_a_discarded_raw_application() {
+    let mut solver = Solver::try_new(Logic::Uflia).unwrap();
+    let predicate = solver
+        .try_declare_fun("native_prebuilt", &[Sort::Int], Sort::Bool)
+        .unwrap();
+    let zero = solver.int_const(0);
+    let _retained_raw_application = solver.try_apply(&predicate, &[zero]).unwrap();
+
+    let parameter = solver.fresh_var("native_prebuilt_x", Sort::Int);
+    let application = solver.try_apply(&predicate, &[parameter]).unwrap();
+    let body = solver.try_gt(parameter, zero).unwrap();
+    let equality = solver.try_eq(application, body).unwrap();
+    let axiom = solver.try_forall(&[parameter], equality).unwrap();
+    solver.try_assert_term(axiom).unwrap();
+
+    assert!(!solver.defined_funs.contains_key("native_prebuilt"));
+    assert_eq!(solver.assertions(), vec![axiom]);
+}
+
+#[test]
+fn reset_assertions_removes_only_assertion_derived_native_definitions() {
+    let mut solver = Solver::try_new(Logic::Uflia).unwrap();
+    let explicit = solver
+        .try_define_fun(
+            "explicit_identity",
+            &[("x", Sort::Int)],
+            Sort::Int,
+            |_solver, params| Ok(params[0]),
+        )
+        .unwrap();
+    let predicate = solver
+        .try_declare_fun("native_reset_predicate", &[Sort::Int], Sort::Bool)
+        .unwrap();
+    let parameter = solver.fresh_var("native_reset_x", Sort::Int);
+    let application = solver.try_apply(&predicate, &[parameter]).unwrap();
+    let zero = solver.int_const(0);
+    let body = solver.try_gt(parameter, zero).unwrap();
+    let equality = solver.try_eq(application, body).unwrap();
+    let axiom = solver.try_forall(&[parameter], equality).unwrap();
+    solver.try_assert_term(axiom).unwrap();
+    assert!(solver.defined_funs.contains_key("native_reset_predicate"));
+
+    solver.try_reset_assertions().unwrap();
+    assert!(!solver.defined_funs.contains_key("native_reset_predicate"));
+    assert!(solver.defined_funs.contains_key("explicit_identity"));
+    let one = solver.int_const(1);
+    assert_eq!(solver.try_apply(&explicit, &[one]).unwrap(), one);
+}
+
+#[test]
+fn native_constant_and_fresh_variable_apis_reject_reserved_identities() {
+    let mut solver = Solver::try_new(Logic::QfUf).unwrap();
+
+    for name in ["__ay_ext_diff!0", "select"] {
+        assert!(matches!(
+            solver.try_declare_const(name, Sort::Int),
+            Err(SolverError::InvalidArgument {
+                operation: "declare_const",
+                ..
+            })
+        ));
+    }
+    assert!(matches!(
+        solver.try_declare_const_with_fresh_identity(
+            "display-name",
+            "__ay_ext_diff!adapter",
+            Sort::Int,
+        ),
+        Err(SolverError::InvalidArgument {
+            operation: "declare_const_with_fresh_identity",
+            ..
+        })
+    ));
+    assert!(matches!(
+        solver.try_fresh_var("__ay", Sort::Int),
+        Err(SolverError::InvalidArgument {
+            operation: "fresh_var",
+            ..
+        })
+    ));
+
+    // `let` is lexical syntax, not a core structural operator identity, and a
+    // prefix only becomes reserved when its generated `<prefix>_<id>` name is.
+    assert!(solver.try_declare_const("let", Sort::Int).is_ok());
+    assert!(solver.try_fresh_var("select", Sort::Int).is_ok());
 }

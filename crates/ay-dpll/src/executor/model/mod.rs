@@ -56,6 +56,7 @@ pub(crate) mod sat_emit;
 mod set_materialize;
 mod string_materialize;
 pub(in crate::executor) mod string_witness;
+pub(in crate::executor) mod uflia_witness;
 mod validation;
 
 pub(in crate::executor) use dt_egraph_values::DtEgraphAssignment;
@@ -504,7 +505,7 @@ impl Eq for EvalValue {}
 impl Executor {
     /// D1 shadow finalizer for the on-assert lazy-extensionality campaign.
     ///
-    /// Correlates the EAGER set (every `__ext_diff` witness the eager path
+    /// Correlates the EAGER set (every `__ay_ext_diff` witness the eager path
     /// actually emitted this solve) against the DEMANDED set (array pairs whose
     /// `(= a b)` equality atom the search forced FALSE — i.e. `a ≠ b` was
     /// asserted, which is exactly the antecedent that makes the extensionality

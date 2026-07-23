@@ -285,13 +285,60 @@ impl ArraySolver<'_> {
             }
         }
 
+        // INDEX-KEYED PRUNING. Both consumers of this candidate set discard any
+        // pair whose two selects' indices are not provably equal (via
+        // `explain_equal_if_provable` / `known_equal`). Partition the distinct
+        // index terms into blocks that are a SOUND OVER-APPROXIMATION of that
+        // index-equality relation `R` (see `index_conflict_partition`): every
+        // pair the consumers would keep has both indices in one block, so
+        // pairing only WITHIN a shared index block preserves the exact conflict
+        // set while collapsing the store-permutation cross-products from
+        // O(selects²) to O(Σ block-restricted products). Because the produced
+        // set is a subset of the old one and is emitted through the SAME final
+        // sort, surviving pairs keep byte-identical order.
+        let mut index_terms: Vec<TermId> =
+            self.select_cache.values().map(|&(_arr, idx)| idx).collect();
+        index_terms.sort_unstable_by_key(|t| t.0);
+        index_terms.dedup();
+        let index_block = self.index_conflict_partition(&index_terms);
+        let select_index_block = |sel: TermId| -> Option<TermId> {
+            let &(_arr, idx) = self.select_cache.get(&sel)?;
+            index_block.get(&idx).copied()
+        };
+
+        // Per value class: index block -> selects (preserving the sorted order
+        // already established on `selects_by_class`).
+        let mut class_block_groups: HashMap<TermId, HashMap<TermId, Vec<TermId>>> =
+            HashMap::default();
+        for (&class_rep, class_selects) in &selects_by_class {
+            let mut groups: HashMap<TermId, Vec<TermId>> = HashMap::default();
+            for &sel in class_selects {
+                if let Some(block) = select_index_block(sel) {
+                    groups.entry(block).or_default().push(sel);
+                }
+            }
+            class_block_groups.insert(class_rep, groups);
+        }
+
         let mut candidate_pairs = HashSet::default();
         for &(lhs_class, rhs_class) in &class_pairs {
-            let lhs_selects = &selects_by_class[&lhs_class];
-            let rhs_selects = &selects_by_class[&rhs_class];
-            for &sel1 in lhs_selects {
-                for &sel2 in rhs_selects {
-                    insert_candidate(&mut candidate_pairs, sel1, sel2);
+            let lhs_groups = &class_block_groups[&lhs_class];
+            let rhs_groups = &class_block_groups[&rhs_class];
+            // Walk the smaller block map; only shared blocks can yield pairs
+            // whose indices are provably equal.
+            let (small, large) = if lhs_groups.len() <= rhs_groups.len() {
+                (lhs_groups, rhs_groups)
+            } else {
+                (rhs_groups, lhs_groups)
+            };
+            for (block, small_selects) in small {
+                let Some(large_selects) = large.get(block) else {
+                    continue;
+                };
+                for &sel_a in small_selects {
+                    for &sel_b in large_selects {
+                        insert_candidate(&mut candidate_pairs, sel_a, sel_b);
+                    }
                 }
             }
         }

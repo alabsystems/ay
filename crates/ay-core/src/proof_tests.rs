@@ -196,6 +196,7 @@ fn alethe_rule_name_and_display() {
     assert_eq!(AletheRule::ReadOverWritePos.name(), "read_over_write_pos");
     assert_eq!(AletheRule::ReadOverWriteNeg.name(), "read_over_write_neg");
     assert_eq!(AletheRule::Extensionality.name(), "extensionality");
+    assert_eq!(AletheRule::Evaluate.name(), "evaluate");
     assert_eq!(AletheRule::BvBitblast.name(), "bv_bitblast");
     assert_eq!(AletheRule::FpToBv.name(), "fp_to_bv");
     assert_eq!(AletheRule::Custom("my_rule".to_string()).name(), "my_rule");

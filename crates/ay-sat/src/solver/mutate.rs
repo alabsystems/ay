@@ -91,6 +91,9 @@ impl Solver {
         if !self.arena.is_active(clause_idx) {
             return false;
         }
+        if self.is_pending_theory_conflict_clause(clause_idx) {
+            return false;
+        }
         if !self.is_reason_clause_marked(clause_idx) {
             return true;
         }

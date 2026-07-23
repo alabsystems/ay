@@ -786,6 +786,26 @@ impl<'a> Translator<'a> {
     fn translate_all(&mut self, args: &[TermId]) -> Option<Vec<ReId>> {
         args.iter().map(|&a| self.translate(a)).collect()
     }
+
+    /// Translate the SINGLETON language `{c}` of a ground String constant `c`
+    /// into a concatenation of single-character sets — exactly what the
+    /// `str.to_re` arm of [`Self::translate_uncached`] builds. Used for the
+    /// equality form `= subject c`, which denotes `subject ∈ {c}`. EXACT or
+    /// `None` (a non-constant leaf, an out-of-alphabet code point, or a blown
+    /// budget), never an approximation.
+    fn translate_string_const_singleton(&mut self, c: TermId) -> Option<ReId> {
+        self.spend()?;
+        let s = self.str_const(c)?;
+        let parts: Vec<ReId> = s
+            .into_iter()
+            .map(|ch| self.arena.mk_set(vec![(ch, ch)]))
+            .collect();
+        let out = self.arena.mk_cat(parts);
+        if self.arena.poisoned {
+            return None;
+        }
+        Some(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,18 +1092,40 @@ fn validate_certificate(
 // Clause-level entry points
 // ---------------------------------------------------------------------------
 
+/// The language a membership hypothesis constrains its subject into.
+#[derive(Clone, Copy)]
+enum ConstraintLang {
+    /// A `RegLan` term from `str.in_re subject regex`.
+    Regex(TermId),
+    /// The SINGLETON language `{c}` from a string equality `= subject c`,
+    /// where `c` is the given String-constant term. Equivalent to
+    /// `str.in_re subject (str.to_re c)`.
+    StringEqConst(TermId),
+}
+
 /// A membership literal of the clause, in HYPOTHESIS polarity: the fact that
 /// must hold of the subject for the literal to be FALSE.
 struct Membership {
     subject: TermId,
-    regex: TermId,
-    /// `true`: the hypothesis is `subject ∈ regex` (clause literal was
-    /// `(not (str.in_re …))`). `false`: the hypothesis is `subject ∉ regex`.
+    /// The language the hypothesis constrains `subject` into (before applying
+    /// `positive`): a `str.in_re` regex, or a string-constant singleton.
+    lang: ConstraintLang,
+    /// `true`: the hypothesis is `subject ∈ lang` (clause literal was
+    /// `(not (str.in_re …))` or `(not (= subject c))`). `false`: the hypothesis
+    /// is `subject ∉ lang`.
     positive: bool,
 }
 
 /// Decompose a clause literal into the membership hypothesis its falsity
-/// asserts, or `None` when the literal is not a `str.in_re` over a String term.
+/// asserts, or `None` when the literal is neither a `str.in_re` over a String
+/// term nor a String equality against a ground constant.
+///
+/// A string equality `(= subject c)` with `c` a String constant denotes the
+/// SINGLETON language `{c}` — exactly `str.in_re subject (str.to_re c)` — so
+/// its falsity asserts `subject ∈ {c}`, the same hypothesis polarity as a
+/// negated membership. Surface-syntax rewrites turn `str.in_re X (str.to_re c)`
+/// into `= X c`, so admitting the equality form is what lets a group whose
+/// singletons are pairwise-disjoint be recognized as an empty intersection.
 fn as_membership(terms: &TermStore, lit: TermId) -> Option<Membership> {
     let (atom, positive) = match terms.get(lit) {
         TermData::Not(inner) => (*inner, true),
@@ -1092,18 +1134,45 @@ fn as_membership(terms: &TermStore, lit: TermId) -> Option<Membership> {
     let TermData::App(sym, args) = terms.get(atom) else {
         return None;
     };
-    if sym.name() != "str.in_re" || args.len() != 2 {
-        return None;
+    match (sym.name(), args.len()) {
+        ("str.in_re", 2) => {
+            let (subject, regex) = (args[0], args[1]);
+            if !matches!(terms.sort(subject), Sort::String)
+                || !matches!(terms.sort(regex), Sort::RegLan)
+            {
+                return None;
+            }
+            Some(Membership {
+                subject,
+                lang: ConstraintLang::Regex(regex),
+                positive,
+            })
+        }
+        ("=", 2) => {
+            // Only String equalities against a ground constant translate to a
+            // singleton language. The subject is the NON-constant side; the
+            // constant side supplies `{c}`. Both-constant or neither-constant
+            // equalities are not memberships here (a ground `(= c1 c2)` is
+            // decided by the ground evaluator, not this lane).
+            let (a, b) = (args[0], args[1]);
+            if !matches!(terms.sort(a), Sort::String) || !matches!(terms.sort(b), Sort::String) {
+                return None;
+            }
+            let a_const = matches!(terms.get(a), TermData::Const(Constant::String(_)));
+            let b_const = matches!(terms.get(b), TermData::Const(Constant::String(_)));
+            let (subject, konst) = match (a_const, b_const) {
+                (false, true) => (a, b),
+                (true, false) => (b, a),
+                _ => return None,
+            };
+            Some(Membership {
+                subject,
+                lang: ConstraintLang::StringEqConst(konst),
+                positive,
+            })
+        }
+        _ => None,
     }
-    let (subject, regex) = (args[0], args[1]);
-    if !matches!(terms.sort(subject), Sort::String) || !matches!(terms.sort(regex), Sort::RegLan) {
-        return None;
-    }
-    Some(Membership {
-        subject,
-        regex,
-        positive,
-    })
 }
 
 /// Whether the clause carries a group of `str.in_re` literals over one common
@@ -1169,7 +1238,11 @@ fn group_intersection_is_empty(terms: &TermStore, group: &[Membership]) -> bool 
         // and the group's tautology argument only ever needs a subset of the
         // clause. Approximating a language in either direction would not be
         // sound, so there is no such arm.
-        let Some(id) = tr.translate(m.regex) else {
+        let id_opt = match m.lang {
+            ConstraintLang::Regex(regex) => tr.translate(regex),
+            ConstraintLang::StringEqConst(konst) => tr.translate_string_const_singleton(konst),
+        };
+        let Some(id) = id_opt else {
             continue;
         };
         let id = if m.positive { id } else { tr.arena.mk_not(id) };

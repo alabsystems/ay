@@ -212,6 +212,18 @@ pub(crate) struct Symmetry {
     /// are licensed for the per-branch orbit walk (component-touching
     /// generators are excluded — see `Orbitope`).
     col_gens: Vec<Vec<u32>>,
+    /// EXACT BOX-STABILIZER support: the sorted union of all (walk-lane)
+    /// generator supports. `group[e][i]` is the image of `support[i]` under
+    /// enumerated group element `e` (a column id). Both are EMPTY when exact
+    /// enumeration was declined (a moved row carries a slack guard, or the
+    /// closure exceeds `MAX_GROUP`), in which case `down_orbit` keeps its
+    /// generator-walk. See `enumerate_group` and `down_orbit_stab`.
+    support: Vec<u32>,
+    group: Vec<Vec<u32>>,
+    /// When true (`AY_MILP_STAB_ORBIT`) and `group` is enumerated, `down_orbit`
+    /// returns the EXACT orbit under the box-stabilizer subgroup instead of the
+    /// generator-walk under-approximation.
+    stab: bool,
     /// Scratch (stamped, so no per-branch clearing): generator applicability
     /// memo and orbit membership, both valid for the current `stamp` only.
     stamp: u32,
@@ -255,6 +267,21 @@ pub(crate) struct Symmetry {
 const MAX_GEN_CHECKS: usize = 96;
 /// At most this many orbit members fixed per branch.
 const MAX_ORBIT: usize = 256;
+/// Exact box-stabilizer enumeration declines above this closure size (the
+/// group is then handled by the generator-walk under-approximation). Sized so
+/// the O(|G| . |support|) per-branch box-preservation scan stays cheap.
+const MAX_GROUP: usize = 4096;
+/// Maximum logical permutation cells retained by exact enumeration:
+/// `group_size * support_size`. Enumeration keeps one copy in the closure and
+/// one in its deduplication set, so this cap bounds raw permutation storage to
+/// roughly 8 MiB before `Vec`/hash-table overhead. A larger group falls back to
+/// the generator walk; exact stabilization is only an optimization.
+const MAX_GROUP_PERMUTATION_CELLS: usize = 1 << 20;
+/// Maximum number of support-column images evaluated while closing the group.
+/// Each attempted `generator . element` composition charges one support-sized
+/// unit, including duplicates. This prevents a small retained group with many
+/// redundant generators from spending unbounded construction work.
+const MAX_GROUP_COMPOSITION_WORK: usize = 1 << 24;
 
 impl Symmetry {
     /// Debug probe (`AY_MILP_SYM_DEBUG`): why is each generator that moves
@@ -287,6 +314,12 @@ impl Symmetry {
         }
     }
 
+    /// Enumerated box-stabilizer group size (0 when exact stabilization is off
+    /// or declined) — a trace probe for the `AY_MILP_STAB_ORBIT` A/B.
+    pub(crate) fn stab_group_size(&self) -> usize {
+        self.group.len()
+    }
+
     /// The orbit of branching column `j` under the generators applicable at a
     /// node with box (`lower`, `upper`), excluding `j` itself, appended to
     /// `out`. Every returned column has a box bit-equal to `j`'s (each
@@ -298,6 +331,12 @@ impl Symmetry {
         upper: &[f64],
         out: &mut Vec<usize>,
     ) {
+        // EXACT box-stabilizer orbit when enumerated (`AY_MILP_STAB_ORBIT`);
+        // otherwise the generator-walk under-approximation below.
+        if self.stab && !self.group.is_empty() {
+            self.down_orbit_stab(j, lower, upper, out);
+            return;
+        }
         out.clear();
         if self.col_gens.get(j).is_none_or(Vec::is_empty) {
             return;
@@ -346,6 +385,143 @@ impl Symmetry {
             }
         }
     }
+
+    /// The EXACT orbit of `j` under the box-stabilizer subgroup `H = { w in G :
+    /// w(B) = B }` (the true node stabilizer over the enumerated group `G`),
+    /// excluding `j`, appended to `out`. `H` is a subgroup (box-preservation is
+    /// closed under composition and inverse), so scanning every enumerated
+    /// element, keeping the box-preserving ones, and collecting their images of
+    /// `j` yields the whole orbit.
+    ///
+    /// SOUNDNESS is identical to `down_orbit`'s (the bab.rs journal), with a
+    /// LARGER group: every kept `w` is a verified model automorphism (a product
+    /// of verified generators) that maps this node's box onto itself
+    /// (box-preserving — journal part (b)); enumeration is gated to generators
+    /// with NO slack guards, so the lifted map is the plain column permutation
+    /// (no slack recomputation — journal part (a) with moved rows slack-free).
+    /// The generator-walk `down_orbit` returns a SUBSET of this orbit (its
+    /// members are reached by products of individually box-preserving
+    /// generators, all of which lie in `H`), so switching to the exact orbit
+    /// only ever fixes MORE, never differently.
+    fn down_orbit_stab(&self, j: usize, lower: &[f64], upper: &[f64], out: &mut Vec<usize>) {
+        out.clear();
+        let Ok(jpos) = self.support.binary_search(&(j as u32)) else {
+            return; // j is fixed by every generator: empty orbit
+        };
+        for elem in &self.group {
+            // Box-preserving? Every moved support column must have a box
+            // bit-equal to its image's (the applicability condition, per
+            // element rather than per generator).
+            let preserves = self.support.iter().zip(elem).all(|(&c, &img)| {
+                img == c
+                    || (lower[c as usize] == lower[img as usize]
+                        && upper[c as usize] == upper[img as usize])
+            });
+            if !preserves {
+                continue;
+            }
+            let img = elem[jpos] as usize;
+            if img != j && !out.contains(&img) {
+                out.push(img);
+                if out.len() >= MAX_ORBIT {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Enumerate the group generated by the walk-lane generators as full
+/// permutations over their combined support, for the EXACT box-stabilizer
+/// orbit. Returns `(support, elements)` where `support` is the sorted union of
+/// the generators' moved columns and `elements[e][i]` is the image of
+/// `support[i]` under element `e` (a column id). DECLINES — returns two empty
+/// vectors — when any generator carries a slack guard (the lifted map would
+/// have to recompute slack coordinates, which the plain permutation used here
+/// does not), the closure exceeds `MAX_GROUP`, its retained permutation cells
+/// exceed `MAX_GROUP_PERMUTATION_CELLS`, or construction exhausts
+/// `MAX_GROUP_COMPOSITION_WORK`.
+fn enumerate_group(gens: &[&SymGen]) -> (Vec<u32>, Vec<Vec<u32>>) {
+    if gens.is_empty() || gens.iter().any(|g| !g.guards.is_empty()) {
+        return (Vec::new(), Vec::new());
+    }
+    let mut support: Vec<u32> = Vec::new();
+    for g in gens {
+        for &(u, v) in &g.pairs {
+            support.push(u);
+            support.push(v);
+        }
+    }
+    support.sort_unstable();
+    support.dedup();
+    if support.len() > MAX_GROUP_PERMUTATION_CELLS {
+        return (Vec::new(), Vec::new());
+    }
+    // BFS closure from the identity. Elements are permutations of the support
+    // positions; HashSet equality, not the hash alone, deduplicates them.
+    let Ok(support_len) = u32::try_from(support.len()) else {
+        return (Vec::new(), Vec::new());
+    };
+    let ident: Vec<u32> = (0..support_len).collect();
+    let mut seen: std::collections::HashSet<Vec<u32>> = std::collections::HashSet::new();
+    seen.insert(ident.clone());
+    let mut elems: Vec<Vec<u32>> = vec![ident];
+    let mut head = 0usize;
+    let mut composition_work = 0usize;
+    while head < elems.len() {
+        let cur = elems[head].clone();
+        head += 1;
+        for g in gens {
+            let Some(next_work) = composition_work.checked_add(support.len()) else {
+                return (Vec::new(), Vec::new());
+            };
+            if next_work > MAX_GROUP_COMPOSITION_WORK {
+                return (Vec::new(), Vec::new());
+            }
+            composition_work = next_work;
+            // (g . cur)(i) = g(cur(i)): map each image column through g.
+            let mut next = Vec::with_capacity(support.len());
+            for &i in &cur {
+                let Some(&column) = support.get(i as usize) else {
+                    return (Vec::new(), Vec::new());
+                };
+                let Ok(image_pos) = support.binary_search(&g.image(column)) else {
+                    return (Vec::new(), Vec::new());
+                };
+                let Ok(image_pos) = u32::try_from(image_pos) else {
+                    return (Vec::new(), Vec::new());
+                };
+                next.push(image_pos);
+            }
+            if seen.contains(&next) {
+                continue;
+            }
+            let Some(next_len) = elems.len().checked_add(1) else {
+                return (Vec::new(), Vec::new());
+            };
+            let Some(next_cells) = next_len.checked_mul(support.len()) else {
+                return (Vec::new(), Vec::new());
+            };
+            if next_len > MAX_GROUP || next_cells > MAX_GROUP_PERMUTATION_CELLS {
+                return (Vec::new(), Vec::new());
+            }
+            seen.insert(next.clone());
+            elems.push(next);
+        }
+    }
+    // The deduplication copy is no longer needed. Drop it before translating
+    // positions to column ids in place, avoiding a third full group copy at
+    // peak memory.
+    drop(seen);
+    for elem in &mut elems {
+        for image in elem {
+            let Some(&column) = support.get(*image as usize) else {
+                return (Vec::new(), Vec::new());
+            };
+            *image = column;
+        }
+    }
+    (support, elems)
 }
 
 impl Symmetry {
@@ -1167,11 +1343,30 @@ pub(crate) fn detect(model: &Model) -> Option<Symmetry> {
             }
         }
     }
+    // EXACT BOX-STABILIZER enumeration (walk-lane generators only — the ones
+    // on `col_gens`; component-touching generators are governed by the orbitope
+    // lane). Declined (empty) unless every such generator has NO slack guards
+    // (so the lifted map is the plain column permutation — the orbital-fixing
+    // soundness journal's part (b) with no slack recomputation) and the closure
+    // fits `MAX_GROUP`. Only enumerated when `AY_MILP_STAB_ORBIT` is set.
+    let stab = std::env::var_os("AY_MILP_STAB_ORBIT").is_some();
+    let (support, group) = if stab {
+        let walk_gens: Vec<&SymGen> = (0..gens.len())
+            .filter(|&gi| !in_component[gi])
+            .map(|gi| &gens[gi])
+            .collect();
+        enumerate_group(&walk_gens)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let n_gens = gens.len();
     Some(Symmetry {
         gens,
         orbitopes,
         col_gens,
+        support,
+        group,
+        stab,
         ranks,
         cells,
         dyn_lane: false,
@@ -1312,6 +1507,19 @@ fn assemble_orbitopes(
         // never re-equalize once branched, the walk retires by depth ~10
         // (noswot, 4x25 mixed: 9 orbit fixes in 508k nodes, ever), and only
         // the root lex order keeps cutting (43k reductions, nodes -62%).
+        //
+        // SERIAL-3 FOLLOW-UP (2026-07-23): forcing misc07's all-binary O_{3,81}
+        // component onto this static lane made the tree 6.3x worse (5,219 ->
+        // 33,043 nodes) and yielded only 856 reductions. This is structural:
+        // its tree is dominated by wide [0,1] boxes, where the full orbitope
+        // admits every matrix after sorting; sound all-pairs lex propagation
+        // likewise yielded no material gain (874 reductions / 33,101 nodes).
+        // Do not combine the static constraints with the walk as a purported
+        // strengthening: the lanes choose different fundamental domains, so
+        // static lex can remove the representative on which the walk's down-fix
+        // relies. The dynamic-lane proof journal above is the same
+        // non-composability boundary. Keep all-binary components on the walk;
+        // the remaining misc07 gap is not an orbitope-propagation gap.
         if b1.iter().all(|&c| {
             model.col_kind(model.col_at(c as usize).expect("in range")) == ColKind::Binary
         }) {
@@ -1680,6 +1888,68 @@ mod tests {
         let upper2 = vec![1.0, 0.0, 1.0, 1.0];
         sym.down_orbit(0, &lower, &upper2, &mut orbit);
         assert_eq!(orbit, vec![2], "b's box differs; only c remains reachable");
+    }
+
+    /// The generators `(0 1)` and `(1 2)` generate S3. On a box where columns
+    /// 0 and 2 are open but column 1 is fixed, neither generator is individually
+    /// applicable, so the ordinary walk cannot leave 0. Their closure contains
+    /// `(0 2)`, however, which preserves the box and must put 2 in the exact
+    /// stabilizer orbit. This is the smallest case where enumeration is strictly
+    /// stronger than the applicable-generator walk.
+    #[test]
+    fn exact_box_stabilizer_finds_composite_s3_orbit() {
+        let make_symmetry = |stab: bool| {
+            let gens = vec![
+                SymGen::new(vec![(0, 1)], Vec::new()),
+                SymGen::new(vec![(1, 2)], Vec::new()),
+            ];
+            let gen_refs: Vec<&SymGen> = gens.iter().collect();
+            let (support, group) = enumerate_group(&gen_refs);
+            assert_eq!(support, vec![0, 1, 2]);
+            assert_eq!(group.len(), 6, "two adjacent transpositions generate S3");
+            Symmetry {
+                gens,
+                orbitopes: Vec::new(),
+                col_gens: vec![vec![0], vec![0, 1], vec![1]],
+                support,
+                group,
+                stab,
+                stamp: 0,
+                gen_stamp: vec![u32::MAX; 2],
+                gen_ok: vec![false; 2],
+                orbit_stamp: vec![u32::MAX; 3],
+                ranks: vec![u64::MAX; 3],
+                cells: vec![(u32::MAX, u32::MAX); 3],
+                dyn_lane: false,
+                fixes_made: 0,
+                branches_hit: 0,
+                orbitope_reductions: 0,
+                orbitope_cutoffs: 0,
+                dyn_nodes: 0,
+                dyn_seq_sum: 0,
+                dyn_seq_max: 0,
+                dyn_pairs_spent: 0,
+                dyn_pairs: 0,
+            }
+        };
+
+        let lower = vec![0.0; 3];
+        let upper = vec![1.0, 0.0, 1.0];
+
+        let mut walk = make_symmetry(false);
+        assert!(!walk.gens[0].applicable(&lower, &upper));
+        assert!(!walk.gens[1].applicable(&lower, &upper));
+        let mut orbit = Vec::new();
+        walk.down_orbit(0, &lower, &upper, &mut orbit);
+        assert!(orbit.is_empty(), "the generator walk must be stuck at 0");
+
+        let mut exact = make_symmetry(true);
+        exact.down_orbit(0, &lower, &upper, &mut orbit);
+        assert_eq!(
+            orbit,
+            vec![2],
+            "the composite transposition (0 2) preserves the box"
+        );
     }
 
     /// An asymmetric model must yield nothing (the self-gate the corpus

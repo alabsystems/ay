@@ -473,3 +473,126 @@ fn test_strict_eq_congruent_pred_step_valid() {
     )
     .expect("valid eq_congruent_pred step should pass");
 }
+
+// ===== `(or …)`-wrapped eq_transitive / eq_congruent theory lemmas =====
+//
+// The lazy-EUF / array-extensionality lanes emit some EUF leaves packed as a
+// single-literal `(cl (or L1 .. Ln))` disjunction instead of the flat
+// `(cl L1 .. Ln)`. The two denote the SAME clause, so the validators flatten
+// the wrapper (mirroring `array_axiom::flatten_clause_literals`) before running
+// their structural checks. Each positive case is paired with a negative case
+// that breaks exactly one side condition and asserts the checker REJECTS.
+
+/// Build `(or args...)`.
+fn mk_or(terms: &mut TermStore, args: Vec<TermId>) -> TermId {
+    terms.mk_app(ay_core::Symbol::named("or"), args, Sort::Bool)
+}
+
+/// Validate a `TheoryLemma` clause of the given kind in strict mode.
+fn validate_theory_lemma_strict(
+    terms: &TermStore,
+    kind: TheoryLemmaKind,
+    clause: Vec<TermId>,
+) -> Result<(), ProofCheckError> {
+    let step = ProofStep::TheoryLemma {
+        theory: "euf".to_string(),
+        clause,
+        farkas: None,
+        kind,
+        lia: None,
+    };
+    let mut derived = Vec::new();
+    validate_step(terms, &mut derived, ProofId(0), &step, true, None)
+}
+
+#[test]
+fn or_wrapped_eq_transitive_accepts_valid_chain() {
+    // (cl (or (not (= a b)) (not (= b c)) (= a c))) — the packed form of a
+    // valid 2-edge transitivity chain a — b — c.
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Int);
+    let b = terms.mk_var("b", Sort::Int);
+    let c = terms.mk_var("c", Sort::Int);
+    let eq_ab = mk_eq_raw(&mut terms, a, b);
+    let not_ab = terms.mk_not_raw(eq_ab);
+    let eq_bc = mk_eq_raw(&mut terms, b, c);
+    let not_bc = terms.mk_not_raw(eq_bc);
+    let eq_ac = mk_eq_raw(&mut terms, a, c);
+    let or_term = mk_or(&mut terms, vec![not_ab, not_bc, eq_ac]);
+    validate_theory_lemma_strict(&terms, TheoryLemmaKind::EufTransitive, vec![or_term])
+        .expect("a valid or-wrapped transitivity chain must certify");
+}
+
+#[test]
+fn or_wrapped_eq_transitive_rejects_disconnected_chain() {
+    // NEGATIVE: (cl (or (not (= a b)) (not (= c d)) (= a d))) — the premises
+    // a — b and c — d do not connect a to d, so the disjunction is not a
+    // transitivity tautology and must be REJECTED even when packed in `or`.
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Int);
+    let b = terms.mk_var("b", Sort::Int);
+    let c = terms.mk_var("c", Sort::Int);
+    let d = terms.mk_var("d", Sort::Int);
+    let eq_ab = mk_eq_raw(&mut terms, a, b);
+    let not_ab = terms.mk_not_raw(eq_ab);
+    let eq_cd = mk_eq_raw(&mut terms, c, d);
+    let not_cd = terms.mk_not_raw(eq_cd);
+    let eq_ad = mk_eq_raw(&mut terms, a, d);
+    let or_term = mk_or(&mut terms, vec![not_ab, not_cd, eq_ad]);
+    let err = validate_theory_lemma_strict(&terms, TheoryLemmaKind::EufTransitive, vec![or_term])
+        .expect_err("a disconnected chain must be rejected even when or-wrapped");
+    assert!(matches!(err, ProofCheckError::InvalidTheoryLemma { .. }));
+}
+
+#[test]
+fn or_wrapped_eq_congruent_accepts_valid_congruence() {
+    // (cl (or (not (= a b)) (= (f a) (f b)))) — packed unary congruence.
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Int);
+    let b = terms.mk_var("b", Sort::Int);
+    let fa = mk_fun(&mut terms, "f", vec![a], Sort::Int);
+    let fb = mk_fun(&mut terms, "f", vec![b], Sort::Int);
+    let eq_ab = mk_eq_raw(&mut terms, a, b);
+    let not_ab = terms.mk_not_raw(eq_ab);
+    let eq_fab = mk_eq_raw(&mut terms, fa, fb);
+    let or_term = mk_or(&mut terms, vec![not_ab, eq_fab]);
+    validate_theory_lemma_strict(&terms, TheoryLemmaKind::EufCongruent, vec![or_term])
+        .expect("a valid or-wrapped congruence must certify");
+}
+
+#[test]
+fn or_wrapped_eq_congruent_rejects_missing_arg_disequality() {
+    // NEGATIVE: (cl (or (not (= a b)) (= (g a c) (g b d)))) — position 1
+    // differs (c vs d) but carries NO `(not (= c d))` premise, so the fused
+    // congruence is unsound and must be REJECTED even when or-wrapped.
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Int);
+    let b = terms.mk_var("b", Sort::Int);
+    let c = terms.mk_var("c", Sort::Int);
+    let d = terms.mk_var("d", Sort::Int);
+    let gac = mk_fun(&mut terms, "g", vec![a, c], Sort::Int);
+    let gbd = mk_fun(&mut terms, "g", vec![b, d], Sort::Int);
+    let eq_ab = mk_eq_raw(&mut terms, a, b);
+    let not_ab = terms.mk_not_raw(eq_ab);
+    let eq_g = mk_eq_raw(&mut terms, gac, gbd);
+    let or_term = mk_or(&mut terms, vec![not_ab, eq_g]);
+    let err = validate_theory_lemma_strict(&terms, TheoryLemmaKind::EufCongruent, vec![or_term])
+        .expect_err("a congruence missing an argument disequality must be rejected");
+    assert!(matches!(err, ProofCheckError::InvalidTheoryLemma { .. }));
+}
+
+#[test]
+fn or_wrapped_single_disjunct_is_not_flattened() {
+    // EXACTNESS: `(or X)` with a single disjunct is NOT a clause-flattening
+    // form (it needs >= 2 disjuncts), so an `(cl (or (= a c)))` unit — with no
+    // premises at all — stays a one-literal clause and is rejected: a bare
+    // conclusion is not a transitivity tautology.
+    let mut terms = TermStore::new();
+    let a = terms.mk_var("a", Sort::Int);
+    let c = terms.mk_var("c", Sort::Int);
+    let eq_ac = mk_eq_raw(&mut terms, a, c);
+    let or_term = terms.mk_app(ay_core::Symbol::named("or"), vec![eq_ac], Sort::Bool);
+    let err = validate_theory_lemma_strict(&terms, TheoryLemmaKind::EufTransitive, vec![or_term])
+        .expect_err("a single-disjunct or must not be treated as a flattened chain");
+    assert!(matches!(err, ProofCheckError::InvalidTheoryLemma { .. }));
+}

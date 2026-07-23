@@ -25,6 +25,31 @@ fn decode_eq(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
     }
 }
 
+/// Flatten a single-literal clause whose one literal is an `(or L1 .. Ln)`
+/// disjunction into `[L1, .., Ln]`; every other clause is returned unchanged.
+///
+/// A clause `(cl (or L1 .. Ln))` denotes the SAME disjunction `L1 ∨ .. ∨ Ln`
+/// as the flat clause `(cl L1 .. Ln)` — the single-literal packing is a
+/// surface-syntax difference, not a semantic one. The lazy-EUF /
+/// array-extensionality lanes emit some `eq_transitive` / `eq_congruent`
+/// leaves in this packed `(or …)` form; without flattening the validators
+/// would reject a genuinely valid tautology purely on its shape. This mirrors
+/// `array_axiom::flatten_clause_literals`, and is applied EXACTLY (only when
+/// the clause is a single `or` of ≥ 2 disjuncts) so no other clause shape is
+/// reinterpreted. All downstream structural checks (chain connectivity,
+/// no-redundant-premise, per-argument matching) run on the flattened literals,
+/// so soundness is unchanged: the clause certifies iff the flat form does.
+fn flatten_or_clause(terms: &TermStore, clause: &[TermId]) -> Vec<TermId> {
+    if clause.len() == 1 {
+        if let TermData::App(Symbol::Named(sym), args) = terms.get(clause[0]) {
+            if sym == "or" && args.len() >= 2 {
+                return args.clone();
+            }
+        }
+    }
+    clause.to_vec()
+}
+
 /// Strip `Not` wrappers and return (inner_term, is_negated).
 fn strip_not(terms: &TermStore, mut term: TermId) -> (TermId, bool) {
     let mut negated = false;
@@ -47,6 +72,8 @@ pub(crate) fn validate_euf_transitive(
     step_id: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
+    let flattened = flatten_or_clause(terms, clause);
+    let clause = flattened.as_slice();
     if clause.len() < 2 {
         return Err(ProofCheckError::InvalidTheoryLemma {
             step: step_id,
@@ -157,6 +184,8 @@ pub(crate) fn validate_euf_congruent(
     step_id: ProofId,
     clause: &[TermId],
 ) -> Result<(), ProofCheckError> {
+    let flattened = flatten_or_clause(terms, clause);
+    let clause = flattened.as_slice();
     if clause.len() < 2 {
         return Err(ProofCheckError::InvalidTheoryLemma {
             step: step_id,

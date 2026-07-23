@@ -422,3 +422,201 @@ mod clause_simplification_tests {
             .expect("pruned false query should validate");
     }
 }
+
+mod dead_end_cone_tests {
+    use super::*;
+
+    /// Non-tautological self-loop `p(x) /\ (y = x + 1) => p(y)`.
+    fn self_loop_clause(p: PredicateId, x: &ChcVar, y: &ChcVar) -> HornClause {
+        HornClause::new(
+            ClauseBody::new(
+                vec![(p, vec![ChcExpr::var(x.clone())])],
+                Some(ChcExpr::eq(
+                    ChcExpr::var(y.clone()),
+                    ChcExpr::add(ChcExpr::var(x.clone()), ChcExpr::int(1)),
+                )),
+            ),
+            ClauseHead::Predicate(p, vec![ChcExpr::var(y.clone())]),
+        )
+    }
+
+    /// Build: p0 -> p1 -> err (query), plus a dead-end `dead` with a
+    /// non-tautological self-loop reached only from p1 (`p1 -> dead`, no path
+    /// dead ~> err). The sole cycle is the dead-end self-loop.
+    fn build_acyclic_modulo_dead_end() -> (ChcProblem, PredicateId) {
+        let mut problem = ChcProblem::new();
+        let p0 = problem.declare_predicate("p0", vec![ChcSort::Int]);
+        let p1 = problem.declare_predicate("p1", vec![ChcSort::Int]);
+        let err = problem.declare_predicate("err", vec![]);
+        let dead = problem.declare_predicate("dead", vec![ChcSort::Int]);
+
+        let x = ChcVar::new("x", ChcSort::Int);
+        let y = ChcVar::new("y", ChcSort::Int);
+
+        // Fact: => p0(x)
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(vec![], None),
+            ClauseHead::Predicate(p0, vec![ChcExpr::var(x.clone())]),
+        ));
+        // p0(x) => p1(x)
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(vec![(p0, vec![ChcExpr::var(x.clone())])], None),
+            ClauseHead::Predicate(p1, vec![ChcExpr::var(x.clone())]),
+        ));
+        // p1(x) => err
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(vec![(p1, vec![ChcExpr::var(x.clone())])], None),
+            ClauseHead::Predicate(err, vec![]),
+        ));
+        // p1(x) => dead(x)   (enters the dead-end region)
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(vec![(p1, vec![ChcExpr::var(x.clone())])], None),
+            ClauseHead::Predicate(dead, vec![ChcExpr::var(x.clone())]),
+        ));
+        // dead(x) /\ (y = x+1) => dead(y)   (the sole cycle, off the query cone)
+        problem.add_clause(self_loop_clause(dead, &x, &y));
+        // Query: err => false
+        problem.add_clause(HornClause::query(ClauseBody::new(
+            vec![(err, vec![])],
+            None,
+        )));
+
+        (problem, dead)
+    }
+
+    #[test]
+    fn cone_excludes_dead_end_predicate() {
+        let (problem, dead) = build_acyclic_modulo_dead_end();
+        let cone = problem
+            .query_cone_of_influence()
+            .expect("explicit query seeds the cone");
+        assert_eq!(cone.len(), 3, "cone should be {{p0, p1, err}}");
+        assert!(
+            !cone.contains(&dead),
+            "dead-end predicate must be out of cone"
+        );
+    }
+
+    #[test]
+    fn strips_dead_end_self_loop_and_becomes_acyclic() {
+        let (mut problem, dead) = build_acyclic_modulo_dead_end();
+        assert!(
+            problem.has_cycles(),
+            "dead-end self-loop makes the full graph cyclic"
+        );
+        let before = problem.clauses().len();
+
+        assert!(
+            problem.strip_dead_end_cycle_predicates(),
+            "the dead-end self-loop should be stripped"
+        );
+
+        assert_eq!(
+            problem.clauses().len(),
+            before - 2,
+            "the p1->dead and dead->dead clauses should be removed"
+        );
+        assert_eq!(
+            problem.clauses_defining(dead).count(),
+            0,
+            "no clause should still define the dead-end predicate"
+        );
+        assert!(
+            !problem.has_cycles(),
+            "after stripping the dead-end cycle the problem is acyclic"
+        );
+        // The query is preserved so the verdict is still well-defined.
+        assert_eq!(problem.queries().count(), 1);
+    }
+
+    #[test]
+    fn does_not_strip_when_cycle_is_on_the_query_cone() {
+        // Same skeleton, but the cycle is a self-loop on p1, which IS on the
+        // path to the query: PDR is genuinely required, so nothing is stripped.
+        let mut problem = ChcProblem::new();
+        let p0 = problem.declare_predicate("p0", vec![ChcSort::Int]);
+        let p1 = problem.declare_predicate("p1", vec![ChcSort::Int]);
+        let err = problem.declare_predicate("err", vec![]);
+
+        let x = ChcVar::new("x", ChcSort::Int);
+        let y = ChcVar::new("y", ChcSort::Int);
+
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(vec![], None),
+            ClauseHead::Predicate(p0, vec![ChcExpr::var(x.clone())]),
+        ));
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(vec![(p0, vec![ChcExpr::var(x.clone())])], None),
+            ClauseHead::Predicate(p1, vec![ChcExpr::var(x.clone())]),
+        ));
+        // p1 self-loop (on the query cone) — a genuine cycle.
+        problem.add_clause(self_loop_clause(p1, &x, &y));
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(vec![(p1, vec![ChcExpr::var(x.clone())])], None),
+            ClauseHead::Predicate(err, vec![]),
+        ));
+        problem.add_clause(HornClause::query(ClauseBody::new(
+            vec![(err, vec![])],
+            None,
+        )));
+
+        let before = problem.clauses().len();
+        assert!(
+            !problem.strip_dead_end_cycle_predicates(),
+            "a cycle on the query cone must not be stripped"
+        );
+        assert_eq!(problem.clauses().len(), before, "no clause removed");
+    }
+
+    #[test]
+    fn does_not_strip_a_dead_end_that_is_already_acyclic() {
+        // A dead-end predicate with NO cycle: stripping would change nothing an
+        // engine cares about for acyclicity, so we deliberately leave it be
+        // (keeps every non-target problem byte-identical).
+        let mut problem = ChcProblem::new();
+        let p0 = problem.declare_predicate("p0", vec![ChcSort::Int]);
+        let err = problem.declare_predicate("err", vec![]);
+        let dead = problem.declare_predicate("dead", vec![ChcSort::Int]);
+
+        let x = ChcVar::new("x", ChcSort::Int);
+
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(vec![], None),
+            ClauseHead::Predicate(p0, vec![ChcExpr::var(x.clone())]),
+        ));
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(vec![(p0, vec![ChcExpr::var(x.clone())])], None),
+            ClauseHead::Predicate(err, vec![]),
+        ));
+        // acyclic dead-end: p0 -> dead, no self-loop.
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(vec![(p0, vec![ChcExpr::var(x.clone())])], None),
+            ClauseHead::Predicate(dead, vec![ChcExpr::var(x.clone())]),
+        ));
+        problem.add_clause(HornClause::query(ClauseBody::new(
+            vec![(err, vec![])],
+            None,
+        )));
+
+        let before = problem.clauses().len();
+        assert!(!problem.has_cycles());
+        assert!(
+            !problem.strip_dead_end_cycle_predicates(),
+            "no cycle to remove -> no strip"
+        );
+        assert_eq!(problem.clauses().len(), before);
+    }
+
+    #[test]
+    fn no_query_returns_none_cone_and_no_strip() {
+        let mut problem = ChcProblem::new();
+        let p0 = problem.declare_predicate("p0", vec![ChcSort::Int]);
+        let x = ChcVar::new("x", ChcSort::Int);
+        problem.add_clause(HornClause::new(
+            ClauseBody::new(vec![], None),
+            ClauseHead::Predicate(p0, vec![ChcExpr::var(x)]),
+        ));
+        assert!(problem.query_cone_of_influence().is_none());
+        assert!(!problem.strip_dead_end_cycle_predicates());
+    }
+}

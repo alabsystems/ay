@@ -204,6 +204,10 @@ struct DefinedFun {
     /// The function's return sort
     #[allow(dead_code)]
     return_sort: Sort,
+    /// True when this definition was adopted from an asserted universal
+    /// equality rather than introduced by the explicit define-fun API.
+    /// Assertion-derived definitions must be removed by reset-assertions.
+    assertion_derived: bool,
 }
 
 /// Native Rust API for AY SMT solver

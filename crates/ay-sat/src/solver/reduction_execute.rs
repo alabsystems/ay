@@ -553,6 +553,11 @@ impl Solver {
     /// role -- per Audemard & Simon (IJCAI'09), LBD alone is the best predictor
     /// of learned clause quality.
     pub(super) fn reduce_db(&mut self) {
+        // Queue ownership is stronger than reduction pressure. The final
+        // popped conflict may reduce normally once no tail references remain.
+        if !self.pending_theory_conflicts.is_empty() {
+            return;
+        }
         // CaDiCaL reduce.cpp:223: propagate out-of-order units first.
         if self.chrono_enabled && !self.propagate_out_of_order_units() {
             self.has_empty_clause = true;

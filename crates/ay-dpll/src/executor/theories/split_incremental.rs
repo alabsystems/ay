@@ -14,8 +14,8 @@
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{
-    term::TermData, BoundRefinementRequest, TermId, TermStore, TheoryConflict, TheoryLit, Tseitin,
-    TseitinResult, TseitinState,
+    term::TermData, BoundRefinementRequest, CnfClause, CnfLit, TermId, TermStore, TheoryConflict,
+    TheoryLit, Tseitin,
 };
 use ay_sat::{Literal as SatLiteral, Solver as SatSolver, Variable as SatVariable};
 use num_rational::BigRational;
@@ -112,20 +112,16 @@ pub(in crate::executor) fn encode_split_pair_incremental(
         // the shape of every split atom this module mints. Tseitin encodes
         // these as a bare `get_var` leaf (see `encode_app`'s theory-predicate
         // arm): no descent, no definitional clauses, and the root-asserting
-        // unit is skipped by `add_split_def_clauses` anyway. The general path
-        // below is therefore a very expensive no-op for them — it clones the
-        // ENTIRE local term<->var mapping into a fresh `TseitinState`
-        // (BTreeMap build = full sort) and merges the whole map back, i.e.
-        // O(map log map) PER ATOM. On large industrial files (Certora
-        // QF_UFLIA, 150k+ assertions, ~10^5-entry maps) that made
-        // `pre_encode_int_disequality_splits` alone consume the entire solve
-        // budget (>95% of CPU samples in `local_tseitin_state` /
-        // `merge_local_mappings_from_tseitin`). Allocating the very same
-        // fresh var directly is byte-identical in outcome: same var id (the
-        // seeded Tseitin's first `fresh_var()` is `local_next_var + 1`
-        // 1-indexed = `*local_next_var` 0-indexed), same map entries, same
-        // `note_fresh_term`, same `ensure_num_vars`, and no clauses — the
-        // slow path emitted none for opaque atoms. Non-predicate shapes
+        // unit is separated out by `encode_assertion` anyway. The general
+        // `encode_atom_delta` path below is a more expensive no-op for them
+        // (move the encoder out of `negations`, run `encode_assertion`, delta-
+        // merge, move it back). Allocating the very same fresh var directly is
+        // byte-identical in outcome: same var id (the seeded Tseitin's first
+        // `fresh_var()` is `local_next_var + 1` 1-indexed = `*local_next_var`
+        // 0-indexed), same map entries, same `note_fresh_term`, same
+        // `ensure_num_vars`, and no clauses. `mirror_encoder_var` keeps the
+        // persistent encoder in sync so a later composite that references this
+        // predicate as a sub-term reuses the same var. Non-predicate shapes
         // (constant-folded atoms, boolean structure) keep the general path.
         if matches!(
             terms.get(atom),
@@ -135,6 +131,10 @@ pub(in crate::executor) fn encode_split_pair_incremental(
             local_term_to_var.insert(atom, var_0idx);
             local_var_to_term.insert(var_0idx, atom);
             negations.note_fresh_term(atom);
+            // Keep the persistent Tseitin encoder consistent with this direct
+            // allocation so a later encode that references `atom` reuses this
+            // var instead of minting a fresh duplicate (#8786).
+            negations.mirror_encoder_var(atom, var_0idx);
             *local_next_var = var_0idx + 1;
             solver.ensure_num_vars(*local_next_var as usize);
             let atom_var = SatVariable::new(var_0idx);
@@ -142,26 +142,21 @@ pub(in crate::executor) fn encode_split_pair_incremental(
             return Some(atom_var);
         }
 
-        // #8786: Seed Tseitin with the existing local_term_to_var / local_var_to_term
-        // so already-encoded sub-terms reuse their stable SAT vars. Using Tseitin::new()
-        // would assign FRESH SAT vars to sub-terms that already live in the SAT solver,
-        // orphaning prior unit clauses from theory dispatch and producing two SAT vars
-        // for the same TermId (spurious Unknown on QF_UFLRA / QF_UFLIA).
-        let state = local_tseitin_state(local_term_to_var, local_var_to_term, *local_next_var);
-        let tseitin = Tseitin::from_state(terms, state);
-        let result = tseitin.transform_all(&[atom]);
-
-        merge_local_mappings_from_tseitin(
-            &result,
+        // #8786 / #incr-tseitin-persist: delta-encode this atom into the
+        // persistent Tseitin encoder so already-encoded sub-terms reuse their
+        // stable SAT vars (Tseitin::new() would mint FRESH vars for sub-terms
+        // already in the SAT solver, orphaning prior unit clauses and producing
+        // two SAT vars for one TermId — spurious Unknown on QF_UFLRA/QF_UFLIA).
+        // Only this atom's new sub-terms and def clauses are touched.
+        let _root_lit = encode_atom_delta(
+            terms,
+            solver,
             local_term_to_var,
             local_var_to_term,
             local_next_var,
             negations,
+            atom,
         );
-
-        solver.ensure_num_vars(*local_next_var as usize);
-        // Tseitin vars are already in the shared 1-indexed namespace; no offset shift.
-        add_split_def_clauses(solver, &result, 0);
 
         let atom_var = *local_term_to_var.get(&atom)?;
         let atom_var = SatVariable::new(atom_var);
@@ -198,119 +193,110 @@ pub(in crate::executor) fn encode_split_pair_incremental(
     Some((left_var, right_var))
 }
 
-/// Build a `TseitinState` seeded from the shared local mappings (#8786).
+/// Delta-encode a single `atom` into the persistent incremental Tseitin encoder
+/// (held inside `negations`), emitting only the NEW definitional clauses and
+/// merging only the NEW variables into the local 0-indexed maps.
 ///
-/// `local_term_to_var` / `local_var_to_term` store 0-indexed SAT variable ids
-/// (`SatVariable::new` takes a 0-indexed value). Tseitin, by contrast, uses
-/// 1-indexed DIMACS-style ids internally. Convert by adding 1 on the way in
-/// and subtracting 1 on the way out (see `merge_local_mappings_from_tseitin`).
-fn local_tseitin_state(
-    local_term_to_var: &HashMap<TermId, u32>,
-    local_var_to_term: &HashMap<u32, TermId>,
-    local_next_var: u32,
-) -> TseitinState {
-    TseitinState {
-        term_to_var: local_term_to_var
-            .iter()
-            .map(|(&term, &var)| (term, var + 1))
-            .collect(),
-        var_to_term: local_var_to_term
-            .iter()
-            .map(|(&var, &term)| (var + 1, term))
-            .collect(),
-        next_var: local_next_var + 1,
-        encoded: Default::default(),
-    }
-}
-
-/// Copy newly-allocated Tseitin mappings back into the local maps (#8786).
+/// This replaces the former rebuild-everything pair (`local_tseitin_state` +
+/// `merge_local_mappings_from_tseitin`), which copied the ENTIRE term↔var map
+/// into a fresh `TseitinState` and iterated the whole result map back on EVERY
+/// cache-miss atom — O(total-encoded-terms) per atom, O(n²) over a run
+/// (#incr-tseitin-persist). Now:
 ///
-/// Because Tseitin was seeded with our existing state (`local_tseitin_state`),
-/// any term already present keeps its previous SAT var. Only genuinely-new
-/// terms get fresh vars (ids `>= prev_next_var + 1` in Tseitin's 1-indexed
-/// space, i.e. `>= *local_next_var` in the 0-indexed local space).
+/// - the encoder state is *moved* out of `negations` (O(1)) rather than rebuilt;
+/// - `encode_assertion` clausifies only sub-terms not already in the persisted
+///   `term_to_var`, returning just the new `def_clauses` (the root-asserting
+///   unit is separated out into `root_lit` and never emitted here);
+/// - only variables in `[prev_next_var, next_var)` are merged into the local
+///   maps — O(size-of-atom), not O(map).
 ///
-/// CRITICAL (#8805, #8785): `*local_next_var` MUST be advanced to cover every
-/// SAT variable that appears in `result.clauses`, which includes:
+/// **Behavior preservation**: `take_tseitin_encoder` seeds `term_to_var` /
+/// `var_to_term` / `next_var` identically to the old `local_tseitin_state`
+/// (1-indexed, `next_var = local_next_var + 1` floor) and resets `encoded` to
+/// empty every call, so the emitted CNF equals the old `transform_all(&[atom])`
+/// clauses minus the skipped root unit — same variable numbering, equisatisfiable.
 ///
-/// 1. Fresh variables allocated by Tseitin (`fresh_var()` bumps `next_var`).
-///    These are covered by `result.num_vars == next_var - 1`.
-/// 2. Auxiliary variables forced by unit clauses but not inserted into
-///    `term_to_var` (e.g., Boolean constants, negation peel-through, single-arg
-///    and/or). These still live in `0..next_var`, so also covered by
-///    `result.num_vars`.
-/// 3. **Seeded variables already present in `term_to_var` at Tseitin
-///    construction time** (from `local_tseitin_state`). These can have 1-indexed
-///    values HIGHER than `next_var - 1` — because `next_var` is only bumped on
-///    `fresh_var()`, not when `get_var(term)` hits a pre-seeded entry. When
-///    such a seeded var is referenced in a clause (e.g. a sub-term participates
-///    in a newly-encoded conjunction), `result.clauses` contains that literal,
-///    but `result.num_vars` understates the highest var.
+/// `local_next_var` is advanced to strictly bound every variable that can reach
+/// the SAT solver (all allocated vars plus any literal in the new def clauses),
+/// preserving the #8805 / #8785 out-of-bounds guarantee over the delta.
 ///
-/// Missing (3) caused the panic in `clause_add_internal.rs:88` when scope
-/// selectors or earlier push()s pushed `solver.num_vars` forward without the
-/// local-side counter seeing it — `ensure_num_vars(*local_next_var)` then
-/// became a no-op and a clause referenced a var the SAT solver hadn't
-/// registered yet.
-fn merge_local_mappings_from_tseitin(
-    result: &TseitinResult,
+/// Returns the assertion's root literal (signed, 1-indexed Tseitin namespace).
+fn encode_atom_delta(
+    terms: &TermStore,
+    solver: &mut SatSolver,
     local_term_to_var: &mut HashMap<TermId, u32>,
     local_var_to_term: &mut HashMap<u32, TermId>,
     local_next_var: &mut u32,
     negations: &mut IncrementalNegationCache,
-) {
-    let mut max_referenced_var_0idx = 0u32;
-    for (&term, &var_1idx) in &result.term_to_var {
-        let sat_var = var_1idx - 1; // convert 1-indexed Tseitin var to 0-indexed local var
-        if local_term_to_var.insert(term, sat_var).is_none() {
-            negations.note_fresh_term(term);
-        }
-        local_var_to_term.insert(sat_var, term);
-        if sat_var >= max_referenced_var_0idx {
-            max_referenced_var_0idx = sat_var + 1;
-        }
-    }
-    // Cover auxiliaries allocated by `fresh_var()` that never appeared in
-    // `term_to_var` (category 2 above).
-    if result.num_vars > max_referenced_var_0idx {
-        max_referenced_var_0idx = result.num_vars;
-    }
-    // Scan the emitted clauses to catch any literal whose variable was
-    // carried over from the seeded state but not covered above (category 3).
-    // This is O(sum of clause lengths) for the newly-encoded assertion and
-    // ensures `local_next_var` strictly bounds every literal in
-    // `result.clauses` before we call `solver.ensure_num_vars`.
-    for clause in &result.clauses {
-        for &lit in clause.literals() {
-            let var_0idx = lit.unsigned_abs() - 1;
-            if var_0idx >= max_referenced_var_0idx {
-                max_referenced_var_0idx = var_0idx + 1;
+    atom: TermId,
+) -> CnfLit {
+    let state =
+        negations.take_tseitin_encoder(local_term_to_var, local_var_to_term, *local_next_var);
+    let prev_next_var = state.next_var;
+    let mut tseitin = Tseitin::from_state(terms, state);
+    let enc = tseitin.encode_assertion(atom);
+    let state = tseitin.into_state();
+    let new_next_var = state.next_var;
+
+    // Delta-merge: only variables allocated by THIS encode carry 1-indexed ids
+    // in `[prev_next_var, new_next_var)`. Seeded sub-terms kept their existing
+    // vars (via the persisted `term_to_var`), so they already live in the local
+    // maps and need no re-merge.
+    for var_1idx in prev_next_var..new_next_var {
+        if let Some(&term) = state.var_to_term.get(&var_1idx) {
+            let sat_var = var_1idx - 1; // 1-indexed Tseitin var -> 0-indexed local var
+            local_var_to_term.insert(sat_var, term);
+            if local_term_to_var.insert(term, sat_var).is_none() {
+                negations.note_fresh_term(term);
             }
         }
     }
-    if max_referenced_var_0idx > *local_next_var {
-        *local_next_var = max_referenced_var_0idx;
+
+    // Advance `local_next_var` to strictly bound every SAT var that can appear
+    // in a clause handed to the solver: all allocated vars (`new_next_var - 1`
+    // = 0-indexed var count) plus any literal in the new def clauses. The clause
+    // scan is the #8805 belt-and-braces guard, now over the delta only.
+    let mut var_count = *local_next_var;
+    if new_next_var.saturating_sub(1) > var_count {
+        var_count = new_next_var - 1;
     }
+    for clause in &enc.def_clauses {
+        for &lit in clause.literals() {
+            let var_0idx = lit.unsigned_abs() - 1;
+            if var_0idx >= var_count {
+                var_count = var_0idx + 1;
+            }
+        }
+    }
+    *local_next_var = var_count;
+    solver.ensure_num_vars(*local_next_var as usize);
+
+    // Put the encoder state back BEFORE any subsequent `mirror_encoder_var`
+    // (root-alias fallback in `ensure_incremental_atom_encoded`) so those mirror
+    // writes land in the live persisted state.
+    negations.put_tseitin_encoder(state);
+
+    add_def_clauses(solver, &enc.def_clauses);
+
+    enc.root_lit
 }
 
-/// Add split-atom Tseitin clauses, skipping the root-asserting unit clause.
-fn add_split_def_clauses(solver: &mut SatSolver, result: &TseitinResult, offset: u32) {
-    for clause in &result.clauses {
-        // Skip unit clauses that assert the root -- we add the split
-        // disjunction separately.
-        if clause.literals().len() == 1 && clause.literals()[0] == result.root {
-            continue;
-        }
+/// Emit Tseitin definitional clauses into the SAT solver.
+///
+/// Vars are already in the shared 1-indexed DIMACS namespace (offset 0): each
+/// literal `lit` maps to `SatVariable::new(|lit| - 1)`. `encode_assertion`
+/// excludes the root-asserting unit, so (unlike the former
+/// `add_split_def_clauses`) there is no unit clause to skip.
+fn add_def_clauses(solver: &mut SatSolver, def_clauses: &[CnfClause]) {
+    for clause in def_clauses {
         let lits: Vec<SatLiteral> = clause
             .literals()
             .iter()
             .map(|&lit| {
                 if lit > 0 {
-                    let var = SatVariable::new((lit - 1) as u32 + offset);
-                    SatLiteral::positive(var)
+                    SatLiteral::positive(SatVariable::new((lit - 1) as u32))
                 } else {
-                    let var = SatVariable::new((-lit - 1) as u32 + offset);
-                    SatLiteral::negative(var)
+                    SatLiteral::negative(SatVariable::new((-lit - 1) as u32))
                 }
             })
             .collect();
@@ -320,12 +306,10 @@ fn add_split_def_clauses(solver: &mut SatSolver, result: &TseitinResult, offset:
             .find(|l| l.variable().index() >= solver.user_num_vars())
         {
             eprintln!(
-                "[#8805] add_split_def_clauses: OUT-OF-BOUNDS lit var={} solver.user_num_vars={} tseitin.num_vars={} clause={:?} result.root={}",
+                "[#8805] add_def_clauses: OUT-OF-BOUNDS lit var={} solver.user_num_vars={} clause={:?}",
                 bad.variable().index(),
                 solver.user_num_vars(),
-                result.num_vars,
                 clause.literals(),
-                result.root,
             );
         }
         solver.add_clause(lits);
@@ -353,29 +337,25 @@ pub(crate) fn ensure_incremental_atom_encoded(
         return sat_var;
     }
 
-    // #8786: Seed Tseitin with the existing local mappings so sub-terms that
-    // were already encoded (e.g., literals re-used across triangle axioms)
-    // reuse their stable SAT vars rather than getting fresh duplicates.
-    let state = local_tseitin_state(local_term_to_var, local_var_to_term, *local_next_var);
-    let tseitin = Tseitin::from_state(terms, state);
-    let result = tseitin.transform_all(&[atom]);
-
-    merge_local_mappings_from_tseitin(
-        &result,
+    // #8786 / #incr-tseitin-persist: delta-encode this atom into the persistent
+    // Tseitin encoder so sub-terms already encoded (e.g., literals re-used across
+    // triangle axioms) reuse their stable SAT vars rather than getting fresh
+    // duplicates. Only this atom's new sub-terms and def clauses are emitted.
+    let root_lit = encode_atom_delta(
+        terms,
+        solver,
         local_term_to_var,
         local_var_to_term,
         local_next_var,
         negations,
+        atom,
     );
 
-    solver.ensure_num_vars(*local_next_var as usize);
-    add_split_def_clauses(solver, &result, 0);
-
-    // Tseitin may not map the top-level atom in `result.term_to_var` for
-    // several reasons (see `encode_inner` in `ay-core/src/tseitin/encode.rs`):
+    // Tseitin may not map the top-level atom in `term_to_var` for several
+    // reasons (see `encode_inner` in `ay-core/src/tseitin/encode.rs`):
     //
     // - `Not(inner)`: `encode_inner` returns `-encode(inner, !positive)` and
-    //   never inserts the outer `Not` term itself. `result.root` will be the
+    //   never inserts the outer `Not` term itself. `root_lit` will be the
     //   negated inner var.
     // - `Bool(true)` / `Bool(false)`: `encode_inner` creates a fresh variable
     //   via `fresh_var()` but never calls `get_var(term_id)`, so no mapping
@@ -383,22 +363,24 @@ pub(crate) fn ensure_incremental_atom_encoded(
     // - Single-argument `And([x])` / `Or([x])`: delegates to
     //   `encode(x, positive)` without mapping the outer term.
     //
-    // In each case `result.root` is the CnfLit representing the atom's truth
-    // value. When `result.root` is positive, the omitted wrapper preserves the
-    // same "positive var means atom=true" semantics, so we can alias the atom
-    // to the root var. When `result.root` is negative (for example, `Not(x)` or
-    // another wrapper that delegates to a negated inner literal), aliasing the
-    // atom to `abs(root)` would invert polarity. In that case allocate a fresh
-    // adapter variable `v_atom <=> root_lit` so callers can safely treat
+    // In each case `root_lit` is the CnfLit representing the atom's truth value.
+    // When `root_lit` is positive, the omitted wrapper preserves the same
+    // "positive var means atom=true" semantics, so we can alias the atom to the
+    // root var. When `root_lit` is negative (for example, `Not(x)` or another
+    // wrapper that delegates to a negated inner literal), aliasing the atom to
+    // `abs(root)` would invert polarity. In that case allocate a fresh adapter
+    // variable `v_atom <=> root_lit` so callers can safely treat
     // `positive(v_atom)` as "atom is true".
-    if !local_term_to_var.contains_key(&atom) && result.num_vars > 0 {
-        let root_var = result.root.unsigned_abs();
+    if !local_term_to_var.contains_key(&atom) {
+        let root_var = root_lit.unsigned_abs();
         let sat_var = root_var - 1;
-        if result.root > 0 {
-            // Tseitin::from_state uses the shared 1-indexed SAT namespace, so
-            // the root var is already in local_next_var's scheme; subtract 1.
+        if root_lit > 0 {
+            // The root var is already in the shared 1-indexed SAT namespace;
+            // subtract 1 for the 0-indexed local scheme.
             local_term_to_var.insert(atom, sat_var);
             local_var_to_term.entry(sat_var).or_insert(atom);
+            // Keep the persistent encoder aware that `atom` aliases this var.
+            negations.mirror_encoder_var(atom, sat_var);
         } else {
             let atom_var = *local_next_var;
             *local_next_var += 1;
@@ -418,6 +400,9 @@ pub(crate) fn ensure_incremental_atom_encoded(
 
             local_term_to_var.insert(atom, atom_var);
             local_var_to_term.insert(atom_var, atom);
+            // Reserve the fresh adapter var in the persistent encoder so a later
+            // encode never re-mints it.
+            negations.mirror_encoder_var(atom, atom_var);
         }
         negations.note_fresh_term(atom);
     }

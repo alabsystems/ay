@@ -1344,6 +1344,7 @@ impl Solver {
             + self.cold.bcp_learned_clause_birth_conflicts.capacity() * size_of::<u64>()
             + self.unit_proof_id.capacity() * size_of::<u64>()
             + self.unit_proof_sign.capacity() * size_of::<i8>()
+            + self.pending_theory_unit_proof_ids.capacity() * size_of::<(ClauseRef, u64)>()
             + self.cold.level0_proof_id.capacity() * size_of::<u64>()
             + self.cold.level0_proof_sign.capacity() * size_of::<i8>()
             + self.cold.scope_selectors.capacity() * size_of::<Variable>()

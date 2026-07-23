@@ -8,7 +8,7 @@
 //!
 //! The eager array lane Skolemizes the array theory's `diff` function: for an
 //! array-equality atom `(= a b)` whose negation the search can assert, it mints
-//! a fresh index symbol `__ext_diff_*` and INJECTS the axiom
+//! one or more fresh AY-internal index symbols and INJECTS an axiom of the form
 //!
 //! ```text
 //! (or (= a b) (not (= (select a k) (select b k))))
@@ -38,104 +38,142 @@
 //!  * [`Executor::promote_array_extensionality_axioms`] replaces each injected
 //!    extensionality assumption with a `TheoryLemma` of kind
 //!    `ArrayExtensionality`, and APPENDS one clause-free
-//!    `array_ext_diff_intro` step per witness recording the array pair it was
-//!    minted for.
+//!    `array_ext_diff_intro` step per witness recording its exact intermediate
+//!    array pair.
 //!  * `ay-proof`'s `ExtDiffRegistry` then independently re-derives whether that
 //!    is believable: the witness must be bound exactly ONCE, must not occur
-//!    inside the arrays it differentiates, and must be genuinely FRESH —
-//!    verified against the problem's own assertions, not taken on faith from
-//!    the `__ext_diff` name or from any solver-side flag.
+//!    inside the arrays it differentiates, must have acyclic dependencies on
+//!    other introduced witnesses, and must be genuinely FRESH — verified
+//!    against the problem's own assertions, not taken on faith from the
+//!    `__ay_ext_diff` name or from any solver-side flag.
 //!
 //! Promotion is fail-closed at every step: a clause that does not match the
-//! exact schema, a witness that is not an AY-internal `__ext_diff` symbol, a
-//! witness bound to two different pairs, or an assumption the solver did not
-//! actually inject all leave the step exactly as it was (trust / foreign
-//! assume), so the gate keeps degrading those UNSATs to `unknown`.
+//! exact schema, any witness/pair missing an exact active generation-site
+//! record, a witness bound to two different pairs, or an assumption the solver
+//! did not actually inject all leave the step exactly as it was (trust /
+//! foreign assume), so the gate keeps degrading those UNSATs to `unknown`.
 
 use ay_core::kani_compat::{DetHashMap, DetHashSet};
-use ay_core::{AletheRule, Proof, ProofStep, TermData, TermId, TheoryLemmaKind};
+use ay_core::{AletheRule, Proof, ProofStep, TermId, TheoryLemmaKind};
 
 use super::Executor;
 
-/// Namespace prefix of the extensionality difference witnesses AY mints.
-///
-/// Used ONLY to keep promotion inside AY's own internal symbol space — a
-/// conservative emitter-side filter, never a soundness argument. Freshness is
-/// established by the checker against the problem's symbols, so a user symbol
-/// that happens to share this prefix is caught there rather than here.
-const EXT_DIFF_PREFIX: &str = "__ext_diff";
-
 impl Executor {
-    /// Injected extensionality axioms of the current solve, as
-    /// `clause_term -> (witness, array_a, array_b)`.
+    /// Recover one generation-site-authenticated extensionality chain.
     ///
-    /// The candidate set is the assertions the SOLVER added — everything on the
-    /// stack that is not one of the problem's own assertions. Reading it back
-    /// off the assertion stack (rather than from a per-mint-site registry)
-    /// keeps this correct across all four places the eager lane mints an
-    /// extensionality witness, and ties the recorded binding to the axiom that
-    /// was actually asserted.
-    ///
-    /// A witness that appears with TWO different array pairs is dropped
-    /// entirely: it cannot be given a single well-defined introduction, so
-    /// every clause over it stays uncertified.
-    fn injected_array_extensionality_axioms(&self) -> DetHashMap<TermId, (TermId, TermId, TermId)> {
-        let mut problem: DetHashSet<TermId> = DetHashSet::default();
-        problem.extend(self.proof_original_problem_assertions());
-        problem.extend(self.proof_problem_assertions());
+    /// Shape and provenance are independent checks: `ay-proof` recognizes the
+    /// exact one-or-more-level schema, while the per-query cache proves that
+    /// every witness identity and intermediate pair were recorded at the
+    /// generator that minted this exact clause. A reserved-looking name alone
+    /// carries no authority.
+    fn recorded_array_extensionality_chain(
+        &self,
+        clause: TermId,
+    ) -> Option<Vec<(TermId, TermId, TermId)>> {
+        let recorded = self
+            .array_ext_witness_cache
+            .generated_clause_bindings(&self.ctx.terms, clause)?;
+        if let Some(recognized) =
+            ay_proof::recognize_array_extensionality_chain(&self.ctx.terms, &[clause])
+        {
+            if recognized.len() != recorded.len() {
+                return None;
+            }
 
-        let mut by_clause: DetHashMap<TermId, (TermId, TermId, TermId)> = DetHashMap::default();
-        let mut pair_of_witness: DetHashMap<TermId, (TermId, TermId)> = DetHashMap::default();
-        let mut conflicted: DetHashSet<TermId> = DetHashSet::default();
-
-        for &assertion in &self.ctx.assertions {
-            if problem.contains(&assertion) {
-                continue;
-            }
-            let Some((array_a, array_b, witness)) =
-                ay_proof::recognize_array_extensionality(&self.ctx.terms, &[assertion])
-            else {
-                continue;
-            };
-            let TermData::Var(name, _) = self.ctx.terms.get(witness) else {
-                continue;
-            };
-            if !name.starts_with(EXT_DIFF_PREFIX) {
-                continue;
-            }
-            let pair = ordered(array_a, array_b);
-            match pair_of_witness.get(&witness) {
-                Some(&seen) if seen != pair => {
-                    // One witness, two pairs: no single introduction can be
-                    // true, so neither clause may be certified.
-                    conflicted.insert(witness);
+            let mut bindings = Vec::with_capacity(recognized.len());
+            for ((array_a, array_b, witness), generated) in
+                recognized.into_iter().zip(recorded.iter())
+            {
+                if witness != generated.witness
+                    || ordered(array_a, array_b) != ordered(generated.array_a, generated.array_b)
+                {
+                    return None;
                 }
-                Some(_) => {}
-                None => {
-                    pair_of_witness.insert(witness, pair);
-                }
+                bindings.push((witness, array_a, array_b));
             }
-            by_clause.insert(assertion, (witness, array_a, array_b));
+            return Some(bindings);
         }
 
-        by_clause.retain(|_, &mut (witness, _, _)| !conflicted.contains(&witness));
-        by_clause
+        // The datatype-array lane folds a synthesized select through
+        // const/store/ITE terms because ordinary ROW preprocessing has already
+        // run. Authenticate that one-level operational shape independently;
+        // cache provenance alone never licenses a folded claim.
+        let [generated] = recorded else {
+            return None;
+        };
+        ay_proof::recognize_folded_array_extensionality(
+            &self.ctx.terms,
+            &[clause],
+            generated.array_a,
+            generated.array_b,
+            generated.witness,
+        )
+        .then_some(vec![(
+            generated.witness,
+            generated.array_a,
+            generated.array_b,
+        )])
     }
 
     /// Replace injected extensionality assumptions with certified
     /// `ArrayExtensionality` theory lemmas plus their witness introductions.
     ///
-    /// Runs LAST in the proof pipeline, after every rewrite, demotion, prune,
-    /// and rebuild pass, so it sees the axiom in whichever shape those passes
-    /// left it (`Assume`, or a `trust` step demoted from one) and so the
-    /// appended introductions cannot be pruned away again.
+    /// The proof pipeline calls this once before strict-gated certified rewrites
+    /// (so authenticated extensionality is not mistaken for unrelated trust),
+    /// and once more after every rewrite, demotion, prune, and rebuild pass. The
+    /// final call sees the axiom in whichever shape those passes left it
+    /// (`Assume`, or a `trust` step demoted from one) and ensures introductions
+    /// cannot be pruned away again. Repeated calls are idempotent: an already
+    /// promoted lemma is not promotable, and witnesses are introduced once.
     ///
     /// The introductions are APPENDED, never inserted: appending leaves every
     /// existing `ProofId` — and therefore every premise reference — untouched,
     /// and an introduction produces no clause, so it cannot disturb the
     /// terminal empty-clause requirement either.
     pub(super) fn promote_array_extensionality_axioms(&mut self, proof: &mut Proof) {
-        let injected = self.injected_array_extensionality_axioms();
+        let mut problem: DetHashSet<TermId> = DetHashSet::default();
+        problem.extend(self.proof_original_problem_assertions());
+        problem.extend(self.proof_problem_assertions());
+
+        // Collect only claims that actually occur in this proof. This also
+        // covers generated clauses installed below the assertion-stack layer,
+        // while the cache record prevents an arbitrary trust step from being
+        // mistaken for a solver-generated axiom.
+        let mut injected: DetHashMap<TermId, Vec<(TermId, TermId, TermId)>> = DetHashMap::default();
+        let mut pair_of_witness: DetHashMap<TermId, (TermId, TermId)> = DetHashMap::default();
+        let mut conflicted: DetHashSet<TermId> = DetHashSet::default();
+        for step in &proof.steps {
+            let Some(clause_term) = promotable_clause_term(step) else {
+                continue;
+            };
+            if problem.contains(&clause_term) || injected.contains_key(&clause_term) {
+                continue;
+            }
+            let Some(bindings) = self.recorded_array_extensionality_chain(clause_term) else {
+                continue;
+            };
+            for &(witness, array_a, array_b) in &bindings {
+                let pair = ordered(array_a, array_b);
+                match pair_of_witness.get(&witness) {
+                    Some(&seen) if seen != pair => {
+                        // One witness, two pairs: no single introduction can
+                        // justify either claim, so every clause using it stays
+                        // uncertified.
+                        conflicted.insert(witness);
+                    }
+                    Some(_) => {}
+                    None => {
+                        pair_of_witness.insert(witness, pair);
+                    }
+                }
+            }
+            injected.insert(clause_term, bindings);
+        }
+        injected.retain(|_, bindings| {
+            bindings
+                .iter()
+                .all(|(witness, _, _)| !conflicted.contains(witness))
+        });
         if injected.is_empty() {
             return;
         }
@@ -165,22 +203,10 @@ impl Executor {
             // records, as a bare `assume` of the injected assertion, or as the
             // `trust` step the surface-rewrite demotion turns that assume into.
             // All three are the SAME claim; promote whichever is present.
-            let clause_term = match step {
-                ProofStep::Assume(term) => *term,
-                ProofStep::TheoryLemma { kind, clause, .. }
-                    if kind.is_trust() && clause.len() == 1 =>
-                {
-                    clause[0]
-                }
-                ProofStep::Step {
-                    rule: AletheRule::Trust,
-                    clause,
-                    premises,
-                    args,
-                } if premises.is_empty() && args.is_empty() && clause.len() == 1 => clause[0],
-                _ => continue,
+            let Some(clause_term) = promotable_clause_term(step) else {
+                continue;
             };
-            let Some(&(witness, array_a, array_b)) = injected.get(&clause_term) else {
+            let Some(bindings) = injected.get(&clause_term) else {
                 continue;
             };
             *step = ProofStep::TheoryLemma {
@@ -190,7 +216,7 @@ impl Executor {
                 kind: TheoryLemmaKind::ArrayExtensionality,
                 lia: None,
             };
-            promoted.push((witness, array_a, array_b));
+            promoted.extend(bindings.iter().copied());
         }
 
         for (witness, array_a, array_b) in promoted {
@@ -210,29 +236,41 @@ impl Executor {
     /// `--self-check` / `--strict-proofs` acceptance gates.
     ///
     /// The gates consult the PARTIAL (non-strict) checker, which admits a
-    /// theory lemma on the strength of its recorded kind alone. For every other
-    /// array kind that is fine — the clause is a tautology — but an
-    /// `ArrayExtensionality` clause is only as good as its witness's
-    /// provenance, so re-running the real check here is what stops a mere
-    /// relabelling from shipping a bare `unsat`.
+    /// theory lemma on the strength of its recorded kind alone. The ordinary
+    /// array kinds are theory-valid clauses, but an `ArrayExtensionality`
+    /// clause is a fresh-witness conservative extension and is only as good as
+    /// its witness's provenance. Re-running the real check here is what stops a
+    /// mere relabelling from shipping a bare `unsat`.
     ///
     /// Returns `true` when the proof's extensionality content (if any) is fully
     /// certified. A proof with no extensionality steps returns `true`
     /// trivially.
     #[must_use]
     pub(in crate::executor) fn unsat_proof_extensionality_certified(&self, proof: &Proof) -> bool {
-        // The AUTHORED assertion window when available: it is captured before
-        // any in-place preprocessing runs, so it is the truest statement of
-        // "the problem's symbols". Otherwise fall back to the parsed-prefix
-        // assertions. Both are unioned with the provenance-tracked problem
-        // assertions — a SUPERSET only ever makes the freshness test stricter.
-        let mut problem: Vec<TermId> = Vec::new();
-        if let Some(authored) = self.self_check_authored_assertions.as_ref() {
-            problem.extend(authored.iter().copied());
-        }
-        problem.extend(self.proof_original_problem_assertions());
-        problem.extend(self.proof_problem_assertions());
+        // Use exactly the same authored/export premise scope as the strict
+        // checker. In addition to freshness, that shared scope covers active
+        // check-sat assumptions and authenticated rebuilt source terms.
+        let problem = self.problem_assertions_for_strict_proof();
         ay_proof::validate_array_extensionality_provenance(proof, &self.ctx.terms, &problem).is_ok()
+    }
+}
+
+/// The three uncertified single-formula shapes an injected solver axiom can
+/// have after proof rewriting. Keeping this matcher shared between collection
+/// and mutation prevents the two passes from disagreeing about eligibility.
+fn promotable_clause_term(step: &ProofStep) -> Option<TermId> {
+    match step {
+        ProofStep::Assume(term) => Some(*term),
+        ProofStep::TheoryLemma { kind, clause, .. } if kind.is_trust() && clause.len() == 1 => {
+            Some(clause[0])
+        }
+        ProofStep::Step {
+            rule: AletheRule::Trust,
+            clause,
+            premises,
+            args,
+        } if premises.is_empty() && args.is_empty() && clause.len() == 1 => Some(clause[0]),
+        _ => None,
     }
 }
 

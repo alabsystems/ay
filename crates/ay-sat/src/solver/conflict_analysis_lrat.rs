@@ -605,6 +605,9 @@ impl Solver {
 
         for i in (start..end).rev() {
             let cand_off = self.cold.learned_clause_trail[i];
+            if self.is_pending_theory_conflict_clause(cand_off) {
+                continue;
+            }
 
             // Skip deleted, irredundant, or garbage clauses. Single combined
             // header read (two words, one bounds check) replaces the previous

@@ -148,6 +148,13 @@ const MAX_W6_VARS: usize = 48;
 /// Joint candidates the regex-word pre-pass hands to validation.
 const MAX_W6_WORD_CANDIDATES: usize = 16;
 
+/// Candidate cap for the EARLY W6 shortcut ([`Executor::try_w6_early_shortcut`]),
+/// which runs ahead of the Nielsen exhaust and so must bound its own
+/// validation cost. The SAT targets decide on the first one or two candidates
+/// (the shortest concat needle-plant / reps=0 skeleton word); anything beyond
+/// the cap is left to the late W6 pass, which validates the full set.
+const MAX_W6_EARLY_VALIDATIONS: usize = 8;
+
 /// Longest word the regex-word pre-pass will build. Much larger than
 /// [`MAX_W4_LEN`]: this is a WHOLE-VARIABLE value, and the stringfuzz
 /// `regexlengths` family pins `(<= 51 (str.len var0))` on a 50-way `re.++`.
@@ -702,6 +709,210 @@ impl Executor {
             }
         }
         self.w4_validate_candidates(&candidates)
+    }
+
+    /// Early W6 shortcut, hoisted ahead of the per-variable witness passes
+    /// (W1b, the cheap W1b probe, W4). Two structurally-narrow generators whose
+    /// targets those passes decide either far more slowly or catastrophically:
+    ///
+    /// 1. The slog `stranger_*_sink` `str.++`-chain construction
+    ///    ([`Self::w6_concat_candidates`]): a positive membership
+    ///    `x ∈ .*"needle".*` on a variable a DISJUNCTION equates to a
+    ///    partially-ground concat (`(or (= x_16 (str.++ σ "/Default.htm")) …)`),
+    ///    decided by planting the needle in the concat's free operand. W1b/W4
+    ///    can only synthesize `x` in ISOLATION, so all three run a full doomed
+    ///    search and only the LATE W6 pass then decides it — after ~20 ms of
+    ///    declined work (`slog_stranger_2825_sink`, 5.9x slower than z3).
+    ///
+    /// 2. The pure regex-membership fragment ([`Self::w6_pure_membership_shape`]):
+    ///    a variable constrained ONLY by `str.in_re`, no `str.++`/`str.len`
+    ///    coupling. Its witness is a linear word of the positive membership's
+    ///    term skeleton (`w6_term_word`), but the downstream w1b derivative BFS
+    ///    is slow on the complement-heavy intersection of the NEGATED
+    ///    memberships (`automatark-lu/instance08792`, ~30 ms) and W4's
+    ///    per-position search on the same shape is CATASTROPHIC (measured 12 s
+    ///    before W6 finally decides in 1.8 ms). Constructing the skeleton word
+    ///    here decides it in ~1 ms.
+    ///
+    /// The general W6 word-pool build must stay LATE (moving it early displaces
+    /// 24 pyex conversions on ties), so generator 2 is gated to the pure
+    /// fragment — which has no `str.++`/`str.len` and so is disjoint from the
+    /// pyex regex+length / word-equation families whose w1b/w4 conversions must
+    /// be preserved. Construct-and-validate, identical to the late W6 pass:
+    /// [`Self::w4_validate_candidates`] pins each candidate and re-solves under
+    /// the FULL model validation, so this emits only a validated SAT model and
+    /// otherwise declines — verdict-preserving by construction. Gated by
+    /// `str_w6_enabled()` so `AY_STR_W6=0` stays byte-identical.
+    pub(in crate::executor) fn try_w6_early_shortcut(&mut self) -> Result<Option<SolveResult>> {
+        if !str_w6_enabled() || self.pivot_enum_depth != 0 {
+            return Ok(None);
+        }
+        let vars = self.collect_string_variables();
+        if vars.is_empty() || vars.len() > MAX_W6_VARS {
+            return Ok(None);
+        }
+        let memberships = self.w6_collect_memberships();
+        if memberships.is_empty() {
+            return Ok(None);
+        }
+        let mut candidates: Vec<HashMap<TermId, String>> = Vec::new();
+        self.w6_concat_candidates(&vars, &memberships, &mut candidates);
+        if self.w6_pure_membership_shape() {
+            self.w6_pure_membership_candidates(&vars, &memberships, &mut candidates);
+        }
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        // Running ahead of Nielsen, this pass must be a bounded FAST PATH: the
+        // targets decide on the shortest few candidates (concat needle-plants
+        // and reps=0 skeleton words, both ordered first), so cap the validation
+        // storm. Anything not decided within the cap declines and is retried by
+        // the late W6 pass (full candidate set) unchanged — no capability lost.
+        candidates.truncate(MAX_W6_EARLY_VALIDATIONS);
+        if super::debug_auflia_enabled() {
+            safe_eprintln!(
+                "[W6] early shortcut: {} joint candidate(s) over {} var(s)",
+                candidates.len(),
+                vars.len()
+            );
+        }
+        self.w4_validate_candidates(&candidates)
+    }
+
+    /// True when EVERY string constraint in the assertion set is a `str.in_re`
+    /// membership or an (in)equality — the pure regex-membership fragment. No
+    /// `str.++`, `str.len`, `str.at`, `str.substr`, or any other string
+    /// operation couples the variables, so each variable's witness is exactly a
+    /// word of its own memberships. This is the fragment where the length-
+    /// indexed W4 search and the complement-heavy w1b derivative BFS are both
+    /// far slower than a linear skeleton word.
+    ///
+    /// The fragment is deliberately NARROW: every top-level assertion (after
+    /// `and`-splitting) must be a DIRECT literal over a string VARIABLE `v` —
+    /// `(str.in_re v R)`, or a `v == const` / `v != const` (dis)equality (the
+    /// polarity `not` wrapping either) — and at least one must be a membership.
+    /// This admits the automatark pure-membership targets (`instance12580`,
+    /// whose `(not (str.in_re x (str.to_re c)))` conjunct is rewritten to
+    /// `(not (= x c))` before this runs; `instance08792`) but rejects
+    /// * membership+length / word-equation files (a coupling `str.len` /
+    ///   `str.++` appears as a conjunct or inside the haystack), keeping the
+    ///   pyex families' w1b/w4 conversions untouched; and, crucially,
+    /// * BOOLEAN COMBINATIONS of memberships such as the sygus-qgen
+    ///   `(and (not (= (str.in_re x R1) (str.in_re x R2))) …)` — where the `=`
+    ///   is Bool≡Bool over two memberships, not `var == const`, so it is
+    ///   rejected. Their SAT is built ONLY by Nielsen's complement-based
+    ///   materializer, which must therefore NOT be declined or shortcut.
+    ///
+    /// The regex ARGUMENT of a membership is not inspected (it is a regex, not a
+    /// coupling term); a blown budget declines conservatively.
+    pub(in crate::executor) fn w6_pure_membership_shape(&self) -> bool {
+        let mut stack: Vec<TermId> = self.ctx.assertions.to_vec();
+        let mut budget = 20_000usize;
+        let mut saw_membership = false;
+        while let Some(t) = stack.pop() {
+            if budget == 0 {
+                return false;
+            }
+            budget -= 1;
+            // Negation is a dedicated `TermData::Not`, not an `App`.
+            let body = match self.ctx.terms.get(t) {
+                TermData::Not(inner) => *inner,
+                TermData::App(sym, args) if sym.name() == "and" => {
+                    stack.extend(args.iter().copied());
+                    continue;
+                }
+                TermData::App(sym, args) if sym.name() == "true" && args.is_empty() => continue,
+                TermData::Const(Constant::Bool(true)) => continue,
+                _ => t,
+            };
+            match self.w6_var_literal_kind(body) {
+                Some(true) => saw_membership = true,
+                Some(false) => {}
+                None => return false,
+            }
+        }
+        saw_membership
+    }
+
+    /// Classify a candidate literal body over a string VARIABLE:
+    /// * `Some(true)`  — `(str.in_re v R)`, a membership;
+    /// * `Some(false)` — `(= v c)` / `(distinct v c)` between a string variable
+    ///   and a string CONSTANT (either argument order);
+    /// * `None`        — anything else (a coupling term, a Bool≡Bool equality
+    ///   of two memberships, a variable≡variable equality, …).
+    fn w6_var_literal_kind(&self, t: TermId) -> Option<bool> {
+        let TermData::App(sym, args) = self.ctx.terms.get(t) else {
+            return None;
+        };
+        let is_str_var = |a: TermId| {
+            matches!(self.ctx.terms.get(a), TermData::Var(..))
+                && *self.ctx.terms.sort(a) == Sort::String
+        };
+        let is_str_const =
+            |a: TermId| matches!(self.ctx.terms.get(a), TermData::Const(Constant::String(_)));
+        match sym.name() {
+            "str.in_re" | "str.in.re" if args.len() == 2 && is_str_var(args[0]) => Some(true),
+            "=" | "distinct" if args.len() == 2 => {
+                let var_const = |a: TermId, b: TermId| is_str_var(a) && is_str_const(b);
+                (var_const(args[0], args[1]) || var_const(args[1], args[0])).then_some(false)
+            }
+            _ => None,
+        }
+    }
+
+    /// Per-variable structural witness pool for the pure regex-membership
+    /// fragment: for each variable, a LINEAR skeleton word of every positive
+    /// `str.in_re` whose haystack is that variable (`w6_term_word` at several
+    /// star-repetition counts) and the empty string.
+    ///
+    /// Deliberately does NOT run the derivative-BFS witness search
+    /// (`find_witness_bounded`) the late W6 word-pool uses: this pass runs
+    /// AHEAD of the Nielsen exhaust, so it must never start a doomed
+    /// complement-heavy product-derivative search — on the pure-membership
+    /// UNSAT `automatark-lu/instance13338` that BFS runs for ~5 s before
+    /// declining, work the Nielsen emptiness check settles in ~15 ms. The
+    /// linear skeleton word is exactly the witness for the SAT targets
+    /// (`instance08792`/`instance12580`: a `str.to_re`/`re.*` concatenation);
+    /// anything whose witness needs the BFS declines here and is picked up by
+    /// the late W6 pass unchanged.
+    ///
+    /// A SAT-side candidate generator only — every candidate is pinned and
+    /// revalidated against the FULL assertion set (including the negated
+    /// memberships and any disequations) by the caller, so a word that happens
+    /// to violate a negative membership simply fails validation and is
+    /// discarded.
+    fn w6_pure_membership_candidates(
+        &self,
+        vars: &[TermId],
+        memberships: &[(TermId, TermId, bool)],
+        out: &mut Vec<HashMap<TermId, String>>,
+    ) {
+        let mut pools: Vec<(TermId, Vec<String>)> = Vec::with_capacity(vars.len());
+        for &var in vars {
+            let mut pool: Vec<String> = Vec::new();
+            for &(hay, re, pol) in memberships {
+                if hay != var || !pol {
+                    continue;
+                }
+                for reps in W6_WORD_REPS {
+                    if let Some(w) = self.w6_term_word(re, reps, 0) {
+                        w6_push_word(w, &mut pool);
+                    }
+                }
+            }
+            w6_push_word(String::new(), &mut pool);
+            pool.sort_by_key(|s| s.chars().count());
+            pools.push((var, pool));
+        }
+        let depth = pools.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
+        for idx in 0..depth.min(MAX_W6_WORD_CANDIDATES) {
+            let mut assign: HashMap<TermId, String> = HashMap::default();
+            for (var, pool) in &pools {
+                let pick = pool.get(idx).or_else(|| pool.last());
+                assign.insert(*var, pick.cloned().unwrap_or_default());
+            }
+            w6_push_candidate(assign, out);
+        }
     }
 
     /// A word of the regex TERM `t`, with every `re.*`/`re.+` body repeated

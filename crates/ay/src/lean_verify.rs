@@ -69,6 +69,7 @@ impl LeanVerifier {
     /// public pathname. The cloned descriptor is inherited across `exec`, and
     /// Lean receives the child-local descriptor path.
     #[cfg(unix)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn verify_descriptor(&self, proof_file: &std::fs::File) -> LeanVerificationOutcome {
         let inherited = match proof_file.try_clone() {
             Ok(file) => file,

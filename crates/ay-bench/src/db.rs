@@ -102,6 +102,24 @@ impl StorePath {
         Self(repo_root.join(".ay-bench").join("results.sqlite"))
     }
 
+    /// Resolve the persistent store, honoring the continuous-runner override.
+    #[must_use]
+    pub fn configured_at(repo_root: &Path) -> Self {
+        Self::resolve_at(
+            repo_root,
+            std::env::var_os("AY_BENCH_STORE_PATH").map(PathBuf::from),
+        )
+    }
+
+    #[must_use]
+    fn resolve_at(repo_root: &Path, configured: Option<PathBuf>) -> Self {
+        match configured.filter(|path| !path.as_os_str().is_empty()) {
+            Some(path) if path.is_absolute() => Self(path),
+            Some(path) => Self(repo_root.join(path)),
+            None => Self::default_at(repo_root),
+        }
+    }
+
     #[must_use]
     pub fn as_path(&self) -> &Path {
         &self.0
@@ -385,6 +403,18 @@ pub fn resolve_head(repo_root: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn private_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("make results-store test parent private");
+        }
+        dir
+    }
+
     fn sample(commit: &str, bench: &str, result: &str, ms: i64, ok: i32) -> ResultRow {
         ResultRow {
             commit_hash: commit.to_string(),
@@ -474,10 +504,27 @@ mod tests {
         assert_eq!(p.as_path(), Path::new("/tmp/repo/.ay-bench/results.sqlite"));
     }
 
+    #[test]
+    fn test_configured_store_path_resolution() {
+        let root = Path::new("/tmp/repo");
+        assert_eq!(
+            StorePath::resolve_at(root, Some(PathBuf::from("state/results.sqlite"))).as_path(),
+            Path::new("/tmp/repo/state/results.sqlite")
+        );
+        assert_eq!(
+            StorePath::resolve_at(root, Some(PathBuf::from("/evidence/results.sqlite"))).as_path(),
+            Path::new("/evidence/results.sqlite")
+        );
+        assert_eq!(
+            StorePath::resolve_at(root, Some(PathBuf::new())).as_path(),
+            Path::new("/tmp/repo/.ay-bench/results.sqlite")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_store_rejects_visible_path_replacement_after_open() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_tempdir();
         let path = dir.path().join("results.sqlite");
         let displaced = dir.path().join("authenticated-results.sqlite");
         let mut store = ResultsStore::open(&path).expect("open authenticated store");
@@ -502,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_store_initialization_failure_preserves_existing_target() {
-        let dir = tempfile::tempdir().expect("tempdir");
+        let dir = private_tempdir();
         let path = dir.path().join("invalid.sqlite");
         let original = b"not a sqlite database";
         std::fs::write(&path, original).expect("write invalid store");

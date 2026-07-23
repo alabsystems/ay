@@ -110,6 +110,145 @@ fn test_validate_step_rejects_trust_in_strict_mode() {
     );
 }
 
+fn array_extensionality_trust_fixture() -> (TermStore, Proof, Vec<TermId>, TermId) {
+    let mut terms = TermStore::new();
+    let array_sort = Sort::array(Sort::Int, Sort::Int);
+    let a = terms.mk_var("context_array_a", array_sort.clone());
+    let b = terms.mk_var("context_array_b", array_sort);
+    let witness = terms.mk_var("__context_ext_diff", Sort::Int);
+
+    let eq_arrays = terms.mk_app(ay_core::Symbol::named("="), vec![a, b], Sort::Bool);
+    let select_a = terms.mk_app(
+        ay_core::Symbol::named("select"),
+        vec![a, witness],
+        Sort::Int,
+    );
+    let select_b = terms.mk_app(
+        ay_core::Symbol::named("select"),
+        vec![b, witness],
+        Sort::Int,
+    );
+    let eq_selects = terms.mk_app(
+        ay_core::Symbol::named("="),
+        vec![select_a, select_b],
+        Sort::Bool,
+    );
+    let not_eq_selects = terms.mk_not(eq_selects);
+    let extensionality = terms.mk_or(vec![eq_arrays, not_eq_selects]);
+    let problem_assertion = terms.mk_not(eq_arrays);
+
+    let mut proof = Proof::new();
+    proof.add_rule_step(
+        AletheRule::ArrayExtDiffIntro,
+        Vec::new(),
+        Vec::new(),
+        vec![witness, a, b],
+    );
+    proof.add_theory_lemma_with_kind(
+        "arrays",
+        vec![extensionality],
+        TheoryLemmaKind::ArrayExtensionality,
+    );
+    proof.add_rule_step(AletheRule::Trust, Vec::new(), Vec::new(), Vec::new());
+
+    (terms, proof, vec![problem_assertion], witness)
+}
+
+#[test]
+fn test_collecting_trust_with_context_authenticates_array_extensionality() {
+    let (terms, proof, problem_assertions, _) = array_extensionality_trust_fixture();
+    let datatype_decls: Vec<(String, Vec<String>)> = Vec::new();
+    let selector_decls: Vec<(String, Vec<String>)> = Vec::new();
+
+    let collected = check_proof_collecting_trust_with_context(
+        &proof,
+        &terms,
+        Some(&datatype_decls),
+        Some(&selector_decls),
+        Some(&problem_assertions),
+    )
+    .expect("valid extensionality provenance should pass while trust is deferred");
+
+    assert_eq!(collected, vec![(ProofId(2), Vec::new())]);
+}
+
+#[test]
+fn test_collecting_trust_with_context_rejects_missing_array_context() {
+    let (terms, proof, _, _) = array_extensionality_trust_fixture();
+
+    let err = check_proof_collecting_trust_with_context(&proof, &terms, None, None, None)
+        .expect_err("missing problem assertions must keep extensionality fail-closed");
+
+    assert!(
+        matches!(err, ProofCheckError::InvalidTheoryLemma { step: ProofId(1), ref reason }
+            if reason.contains("no problem assertion set")),
+        "expected missing-context rejection, got {err:?}"
+    );
+}
+
+#[test]
+fn test_collecting_trust_with_context_rejects_nonfresh_witness() {
+    let (mut terms, proof, _, witness) = array_extensionality_trust_fixture();
+    let forged_assertion = terms.mk_app(
+        ay_core::Symbol::named("="),
+        vec![witness, witness],
+        Sort::Bool,
+    );
+
+    let err = check_proof_collecting_trust_with_context(
+        &proof,
+        &terms,
+        None,
+        None,
+        Some(&[forged_assertion]),
+    )
+    .expect_err("a problem-constrained witness must not authenticate extensionality");
+
+    assert!(
+        matches!(err, ProofCheckError::InvalidTheoryLemma { step: ProofId(0), ref reason }
+            if reason.contains("NOT fresh")),
+        "expected forged-context rejection, got {err:?}"
+    );
+}
+
+#[test]
+fn test_strict_context_rejects_assumption_outside_problem_obligation() {
+    let mut terms = TermStore::new();
+    let asserted = terms.mk_var("asserted", Sort::Bool);
+    let foreign = terms.mk_not(asserted);
+    let mut proof = Proof::new();
+    let asserted_step = proof.add_assume(asserted, None);
+    let foreign_step = proof.add_assume(foreign, None);
+    proof.add_resolution(Vec::new(), asserted, asserted_step, foreign_step);
+
+    let err = crate::check_proof_strict_with_context(&proof, &terms, None, None, Some(&[asserted]))
+        .expect_err("a context-bound proof must not introduce a foreign hypothesis");
+    assert_eq!(
+        err,
+        ProofCheckError::UnauthorizedAssumption {
+            step: ProofId(1),
+            term: foreign,
+        }
+    );
+}
+
+#[test]
+fn test_strict_context_accepts_nested_conjunct_assumptions() {
+    let mut terms = TermStore::new();
+    let p = terms.mk_var("nested_conjunct_p", Sort::Bool);
+    let not_p = terms.mk_not(p);
+    let authored = terms.mk_app(ay_core::Symbol::named("and"), vec![p, not_p], Sort::Bool);
+    let mut proof = Proof::new();
+    let p_step = proof.add_assume(p, None);
+    let not_p_step = proof.add_assume(not_p, None);
+    proof.add_resolution(Vec::new(), p, p_step, not_p_step);
+
+    let quality =
+        crate::check_proof_strict_with_context(&proof, &terms, None, None, Some(&[authored]))
+            .expect("flattened nested conjunctions remain authored premises");
+    assert!(quality.is_complete());
+}
+
 #[test]
 fn test_validate_step_strict_mode_rejects_unvalidated_generic_rule() {
     let mut terms = TermStore::new();

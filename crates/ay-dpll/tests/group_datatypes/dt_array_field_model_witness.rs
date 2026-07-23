@@ -336,15 +336,13 @@ fn datatype_array_field_congruence_conflict_is_sound() {
 /// #dt-array-nested-const-idx — NESTED array-of-array datatype select-congruence
 /// across a CONSTANT vs SYMBOLIC inner index. `R : Array -> Array -> T`. The two
 /// reads `(select (select R #x3) i)` and `(select (select R k) i)` with `k = #x3`
-/// denote the SAME `T` cell, so their `p`-fields must agree — UNSAT. The scalar-
-/// projection pass templates chains by their symbolic indices; before the fix it
-/// SKIPPED the constant inner index, so the const-inner and symbolic-inner reads
-/// landed in different templates and were never tied (on the aterm parser BMC
-/// instance this left the base model congruence-violating -> census reject ->
-/// re-encode blowup). Behavior guard: this must stay UNSAT (a break flips it to a
-/// sound `unknown`).
+/// denote the SAME `T` cell, so their `p`-fields must agree. The scalar-projection
+/// pass finds the contradiction, but nested-array UNSAT is intentionally
+/// quarantined at the public boundary until the theory-combination refutation has
+/// a trust-free certificate. Preserve the sound `unknown`; in particular, this
+/// congruence conflict must never be reported `sat`.
 #[test]
-fn nested_array_of_array_const_symbolic_index_congruence_is_unsat() {
+fn nested_array_of_array_const_symbolic_index_congruence_is_quarantined() {
     let smt = r#"
         (set-logic ALL)
         (declare-datatype T ((mk (p (_ BitVec 4)) (q (_ BitVec 4)))))
@@ -359,7 +357,7 @@ fn nested_array_of_array_const_symbolic_index_congruence_is_unsat() {
     "#;
     let lines = results(&crate::common::solve(smt));
     assert_eq!(
-        lines[0], "unsat",
-        "nested array-of-array congruence across const/symbolic inner index must be unsat:\n{lines:?}"
+        lines[0], "unknown",
+        "uncertified nested array-of-array UNSAT must be quarantined:\n{lines:?}"
     );
 }

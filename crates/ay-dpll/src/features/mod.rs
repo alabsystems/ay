@@ -46,6 +46,10 @@ pub(crate) struct StaticFeatures {
     pub has_bv: bool,
     /// Formula contains Array-sorted terms
     pub has_arrays: bool,
+    /// Formula contains an array whose index or element sort itself contains
+    /// an array. This is tracked separately because the current nested-array
+    /// arithmetic-combination path cannot yet authorize an UNSAT verdict.
+    pub has_nested_arrays: bool,
     /// Formula contains String-sorted terms
     pub has_strings: bool,
     /// Formula contains generic Seq-sorted terms (not String)
@@ -402,6 +406,11 @@ impl StaticFeatures {
             Sort::BitVec(_) => self.has_bv = true,
             Sort::Array(arr) => {
                 self.has_arrays = true;
+                if Self::sort_mentions_array(&arr.index_sort)
+                    || Self::sort_mentions_array(&arr.element_sort)
+                {
+                    self.has_nested_arrays = true;
+                }
                 // Recurse into array index/element sorts
                 self.detect_sort_theory(&arr.index_sort);
                 self.detect_sort_theory(&arr.element_sort);
@@ -432,6 +441,20 @@ impl StaticFeatures {
             }
             // All current Sort variants handled above (#5692).
             other => unreachable!("unhandled Sort variant in detect_sort_theory(): {other:?}"),
+        }
+    }
+
+    fn sort_mentions_array(sort: &Sort) -> bool {
+        match sort {
+            Sort::Array(_) => true,
+            Sort::Seq(element) => Self::sort_mentions_array(element),
+            Sort::Datatype(datatype) => datatype.constructors.iter().any(|constructor| {
+                constructor
+                    .fields
+                    .iter()
+                    .any(|field| Self::sort_mentions_array(&field.sort))
+            }),
+            _ => false,
         }
     }
 }

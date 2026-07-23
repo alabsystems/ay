@@ -444,3 +444,88 @@ fn precheck_flag_off_declines_bridge_shape() {
         "flag-off precheck must decline the bridge tautology shape"
     );
 }
+
+/// Locate the datatype-sorted `Var(name)` in `exec`'s assertions.
+fn find_var(exec: &Executor, name: &str) -> TermId {
+    let mut stack: Vec<TermId> = exec.ctx.assertions.clone();
+    let mut seen: HashSet<TermId> = HashSet::default();
+    while let Some(t) = stack.pop() {
+        if !seen.insert(t) {
+            continue;
+        }
+        match exec.ctx.terms.get(t) {
+            TermData::Var(n, _) if n == name => return t,
+            TermData::App(_, args) => {
+                for &a in args {
+                    stack.push(a);
+                }
+            }
+            TermData::Not(i) => stack.push(*i),
+            TermData::Ite(a, b, c) => {
+                stack.push(*a);
+                stack.push(*b);
+                stack.push(*c);
+            }
+            _ => {}
+        }
+    }
+    panic!("var `{name}` not found in assertions");
+}
+
+#[test]
+fn value_key_fails_closed_on_free_carrier_selector_derived_term() {
+    // take_some_rest / inc_some_2_list forall-13 (SAT-side base-recheck
+    // campaign): the `(&mut u32, &mut List)` tuple carrier routes `logic_sum`'s
+    // `List` argument through a FREE, unaxiomatized carrier selector
+    // (`logic_...tuple_get_1_placeholder_Tuple2...`) applied to a CONSTRUCTED
+    // tuple value. That selector application commits NO model row (the base
+    // recheck carries no Tuple2 selector-over-constructor projection axiom and
+    // no ground equality pinning it — a verification-consumer premise gap, the
+    // `spec_axiom_dropped` class), so the derived `List` term has NO committed
+    // datatype e-class. `dt_cert_value_key` MUST fail closed (`None`) — the
+    // step-4 "unresolvable e-class key for a table arg" decline — rather than
+    // fabricate a key, which would be a wrong-grant.
+    //
+    // This is precisely why take_some_rest's forall-13 DECLINES while sum_x's
+    // forall-5 GRANTS: sum_x's `logic_sum` args bottom out at committed native
+    // selectors over committed `List` consts (every arg has a committed
+    // e-class); take_some_rest's route through the free carrier selector and
+    // bottom out at an uncommitted point. It is NOT resolvable by the W2
+    // argument-value congruence completion (`dt_cert_build_uf_value_index`):
+    // there is nothing committed to be congruent to. Fail-closed decline is the
+    // sound outcome. See memory/sat-side-base-recheck-campaign.md.
+    let (mut exec, model) = solve_ground(
+        r#"
+        (set-logic ALL)
+        (declare-datatypes ((List 0)) (((Cons (hd Int) (tl List)) (Nil))))
+        (declare-const self List)
+        (declare-fun logic_sum (List) Int)
+        (assert (is-Cons self))
+        (assert (= (logic_sum self) 0))
+        (check-sat)
+    "#,
+    );
+    // Positive control (the forall-5 case): a committed `List` const resolves to
+    // a datatype e-class.
+    let self_tid = find_var(&exec, "self");
+    assert!(
+        exec.dt_cert_value_key(&model, self_tid).is_some(),
+        "a committed List const must resolve to a datatype e-class"
+    );
+    // Fail-closed (the forall-13 case): a FREE carrier-selector application whose
+    // datatype value the model never committed has NO e-class key. (Minted after
+    // the solve, so it is committed to nothing — exactly the base-recheck state
+    // where the carrier chain is a solver don't-care.)
+    let list_sort = exec.ctx.terms.sort(self_tid).clone();
+    let carrier_tail = exec.ctx.terms.mk_app(
+        Symbol::named("logic_____VERIFICATION_CONSUMER__tuple__get__1__placeholder_Tuple2_carrier"),
+        [self_tid],
+        list_sort,
+    );
+    assert_eq!(
+        exec.dt_cert_value_key(&model, carrier_tail),
+        None,
+        "a free carrier-selector-derived List term with no committed e-class must \
+         fail closed (the take_some_rest forall-13 decline), never fabricate a key"
+    );
+}

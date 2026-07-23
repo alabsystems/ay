@@ -31,15 +31,15 @@ use ay_frontend::parse;
 
 use super::model_params::eval_term_under_model;
 use super::{
-    apply_supported_params, ast_to_term, cache_ast_vector, cache_string,
+    apply_supported_params, cache_ast_vector, cache_string, checked_ast_to_term,
     ensure_cross_context_translation_semantics, ffi_count_within_limit, ffi_guard_ast,
     ffi_guard_const_ptr, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
     ffi_read_bounded_parser_file, ffi_read_bounded_parser_text, ffi_read_bounded_text,
-    record_ast_sort, sort_handle_to_ast, term_to_ast, transfer_cross_context_ffi_metadata,
-    ModelHandle, ParamDescr, ParamDescrsHandle, Z3Context, Z3_apply_result, Z3_ast, Z3_ast_vector,
-    Z3_constructor, Z3_context, Z3_func_decl, Z3_model, Z3_param_descrs, Z3_params, Z3_pattern,
-    Z3_sort, Z3_string, Z3_symbol, HANDLE_TAG_MASK, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_OK,
-    Z3_PK_BOOL,
+    record_ast_sort, require_term_ast_or_return, require_term_asts_or_return, sort_handle_to_ast,
+    term_to_ast, transfer_cross_context_ffi_metadata, ModelHandle, ParamDescr, ParamDescrsHandle,
+    Z3Context, Z3_apply_result, Z3_ast, Z3_ast_vector, Z3_constructor, Z3_context, Z3_func_decl,
+    Z3_model, Z3_param_descrs, Z3_params, Z3_pattern, Z3_sort, Z3_string, Z3_symbol,
+    HANDLE_TAG_MASK, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_OK, Z3_PK_BOOL,
 };
 
 // ============================================================================
@@ -82,13 +82,13 @@ pub unsafe extern "C" fn Z3_app_to_ast(_c: Z3_context, a: Z3_ast) -> Z3_ast {
 
 /// Convert a sort to an AST (Z3's `Z3_sort_to_ast`).
 ///
-/// Returns a value-canonical tagged handle (`SORT_AST_TAG | sort_id`): the
-/// same semantic `Sort` always yields the SAME `Z3_ast`, so `Z3_is_eq_ast`,
+/// Returns a value-canonical, context-salted tagged handle: the same semantic
+/// `Sort` in one context always yields the SAME `Z3_ast`, so `Z3_is_eq_ast`,
 /// `Z3_get_ast_id`, and dict/hash use through z3py behave exactly like z3's
 /// hash-consed sort asts. The tag keeps the handle disjoint from every term
-/// (see `HANDLE_TAG_MASK`); a tagged handle leaking into a term-consuming
-/// entry point fails closed via the `ast_to_term` poison guard. A null sort
-/// returns the null AST (`0`).
+/// (see `HANDLE_TAG_MASK`); a tagged handle leaking into a term-consuming entry
+/// point fails closed via authenticated term-handle decoding. A null sort or a
+/// sort owned by another context returns the null AST (`0`).
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `s`, when non-null, a valid sort
@@ -101,7 +101,18 @@ pub unsafe extern "C" fn Z3_sort_to_ast(c: Z3_context, s: Z3_sort) -> Z3_ast {
     // SAFETY: `c` is the caller-supplied context pointer; `ffi_guard_ast`
     // handles the null case and catches panics. `s` is null-checked above and
     // owned by the context arena per the safety contract.
-    unsafe { ffi_guard_ast(c, |ctx| sort_handle_to_ast(ctx, s)) }
+    unsafe {
+        ffi_guard_ast(c, |ctx| {
+            if !ctx.sort_cache.contains(&s) {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg =
+                    Some("Z3_sort_to_ast: sort handle belongs to a different context".to_string());
+                return 0;
+            }
+            ctx.last_error = Z3_OK;
+            sort_handle_to_ast(ctx, s)
+        })
+    }
 }
 
 /// Convert an AST back to a func_decl (Z3's `Z3_to_func_decl`).
@@ -257,8 +268,17 @@ pub unsafe extern "C" fn Z3_translate(source: Z3_context, a: Z3_ast, target: Z3_
                 tgt.error_msg = Some("Z3_translate: argument is not a term AST".to_string());
                 return 0;
             }
-            // Same context: the handle is already valid here.
+            // Same context: authenticate before returning the identity handle;
+            // otherwise this API would launder a colliding foreign handle.
             if source == target {
+                if checked_ast_to_term(tgt, a).is_none() {
+                    tgt.last_error = Z3_INVALID_ARG;
+                    tgt.error_msg = Some(
+                        "Z3_translate: argument is invalid or belongs to a different context"
+                            .to_string(),
+                    );
+                    return 0;
+                }
                 tgt.last_error = Z3_OK;
                 return a;
             }
@@ -270,10 +290,17 @@ pub unsafe extern "C" fn Z3_translate(source: Z3_context, a: Z3_ast, target: Z3_
                 tgt.error_msg = Some("Z3_translate: null source context".to_string());
                 return 0;
             };
+            let Some(src_term) = checked_ast_to_term(src, a) else {
+                tgt.last_error = Z3_INVALID_ARG;
+                tgt.error_msg = Some(
+                    "Z3_translate: argument is invalid or belongs to a different source context"
+                        .to_string(),
+                );
+                return 0;
+            };
             if !ensure_cross_context_translation_semantics(src, tgt, "Z3_translate") {
                 return 0;
             }
-            let src_term = ast_to_term(a);
             let new_terms = tgt.solver.translate_terms_from(&src.solver, &[src_term]);
             let Some(&new_term) = new_terms.first() else {
                 tgt.last_error = Z3_EXCEPTION;
@@ -290,7 +317,7 @@ pub unsafe extern "C" fn Z3_translate(source: Z3_context, a: Z3_ast, target: Z3_
             ) {
                 return 0;
             }
-            let ast = term_to_ast(new_term);
+            let ast = term_to_ast(tgt, new_term);
             let sort = src.solver.term_sort(src_term);
             record_ast_sort(tgt, ast, sort);
             tgt.last_error = Z3_OK;
@@ -349,20 +376,19 @@ pub unsafe extern "C" fn Z3_add_rec_def(
     if !unsafe { ffi_count_within_limit(c, "Z3_add_rec_def", n) } {
         return;
     }
-    // Pre-extract the decl and argument terms outside the guard (raw derefs).
+    // Pre-extract the decl and argument handles outside the guard (raw derefs).
     // SAFETY: `f`, when non-null, is a live `FuncDeclHandle`; `as_ref` null-checks.
     let decl_handle = unsafe { f.as_ref() };
     let decl = decl_handle.map(|h| h.decl.clone());
     let api_name = decl_handle.and_then(|h| h.symbol.as_ref().map(super::SymbolKey::display_name));
-    let mut arg_terms: Vec<Term> = Vec::new();
+    let mut arg_asts: Vec<Z3_ast> = Vec::new();
     if n > 0 && !args.is_null() {
         for i in 0..n as usize {
             // SAFETY: `args` points to at least `n` elements per the contract; the
             // count was range-checked and the pointer null-checked above.
-            arg_terms.push(ast_to_term(unsafe { *args.add(i) }));
+            arg_asts.push(unsafe { *args.add(i) });
         }
     }
-    let body_term = ast_to_term(body);
 
     // SAFETY: `ffi_guard_void` handles a null context and catches panics.
     unsafe {
@@ -378,6 +404,9 @@ pub unsafe extern "C" fn Z3_add_rec_def(
                 ctx.error_msg = Some("Z3_add_rec_def: null func_decl handle".to_string());
                 return;
             };
+            let arg_terms = require_term_asts_or_return!(ctx, &arg_asts, "Z3_add_rec_def");
+            let body_term =
+                require_term_ast_or_return!(ctx, body, "Z3_add_rec_def", "definition body");
             // Recursive definitions are declaration semantics consumed by both
             // Solver and Optimize. They do not select one family, but a context
             // already poisoned by a partial transaction must remain unusable.
@@ -823,7 +852,7 @@ pub unsafe extern "C" fn Z3_model_extrapolate(c: Z3_context, m: Z3_model, fml: Z
                 return 0;
             }
             let handle = &*m;
-            let t = ast_to_term(fml);
+            let t = require_term_ast_or_return!(ctx, fml, "Z3_model_extrapolate", "formula", 0);
             let mut lits: Vec<Term> = Vec::new();
             let result = if model_implicant(ctx, handle, t, &mut lits) {
                 match lits.len() {
@@ -835,7 +864,7 @@ pub unsafe extern "C" fn Z3_model_extrapolate(c: Z3_context, m: Z3_model, fml: Z
                 // m ⊭ fml (or undeterminable): the sound empty implicant.
                 ctx.solver.bool_const(false)
             };
-            let ast = term_to_ast(result);
+            let ast = term_to_ast(ctx, result);
             record_ast_sort(ctx, ast, Sort::Bool);
             ast
         })
@@ -883,8 +912,15 @@ pub unsafe extern "C" fn Z3_apply_result_to_string(c: Z3_context, r: Z3_apply_re
                     let rendered = if a == 0 {
                         "?".to_string()
                     } else {
+                        let term = require_term_ast_or_return!(
+                            ctx,
+                            a,
+                            "Z3_apply_result_to_string",
+                            "subgoal formula",
+                            ptr::null()
+                        );
                         ctx.solver
-                            .format_term_checked(ast_to_term(a))
+                            .format_term_checked(term)
                             .unwrap_or_else(|| "?".to_string())
                     };
                     s.push_str("\n  ");
@@ -923,22 +959,30 @@ pub unsafe extern "C" fn Z3_apply_result_to_string(c: Z3_context, r: Z3_apply_re
 #[no_mangle]
 pub unsafe extern "C" fn Z3_pattern_to_ast(c: Z3_context, p: Z3_pattern) -> Z3_ast {
     // SAFETY: `p`, when non-null, is a live `PatternHandle`; `as_ref` null-checks.
-    let terms = unsafe { p.as_ref() }.map(|h| h.terms.clone());
+    let pattern = unsafe { p.as_ref() }.map(|h| (h.owner_salt, h.terms.clone()));
     // SAFETY: `ffi_guard_ast` handles a null context and catches panics.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let Some(terms) = terms else {
+            let Some(pattern) = pattern else {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some("Z3_pattern_to_ast: null pattern handle".to_string());
                 return 0;
             };
+            let Some(mut slices) = super::quantifiers::checked_pattern_slices(
+                ctx,
+                std::slice::from_ref(&pattern),
+                "Z3_pattern_to_ast",
+            ) else {
+                return 0;
+            };
+            let terms = slices.pop().unwrap_or_default();
             if terms.len() == 1 {
                 ctx.last_error = Z3_OK;
-                term_to_ast(terms[0])
+                term_to_ast(ctx, terms[0])
             } else {
                 // Multi-trigger: the real `(pattern t1 t2 ...)` grouping node.
                 let t = ctx.solver.pattern_term(&terms);
-                let ast = term_to_ast(t);
+                let ast = term_to_ast(ctx, t);
                 record_ast_sort(ctx, ast, Sort::Bool);
                 ctx.last_error = Z3_OK;
                 ast
@@ -956,15 +1000,23 @@ pub unsafe extern "C" fn Z3_pattern_to_ast(c: Z3_context, p: Z3_pattern) -> Z3_a
 #[no_mangle]
 pub unsafe extern "C" fn Z3_pattern_to_string(c: Z3_context, p: Z3_pattern) -> Z3_string {
     // SAFETY: `p`, when non-null, is a live `PatternHandle`; `as_ref` null-checks.
-    let terms = unsafe { p.as_ref() }.map(|h| h.terms.clone());
+    let pattern = unsafe { p.as_ref() }.map(|h| (h.owner_salt, h.terms.clone()));
     // SAFETY: `ffi_guard_const_ptr` handles a null context and catches panics.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
-            let Some(terms) = terms else {
+            let Some(pattern) = pattern else {
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some("Z3_pattern_to_string: null pattern handle".to_string());
                 return ptr::null();
             };
+            let Some(mut slices) = super::quantifiers::checked_pattern_slices(
+                ctx,
+                std::slice::from_ref(&pattern),
+                "Z3_pattern_to_string",
+            ) else {
+                return ptr::null();
+            };
+            let terms = slices.pop().unwrap_or_default();
             let mut s = String::from("(pattern");
             for &t in &terms {
                 let rendered = ctx
@@ -1097,31 +1149,45 @@ pub unsafe extern "C" fn Z3_benchmark_to_smtlib_string(
     } {
         return ptr::null();
     }
-    // Decode the header strings and collect the assertion terms outside the guard.
+    // Decode the header strings and collect the assertion handles outside the guard.
     // SAFETY: each string, when non-null, is a valid C string per the contract.
     let name = unsafe { cstr_opt(name) }.unwrap_or_default();
     let logic = unsafe { cstr_opt(logic) }.unwrap_or_default();
     let status = unsafe { cstr_opt(status) }.unwrap_or_default();
     let attributes = unsafe { cstr_opt(attributes) }.unwrap_or_default();
 
-    let mut all_terms: Vec<Term> = Vec::new();
+    let mut all_asts: Vec<Z3_ast> = Vec::new();
     if num_assumptions > 0 && !assumptions.is_null() {
         for i in 0..num_assumptions as usize {
             // SAFETY: `assumptions` points to at least `num_assumptions` elements
             // per the contract; range/null checked above.
             let a = unsafe { *assumptions.add(i) };
             if a != 0 {
-                all_terms.push(ast_to_term(a));
+                all_asts.push(a);
             }
         }
     }
     if formula != 0 {
-        all_terms.push(ast_to_term(formula));
+        all_asts.push(formula);
     }
 
     // SAFETY: `ffi_guard_const_ptr` handles a null context and catches panics.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
+            if num_assumptions > 0 && assumptions.is_null() {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg = Some(
+                    "Z3_benchmark_to_smtlib_string: null assumptions array for non-zero count"
+                        .to_string(),
+                );
+                return ptr::null();
+            }
+            let all_terms = require_term_asts_or_return!(
+                ctx,
+                &all_asts,
+                "Z3_benchmark_to_smtlib_string",
+                ptr::null()
+            );
             // Real serialization of exactly these assertions (decls + asserts, no
             // script wrapper) — never fabricated.
             let body = ctx.solver.assertions_sexpr(&all_terms);
@@ -1207,7 +1273,10 @@ pub unsafe extern "C" fn Z3_parse_smtlib2_file(
             let terms =
                 super::solver::parse_solver_transaction(ctx, &content, "Z3_parse_smtlib2_file")
                     .unwrap_or_default();
-            let asts = terms.into_iter().map(term_to_ast).collect();
+            let asts = terms
+                .into_iter()
+                .map(|term| term_to_ast(ctx, term))
+                .collect();
             cache_ast_vector(ctx, asts)
         })
     }

@@ -754,6 +754,16 @@ fn propagate_branch_rows_t<T: PropDeps>(
                 PROP_SWEEP_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             let (coeffs, lb, ub) = model.row(Row(r));
+            // SERIAL-3 WIDE-ROW STUDY (2026-07-23): retaining the 64-nnz cap is
+            // deliberate, not an unexamined stack-size artifact. A sound
+            // heap-backed path was measured through 518 nnz on every prop-on
+            // corpus shape with wide rows: qiu's 312/198-nnz rows, dcmulti's
+            // 518-nnz row, and mas74's 14 wide knapsack rows under forced
+            // propagation all produced zero additional tightenings and no node
+            // gain. Their activity intervals never approached the RHS at visited
+            // nodes, so a configurable heap path would add global mutable state
+            // and allocation with no earned production class. Revisit only when
+            // a binding wide-row class is measured.
             if coeffs.is_empty() || coeffs.len() > 64 {
                 continue;
             }
@@ -1800,6 +1810,29 @@ const FIXED_CHARGE_DENSE_GATE: f64 = 15.0;
 /// only the `floor`, handing the tree the last ~1s it needs to close a gap.
 /// Verdict-safe: a squeezed finalize only fails closed (`tree_cert: None`), never a
 /// wrong verdict — the exact rim adjudicates OPTIMAL/FEASIBLE regardless.
+/// Bound one warm node LP attempt without ever extending the search's outer
+/// deadline. A duration too large for `Instant` is equivalent to no warm-only
+/// cap, so the outer deadline (if any) still dominates.
+///
+/// On the cifar100 NN-MILP class a warm node re-solve from the parent basis
+/// can stall for much longer than a cold crash-solve. A short typed cap fails
+/// that hint fast to the reliable cold path; a healthy warm solve finishes
+/// before the cap. This remains an advice lane: the LP result is independently
+/// checked downstream.
+fn node_warm_deadline(
+    warm_time_limit: Option<Duration>,
+    now: Instant,
+    outer_deadline: Option<Instant>,
+) -> Option<Instant> {
+    let warm_deadline = warm_time_limit
+        .filter(|limit| !limit.is_zero())
+        .and_then(|limit| now.checked_add(limit));
+    match (outer_deadline, warm_deadline) {
+        (Some(outer), Some(warm)) => Some(outer.min(warm)),
+        (outer, warm) => outer.or(warm),
+    }
+}
+
 fn finalize_reserve_split(remaining: Duration, small_per_leaf: bool) -> (Duration, Duration) {
     let floor = Duration::from_millis(200);
     let reserve = if small_per_leaf {
@@ -1949,15 +1982,195 @@ fn set_partition_supports(model: &Model) -> Option<Vec<Vec<usize>>> {
     }
 }
 
+/// CONFLICT-GRAPH CLIQUE supports for GUB/clique branching (the "deeper" front:
+/// derive cliques from the conflict graph, not only single model GUB rows). A
+/// CLIQUE ROW is any row whose columns pairwise conflict: a set-partition equality
+/// `Σx=1`, a set-packing inequality `Σx<=1`, or any `Σ a_j x_j <= ub` on binaries
+/// with `a_j>0` whose two smallest coefficients already sum past `ub` (so no two of
+/// its columns can both be 1). Every pair of a clique row's columns is a conflict
+/// edge, and two columns are ADJACENT when they share ANY clique row — so a clique
+/// of this graph can MERGE columns drawn from several overlapping rows into an
+/// at-most-one set WIDER than any single model row. Each returned clique is grown
+/// from a seed row toward maximality and kept only when the growth strictly widened
+/// it (a clique equal to a row adds no branching reach the row support lacks).
+///
+/// SOUNDNESS (branching, never cutting): the returned sets feed ONLY the two-way
+/// `(s1,s2)` disjunction (`gub_split_row` / `push_gub_children`). For any set `C`
+/// with at most one column equal to 1 in every feasible point, the pair of children
+/// "fix s2->0" and "fix s1->0" is exhaustive — the single 1, if present, lands on
+/// exactly one side (so the other child holds the point) and the all-zero case
+/// satisfies both children. That is the SAME exhaustive-disjunction guarantee
+/// `gub_split` proves for `Σx=1`, and it holds verbatim for `<=1`. So membership
+/// need only be a VALID at-most-one certificate — pairwise conflict via a shared
+/// clique row — and the greedy that grows the cliques is selection advice that can
+/// never change a verdict.
+///
+/// DEFAULT OFF (`AY_MILP_GUB_CLIQUE=1` to arm). Measured (2026-07-22): the corpus
+/// offers no node-count headroom for this source. On the fast GUB provers
+/// (mod010/khb05250) the wider cliques are OFFERED but the strong-GUB pick never
+/// selects them — byte-identical trees. On air05 (pure set-partition, the flagship
+/// target) merging overlapping rows DOES yield wider cliques, but branching on a
+/// 64-wide clique makes each node dearer and the search explores FEWER nodes in the
+/// budget with no dual-lift payoff. So the plumbing lands sound and measurable, but
+/// stays off by default — the shipped tree is byte-identical to round 1 everywhere.
+const CLIQUE_BRANCH_MAX: usize = 256; // most cliques appended as branchable supports
+const CLIQUE_BRANCH_MAX_MEMBERS: usize = 64; // widest clique grown (branch cost is O(members))
+const CLIQUE_BRANCH_MAX_ROW_MEMBERSHIPS: usize = 1 << 20; // <= 8 MiB of column indices
+const CLIQUE_BRANCH_MAX_CLASSIFY_MEMBERSHIPS: usize = 1 << 22; // exact-row scan work
+const CLIQUE_BRANCH_MAX_INCIDENCE_WORDS: usize = 1 << 20; // <= 8 MiB dense bitset
+const CLIQUE_BRANCH_MAX_ADJACENCY_WORDS: usize = 1 << 22; // bounded clique-growth work
+fn conflict_cliques(model: &Model) -> Vec<Vec<usize>> {
+    if std::env::var("AY_MILP_GUB_CLIQUE").as_deref() != Ok("1") {
+        return Vec::new();
+    }
+    let ncols = model.num_cols();
+    let nrows = model.num_rows();
+    let is_bin = |c: u32| {
+        let col = Col(c);
+        if !model.col_kind(col).is_integral() {
+            return false;
+        }
+        let (l, u) = model.col_bounds(col);
+        l == 0.0 && u == 1.0
+    };
+    // CLIQUE ROWS: column lists in which every pair conflicts. Oriented to `<= ub`
+    // (an equality `=ub` carries the same upper bound); all TRUE coefficients are
+    // positive on binaries, and the two smallest sum past the TRUE `ub`, so no two
+    // columns can both be 1. The f64 matrix is advice only: exact-rational side-store
+    // values adjudicate this certificate before it can affect branching.
+    let mut crows: Vec<Vec<usize>> = Vec::new();
+    let mut row_memberships = 0usize;
+    let mut classify_memberships = 0usize;
+    for r in 0..nrows {
+        let (coeffs, _lb, ub) = model.row(Row(r as u32));
+        if coeffs.len() < 2 || !ub.is_finite() {
+            continue;
+        }
+        let Some(ub_exact) = model.row_ub_exact(r, ub) else {
+            continue;
+        };
+        if coeffs.len() > CLIQUE_BRANCH_MAX_ROW_MEMBERSHIPS - row_memberships {
+            return Vec::new();
+        }
+        let mut exact_coeffs: Vec<(usize, BigRational)> = Vec::with_capacity(coeffs.len());
+        let mut certified = true;
+        for &(c, a) in coeffs {
+            if classify_memberships >= CLIQUE_BRANCH_MAX_CLASSIFY_MEMBERSHIPS {
+                return Vec::new();
+            }
+            classify_memberships += 1;
+            let a_exact = model.row_coeff_exact(r, c, a);
+            if !a_exact.is_positive() || !is_bin(c) {
+                certified = false;
+                break;
+            }
+            exact_coeffs.push((c as usize, a_exact));
+        }
+        if !certified {
+            continue;
+        }
+        exact_coeffs.sort_unstable_by(|a, b| a.1.cmp(&b.1));
+        if exact_coeffs[0].1.clone() + &exact_coeffs[1].1 <= ub_exact {
+            continue;
+        }
+        let Some(next_memberships) = row_memberships.checked_add(exact_coeffs.len()) else {
+            return Vec::new();
+        };
+        if next_memberships > CLIQUE_BRANCH_MAX_ROW_MEMBERSHIPS {
+            return Vec::new();
+        }
+        row_memberships = next_memberships;
+        crows.push(exact_coeffs.into_iter().map(|(c, _)| c).collect());
+    }
+    if crows.len() < 2 {
+        return Vec::new();
+    }
+    // allrow: each column's clique-row membership, as a bitset over `crows`.
+    let wr = crows.len().div_ceil(64);
+    let Some(incidence_words) = ncols.checked_mul(wr) else {
+        return Vec::new();
+    };
+    if incidence_words > CLIQUE_BRANCH_MAX_INCIDENCE_WORDS {
+        return Vec::new();
+    }
+    let mut allrow = vec![0u64; incidence_words];
+    let mut in_multi: Vec<bool> = vec![false; ncols]; // in >=2 clique rows (a bridge col)
+    for (ri, cols) in crows.iter().enumerate() {
+        for &c in cols {
+            let w = c * wr + ri / 64;
+            if allrow[w] & (1 << (ri % 64)) == 0 {
+                allrow[w] |= 1 << (ri % 64);
+            }
+        }
+    }
+    for c in 0..ncols {
+        let cnt: u32 = (0..wr).map(|w| allrow[c * wr + w].count_ones()).sum();
+        in_multi[c] = cnt >= 2;
+    }
+    // Only bridge columns (in >=2 clique rows) can join a clique spanning rows.
+    let bridges: Vec<usize> = (0..ncols).filter(|&c| in_multi[c]).collect();
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut seen: std::collections::HashSet<Vec<usize>> = std::collections::HashSet::new();
+    let mut adjacency_words = 0usize;
+    for cols in &crows {
+        if out.len() >= CLIQUE_BRANCH_MAX {
+            break;
+        }
+        let base = cols.len();
+        let mut members: Vec<usize> = cols.clone();
+        // Grow: add any bridge column adjacent to every current member. Early-exit on
+        // the first non-adjacent member keeps this near-linear (most candidates fail
+        // on member 0), and the widest merge that any single seed grows is capped.
+        for &b in &bridges {
+            if members.len() >= CLIQUE_BRANCH_MAX_MEMBERS {
+                break;
+            }
+            if members.contains(&b) {
+                continue;
+            }
+            let mut adjacent_to_all = true;
+            for &m in &members {
+                let mut adjacent = false;
+                for w in 0..wr {
+                    if adjacency_words >= CLIQUE_BRANCH_MAX_ADJACENCY_WORDS {
+                        return out;
+                    }
+                    adjacency_words += 1;
+                    if allrow[b * wr + w] & allrow[m * wr + w] != 0 {
+                        adjacent = true;
+                        break;
+                    }
+                }
+                if !adjacent {
+                    adjacent_to_all = false;
+                    break;
+                }
+            }
+            if adjacent_to_all {
+                members.push(b);
+            }
+        }
+        if members.len() <= base {
+            continue; // grew nothing: the seed row support already covers this set
+        }
+        members.sort_unstable();
+        if seen.insert(members.clone()) {
+            out.push(members);
+        }
+    }
+    out
+}
+
 /// Whether GUB/Ryan-Foster branching is armed for this solve. Auto-on when the
 /// set-partition shape holds AND no symmetry was detected (the symmetry lane owns
 /// its own child construction via orbital fixing / `push_children`, and GUB bypasses
 /// that path — so the two are kept disjoint). `AY_MILP_GUB_BRANCH=0` forces it off,
-/// `=1` forces it on wherever a support map exists.
+/// `=1` forces it on wherever a support map exists and no symmetry lane owns the
+/// child construction.
 fn gub_branch_on(has_supports: bool, sym_present: bool) -> bool {
     match std::env::var("AY_MILP_GUB_BRANCH").as_deref() {
         Ok("0") => false,
-        Ok("1") => has_supports,
+        Ok("1") => has_supports && !sym_present,
         _ => has_supports && !sym_present,
     }
 }
@@ -2171,10 +2384,15 @@ fn gub_strong_pick(
     iters: u64,
     rc: &mut [(f64, f64)],
     deadline: Option<Instant>,
-) -> Option<(Vec<usize>, Vec<usize>)> {
+) -> Option<(Vec<usize>, Vec<usize>, Option<f64>, Option<f64>)> {
     let cands = gub_candidate_splits(supports, vals, lo, up, k);
     if cands.len() <= 1 {
-        return cands.into_iter().next();
+        // No probe budget spent (nothing to compare against): the single split
+        // carries no probed child bounds, so the children inherit the parent's.
+        return cands
+            .into_iter()
+            .next()
+            .map(|(s1, s2)| (s1, s2, None, None));
     }
     // CROSS-PROBE LU REUSE (see `simplex::ProbeReuse`): all 2k probes below warm-start
     // the SAME parent basis, so cache one fresh factorization of it and let every probe
@@ -2186,7 +2404,10 @@ fn gub_strong_pick(
     // One scratch upper box; each probe fixes its side to 0 and restores it after
     // (s1/s2 are disjoint small sets, so restore is cheap and the box stays exact).
     let mut up_s = up.to_vec();
-    let mut best: Option<(f64, usize)> = None;
+    // (score, index, child-A bound, child-B bound). The two probe bounds of the
+    // CHOSEN split are carried out so the caller can seat each child on its OWN
+    // rigorous lower bound instead of the parent's — see the call site.
+    let mut best: Option<(f64, usize, Option<f64>, Option<f64>)> = None;
     for (i, (s1, s2)) in cands.iter().enumerate() {
         // Child A keeps s1 (fixes s2 -> 0).
         for &c in s2 {
@@ -2209,12 +2430,12 @@ fn gub_strong_pick(
         // Reliability-branching product score, tiny floor so a one-sided gain
         // still ranks above a dead split without swamping a two-sided one.
         let score = ga.max(1e-6) * gb.max(1e-6);
-        if best.is_none_or(|(bs, _)| score > bs) {
-            best = Some((score, i));
+        if best.is_none_or(|(bs, ..)| score > bs) {
+            best = Some((score, i, ba, bb));
         }
     }
-    let idx = best.map_or(0, |(_, i)| i);
-    cands.into_iter().nth(idx)
+    let (idx, ba, bb) = best.map_or((0, None, None), |(_, i, a, b)| (i, a, b));
+    cands.into_iter().nth(idx).map(|(s1, s2)| (s1, s2, ba, bb))
 }
 
 /// Branching rule on the market-split shape (selection only — never touches a bound,
@@ -2933,6 +3154,45 @@ fn push_children(
     }
 }
 
+/// Merge one strong-GUB probe bound with the rigorous parent bound. Non-finite
+/// probe results are advisory (an infeasible/aborted probe still has to be
+/// established by the real child solve), so they inherit the parent unchanged.
+fn gub_child_bound(
+    probe: Option<f64>,
+    parent_exact: Option<&BigRational>,
+    parent_raw: Option<f64>,
+    objective_granularity: Option<&BigRational>,
+) -> (Option<BigRational>, Option<f64>) {
+    let probe = probe.filter(|value| value.is_finite());
+    let probe_exact = probe.and_then(exact).map(|value| {
+        let value = objective_granularity.map_or(value.clone(), |granularity| {
+            round_up_to(&value, granularity)
+        });
+        parent_exact.map_or(value.clone(), |parent| value.max(parent.clone()))
+    });
+    let exact = probe_exact.or_else(|| parent_exact.cloned());
+    let raw = match (probe, parent_raw) {
+        (Some(probe), Some(parent)) => Some(probe.max(parent)),
+        (Some(probe), None) => Some(probe),
+        (None, parent) => parent,
+    };
+    (exact, raw)
+}
+
+type GubChildBound = (Option<BigRational>, Option<f64>);
+
+fn gub_child_bounds(
+    probes: (Option<f64>, Option<f64>),
+    parent_exact: Option<&BigRational>,
+    parent_raw: Option<f64>,
+    objective_granularity: Option<&BigRational>,
+) -> (GubChildBound, GubChildBound) {
+    (
+        gub_child_bound(probes.0, parent_exact, parent_raw, objective_granularity),
+        gub_child_bound(probes.1, parent_exact, parent_raw, objective_granularity),
+    )
+}
+
 /// GUB / Ryan-Foster child construction (see `gub_split`). Builds the two children
 /// of a set-partition-row split: child A fixes every column in `s2` to 0 (keeping
 /// `s1` live), child B fixes every column in `s1` to 0. Each fix is a plain
@@ -2944,9 +3204,18 @@ fn push_children(
 /// off on this path (GUB is armed only when no generators were detected), so this
 /// bypasses `push_children`'s orbital-fixing / capture-split machinery entirely.
 ///
-/// Bound inheritance is the parent's rigorous bound alone (no decision-time probe),
-/// which is always sound; the children re-solve their own LPs and each proves its own
-/// bound. `from_branch` is `None` (no single column moved), so these nodes record no
+/// Bound inheritance: each child is seated on the TIGHTER of the parent's rigorous
+/// bound and its OWN strong-GUB probe bound (`bound_a`/`bound_b`, already computed by
+/// `gub_strong_pick` and otherwise discarded). Both are rigorous lower bounds for the
+/// child's box — the parent bound because the child box is a subset, the probe bound
+/// because `safe_bound` is valid for any duals (the same license that certifies the
+/// root bound and the cutoff prune) — so their max is a valid, tighter lower bound.
+/// Seating it raises the open-frontier minimum (the reported dual bound is that min,
+/// see `tree_bound`) and lets a child prune before its LP (the pre-LP `bound >= best`
+/// check) — both verdict-neutral, never asserting Optimal, only withholding it later.
+/// When no probe ran (plain most-fractional split, or the SB budget was spent) the
+/// bounds are `None` and the child inherits the parent's bound exactly as before.
+/// `from_branch` is `None` (no single column moved), so these nodes record no
 /// pseudocost — correct, since the "branch" was a row split, not a column.
 #[allow(clippy::too_many_arguments)]
 fn push_gub_children(
@@ -2957,8 +3226,10 @@ fn push_gub_children(
     s2: &[usize],
     node_lower: &[f64],
     _node_upper: &[f64],
-    bound: Option<BigRational>,
-    raw_bound: Option<f64>,
+    // Probed rigorous lower bounds of the two children (child A keeps `s1`, child B
+    // keeps `s2`), each already merged with the parent as (exact, raw-f64).
+    child_a_bound: (Option<BigRational>, Option<f64>),
+    child_b_bound: (Option<BigRational>, Option<f64>),
     warm: Option<std::sync::Arc<(Vec<usize>, Vec<NbBound>)>>,
     dfs: bool,
     open_bytes: &mut usize,
@@ -2980,25 +3251,28 @@ fn push_gub_children(
         }
         chain
     };
+    // The caller has already merged each child's own probe with the parent.
+    let (a_exact, a_raw) = child_a_bound;
+    let (b_exact, b_raw) = child_b_bound;
     // Child A keeps s1 (fixes s2 -> 0); child B keeps s2 (fixes s1 -> 0).
     let child_a = Node {
         depth: d,
         fixes: build(s2),
         sym_seq: node.sym_seq.clone(),
-        bound: bound.clone(),
+        bound: a_exact,
         warm: warm.clone(),
         from_branch: None,
-        raw_bound,
+        raw_bound: a_raw,
         cap: crate::tree_cert::UNTRACKED,
     };
     let mut child_b = Node {
         depth: d,
         fixes: build(s1),
         sym_seq: node.sym_seq.clone(),
-        bound,
+        bound: b_exact,
         warm,
         from_branch: None,
-        raw_bound,
+        raw_bound: b_raw,
         cap: crate::tree_cert::UNTRACKED,
     };
     // Dive the side that keeps the most fractional mass (child A) toward a leaf; the
@@ -3199,6 +3473,32 @@ fn separate_mixing_for_root_shape(
     crate::cuts::separate_mixing(work, x, n_rows, budget)
 }
 
+/// Parse a floating-point tuning knob without allowing NaN, infinities, or a
+/// negative spelling to acquire surprising control-flow semantics.
+fn finite_nonnegative_setting(raw: Option<&str>, default: f64) -> f64 {
+    raw.and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .map(|value| value.max(0.0))
+        .unwrap_or(default)
+}
+
+/// Measured root-cut efficacy floor for the model's coarse shape. Using
+/// division after the nonzero-row guard expresses `cols >= 4 * rows` without
+/// allowing the multiplication to overflow on a synthetic extreme shape.
+fn default_root_cut_eff_floor(num_rows: usize, num_cols: usize) -> f64 {
+    const GLOBAL: f64 = 1e-3;
+    const KNAPSACK: f64 = 6e-3;
+    if num_rows > 0 && num_cols / num_rows >= 4 {
+        KNAPSACK
+    } else {
+        GLOBAL
+    }
+}
+
+fn symmetry_branch_band_setting(raw: Option<&str>) -> f64 {
+    finite_nonnegative_setting(raw, 1.0).min(1.0)
+}
+
 fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
     let objective: Vec<(u32, f64)> = (0..model.num_cols())
         .map(|j| (j as u32, model.obj_coeff(Col(j as u32))))
@@ -3216,6 +3516,31 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
     let mixing_on = mixing_enabled(
         std::env::var_os("AY_MILP_MIXING").is_some(),
         std::env::var_os("AY_MILP_NO_MIXING").is_some(),
+    );
+    // Read once for the root loop. Invalid/non-finite spellings retain the
+    // measured default; a negative spelling is the intuitive disabled value.
+    //
+    // SHAPE-GATED FLOOR (serial round 3). The 1e-3 floor was tuned on gt2 and is
+    // the Pareto-safe GLOBAL value: raising it corpus-wide regresses the
+    // low-aspect blend/flow models (blend2 5515->6129, flugpl 1941->2255 at
+    // 5e-3) even though it wins big on the KNAPSACK-shaped ones. Those two
+    // families sit on opposite sides of the model's aspect ratio: a knapsack has
+    // few rows and many columns, and its root GMI rows come out dense and
+    // SHALLOW -- their depth clusters just above 1e-3, so 1e-3 keeps freight a
+    // higher floor would shed. Gate the higher floor to that shape
+    // (`cols >= 4*rows`, which cleanly separates gt2 6.5x / mas76 12.6x /
+    // mas74 11.6x from blend2 1.3x / flugpl 1.0x). MEASURED at 6e-3 on the gated
+    // set: gt2 449->59, mas76 885913->722269 (both exact optimum preserved to the
+    // digit); the low-aspect models keep 1e-3 and are byte-identical. 6e-3 is
+    // centred in the intersection of both winners' safe windows (gt2 [4e-3,7e-3],
+    // cliff at 8e-3 -> 8377; mas76 [5e-3,7e-3], 4e-3 regresses to 940989) with
+    // ~2e-3 margin each side. Dropping a VALID cut only changes the search, never
+    // a verdict. `AY_MILP_CUT_EFF_FLOOR=<f>` overrides either default; `=0`
+    // disables.
+    let default_floor = default_root_cut_eff_floor(model.num_rows(), model.num_cols());
+    let cut_eff_floor = finite_nonnegative_setting(
+        std::env::var("AY_MILP_CUT_EFF_FLOOR").ok().as_deref(),
+        default_floor,
     );
     let share = std::env::var("AY_MILP_CUT_SHARE")
         .ok()
@@ -4127,6 +4452,25 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
         // clean, snap and the nnz cap each read only the cut they are given, so this one
         // pass produces the same rows in the same order as the historical sequential
         // retains did.
+        // EFFICACY FLOOR. After clean+snap, a cut's scale-free depth
+        // (`violation / ‖a‖`) is known, and it is a truer measure of what the row
+        // buys than the raw `> 1e-4` violation gate the next retain applies:
+        // violation scales with the coefficients, so a big-but-shallow row passes
+        // the violation gate while cutting the vertex off by almost nothing. Such
+        // a row is pure freight — every LP of the loop AND of every node under it
+        // carries it, for a bound it does not move. Drop the rows whose DEPTH is
+        // below the floor and keep the productive ones in place and in order (the
+        // one perturbation that reordering is not: nothing that survives moves).
+        //
+        // MEASURED (2026-07-22): gt2's root GMI rounds emit several sub-`1e-3`-depth
+        // rows; carrying them degrades the branching relaxation and the tree runs
+        // 1103 nodes. Dropping them (`OPTIMAL 21166`, unchanged) the tree is 449 —
+        // a 59% cut. Across the corpus every proven optimum is preserved to the
+        // digit and no finishing instance grows its tree (misc07 5941, pk1 357325,
+        // qnet1 95, mod010 1701, dcmulti 1155, blend2 5515, p0201 153 all
+        // byte-stable; mas76 40005.054142 same tree, ~20% faster; rout 30959 ->
+        // 30059). Dropping a VALID cut can only ever change the search, never a
+        // verdict. `AY_MILP_CUT_EFF_FLOOR=<f>` overrides; `=0` disables.
         {
             let mut kept = Vec::with_capacity(fresh.len());
             let mut kept_tags = Vec::with_capacity(fresh.len());
@@ -4138,6 +4482,9 @@ fn add_root_cuts(model: Model, opts: &SolveOpts) -> Model {
                     continue;
                 }
                 if c.coeffs.len() > cap {
+                    continue;
+                }
+                if cut_eff_floor > 0.0 && crate::cuts::cut_depth(&c, &cand.values) < cut_eff_floor {
                     continue;
                 }
                 kept.push(c);
@@ -16191,14 +16538,15 @@ fn solve_milp_in(
         if std::env::var_os("AY_MILP_TRACE").is_some() {
             match &s {
                     Some(s) => eprintln!(
-                        "AY_MILP_TRACE symmetry: {} verified generators (moved cols per gen: {:?}) in {:.3}s; orbitopes {:?} (k x m)",
+                        "AY_MILP_TRACE symmetry: {} verified generators (moved cols per gen: {:?}) in {:.3}s; orbitopes {:?} (k x m); stab_group={}",
                         s.gens.len(),
                         s.gens.iter().take(8).map(|g| 2 * g.pairs.len()).collect::<Vec<_>>(),
                         _t_sym.elapsed().as_secs_f64(),
                         s.orbitopes
                             .iter()
                             .map(|o| (o.blocks.len(), o.blocks[0].len()))
-                            .collect::<Vec<_>>()
+                            .collect::<Vec<_>>(),
+                        s.stab_group_size(),
                     ),
                     None => eprintln!(
                         "AY_MILP_TRACE symmetry: none detected in {:.3}s",
@@ -16216,18 +16564,28 @@ fn solve_milp_in(
     // kept disjoint). When armed it replaces the single-column pseudocost pick with a
     // whole-GUB-row split, which moves BOTH child bounds decisively on pure
     // set-partitioning — a valid, exhaustive disjunction, so verdict-neutral.
-    let gub_supports: Option<Vec<Vec<usize>>> = if mode.cheap {
-        None // finders stay on the throughput path
+    let gub_supports: Option<Vec<Vec<usize>>> = if mode.cheap || sym.is_some() {
+        None // finders stay on throughput; symmetry owns its child construction
     } else {
-        set_partition_supports(model)
+        // Where the set-partition shape arms GUB, optionally ALSO offer conflict-graph
+        // cliques (merged from overlapping partition/packing rows) as extra branchable
+        // supports — a wider at-most-one set fixes more columns per child than any
+        // single model row. Additive and verdict-neutral (`conflict_cliques`), but
+        // DEFAULT OFF (`AY_MILP_GUB_CLIQUE=1`): it showed no corpus node-count win, so
+        // it returns empty unless armed, keeping the shipped tree byte-identical to
+        // round 1 everywhere.
+        set_partition_supports(model).map(|mut sup| {
+            sup.extend(conflict_cliques(model));
+            sup
+        })
     };
     let gub_on = gub_branch_on(gub_supports.is_some(), sym.is_some());
     if gub_on && std::env::var_os("AY_MILP_TRACE").is_some() {
         eprintln!(
-            "AY_MILP_TRACE gub-branch: armed ({} partition rows)",
+            "AY_MILP_TRACE gub-branch: armed ({} branchable clique/partition supports)",
             gub_supports
                 .as_ref()
-                .map_or(0, |s| s.iter().filter(|c| !c.is_empty()).count())
+                .map_or(0, |s| s.iter().filter(|c| c.len() >= 2).count())
         );
     }
     // `rows` mode: append the symmetry-breaking rows to the model itself and
@@ -17073,6 +17431,22 @@ fn solve_milp_in(
     let zero_objective = (0..lp.n).all(|j| lp.cost[j] == 0.0);
     let mut unbounded = false;
     let mut nodes = 0usize;
+    // MEASUREMENT-ONLY node cap (load-invariant branching A/B). `AY_MILP_MAX_NODES=N`
+    // stops the tree after N processed nodes and returns the interrupted-but-valid
+    // Feasible/dual-bound outcome (identical exit path to the deadline stop, so the
+    // dual bound stays rigorous and no verdict is changed — an early stop can only
+    // withhold Optimal, never assert one). Unset in every normal solve.
+    let measure_node_cap: Option<usize> = std::env::var("AY_MILP_MAX_NODES")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    // Selection-only symmetry controls are solve configuration, not mutable
+    // per-node state. Read them once so an external environment mutation cannot
+    // change the search policy halfway through a tree. A band of 0 keeps only
+    // score ties; 1 admits every nonnegative score. Invalid/non-finite values
+    // retain the measured default.
+    let sym_branch_on = std::env::var("AY_MILP_SYM_BRANCH").map_or(true, |value| value != "0");
+    let sym_branch_band =
+        symmetry_branch_band_setting(std::env::var("AY_MILP_SYM_BRANCH_BAND").ok().as_deref());
     let mut elites = Elites::new();
     // FARKAS BOX NO-GOODS (session-scale conflict learning). When a node is exactly
     // proven empty by a Farkas ray, emptiness transfers to every SUBSET of the proven
@@ -19343,7 +19717,9 @@ fn solve_milp_in(
         // and the improving ladder vanished for 50s. The main tree's job on
         // these models is supplying WIDE relaxations to the pulls; leaves come
         // from the sub-solves.)
-        if nodes > mode.node_cap.map_or(MAX_NODES, |c| c.min(MAX_NODES)) {
+        if nodes > mode.node_cap.map_or(MAX_NODES, |c| c.min(MAX_NODES))
+            || measure_node_cap.is_some_and(|c| nodes > c)
+        {
             incomplete = true;
             // Dead store on this exit path, kept on purpose: `open_bytes` mirrors the
             // retained bytes of the open set, and the node goes back on the stack.
@@ -19497,7 +19873,12 @@ fn solve_milp_in(
         } else {
             0
         };
-        let mut cand = lp.solve_bounded(&node_lower, &node_upper, warm, deadline);
+        // Cap the WARM attempt so an NN-MILP stall fails fast to the cold-crash
+        // retry below. The typed per-session cap is subordinate to the outer
+        // search deadline; default-off remains the historical path.
+        let warm_time_limit = warm.as_ref().and(opts.node_warm_time_limit);
+        let warm_deadline = node_warm_deadline(warm_time_limit, Instant::now(), deadline);
+        let mut cand = lp.solve_bounded(&node_lower, &node_upper, warm, warm_deadline);
         t_simplex += _t0.elapsed();
         if trace {
             let spent = crate::simplex::DUAL_ITERS
@@ -19536,6 +19917,8 @@ fn solve_milp_in(
         // budget, and the solve gives up. Before paying for an exact LP on the rim
         // — which is orders of magnitude dearer — simply throw the hint away and
         // start cold. This is where nearly all of the rim traffic was coming from.
+        // Exactly one cold retry: the retry is not looped and cannot inherit
+        // the warm-only cap. It remains bounded by the original outer deadline.
         if cand.status == SimplexStatus::Stopped && warm.is_some() {
             cand = lp.solve_bounded(&node_lower, &node_upper, None, deadline);
         }
@@ -22604,6 +22987,61 @@ fn solve_milp_in(
                 }
             }
         }
+        // LARGEST-ORBIT BRANCHING (Ostrowski et al.'s orbital-branching variable
+        // rule; the ORBITAL LANE only — models with an assembled orbitope keep
+        // their own aligned rules above). Among fractional candidates within a
+        // score band of the pseudocost pick, prefer the column whose CURRENT
+        // applicable orbit (`down_orbit` at this node's box) is largest. Fixing
+        // a bigger orbit `<= floor(v)` in the down child amplifies each branch,
+        // and — decisively — branching an orbit representative keeps the
+        // interchangeable blocks position-synchronized, so the wide-support
+        // generators stay box-applicable deeper into the tree (box-equality
+        // orbital fixing otherwise retires a generator at the first asymmetric
+        // branch on its support). Branching choice is license-free: it changes
+        // WHICH sound tree is searched, never what any node claims, so no
+        // verdict, optimum, or certificate is affected. A dropped probe pair is
+        // re-derived by the chosen children. `AY_MILP_SYM_BRANCH=0` disables.
+        if sym_branch_on && branch.is_some() {
+            let orbital_lane = sym.as_ref().is_some_and(|s| s.orbitopes.is_empty());
+            if orbital_lane {
+                if let Some((bj, bv)) = branch {
+                    let best_s = cands.iter().find(|c| c.0 == bj).map_or(0.0, |c| c.2);
+                    // Only reconsider candidates the pseudocost rule already
+                    // rates near the pick (half its score), so the orbit tiebreak
+                    // never trades away real LP-gain for symmetry.
+                    // Band = how far below the pseudocost pick's score a
+                    // candidate may score and still be reconsidered for its
+                    // orbit. `>= 1.0` reconsiders every positive-score
+                    // candidate (measured best on misc07: nodes 5941 -> 5219,
+                    // the interchangeable blocks stay synchronized far deeper).
+                    let thr = best_s * (1.0 - sym_branch_band);
+                    let s = sym.as_mut().expect("orbital lane");
+                    let mut orbit: Vec<usize> = Vec::new();
+                    s.down_orbit(bj, &node_lower, &node_upper, &mut orbit);
+                    let mut best = (orbit.len(), bj, bv);
+                    // Cap the extra orbit scans per node so a wide symmetric model
+                    // never pays more here than for its LP.
+                    let mut scans = 0usize;
+                    for &(cj, cv, cs) in &cands {
+                        if cj == bj || cs < thr {
+                            continue;
+                        }
+                        scans += 1;
+                        if scans > 48 {
+                            break;
+                        }
+                        s.down_orbit(cj, &node_lower, &node_upper, &mut orbit);
+                        if orbit.len() > best.0 {
+                            best = (orbit.len(), cj, cv);
+                        }
+                    }
+                    if best.1 != bj {
+                        branch = Some((best.1, best.2));
+                        probed_kids = None;
+                    }
+                }
+            }
+        }
         let Some((j, v)) = branch else {
             // The relaxation is integral, so this node's optimum is a genuine
             // MILP solution — but only once it is re-derived exactly. The float
@@ -23039,10 +23477,20 @@ fn solve_milp_in(
                 picked
             } else {
                 gub_split(sup, &cand.values, &node_lower, &node_upper)
+                    .map(|(s1, s2)| (s1, s2, None, None))
             };
-            if let Some((s1, s2)) = split {
+            if let Some((s1, s2, pa, pb)) = split {
                 capture.poison();
                 gub_branches += 1;
+                // Seat each child on its OWN strong-GUB probe bound (rigorous — the
+                // same `safe_bound` license as `raw_f`), snapped to an exact rational,
+                // rounded up to the objective granularity, and never allowed to fall
+                // below the parent's bound. This raises the open frontier (the reported
+                // dual bound) and can prune a child before its LP; see the
+                // `push_gub_children` doc-comment. `None` on the un-probed path leaves
+                // the parent bound in place, byte-identical to the old behaviour.
+                let (cb_a, cb_b) =
+                    gub_child_bounds((pa, pb), bound.as_ref(), raw_f, obj_gran.as_ref());
                 push_gub_children(
                     &mut stack,
                     &mut dive,
@@ -23051,8 +23499,8 @@ fn solve_milp_in(
                     &s2,
                     &node_lower,
                     &node_upper,
-                    bound.clone(),
-                    raw_f,
+                    cb_a,
+                    cb_b,
                     warm_hint.clone(),
                     mode.dfs || plateau_dfs,
                     &mut open_bytes,
@@ -23926,6 +24374,61 @@ mod tests {
     // panic) process-environment mutation for these tests.
     use ay_test_support::env::{lock_env, with_env_edits, ScopedEnvVar};
 
+    #[test]
+    fn node_warm_deadline_never_exceeds_outer_deadline() {
+        let now = Instant::now();
+        let outer = now + Duration::from_millis(20);
+        let opts = SolveOpts::new().with_node_warm_time_limit(Some(Duration::from_millis(200)));
+
+        assert_eq!(
+            node_warm_deadline(opts.node_warm_time_limit, now, Some(outer)),
+            Some(outer)
+        );
+        assert_eq!(
+            node_warm_deadline(None, now, Some(outer)),
+            Some(outer),
+            "a cold attempt must ignore the warm-only cap"
+        );
+    }
+
+    #[test]
+    fn node_warm_deadline_uses_shorter_typed_cap() {
+        let now = Instant::now();
+        let cap = Duration::from_millis(20);
+        let outer = now + Duration::from_millis(200);
+        let opts = SolveOpts::new().with_node_warm_time_limit(Some(cap));
+
+        assert_eq!(
+            node_warm_deadline(opts.node_warm_time_limit, now, Some(outer)),
+            Some(now + cap)
+        );
+        assert_eq!(
+            node_warm_deadline(opts.node_warm_time_limit, now, None),
+            Some(now + cap)
+        );
+    }
+
+    #[test]
+    fn node_warm_deadline_handles_instant_overflow_without_extending_outer() {
+        let now = Instant::now();
+        assert!(
+            now.checked_add(Duration::MAX).is_none(),
+            "Duration::MAX must exceed this platform's Instant range"
+        );
+        let outer = now + Duration::from_millis(20);
+        let opts = SolveOpts::new().with_node_warm_time_limit(Some(Duration::MAX));
+
+        assert_eq!(
+            node_warm_deadline(opts.node_warm_time_limit, now, Some(outer)),
+            Some(outer)
+        );
+        assert_eq!(
+            node_warm_deadline(opts.node_warm_time_limit, now, None),
+            None,
+            "an unrepresentable cap must behave as uncapped, not panic"
+        );
+    }
+
     /// The top-level MILP call site must pass an already-expired caller
     /// deadline into the parity device unchanged.  This rank-2/nullity-1
     /// lights-out system would otherwise produce an exact optimum.
@@ -23969,6 +24472,64 @@ mod tests {
             vec![y, x],
             "stale, non-binary, fixed, and duplicate advice must be ignored"
         );
+    }
+
+    #[test]
+    fn conflict_cliques_require_exact_at_most_one_rows() {
+        let _env_lock = lock_env();
+        let _clique_branching = ScopedEnvVar::set("AY_MILP_GUB_CLIQUE", "1");
+        let _gub_branching = ScopedEnvVar::set("AY_MILP_GUB_BRANCH", "1");
+        assert!(gub_branch_on(true, false));
+        assert!(
+            !gub_branch_on(true, true),
+            "forced GUB branching must not bypass the symmetry owner"
+        );
+
+        // Three pairwise at-most-one rows form a triangle wider than each seed
+        // row, proving that the focused test actually exercises clique growth.
+        let mut exact = Model::new();
+        let x0 = exact.add_binary_col();
+        let x1 = exact.add_binary_col();
+        let x2 = exact.add_binary_col();
+        exact.add_row(f64::NEG_INFINITY, 1.0, &[(x0, 1.0), (x1, 1.0)]);
+        exact.add_row(f64::NEG_INFINITY, 1.0, &[(x0, 1.0), (x2, 1.0)]);
+        exact.add_row(f64::NEG_INFINITY, 1.0, &[(x1, 1.0), (x2, 1.0)]);
+        let cliques = conflict_cliques(&exact);
+        assert_eq!(cliques, vec![vec![0, 1, 2]]);
+        for mask in 0u8..8 {
+            let point: Vec<BigRational> = (0..3)
+                .map(|bit| BigRational::from_integer(i64::from((mask >> bit) & 1).into()))
+                .collect();
+            if exact.check_point(&point).is_ok() {
+                for clique in &cliques {
+                    assert!(
+                        clique.iter().filter(|&&c| point[c].is_positive()).count() <= 1,
+                        "returned support is not at-most-one at {point:?}"
+                    );
+                }
+            }
+        }
+
+        // The f64 proxies make 0.1 + 0.2 appear strictly greater than 0.3,
+        // while the MPS side store records the true equality. Therefore x0=x1=1
+        // is feasible and the first row is NOT an at-most-one certificate. If
+        // the classifier consulted only f64, the other two rows would complete
+        // the same unsound triangle above.
+        assert!(std::hint::black_box(0.1_f64) + 0.2_f64 > 0.3_f64);
+        let mut inexact = Model::new();
+        let x0 = inexact.add_binary_col();
+        let x1 = inexact.add_binary_col();
+        let x2 = inexact.add_binary_col();
+        let rounded = inexact.add_row(f64::NEG_INFINITY, 0.3, &[(x0, 0.1), (x1, 0.2)]);
+        inexact.add_row(f64::NEG_INFINITY, 1.0, &[(x0, 1.0), (x2, 1.0)]);
+        inexact.add_row(f64::NEG_INFINITY, 1.0, &[(x1, 1.0), (x2, 1.0)]);
+        inexact.record_inexact_row_coeff(rounded, x0.0, BigRational::new(1.into(), 10.into()));
+        inexact.record_inexact_row_coeff(rounded, x1.0, BigRational::new(1.into(), 5.into()));
+        inexact.record_inexact_row_bound(rounded, false, BigRational::new(3.into(), 10.into()));
+        let one = BigRational::from_integer(1.into());
+        let zero = BigRational::zero();
+        assert!(inexact.check_point(&[one.clone(), one, zero]).is_ok());
+        assert!(conflict_cliques(&inexact).is_empty());
     }
 
     #[test]
@@ -25396,14 +25957,25 @@ mod tests {
         // Held for the whole test; restored on scope exit under `_env_lock`.
         let _heur_share = ScopedEnvVar::set("AY_MILP_HEUR_SHARE", "0");
         let _no_cuts = ScopedEnvVar::set("AY_MILP_NO_CUTS", "1");
+        // Pin off the largest-orbit branch rule too: it is an ORTHOGONAL
+        // mechanism (branch selection, measured separately on misc07) whose
+        // point is to make the search need FEWER explicit orbital down-fixes —
+        // so it would starve this fixing-lane non-vacuity guard.
+        let _sym_branch = ScopedEnvVar::set("AY_MILP_SYM_BRANCH", "0");
         let mut seed = 0x5E11_2026_u64;
         let mut rnd = move || {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             (seed >> 33) as i64
         };
         let big = |v: i64| BigRational::from_integer(v.into());
-        for mode in ["orbital", "rows"] {
+        // The third arm (`orbital` + `AY_MILP_STAB_ORBIT`) drives the EXACT
+        // box-stabilizer orbit (`symmetry::down_orbit_stab`): the enumerated
+        // group's box-preserving elements, a superset of the generator-walk.
+        // It must return the same brute-force optima — the soundness guard for
+        // the exact-stabilizer path over the identical random symmetric corpus.
+        for (mode, stab_on) in [("orbital", false), ("rows", false), ("orbital", true)] {
             let sym = ScopedEnvVar::set("AY_MILP_SYM", mode);
+            let stab = stab_on.then(|| ScopedEnvVar::set("AY_MILP_STAB_ORBIT", "1"));
             let mut solved = 0usize;
             for case in 0..24 {
                 // Columns: 4 identical pairs (y), one interchangeable block
@@ -25544,10 +26116,11 @@ mod tests {
                     ),
                 }
             }
+            drop(stab);
             drop(sym);
             assert!(
                 solved >= 12,
-                "mode {mode}: too few Optimal cases ({solved}) — corpus degenerate"
+                "mode {mode} (stab={stab_on}): too few Optimal cases ({solved}) — corpus degenerate"
             );
         }
         // PHASE 3 — THE ORBITOPE LANE (mixed-kind blocks; `symmetry::Orbitope`
@@ -25798,8 +26371,8 @@ mod tests {
             solved >= 8,
             "too few Optimal cases ({solved}) — dynamic corpus degenerate"
         );
-        // `_heur_share` / `_no_cuts` restore at end of scope, still under
-        // `_env_lock`.
+        // `_heur_share` / `_no_cuts` / `_sym_branch` restore at end of scope,
+        // still under `_env_lock`.
         assert!(
             SYM_FIXES_TOTAL.load(Relaxed) > fixes_before,
             "non-vacuity: orbital fixing never fired on the symmetric corpus"
@@ -29155,6 +29728,65 @@ mod tests {
         assert!(
             on.iter().any(|&(t, upper, b)| t == 1 && !upper && b == 1.0),
             "y=1 must imply w >= 1, got {on:?}"
+        );
+    }
+
+    #[test]
+    fn floating_tuning_knobs_reject_non_finite_and_clamp_domains() {
+        assert_eq!(finite_nonnegative_setting(None, 0.25), 0.25);
+        assert_eq!(finite_nonnegative_setting(Some("garbage"), 0.25), 0.25);
+        assert_eq!(finite_nonnegative_setting(Some("NaN"), 0.25), 0.25);
+        assert_eq!(finite_nonnegative_setting(Some("inf"), 0.25), 0.25);
+        assert_eq!(finite_nonnegative_setting(Some("-3"), 0.25), 0.0);
+        assert_eq!(finite_nonnegative_setting(Some("0.125"), 0.25), 0.125);
+
+        assert_eq!(symmetry_branch_band_setting(Some("-1")), 0.0);
+        assert_eq!(symmetry_branch_band_setting(Some("0.4")), 0.4);
+        assert_eq!(symmetry_branch_band_setting(Some("8")), 1.0);
+        assert_eq!(symmetry_branch_band_setting(Some("NaN")), 1.0);
+    }
+
+    #[test]
+    fn root_cut_floor_shape_gate_has_exact_overflow_safe_boundary() {
+        assert_eq!(default_root_cut_eff_floor(0, 100), 1e-3);
+        assert_eq!(default_root_cut_eff_floor(10, 39), 1e-3);
+        assert_eq!(default_root_cut_eff_floor(10, 40), 6e-3);
+        assert_eq!(default_root_cut_eff_floor(10, 41), 6e-3);
+        // The original spelling `cols >= 4 * rows` can overflow here. The
+        // mathematical ratio is below four and must retain the global floor.
+        assert_eq!(default_root_cut_eff_floor(usize::MAX, usize::MAX), 1e-3);
+    }
+
+    #[test]
+    fn strong_gub_child_bounds_keep_probe_sides_and_parent_fallback() {
+        let integer = |value: i64| BigRational::from_integer(value.into());
+        let parent = integer(10);
+        let granularity = integer(1);
+
+        // Child A's 12.25 probe rounds to 13; child B's 11.25 probe rounds to
+        // 12. Keeping these deliberately asymmetric pins the A/B tuple order.
+        let (child_a, child_b) = gub_child_bounds(
+            (Some(12.25), Some(11.25)),
+            Some(&parent),
+            Some(10.0),
+            Some(&granularity),
+        );
+        assert_eq!(child_a, (Some(integer(13)), Some(12.25)));
+        assert_eq!(child_b, (Some(integer(12)), Some(11.25)));
+
+        // A weaker, absent, or non-finite probe cannot lower or poison the
+        // rigorous parent bound.
+        assert_eq!(
+            gub_child_bound(Some(8.5), Some(&parent), Some(10.0), None),
+            (Some(parent.clone()), Some(10.0))
+        );
+        assert_eq!(
+            gub_child_bound(None, Some(&parent), Some(10.0), None),
+            (Some(parent.clone()), Some(10.0))
+        );
+        assert_eq!(
+            gub_child_bound(Some(f64::INFINITY), Some(&parent), Some(10.0), None),
+            (Some(parent), Some(10.0))
         );
     }
 

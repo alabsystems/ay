@@ -39,9 +39,9 @@ use std::ffi::{c_double, c_int, c_uint};
 use ay_dpll::api::{Sort, Term};
 
 use super::{
-    alloc_sort, ast_to_term, ffi_guard_ast, ffi_guard_ptr, record_ast_sort,
-    require_fpa_rounding_mode, term_to_ast, Z3Context, Z3_ast, Z3_context, Z3_sort,
-    MAX_FFI_BITVECTOR_WIDTH, MAX_FFI_FP_EXPONENT_BITS, Z3_INVALID_ARG, Z3_SORT_ERROR,
+    alloc_sort, ffi_guard_ast, ffi_guard_ptr, record_ast_sort, require_fpa_rounding_mode,
+    require_term_ast, term_to_ast, Z3Context, Z3_ast, Z3_context, Z3_sort, MAX_FFI_BITVECTOR_WIDTH,
+    MAX_FFI_FP_EXPONENT_BITS, Z3_INVALID_ARG, Z3_SORT_ERROR,
 };
 
 /// Record an error code + message on the context and return the null AST sentinel.
@@ -172,7 +172,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_rounding_mode_sort(c: Z3_context) -> Z3_sort 
 fn mk_rm(ctx: &mut Z3Context, name: &str) -> Z3_ast {
     match ctx.solver.try_fp_rounding_mode(name) {
         Ok(t) => {
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             // The rounding-mode term is reported as the RoundingMode sort so a
             // consumer that queries its sort sees a coherent answer.
             record_ast_sort(ctx, a, Sort::Uninterpreted("RoundingMode".to_string()));
@@ -278,7 +278,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_nan(c: Z3_context, sort: Z3_sort) -> Z3_ast {
     unsafe {
         ffi_guard_ast(c, |ctx| match ctx.solver.try_fp_nan(eb, sb) {
             Ok(t) => {
-                let a = term_to_ast(t);
+                let a = term_to_ast(ctx, t);
                 record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
                 a
             }
@@ -320,7 +320,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_inf(c: Z3_context, sort: Z3_sort, negative: b
             };
             match result {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
                     a
                 }
@@ -363,7 +363,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_zero(c: Z3_context, sort: Z3_sort, negative: 
             };
             match result {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
                     a
                 }
@@ -525,7 +525,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_numeral_double(
             let big = num_bigint::BigInt::from(bits);
             match ctx.solver.try_fp_const_from_bits_bigint(&big, eb, sb) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
                     a
                 }
@@ -564,7 +564,9 @@ fn fpa_unary(
     a: Z3_ast,
     build: impl FnOnce(&mut Z3Context, Term) -> Result<Term, ay_dpll::api::SolverError>,
 ) -> Z3_ast {
-    let at = ast_to_term(a);
+    let Some(at) = require_term_ast(ctx, a, op, "operand") else {
+        return 0;
+    };
     let Sort::FloatingPoint(eb, sb) = ctx.solver.sort_of(at) else {
         return ast_error(
             ctx,
@@ -574,7 +576,7 @@ fn fpa_unary(
     };
     match build(ctx, at) {
         Ok(t) => {
-            let r = term_to_ast(t);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, Sort::FloatingPoint(eb, sb));
             r
         }
@@ -626,7 +628,12 @@ fn fpa_rm_binary(
     let Some(rmt) = require_fpa_rounding_mode(ctx, op, rm) else {
         return 0;
     };
-    let (at, bt) = (ast_to_term(a), ast_to_term(b));
+    let Some(at) = require_term_ast(ctx, a, op, "left operand") else {
+        return 0;
+    };
+    let Some(bt) = require_term_ast(ctx, b, op, "right operand") else {
+        return 0;
+    };
     let Sort::FloatingPoint(eb, sb) = ctx.solver.sort_of(at) else {
         return ast_error(
             ctx,
@@ -636,7 +643,7 @@ fn fpa_rm_binary(
     };
     match build(ctx, rmt, at, bt) {
         Ok(t) => {
-            let r = term_to_ast(t);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, Sort::FloatingPoint(eb, sb));
             r
         }
@@ -714,13 +721,21 @@ pub unsafe extern "C" fn Z3_mk_fpa_fma(
             let Some(rmt) = require_fpa_rounding_mode(ctx, "fp.fma", rm) else {
                 return 0;
             };
-            let (at, bt, ct) = (ast_to_term(t1), ast_to_term(t2), ast_to_term(t3));
+            let Some(at) = require_term_ast(ctx, t1, "fp.fma", "first operand") else {
+                return 0;
+            };
+            let Some(bt) = require_term_ast(ctx, t2, "fp.fma", "second operand") else {
+                return 0;
+            };
+            let Some(ct) = require_term_ast(ctx, t3, "fp.fma", "third operand") else {
+                return 0;
+            };
             let Sort::FloatingPoint(eb, sb) = ctx.solver.sort_of(at) else {
                 return ast_error(ctx, Z3_SORT_ERROR, "fp.fma: operands must be FloatingPoint");
             };
             match ctx.solver.try_fp_fma(rmt, at, bt, ct) {
                 Ok(t) => {
-                    let r = term_to_ast(t);
+                    let r = term_to_ast(ctx, t);
                     record_ast_sort(ctx, r, Sort::FloatingPoint(eb, sb));
                     r
                 }
@@ -742,13 +757,15 @@ pub unsafe extern "C" fn Z3_mk_fpa_sqrt(c: Z3_context, rm: Z3_ast, t: Z3_ast) ->
             let Some(rmt) = require_fpa_rounding_mode(ctx, "fp.sqrt", rm) else {
                 return 0;
             };
-            let at = ast_to_term(t);
+            let Some(at) = require_term_ast(ctx, t, "fp.sqrt", "operand") else {
+                return 0;
+            };
             let Sort::FloatingPoint(eb, sb) = ctx.solver.sort_of(at) else {
                 return ast_error(ctx, Z3_SORT_ERROR, "fp.sqrt: operand must be FloatingPoint");
             };
             match ctx.solver.try_fp_sqrt(rmt, at) {
                 Ok(t) => {
-                    let r = term_to_ast(t);
+                    let r = term_to_ast(ctx, t);
                     record_ast_sort(ctx, r, Sort::FloatingPoint(eb, sb));
                     r
                 }
@@ -776,7 +793,9 @@ pub unsafe extern "C" fn Z3_mk_fpa_round_to_integral(
             let Some(rmt) = require_fpa_rounding_mode(ctx, "fp.roundToIntegral", rm) else {
                 return 0;
             };
-            let at = ast_to_term(t);
+            let Some(at) = require_term_ast(ctx, t, "fp.roundToIntegral", "operand") else {
+                return 0;
+            };
             let Sort::FloatingPoint(eb, sb) = ctx.solver.sort_of(at) else {
                 return ast_error(
                     ctx,
@@ -786,7 +805,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_round_to_integral(
             };
             match ctx.solver.try_fp_round_to_integral(rmt, at) {
                 Ok(t) => {
-                    let r = term_to_ast(t);
+                    let r = term_to_ast(ctx, t);
                     record_ast_sort(ctx, r, Sort::FloatingPoint(eb, sb));
                     r
                 }
@@ -808,7 +827,12 @@ fn fpa_binary(
     b: Z3_ast,
     build: impl FnOnce(&mut Z3Context, Term, Term) -> Result<Term, ay_dpll::api::SolverError>,
 ) -> Z3_ast {
-    let (at, bt) = (ast_to_term(a), ast_to_term(b));
+    let Some(at) = require_term_ast(ctx, a, op, "left operand") else {
+        return 0;
+    };
+    let Some(bt) = require_term_ast(ctx, b, op, "right operand") else {
+        return 0;
+    };
     let Sort::FloatingPoint(eb, sb) = ctx.solver.sort_of(at) else {
         return ast_error(
             ctx,
@@ -818,7 +842,7 @@ fn fpa_binary(
     };
     match build(ctx, at, bt) {
         Ok(t) => {
-            let r = term_to_ast(t);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, Sort::FloatingPoint(eb, sb));
             r
         }
@@ -875,7 +899,12 @@ fn fpa_pred_binary(
     b: Z3_ast,
     build: impl FnOnce(&mut Z3Context, Term, Term) -> Result<Term, ay_dpll::api::SolverError>,
 ) -> Z3_ast {
-    let (at, bt) = (ast_to_term(a), ast_to_term(b));
+    let Some(at) = require_term_ast(ctx, a, op, "left operand") else {
+        return 0;
+    };
+    let Some(bt) = require_term_ast(ctx, b, op, "right operand") else {
+        return 0;
+    };
     if !matches!(ctx.solver.sort_of(at), Sort::FloatingPoint(_, _)) {
         return ast_error(
             ctx,
@@ -885,7 +914,7 @@ fn fpa_pred_binary(
     }
     match build(ctx, at, bt) {
         Ok(t) => {
-            let r = term_to_ast(t);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, Sort::Bool);
             r
         }
@@ -953,7 +982,9 @@ fn fpa_pred_unary(
     a: Z3_ast,
     build: impl FnOnce(&mut Z3Context, Term) -> Result<Term, ay_dpll::api::SolverError>,
 ) -> Z3_ast {
-    let at = ast_to_term(a);
+    let Some(at) = require_term_ast(ctx, a, op, "operand") else {
+        return 0;
+    };
     if !matches!(ctx.solver.sort_of(at), Sort::FloatingPoint(_, _)) {
         return ast_error(
             ctx,
@@ -963,7 +994,7 @@ fn fpa_pred_unary(
     }
     match build(ctx, at) {
         Ok(t) => {
-            let r = term_to_ast(t);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, Sort::Bool);
             r
         }
@@ -1069,7 +1100,11 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_float(
             let Some(rmt) = require_fpa_rounding_mode(ctx, "Z3_mk_fpa_to_fp_float", rm) else {
                 return 0;
             };
-            let ft = ast_to_term(t);
+            let Some(ft) =
+                require_term_ast(ctx, t, "Z3_mk_fpa_to_fp_float", "floating-point value")
+            else {
+                return 0;
+            };
             if !matches!(ctx.solver.sort_of(ft), Sort::FloatingPoint(_, _)) {
                 return ast_error(
                     ctx,
@@ -1079,7 +1114,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_float(
             }
             match ctx.solver.try_fp_to_fp(rmt, ft, eb, sb) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
                     a
                 }
@@ -1122,7 +1157,10 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_signed(
             let Some(rmt) = require_fpa_rounding_mode(ctx, "Z3_mk_fpa_to_fp_signed", rm) else {
                 return 0;
             };
-            let bvt = ast_to_term(t);
+            let Some(bvt) = require_term_ast(ctx, t, "Z3_mk_fpa_to_fp_signed", "bit-vector value")
+            else {
+                return 0;
+            };
             if !matches!(ctx.solver.sort_of(bvt), Sort::BitVec(_)) {
                 return ast_error(
                     ctx,
@@ -1132,7 +1170,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_signed(
             }
             match ctx.solver.try_bv_to_fp(rmt, bvt, eb, sb) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
                     a
                 }

@@ -136,6 +136,38 @@ fn witness_exact_len() {
 }
 
 #[test]
+fn witness_work_budget_declines_without_losing_the_unbounded_retry() {
+    let constraints = [WeRegex::lit("abc")];
+    assert_eq!(
+        find_witness_work_budgeted(&constraints, Some(3), 3, Some(0)),
+        None,
+        "a spent budget is a conservative decline"
+    );
+    assert_eq!(
+        find_witness_work_budgeted(&constraints, Some(3), 3, None).as_deref(),
+        Some("abc"),
+        "the same search remains available to the unbounded retry"
+    );
+}
+
+#[test]
+fn witness_work_budget_is_shared_across_searches() {
+    let regex = WeRegex::lit("a");
+    let mut budget = WitnessWorkBudget::new(1);
+
+    assert_eq!(
+        find_witness_with_work_budget(std::slice::from_ref(&regex), Some(1), 1, &mut budget,)
+            .as_deref(),
+        Some("a")
+    );
+    assert_eq!(budget.remaining(), 0);
+    assert_eq!(
+        find_witness_with_work_budget(std::slice::from_ref(&regex), Some(1), 1, &mut budget,),
+        None
+    );
+}
+
+#[test]
 fn witness_product() {
     // a-or-b-star ∩ (…must contain exactly two chars…): witness in both.
     let w = find_witness(

@@ -377,7 +377,8 @@ impl Solver {
         // (observed under AY_LRA_EAGER_LAZY: arena len 6, index ~174M).
         // The trail is cleared by this reset regardless, so the "conflict
         // under current assignment" is meaningless for the new solve: drop it.
-        self.pending_theory_conflict = None;
+        self.pending_theory_conflicts.clear();
+        self.pending_theory_unit_proof_ids.clear();
 
         #[cfg(debug_assertions)]
         {

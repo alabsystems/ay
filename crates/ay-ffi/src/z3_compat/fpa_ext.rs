@@ -51,7 +51,7 @@ use num_bigint::BigInt;
 use ay_dpll::api::Sort;
 
 use super::{
-    ast_to_term, ffi_guard_ast, ffi_guard_uint, record_ast_sort, require_fpa_rounding_mode,
+    ffi_guard_ast, ffi_guard_uint, record_ast_sort, require_fpa_rounding_mode, require_term_ast,
     term_to_ast, Z3Context, Z3_ast, Z3_context, Z3_mk_fpa_numeral_double, Z3_mk_fpa_sort, Z3_sort,
     MAX_FFI_BITVECTOR_WIDTH, MAX_FFI_FP_EXPONENT_BITS, Z3_INVALID_ARG, Z3_SORT_ERROR,
 };
@@ -214,7 +214,15 @@ pub unsafe extern "C" fn Z3_mk_fpa_fp(
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let (sgnt, expt, sigt) = (ast_to_term(sgn), ast_to_term(exp), ast_to_term(sig));
+            let Some(sgnt) = require_term_ast(ctx, sgn, "Z3_mk_fpa_fp", "sign") else {
+                return 0;
+            };
+            let Some(expt) = require_term_ast(ctx, exp, "Z3_mk_fpa_fp", "exponent") else {
+                return 0;
+            };
+            let Some(sigt) = require_term_ast(ctx, sig, "Z3_mk_fpa_fp", "significand") else {
+                return 0;
+            };
             let Sort::BitVec(sign_bv) = ctx.solver.sort_of(sgnt) else {
                 return ast_error(ctx, Z3_SORT_ERROR, "Z3_mk_fpa_fp: sign must be a BitVec");
             };
@@ -252,7 +260,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_fp(
             }
             match ctx.solver.try_fp_from_bvs(sgnt, expt, sigt, eb, sb) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
                     a
                 }
@@ -294,7 +302,10 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_bv(c: Z3_context, bv: Z3_ast, s: Z3_sor
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let bvt = ast_to_term(bv);
+            let Some(bvt) = require_term_ast(ctx, bv, "Z3_mk_fpa_to_fp_bv", "bit-vector value")
+            else {
+                return 0;
+            };
             if !matches!(ctx.solver.sort_of(bvt), Sort::BitVec(_)) {
                 return ast_error(
                     ctx,
@@ -304,7 +315,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_bv(c: Z3_context, bv: Z3_ast, s: Z3_sor
             }
             match ctx.solver.try_bv_to_fp_reinterpret(bvt, eb, sb) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
                     a
                 }
@@ -349,7 +360,11 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_unsigned(
             let Some(rmt) = require_fpa_rounding_mode(ctx, "Z3_mk_fpa_to_fp_unsigned", rm) else {
                 return 0;
             };
-            let bvt = ast_to_term(t);
+            let Some(bvt) =
+                require_term_ast(ctx, t, "Z3_mk_fpa_to_fp_unsigned", "bit-vector value")
+            else {
+                return 0;
+            };
             if !matches!(ctx.solver.sort_of(bvt), Sort::BitVec(_)) {
                 return ast_error(
                     ctx,
@@ -359,7 +374,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_fp_unsigned(
             }
             match ctx.solver.try_bv_to_fp_unsigned(rmt, bvt, eb, sb) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
                     a
                 }
@@ -387,7 +402,11 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_ieee_bv(c: Z3_context, t: Z3_ast) -> Z3_as
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let xt = ast_to_term(t);
+            let Some(xt) =
+                require_term_ast(ctx, t, "Z3_mk_fpa_to_ieee_bv", "floating-point operand")
+            else {
+                return 0;
+            };
             let Sort::FloatingPoint(eb, sb) = ctx.solver.sort_of(xt) else {
                 return ast_error(
                     ctx,
@@ -413,7 +432,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_ieee_bv(c: Z3_context, t: Z3_ast) -> Z3_as
             }
             match ctx.solver.try_fp_to_ieee_bv(xt) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     // Record the BitVec(eb+sb) sort the core builder computed.
                     let sort = ctx.solver.sort_of(t);
                     record_ast_sort(ctx, a, sort);
@@ -438,7 +457,10 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_real(c: Z3_context, t: Z3_ast) -> Z3_ast {
     // SAFETY: `c` forwarded under the caller's contract.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let xt = ast_to_term(t);
+            let Some(xt) = require_term_ast(ctx, t, "Z3_mk_fpa_to_real", "floating-point operand")
+            else {
+                return 0;
+            };
             if !matches!(ctx.solver.sort_of(xt), Sort::FloatingPoint(_, _)) {
                 return ast_error(
                     ctx,
@@ -448,7 +470,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_real(c: Z3_context, t: Z3_ast) -> Z3_ast {
             }
             match ctx.solver.try_fp_to_real(xt) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::Real);
                     a
                 }
@@ -488,7 +510,10 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_sbv(
             let Some(rmt) = require_fpa_rounding_mode(ctx, "Z3_mk_fpa_to_sbv", rm) else {
                 return 0;
             };
-            let xt = ast_to_term(t);
+            let Some(xt) = require_term_ast(ctx, t, "Z3_mk_fpa_to_sbv", "floating-point operand")
+            else {
+                return 0;
+            };
             if !matches!(ctx.solver.sort_of(xt), Sort::FloatingPoint(_, _)) {
                 return ast_error(
                     ctx,
@@ -498,7 +523,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_sbv(
             }
             match ctx.solver.try_fp_to_sbv(rmt, xt, sz) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::bitvec(sz));
                     a
                 }
@@ -538,7 +563,10 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_ubv(
             let Some(rmt) = require_fpa_rounding_mode(ctx, "Z3_mk_fpa_to_ubv", rm) else {
                 return 0;
             };
-            let xt = ast_to_term(t);
+            let Some(xt) = require_term_ast(ctx, t, "Z3_mk_fpa_to_ubv", "floating-point operand")
+            else {
+                return 0;
+            };
             if !matches!(ctx.solver.sort_of(xt), Sort::FloatingPoint(_, _)) {
                 return ast_error(
                     ctx,
@@ -548,7 +576,7 @@ pub unsafe extern "C" fn Z3_mk_fpa_to_ubv(
             }
             match ctx.solver.try_fp_to_ubv(rmt, xt, sz) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::bitvec(sz));
                     a
                 }
@@ -649,7 +677,7 @@ fn build_fp_numeral_fields(
         (BigInt::from(u8::from(sgn)) << sign_shift) | (biased << (sb as usize - 1)) | sig_big;
     match ctx.solver.try_fp_const_from_bits_bigint(&bits, eb, sb) {
         Ok(t) => {
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::FloatingPoint(eb, sb));
             a
         }

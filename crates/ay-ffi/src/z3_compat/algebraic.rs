@@ -8,9 +8,10 @@
 //!
 //! AY's `Real` AST encodes only `BigRational`, so a genuinely irrational
 //! algebraic result (e.g. √2 from `Z3_algebraic_root`) is carried by an
-//! [`ALGEBRAIC_AST_TAG`]-tagged `Z3_ast` handle backed by an exact `RealScalar`
-//! in `Z3Context::algebraic_values`; rational results keep flowing through the
-//! ordinary numeral-AST path. Every operand is read via [`ast_as_scalar`]
+//! [`ALGEBRAIC_AST_TAG`]-tagged, context-salted `Z3_ast` handle backed by an
+//! exact `RealScalar` in `Z3Context::algebraic_values`; rational results keep
+//! flowing through the ordinary numeral-AST path. Every operand is read via
+//! [`ast_as_scalar`]
 //! (rational numeral OR algebraic handle) and every result interned via
 //! [`scalar_to_ast`], so:
 //!
@@ -41,10 +42,10 @@ use num_bigint::{BigInt, Sign};
 use num_rational::BigRational;
 
 use super::{
-    ast_to_term, cache_ast_vector, ffi_count_within_limit, ffi_guard_ast, ffi_guard_int,
-    ffi_guard_ptr, ffi_guard_uint, record_ast_sort, term_to_ast, Z3Context, Z3_ast, Z3_ast_vector,
-    Z3_context, ALGEBRAIC_AST_TAG, MAX_FFI_ALGEBRAIC_EXPONENT, MAX_FFI_CONTAINER_ELEMENTS,
-    PROOF_AST_TAG, Z3_INVALID_ARG,
+    cache_ast_vector, checked_ast_to_term, decode_indexed_ast, encode_indexed_ast,
+    ffi_count_within_limit, ffi_guard_ast, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint,
+    record_ast_sort, term_to_ast, Z3Context, Z3_ast, Z3_ast_vector, Z3_context, ALGEBRAIC_AST_TAG,
+    HANDLE_TAG_MASK, MAX_FFI_ALGEBRAIC_EXPONENT, MAX_FFI_CONTAINER_ELEMENTS, Z3_INVALID_ARG,
 };
 
 // ============================================================================
@@ -89,10 +90,7 @@ fn term_rational(ctx: &Z3Context, t: Term) -> Option<(BigInt, BigInt)> {
 
 /// Interpret a `Z3_ast` as an exact rational algebraic value, or `None`.
 fn numeral_as_rational(ctx: &Z3Context, a: Z3_ast) -> Option<(BigInt, BigInt)> {
-    if a == 0 {
-        return None;
-    }
-    term_rational(ctx, ast_to_term(a))
+    term_rational(ctx, checked_ast_to_term(ctx, a)?)
 }
 
 /// Sign of a rational (its numerator, denominator being positive) as `1/0/-1`.
@@ -108,18 +106,13 @@ fn signum_int(num: &BigInt) -> c_int {
 // Algebraic-number AST bridge (tagged handles ↔ exact RealScalar).
 // ============================================================================
 
-/// True iff `a` is an [`ALGEBRAIC_AST_TAG`]-tagged handle (an irrational
-/// algebraic-number AST), distinct from a proof handle (bit 63) and a real term.
-pub(crate) fn is_algebraic_ast(a: Z3_ast) -> bool {
-    a != 0 && (a & ALGEBRAIC_AST_TAG) != 0 && (a & PROOF_AST_TAG) == 0
-}
-
 /// Read a `Z3_ast` as an exact [`RealScalar`]: an algebraic-tagged handle yields
 /// the stored value; an ordinary `Int`/`Real` numeral yields a rational. `None`
-/// for anything else (free variable, non-numeric, dangling index).
+/// for anything else (free variable, non-numeric, dangling index, or a handle
+/// owned by another context).
 pub(crate) fn ast_as_scalar(ctx: &Z3Context, a: Z3_ast) -> Option<RealScalar> {
-    if is_algebraic_ast(a) {
-        let idx = (a & !ALGEBRAIC_AST_TAG) as usize;
+    if a & HANDLE_TAG_MASK == ALGEBRAIC_AST_TAG {
+        let idx = decode_indexed_ast(ctx, a, ALGEBRAIC_AST_TAG)?;
         return ctx.algebraic_values.get(idx).cloned();
     }
     let (num, den) = numeral_as_rational(ctx, a)?;
@@ -129,20 +122,23 @@ pub(crate) fn ast_as_scalar(ctx: &Z3Context, a: Z3_ast) -> Option<RealScalar> {
 /// Intern an exact [`RealScalar`] as a `Z3_ast`: a rational (after
 /// canonicalization) via the ordinary `Real` numeral path; a genuine irrational
 /// algebraic via an [`ALGEBRAIC_AST_TAG`] handle backed by
-/// `Z3Context::algebraic_values`. Returns `0` only on a refinement cap — the
-/// caller sets the error on `0`.
+/// `Z3Context::algebraic_values`. Returns `0` on a refinement cap or exhausted
+/// tagged-handle index space — the caller sets the error on `0`.
 pub(crate) fn scalar_to_ast(ctx: &mut Z3Context, s: RealScalar) -> Z3_ast {
     match rcf_api::canonicalize(&s) {
         Some(RealScalar::Rational(r)) => {
             let term = ctx.solver.rational_const_bigint(r.numer(), r.denom());
-            let ast = term_to_ast(term);
+            let ast = term_to_ast(ctx, term);
             record_ast_sort(ctx, ast, Sort::Real);
             ast
         }
         Some(alg) => {
-            let idx = ctx.algebraic_values.len() as u64;
+            let Some(ast) = encode_indexed_ast(ctx, ALGEBRAIC_AST_TAG, ctx.algebraic_values.len())
+            else {
+                return 0;
+            };
             ctx.algebraic_values.push(alg);
-            ALGEBRAIC_AST_TAG | idx
+            ast
         }
         None => 0,
     }
@@ -849,11 +845,24 @@ pub unsafe extern "C" fn Z3_algebraic_roots(
                 ctx.error_msg = Some(format!("Z3_algebraic_roots: {msg}"));
                 cache_ast_vector(ctx, Vec::new())
             };
+            let Some(arg_terms) = args
+                .iter()
+                .map(|&arg| checked_ast_to_term(ctx, arg))
+                .collect::<Option<Vec<Term>>>()
+            else {
+                return fail(ctx, "an argument is invalid or belongs to another context");
+            };
+            let Some(p_term) = checked_ast_to_term(ctx, p) else {
+                return fail(
+                    ctx,
+                    "the polynomial is invalid or belongs to another context",
+                );
+            };
             // Substitution values must be RATIONAL numerals: an
             // irrational-algebraic handle has no term to substitute (honest
             // divergence; Z3 accepts algebraic parameter values).
-            for &arg in &args {
-                if numeral_as_rational(ctx, arg).is_none() {
+            for &arg_term in &arg_terms {
+                if term_rational(ctx, arg_term).is_none() {
                     return fail(ctx, "an argument is not a rational numeral value");
                 }
             }
@@ -872,11 +881,10 @@ pub unsafe extern "C" fn Z3_algebraic_roots(
                 {
                     if idx < n_usize {
                         from.push(*var_term);
-                        to.push(ast_to_term(args[idx]));
+                        to.push(arg_terms[idx]);
                     }
                 }
             }
-            let p_term = ast_to_term(p);
             let substituted = ctx.solver.substitute(p_term, &from, &to);
             let simplified = ctx.solver.simplify(substituted);
 
@@ -961,8 +969,28 @@ pub unsafe extern "C" fn Z3_algebraic_eval(
     // SAFETY: `ffi_guard_int` null-checks `c` and catches panics.
     unsafe {
         ffi_guard_int(c, 0, move |ctx| {
-            for &arg in &args {
-                if numeral_as_rational(ctx, arg).is_none() {
+            let Some(arg_terms) = args
+                .iter()
+                .map(|&arg| checked_ast_to_term(ctx, arg))
+                .collect::<Option<Vec<Term>>>()
+            else {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg = Some(
+                    "Z3_algebraic_eval: an argument is invalid or belongs to another context"
+                        .to_string(),
+                );
+                return 0;
+            };
+            let Some(p_term) = checked_ast_to_term(ctx, p) else {
+                ctx.last_error = Z3_INVALID_ARG;
+                ctx.error_msg = Some(
+                    "Z3_algebraic_eval: polynomial is invalid or belongs to another context"
+                        .to_string(),
+                );
+                return 0;
+            };
+            for &arg_term in &arg_terms {
+                if term_rational(ctx, arg_term).is_none() {
                     ctx.last_error = Z3_INVALID_ARG;
                     ctx.error_msg =
                         Some("Z3_algebraic_eval: an argument is not a rational value".to_string());
@@ -984,12 +1012,11 @@ pub unsafe extern "C" fn Z3_algebraic_eval(
                 {
                     if idx < n_usize {
                         from.push(*var_term);
-                        to.push(ast_to_term(args[idx]));
+                        to.push(arg_terms[idx]);
                     }
                 }
             }
 
-            let p_term = ast_to_term(p);
             let substituted = ctx.solver.substitute(p_term, &from, &to);
             let simplified = ctx.solver.simplify(substituted);
 
@@ -1041,7 +1068,7 @@ pub unsafe extern "C" fn Z3_algebraic_get_poly(c: Z3_context, a: Z3_ast) -> Z3_a
                 .iter()
                 .map(|c0| {
                     let term = ctx.solver.int_const_bigint(c0);
-                    let ast = term_to_ast(term);
+                    let ast = term_to_ast(ctx, term);
                     record_ast_sort(ctx, ast, Sort::Int);
                     ast
                 })
@@ -1126,11 +1153,18 @@ pub unsafe extern "C" fn Z3_polynomial_subresultants(
             if p == 0 || q == 0 || x == 0 {
                 return fail(ctx, "null AST argument");
             }
-            let x_term = ast_to_term(x);
+            let Some(x_term) = checked_ast_to_term(ctx, x) else {
+                return fail(ctx, "x is invalid or belongs to another context");
+            };
             if !matches!(ctx.solver.term_kind(x_term), TermKind::Var { .. }) {
                 return fail(ctx, "x must be a variable/constant term");
             }
-            let (mut pp, mut qq) = (ast_to_term(p), ast_to_term(q));
+            let Some(mut pp) = checked_ast_to_term(ctx, p) else {
+                return fail(ctx, "p is invalid or belongs to another context");
+            };
+            let Some(mut qq) = checked_ast_to_term(ctx, q) else {
+                return fail(ctx, "q is invalid or belongs to another context");
+            };
             let Some(mut pc) = term_to_poly(ctx, pp, x_term) else {
                 return fail(
                     ctx,
@@ -1187,7 +1221,7 @@ pub unsafe extern "C" fn Z3_polynomial_subresultants(
                 .into_iter()
                 .map(|v| {
                     let term = ctx.solver.rational_const_bigint(v.numer(), v.denom());
-                    let ast = term_to_ast(term);
+                    let ast = term_to_ast(ctx, term);
                     record_ast_sort(ctx, ast, Sort::Real);
                     ast
                 })

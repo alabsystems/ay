@@ -157,6 +157,7 @@ impl Context {
             // Remove datatypes defined in this scope
             for name in frame.datatypes {
                 self.datatypes.remove(&name);
+                self.monomorphic_datatype_decs.remove(&name);
                 // Parametric instance metadata is keyed by the same mangled name.
                 self.parametric_instance_args.remove(&name);
             }
@@ -276,6 +277,50 @@ impl Context {
     /// an adopted declared function still needs a model entry — this is it.
     pub fn adopted_macro_interp(&self, name: &str) -> Option<&(Vec<(String, Sort)>, TermId)> {
         self.adopted_macro_interps.get(name)
+    }
+
+    /// Register the model interpretation for a pure definitional macro that
+    /// was recognized by the native Rust API after term construction.
+    ///
+    /// The native API owns expansion of later applications, so this method
+    /// deliberately installs only the interpretation used by model emission.
+    /// It repeats the context-side soundness checks: the declaration must be a
+    /// single, ordinary user function with the exact signature; no earlier
+    /// constraint may mention it; and the body must be non-recursive.
+    #[doc(hidden)]
+    pub fn try_register_native_adopted_macro_interp(
+        &mut self,
+        name: &str,
+        params: &[(String, Sort)],
+        body: TermId,
+    ) -> bool {
+        if !self.scopes.is_empty()
+            || self.fun_defs.contains_key(name)
+            || self.recursive_fun_names.contains(name)
+            || self.is_datatype_member_name(name)
+            || self.overloaded_symbols.contains_key(name)
+            || self.adopted_macro_interps.contains_key(name)
+            || self.constraints_mention_symbol(name)
+            || self.term_mentions_symbol(body, name)
+        {
+            return false;
+        }
+        let Some(info) = self.symbols.get(name) else {
+            return false;
+        };
+        if info.arg_sorts.len() != params.len()
+            || info
+                .arg_sorts
+                .iter()
+                .zip(params.iter())
+                .any(|(declared, (_, actual))| declared != actual)
+            || self.terms.sort(body) != &info.sort
+        {
+            return false;
+        }
+        self.adopted_macro_interps
+            .insert(name.to_string(), (params.to_vec(), body));
+        true
     }
 
     /// #quantprod-g3: is `name` referenced by any EXISTING constraint — a

@@ -88,7 +88,7 @@ impl Solver {
         // Skip compaction (rather than panic) when BCP has pending work — this
         // can happen legitimately during reduce_db since learned clause deletion
         // doesn't drain the propagation queue.
-        if self.qhead < self.trail.len() || self.pending_theory_conflict.is_some() {
+        if self.qhead < self.trail.len() || !self.pending_theory_conflicts.is_empty() {
             return;
         }
 

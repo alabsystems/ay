@@ -314,6 +314,20 @@ fn qf_abv_pinned_concat_index_select_unsat_proof_guard_wishlist1_cli_parity() {
         alethe.contains("step") || alethe.contains("assume"),
         "exported Alethe proof looks empty: {alethe:?}"
     );
+    assert!(
+        alethe.contains(":rule distinct_elim"),
+        "surface `distinct` premise must be certified before canonical disequality use: {alethe}"
+    );
+    assert!(
+        alethe.contains(":rule evaluate"),
+        "ground concat folds must be certified with Carcara's `evaluate` rule: {alethe}"
+    );
+    assert!(
+        !alethe.contains(":rule trust")
+            && !alethe.contains(":rule hole")
+            && !alethe.contains(":rule bv_bitblast"),
+        "proof must not contain unchecked or AY-private rules: {alethe}"
+    );
 }
 
 /// Genuine-UNSAT guard: the same shape with a contradictory pin must stay

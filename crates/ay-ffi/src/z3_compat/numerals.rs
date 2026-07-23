@@ -37,7 +37,7 @@ fn mk_finite_domain_numeral(ctx: &mut Z3Context, v: &BigInt, sort: &Sort) -> Z3_
         return 0;
     }
     let term = ctx.solver.int_const_bigint(v);
-    let ast = term_to_ast(term);
+    let ast = term_to_ast(ctx, term);
     record_ast_sort(ctx, ast, sort.clone());
     ast
 }
@@ -101,7 +101,7 @@ pub unsafe extern "C" fn Z3_mk_numeral(
                 },
                 _ => return 0,
             };
-            let ast = term_to_ast(term);
+            let ast = term_to_ast(ctx, term);
             record_ast_sort(ctx, ast, sort.clone());
             ast
         })
@@ -138,7 +138,7 @@ pub unsafe extern "C" fn Z3_mk_int(c: Z3_context, v: c_int, ty: Z3_sort) -> Z3_a
                 }
                 _ => return 0,
             };
-            let ast = term_to_ast(term);
+            let ast = term_to_ast(ctx, term);
             record_ast_sort(ctx, ast, sort.clone());
             ast
         })
@@ -175,7 +175,7 @@ pub unsafe extern "C" fn Z3_mk_unsigned_int(c: Z3_context, v: c_uint, ty: Z3_sor
                 }
                 _ => return 0,
             };
-            let ast = term_to_ast(term);
+            let ast = term_to_ast(ctx, term);
             record_ast_sort(ctx, ast, sort.clone());
             ast
         })
@@ -215,7 +215,7 @@ pub unsafe extern "C" fn Z3_mk_int64(c: Z3_context, v: i64, ty: Z3_sort) -> Z3_a
                 }
                 _ => return 0,
             };
-            let ast = term_to_ast(term);
+            let ast = term_to_ast(ctx, term);
             record_ast_sort(ctx, ast, sort.clone());
             ast
         })
@@ -251,7 +251,7 @@ pub unsafe extern "C" fn Z3_mk_unsigned_int64(c: Z3_context, v: u64, ty: Z3_sort
                 Sort::FiniteDomain(_, _) => return mk_finite_domain_numeral(ctx, &big_v, &sort),
                 _ => return 0,
             };
-            let ast = term_to_ast(term);
+            let ast = term_to_ast(ctx, term);
             record_ast_sort(ctx, ast, sort.clone());
             ast
         })
@@ -271,7 +271,7 @@ pub unsafe extern "C" fn Z3_mk_real(c: Z3_context, num: c_int, den: c_int) -> Z3
     unsafe {
         ffi_guard_ast(c, |ctx| {
             let term = ctx.solver.rational_const(i64::from(num), i64::from(den));
-            let ast = term_to_ast(term);
+            let ast = term_to_ast(ctx, term);
             record_ast_sort(ctx, ast, Sort::Real);
             ast
         })

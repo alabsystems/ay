@@ -785,7 +785,6 @@ fn array_extensionality_adds_skolem_without_explicit_witness_6282() {
 
     let a = exec.ctx.terms.lookup("a").expect("a declared");
     let b = exec.ctx.terms.lookup("b").expect("b declared");
-    let skolem_name = format!("__ext_diff_{}_{}", a.0, b.0);
     let before = exec.ctx.assertions.len();
 
     exec.add_array_extensionality_axioms();
@@ -796,9 +795,59 @@ fn array_extensionality_adds_skolem_without_explicit_witness_6282() {
         "without an existing select witness, extensionality should add one axiom"
     );
     assert!(
-        exec.ctx.terms.lookup(&skolem_name).is_some(),
+        exec.array_ext_witness_cache
+            .pair_witness(&exec.ctx.terms, a, b)
+            .is_some(),
         "extensionality should create a fresh diff Skolem without a witness"
     );
+}
+
+#[test]
+fn array_extensionality_user_legacy_name_collision_stays_sat() {
+    let mut exec = prepare_executor(
+        r#"
+        (set-logic QF_AUFLIA)
+        (declare-const a (Array Int Int))
+        (declare-const b (Array Int Int))
+    "#,
+    );
+    let a = exec.ctx.terms.lookup("a").expect("a declared");
+    let b = exec.ctx.terms.lookup("b").expect("b declared");
+
+    // This is the exact public name the old pair-derived generator would have
+    // reused through sort-blind `mk_var`. Pinning the arrays equal at that
+    // user-controlled index while keeping them extensionally different is
+    // satisfiable, but the aliased witness axiom made it falsely UNSAT.
+    let legacy_user_name = format!("__ext_diff_{}_{}", a.0, b.0);
+    let commands = parse(&format!(
+        r#"
+        (declare-const {legacy_user_name} Int)
+        (assert (= (select a {legacy_user_name}) (select b {legacy_user_name})))
+        (assert (not (= a b)))
+        (check-sat)
+    "#
+    ))
+    .expect("collision regression should parse");
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("collision regression should execute");
+
+    assert_eq!(
+        outputs,
+        vec!["sat"],
+        "a user-owned legacy name is not a witness"
+    );
+    let user_term = exec
+        .ctx
+        .terms
+        .lookup(&legacy_user_name)
+        .expect("user collision symbol exists");
+    let internal_term = exec
+        .array_ext_witness_cache
+        .pair_witness(&exec.ctx.terms, a, b)
+        .expect("solver created a disjoint internal witness");
+    assert_ne!(user_term, internal_term);
+    assert_eq!(exec.ctx.terms.sort(internal_term), &ay_core::Sort::Int);
 }
 
 #[test]
@@ -818,7 +867,6 @@ fn array_extensionality_skips_skolem_with_explicit_select_witness_6282() {
 
     let a = exec.ctx.terms.lookup("a").expect("a declared");
     let b = exec.ctx.terms.lookup("b").expect("b declared");
-    let skolem_name = format!("__ext_diff_{}_{}", a.0, b.0);
     let before = exec.ctx.assertions.len();
 
     exec.add_array_extensionality_axioms();
@@ -829,7 +877,9 @@ fn array_extensionality_skips_skolem_with_explicit_select_witness_6282() {
         "an explicit select disequality witness should suppress redundant extensionality axioms"
     );
     assert!(
-        exec.ctx.terms.lookup(&skolem_name).is_none(),
+        exec.array_ext_witness_cache
+            .pair_witness(&exec.ctx.terms, a, b)
+            .is_none(),
         "already_diseq optimization should avoid creating a fresh diff Skolem"
     );
 }
@@ -855,7 +905,6 @@ fn array_extensionality_skips_skolem_with_select_alias_witness_8785() {
 
     let a = exec.ctx.terms.lookup("a").expect("a declared");
     let b = exec.ctx.terms.lookup("b").expect("b declared");
-    let skolem_name = format!("__ext_diff_{}_{}", a.0, b.0);
     let before = exec.ctx.assertions.len();
 
     exec.add_array_extensionality_axioms();
@@ -866,7 +915,9 @@ fn array_extensionality_skips_skolem_with_select_alias_witness_8785() {
         "select aliases with a top-level disequality should suppress redundant extensionality"
     );
     assert!(
-        exec.ctx.terms.lookup(&skolem_name).is_none(),
+        exec.array_ext_witness_cache
+            .pair_witness(&exec.ctx.terms, a, b)
+            .is_none(),
         "alias-expanded already_diseq optimization should avoid a fresh diff Skolem"
     );
 }
@@ -888,7 +939,6 @@ fn array_extensionality_skips_top_level_positive_array_equality_8785() {
     let b = exec.ctx.terms.lookup("b").expect("b declared");
     let eq = exec.ctx.terms.mk_eq(a, b);
     let _neg_eq = exec.ctx.terms.mk_not(eq);
-    let skolem_name = format!("__ext_diff_{}_{}", a.0, b.0);
     let before = exec.ctx.assertions.len();
 
     exec.add_array_extensionality_axioms();
@@ -899,7 +949,9 @@ fn array_extensionality_skips_top_level_positive_array_equality_8785() {
         "positive top-level array equality should not create an inactive extensionality axiom"
     );
     assert!(
-        exec.ctx.terms.lookup(&skolem_name).is_none(),
+        exec.array_ext_witness_cache
+            .pair_witness(&exec.ctx.terms, a, b)
+            .is_none(),
         "positive top-level equality should suppress redundant diff Skolems"
     );
 }
@@ -925,7 +977,6 @@ fn array_extensionality_bounded_scan_ignores_generated_negations_8785() {
     let store_b = bounded.ctx.terms.mk_store(b, k, v);
     let store_eq = bounded.ctx.terms.mk_eq(store_a, store_b);
     let _generated_negation = bounded.ctx.terms.mk_not(store_eq);
-    let skolem_name = format!("__ext_diff_{}_{}", store_a.0, store_b.0);
     let before = bounded.ctx.assertions.len();
 
     bounded.add_array_extensionality_axioms_up_to(scan_limit);
@@ -936,7 +987,10 @@ fn array_extensionality_bounded_scan_ignores_generated_negations_8785() {
         "generated post-boundary negations should not demand eager extensionality"
     );
     assert!(
-        bounded.ctx.terms.lookup(&skolem_name).is_none(),
+        bounded
+            .array_ext_witness_cache
+            .pair_witness(&bounded.ctx.terms, store_a, store_b)
+            .is_none(),
         "bounded scan should ignore generated congruence guard negations"
     );
 
@@ -949,12 +1003,14 @@ fn array_extensionality_bounded_scan_ignores_generated_negations_8785() {
     let store_b = unbounded.ctx.terms.mk_store(b, k, v);
     let store_eq = unbounded.ctx.terms.mk_eq(store_a, store_b);
     let _generated_negation = unbounded.ctx.terms.mk_not(store_eq);
-    let skolem_name = format!("__ext_diff_{}_{}", store_a.0, store_b.0);
 
     unbounded.add_array_extensionality_axioms();
 
     assert!(
-        unbounded.ctx.terms.lookup(&skolem_name).is_some(),
+        unbounded
+            .array_ext_witness_cache
+            .pair_witness(&unbounded.ctx.terms, store_a, store_b)
+            .is_some(),
         "the unbounded direct wrapper should preserve legacy extensionality behavior"
     );
 }
@@ -1028,14 +1084,19 @@ fn store_base_decomposition_reuses_extensionality_witness_6282() {
 
     let a = exec.ctx.terms.lookup("a").expect("a declared");
     let b = exec.ctx.terms.lookup("b").expect("b declared");
-    let ext_name = format!("__ext_diff_{}_{}", a.0, b.0);
     let legacy_sbd_name = format!("__sbd_diff_{}_{}", a.0, b.0);
 
     exec.add_array_extensionality_axioms();
+    let ext_witness = exec
+        .array_ext_witness_cache
+        .pair_witness(&exec.ctx.terms, a, b)
+        .expect("extensionality should mint the base-pair witness");
     exec.add_store_store_base_decomposition_axioms();
 
-    assert!(
-        exec.ctx.terms.lookup(&ext_name).is_some(),
+    assert_eq!(
+        exec.array_ext_witness_cache
+            .pair_witness(&exec.ctx.terms, a, b),
+        Some(ext_witness),
         "store decomposition should use the existing extensionality witness for the base pair"
     );
     assert!(

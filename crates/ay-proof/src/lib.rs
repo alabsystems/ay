@@ -66,15 +66,22 @@ pub use bv_blast_solver::{
     BvSolvedExportError, SolvedObligation,
 };
 pub use bv_cnf_refutation::surface_bv_cnf_refutation;
+pub use checker::recognize_fp_rounding_mode_domain;
 pub use checker::recognize_ite_same;
 pub use checker::recognize_regex_intersect_empty;
+pub use checker::recognize_rounding_mode_domain;
 pub use checker::recognize_string_ground_eval;
-pub use checker::{check_proof, check_proof_collecting_trust, ProofCheckError};
+pub use checker::recognize_string_length_lemma;
 pub use checker::{
-    recognize_array_extensionality, recognize_array_select_store, recognize_array_theory_lemma,
-    ExtDiffRegistry,
+    check_proof, check_proof_collecting_trust, check_proof_collecting_trust_with_context,
+    ProofCheckError,
 };
-pub use checker::{recognize_bool_tautology, recognize_bv_bitblast};
+pub use checker::{
+    recognize_array_extensionality, recognize_array_extensionality_chain,
+    recognize_array_select_store, recognize_array_theory_lemma,
+    recognize_folded_array_extensionality, ExtDiffRegistry,
+};
+pub use checker::{recognize_bool_tautology, recognize_bv_bitblast, recognize_bv_ground_evaluate};
 pub use checker::{recognize_datatype_distinct, recognize_datatype_selector_project};
 pub use checker::{recognize_fp_classification, recognize_fp_classification_op};
 pub use partial::{check_proof_partial, PartialProofCheck};
@@ -138,8 +145,9 @@ pub fn export_alethe(proof: &Proof, terms: &TermStore) -> String {
 /// Fallible variant of [`export_alethe`] (#8821).
 ///
 /// Returns `Err(AlethePrintError)` when any step cannot be rendered as a
-/// verifiable Alethe rule — currently this fires only for `LraFarkas` /
-/// `LiaGeneric` theory lemmas missing their `FarkasAnnotation`.
+/// verifiable Alethe rule — including `LraFarkas` / `LiaGeneric` theory lemmas
+/// missing their `FarkasAnnotation` and array-extensionality certificates whose
+/// internal witness provenance has no stock Alethe/Carcara translation.
 ///
 /// Use this variant when the caller must refuse to write an unverifiable
 /// proof to disk. The infallible [`export_alethe`] wraps this function and

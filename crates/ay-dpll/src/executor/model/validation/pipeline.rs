@@ -502,7 +502,7 @@ impl Executor {
     /// proof mode the theory routes RETAIN their injected axioms (eager array
     /// ROW/extensionality instances, purification definitions, …) in that
     /// vector so proof premises stay honest. Those axioms mention fresh internal
-    /// symbols (`__ay_*`, `__ext_diff_*`) that carry no model value, so they
+    /// symbols (`__ay_*`) that carry no model value, so they
     /// observe as `Skip(Internal)` and land in the `incomplete` count — and a
     /// QF_AX model that satisfied all 46 authored assertions was degraded to
     /// `unknown` because 41 *solver-generated* axioms were "unverified". Without
@@ -2871,6 +2871,17 @@ impl Executor {
         }
         self.repair_cross_base_chain_equalities();
         self.repair_negated_same_base_chain();
+        // #uflia-witness-complete (1a-ii): asserted range/disequality index for
+        // the range-aware shift below. Built LAZILY — only when a collision is
+        // actually found — because this primitive runs on every gate pass of
+        // every problem and both scans are O(assertion window).
+        let mut bound_index: Option<(
+            ay_core::kani_compat::DetHashMap<
+                TermId,
+                crate::executor::model::uflia_witness::AssertedRange,
+            >,
+            ay_core::kani_compat::DetHashMap<TermId, Vec<TermId>>,
+        )> = None;
         let wdefs = self.build_array_defs();
         let mut total_applied = 0usize;
         let mut total_shifted = 0usize;
@@ -2943,7 +2954,65 @@ impl Executor {
                     } else {
                         continue;
                     };
-                    diseq_shifts.push((target, next_fresh));
+                    // CENSUS DIAGNOSTIC ONLY (`AY_MODEL_REJECT_DUMP=1`; default
+                    // off is byte-identical — one `var_os` probe, no I/O and no
+                    // state change). This shift is the only producer of the
+                    // `1_000_003+` sentinel values that later show up in strict
+                    // arithmetic-oracle rejections, and the pre-shift COLLIDING
+                    // value is what says whether the extracted model dropped a
+                    // variable (both sides default) or merged two arithmetic
+                    // points. WRITE-ONLY: no verdict path reads it.
+                    if std::env::var_os("AY_MODEL_REJECT_DUMP").is_some() {
+                        eprintln!(
+                            "[diseq-shift] {} := {} (was {}, collided with {} on assertion {})",
+                            self.format_term(target),
+                            next_fresh,
+                            vx,
+                            self.format_term(if target == x { y } else { x }),
+                            self.format_term(assertion)
+                                .chars()
+                                .take(80)
+                                .collect::<String>()
+                        );
+                    }
+                    // #uflia-witness-complete (1a-ii): the "shifting one side
+                    // to a fresh integer can only help" justification above is
+                    // FALSE whenever the variable carries ASSERTED BOUNDS —
+                    // the sentinel falsifies the very `(< target N)` the same
+                    // formula asserts, and the strict arithmetic oracle then
+                    // definitively refutes the repaired model. When bounds
+                    // exist the shift is REFUSED (or, under
+                    // `AY_UFLIA_WITNESS_SHIFT=inrange`, confined to the
+                    // interval) and the model is left exactly as the gates
+                    // would otherwise have seen it — the collision still
+                    // falsifies the asserted disequality, so the candidate is
+                    // rejected as before, just not via a fabricated
+                    // out-of-bounds value. Env-gated: with the gate off this
+                    // returns `Some(next_fresh)` and behaviour is
+                    // byte-identical.
+                    if bound_index.is_none() {
+                        bound_index = Some(
+                            if crate::executor::model::uflia_witness::uflia_witness_complete_enabled(
+                            ) {
+                                (self.asserted_int_ranges(), self.asserted_int_diseq_peers())
+                            } else {
+                                Default::default()
+                            },
+                        );
+                    }
+                    let (bound_ranges, diseq_peers) =
+                        bound_index.as_ref().expect("initialized just above");
+                    let Some(shift_to) = self.uflia_bounded_diseq_shift_value(
+                        self.last_model.as_ref().expect("checked above"),
+                        bound_ranges,
+                        diseq_peers,
+                        target,
+                        next_fresh,
+                    ) else {
+                        shifted_vars.insert(target);
+                        continue;
+                    };
+                    diseq_shifts.push((target, shift_to));
                     next_fresh += 1;
                     shifted_vars.insert(target);
                 }
@@ -3892,7 +3961,22 @@ impl Executor {
             return result;
         }
         self.repair_asserted_bool_leaf_polarities();
+        // #uflia-witness-complete (1a-i): fill absent / out-of-range
+        // asserted-bound Int leaves BEFORE the read-pin repair measures any
+        // collision, so the range-blind diseq shift is never even reached for
+        // them. Env-gated; default off is a no-op returning 0.
+        self.uflia_fill_bounded_int_leaves();
         self.repair_asserted_array_read_pins();
+        // #uflia-witness-complete (1b), mirroring the finalize site: an
+        // IN-LOOP-validated model reaches the funnel through THIS entry, so
+        // the free-UF-point completion must run here too or the class is never
+        // seen (measured: the whole mathsat Hash 1b sub-class arrives with
+        // `last_model_validated == true`). The completion clears that evidence
+        // itself, so `emit_sat_verdict` re-runs the FULL unchanged validation
+        // pipeline over the completed witness — no gate is bypassed and no
+        // certificate can be minted from stale evidence. Env-gated; default
+        // off is a no-op.
+        self.uflia_complete_free_uf_chain_witness();
         // #g4-dt-defer (also on this entry, mirroring finalize): a
         // `datatype-field` strict-oracle rejection on a datatype-carrying-array
         // problem can be a COMPLETENESS gap (the strict per-theory evaluator
@@ -3959,6 +4043,13 @@ impl Executor {
             // trace): the strict definitive-false oracle caught a model that
             // falsifies an assertion. Emitted while `last_model` is still live.
             let term = self.format_term(assertion);
+            // CENSUS DIAGNOSTIC ONLY (`AY_MODEL_REJECT_DUMP=1`): name the
+            // rejecting SITE and oracle. Three different code paths print the
+            // same soundness banner; a census that cannot tell them apart
+            // cannot attribute a rejection. WRITE-ONLY.
+            if std::env::var_os("AY_MODEL_REJECT_DUMP").is_some() {
+                eprintln!("[reject-site] apply_strict_model_gate oracle={oracle} idx={idx}");
+            }
             self.report_caught_invalid_model(assertion, &term);
             tracing::warn!(
                 assertion_index = idx,
@@ -4458,7 +4549,20 @@ impl Executor {
         // evaluator returns Bool(false) with polarity accounted for), the
         // model is unsound and we MUST degrade SAT to Unknown regardless of
         // downstream fallbacks.
+        // #uflia-witness-complete (1a-i): see `apply_strict_model_gate`.
+        self.uflia_fill_bounded_int_leaves();
         self.repair_asserted_array_read_pins();
+        // #uflia-witness-complete (1b): UNDER-COMPLETED UF TABLE. A falsified
+        // UF-chain equality whose chain argument lands on a function point the
+        // formula constrains NOWHERE ELSE is a model-EXTRACTION gap, not a bad
+        // search point — the table simply did not pick the colliding value.
+        // Complete it here, as a model-completion step, so the strict oracle
+        // below and every downstream gate (independent, authoritative,
+        // postcondition) re-check the COMPLETED witness with NO gate weakened.
+        // Env-gated (`AY_UFLIA_WITNESS_COMPLETE=1`); default off is a no-op.
+        // A completion the gates refute degrades to `unknown` exactly as the
+        // uncompleted model does today — never a wrong `sat`.
+        self.uflia_complete_free_uf_chain_witness();
         // #g4-dt-defer: a `datatype-field` strict-oracle rejection on a
         // datatype-carrying-array problem can be a COMPLETENESS gap (the strict
         // per-theory evaluator lacks the reconstructed committed datatype-field
@@ -4546,6 +4650,21 @@ impl Executor {
                 eprintln!(
                     "c phase-trace model-gate definitive-false-oracle idx={idx} oracle={oracle} term={t}"
                 );
+            }
+            // CENSUS DIAGNOSTIC ONLY (`AY_MODEL_REJECT_DUMP=1`; default off is
+            // byte-identical — a single `var_os` probe and no I/O). Unlike
+            // `apply_strict_model_gate`, this DEFERRED-validation rejection site
+            // is silent: it records the violated assertion in the statistics but
+            // never prints the concrete values the extracted model gave that
+            // assertion's leaves. A model-rejection census therefore cannot tell
+            // an out-of-range extracted value from a genuinely-bad search point.
+            // Reuse the existing loud-alarm formatter (falsifying assignment
+            // included) so both strict sites report the same evidence shape.
+            // WRITE-ONLY: nothing in any verdict path reads this, and the
+            // degrade below is unchanged.
+            if std::env::var_os("AY_MODEL_REJECT_DUMP").is_some() {
+                let dump_term = self.format_term(assertion);
+                self.report_caught_invalid_model(assertion, &dump_term);
             }
             // Futile-deepening backstop (#dt-array-degrade-backstop, extended):
             // a datatype-field oracle rejection on a datatype-carrying-array

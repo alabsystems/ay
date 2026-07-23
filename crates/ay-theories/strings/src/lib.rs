@@ -33,6 +33,7 @@ mod regexp;
 mod skolem;
 mod state;
 mod state_query;
+pub mod term_regex;
 mod theory_impl;
 #[cfg(kani)]
 mod verification;
@@ -302,15 +303,15 @@ impl std::fmt::Display for RegexWorkLimitExceeded {
 
 impl std::error::Error for RegexWorkLimitExceeded {}
 
-/// This thread's monotone regex-membership work counter: the number of
-/// `(regex node, substring)` sub-problem consultations the concrete-membership
-/// evaluator has made since the process started.
+/// This thread's monotone regex-membership work counter. Memoised fallback
+/// consultations cost one unit; exact translation and derivative evaluation
+/// charge their deterministic structural work.
 ///
 /// A budgeting caller (the W4 witness search) adds this to the term
 /// evaluator's own node-visit clock so ONE number bounds both shapes of
 /// evaluation cost — a deep `str.substr`/`str.to_int` nest (many cheap node
 /// visits) and a single `str.in_re` atom over an industrial regex (one node
-/// visit, millions of membership sub-problems).
+/// visit, substantial translation, derivative, or fallback work).
 #[must_use]
 pub fn regex_eval_work() -> u64 {
     regexp::eval_work()

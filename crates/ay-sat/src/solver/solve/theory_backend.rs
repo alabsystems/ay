@@ -633,14 +633,7 @@ impl Solver {
                         let mut fixpoint_iter = 0u32;
                         loop {
                             // Check for pending theory conflict before BCP (#6262).
-                            if let Some(conflict_ref) = self.take_pending_theory_conflict() {
-                                // #8480: Validate conflict is still live after backtracking.
-                                let lits = self.arena.literals(conflict_ref.0 as usize);
-                                let still_conflict = lits.iter().all(|&lit| self.lit_val(lit) < 0);
-                                if !still_conflict {
-                                    // Stale conflict — discard and continue fixpoint.
-                                    continue;
-                                }
+                            if let Some(conflict_ref) = self.take_live_pending_theory_conflict() {
                                 self.conflicts_since_restart += 1;
                                 self.num_conflicts += 1;
                                 self.on_conflict_random_decision();
@@ -796,20 +789,7 @@ impl Solver {
                 // Catch pending theory conflicts from non-propagation paths (#6262).
                 // This handles the edge case where callback.propagate() returns
                 // Continue but a previous iteration left a pending conflict.
-                if let Some(conflict_ref) = self.take_pending_theory_conflict() {
-                    // #8480: Validate that the clause is still a conflict (all
-                    // literals false). Backtracking between when the pending
-                    // conflict was set and when it is processed can unassign
-                    // or flip literals, making the clause satisfied or unit.
-                    // Processing a non-conflict as a conflict corrupts conflict
-                    // analysis, producing invalid learned clauses (spurious UNSAT).
-                    let lits = self.arena.literals(conflict_ref.0 as usize);
-                    let still_conflict = lits.iter().all(|&lit| self.lit_val(lit) < 0);
-                    if !still_conflict {
-                        // Clause is no longer a conflict — discard.
-                        // BCP or a future check() will re-discover it if needed.
-                        continue;
-                    }
+                if let Some(conflict_ref) = self.take_live_pending_theory_conflict() {
                     self.conflicts_since_restart += 1;
                     self.num_conflicts += 1;
                     self.on_conflict_random_decision();
@@ -832,6 +812,18 @@ impl Solver {
                         callback.backtrack_after_materializing_lazy_reasons(solver, level);
                     });
                     self.maybe_run_restart(callback);
+                    continue;
+                }
+
+                // `take_live_pending_theory_conflict` can consume a queued
+                // unit by installing it at level 0, in which case it returns
+                // `None` rather than a conflict. BCP already ran earlier in
+                // this iteration, so do not fall through to scheduling with
+                // the newly enqueued root fact still pending. The empty-clause
+                // check likewise belongs at the top of the next iteration:
+                // callbacks are permitted to add a lemma and still return
+                // `Continue`.
+                if self.has_empty_clause || self.qhead < self.trail.len() {
                     continue;
                 }
             }
@@ -987,15 +979,7 @@ impl Solver {
                 // A prior callback.propagate() may have set this via
                 // add_theory_lemma's all-false detection without it being
                 // consumed (e.g., propagate returned Continue).
-                if let Some(conflict_ref) = self.take_pending_theory_conflict() {
-                    // #8480: Validate conflict is still live after backtracking.
-                    let lits = self.arena.literals(conflict_ref.0 as usize);
-                    let still_conflict = lits.iter().all(|&lit| self.lit_val(lit) < 0);
-                    if !still_conflict {
-                        // Stale conflict — discard. The solver will re-enter
-                        // check_model which will re-discover violations.
-                        continue;
-                    }
+                if let Some(conflict_ref) = self.take_live_pending_theory_conflict() {
                     self.conflicts_since_restart += 1;
                     self.num_conflicts += 1;
                     self.on_conflict_random_decision();
@@ -1017,6 +1001,13 @@ impl Solver {
                         callback.backtrack_after_materializing_lazy_reasons(solver, level);
                     });
                     self.maybe_run_restart(callback);
+                    continue;
+                }
+                // Draining may have installed an unassigned queued unit at
+                // root. Re-enter BCP before asking the theory backend to check
+                // a model; otherwise the model can be accepted while the root
+                // unit's watch consequences are still pending.
+                if self.has_empty_clause || self.qhead < self.trail.len() {
                     continue;
                 }
                 match callback.check_model(self) {

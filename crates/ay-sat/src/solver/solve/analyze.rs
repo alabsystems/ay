@@ -63,6 +63,24 @@ impl Solver {
     {
         let prune_conflict_experiments = self.should_prune_conflict_analysis_experiments();
 
+        // A global unit clause is a root fact regardless of where its
+        // conflicting assignment was made. This path is especially important
+        // for unit theory axioms queued by add_theory_lemma: callers may ignore
+        // the returned ClauseRef, and the clause has no watches that could
+        // rediscover it after a fallback backtrack. Handle it before the
+        // chrono/non-chrono split so both modes install the unit at level 0
+        // (#1696).
+        if self.arena.len_of(conflict_ref.index()) == 1 {
+            before_backtrack(self, 0);
+            self.backtrack(0);
+            if !self.install_theory_unit_at_root(conflict_ref) {
+                self.record_level0_conflict_chain(conflict_ref);
+                return;
+            }
+            self.stats.forced_backtracks += 1;
+            return;
+        }
+
         // CaDiCaL analyze.cpp:962-1018: when chronological backtracking is
         // enabled, find the actual conflict level (max level in conflict clause)
         // and backtrack to it before analysis. This ensures decision_level

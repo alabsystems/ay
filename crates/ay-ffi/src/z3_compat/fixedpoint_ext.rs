@@ -62,13 +62,12 @@ use ay_dpll::api::{Solver, Sort, Term, TermKind};
 use super::fixedpoint::build_lemma_hint;
 use super::statistics::StatEntry;
 use super::{
-    apply_supported_params, ast_to_term, cache_ast_vector, cache_string, ffi_count_within_limit,
-    ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
-    ffi_read_bounded_text, record_ast_sort, term_to_ast, ParamDescr, ParamDescrsHandle,
-    StatsHandle, Z3Context, Z3_ast, Z3_ast_vector, Z3_context, Z3_fixedpoint, Z3_fixedpoint_query,
-    Z3_func_decl, Z3_param_descrs, Z3_params, Z3_stats, Z3_string, Z3_symbol, Z3_EXCEPTION,
-    Z3_FILE_ACCESS_ERROR, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_OK, Z3_PK_BOOL, Z3_PK_STRING,
-    Z3_PK_UINT, Z3_SORT_ERROR,
+    apply_supported_params, cache_ast_vector, cache_string, ffi_count_within_limit, ffi_guard_ast,
+    ffi_guard_const_ptr, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, ffi_read_bounded_text,
+    record_ast_sort, require_term_ast, term_to_ast, ParamDescr, ParamDescrsHandle, StatsHandle,
+    Z3Context, Z3_ast, Z3_ast_vector, Z3_context, Z3_fixedpoint, Z3_fixedpoint_query, Z3_func_decl,
+    Z3_param_descrs, Z3_params, Z3_stats, Z3_string, Z3_symbol, Z3_EXCEPTION, Z3_FILE_ACCESS_ERROR,
+    Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_OK, Z3_PK_BOOL, Z3_PK_STRING, Z3_PK_UINT, Z3_SORT_ERROR,
 };
 
 // ============================================================================
@@ -92,7 +91,12 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_rules(c: Z3_context, f: Z3_fixedpoint
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             let asts: Vec<Z3_ast> = match f.as_ref() {
-                Some(handle) => handle.rules.iter().copied().map(term_to_ast).collect(),
+                Some(handle) => handle
+                    .rules
+                    .iter()
+                    .copied()
+                    .map(|term| term_to_ast(ctx, term))
+                    .collect(),
                 None => {
                     ctx.last_error = Z3_INVALID_ARG;
                     ctx.error_msg = Some("null Z3_fixedpoint handle in get_rules".to_string());
@@ -633,7 +637,7 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_cover_delta(
                 // fixedpoint is a CHC/spacer-class engine. REAL, not a
                 // fabrication: `true` is the honest "no lemmas at this frame".
                 let t = ctx.solver.bool_const(true);
-                let ast = term_to_ast(t);
+                let ast = term_to_ast(ctx, t);
                 record_ast_sort(ctx, ast, Sort::Bool);
                 ctx.last_error = Z3_OK;
                 return ast;
@@ -680,7 +684,7 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_cover_delta(
                     "the invariant interpretation is outside the back-translatable fragment",
                 );
             };
-            let ast = term_to_ast(term);
+            let ast = term_to_ast(ctx, term);
             record_ast_sort(ctx, ast, Sort::Bool);
             ctx.last_error = Z3_OK;
             ast
@@ -796,6 +800,9 @@ unsafe fn register_db_property_hint(
         ctx.error_msg = Some(format!("{who}: {pred_name} is not a registered relation"));
         return;
     };
+    let Some(property_term) = require_term_ast(ctx, property, who, "property") else {
+        return;
+    };
     let positions = |name: &str| -> Option<usize> {
         name.strip_prefix("__db")
             .and_then(|s| s.parse::<usize>().ok())
@@ -805,7 +812,7 @@ unsafe fn register_db_property_hint(
         &handle.relations,
         &handle.relations[rel_index],
         &positions,
-        ast_to_term(property),
+        property_term,
     );
     match hint {
         Ok(h) => {
@@ -874,7 +881,11 @@ pub unsafe extern "C" fn Z3_fixedpoint_add_constraint(
                 return;
             }
             // Strip an optional forall wrapper, then require `(=> (P x̄) φ)`.
-            let mut term = ast_to_term(e);
+            let Some(mut term) =
+                require_term_ast(ctx, e, "Z3_fixedpoint_add_constraint", "constraint")
+            else {
+                return;
+            };
             while matches!(ctx.solver.term_kind(term), TermKind::Forall) {
                 let children = ctx.solver.term_children(term);
                 let Some(&body) = children.first() else {

@@ -694,6 +694,12 @@ impl Executor {
             extra_axioms.extend(self.dt_acyclicity_depth_axioms(sort.clone()));
         }
 
+        if self.produce_proofs_enabled() {
+            for &axiom in &extra_axioms {
+                let _ = self.proof_tracker.add_theory_lemma(vec![axiom]);
+            }
+        }
+
         let base_len = self.ctx.assertions.len();
         // Record the appended axiom terms so the in-loop validation's
         // #dt-embedded-cycle compound guard exempts them (each is an entailed
@@ -765,6 +771,12 @@ impl Executor {
         // which would wrongly flag the genuine UNSAT as spurious and spin the
         // iterative-deepening loop to the ceiling (#dt-array-store-value-injectivity).
         extra_axioms.extend(self.dt_store_value_injectivity_axioms(&base_assertions));
+
+        if self.produce_proofs_enabled() {
+            for &axiom in &extra_axioms {
+                let _ = self.proof_tracker.add_theory_lemma(vec![axiom]);
+            }
+        }
 
         let base_len = self.ctx.assertions.len();
         // Record the appended axiom terms so the in-loop validation's

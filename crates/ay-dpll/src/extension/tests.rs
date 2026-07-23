@@ -29,6 +29,8 @@ struct MockTheory {
     axiom_terms: Vec<(TermId, bool, TermId, bool)>,
     rejected_propagations: Vec<(TermId, u64)>,
     native_theory_propagation_profile: NativeTheoryPropagationProfile,
+    theory_aware_branching: bool,
+    phase_hints: HashMap<TermId, bool>,
 }
 
 impl MockTheory {
@@ -45,6 +47,8 @@ impl MockTheory {
             axiom_terms: Vec::new(),
             rejected_propagations: Vec::new(),
             native_theory_propagation_profile: NativeTheoryPropagationProfile::unsupported(),
+            theory_aware_branching: false,
+            phase_hints: HashMap::default(),
         }
     }
 
@@ -73,6 +77,12 @@ impl MockTheory {
         profile: NativeTheoryPropagationProfile,
     ) -> Self {
         self.native_theory_propagation_profile = profile;
+        self
+    }
+
+    fn with_theory_decisions(mut self, phase_hints: HashMap<TermId, bool>) -> Self {
+        self.theory_aware_branching = true;
+        self.phase_hints = phase_hints;
         self
     }
 }
@@ -116,6 +126,14 @@ impl TheorySolver for MockTheory {
 
     fn native_theory_propagation_profile(&self) -> NativeTheoryPropagationProfile {
         self.native_theory_propagation_profile
+    }
+
+    fn supports_theory_aware_branching(&self) -> bool {
+        self.theory_aware_branching
+    }
+
+    fn suggest_phase(&self, atom: TermId) -> Option<bool> {
+        self.phase_hints.get(&atom).copied()
     }
 
     fn mark_propagation_rejected(&mut self, lit: TermId, reason_data: u64) {
@@ -174,6 +192,7 @@ impl TheorySolver for PropagateOnlyRefinementTheory {
 struct MockContext {
     trail: Vec<Literal>,
     values: HashMap<u32, bool>,
+    activities: HashMap<u32, f64>,
     decision_level: u32,
 }
 
@@ -182,6 +201,7 @@ impl MockContext {
         Self {
             trail: vec![],
             values: HashMap::default(),
+            activities: HashMap::default(),
             decision_level: 0,
         }
     }
@@ -192,6 +212,19 @@ impl MockContext {
         }
         self.trail = trail;
         self
+    }
+
+    fn with_activities(mut self, activities: impl IntoIterator<Item = (u32, f64)>) -> Self {
+        self.activities.extend(activities);
+        self
+    }
+
+    fn replace_trail(&mut self, trail: Vec<Literal>) {
+        self.values.clear();
+        for lit in &trail {
+            self.values.insert(lit.variable().id(), lit.is_positive());
+        }
+        self.trail = trail;
     }
 
     fn with_level(mut self, level: u32) -> Self {
@@ -217,9 +250,38 @@ impl SolverContext for MockContext {
         &self.trail
     }
 
+    fn activity(&self, var: Variable) -> f64 {
+        self.activities.get(&var.id()).copied().unwrap_or(0.0)
+    }
+
     fn new_assignments(&self, _last_pos: usize) -> &[Literal] {
         &self.trail
     }
+}
+
+fn configure_unassigned_freelist_for_test<T: TheorySolver>(
+    ext: &mut TheoryExtension<'_, T>,
+    enabled: bool,
+) {
+    let num_var_slots = ext
+        .seed_index
+        .iter()
+        .map(|(sat_var, _)| *sat_var as usize)
+        .max()
+        .map_or(0, |max_var| max_var + 1);
+    let (sat_var_to_seed_pos, prev, next, linked) =
+        types::build_unassigned_freelist_state(enabled, &ext.seed_index, num_var_slots);
+
+    ext.unassigned_skip = enabled;
+    ext.sat_var_to_seed_pos = sat_var_to_seed_pos;
+    ext.unassigned_prev.replace(prev);
+    ext.unassigned_next.replace(next);
+    ext.unassigned_linked.replace(linked);
+    ext.unassigned_head.set(UNASSIGNED_NIL);
+    ext.unassigned_dirty.set(true);
+    ext.unassigned_scan_pos.set(0);
+    ext.theory_decision_idx.set(0);
+    ext.theory_decision_call_count.set(0);
 }
 
 type TestSetup = (
@@ -251,6 +313,130 @@ fn create_test_setup() -> TestSetup {
         theory_atom_set,
         [x, y, z],
     )
+}
+
+#[test]
+fn unassigned_freelist_matches_full_scan_across_assign_backtrack_and_init() {
+    let (terms, var_to_term, term_to_var, theory_atoms, theory_atom_set, [x, y, z]) =
+        create_test_setup();
+    let phase_hints: HashMap<TermId, bool> =
+        [(x, true), (y, false), (z, true)].into_iter().collect();
+    let mut full_scan_theory = MockTheory::new().with_theory_decisions(phase_hints.clone());
+    let mut freelist_theory = MockTheory::new().with_theory_decisions(phase_hints);
+    let mut full_scan = TheoryExtension::new(
+        &mut full_scan_theory,
+        &var_to_term,
+        &term_to_var,
+        &theory_atoms,
+        &theory_atom_set,
+        Some(&terms),
+        None,
+    );
+    let mut freelist = TheoryExtension::new(
+        &mut freelist_theory,
+        &var_to_term,
+        &term_to_var,
+        &theory_atoms,
+        &theory_atom_set,
+        Some(&terms),
+        None,
+    );
+    // Configure both paths explicitly so this differential test is independent
+    // of the process-global AY_LRA_UNASSIGNED_SKIP OnceLock and environment.
+    configure_unassigned_freelist_for_test(&mut full_scan, false);
+    configure_unassigned_freelist_for_test(&mut freelist, true);
+
+    let mut ctx = MockContext::new().with_activities([(1, 1.0), (2, 9.0), (3, 3.0)]);
+    let y_pos = freelist
+        .seed_index
+        .iter()
+        .position(|(_, atom)| *atom == y)
+        .expect("y seed position");
+
+    // Mode A: both implementations choose the highest-activity hinted atom,
+    // including its theory-selected negative phase.
+    let expected = full_scan.suggest_decision(&ctx);
+    let actual = freelist.suggest_decision(&ctx);
+    assert_eq!(actual, expected);
+    assert_eq!(actual, Some(Literal::negative(Variable::new(2))));
+
+    // Incremental maintenance: append the chosen assignment to the SAT trail,
+    // restart Mode B's cursor at zero, and require the fast path to unlink y
+    // while returning the same next literal as the full scan.
+    ctx.replace_trail(vec![Literal::negative(Variable::new(2))]);
+    full_scan.theory_decision_call_count.set(2);
+    freelist.theory_decision_call_count.set(2);
+    full_scan.theory_decision_idx.set(0);
+    freelist.theory_decision_idx.set(0);
+    let expected = full_scan.suggest_decision(&ctx);
+    let actual = freelist.suggest_decision(&ctx);
+    assert_eq!(actual, expected);
+    assert_eq!(actual, Some(Literal::positive(Variable::new(1))));
+    assert!(
+        !freelist.unassigned_linked.borrow()[y_pos],
+        "incremental trail scan must unlink the newly assigned seed"
+    );
+
+    // Defensive recovery: even if a context exposes a shortened trail before
+    // delivering the normal backtrack callback, the accelerated path must
+    // rebuild from `value()` and recover exactly the full scan's choice.
+    ctx.replace_trail(Vec::new());
+    full_scan.theory_decision_call_count.set(2);
+    freelist.theory_decision_call_count.set(2);
+    full_scan.theory_decision_idx.set(y_pos);
+    freelist.theory_decision_idx.set(y_pos);
+    let expected = full_scan.suggest_decision(&ctx);
+    let actual = freelist.suggest_decision(&ctx);
+    assert_eq!(actual, expected);
+    assert_eq!(actual, Some(Literal::negative(Variable::new(2))));
+    assert!(
+        freelist.unassigned_linked.borrow()[y_pos],
+        "trail-shrink recovery must re-link a newly unassigned seed"
+    );
+
+    // Backtracking may notify the extension before the SAT trail is compacted.
+    // The dirty rebuild on the next decision must re-link y after it becomes
+    // unassigned and preserve the full scan's cyclic selection.
+    full_scan.backtrack(0);
+    freelist.backtrack(0);
+    ctx.replace_trail(Vec::new());
+    full_scan.theory_decision_call_count.set(2);
+    freelist.theory_decision_call_count.set(2);
+    full_scan.theory_decision_idx.set(y_pos);
+    freelist.theory_decision_idx.set(y_pos);
+    let expected = full_scan.suggest_decision(&ctx);
+    let actual = freelist.suggest_decision(&ctx);
+    assert_eq!(actual, expected);
+    assert_eq!(actual, Some(Literal::negative(Variable::new(2))));
+    assert!(
+        freelist.unassigned_linked.borrow()[y_pos],
+        "backtrack rebuild must re-link a newly unassigned seed"
+    );
+
+    // Unlink y once more, then exercise the full init/restart reset. Init must
+    // mark the list dirty so the now-empty trail restores y before Mode A.
+    ctx.replace_trail(vec![Literal::negative(Variable::new(2))]);
+    full_scan.theory_decision_call_count.set(2);
+    freelist.theory_decision_call_count.set(2);
+    full_scan.theory_decision_idx.set(0);
+    freelist.theory_decision_idx.set(0);
+    assert_eq!(
+        freelist.suggest_decision(&ctx),
+        full_scan.suggest_decision(&ctx)
+    );
+    assert!(!freelist.unassigned_linked.borrow()[y_pos]);
+
+    ctx.replace_trail(Vec::new());
+    full_scan.init();
+    freelist.init();
+    let expected = full_scan.suggest_decision(&ctx);
+    let actual = freelist.suggest_decision(&ctx);
+    assert_eq!(actual, expected);
+    assert_eq!(actual, Some(Literal::negative(Variable::new(2))));
+    assert!(
+        freelist.unassigned_linked.borrow()[y_pos],
+        "init rebuild must restore seeds unassigned by the restart"
+    );
 }
 
 #[cfg(test)]

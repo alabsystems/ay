@@ -9,14 +9,15 @@ use super::lemmas::{
     take_new_theory_lemmas,
 };
 use super::{
-    bias_split_clause_vars, encode_and_add_split_clause, encode_split_pair_incremental,
-    ensure_incremental_atom_encoded, map_conflict_to_blocking_clause,
-    replay_incremental_bound_refinements, BlockingClauseResult, BoundRefinementReplayKey,
+    add_extra_blocking_clauses, bias_split_clause_vars, encode_and_add_split_clause,
+    encode_split_pair_incremental, ensure_incremental_atom_encoded,
+    map_conflict_to_blocking_clause, replay_incremental_bound_refinements, BlockingClauseResult,
+    BoundRefinementReplayKey,
 };
 use crate::incremental_proof_cache::{IncrementalNegationCache, TheoryLemmaSeenSet};
 // #8529: Use deterministic hash sets in all builds.
 use ay_core::kani_compat::DetHashSet as HashSet;
-use ay_core::{BoundRefinementRequest, Sort, TermStore, TheoryLemma, TheoryLit};
+use ay_core::{BoundRefinementRequest, Sort, TermStore, TheoryConflict, TheoryLemma, TheoryLit};
 use ay_sat::{Literal as SatLiteral, SatResult, Solver as SatSolver, Variable as SatVariable};
 use num_bigint::BigInt;
 use num_rational::BigRational;
@@ -356,6 +357,71 @@ fn map_conflict_to_blocking_clause_blocks_cached_assignment_issue_8785() {
         matches!(solver.solve().into_inner(), SatResult::Sat(_)),
         "blocking clause should not survive its assertion scope"
     );
+}
+
+#[test]
+fn extra_bound_conflict_batch_preserves_every_pending_clause() {
+    let mut terms = TermStore::new();
+    let p = terms.mk_var("p", Sort::Bool);
+    let q = terms.mk_var("q", Sort::Bool);
+    let r = terms.mk_var("r", Sort::Bool);
+
+    let mut local_term_to_var = super::HashMap::default();
+    local_term_to_var.insert(p, 0);
+    local_term_to_var.insert(q, 1);
+    local_term_to_var.insert(r, 2);
+
+    let p_var = SatVariable::new(0);
+    let q_var = SatVariable::new(1);
+    let r_var = SatVariable::new(2);
+    let mut solver = SatSolver::new(3);
+    solver.set_preprocess_enabled(false);
+
+    // Force q and r opposite p without creating root-level units. A complete
+    // model therefore leaves all three variables assigned above level zero,
+    // matching the incremental theory-batch path that exposed the overwrite.
+    solver.add_clause(vec![
+        SatLiteral::positive(p_var),
+        SatLiteral::positive(q_var),
+    ]);
+    solver.add_clause(vec![
+        SatLiteral::negative(p_var),
+        SatLiteral::negative(q_var),
+    ]);
+    solver.add_clause(vec![
+        SatLiteral::positive(p_var),
+        SatLiteral::positive(r_var),
+    ]);
+    solver.add_clause(vec![
+        SatLiteral::negative(p_var),
+        SatLiteral::negative(r_var),
+    ]);
+
+    let model = match solver.solve().into_inner() {
+        SatResult::Sat(model) => model,
+        other => panic!("opposite-polarity fixture must be SAT, got {other:?}"),
+    };
+    let conflicts = [
+        TheoryConflict::new(vec![
+            TheoryLit::new(p, model[0]),
+            TheoryLit::new(q, model[1]),
+        ]),
+        TheoryConflict::new(vec![
+            TheoryLit::new(p, model[0]),
+            TheoryLit::new(r, model[2]),
+        ]),
+    ];
+
+    add_extra_blocking_clauses(&mut solver, &conflicts, &local_term_to_var);
+
+    let first = solver
+        .take_pending_theory_conflict()
+        .expect("first all-false extra conflict must remain pending");
+    let second = solver
+        .take_pending_theory_conflict()
+        .expect("second all-false extra conflict must not overwrite the first");
+    assert_ne!(first, second);
+    assert_eq!(solver.take_pending_theory_conflict(), None);
 }
 
 #[test]

@@ -45,6 +45,107 @@ pub fn recognize_bv_bitblast(terms: &TermStore, clause: &[TermId]) -> bool {
     validate_bv_bitblast(terms, ProofId(0), clause, None).is_ok()
 }
 
+/// Recognize the deliberately narrow `evaluate` fragment used to certify a
+/// preprocessing-folded bitvector concat: one unit equality from a closed
+/// concat tree to its exact BV constant, with total width at most 64 bits.
+///
+/// Keeping this separate from [`recognize_bv_bitblast`] avoids widening that
+/// rule's bounded symbolic truth-table surface merely to check one closed
+/// constant-folding fact.
+#[must_use]
+pub fn recognize_bv_ground_evaluate(terms: &TermStore, clause: &[TermId]) -> bool {
+    validate_bv_ground_evaluate(terms, ProofId(0), clause, 0, &[]).is_ok()
+}
+
+/// Strictly validate the Carcara `evaluate` shape emitted for folded BV
+/// concats. This is intentionally not a general evaluator: no variables,
+/// non-concat operators, premises, arguments, or widths above 64 are admitted.
+pub(crate) fn validate_bv_ground_evaluate(
+    terms: &TermStore,
+    step_id: ProofId,
+    clause: &[TermId],
+    premise_count: usize,
+    args: &[TermId],
+) -> Result<(), ProofCheckError> {
+    let invalid = |reason: &str| ProofCheckError::InvalidTheoryLemma {
+        step: step_id,
+        reason: format!("evaluate: {reason}"),
+    };
+    if premise_count != 0 {
+        return Err(invalid("ground BV evaluation must not have premises"));
+    }
+    if !args.is_empty() {
+        return Err(invalid("ground BV evaluation must not have arguments"));
+    }
+    let [equality] = clause else {
+        return Err(invalid(
+            "ground BV evaluation must conclude one equality literal",
+        ));
+    };
+    if terms.sort(*equality) != &Sort::Bool {
+        return Err(invalid("conclusion equality must have Bool sort"));
+    }
+    let TermData::App(Symbol::Named(name), equality_args) = terms.get(*equality) else {
+        return Err(invalid("conclusion must be an equality application"));
+    };
+    if name != "=" || equality_args.len() != 2 {
+        return Err(invalid("conclusion must be a binary equality"));
+    }
+
+    let (actual, actual_width, contains_concat) = eval_ground_concat(terms, equality_args[0], 0)
+        .ok_or_else(|| invalid("left side is not a well-sorted closed concat tree"))?;
+    if !contains_concat {
+        return Err(invalid("left side must contain a concat"));
+    }
+    let (expected, expected_width) = eval_ground_bv_constant(terms, equality_args[1])
+        .ok_or_else(|| invalid("right side must be a well-sorted BV constant"))?;
+    if actual_width != expected_width || actual != expected {
+        return Err(invalid(
+            "closed concat does not evaluate to the asserted BV constant",
+        ));
+    }
+    Ok(())
+}
+
+fn eval_ground_concat(terms: &TermStore, term: TermId, depth: u32) -> Option<(u64, u32, bool)> {
+    if depth > 512 {
+        return None;
+    }
+    if let Some((value, width)) = eval_ground_bv_constant(terms, term) {
+        return Some((value, width, false));
+    }
+    let TermData::App(Symbol::Named(name), concat_args) = terms.get(term) else {
+        return None;
+    };
+    if name != "concat" || concat_args.len() != 2 {
+        return None;
+    }
+    let (high, high_width, _) = eval_ground_concat(terms, concat_args[0], depth + 1)?;
+    let (low, low_width, _) = eval_ground_concat(terms, concat_args[1], depth + 1)?;
+    let width = high_width.checked_add(low_width)?;
+    if high_width == 0 || low_width == 0 || width > u64::BITS || low_width >= u64::BITS {
+        return None;
+    }
+    if terms.sort(term) != &Sort::bitvec(width) {
+        return None;
+    }
+    Some(((high << low_width) | low, width, true))
+}
+
+fn eval_ground_bv_constant(terms: &TermStore, term: TermId) -> Option<(u64, u32)> {
+    let TermData::Const(Constant::BitVec { value, width }) = terms.get(term) else {
+        return None;
+    };
+    if *width == 0 || *width > u64::BITS || terms.sort(term) != &Sort::bitvec(*width) {
+        return None;
+    }
+    let value = value.to_u64()?;
+    if value > bv_mask(*width) {
+        return None;
+    }
+    Some((value, *width))
+}
+
 /// Recognize whether `clause` is a strict-checkable Boolean tautology — every
 /// literal is `Bool`-sorted and the clause is TRUE under every assignment of its
 /// bounded (Bool / small-BV) variables. The exact inverse of
@@ -86,7 +187,81 @@ pub(crate) fn validate_bool_tautology(
             });
         }
     }
+    // Packed clausification units can contain theory atoms the bounded
+    // Bool/BV evaluator intentionally cannot interpret. Their propositional
+    // tautology is nevertheless decidable by exact structure:
+    //
+    //   (or p (not p))
+    //   (or child (not (and ... child ...)))
+    //   (or p q ... (not (or p q ...)))
+    //
+    // The conjunction form is packed Alethe `and_pos`; top-level assertion
+    // flattening also generates the OR/self-complement unit. Recognize only a
+    // literal and its exact complement, an exact child of the negated
+    // conjunction, or every member of the negated disjunction. The atoms'
+    // theory semantics are irrelevant, so this remains sound for RM, arrays,
+    // datatypes, and every other Boolean-sorted atom.
+    if let [unit] = clause {
+        if is_packed_clausification_tautology(terms, *unit) {
+            return Ok(());
+        }
+    }
     validate_bounded_clause_semantics(terms, step_id, clause)
+}
+
+fn is_packed_clausification_tautology(terms: &TermStore, term: TermId) -> bool {
+    let TermData::App(symbol, disjuncts) = terms.get(term) else {
+        return false;
+    };
+    if symbol.name() != "or" || disjuncts.len() < 2 {
+        return false;
+    }
+    if disjuncts
+        .iter()
+        .any(|&disjunct| terms.sort(disjunct) != &Sort::Bool)
+    {
+        return false;
+    }
+    for &negated in disjuncts {
+        let TermData::Not(inner) = terms.get(negated) else {
+            continue;
+        };
+        if terms.sort(*inner) != &Sort::Bool {
+            continue;
+        }
+        if disjuncts.contains(inner) {
+            return true;
+        }
+        let TermData::App(join_symbol, members) = terms.get(*inner) else {
+            continue;
+        };
+        if members
+            .iter()
+            .any(|&member| terms.sort(member) != &Sort::Bool)
+        {
+            continue;
+        }
+        match join_symbol.name() {
+            "and"
+                if disjuncts
+                    .iter()
+                    .any(|other| *other != negated && members.contains(other)) =>
+            {
+                return true;
+            }
+            "or" if !members.is_empty()
+                && members.iter().all(|member| {
+                    disjuncts
+                        .iter()
+                        .any(|other| *other != negated && other == member)
+                }) =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Validate a `BvBitBlast` or `BvBitBlastGate` lemma in strict mode.
@@ -317,9 +492,11 @@ fn bitvec_width(sort: &Sort) -> Option<u32> {
 
 // Keep this intentionally small: the checker is a proof validator, not a
 // second bit-blaster. These bounds catch small forged gate annotations without
-// risking exponential work on real proofs.
+// risking exponential work on real proofs. Wider closed concat evaluation uses
+// the separate, non-symbolic `evaluate` validator above.
 const MAX_BOUNDED_BV_WIDTH: u32 = 4;
 const MAX_BOUNDED_ASSIGNMENT_BITS: u32 = 8;
+const MAX_EVALUATED_BV_WIDTH: u32 = u64::BITS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvalValue {
@@ -411,6 +588,12 @@ fn collect_bounded_vars_term(
     stack: &mut Vec<TermId>,
 ) -> Option<()> {
     if stack.len() > 512 {
+        return None;
+    }
+    if matches!(
+        terms.sort(term),
+        Sort::BitVec(bv) if bv.width > MAX_EVALUATED_BV_WIDTH
+    ) {
         return None;
     }
     stack.push(term);
@@ -659,7 +842,10 @@ fn eval_app(
             // SMT-LIB `(concat hi lo)`: first arg is the high part, second the low.
             let (hi, hi_width) = eval_bv_arg(terms, args[0], env)?;
             let (lo, lo_width) = eval_bv_arg(terms, args[1], env)?;
-            let width = hi_width + lo_width;
+            let width = hi_width.checked_add(lo_width)?;
+            if hi_width == 0 || lo_width == 0 || width > MAX_EVALUATED_BV_WIDTH {
+                return None;
+            }
             Some(EvalValue::BitVec {
                 value: ((hi << lo_width) | lo) & bv_mask(width),
                 width,
@@ -682,11 +868,11 @@ fn eval_indexed_bv(
     match name {
         "extract" if indices.len() == 2 && args.len() == 1 => {
             let (high, low) = (indices[0], indices[1]);
-            if high < low {
+            let (value, src_width) = eval_bv_arg(terms, args[0], env)?;
+            if high < low || high >= src_width {
                 return None;
             }
-            let (value, _src_width) = eval_bv_arg(terms, args[0], env)?;
-            let width = high - low + 1;
+            let width = high.checked_sub(low)?.checked_add(1)?;
             Some(EvalValue::BitVec {
                 value: (value >> low) & bv_mask(width),
                 width,
@@ -694,7 +880,10 @@ fn eval_indexed_bv(
         }
         "zero_extend" if indices.len() == 1 && args.len() == 1 => {
             let (value, src_width) = eval_bv_arg(terms, args[0], env)?;
-            let width = src_width + indices[0];
+            let width = src_width.checked_add(indices[0])?;
+            if width > MAX_EVALUATED_BV_WIDTH {
+                return None;
+            }
             // The added high bits are zero; `value` is already masked to src_width.
             Some(EvalValue::BitVec {
                 value: value & bv_mask(width),
@@ -703,7 +892,10 @@ fn eval_indexed_bv(
         }
         "sign_extend" if indices.len() == 1 && args.len() == 1 => {
             let (value, src_width) = eval_bv_arg(terms, args[0], env)?;
-            let width = src_width + indices[0];
+            let width = src_width.checked_add(indices[0])?;
+            if src_width == 0 || width > MAX_EVALUATED_BV_WIDTH {
+                return None;
+            }
             let negative = src_width > 0 && (value >> (src_width - 1)) & 1 == 1;
             let extended = if negative {
                 // Fill the added high bits with the sign bit (1).
@@ -738,10 +930,17 @@ fn eval_indexed_bv(
                 return None; // (_ repeat 0) is not well-formed
             }
             let (value, width) = eval_bv_arg(terms, args[0], env)?;
-            let total = width * count;
+            let total = width.checked_mul(count)?;
+            if width == 0 || total > MAX_EVALUATED_BV_WIDTH {
+                return None;
+            }
             let mut result = 0u64;
-            for _ in 0..count {
-                result = (result << width) | value;
+            for index in 0..count {
+                result = if index == 0 {
+                    value
+                } else {
+                    (result << width) | value
+                };
             }
             Some(EvalValue::BitVec {
                 value: result & bv_mask(total),
@@ -795,6 +994,9 @@ fn eval_bv_shift(name: &str, lhs: u64, rhs: u64, width: u32) -> u64 {
 fn to_signed_u64(value: u64, width: u32) -> i64 {
     if width == 0 {
         return 0;
+    }
+    if width >= u64::BITS {
+        return value as i64;
     }
     if (value >> (width - 1)) & 1 == 1 {
         (value as i64).wrapping_sub(1i64 << width)

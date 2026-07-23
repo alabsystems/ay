@@ -108,6 +108,47 @@ const WITNESS_MAX_STATES_S1: usize = 32_768;
 const WITNESS_ALPHABET_CAP: usize = 16;
 const WITNESS_ALPHABET_CAP_S1: usize = 128;
 
+/// A derivative-work allowance shared across a sequence of witness searches.
+///
+/// W1b probes several exact lengths and then a shortest-word fallback. Passing
+/// the same numeric limit to each search multiplies the advertised envelope;
+/// this value is consumed monotonically across all of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WitnessWorkBudget {
+    remaining: u64,
+}
+
+impl WitnessWorkBudget {
+    /// Create a shared budget with at most `max_work` derivative-work units.
+    #[must_use]
+    pub const fn new(max_work: u64) -> Self {
+        Self {
+            remaining: max_work,
+        }
+    }
+
+    /// Return the derivative-work units that have not yet been consumed.
+    #[must_use]
+    pub const fn remaining(&self) -> u64 {
+        self.remaining
+    }
+
+    /// Return whether no derivative-work units remain.
+    #[must_use]
+    pub const fn is_exhausted(&self) -> bool {
+        self.remaining == 0
+    }
+
+    fn try_charge(&mut self, amount: u64) -> bool {
+        let Some(remaining) = self.remaining.checked_sub(amount) else {
+            self.remaining = 0;
+            return false;
+        };
+        self.remaining = remaining;
+        true
+    }
+}
+
 /// Default maximum witness length when no exact length is requested.
 /// Env-tunable via `AY_WE_WITNESS_MAX_LEN` (strings S1 feasibility knob):
 /// flags-off default unchanged; `AY_WE_S1=1` lifts the default to
@@ -442,17 +483,26 @@ impl WeRegex {
     /// evaluation size cap; callers MUST treat that as "no information".
     #[must_use]
     pub fn matches(&self, s: &str) -> Option<bool> {
+        self.matches_with_work(s).0
+    }
+
+    /// Crate-internal counterpart of [`Self::matches`] that also reports a
+    /// deterministic, saturating derivative-work estimate.
+    pub(crate) fn matches_with_work(&self, s: &str) -> (Option<bool>, u64) {
         let mut cur = self.clone();
+        let mut work = 0u64;
         for c in s.chars() {
+            work = work.saturating_add((cur.size() as u64).max(1));
             cur = cur.derive(c);
             if cur.is_empty_lang() {
-                return Some(false);
+                return (Some(false), work);
             }
             if cur.size() > MATCH_SIZE_CAP {
-                return None;
+                return (None, work);
             }
         }
-        Some(cur.nullable())
+        work = work.saturating_add((cur.size() as u64).max(1));
+        (Some(cur.nullable()), work)
     }
 
     /// Reverse the language: `L(self.reverse()) = { rev(w) | w ∈ L(self) }`.
@@ -577,7 +627,40 @@ pub fn find_witness_bounded(
     exact_len: Option<usize>,
     max_len: usize,
 ) -> Option<String> {
-    find_witnesses_bounded(constraints, exact_len, max_len, 1)
+    find_witness_work_budgeted(constraints, exact_len, max_len, None)
+}
+
+/// [`find_witness_bounded`] with an optional derivative-work budget.
+///
+/// Work is the saturating sum of the current product-state sizes before each
+/// derivative step. Reaching the budget returns "not found"; it never proves
+/// the language empty. This lets callers make a cheap first probe and retry
+/// without a budget later without changing any solver verdict.
+#[must_use]
+pub fn find_witness_work_budgeted(
+    constraints: &[WeRegex],
+    exact_len: Option<usize>,
+    max_len: usize,
+    max_work: Option<u64>,
+) -> Option<String> {
+    find_witnesses_bounded_with_work(constraints, exact_len, max_len, 1, max_work)
+        .into_iter()
+        .next()
+}
+
+/// [`find_witness_bounded`] using a derivative-work allowance shared with the
+/// caller's other probes.
+///
+/// A returned witness is exact. Exhaustion returns `None` ("not found") and
+/// carries no verdict authority.
+#[must_use]
+pub fn find_witness_with_work_budget(
+    constraints: &[WeRegex],
+    exact_len: Option<usize>,
+    max_len: usize,
+    budget: &mut WitnessWorkBudget,
+) -> Option<String> {
+    find_witnesses_with_work_budget(constraints, exact_len, max_len, 1, Some(budget))
         .into_iter()
         .next()
 }
@@ -602,6 +685,27 @@ pub fn find_witnesses_bounded(
     exact_len: Option<usize>,
     max_len: usize,
     want: usize,
+) -> Vec<String> {
+    find_witnesses_bounded_with_work(constraints, exact_len, max_len, want, None)
+}
+
+fn find_witnesses_bounded_with_work(
+    constraints: &[WeRegex],
+    exact_len: Option<usize>,
+    max_len: usize,
+    want: usize,
+    max_work: Option<u64>,
+) -> Vec<String> {
+    let mut budget = max_work.map(WitnessWorkBudget::new);
+    find_witnesses_with_work_budget(constraints, exact_len, max_len, want, budget.as_mut())
+}
+
+fn find_witnesses_with_work_budget(
+    constraints: &[WeRegex],
+    exact_len: Option<usize>,
+    max_len: usize,
+    want: usize,
+    mut work_budget: Option<&mut WitnessWorkBudget>,
 ) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     if want == 0 || constraints.iter().any(WeRegex::is_empty_lang) {
@@ -660,7 +764,6 @@ pub fn find_witnesses_bounded(
     seen.insert((0, start.clone()));
     frontier.push_back((start, String::new()));
     let mut popped = 0usize;
-
     let max_states = witness_max_states();
     while let Some((state, prefix)) = frontier.pop_front() {
         popped += 1;
@@ -672,11 +775,23 @@ pub fn find_witnesses_bounded(
             continue;
         }
         for &c in &alphabet {
+            if let Some(budget) = work_budget.as_deref_mut() {
+                let step_work = state.iter().fold(0u64, |total, regex| {
+                    total.saturating_add(regex.size() as u64)
+                });
+                if !budget.try_charge(step_work) {
+                    return found;
+                }
+            }
             let next: Vec<WeRegex> = state.iter().map(|r| r.derive(c)).collect();
             if next.iter().any(|r| r.is_empty_lang()) {
                 continue;
             }
-            if next.iter().map(WeRegex::size).sum::<usize>() > MATCH_SIZE_CAP {
+            if next
+                .iter()
+                .fold(0usize, |total, regex| total.saturating_add(regex.size()))
+                > MATCH_SIZE_CAP
+            {
                 continue;
             }
             let mut word = prefix.clone();

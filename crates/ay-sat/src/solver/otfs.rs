@@ -290,6 +290,12 @@ impl super::Solver {
         let subsuming_idx = subsuming_ref.0 as usize;
         let subsumed_idx = subsumed_ref.0 as usize;
 
+        // A later theory conflict may already be queued while an earlier one
+        // is being analyzed. Keep its ClauseRef live until the queue drains.
+        if self.is_pending_theory_conflict_clause(subsumed_idx) {
+            return;
+        }
+
         debug_assert_ne!(
             subsuming_idx, subsumed_idx,
             "BUG: OTFS subsume called with same clause"

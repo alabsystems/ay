@@ -5589,6 +5589,31 @@ impl Executor {
         for i in 0..self.ctx.assertions.len() {
             let a = self.ctx.assertions[i];
             if contains_quantifier(&self.ctx.terms, a) {
+                // The proof tracker has a dedicated, strict derivation for a
+                // top-level negative single-binder forall: it starts from the
+                // exact authored `not(forall ...)`, applies `sko_forall`, and
+                // derives the Skolemized NNF body with Boolean rules. Folding
+                // comparisons inside that source first would instead create a
+                // semantically equivalent but unauthored Assume leaf. Preserve
+                // the source shape only when it matches that certified lane;
+                // Skolemization still performs the required NNF conversion.
+                let preserve_certified_skolem_source = self.produce_proofs_enabled()
+                    && match self.ctx.terms.get(a) {
+                        TermData::Not(quantified) => match self.ctx.terms.get(*quantified) {
+                            TermData::Forall(bindings, body, _) if bindings.len() == 1 => {
+                                matches!(
+                                    self.ctx.terms.get(*body),
+                                    TermData::App(sym, args)
+                                        if sym.name() == "or" && args.len() >= 2
+                                ) && !contains_quantifier(&self.ctx.terms, *body)
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                if preserve_certified_skolem_source {
+                    continue;
+                }
                 let folded = self.fold_linear_eqs(a);
                 self.ctx.assertions[i] = folded;
             }
@@ -7368,6 +7393,77 @@ mod rebuild_tests {
         let forall = terms.mk_forall(vec![("x".to_string(), Sort::Int)], body);
         let inst = CegqiInstantiator::new(forall, terms).expect("CEGQI instantiator");
         (forall, inst)
+    }
+
+    fn negative_single_forall_with_foldable_comparison(exec: &mut Executor) -> (TermId, TermId) {
+        let x = exec.ctx.terms.mk_var("x", Sort::Int);
+        let lower = exec.ctx.terms.mk_var("lower", Sort::Int);
+        let predicate = exec.ctx.terms.mk_var("predicate", Sort::Bool);
+        let le = exec.ctx.terms.mk_le(lower, x);
+        let not_le = exec.ctx.terms.mk_not(le);
+        let body = exec.ctx.terms.mk_or(vec![predicate, not_le]);
+        let forall = exec
+            .ctx
+            .terms
+            .mk_forall(vec![("x".to_string(), Sort::Int)], body);
+        let negative = exec.ctx.terms.mk_not(forall);
+        (negative, forall)
+    }
+
+    #[test]
+    fn proof_fold_preserves_certified_negative_forall_source_only() {
+        let mut proof_exec = Executor::new();
+        proof_exec.set_produce_proofs(true);
+        let (negative, positive) = negative_single_forall_with_foldable_comparison(&mut proof_exec);
+        proof_exec.ctx.assertions = vec![negative, positive];
+
+        proof_exec.fold_quantified_linear_eqs();
+
+        assert_eq!(
+            proof_exec.ctx.assertions[0], negative,
+            "proof mode must retain the exact authored source for sko_forall"
+        );
+        assert_ne!(
+            proof_exec.ctx.assertions[1], positive,
+            "positive foralls must retain the existing linear folding"
+        );
+
+        let outer_x = proof_exec.ctx.terms.mk_var("outer_x", Sort::Int);
+        let inner_y = proof_exec.ctx.terms.mk_var("inner_y", Sort::Int);
+        let lower = proof_exec.ctx.terms.mk_var("nested_lower", Sort::Int);
+        let outer_atom = proof_exec.ctx.terms.mk_le(lower, outer_x);
+        let le = proof_exec.ctx.terms.mk_le(lower, inner_y);
+        let not_le = proof_exec.ctx.terms.mk_not(le);
+        let exists = proof_exec
+            .ctx
+            .terms
+            .mk_exists(vec![("inner_y".to_string(), Sort::Int)], not_le);
+        let nested_body = proof_exec.ctx.terms.mk_or(vec![outer_atom, exists]);
+        let nested_forall = proof_exec
+            .ctx
+            .terms
+            .mk_forall(vec![("outer_x".to_string(), Sort::Int)], nested_body);
+        let nested_negative = proof_exec.ctx.terms.mk_not(nested_forall);
+        proof_exec.ctx.assertions = vec![nested_negative];
+
+        proof_exec.fold_quantified_linear_eqs();
+
+        assert_ne!(
+            proof_exec.ctx.assertions[0], nested_negative,
+            "nested quantifiers are outside the certified Skolem lane and must still fold"
+        );
+
+        let mut ordinary_exec = Executor::new();
+        let (ordinary_negative, _) =
+            negative_single_forall_with_foldable_comparison(&mut ordinary_exec);
+        ordinary_exec.ctx.assertions = vec![ordinary_negative];
+
+        ordinary_exec.fold_quantified_linear_eqs();
+
+        assert_ne!(
+            ordinary_exec.ctx.assertions[0], ordinary_negative,
+            "non-proof solving must retain the existing NNF folding"
+        );
     }
 
     /// 1-binder exact reconstruction: `forall x. sk(x) > x` (from

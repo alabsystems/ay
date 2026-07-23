@@ -168,6 +168,13 @@ pub struct Solver {
     pub(super) unit_proof_id: Vec<u64>,
     /// Signed literal proven by `unit_proof_id`; 0 means no signed provenance.
     pub(super) unit_proof_sign: Vec<i8>,
+    /// Proof-manager IDs for queued theory units when they differ from the
+    /// arena clause ID (notably hidden LRAT `TrustedTransform` additions).
+    ///
+    /// Entries survive the queue pop because unit installation happens in the
+    /// subsequent conflict-analysis step. They are consumed when the unit is
+    /// installed or discarded with stale queued work.
+    pub(super) pending_theory_unit_proof_ids: Vec<(ClauseRef, u64)>,
     /// Clause-indexed reason markers (epoch-stamped, avoids per-pass bool allocations).
     pub(super) reason_clause_marks: Vec<u32>,
     /// Current epoch for `reason_clause_marks`.
@@ -214,7 +221,18 @@ pub struct Solver {
     pub(crate) tiers: tier_state::TierState,
     pub(crate) min: minimization_state::MinimizationState,
     pub(crate) phase_init: phase_init_state::PhaseInitState,
-    pub(super) pending_theory_conflict: Option<ClauseRef>,
+    /// FIFO queue of theory conflicts and mandatory unit work detected by
+    /// `add_theory_lemma` at decision level > 0. All-false watched clauses
+    /// have no future watch event, while unit axioms must be installed at root
+    /// before a later backtrack can erase them (#6262).
+    ///
+    /// This must be a queue, not a single slot: a theory callback may add a
+    /// batch of simultaneously conflicting lemmas before the CDCL loop gets a
+    /// chance to consume any of them. Overwriting an `Option` silently dropped
+    /// every conflict except the last one and allowed search to continue on a
+    /// conflict-laden trail. Each queued clause is revalidated when popped, so
+    /// conflicts made stale by an earlier backtrack are still discarded.
+    pub(super) pending_theory_conflicts: std::collections::VecDeque<ClauseRef>,
     /// Clauses marked pending-garbage (deferred HBR subsumption deletion).
     /// Incremented in probe_propagate, decremented in collect_level0_garbage.
     pub(super) pending_garbage_count: u32,

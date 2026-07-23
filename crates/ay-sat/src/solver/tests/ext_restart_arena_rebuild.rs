@@ -393,7 +393,7 @@ fn inc5_gate_plain_to_ext_restart_survives_arena_rebuild() {
 /// and the planted ref is the topmost solve-1 learned-clause offset; the
 /// destructive rebuild drops all learned clauses, so the offset is genuinely
 /// out of bounds at solve-2's take-site. Mutation-verified: commenting out the
-/// `pending_theory_conflict = None` clear in `reset_search_state` makes this
+/// `pending_theory_conflicts.clear()` in `reset_search_state` makes this
 /// test panic with an arena out-of-bounds deref.
 #[test]
 fn inc5_gate_stale_pending_theory_conflict_cleared_across_rebuild() {
@@ -431,7 +431,9 @@ fn inc5_gate_stale_pending_theory_conflict_cleared_across_rebuild() {
     );
 
     // Plant the stale ref, then force the arena rebuild it must not survive.
-    solver.pending_theory_conflict = Some(ClauseRef(top_learned as u32));
+    solver
+        .pending_theory_conflicts
+        .push_back(ClauseRef(top_learned as u32));
     solver.cold.inprocessing_modified_clause_db = true;
 
     // Solve 2 must not re-emit the padding (keeps the rebuilt arena small at
@@ -446,7 +448,7 @@ fn inc5_gate_stale_pending_theory_conflict_cleared_across_rebuild() {
     };
     assert_uflia_sat_model(&m2, "solve 2");
     assert!(
-        solver.pending_theory_conflict.is_none(),
+        solver.pending_theory_conflicts.is_empty(),
         "stale pending_theory_conflict must not survive the solve"
     );
 }

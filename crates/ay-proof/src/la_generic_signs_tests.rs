@@ -61,6 +61,24 @@ fn repairs_pure_equality_inequality_pair() {
     assert_eq!(out, vec![r(1, 1), r(1, 1)]);
 }
 
+/// The QF_ALIA array-swap regression cancels to exactly zero, but one
+/// positively weighted hypothesis is strict (`b[0] > b[1]`). That is the
+/// contradiction `0 > 0`, so the printed-form search must accept it and repair
+/// the two equality orientations.
+#[test]
+fn repairs_strict_zero_opaque_select_chain() {
+    let atoms = vec![
+        ("(= (select b 1) (select a 1))".to_string(), true),
+        ("(<= (select a 0) (select a 1))".to_string(), true),
+        ("(> (select b 0) (select b 1))".to_string(), true),
+        ("(= (select b 0) (select a 0))".to_string(), true),
+    ];
+    let existing = vec![r(-1, 1), r(1, 1), r(1, 1), r(1, 1)];
+    let magnitudes = vec![r(1, 1), r(1, 1), r(1, 1), r(1, 1)];
+    let out = resolve_printed_la_generic_coefficients(&atoms, &existing, &magnitudes);
+    assert_eq!(out, vec![r(1, 1), r(1, 1), r(1, 1), r(-1, 1)]);
+}
+
 /// A conflict with a non-arithmetic (unparseable-as-linear) atom must fall
 /// back to the existing coefficients unchanged (no false repair).
 #[test]

@@ -45,13 +45,13 @@ use ay_dpll::api::{DatatypeConstructor, DatatypeField, DatatypeSort, FuncDecl, S
 use num_bigint::BigInt;
 
 use super::{
-    alloc_sort, ast_to_term, cache_dt_func_decl_with_symbol, cache_func_decl,
-    cache_func_decl_with_symbol, ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast,
-    ffi_guard_ptr, ffi_read_bounded_text, ffi_try_declare_function, record_ast_sort, term_to_ast,
-    DatatypeOp, SymbolKey, Z3Context, Z3_ast, Z3_constructor, Z3_context, Z3_func_decl,
-    Z3_mk_exists, Z3_mk_exists_const, Z3_mk_forall, Z3_mk_forall_const, Z3_mk_solver, Z3_pattern,
-    Z3_solver, Z3_sort, Z3_string, Z3_symbol, AY_MAX_CHAR, MAX_FFI_BITVECTOR_WIDTH, Z3_INVALID_ARG,
-    Z3_SORT_ERROR,
+    alloc_sort, cache_dt_func_decl_with_symbol, cache_func_decl, cache_func_decl_with_symbol,
+    ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast, ffi_guard_ptr,
+    ffi_read_bounded_text, ffi_try_declare_function, record_ast_sort, require_term_ast_or_return,
+    require_term_asts_or_return, term_to_ast, DatatypeOp, SymbolKey, Z3Context, Z3_ast,
+    Z3_constructor, Z3_context, Z3_func_decl, Z3_mk_exists, Z3_mk_exists_const, Z3_mk_forall,
+    Z3_mk_forall_const, Z3_mk_solver, Z3_pattern, Z3_solver, Z3_sort, Z3_string, Z3_symbol,
+    AY_MAX_CHAR, MAX_FFI_BITVECTOR_WIDTH, Z3_INVALID_ARG, Z3_SORT_ERROR,
 };
 
 // ============================================================================
@@ -100,7 +100,8 @@ unsafe fn attach_quantifier_ids(c: Z3_context, ast: Z3_ast, qid: Z3_symbol, skid
     // isolates panics.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let term = ast_to_term(ast);
+            let term =
+                require_term_ast_or_return!(ctx, ast, "attach_quantifier_ids", "quantifier", ast);
             if let Some(n) = &qname {
                 ctx.solver.set_quantifier_id(term, n);
             }
@@ -286,12 +287,14 @@ pub unsafe extern "C" fn Z3_mk_select_n(
     // SAFETY: `c` valid per contract; `ffi_guard_ast` null-checks + isolates panics.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let mut acc = ast_to_term(a);
-            for &idx in &index_asts {
-                acc = ctx.solver.select(acc, ast_to_term(idx));
+            let mut acc = require_term_ast_or_return!(ctx, a, "Z3_mk_select_n", "array", 0);
+            let indices =
+                require_term_asts_or_return!(ctx, &index_asts, "Z3_mk_select_n indices", 0);
+            for idx in indices {
+                acc = ctx.solver.select(acc, idx);
             }
             let result_sort = ctx.solver.sort_of(acc);
-            let out = term_to_ast(acc);
+            let out = term_to_ast(ctx, acc);
             record_ast_sort(ctx, out, result_sort);
             out
         })
@@ -334,23 +337,23 @@ pub unsafe extern "C" fn Z3_mk_store_n(
     // SAFETY: `c` valid per contract; `ffi_guard_ast` null-checks + isolates panics.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let base = ast_to_term(a);
+            let base = require_term_ast_or_return!(ctx, a, "Z3_mk_store_n", "array", 0);
+            let indices =
+                require_term_asts_or_return!(ctx, &index_asts, "Z3_mk_store_n indices", 0);
+            let mut val = require_term_ast_or_return!(ctx, v, "Z3_mk_store_n", "value", 0);
             // prefix[k] = select(...select(a, i0)..., i_{k-1}); prefix[0] = a.
-            let mut prefix = Vec::with_capacity(index_asts.len() + 1);
+            let mut prefix = Vec::with_capacity(indices.len() + 1);
             prefix.push(base);
-            for &idx in &index_asts {
-                let sel = ctx
-                    .solver
-                    .select(prefix[prefix.len() - 1], ast_to_term(idx));
+            for &idx in &indices {
+                let sel = ctx.solver.select(prefix[prefix.len() - 1], idx);
                 prefix.push(sel);
             }
             // Build inside-out: val_{n} = v; val_k = store(prefix[k], i_k, val_{k+1}).
-            let mut val = ast_to_term(v);
-            for k in (0..index_asts.len()).rev() {
-                val = ctx.solver.store(prefix[k], ast_to_term(index_asts[k]), val);
+            for k in (0..indices.len()).rev() {
+                val = ctx.solver.store(prefix[k], indices[k], val);
             }
             let result_sort = ctx.solver.sort_of(val);
-            let out = term_to_ast(val);
+            let out = term_to_ast(ctx, val);
             record_ast_sort(ctx, out, result_sort);
             out
         })
@@ -390,8 +393,8 @@ pub unsafe extern "C" fn Z3_mk_array_ext(c: Z3_context, arg1: Z3_ast, arg2: Z3_a
                 ctx.error_msg = Some("Z3_mk_array_ext: null AST argument".to_string());
                 return 0;
             }
-            let a = ast_to_term(arg1);
-            let b = ast_to_term(arg2);
+            let a = require_term_ast_or_return!(ctx, arg1, "Z3_mk_array_ext", "left array", 0);
+            let b = require_term_ast_or_return!(ctx, arg2, "Z3_mk_array_ext", "right array", 0);
             // Both arguments must be arrays of the SAME sort (Z3 contract).
             let (sort_a, sort_b) = (ctx.solver.sort_of(a), ctx.solver.sort_of(b));
             let Sort::Array(arr) = &sort_a else {
@@ -423,7 +426,7 @@ pub unsafe extern "C" fn Z3_mk_array_ext(c: Z3_context, arg1: Z3_ast, arg2: Z3_a
             let axiom = ctx.solver.implies(a_ne_b, sel_ne);
             ctx.background_axioms.push(axiom);
             ctx.clear_decision_check_artifacts();
-            let ast = term_to_ast(k);
+            let ast = term_to_ast(ctx, k);
             record_ast_sort(ctx, ast, index_sort);
             ctx.array_ext_cache.insert((a, b), ast);
             ast
@@ -447,7 +450,7 @@ pub unsafe extern "C" fn Z3_mk_bit2bool(c: Z3_context, i: c_uint, t1: Z3_ast) ->
     // SAFETY: `c` valid per contract; `ffi_guard_ast` null-checks + isolates panics.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let bv = ast_to_term(t1);
+            let bv = require_term_ast_or_return!(ctx, t1, "Z3_mk_bit2bool", "bit-vector", 0);
             let width = match ctx.solver.sort_of(bv) {
                 Sort::BitVec(bvs) => bvs.width,
                 other => {
@@ -468,7 +471,7 @@ pub unsafe extern "C" fn Z3_mk_bit2bool(c: Z3_context, i: c_uint, t1: Z3_ast) ->
             let bit = ctx.solver.bvextract(bv, i, i);
             let one = ctx.solver.bv_const(1, 1);
             let t = ctx.solver.eq(bit, one);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -510,7 +513,7 @@ pub unsafe extern "C" fn Z3_mk_bv_numeral(c: Z3_context, sz: c_uint, bits: *cons
                 }
             }
             let t = ctx.solver.bv_const_bigint(&value, sz);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::bitvec(sz));
             a
         })
@@ -550,8 +553,8 @@ unsafe fn ext_rotate(c: Z3_context, t1: Z3_ast, t2: Z3_ast, left: bool) -> Z3_as
     // SAFETY: `c` valid per contract; `ffi_guard_ast` null-checks + isolates panics.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let x = ast_to_term(t1);
-            let amount = ast_to_term(t2);
+            let x = require_term_ast_or_return!(ctx, t1, "ext_rotate", "bit-vector", 0);
+            let amount = require_term_ast_or_return!(ctx, t2, "ext_rotate", "amount", 0);
             let width = match ctx.solver.sort_of(x) {
                 Sort::BitVec(bvs) => bvs.width,
                 other => {
@@ -575,7 +578,7 @@ unsafe fn ext_rotate(c: Z3_context, t1: Z3_ast, t2: Z3_ast, left: bool) -> Z3_as
                 let hi = ctx.solver.bvshl(x, complement);
                 ctx.solver.bvor(lo, hi)
             };
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::bitvec(width));
             a
         })
@@ -628,12 +631,12 @@ pub unsafe extern "C" fn Z3_mk_divides(c: Z3_context, t1: Z3_ast, t2: Z3_ast) ->
     // SAFETY: `c` valid per contract; `ffi_guard_ast` null-checks + isolates panics.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let divisor = ast_to_term(t1);
-            let dividend = ast_to_term(t2);
+            let divisor = require_term_ast_or_return!(ctx, t1, "Z3_mk_divides", "divisor", 0);
+            let dividend = require_term_ast_or_return!(ctx, t2, "Z3_mk_divides", "dividend", 0);
             let m = ctx.solver.modulo(dividend, divisor);
             let zero = ctx.solver.int_const(0);
             let t = ctx.solver.eq(m, zero);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -653,7 +656,7 @@ pub unsafe extern "C" fn Z3_mk_real_int64(c: Z3_context, num: i64, den: i64) -> 
     unsafe {
         ffi_guard_ast(c, |ctx| {
             let t = ctx.solver.rational_const(num, den);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Real);
             a
         })
@@ -1551,16 +1554,18 @@ pub unsafe extern "C" fn Z3_mk_re_diff(c: Z3_context, re1: Z3_ast, re2: Z3_ast) 
     // SAFETY: `c` valid per contract; `ffi_guard_ast` null-checks + isolates panics.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let comp = match ctx.solver.try_re_comp(ast_to_term(re2)) {
+            let re1 = require_term_ast_or_return!(ctx, re1, "Z3_mk_re_diff", "left regex", 0);
+            let re2 = require_term_ast_or_return!(ctx, re2, "Z3_mk_re_diff", "right regex", 0);
+            let comp = match ctx.solver.try_re_comp(re2) {
                 Ok(t) => t,
                 Err(_) => {
                     ctx.last_error = Z3_SORT_ERROR;
                     return 0;
                 }
             };
-            match ctx.solver.try_re_inter(ast_to_term(re1), comp) {
+            match ctx.solver.try_re_inter(re1, comp) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::RegLan);
                     a
                 }
@@ -1584,9 +1589,10 @@ pub unsafe extern "C" fn Z3_mk_re_power(c: Z3_context, re: Z3_ast, n: c_uint) ->
     // SAFETY: `c` valid per contract; `ffi_guard_ast` null-checks + isolates panics.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            match ctx.solver.try_re_loop(ast_to_term(re), n, n) {
+            let re = require_term_ast_or_return!(ctx, re, "Z3_mk_re_power", "regex", 0);
+            match ctx.solver.try_re_loop(re, n, n) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::RegLan);
                     a
                 }
@@ -1625,7 +1631,7 @@ pub unsafe extern "C" fn Z3_mk_lstring(c: Z3_context, len: c_uint, s: Z3_string)
         return unsafe {
             ffi_guard_ast(c, |ctx| {
                 let t = ctx.solver.string_const("");
-                let a = term_to_ast(t);
+                let a = term_to_ast(ctx, t);
                 record_ast_sort(ctx, a, Sort::String);
                 a
             })
@@ -1656,7 +1662,7 @@ pub unsafe extern "C" fn Z3_mk_lstring(c: Z3_context, len: c_uint, s: Z3_string)
     unsafe {
         ffi_guard_ast(c, |ctx| {
             let t = ctx.solver.string_const(&value);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::String);
             a
         })
@@ -1712,7 +1718,7 @@ pub unsafe extern "C" fn Z3_mk_u32string(
     unsafe {
         ffi_guard_ast(c, |ctx| {
             let t = ctx.solver.string_const(&value);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::String);
             a
         })
@@ -1730,15 +1736,18 @@ pub unsafe extern "C" fn Z3_mk_u32string(
 pub unsafe extern "C" fn Z3_mk_ubv_to_str(c: Z3_context, s: Z3_ast) -> Z3_ast {
     // SAFETY: `c` valid per contract; `ffi_guard_ast` null-checks + isolates panics.
     unsafe {
-        ffi_guard_ast(c, |ctx| match ctx.solver.try_bv_to_string(ast_to_term(s)) {
-            Ok(t) => {
-                let a = term_to_ast(t);
-                record_ast_sort(ctx, a, Sort::String);
-                a
-            }
-            Err(_) => {
-                ctx.last_error = Z3_SORT_ERROR;
-                0
+        ffi_guard_ast(c, |ctx| {
+            let s = require_term_ast_or_return!(ctx, s, "Z3_mk_ubv_to_str", "bit-vector", 0);
+            match ctx.solver.try_bv_to_string(s) {
+                Ok(t) => {
+                    let a = term_to_ast(ctx, t);
+                    record_ast_sort(ctx, a, Sort::String);
+                    a
+                }
+                Err(_) => {
+                    ctx.last_error = Z3_SORT_ERROR;
+                    0
+                }
             }
         })
     }
@@ -1756,9 +1765,10 @@ pub unsafe extern "C" fn Z3_mk_sbv_to_str(c: Z3_context, s: Z3_ast) -> Z3_ast {
     // SAFETY: `c` valid per contract; `ffi_guard_ast` null-checks + isolates panics.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            match ctx.solver.try_bv_to_string_signed(ast_to_term(s)) {
+            let s = require_term_ast_or_return!(ctx, s, "Z3_mk_sbv_to_str", "bit-vector", 0);
+            match ctx.solver.try_bv_to_string_signed(s) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::String);
                     a
                 }
@@ -1789,12 +1799,13 @@ pub unsafe extern "C" fn Z3_mk_seq_replace_all(
     // SAFETY: `c` valid per contract; `ffi_guard_ast` null-checks + isolates panics.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            match ctx
-                .solver
-                .try_str_replace_all(ast_to_term(s), ast_to_term(src), ast_to_term(dst))
-            {
+            let s = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_replace_all", "sequence", 0);
+            let src = require_term_ast_or_return!(ctx, src, "Z3_mk_seq_replace_all", "source", 0);
+            let dst =
+                require_term_ast_or_return!(ctx, dst, "Z3_mk_seq_replace_all", "replacement", 0);
+            match ctx.solver.try_str_replace_all(s, src, dst) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::String);
                     a
                 }
@@ -1831,8 +1842,8 @@ pub unsafe extern "C" fn Z3_mk_set_subset(c: Z3_context, arg1: Z3_ast, arg2: Z3_
     // SAFETY: `c` valid per contract; `ffi_guard_ast` null-checks + isolates panics.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let a = ast_to_term(arg1);
-            let b = ast_to_term(arg2);
+            let a = require_term_ast_or_return!(ctx, arg1, "Z3_mk_set_subset", "left set", 0);
+            let b = require_term_ast_or_return!(ctx, arg2, "Z3_mk_set_subset", "right set", 0);
             let elem_sort = match ctx.solver.sort_of(a) {
                 Sort::Array(arr) => arr.index_sort.clone(),
                 other => {
@@ -1852,7 +1863,7 @@ pub unsafe extern "C" fn Z3_mk_set_subset(c: Z3_context, arg1: Z3_ast, arg2: Z3_
             let body = ctx.solver.implies(in_a, in_b);
             match ctx.solver.try_forall(&[x], body) {
                 Ok(t) => {
-                    let out = term_to_ast(t);
+                    let out = term_to_ast(ctx, t);
                     record_ast_sort(ctx, out, Sort::Bool);
                     out
                 }
@@ -1935,7 +1946,7 @@ pub unsafe extern "C" fn Z3_mk_char(c: Z3_context, ch: c_uint) -> Z3_ast {
                 return 0;
             }
             let t = ctx.solver.int_const(i64::from(ch));
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Char);
             a
         })
@@ -1954,8 +1965,10 @@ pub unsafe extern "C" fn Z3_mk_char_le(c: Z3_context, ch1: Z3_ast, ch2: Z3_ast) 
     // SAFETY: `c` valid per contract; `ffi_guard_ast` null-checks + isolates panics.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.le(ast_to_term(ch1), ast_to_term(ch2));
-            let a = term_to_ast(t);
+            let ch1 = require_term_ast_or_return!(ctx, ch1, "Z3_mk_char_le", "left character", 0);
+            let ch2 = require_term_ast_or_return!(ctx, ch2, "Z3_mk_char_le", "right character", 0);
+            let t = ctx.solver.le(ch1, ch2);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -1976,6 +1989,7 @@ pub unsafe extern "C" fn Z3_mk_char_to_int(c: Z3_context, ch: Z3_ast) -> Z3_ast 
     // SAFETY: `c` valid per contract; `ffi_guard_ast` null-checks + isolates panics.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let _ = require_term_ast_or_return!(ctx, ch, "Z3_mk_char_to_int", "character", 0);
             // The underlying term IS the code point; re-report it as Int. (The
             // Char range invariant for `ch` was already emitted when `ch` was
             // built, so the resulting Int inherits `0 <= . <= 196607`.)
@@ -1998,13 +2012,13 @@ pub unsafe extern "C" fn Z3_mk_char_is_digit(c: Z3_context, ch: Z3_ast) -> Z3_as
     // SAFETY: `c` valid per contract; `ffi_guard_ast` null-checks + isolates panics.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let x = ast_to_term(ch);
+            let x = require_term_ast_or_return!(ctx, ch, "Z3_mk_char_is_digit", "character", 0);
             let lo = ctx.solver.int_const(48);
             let hi = ctx.solver.int_const(57);
             let ge = ctx.solver.le(lo, x);
             let le = ctx.solver.le(x, hi);
             let t = ctx.solver.and_many(&[ge, le]);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -2062,7 +2076,7 @@ pub unsafe extern "C" fn Z3_mk_char_to_bv(c: Z3_context, ch: Z3_ast) -> Z3_ast {
             }
             // The underlying Char term IS the Int code point (in `[0, 196607]`
             // by the standing Char range invariant).
-            let code = ast_to_term(ch);
+            let code = require_term_ast_or_return!(ctx, ch, "Z3_mk_char_to_bv", "character", 0);
             // Literal char → exact BV literal (int2bv of a constant, folded).
             if ctx.solver.is_numeral(code) {
                 if let Some(value) = ctx
@@ -2072,7 +2086,7 @@ pub unsafe extern "C" fn Z3_mk_char_to_bv(c: Z3_context, ch: Z3_ast) -> Z3_ast {
                     .filter(|v| (0..=AY_MAX_CHAR).contains(v))
                 {
                     let t = ctx.solver.bv_const(value, AY_CHAR_BV_WIDTH);
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::bitvec(AY_CHAR_BV_WIDTH));
                     return a;
                 }
@@ -2080,11 +2094,13 @@ pub unsafe extern "C" fn Z3_mk_char_to_bv(c: Z3_context, ch: Z3_ast) -> Z3_ast {
             if let Some(&cached) = ctx.char_to_bv_cache.get(&code) {
                 return cached; // identical term per char term (Z3 hash-consing parity)
             }
-            let old_witnesses: Vec<Term> = ctx
-                .char_to_bv_cache
-                .values()
-                .map(|&a| ast_to_term(a))
-                .collect();
+            let old_witness_asts: Vec<Z3_ast> = ctx.char_to_bv_cache.values().copied().collect();
+            let old_witnesses = require_term_asts_or_return!(
+                ctx,
+                &old_witness_asts,
+                "Z3_mk_char_to_bv cached witnesses",
+                0
+            );
             let name = format!("!ay.char2bv!{}", ctx.char_to_bv_cache.len());
             let v = ctx
                 .solver
@@ -2109,7 +2125,7 @@ pub unsafe extern "C" fn Z3_mk_char_to_bv(c: Z3_context, ch: Z3_ast) -> Z3_ast {
                 ctx.background_axioms.push(imp);
             }
             ctx.clear_decision_check_artifacts();
-            let a = term_to_ast(v);
+            let a = term_to_ast(ctx, v);
             record_ast_sort(ctx, a, Sort::bitvec(AY_CHAR_BV_WIDTH));
             ctx.char_to_bv_cache.insert(code, a);
             a
@@ -2150,7 +2166,7 @@ pub unsafe extern "C" fn Z3_mk_char_from_bv(c: Z3_context, bv: Z3_ast) -> Z3_ast
                 ctx.error_msg = Some("Z3_mk_char_from_bv: null AST argument".to_string());
                 return 0;
             }
-            let b = ast_to_term(bv);
+            let b = require_term_ast_or_return!(ctx, bv, "Z3_mk_char_from_bv", "bit-vector", 0);
             match ctx.solver.sort_of(b) {
                 Sort::BitVec(bvs) if bvs.width == AY_CHAR_BV_WIDTH => {}
                 other => {
@@ -2164,7 +2180,7 @@ pub unsafe extern "C" fn Z3_mk_char_from_bv(c: Z3_context, bv: Z3_ast) -> Z3_ast
                 }
             }
             let t = ctx.solver.bv2int(b);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             // Sort `Char` ⇒ the standing `0 <= code <= 196607` range invariant
             // is emitted (see `record_ast_sort`), making out-of-range BVs
             // infeasible — libz3's engaged char-theory semantics.
@@ -2225,9 +2241,9 @@ fn build_order_axioms(
     sort: &Sort,
     kind: SrKind,
 ) -> Result<Vec<Term>, String> {
-    let x = ctx.solver.fresh_var("__ay_sr_x", sort.clone());
-    let y = ctx.solver.fresh_var("__ay_sr_y", sort.clone());
-    let z = ctx.solver.fresh_var("__ay_sr_z", sort.clone());
+    let x = ctx.solver.fresh_var("z3_sr_x", sort.clone());
+    let y = ctx.solver.fresh_var("z3_sr_y", sort.clone());
+    let z = ctx.solver.fresh_var("z3_sr_z", sort.clone());
     let mut axioms: Vec<Term> = Vec::new();
 
     // Reflexivity: forall x. R(x,x)
@@ -2540,9 +2556,9 @@ fn build_transitive_closure_axioms(
     tc: &FuncDecl,
     sort: &Sort,
 ) -> Result<Vec<Term>, String> {
-    let x = ctx.solver.fresh_var("__ay_tc_x", sort.clone());
-    let y = ctx.solver.fresh_var("__ay_tc_y", sort.clone());
-    let z = ctx.solver.fresh_var("__ay_tc_z", sort.clone());
+    let x = ctx.solver.fresh_var("z3_tc_x", sort.clone());
+    let y = ctx.solver.fresh_var("z3_tc_y", sort.clone());
+    let z = ctx.solver.fresh_var("z3_tc_z", sort.clone());
     let mut axioms: Vec<Term> = Vec::new();
     // Reflexivity: forall x. TC(x,x)   (libz3's TC is the REFLEXIVE closure).
     {
@@ -2633,14 +2649,16 @@ pub unsafe extern "C" fn Z3_mk_seq_foldl(c: Z3_context, f: Z3_ast, a: Z3_ast, s:
                 ctx.error_msg = Some("Z3_mk_seq_foldl: null AST argument".to_string());
                 return 0;
             }
-            let (ft, at, st) = (ast_to_term(f), ast_to_term(a), ast_to_term(s));
+            let ft = require_term_ast_or_return!(ctx, f, "Z3_mk_seq_foldl", "function", 0);
+            let at = require_term_ast_or_return!(ctx, a, "Z3_mk_seq_foldl", "accumulator", 0);
+            let st = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_foldl", "sequence", 0);
             let f_sort = ctx.solver.sort_of(ft);
             if array_layer(ctx, "Z3_mk_seq_foldl", &f_sort).is_none() {
                 return 0;
             }
             let result_sort = ctx.solver.sort_of(at);
             let t = ctx.solver.seq_foldl(ft, at, st, result_sort.clone());
-            let ast = term_to_ast(t);
+            let ast = term_to_ast(ctx, t);
             record_ast_sort(ctx, ast, result_sort);
             ast
         })
@@ -2671,19 +2689,17 @@ pub unsafe extern "C" fn Z3_mk_seq_foldli(
                 ctx.error_msg = Some("Z3_mk_seq_foldli: null AST argument".to_string());
                 return 0;
             }
-            let (ft, it, at, st) = (
-                ast_to_term(f),
-                ast_to_term(i),
-                ast_to_term(a),
-                ast_to_term(s),
-            );
+            let ft = require_term_ast_or_return!(ctx, f, "Z3_mk_seq_foldli", "function", 0);
+            let it = require_term_ast_or_return!(ctx, i, "Z3_mk_seq_foldli", "index", 0);
+            let at = require_term_ast_or_return!(ctx, a, "Z3_mk_seq_foldli", "accumulator", 0);
+            let st = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_foldli", "sequence", 0);
             let f_sort = ctx.solver.sort_of(ft);
             if array_layer(ctx, "Z3_mk_seq_foldli", &f_sort).is_none() {
                 return 0;
             }
             let result_sort = ctx.solver.sort_of(at);
             let t = ctx.solver.seq_foldli(ft, it, at, st, result_sort.clone());
-            let ast = term_to_ast(t);
+            let ast = term_to_ast(ctx, t);
             record_ast_sort(ctx, ast, result_sort);
             ast
         })
@@ -2708,14 +2724,15 @@ pub unsafe extern "C" fn Z3_mk_seq_map(c: Z3_context, f: Z3_ast, s: Z3_ast) -> Z
                 ctx.error_msg = Some("Z3_mk_seq_map: null AST argument".to_string());
                 return 0;
             }
-            let (ft, st) = (ast_to_term(f), ast_to_term(s));
+            let ft = require_term_ast_or_return!(ctx, f, "Z3_mk_seq_map", "function", 0);
+            let st = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_map", "sequence", 0);
             let f_sort = ctx.solver.sort_of(ft);
             let Some((_, range)) = array_layer(ctx, "Z3_mk_seq_map", &f_sort) else {
                 return 0;
             };
             let result_sort = Sort::seq(range);
             let t = ctx.solver.seq_map(ft, st, result_sort.clone());
-            let ast = term_to_ast(t);
+            let ast = term_to_ast(ctx, t);
             record_ast_sort(ctx, ast, result_sort);
             ast
         })
@@ -2740,7 +2757,9 @@ pub unsafe extern "C" fn Z3_mk_seq_mapi(c: Z3_context, f: Z3_ast, i: Z3_ast, s: 
                 ctx.error_msg = Some("Z3_mk_seq_mapi: null AST argument".to_string());
                 return 0;
             }
-            let (ft, it, st) = (ast_to_term(f), ast_to_term(i), ast_to_term(s));
+            let ft = require_term_ast_or_return!(ctx, f, "Z3_mk_seq_mapi", "function", 0);
+            let it = require_term_ast_or_return!(ctx, i, "Z3_mk_seq_mapi", "index", 0);
+            let st = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_mapi", "sequence", 0);
             let f_sort = ctx.solver.sort_of(ft);
             let Some((_, inner)) = array_layer(ctx, "Z3_mk_seq_mapi", &f_sort) else {
                 return 0;
@@ -2751,7 +2770,7 @@ pub unsafe extern "C" fn Z3_mk_seq_mapi(c: Z3_context, f: Z3_ast, i: Z3_ast, s: 
             };
             let result_sort = Sort::seq(range);
             let t = ctx.solver.seq_mapi(ft, it, st, result_sort.clone());
-            let ast = term_to_ast(t);
+            let ast = term_to_ast(ctx, t);
             record_ast_sort(ctx, ast, result_sort);
             ast
         })

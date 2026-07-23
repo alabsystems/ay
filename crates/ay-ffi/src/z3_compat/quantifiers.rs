@@ -14,9 +14,10 @@ use std::ptr;
 use ay_dpll::api::{Sort, Term};
 
 use super::{
-    ast_to_term, bounded_sort_hi, ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast,
-    ffi_guard_ptr, lookup_ast_sort, range_guard_term, record_ast_sort, term_to_ast, Z3Context,
-    Z3_ast, Z3_context, Z3_sort, Z3_symbol, MAX_FFI_CONTAINER_ELEMENTS, Z3_INVALID_ARG,
+    bounded_sort_hi, ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast, ffi_guard_ptr,
+    lookup_ast_sort, range_guard_term, record_ast_sort, require_term_ast_or_return,
+    require_term_asts_or_return, term_to_ast, Z3Context, Z3_ast, Z3_context, Z3_sort, Z3_symbol,
+    MAX_FFI_CONTAINER_ELEMENTS, Z3_INVALID_ARG,
 };
 
 // ============================================================================
@@ -28,6 +29,26 @@ pub type Z3_pattern = *mut PatternHandle;
 
 pub struct PatternHandle {
     pub(crate) terms: Vec<Term>,
+    pub(crate) owner_salt: u32,
+}
+
+/// Validate that pre-extracted trigger patterns came from `ctx` and that every
+/// stored term is still live before a quantifier builder mutates the term arena.
+pub(crate) fn checked_pattern_slices(
+    ctx: &mut Z3Context,
+    patterns: &[(u32, Vec<Term>)],
+    operation: &str,
+) -> Option<Vec<Vec<Term>>> {
+    if patterns.iter().any(|(owner_salt, terms)| {
+        *owner_salt != ctx.handle_salt || terms.iter().any(|&term| !ctx.solver.is_valid_term(term))
+    }) {
+        ctx.last_error = Z3_INVALID_ARG;
+        ctx.error_msg = Some(format!(
+            "{operation}: trigger pattern is stale or belongs to a different context"
+        ));
+        return None;
+    }
+    Some(patterns.iter().map(|(_, terms)| terms.clone()).collect())
 }
 
 // ============================================================================
@@ -67,11 +88,11 @@ pub unsafe extern "C" fn Z3_mk_pattern(
             });
         }
     }
-    let pattern_terms: Vec<Term> = (0..num_patterns as usize)
+    let pattern_asts: Vec<Z3_ast> = (0..num_patterns as usize)
         // SAFETY: The caller's `# Safety` contract guarantees `terms` points to at least the
         // declared number of elements. The count was range-checked above, and null-checked
         // before entering this block, so `terms.add(i)` stays within the caller's allocation.
-        .map(|i| ast_to_term(unsafe { *terms.add(i) }))
+        .map(|i| unsafe { *terms.add(i) })
         .collect();
     // SAFETY: `c` is the Z3_context pointer supplied by the caller; the `# Safety` on this
     // extern "C" function requires it to be a valid, non-aliased pointer (or null).
@@ -79,8 +100,11 @@ pub unsafe extern "C" fn Z3_mk_pattern(
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
+            let pattern_terms =
+                require_term_asts_or_return!(ctx, &pattern_asts, "Z3_mk_pattern", ptr::null_mut());
             let handle = Box::into_raw(Box::new(PatternHandle {
-                terms: pattern_terms.clone(),
+                terms: pattern_terms,
+                owner_salt: ctx.handle_salt,
             }));
             ctx.pattern_cache.push(handle);
             handle
@@ -120,7 +144,7 @@ pub unsafe extern "C" fn Z3_mk_bound(c: Z3_context, index: c_uint, ty: Z3_sort) 
             // Create a named variable that encodes the de Bruijn index.
             let name = format!("__db{index}");
             let term = ctx.solver.declare_const(&name, sort.clone());
-            let ast = term_to_ast(term);
+            let ast = term_to_ast(ctx, term);
             record_ast_sort(ctx, ast, sort.clone());
             ast
         })
@@ -258,17 +282,15 @@ unsafe fn mk_quantifier_const(
         }
     }
 
-    let vars: Vec<Term> = (0..num_bound as usize)
+    let bound_asts: Vec<Z3_ast> = (0..num_bound as usize)
         // SAFETY: The caller's `# Safety` contract guarantees `bound` points to at least the
         // declared number of elements. The count was range-checked above, and null-checked
         // before entering this block, so `bound.add(i)` stays within the caller's allocation.
-        .map(|i| ast_to_term(unsafe { *bound.add(i) }))
+        .map(|i| unsafe { *bound.add(i) })
         .collect();
 
-    let body_term = ast_to_term(body);
-
     // Collect trigger patterns before entering the guard
-    let trigger_slices: Option<Vec<Vec<Term>>> = if num_patterns > 0 && !patterns.is_null() {
+    let trigger_data: Option<Vec<(u32, Vec<Term>)>> = if num_patterns > 0 && !patterns.is_null() {
         let mut slices = Vec::new();
         let mut total_terms = (num_bound as usize).saturating_add(num_patterns as usize);
         for i in 0..num_patterns as usize {
@@ -296,7 +318,7 @@ unsafe fn mk_quantifier_const(
                     }
                     return 0;
                 }
-                slices.push(handle.terms.clone());
+                slices.push((handle.owner_salt, handle.terms.clone()));
             }
         }
         Some(slices)
@@ -310,12 +332,26 @@ unsafe fn mk_quantifier_const(
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let vars = require_term_asts_or_return!(ctx, &bound_asts, "quantifier construction", 0);
+            let body_term =
+                require_term_ast_or_return!(ctx, body, "quantifier construction", "body", 0);
+            let trigger_slices = match trigger_data.as_deref() {
+                Some(patterns) => {
+                    let Some(slices) =
+                        checked_pattern_slices(ctx, patterns, "quantifier construction")
+                    else {
+                        return 0;
+                    };
+                    Some(slices)
+                }
+                None => None,
+            };
             // Relativize bounded-Int-lowered bound vars (Char / finite-domain)
             // to their carrier range — see `guard_bounded_quantifier_body`.
             let var_bounds: Vec<(Term, i64)> = vars
                 .iter()
                 .filter_map(|&v| {
-                    lookup_ast_sort(ctx, term_to_ast(v))
+                    lookup_ast_sort(ctx, term_to_ast(ctx, v))
                         .and_then(bounded_sort_hi)
                         .map(|hi| (v, hi))
                 })
@@ -338,7 +374,7 @@ unsafe fn mk_quantifier_const(
 
             match result {
                 Ok(term) => {
-                    let ast = term_to_ast(term);
+                    let ast = term_to_ast(ctx, term);
                     record_ast_sort(ctx, ast, Sort::Bool);
                     ast
                 }
@@ -511,31 +547,13 @@ unsafe fn mk_quantifier_db(
     // cannot cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let mut bound_asts_inner: Vec<Z3_ast> = Vec::with_capacity(decl_data.len());
-            for (sort, name) in &decl_data {
-                let term = ctx.solver.declare_const(name, sort.clone());
-                let ast = term_to_ast(term);
-                record_ast_sort(ctx, ast, sort.clone());
-                bound_asts_inner.push(ast);
-            }
-
-            // Now inline the quantifier construction logic (since we can't call
-            // mk_quantifier_const from inside a guard — it would double-guard)
-            let vars: Vec<Term> = bound_asts_inner.iter().map(|&a| ast_to_term(a)).collect();
-            let body_term = ast_to_term(body);
-
-            // Relativize bounded-Int-lowered bound vars (Char / finite-domain)
-            // to their carrier range — see `guard_bounded_quantifier_body`.
-            let var_bounds: Vec<(Term, i64)> = decl_data
-                .iter()
-                .zip(vars.iter())
-                .filter_map(|((sort, _), &v)| bounded_sort_hi(sort).map(|hi| (v, hi)))
-                .collect();
-            let body_term = guard_bounded_quantifier_body(ctx, is_forall, &var_bounds, body_term);
-
+            // Authenticate every caller-provided term/pattern before declaring
+            // bound variables, so a rejected call leaves the solver unchanged.
+            let body_term =
+                require_term_ast_or_return!(ctx, body, "quantifier construction", "body", 0);
             let trigger_slices: Option<Vec<Vec<Term>>> = if num_patterns > 0 && !patterns.is_null()
             {
-                let mut slices = Vec::new();
+                let mut pattern_data = Vec::new();
                 let mut total_terms = (num_decls as usize)
                     .saturating_mul(2)
                     .saturating_add(num_patterns as usize);
@@ -551,17 +569,39 @@ unsafe fn mk_quantifier_db(
                         if total_terms > MAX_FFI_CONTAINER_ELEMENTS as usize {
                             ctx.last_error = Z3_INVALID_ARG;
                             ctx.error_msg = Some(format!(
-                                "quantifier trigger terms: element count exceeds the supported maximum {MAX_FFI_CONTAINER_ELEMENTS}"
-                            ));
+                                    "quantifier trigger terms: element count exceeds the supported maximum {MAX_FFI_CONTAINER_ELEMENTS}"
+                                ));
                             return 0;
                         }
-                        slices.push(handle.terms.clone());
+                        pattern_data.push((handle.owner_salt, handle.terms.clone()));
                     }
                 }
+                let Some(slices) =
+                    checked_pattern_slices(ctx, &pattern_data, "quantifier construction")
+                else {
+                    return 0;
+                };
                 Some(slices)
             } else {
                 None
             };
+
+            let mut vars: Vec<Term> = Vec::with_capacity(decl_data.len());
+            for (sort, name) in &decl_data {
+                let term = ctx.solver.declare_const(name, sort.clone());
+                let ast = term_to_ast(ctx, term);
+                record_ast_sort(ctx, ast, sort.clone());
+                vars.push(term);
+            }
+
+            // Relativize bounded-Int-lowered bound vars (Char / finite-domain)
+            // to their carrier range — see `guard_bounded_quantifier_body`.
+            let var_bounds: Vec<(Term, i64)> = decl_data
+                .iter()
+                .zip(vars.iter())
+                .filter_map(|((sort, _), &v)| bounded_sort_hi(sort).map(|hi| (v, hi)))
+                .collect();
+            let body_term = guard_bounded_quantifier_body(ctx, is_forall, &var_bounds, body_term);
 
             let result = if let Some(ref trigger_slices) = trigger_slices {
                 let trigger_refs: Vec<&[Term]> = trigger_slices.iter().map(Vec::as_slice).collect();
@@ -580,7 +620,7 @@ unsafe fn mk_quantifier_db(
 
             match result {
                 Ok(term) => {
-                    let ast = term_to_ast(term);
+                    let ast = term_to_ast(ctx, term);
                     record_ast_sort(ctx, ast, Sort::Bool);
                     ast
                 }

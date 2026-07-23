@@ -977,7 +977,7 @@ pub struct ArraySolver<'a> {
     deadline: Option<ay_core::time::Instant>,
 }
 
-pub(crate) type AffineIntExpr = (HashMap<String, BigInt>, BigInt);
+pub(crate) type AffineIntExpr = (HashMap<TermId, BigInt>, BigInt);
 
 /// Shared, pop-invariant memo for affine Int normal forms.
 ///
@@ -988,14 +988,14 @@ pub(crate) type AffineIntExpr = (HashMap<String, BigInt>, BigInt);
 /// key distinction from equality-reason-path memos: affine forms are not reason
 /// paths, so no staleness key is required.
 ///
-/// `interner` assigns each *canonical* affine variable-map (sorted
-/// `(var, coeff)` vector, zero coeffs already dropped) a dense `u32` id. Two
+/// `interner` assigns each *canonical* affine variable-map (sorted exact
+/// `(TermId, coeff)` vector, zero coeffs already dropped) a dense `u32` id. Two
 /// variable-maps receive the same id **iff** their canonical vectors compare
 /// equal — the `HashMap` key equality is exact (not a hash digest), so the
 /// interning is collision-free and byte-identical to a structural `HashMap`
 /// compare. Equality of two affine forms then collapses to `id == id` on the
 /// variable part plus a `BigInt` constant compare, replacing the pairwise
-/// `HashMap<String, BigInt>` structural walk in `known_equal` /
+/// `HashMap<TermId, BigInt>` structural walk in `known_equal` /
 /// `equal_by_affine_form` / `distinct_by_affine_offset`.
 #[derive(Default)]
 pub struct AffineCache {
@@ -1005,8 +1005,8 @@ pub struct AffineCache {
     /// `None` parse). Memoizes the canonical-vector build + interner lookup so
     /// a term is interned at most once.
     varmap_ids: RefCell<HashMap<TermId, Option<u32>>>,
-    /// Canonical affine variable-map (sorted `(var, coeff)`) -> dense `u32` id.
-    interner: RefCell<HashMap<Vec<(String, BigInt)>, u32>>,
+    /// Canonical affine variable-map (sorted `(TermId, coeff)`) -> dense `u32` id.
+    interner: RefCell<HashMap<Vec<(TermId, BigInt)>, u32>>,
     /// Ordered `(t1, t2)` -> `distinct_by_affine_offset` result. Like every
     /// other field here it is a pure function of the immutable term DAG; the
     /// ROW2 probe loop hits the same pairs millions of times per solve

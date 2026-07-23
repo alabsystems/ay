@@ -100,6 +100,41 @@ fn proof_unsat_enabled_returns_alethe() {
     }
 }
 
+#[test]
+fn proof_handles_are_authenticated_to_their_context() {
+    // SAFETY: each proof and solver stays live until its owning context is
+    // deleted at the end of the block.
+    unsafe {
+        let (local, local_solver) = unsat_context();
+        let (foreign, foreign_solver) = unsat_context();
+        Z3_solver_set_proof_production(local, local_solver, true);
+        Z3_solver_set_proof_production(foreign, foreign_solver, true);
+        assert_eq!(Z3_solver_check(local, local_solver), Z3_L_FALSE);
+        assert_eq!(Z3_solver_check(foreign, foreign_solver), Z3_L_FALSE);
+
+        assert_eq!(Z3_solver_get_proof(local, foreign_solver), 0);
+        assert_eq!(Z3_get_error_code(local), Z3_INVALID_ARG);
+        let local_proof = Z3_solver_get_proof(local, local_solver);
+        let foreign_proof = Z3_solver_get_proof(foreign, foreign_solver);
+        assert_ne!(local_proof, 0);
+        assert_ne!(foreign_proof, 0);
+        assert_eq!(
+            local_proof & TAGGED_AST_INDEX_MASK,
+            foreign_proof & TAGGED_AST_INDEX_MASK,
+            "fixture must exercise colliding proof-arena indices"
+        );
+        assert_ne!(local_proof, foreign_proof);
+
+        assert!(proof_text_for_ast(&*local, foreign_proof).is_none());
+        assert!(Z3_ast_to_string(local, foreign_proof).is_null());
+        assert_eq!(Z3_get_error_code(local), Z3_INVALID_ARG);
+        assert_looks_like_alethe(&cstr_to_string(Z3_ast_to_string(local, local_proof)));
+
+        Z3_del_context(foreign);
+        Z3_del_context(local);
+    }
+}
+
 /// UNSAT + proofs enabled: `Z3_solver_get_proof_string` yields the same kind of
 /// real Alethe text directly.
 #[test]
@@ -248,8 +283,13 @@ fn proof_text_for_ast_rejects_non_proof_handles() {
         assert!(proof_text_for_ast(ctx_ref, 1).is_none());
         // The real proof handle does resolve.
         assert!(proof_text_for_ast(ctx_ref, proof).is_some());
-        // A tagged-but-out-of-range index must be None (not a panic / not UB).
+        // A bare forged tag has no context salt and must not decode.
         assert!(proof_text_for_ast(ctx_ref, PROOF_AST_TAG | 0x270f).is_none());
+        // An authenticated-but-out-of-range index is likewise None (not a
+        // panic / not UB).
+        let dangling = encode_indexed_ast(ctx_ref, PROOF_AST_TAG, 0x270f)
+            .expect("small test index must be representable");
+        assert!(proof_text_for_ast(ctx_ref, dangling).is_none());
 
         Z3_del_context(ctx);
     }

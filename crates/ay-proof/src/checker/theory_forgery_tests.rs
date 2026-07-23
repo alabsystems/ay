@@ -15,8 +15,8 @@
 
 use crate::checker::*;
 use ay_core::{
-    BvGateType, CuttingPlaneAnnotation, FarkasAnnotation, FpOp, LiaAnnotation, ProofId, ProofStep,
-    Sort, TermId, TermStore, TheoryLemmaKind,
+    AletheRule, BvGateType, CuttingPlaneAnnotation, FarkasAnnotation, FpOp, LiaAnnotation, ProofId,
+    ProofStep, Sort, TermId, TermStore, TheoryLemmaKind,
 };
 use num_bigint::BigInt;
 
@@ -32,6 +32,21 @@ fn validate_theory_lemma_strict(
         farkas: None,
         kind,
         lia: None,
+    };
+    let mut derived = Vec::new();
+    validate_step(terms, &mut derived, ProofId(0), &step, true, None)
+}
+
+fn validate_rule_strict(
+    terms: &TermStore,
+    clause: Vec<TermId>,
+    rule: AletheRule,
+) -> Result<(), ProofCheckError> {
+    let step = ProofStep::Step {
+        rule,
+        clause,
+        premises: Vec::new(),
+        args: Vec::new(),
     };
     let mut derived = Vec::new();
     validate_step(terms, &mut derived, ProofId(0), &step, true, None)
@@ -121,6 +136,88 @@ fn test_bv_bitblast_rejects_too_wide_unchecked_clause() {
         matches!(err, ProofCheckError::InvalidTheoryLemma { .. }),
         "expected InvalidTheoryLemma, got {err:?}"
     );
+}
+
+#[test]
+fn test_evaluate_accepts_ground_concat_at_24_bits() {
+    // This is the exact proof obligation produced when preprocessing folds a
+    // pinned concat index to its 24-bit literal.
+    let mut terms = TermStore::new();
+    let hi = terms.mk_bitvec(BigInt::from(0x01_u8), 8);
+    let lo = terms.mk_bitvec(BigInt::from(0x3f40_u16), 16);
+    let concat = terms.mk_app(
+        ay_core::Symbol::named("concat"),
+        vec![hi, lo],
+        Sort::bitvec(24),
+    );
+    let expected = terms.mk_bitvec(BigInt::from(0x013f40_u32), 24);
+    let eq = terms.mk_app(
+        ay_core::Symbol::named("="),
+        vec![concat, expected],
+        Sort::Bool,
+    );
+
+    validate_rule_strict(&terms, vec![eq], AletheRule::Evaluate)
+        .expect("closed 24-bit concat evaluation must be checked exactly");
+}
+
+#[test]
+fn test_evaluate_rejects_ground_concat_forgery() {
+    let mut terms = TermStore::new();
+    let hi = terms.mk_bitvec(BigInt::from(0x01_u8), 8);
+    let lo = terms.mk_bitvec(BigInt::from(0x3f40_u16), 16);
+    let concat = terms.mk_app(
+        ay_core::Symbol::named("concat"),
+        vec![hi, lo],
+        Sort::bitvec(24),
+    );
+    let wrong = terms.mk_bitvec(BigInt::from(0x013f41_u32), 24);
+    let eq = terms.mk_app(ay_core::Symbol::named("="), vec![concat, wrong], Sort::Bool);
+
+    validate_rule_strict(&terms, vec![eq], AletheRule::Evaluate)
+        .expect_err("a false closed 24-bit concat evaluation must be rejected");
+}
+
+#[test]
+fn test_evaluate_rejects_symbolic_concat() {
+    let mut terms = TermStore::new();
+    let hi = terms.mk_var("hi", Sort::bitvec(8));
+    let lo = terms.mk_bitvec(BigInt::from(0x3f40_u16), 16);
+    let concat = terms.mk_app(
+        ay_core::Symbol::named("concat"),
+        vec![hi, lo],
+        Sort::bitvec(24),
+    );
+    let expected = terms.mk_bitvec(BigInt::from(0x013f40_u32), 24);
+    let eq = terms.mk_app(
+        ay_core::Symbol::named("="),
+        vec![concat, expected],
+        Sort::Bool,
+    );
+
+    validate_rule_strict(&terms, vec![eq], AletheRule::Evaluate)
+        .expect_err("evaluate must not admit a symbolic concat");
+}
+
+#[test]
+fn test_evaluate_rejects_ground_concat_above_64_bits() {
+    let mut terms = TermStore::new();
+    let hi = terms.mk_bitvec(BigInt::from(1_u8), 1);
+    let lo = terms.mk_bitvec(BigInt::from(0_u8), 64);
+    let concat = terms.mk_app(
+        ay_core::Symbol::named("concat"),
+        vec![hi, lo],
+        Sort::bitvec(65),
+    );
+    let expected = terms.mk_bitvec(BigInt::from(1_u8) << 64_u32, 65);
+    let eq = terms.mk_app(
+        ay_core::Symbol::named("="),
+        vec![concat, expected],
+        Sort::Bool,
+    );
+
+    validate_rule_strict(&terms, vec![eq], AletheRule::Evaluate)
+        .expect_err("evaluate must fail closed above its exact u64 envelope");
 }
 
 #[test]
@@ -379,6 +476,115 @@ fn test_array_select_store_pos_accepts_well_formed() {
         TheoryLemmaKind::ArraySelectStore { index_eq: true },
     )
     .expect("well-formed positive select-store axiom should pass");
+}
+
+#[test]
+fn test_array_select_store_pos_accepts_mirror_orientation_conditional() {
+    // Conditional ROW1 in MIRROR (value-first) orientation:
+    //   (cl (not (= i k)) (= v (select (store c i v) k)))
+    // where the stored value `v` is ITSELF a select-of-store term, so BOTH
+    // sides of the equality parse as select-of-store. Committing to the first
+    // parseable side (the value `v` on the left) would miss this; the matcher
+    // must also try the mirror. It is a genuine read-over-write tautology: under
+    // `i = k` the read denotes `v`; otherwise the `(not (= i k))` guard fires.
+    let mut terms = TermStore::new();
+    let array_sort = Sort::Array(Box::new(ay_core::ArraySort::new(Sort::Int, Sort::Int)));
+    let c = terms.mk_var("c", array_sort.clone());
+    let d = terms.mk_var("d", array_sort.clone());
+    let i = terms.mk_var("i", Sort::Int);
+    let k = terms.mk_var("k", Sort::Int);
+    let m = terms.mk_var("m", Sort::Int);
+    let n = terms.mk_var("n", Sort::Int);
+    let p = terms.mk_var("p", Sort::Int);
+    // v := (select (store d m n) p): a select-of-store term used as the value.
+    let d_store = terms.mk_app(
+        ay_core::Symbol::named("store"),
+        vec![d, m, n],
+        array_sort.clone(),
+    );
+    let v = terms.mk_app(
+        ay_core::Symbol::named("select"),
+        vec![d_store, p],
+        Sort::Int,
+    );
+    // (select (store c i v) k)
+    let c_store = terms.mk_app(ay_core::Symbol::named("store"), vec![c, i, v], array_sort);
+    let read = terms.mk_app(
+        ay_core::Symbol::named("select"),
+        vec![c_store, k],
+        Sort::Int,
+    );
+    // MIRROR: the value `v` is on the LEFT of the equality.
+    let eq = terms.mk_app(ay_core::Symbol::named("="), vec![v, read], Sort::Bool);
+    let idx_eq = terms.mk_eq(i, k);
+    let guard = terms.mk_not(idx_eq);
+
+    validate_theory_lemma_strict(
+        &terms,
+        vec![guard, eq],
+        TheoryLemmaKind::ArraySelectStore { index_eq: true },
+    )
+    .expect("mirror-orientation conditional ROW1 must certify");
+    assert_eq!(
+        recognize_array_select_store(&terms, &[guard, eq]),
+        Some(true),
+        "the classifier must recognize the mirror ROW1 as index_eq=true, in lockstep \
+         with the strict checker"
+    );
+}
+
+#[test]
+fn test_array_select_store_pos_rejects_mirror_orientation_missing_guard() {
+    // The same mirror-orientation equality `(= v (select (store c i v) k))` with
+    // a read index `k` distinct from the store index `i`, but the second literal
+    // is NOT the required `(not (= i k))` disequality guard. Without the guard
+    // the clause is not a tautology (take `i != k`: the read denotes
+    // `(select c k)`, unconstrained), so even though the mirror orientation now
+    // parses, the schema must still REJECT it.
+    let mut terms = TermStore::new();
+    let array_sort = Sort::Array(Box::new(ay_core::ArraySort::new(Sort::Int, Sort::Int)));
+    let c = terms.mk_var("c", array_sort.clone());
+    let d = terms.mk_var("d", array_sort.clone());
+    let i = terms.mk_var("i", Sort::Int);
+    let k = terms.mk_var("k", Sort::Int);
+    let m = terms.mk_var("m", Sort::Int);
+    let n = terms.mk_var("n", Sort::Int);
+    let p = terms.mk_var("p", Sort::Int);
+    let d_store = terms.mk_app(
+        ay_core::Symbol::named("store"),
+        vec![d, m, n],
+        array_sort.clone(),
+    );
+    let v = terms.mk_app(
+        ay_core::Symbol::named("select"),
+        vec![d_store, p],
+        Sort::Int,
+    );
+    let c_store = terms.mk_app(ay_core::Symbol::named("store"), vec![c, i, v], array_sort);
+    let read = terms.mk_app(
+        ay_core::Symbol::named("select"),
+        vec![c_store, k],
+        Sort::Int,
+    );
+    let eq = terms.mk_app(ay_core::Symbol::named("="), vec![v, read], Sort::Bool);
+    // A plain Boolean literal in place of the `(not (= i k))` guard.
+    let filler = terms.mk_var("filler", Sort::Bool);
+
+    let err = validate_theory_lemma_strict(
+        &terms,
+        vec![filler, eq],
+        TheoryLemmaKind::ArraySelectStore { index_eq: true },
+    )
+    .expect_err("mirror-orientation ROW1 without the (not (= i k)) guard must be rejected");
+    assert!(
+        matches!(err, ProofCheckError::InvalidTheoryLemma { .. }),
+        "expected InvalidTheoryLemma, got {err:?}"
+    );
+    assert_eq!(
+        recognize_array_select_store(&terms, &[filler, eq]),
+        None,
+        "the classifier must also decline the guard-less mirror clause"
+    );
 }
 
 #[test]
@@ -1928,6 +2134,205 @@ fn bool_tautology_accepts_double_negation_and_rejects_nontautologies() {
     assert!(
         validate_theory_lemma_strict(&terms, vec![xi], TheoryLemmaKind::BoolTautology).is_err(),
         "non-Bool literal must be rejected"
+    );
+}
+
+#[test]
+fn bool_tautology_accepts_exact_packed_connective_clauses_and_rejects_near_misses() {
+    let mut terms = TermStore::new();
+    let x = terms.mk_var("x", Sort::Int);
+    let y = terms.mk_var("y", Sort::Int);
+    let z = terms.mk_var("z", Sort::Int);
+    let eq = |terms: &mut TermStore, a: TermId, b: TermId| {
+        terms.mk_app(ay_core::Symbol::named("="), vec![a, b], Sort::Bool)
+    };
+    let p = eq(&mut terms, x, y);
+    let q = eq(&mut terms, y, z);
+    let r = eq(&mut terms, x, z);
+
+    // Emitted packed-or shape: p \/ q \/ r \/ !(p \/ q \/ r).
+    // The arithmetic atoms are intentionally opaque to the bounded evaluator;
+    // validity comes solely from the exact propositional structure.
+    let inner_or = terms.mk_app(ay_core::Symbol::named("or"), vec![p, q, r], Sort::Bool);
+    let not_inner_or = terms.mk_not_raw(inner_or);
+    let packed_or = terms.mk_app(
+        ay_core::Symbol::named("or"),
+        vec![p, q, r, not_inner_or],
+        Sort::Bool,
+    );
+    assert!(
+        validate_theory_lemma_strict(&terms, vec![packed_or], TheoryLemmaKind::BoolTautology)
+            .is_ok(),
+        "an exact packed OR/self-complement clause must validate"
+    );
+
+    // Missing one inner disjunct from the outer OR is falsifiable (r=true,
+    // p=q=false), so structural recognition must fail closed.
+    let missing_r = terms.mk_app(
+        ay_core::Symbol::named("or"),
+        vec![p, q, not_inner_or],
+        Sort::Bool,
+    );
+    assert!(
+        validate_theory_lemma_strict(&terms, vec![missing_r], TheoryLemmaKind::BoolTautology)
+            .is_err(),
+        "a packed OR missing an inner member must be rejected"
+    );
+
+    // Emitted and-pos shape: q \/ !(p /\ q /\ r).
+    let inner_and = terms.mk_app(ay_core::Symbol::named("and"), vec![p, q, r], Sort::Bool);
+    let not_inner_and = terms.mk_not_raw(inner_and);
+    let and_projection = terms.mk_app(
+        ay_core::Symbol::named("or"),
+        vec![q, not_inner_and],
+        Sort::Bool,
+    );
+    assert!(
+        validate_theory_lemma_strict(&terms, vec![and_projection], TheoryLemmaKind::BoolTautology)
+            .is_ok(),
+        "a conjunction child OR the negated conjunction must validate"
+    );
+
+    let s = eq(&mut terms, z, z);
+    let wrong_projection = terms.mk_app(
+        ay_core::Symbol::named("or"),
+        vec![s, not_inner_and],
+        Sort::Bool,
+    );
+    assert!(
+        validate_theory_lemma_strict(
+            &terms,
+            vec![wrong_projection],
+            TheoryLemmaKind::BoolTautology
+        )
+        .is_err(),
+        "a non-child OR the negated conjunction must be rejected"
+    );
+
+    // Raw TermStore construction can bypass application sort checking. A forged
+    // packed `and_pos` whose conjunction contains a non-Boolean member must not
+    // pass merely because the conjunction's result sort was labelled Bool.
+    let integer = terms.mk_var("integer", Sort::Int);
+    let ill_sorted_and = terms.mk_app(ay_core::Symbol::named("and"), vec![p, integer], Sort::Bool);
+    let not_ill_sorted_and = terms.mk_not_raw(ill_sorted_and);
+    let ill_sorted = terms.mk_app(
+        ay_core::Symbol::named("or"),
+        vec![p, not_ill_sorted_and],
+        Sort::Bool,
+    );
+    assert!(
+        validate_theory_lemma_strict(&terms, vec![ill_sorted], TheoryLemmaKind::BoolTautology)
+            .is_err(),
+        "a structurally complementary but ill-sorted packed clause must fail closed"
+    );
+}
+
+#[test]
+fn fp_rm_domain_accepts_exact_six_term_pigeonhole_and_rejects_near_misses() {
+    fn disequality(terms: &mut TermStore, lhs: TermId, rhs: TermId) -> TermId {
+        let equality = terms.mk_app(ay_core::Symbol::named("="), vec![lhs, rhs], Sort::Bool);
+        terms.mk_not_raw(equality)
+    }
+
+    fn complete_pairs(terms: &mut TermStore, subjects: &[TermId]) -> Vec<TermId> {
+        let mut pairs = Vec::new();
+        for (index, &lhs) in subjects.iter().enumerate() {
+            for &rhs in &subjects[index + 1..] {
+                pairs.push(disequality(terms, lhs, rhs));
+            }
+        }
+        pairs
+    }
+
+    fn negated_conjunction(terms: &mut TermStore, pairs: Vec<TermId>) -> TermId {
+        let conjunction = terms.mk_app(ay_core::Symbol::named("and"), pairs, Sort::Bool);
+        terms.mk_not_raw(conjunction)
+    }
+
+    let mut terms = TermStore::new();
+    let rm_sort = Sort::Uninterpreted("RoundingMode".to_string());
+    let subjects: Vec<_> = (0..6)
+        .map(|index| terms.mk_var(format!("rm_{index}"), rm_sort.clone()))
+        .collect();
+    let exact = complete_pairs(&mut terms, &subjects);
+    assert_eq!(exact.len(), 15);
+    let exact = negated_conjunction(&mut terms, exact);
+    assert!(
+        validate_theory_lemma_strict(&terms, vec![exact], TheoryLemmaKind::FpRoundingModeDomain)
+            .is_ok(),
+        "six pairwise-distinct values cannot inhabit the fixed five-value RM domain"
+    );
+
+    // Additional literals are sound clause weakening once the exact domain
+    // theorem is present; this is the live solver conflict shape.
+    let arbitrary = terms.mk_var("arbitrary", Sort::Bool);
+    assert!(
+        validate_theory_lemma_strict(
+            &terms,
+            vec![arbitrary, exact],
+            TheoryLemmaKind::FpRoundingModeDomain
+        )
+        .is_ok(),
+        "an authenticated pigeonhole literal must permit ordinary weakening"
+    );
+
+    let mut missing = complete_pairs(&mut terms, &subjects);
+    missing.pop();
+    let missing = negated_conjunction(&mut terms, missing);
+    assert!(
+        validate_theory_lemma_strict(&terms, vec![missing], TheoryLemmaKind::FpRoundingModeDomain)
+            .is_err(),
+        "a missing K6 edge must fail closed"
+    );
+
+    let mut duplicate = complete_pairs(&mut terms, &subjects);
+    duplicate[14] = duplicate[0];
+    let duplicate = negated_conjunction(&mut terms, duplicate);
+    assert!(
+        validate_theory_lemma_strict(
+            &terms,
+            vec![duplicate],
+            TheoryLemmaKind::FpRoundingModeDomain
+        )
+        .is_err(),
+        "a duplicate edge replacing one K6 pair must fail closed"
+    );
+
+    let wrong_sort = terms.mk_var("not_rm", Sort::Int);
+    let mut mixed_subjects = subjects[..5].to_vec();
+    mixed_subjects.push(wrong_sort);
+    let mixed = complete_pairs(&mut terms, &mixed_subjects);
+    let mixed = negated_conjunction(&mut terms, mixed);
+    assert!(
+        validate_theory_lemma_strict(&terms, vec![mixed], TheoryLemmaKind::FpRoundingModeDomain)
+            .is_err(),
+        "a wrong-sort sixth subject must fail closed"
+    );
+
+    let other_sort = Sort::Uninterpreted("OtherDomain".to_string());
+    let foreign_subjects: Vec<_> = (0..6)
+        .map(|index| terms.mk_var(format!("foreign_{index}"), other_sort.clone()))
+        .collect();
+    let foreign = complete_pairs(&mut terms, &foreign_subjects);
+    let foreign = negated_conjunction(&mut terms, foreign);
+    assert!(
+        validate_theory_lemma_strict(&terms, vec![foreign], TheoryLemmaKind::FpRoundingModeDomain)
+            .is_err(),
+        "a same-shaped theorem over an unrelated domain must fail closed"
+    );
+
+    let not_negated = {
+        let pairs = complete_pairs(&mut terms, &subjects);
+        terms.mk_app(ay_core::Symbol::named("and"), pairs, Sort::Bool)
+    };
+    assert!(
+        validate_theory_lemma_strict(
+            &terms,
+            vec![not_negated],
+            TheoryLemmaKind::FpRoundingModeDomain
+        )
+        .is_err(),
+        "the positive six-way distinct conjunction must not be certified"
     );
 }
 

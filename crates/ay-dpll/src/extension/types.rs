@@ -17,7 +17,67 @@ use ay_core::{
     BoundRefinementRequest, FarkasAnnotation, TermData, TermId, TermStore, TheorySolver,
 };
 use ay_sat::Literal;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+
+/// Sentinel for "no node" in the skip-assigned free-list (`u32::MAX`). No seed
+/// position can equal this because [`build_unassigned_freelist_state`] enforces
+/// that `seed_index.len()` leaves this value reserved.
+pub(super) const UNASSIGNED_NIL: u32 = u32::MAX;
+
+/// Read the `AY_LRA_UNASSIGNED_SKIP` flag once per process (default ON).
+///
+/// Default-ON with opt-out (`AY_LRA_UNASSIGNED_SKIP=0`), matching the
+/// `AY_LRA_INC_ENGINE` convention. When on, `suggest_decision` scans only the
+/// unassigned theory atoms via the order-preserving free-list (selecting the
+/// same literal as the full scan, just skipping assigned atoms); when off it
+/// takes the byte-identical full-scan path. Measured z3-mode @90s 2-sample:
+/// +19 on the QF_LRA hybrid_networks .ind pool, 0 soundness mismatches
+/// (suggest_decision returns decision HINTS only — soundness is enforced
+/// downstream regardless — and no reproducible per-file regression was found).
+pub(super) fn unassigned_skip_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("AY_LRA_UNASSIGNED_SKIP")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Build the initial skip-assigned free-list backing storage.
+///
+/// Returns `(sat_var_to_seed_pos, prev, next, linked)`. When `enabled` is
+/// false every vector is empty (zero allocation on the disabled path). When
+/// enabled, `sat_var_to_seed_pos` is sized to `num_var_slots` and maps each
+/// SAT variable id to its seed position (`UNASSIGNED_NIL` for non-seed vars);
+/// `prev`/`next`/`linked` are sized to `seed_index.len()` and are populated on
+/// the first rebuild (the extension starts `unassigned_dirty = true`).
+pub(super) fn build_unassigned_freelist_state(
+    enabled: bool,
+    seed_index: &[(u32, TermId)],
+    num_var_slots: usize,
+) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<bool>) {
+    if !enabled {
+        return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    }
+    let n = seed_index.len();
+    assert!(
+        n <= UNASSIGNED_NIL as usize,
+        "skip-assigned free-list exhausted its u32 seed-position space"
+    );
+    let mut sat_var_to_seed_pos = vec![UNASSIGNED_NIL; num_var_slots];
+    for (pos, &(sat_var, _atom)) in seed_index.iter().enumerate() {
+        let vi = sat_var as usize;
+        if vi < sat_var_to_seed_pos.len() {
+            sat_var_to_seed_pos[vi] = pos as u32;
+        }
+    }
+    (
+        sat_var_to_seed_pos,
+        vec![UNASSIGNED_NIL; n],
+        vec![UNASSIGNED_NIL; n],
+        vec![false; n],
+    )
+}
 
 use crate::diagnostic_trace::DpllDiagnosticWriter;
 use crate::executor::BoundRefinementReplayKey;
@@ -229,6 +289,44 @@ pub(crate) struct TheoryExtension<'a, T: TheorySolver> {
     /// Tseitin encoding variables, matching Z3's `theory_aware_branching`.
     /// Reference: Z3 smt_case_split_queue.cpp:1170-1209.
     pub(super) theory_decision_idx: Cell<usize>,
+    /// #skip-assigned (`AY_LRA_UNASSIGNED_SKIP`, default ON): when true,
+    /// `suggest_decision` selects theory atoms by walking an intrusive
+    /// order-preserving free-list of the CURRENTLY-UNASSIGNED seed positions
+    /// instead of re-scanning every seed atom (assigned or not) each decision.
+    /// Read once at construction; when false, all the free-list fields below
+    /// are empty and untouched and the byte-identical full-scan path runs.
+    pub(super) unassigned_skip: bool,
+    /// Reverse index `sat_var id -> seed position` (`UNASSIGNED_NIL` for SAT
+    /// variables that are not theory-atom seeds). Sized to the max SAT var id
+    /// seen at construction. Empty unless `unassigned_skip` is on. Used by the
+    /// incremental trail scan to unlink a position in O(1) when its variable
+    /// becomes assigned.
+    pub(super) sat_var_to_seed_pos: Vec<u32>,
+    /// Intrusive doubly-linked free-list over SEED POSITIONS: `prev`/`next`
+    /// pointers (indexed by seed position, `UNASSIGNED_NIL` = end). Together
+    /// with `unassigned_head` these thread the unassigned seed positions in
+    /// ascending seed order, so the head->tail walk visits exactly the same
+    /// atoms in the same order the full scan would — only skipping assigned
+    /// ones. Empty unless `unassigned_skip` is on.
+    pub(super) unassigned_prev: RefCell<Vec<u32>>,
+    pub(super) unassigned_next: RefCell<Vec<u32>>,
+    /// Per-position membership flag, guarding the incremental unlink against a
+    /// double-unlink (idempotent). `linked[pos]` is true iff `pos` is currently
+    /// threaded into the free-list. Empty unless `unassigned_skip` is on.
+    pub(super) unassigned_linked: RefCell<Vec<bool>>,
+    /// Head of the free-list (smallest-seed-position unassigned atom), or
+    /// `UNASSIGNED_NIL` when empty.
+    pub(super) unassigned_head: Cell<u32>,
+    /// When true, the free-list is stale and must be rebuilt from `ctx.value()`
+    /// (the source of truth) on the next `suggest_decision`. Set by
+    /// `backtrack()` and `init()` — every path that unassigns a theory var
+    /// routes through one of those — so the list is never walked stale.
+    pub(super) unassigned_dirty: Cell<bool>,
+    /// Trail position up to which the incremental unlink scan has consumed.
+    /// Between rebuilds the trail only grows, so scanning `trail[scan_pos..]`
+    /// and unlinking each newly-assigned seed position keeps the free-list in
+    /// sync. Reset to `trail.len()` on each rebuild.
+    pub(super) unassigned_scan_pos: Cell<usize>,
     /// Bound ordering axiom clauses to inject on the first propagate() call.
     /// Generated from Z3's mk_bound_axioms algorithm: for each pair of
     /// nearest-neighbor bounds on the same variable, add a binary SAT clause

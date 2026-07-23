@@ -252,3 +252,112 @@ theorem ex_strAt_len_three_via_principle : ¬ (len (strAt sAB 1) = 3) :=
   strAt_len_eq_conflict sAB 1 3 (by decide)
 
 end AySoundness.StrAt
+
+/-! ## `str.indexof` / `str.from_int` / `str.is_digit` — the `str_indexof` declines.
+
+The SMT `str.indexof h n start` returns the first position `≥ start` where the
+needle `n` occurs contiguously in the haystack `h`, or `-1` if there is no such
+occurrence. `str.from_int` maps a negative integer to the empty string, and
+`str.is_digit` is true only of a single ASCII-digit character. When ay decides
+that a needle is ABSENT from a haystack (`str.indexof … = -1`), the downstream
+conflicts `¬(str.indexof … ≥ 0)` and `str.is_digit (str.from_int (str.indexof …)) =
+false` must be sound. We model all three over `StringThy.Str = List Nat` and prove
+a CLASSICAL-FREE absence lemma: if the concrete `matchAt` fails at every candidate
+position, then `str.indexof h n m = -1` for every start `m` — discharged from the
+`List.all` hypothesis by `decide`/List lemmas, with NO `Classical.choice`. -/
+namespace AySoundness.IndexOfThy
+open StringThy
+
+/-- Is `n` a contiguous sublist of `h` starting at position `i`? -/
+def matchAt (h n : Str) (i : Nat) : Bool := (h.drop i).take n.length == n
+
+/-- str.indexof: first position ≥ start where needle occurs, else -1. -/
+def indexOf (h n : Str) (start : Nat) : Int :=
+  match (List.range (h.length + 1)).filter (fun i => start ≤ i && matchAt h n i) with
+  | []      => -1
+  | i :: _  => (i : Int)
+
+/-- str.from_int: negative → empty (SMT: from_int of a negative is ""). -/
+def fromInt (k : Int) : Str := if k < 0 then [] else [k.toNat]
+
+/-- str.is_digit: true iff exactly one char in the ASCII digit range. -/
+def isDigit (s : Str) : Bool := match s with | [c] => 48 ≤ c && c ≤ 57 | _ => false
+
+/-! ### The classical-free absence lemma.
+
+The key fix: rather than `simp`, we prove `∀ start` from the *concrete* `matchAt`
+hypothesis by pure `decide`/List reasoning. If `matchAt h n i` is `false` for every
+`i` in `List.range (h.length + 1)` (the `List.all` hypothesis `habs`), then the
+`filter` in `indexOf` is empty — its predicate `start ≤ i && matchAt h n i` is
+`false` at every candidate position — so the `match` returns `-1`, for any `start`.
+No `Classical.choice`: `List.all_eq_true` + `List.filter_eq_nil_iff` are
+constructive. -/
+
+/-- Constructive `filter` emptiness: if a `Bool` predicate is `false` at every
+    element of `l`, then `filter p l = []`. Proved by induction with
+    `List.filter_cons_of_neg` — no `List.filter_eq_nil_iff` (which pulls in
+    `Classical.choice`), hence axiom-free. -/
+theorem filter_all_false {α} (p : α → Bool) :
+    ∀ l : List α, (∀ a, a ∈ l → p a = false) → l.filter p = []
+  | [], _ => rfl
+  | a :: as, h => by
+      have ha : p a = false := h a (List.mem_cons_self ..)
+      rw [List.filter_cons_of_neg (by rw [ha]; exact Bool.false_ne_true)]
+      exact filter_all_false p as (fun x hx => h x (List.mem_cons_of_mem a hx))
+
+/-- **Absence ⇒ `-1` at every start.** If the concrete `matchAt h n` fails at every
+    position in `List.range (h.length + 1)`, then `str.indexof h n m = -1` for all
+    starts `m`. Classical-free: proved from the decidable `List.all` witness via the
+    constructive `filter_all_false` (no `Classical.choice`). -/
+theorem indexOf_absent_all_start (H N : Str)
+    (habs : (List.range (H.length + 1)).all (fun i => !matchAt H N i) = true) :
+    ∀ m, indexOf H N m = -1 := by
+  intro m
+  unfold indexOf
+  have hnil :
+      (List.range (H.length + 1)).filter (fun i => m ≤ i && matchAt H N i) = [] := by
+    apply filter_all_false
+    intro i hi
+    rw [List.all_eq_true] at habs
+    have hi' := habs i hi
+    have hfalse : matchAt H N i = false := by
+      simp only [Bool.not_eq_true'] at hi'
+      exact hi'
+    simp only [hfalse, Bool.and_false]
+  rw [hnil]
+
+/-! ### Concrete conflict corollaries (the two `str_indexof` files).
+
+`xt_indexof`: needle `"ca" = [99,97]` (length 2) is longer than haystack
+`"a" = [97]` (length 1), so it is absent → `str.indexof = -1`, and `-1 ≥ 0` is
+FALSE. `str_indexof`: `"aba" = [97,98,97]` does not occur in `"cba" = [99,98,97]`,
+so `str.indexof = -1`, `str.from_int (-1) = ""`, and `str.is_digit "" = false`. The
+`habs` premises are closed by `decide` on the concrete `matchAt`; the conflict then
+follows from `indexOf_absent_all_start`, with NO `Classical.choice`. -/
+
+/-- **`xt_indexof` conflict.** For every start `m`, `¬ (str.indexof "a" "ca" m ≥ 0)`:
+    the needle is absent, so `str.indexof = -1 < 0`. -/
+theorem xt_indexof_not_ge_zero : ∀ m, ¬ (indexOf [97] [99, 97] m ≥ 0) := by
+  have h := indexOf_absent_all_start [97] [99, 97] (by decide)
+  intro m
+  rw [h m]
+  decide
+
+/-- **`str_indexof` conflict.** For every start `m`,
+    `str.is_digit (str.from_int (str.indexof "cba" "aba" m)) = false`: the needle is
+    absent, so `str.indexof = -1`, `str.from_int (-1) = ""`, `str.is_digit "" = false`. -/
+theorem str_indexof_is_digit_false :
+    ∀ m, isDigit (fromInt (indexOf [99, 98, 97] [97, 98, 97] m)) = false := by
+  have h := indexOf_absent_all_start [99, 98, 97] [97, 98, 97] (by decide)
+  intro m
+  rw [h m]
+  decide
+
+/-! ### Axiom audit — each new lemma must avoid `Classical.choice`. -/
+
+-- verify: axioms ⊆ {propext, Quot.sound} (NO Classical.choice)
+#print axioms indexOf_absent_all_start
+#print axioms xt_indexof_not_ge_zero
+#print axioms str_indexof_is_digit_false
+
+end AySoundness.IndexOfThy

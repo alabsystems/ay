@@ -296,6 +296,13 @@ impl Solver {
 
     /// Check if we should reduce the clause database
     pub(super) fn should_reduce_db(&self) -> bool {
+        // A queued theory conflict owns its ClauseRef until the solve loop
+        // consumes it. Besides avoiding O(candidates × queued) ownership
+        // scans, deferring reduction prevents any deletion/compaction pass
+        // from invalidating a later conflict in the same callback batch.
+        if !self.pending_theory_conflicts.is_empty() {
+            return false;
+        }
         // Suppressed during backbone probing (#7929): prevent clause deletion
         // from invalidating the DRAT proof chain for backbone units.
         if self.suppress_reduce_db {

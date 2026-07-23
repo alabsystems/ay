@@ -502,24 +502,97 @@ impl Executor {
             );
         }
         if self.pivot_enum_depth == 0 {
-            if let Some(result) = self.try_prefix_suffix_witnesses()? {
+            let __tr = std::env::var("AY_STR_PREPASS_STATS").ok().as_deref() == Some("1");
+            macro_rules! timed {
+                ($name:literal, $e:expr) => {{
+                    let __t = std::time::Instant::now();
+                    let __r = $e;
+                    if __tr {
+                        safe_eprintln!(
+                            "[PREPASS] {} {:.1}ms",
+                            $name,
+                            __t.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    __r
+                }};
+            }
+            // Exact, budgeted constant propagation over large word-equation
+            // systems runs ahead of every SEARCH-and-validate pass: on
+            // `woorpje-lu/track04/04_track_57` the concat-constant pre-pass
+            // spent 40 ms pinning and re-solving candidates for a system this
+            // pass refutes outright in 0.1 ms. It only returns UNSAT; proof
+            // mode and every resource limit fall through unchanged.
+            if let Some(result) = timed!("wordprop", self.try_word_eq_constant_propagation()?) {
                 return Ok(result);
             }
-            if let Some(result) = self.try_concat_predicate_witnesses()? {
+            if let Some(result) = timed!("prefix_suffix", self.try_prefix_suffix_witnesses()?) {
+                return Ok(result);
+            }
+            if let Some(result) = timed!("concat_pred", self.try_concat_predicate_witnesses()?) {
                 return Ok(result);
             }
             // Bounded regex-membership × length decision (TARGET strings_regex_len).
-            if let Some(result) = self.try_regex_length_witnesses()? {
+            if let Some(result) = timed!("regex_len", self.try_regex_length_witnesses()?) {
                 return Ok(result);
             }
             // Concat-equals-constant single-free-variable witness (S2).
-            if let Some(result) = self.try_concat_constant_witnesses()? {
+            if let Some(result) = timed!("concat_const", self.try_concat_constant_witnesses()?) {
                 return Ok(result);
             }
             // Nielsen word-equation decision (Track A3 M1): symbolic word
             // equations like `x ++ "ab" = "a" ++ y`. SAT only after full
-            // model validation; UNSAT only from exhaustive Nielsen closure.
-            if let Some(result) = self.try_word_equation_nielsen()? {
+            // model validation; UNSAT only from exhaustive Nielsen closure. For
+            // the pure `str.in_re` fragment it decides UNSAT (via emptiness) but
+            // DECLINES the expensive SAT materialization, leaving it to the W6
+            // shortcut immediately below.
+            if let Some(result) = timed!("nielsen", self.try_word_equation_nielsen()?) {
+                return Ok(result);
+            }
+            // Early W6 shortcut (`AY_STR_W6=0` kill switch): two structurally-
+            // narrow SAT constructions hoisted ahead of the per-variable witness
+            // passes below (W1b, the cheap W1b probe, W4), which decide their
+            // targets either far more slowly or catastrophically —
+            // (1) the slog `stranger_*_sink` `str.++`-chain
+            //     (`slog_stranger_2825_sink`: ~20 ms of declined W1b/W4 work
+            //     before the late W6 pass), and
+            // (2) the pure regex-membership fragment, whose SAT witness Nielsen
+            //     has just declined (`automatark-lu/instance12580`: 40 ms of
+            //     exhaust + ~19 ms of W1b; `instance08792`: ~30 ms in the
+            //     complement-heavy W1b BFS; W4's per-position search on the same
+            //     shape is a measured 12 s).
+            // Both decide in ~1 ms here. Placed AFTER Nielsen so its cheap
+            // emptiness check settles the pure-membership UNSAT files
+            // (`instance13338`, ~15 ms) before this pass ever builds a
+            // candidate. Construct-and-validate (same contract as the late W6
+            // pass): emits only a fully model-validated SAT model, else declines
+            // — verdict-preserving, and a file matching neither shape pays only a
+            // few linear syntactic walks before instantly declining. See
+            // `strings_w6::try_w6_early_shortcut`.
+            if super::strings_w6::str_w6_enabled() {
+                if let Some(result) = timed!("w6_early", self.try_w6_early_shortcut()?) {
+                    return Ok(result);
+                }
+            }
+            // W1b for the variables whose derivative search converges within a
+            // CHEAP work budget: those are fast conversions that should not be
+            // made to pay for the W4/W6 passes below. Placed AFTER the exact
+            // UNSAT deciders (Nielsen decides `instance13338` in 4.6 ms, so its
+            // 65M-unit doomed search is never even started here), and BEFORE
+            // W4/W6 (so `instance12580` converts in ~12 ms instead of after
+            // them). Everything the budget declines is retried unbudgeted by
+            // the LATE placement.
+            if let Some(result) = timed!("w1b_cheap", self.try_regex_construct_witnesses_cheap()?) {
+                return Ok(result);
+            }
+            // W1b regex witness CONSTRUCTION. Deliberately placed after every
+            // pass that can decide the formula exactly: it only ever produces
+            // SAT candidates, so a formula the exact passes settle must not be
+            // charged its derivative product search
+            // (`automatark-lu/instance13338`: 2.1 s of search on a file the
+            // Nielsen pass refutes in 4.6 ms). Capability is unchanged — same
+            // candidates, same pinning, same full model validation.
+            if let Some(result) = timed!("w1b", self.try_regex_construct_witnesses()?) {
                 return Ok(result);
             }
             // W4 (default ON, `AY_STR_W4=0` kill switch): length-indexed per-position
@@ -527,7 +600,7 @@ impl Executor {
             // validated-candidate contract as the passes above — a failed
             // synthesis falls through and never concludes UNSAT.
             if super::strings_w4::str_w4_enabled() {
-                if let Some(result) = self.try_per_position_witnesses()? {
+                if let Some(result) = timed!("w4", self.try_per_position_witnesses()?) {
                     return Ok(result);
                 }
             }
@@ -535,7 +608,7 @@ impl Executor {
             // construction (see `strings_w6.rs`). Same validated-candidate
             // contract — a failed construction never concludes UNSAT.
             if super::strings_w6::str_w6_enabled() {
-                if let Some(result) = self.try_regex_word_witnesses()? {
+                if let Some(result) = timed!("w6", self.try_regex_word_witnesses()?) {
                     return Ok(result);
                 }
             }

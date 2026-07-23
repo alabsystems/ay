@@ -255,8 +255,8 @@ impl ArraySolver<'_> {
     }
 
     fn merge_affine_terms(
-        lhs: &mut HashMap<String, BigInt>,
-        rhs: &HashMap<String, BigInt>,
+        lhs: &mut HashMap<TermId, BigInt>,
+        rhs: &HashMap<TermId, BigInt>,
         sign: i32,
     ) {
         for (symbol, coeff) in rhs {
@@ -265,7 +265,7 @@ impl ArraySolver<'_> {
             } else {
                 -coeff.clone()
             };
-            let entry = lhs.entry(symbol.clone()).or_insert_with(|| BigInt::from(0));
+            let entry = lhs.entry(*symbol).or_insert_with(|| BigInt::from(0));
             *entry += signed;
             if *entry == BigInt::from(0) {
                 lhs.remove(symbol);
@@ -288,9 +288,13 @@ impl ArraySolver<'_> {
 
         let parsed = match self.terms.get(term) {
             TermData::Const(Constant::Int(n)) => Some((HashMap::default(), n.clone())),
-            TermData::Var(name, _) => {
+            TermData::Var(_, _) => {
                 let mut vars = HashMap::default();
-                vars.insert(name.clone(), BigInt::from(1));
+                // Variable identity includes the internal declaration
+                // identity, not just the user-visible name. In particular,
+                // `mk_fresh_named_var` intentionally creates distinct terms
+                // when a scoped symbol name is redeclared.
+                vars.insert(term, BigInt::from(1));
                 Some((vars, BigInt::from(0)))
             }
             TermData::App(Symbol::Named(name), args) => match name.as_str() {
@@ -353,15 +357,18 @@ impl ArraySolver<'_> {
 
     /// Intern a canonical affine variable-map to a dense `u32` id.
     ///
-    /// The canonical key is the variable/coefficient pairs sorted by variable
-    /// name (zero coefficients are already dropped during parsing by
-    /// `merge_affine_terms`/`scale_affine`). Interner-key equality is exact
-    /// `HashMap` key comparison, so two maps get the same id **iff** they are
-    /// structurally equal — collision-free, no hash-digest fallback needed.
-    fn intern_affine_varmap(&self, vars: &HashMap<String, BigInt>) -> u32 {
-        let mut key: Vec<(String, BigInt)> =
-            vars.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        key.sort_by(|a, b| a.0.cmp(&b.0));
+    /// The canonical key is the variable/coefficient pairs sorted by exact
+    /// variable `TermId` (zero coefficients are already dropped during
+    /// parsing by `merge_affine_terms`/`scale_affine`). Interner-key equality
+    /// is exact `HashMap` key comparison, so two maps get the same id **iff**
+    /// they are structurally equal — collision-free, no hash-digest fallback
+    /// needed.
+    fn intern_affine_varmap(&self, vars: &HashMap<TermId, BigInt>) -> u32 {
+        let mut key: Vec<(TermId, BigInt)> = vars
+            .iter()
+            .map(|(&term, coeff)| (term, coeff.clone()))
+            .collect();
+        key.sort_unstable_by_key(|(term, _)| term.0);
         let mut interner = self.affine_cache.interner.borrow_mut();
         if let Some(&id) = interner.get(&key) {
             return id;
@@ -417,7 +424,7 @@ impl ArraySolver<'_> {
                 break 'compute false;
             };
             // Interned id equality on the variable-part replaces the pairwise
-            // `HashMap<String, BigInt>` structural walk (`lhs.0 == rhs.0`).
+            // `HashMap<TermId, BigInt>` structural walk (`lhs.0 == rhs.0`).
             #[cfg(debug_assertions)]
             Self::debug_assert_affine_intern(id1, id2, lhs.as_ref(), rhs.as_ref());
             id1 == id2 && lhs.1 != rhs.1
@@ -458,7 +465,7 @@ impl ArraySolver<'_> {
             return false;
         };
         // Interned id equality on the variable-part replaces the pairwise
-        // `HashMap<String, BigInt>` structural walk (`lhs.0 == rhs.0`).
+        // `HashMap<TermId, BigInt>` structural walk (`lhs.0 == rhs.0`).
         let result = id1 == id2 && lhs.1 == rhs.1;
         #[cfg(debug_assertions)]
         Self::debug_assert_affine_intern(id1, id2, lhs.as_ref(), rhs.as_ref());
@@ -684,6 +691,157 @@ impl ArraySolver<'_> {
         }
         Self::canonicalize_theory_lits(&mut reasons);
         Some(reasons)
+    }
+
+    /// Opaque-affine key for `term` with every leaf canonicalised to its
+    /// equivalence-class representative. Two Int terms whose difference is a
+    /// linear combination of equivalence-class-equal leaves at matching
+    /// coefficients (equal constant) map to the SAME key.
+    ///
+    /// This is the grouping key that captures both `equal_by_affine_form`
+    /// (§ soundness case 2) and `explain_equal_by_affine_leaf_congruence`
+    /// (§ soundness case 3): see `index_conflict_partition`. Returns `None`
+    /// for non-Int terms (where those affine paths cannot fire).
+    fn opaque_affine_rep_key(&self, term: TermId) -> Option<(Vec<(u32, BigInt)>, BigInt)> {
+        let parsed = self.parse_affine_opaque(term)?;
+        let (leaves, constant) = parsed.as_ref();
+        // Fold each opaque leaf onto its equivalence-class representative.
+        // A base-equality match between two DISTINCT opaque leaves (the only
+        // way leaf congruence pairs residual leaves) is provably an
+        // equivalence-class equality — distinct opaque leaves are never
+        // `equal_by_affine_form` under hash-consing (a variable is keyed by its
+        // exact TermId; a compound affine term is never an opaque leaf) — so
+        // matched leaves land on the same representative and the
+        // per-representative coefficient sums of congruent terms coincide.
+        let mut combined: HashMap<u32, BigInt> = HashMap::default();
+        for (&leaf, coeff) in leaves {
+            let rep = self.equiv_class_representative(leaf).0;
+            let entry = combined.entry(rep).or_insert_with(|| BigInt::from(0));
+            *entry += coeff;
+        }
+        let zero = BigInt::from(0);
+        let mut key: Vec<(u32, BigInt)> = combined
+            .into_iter()
+            .filter(|(_, coeff)| *coeff != zero)
+            .collect();
+        key.sort_unstable_by_key(|entry| entry.0);
+        Some((key, constant.clone()))
+    }
+
+    /// Partition `indices` (the distinct select-index terms) into blocks such
+    /// that any two indices `explain_equal_if_provable` would prove equal share
+    /// a block. Returns `index_term -> block representative` (the minimum
+    /// `TermId` of the block), with an entry for every input index.
+    ///
+    /// SOUNDNESS — over-approximation of the index-equality relation `R` that
+    /// BOTH select-conflict consumers gate on
+    /// (`check_store_permutation_select_conflicts` via
+    /// `explain_equal_if_provable`, `row2_extended_conflict_lemmas` via the
+    /// weaker `known_equal ⊆ R`). `R(i, j) ⇒ same block`. `R` is exactly the
+    /// success set of `explain_equal_if_provable`, which has three paths:
+    ///   1. same equivalence class (syntactic identity / directly-asserted
+    ///      equality atom / asserted-equality BFS path) — grouped by
+    ///      `equiv_class_representative`;
+    ///   2. `equal_by_affine_form` (equal interned varmap id AND equal
+    ///      constant) — grouped by `affine_canonical`;
+    ///   3. `explain_equal_by_affine_leaf_congruence` (opaque-affine forms with
+    ///      equal constant whose residual leaves match pairwise via base
+    ///      equality at equal coefficients) — grouped by `opaque_affine_rep_key`.
+    ///
+    /// Each grouping unions its members into one block; the transitive union
+    /// (union-find) is only COARSER than `R`, so no `R`-edge is ever split
+    /// across blocks (grouping 2 is subsumed by grouping 3 but kept as explicit
+    /// insurance). Blocks may also hold indices that are NOT pairwise
+    /// `R`-related (over-approximation); the consumers re-check index equality
+    /// per candidate pair, so the produced conflicts are byte-identical.
+    pub(crate) fn index_conflict_partition(&self, indices: &[TermId]) -> HashMap<TermId, TermId> {
+        fn uf_find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+        fn uf_union(parent: &mut [usize], a: usize, b: usize) {
+            let ra = uf_find(parent, a);
+            let rb = uf_find(parent, b);
+            if ra != rb {
+                // Attach to the smaller root for deterministic forests.
+                if ra < rb {
+                    parent[rb] = ra;
+                } else {
+                    parent[ra] = rb;
+                }
+            }
+        }
+
+        let n = indices.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+
+        // Grouping (1): equivalence-class representative.
+        {
+            let mut first_of: HashMap<TermId, usize> = HashMap::default();
+            for (i, &t) in indices.iter().enumerate() {
+                let rep = self.equiv_class_representative(t);
+                match first_of.get(&rep) {
+                    Some(&first) => uf_union(&mut parent, first, i),
+                    None => {
+                        first_of.insert(rep, i);
+                    }
+                }
+            }
+        }
+        // Grouping (2): affine canonical form (varmap id, constant). This is
+        // EXACTLY the pairs `equal_by_affine_form` relates.
+        {
+            let mut first_of: HashMap<(u32, BigInt), usize> = HashMap::default();
+            for (i, &t) in indices.iter().enumerate() {
+                if let Some((id, form)) = self.affine_canonical(t) {
+                    let key = (id, form.1.clone());
+                    match first_of.get(&key) {
+                        Some(&first) => uf_union(&mut parent, first, i),
+                        None => {
+                            first_of.insert(key, i);
+                        }
+                    }
+                }
+            }
+        }
+        // Grouping (3): opaque-affine key with rep-canonicalised leaves. Covers
+        // `explain_equal_by_affine_leaf_congruence` (and re-covers grouping 2).
+        {
+            let mut first_of: HashMap<(Vec<(u32, BigInt)>, BigInt), usize> = HashMap::default();
+            for (i, &t) in indices.iter().enumerate() {
+                if let Some(key) = self.opaque_affine_rep_key(t) {
+                    match first_of.get(&key) {
+                        Some(&first) => uf_union(&mut parent, first, i),
+                        None => {
+                            first_of.insert(key, i);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Materialise `index -> block representative` (min TermId per block).
+        let mut root_min: HashMap<usize, TermId> = HashMap::default();
+        for (i, &t) in indices.iter().enumerate() {
+            let r = uf_find(&mut parent, i);
+            root_min
+                .entry(r)
+                .and_modify(|m| {
+                    if t.0 < m.0 {
+                        *m = t;
+                    }
+                })
+                .or_insert(t);
+        }
+        let mut result: HashMap<TermId, TermId> = HashMap::default();
+        for (i, &t) in indices.iter().enumerate() {
+            let r = uf_find(&mut parent, i);
+            result.insert(t, root_min[&r]);
+        }
+        result
     }
 
     /// Rebuild disequality set and adjacency list from current assignments.

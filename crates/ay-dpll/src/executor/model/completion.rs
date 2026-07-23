@@ -1764,6 +1764,24 @@ impl Executor {
             if color[ei].is_some() {
                 continue;
             }
+            // A SINGLE-INHABITANT enum (k == 1) has exactly one slot: every
+            // element MUST denote the sole nullary constructor. A forced-distinct
+            // edge over such a sort is UNSATISFIABLE — no real model has two
+            // distinct values of a 1-inhabitant sort — so the committed model is
+            // a non-model, and the only enum-valid candidate is "collapse
+            // everything onto slot 0". Produce it (the repair is strictly
+            // candidate-producing) and let the full assertion-level validation
+            // decide: a genuine committed disequality then makes its `(not (= a
+            // b))` / `(distinct ..)` assertion evaluate FALSE and degrades the
+            // SAT to Unknown — never a wrong SAT. Without this, a spurious
+            // don't-care disequality between two over-populated reps (the
+            // eager-DT selector-congruence artifact, e.g. `excl`'s `PhantomData`)
+            // blocks the k == 1 coloring and defeats the cardinality collapse,
+            // fixpointing iterative deepening on the degrade.
+            if k == 1 {
+                color[ei] = Some(0);
+                continue;
+            }
             let mut blocked = vec![false; k];
             for &(a, b) in &edges {
                 let other = if a == ei {
@@ -1794,8 +1812,28 @@ impl Executor {
         // Canonical element per slot: the anchored element if the constructor
         // occurs in the model, else the first element assigned the slot. All
         // other same-slot elements are renamed onto the canonical one.
+        //
+        // For a SINGLE-CONSTRUCTOR enum (`k == 1`) slot 0 is unambiguously that
+        // sole constructor, so canonicalize onto the CONSTRUCTOR NAME itself, not
+        // the `@Sort!n` rep the over-populated model happened to assign (even
+        // when a constructor constant was anchored to a rep). An all-nullary enum
+        // value IS its constructor, and representing it by the constructor name
+        // keeps the datatype tautologies the strict definitive-false oracle
+        // checks — `is-C(m)` iff `(C = m)` — mutually consistent: `is-C` is
+        // recomputed from the coloring (true), and `(C = m)` compares constructor
+        // NAMES, so both agree only when `m` denotes the name `C`. Collapsing
+        // onto a fresh rep instead leaves `is-C` true while `(C = m)` is false,
+        // which the oracle rejects (the residual `excl` PhantomData degrade).
+        // Confined to `k == 1` so the `k > 1` blocksworld canonicalization is
+        // byte-identical.
         let mut canon: Vec<Option<&str>> = (0..k)
-            .map(|c| ctor_elem[c].map(|ei| elements[ei].as_str()))
+            .map(|c| {
+                if k == 1 {
+                    Some(ctors[0].as_str())
+                } else {
+                    ctor_elem[c].map(|ei| elements[ei].as_str())
+                }
+            })
             .collect();
         let mut remap: HashMap<String, String> = HashMap::default();
         for (ei, elem) in elements.iter().enumerate() {
@@ -1822,9 +1860,36 @@ impl Executor {
         // echo don't-care SAT assignments, and the commit below RECOMPUTES
         // every row from the final coloring — so a pre-remap row conflict there
         // is repaired, not a defect.
+        //
+        // The solver-internal DT acyclicity DEPTH instrumentation
+        // (`__ay_dt_depth_<dt>`, injected by `dt_axioms/acyclicity.rs`) is
+        // likewise exempt: its semantics are fixed (the well-founded depth of a
+        // datatype element), and for an all-nullary ENUM sort — the only sorts
+        // this repair touches — every element denotes one of the `k` nullary
+        // constructors, whose depth is a fixed constant, so a post-merge row
+        // conflict there is a don't-care artifact of the over-populated model,
+        // not a genuine functional defect. The commit's per-arg dedup below
+        // keeps the table functional regardless, and the full assertion-level
+        // validation (which re-evaluates the depth/acyclicity axioms) still
+        // decides acceptance — so a bad merge degrades to Unknown, never a wrong
+        // SAT. Without this exemption the depth table's stale per-`@Even!n` rows
+        // (distinct Int depths the SAT solver left as don't-cares) spuriously
+        // abort the repair, defeating the enum-cardinality collapse and
+        // fixpointing iterative deepening on the degrade (mutex, excl).
+        // A CONSTRUCTOR table over a SINGLE-INHABITANT enum (`k == 1`) is also
+        // exempt: the sole inhabitant forces every application of an injective
+        // constructor to the collapsed value, so a pre-merge row conflict there
+        // is another don't-care fragment of the over-populated model (`excl`'s
+        // `Resource` wrapping `PhantomData`). The commit's per-arg dedup keeps
+        // the table functional and the full validation still decides, so this is
+        // candidate-only. Kept to `k == 1` so the `k > 1` blocksworld coloring
+        // (where a genuine constructor conflict is a real signal) is unchanged.
         let tester_names: HashSet<String> = ctors.iter().map(|c| format!("is-{c}")).collect();
         for (fn_name, table) in euf.function_tables.iter() {
-            if tester_names.contains(fn_name) {
+            if tester_names.contains(fn_name)
+                || fn_name.starts_with("__ay_dt_depth_")
+                || (k == 1 && self.ctx.is_constructor(fn_name).is_some())
+            {
                 continue;
             }
             let mut seen_rows: HashMap<Vec<String>, String> = HashMap::default();
@@ -1862,6 +1927,15 @@ impl Executor {
         }
         if let Some(elems) = euf.sort_elements.get_mut(sort_name) {
             elems.retain(|e| !remap.contains_key(e));
+            // A canonical slot element may be a constructor NAME that was never
+            // an extracted `@Sort!n` rep (the single-constructor canonicalization
+            // above): make sure the sort's surviving inhabitant is listed, so the
+            // element set stays consistent with the remapped term values.
+            for name in canon.iter().flatten() {
+                if !elems.iter().any(|e| e == name) {
+                    elems.push((*name).to_string());
+                }
+            }
         }
         for table in euf.function_tables.values_mut() {
             for (args, result) in table.iter_mut() {

@@ -1398,6 +1398,39 @@ impl BabSession {
     }
 }
 
+#[cfg(test)]
+mod node_warm_tests {
+    use super::*;
+
+    fn binary_model() -> Model {
+        let mut model = Model::new();
+        let _ = model.add_binary_col();
+        model
+    }
+
+    #[test]
+    fn node_warm_limit_is_isolated_between_sessions() {
+        let short_limit = Duration::from_millis(10);
+        let long_limit = Duration::from_secs(10);
+        let short_opts = SolveOpts::new().with_node_warm_time_limit(Some(short_limit));
+        let long_opts = SolveOpts::new().with_node_warm_time_limit(Some(long_limit));
+
+        let short = BabSession::new(binary_model(), &short_opts).expect("short-cap session");
+        let uncapped =
+            BabSession::new(binary_model(), &SolveOpts::new()).expect("default uncapped session");
+        let long = BabSession::new(binary_model(), &long_opts).expect("long-cap session");
+
+        assert_eq!(short.opts.node_warm_time_limit, Some(short_limit));
+        assert_eq!(uncapped.opts.node_warm_time_limit, None);
+        assert_eq!(long.opts.node_warm_time_limit, Some(long_limit));
+        assert_eq!(
+            short.opts.node_warm_time_limit,
+            Some(short_limit),
+            "constructing later sessions must not change an earlier session's cap"
+        );
+    }
+}
+
 #[cfg(all(test, feature = "smt"))]
 mod tests {
     use super::*;

@@ -69,17 +69,21 @@ setup_drat_trim() {
 
 # --- carcara (SMT Alethe proof replay) -------------------------------------
 CARCARA_BIN="$HOME/.cargo/bin/carcara"
+CARCARA_COMMIT="9a352eea6c935ad35cb8ec22e521a7620ec5d474"
 setup_carcara() {
-  if [[ -x "$CARCARA_BIN" ]] || command -v carcara >/dev/null 2>&1; then
-    report carcara "present"; return
+  if [[ -x "$CARCARA_BIN" ]] &&
+     "$CARCARA_BIN" --version 2>/dev/null | grep -q "${CARCARA_COMMIT:0:7}"; then
+    report carcara "present at ${CARCARA_COMMIT:0:12}"; return
   fi
-  echo "[setup] building carcara ..."
+  echo "[setup] building pinned carcara ${CARCARA_COMMIT:0:12} ..."
   rm -rf "$WORK/carcara-src"
-  git clone --depth 1 https://github.com/ufmg-smite/carcara "$WORK/carcara-src"
+  git clone --filter=blob:none --no-checkout https://github.com/ufmg-smite/carcara "$WORK/carcara-src"
+  git -C "$WORK/carcara-src" fetch --depth 1 origin "$CARCARA_COMMIT"
+  git -C "$WORK/carcara-src" checkout --detach "$CARCARA_COMMIT"
   ( cd "$WORK/carcara-src" && cargo build --release -p carcara-cli )
   mkdir -p "$HOME/.cargo/bin"
   cp -f "$WORK/carcara-src/target/release/carcara" "$CARCARA_BIN"
-  report carcara "built: $CARCARA_BIN"
+  report carcara "built ${CARCARA_COMMIT:0:12}: $CARCARA_BIN"
 }
 
 # --- lean (Lean4 proof replay) ---------------------------------------------

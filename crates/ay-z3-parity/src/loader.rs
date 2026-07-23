@@ -108,6 +108,12 @@ pub(crate) fn load_api(lib: &Library) -> Result<SolverApi, String> {
 /// certificate with each library's self-reported version string.
 type FullVersionFn = unsafe extern "C" fn() -> *const c_char;
 
+/// AY-specific stamped-build identity functions. Unlike
+/// `Z3_get_full_version`, `ay_version` returns an owned string which must be
+/// released with `ay_string_free`.
+type AyVersionFn = unsafe extern "C" fn() -> *mut c_char;
+type AyStringFreeFn = unsafe extern "C" fn(*mut c_char);
+
 /// Best-effort `Z3_get_full_version()` for an open library. `None` when the
 /// symbol is absent or returns NULL; version strings are metadata only and
 /// never affect verdicts.
@@ -122,6 +128,30 @@ pub(crate) fn full_version(lib: &Library) -> Option<String> {
             return None;
         }
         Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned())
+    }
+}
+
+/// Best-effort stamped AY build identity for an open AY FFI library.
+///
+/// Both symbols are required so an arbitrary library cannot make the probe
+/// leak memory by exporting `ay_version` without the matching ownership API.
+/// The scoreboard uses this identity to ensure its `ay solve --self-check`
+/// executable was built from the same clean source revision as the FFI
+/// artifact whose answers it is certifying.
+pub(crate) fn ay_build_stamp(lib: &Library) -> Option<String> {
+    // SAFETY: both symbols are AY's documented C API and are called at their
+    // exact signatures. `ay_version` returns a fresh allocation; we copy it
+    // before releasing it exactly once with the paired `ay_string_free`.
+    unsafe {
+        let version = lib.get::<AyVersionFn>(b"ay_version\0").ok()?;
+        let free = lib.get::<AyStringFreeFn>(b"ay_string_free\0").ok()?;
+        let ptr = version();
+        if ptr.is_null() {
+            return None;
+        }
+        let stamp = std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned();
+        free(ptr);
+        Some(stamp)
     }
 }
 

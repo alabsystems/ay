@@ -1218,12 +1218,256 @@ fn substr_with_out_of_usize_length_selects_the_whole_suffix() {
         Some(BigInt::from(-1))
     );
 }
-// ── Memoised concrete-membership evaluator (#re-eval-memo) ─────────
+// ── Derivative fast path + memoised fallback ───────────────────────
 //
-// The recursive-descent matcher tries every split point of every child and
-// recurses; without a memo the same `(node, substring)` sub-problem is asked
-// for exponentially many times. These pin BOTH halves of the fix: the answers
-// are unchanged, and the classic catastrophic-backtracking shapes now finish.
+// The exact shared translation is checked against the prior recursive
+// evaluator as a specification. Separate fallback tests keep pinning the memo
+// itself: if translation or derivative limits decline, recursive descent must
+// still terminate without changing an answer.
+
+#[test]
+fn derivative_translation_matches_recursive_fallback_spec() {
+    let mut terms = TermStore::new();
+
+    let none = mk_re_none(&mut terms);
+    let all = mk_re_all(&mut terms);
+    let allchar = mk_re_allchar(&mut terms);
+    let range = mk_re_range(&mut terms, "a", "z");
+    let reversed_range = mk_re_range(&mut terms, "z", "a");
+    let malformed_range = mk_re_range(&mut terms, "ab", "z");
+    let empty = mk_str_to_re(&mut terms, "");
+    let a = mk_str_to_re(&mut terms, "a");
+    let ab = mk_str_to_re(&mut terms, "ab");
+    let unicode = mk_str_to_re(&mut terms, "éλ");
+    let concat = mk_re_concat(&mut terms, vec![a, allchar]);
+    let union = mk_re_union(&mut terms, vec![ab, range]);
+    let inter = mk_re_inter(&mut terms, vec![all, union]);
+    let star = mk_re_star(&mut terms, union);
+    let plus = mk_re_plus(&mut terms, empty);
+    let opt = mk_re_opt(&mut terms, ab);
+    let comp = mk_re_comp(&mut terms, range);
+    let diff = mk_re_diff(&mut terms, all, ab);
+    let loop_small = mk_re_loop(&mut terms, opt, 2, 4);
+    let loop_counter = mk_re_loop(&mut terms, a, 13, 20);
+    let loop_degenerate = mk_re_loop(&mut terms, star, 4, 3);
+    let comp_degenerate = mk_re_comp(&mut terms, loop_degenerate);
+
+    let regexes = [
+        none,
+        all,
+        allchar,
+        range,
+        reversed_range,
+        malformed_range,
+        empty,
+        a,
+        ab,
+        unicode,
+        concat,
+        union,
+        inter,
+        star,
+        plus,
+        opt,
+        comp,
+        diff,
+        loop_small,
+        loop_counter,
+        loop_degenerate,
+        comp_degenerate,
+    ];
+    let subjects = ["", "a", "b", "ab", "aa", "az", "é", "éλ", "λé"];
+
+    for regex in regexes {
+        for subject in subjects {
+            let mut budget = RegexWorkBudget::unlimited();
+            let derivative =
+                RegExpSolver::evaluate_derivative_with_budget(&terms, subject, regex, &mut budget);
+            let fallback = RegExpSolver::evaluate_fallback(&terms, subject, regex);
+            assert!(!budget.exhausted, "unlimited derivative budget exhausted");
+            assert!(
+                derivative.is_some(),
+                "representative term failed exact translation: regex={regex:?}, subject={subject:?}"
+            );
+            assert_eq!(
+                derivative, fallback,
+                "derivative/fallback disagreement: regex={regex:?}, subject={subject:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn derivative_translation_limit_falls_back_without_losing_a_decision() {
+    let mut terms = TermStore::new();
+    let subject = "a".repeat(8 * 4096 + 8);
+    let regex = mk_str_to_re(&mut terms, &subject);
+    let mut budget = RegexWorkBudget::unlimited();
+
+    assert_eq!(
+        RegExpSolver::evaluate_derivative_with_budget(&terms, &subject, regex, &mut budget),
+        None,
+        "oversized exact translation must decline"
+    );
+    assert_eq!(
+        RegExpSolver::evaluate_fallback(&terms, &subject, regex),
+        Some(true)
+    );
+    assert_eq!(RegExpSolver::evaluate(&terms, &subject, regex), Some(true));
+}
+
+#[test]
+fn derivative_transient_expansion_is_preflighted_before_fallback() {
+    let mut terms = TermStore::new();
+    let allchar = mk_re_allchar(&mut terms);
+    let optional = mk_re_opt(&mut terms, allchar);
+    let regex = mk_re_concat(&mut terms, vec![optional; 80]);
+    let mut budget = RegexWorkBudget::unlimited();
+
+    // Deriving a concat of nullable children clones and derives every suffix.
+    // Its retained regex is small, but the candidate implementation could
+    // transiently construct a quadratic number of nodes before checking size.
+    assert_eq!(
+        RegExpSolver::evaluate_derivative_with_budget(&terms, "x", regex, &mut budget),
+        None,
+        "transient expansion above the structural cap must decline pre-allocation"
+    );
+    assert!(!budget.exhausted);
+    assert_eq!(
+        RegExpSolver::evaluate_fallback(&terms, "x", regex),
+        Some(true)
+    );
+    assert_eq!(RegExpSolver::evaluate(&terms, "x", regex), Some(true));
+}
+
+#[test]
+fn derivative_preflight_traversal_obeys_a_tiny_work_budget() {
+    let mut terms = TermStore::new();
+    let allchar = mk_re_allchar(&mut terms);
+    let optional = mk_re_opt(&mut terms, allchar);
+    let term = mk_re_concat(&mut terms, vec![optional; 80]);
+    let regex = crate::term_regex::translate(
+        &terms,
+        term,
+        &crate::term_regex::TranslateLimits::for_ground_eval(),
+    )
+    .expect("wide nullable concat translates within the retained-size cap");
+
+    let before = crate::regex_eval_work();
+    let mut budget = RegexWorkBudget::limited(1);
+    assert_eq!(
+        derivative_transient_bound(&regex, 4096, &mut budget),
+        None,
+        "preflight must stop before traversing a wide nullable concat"
+    );
+    assert!(budget.exhausted);
+    assert_eq!(crate::regex_eval_work().saturating_sub(before), 1);
+}
+
+#[test]
+fn derivative_fast_path_obeys_the_in_evaluator_work_budget() {
+    let mut terms = TermStore::new();
+    let regex = mk_str_to_re(&mut terms, "abcdefgh");
+    let before = crate::regex_eval_work();
+    assert_eq!(
+        RegExpSolver::evaluate(&terms, "abcdefgh", regex),
+        Some(true)
+    );
+    let exact_work = crate::regex_eval_work().saturating_sub(before);
+    assert!(
+        exact_work > 1,
+        "translation and derivatives must be charged"
+    );
+
+    assert_eq!(
+        RegExpSolver::evaluate_with_work_limit(&terms, "abcdefgh", regex, exact_work - 1),
+        Err(RegexWorkLimitExceeded)
+    );
+    assert_eq!(
+        RegExpSolver::evaluate_with_work_limit(&terms, "abcdefgh", regex, exact_work),
+        Ok(Some(true))
+    );
+}
+
+#[test]
+fn shared_translation_preserves_multi_witness_enumeration() {
+    use crate::we_regex::{find_witnesses_bounded, WeRegex};
+
+    let mut terms = TermStore::new();
+    let b = mk_str_to_re(&mut terms, "b");
+    let a = mk_str_to_re(&mut terms, "a");
+    let c = mk_str_to_re(&mut terms, "c");
+    let term = mk_re_union(&mut terms, vec![b, a, c]);
+    let translated = crate::term_regex::translate(
+        &terms,
+        term,
+        &crate::term_regex::TranslateLimits::for_ground_eval(),
+    )
+    .expect("ground union translates exactly");
+    let direct = WeRegex::union(vec![
+        WeRegex::lit("b"),
+        WeRegex::lit("a"),
+        WeRegex::lit("c"),
+    ]);
+
+    assert_eq!(
+        find_witnesses_bounded(&[translated], None, 2, 3),
+        find_witnesses_bounded(&[direct], None, 2, 3),
+        "centralizing translation must not perturb W7 witness order or count"
+    );
+}
+
+#[test]
+fn shared_translation_is_exact_or_bail_at_policy_boundaries() {
+    use crate::term_regex::{translate, TranslateLimits};
+    use crate::we_regex::WeRegex;
+
+    let mut terms = TermStore::new();
+    let a = mk_str_to_re(&mut terms, "a");
+    let large_loop = mk_re_loop(&mut terms, a, 13, 20);
+    let limits = TranslateLimits {
+        max_size: 64,
+        max_loop: 12,
+        bounded_loop_node: false,
+        max_depth: 32,
+    };
+    assert_eq!(
+        translate(&terms, large_loop, &limits),
+        None,
+        "a disallowed exact loop representation must bail, not approximate"
+    );
+
+    let x = terms.mk_var("x", Sort::String);
+    let non_ground = terms.mk_app(Symbol::named("str.to_re"), vec![x], Sort::RegLan);
+    assert_eq!(translate(&terms, non_ground, &limits), None);
+
+    // Preserve 54a8518a: lo > hi denotes the empty language without needing
+    // to inspect the body, even when that body is non-ground.
+    let degenerate = mk_re_loop(&mut terms, non_ground, 4, 3);
+    assert_eq!(translate(&terms, degenerate, &limits), Some(WeRegex::None));
+
+    let b = mk_str_to_re(&mut terms, "b");
+    let c = mk_str_to_re(&mut terms, "c");
+    let wide = mk_re_union(&mut terms, vec![a, b, c]);
+    let narrow_limits = TranslateLimits {
+        max_size: 2,
+        max_loop: 8,
+        bounded_loop_node: false,
+        max_depth: 32,
+    };
+    assert_eq!(
+        translate(&terms, wide, &narrow_limits),
+        None,
+        "source arity beyond the size policy must bail before reserving"
+    );
+    let epsilon = mk_str_to_re(&mut terms, "");
+    let over_capacity_loop = mk_re_loop(&mut terms, epsilon, 0, 3);
+    assert_eq!(
+        translate(&terms, over_capacity_loop, &narrow_limits),
+        None,
+        "loop unrolling beyond the size policy must bail before reserving"
+    );
+}
 
 /// `(a*)*` against a long all-`a` string that the trailing literal rejects —
 /// the textbook exponential blow-up. Unmemoised this does not terminate in any
@@ -1237,10 +1481,10 @@ fn nested_star_no_match_terminates() {
     let b = mk_str_to_re(&mut terms, "b");
     let r = mk_re_concat(&mut terms, vec![outer, b]);
     let s = "a".repeat(40);
-    assert_eq!(RegExpSolver::evaluate(&terms, &s, r), Some(false));
+    assert_eq!(RegExpSolver::evaluate_fallback(&terms, &s, r), Some(false));
     let mut yes = s.clone();
     yes.push('b');
-    assert_eq!(RegExpSolver::evaluate(&terms, &yes, r), Some(true));
+    assert_eq!(RegExpSolver::evaluate_fallback(&terms, &yes, r), Some(true));
 }
 
 /// `(a|aa)*` — every prefix has two decompositions, so the split tree is
@@ -1253,7 +1497,7 @@ fn ambiguous_star_alternation_terminates() {
     let u = mk_re_union(&mut terms, vec![a, aa]);
     let r = mk_re_star(&mut terms, u);
     assert_eq!(
-        RegExpSolver::evaluate(&terms, &"a".repeat(48), r),
+        RegExpSolver::evaluate_fallback(&terms, &"a".repeat(48), r),
         Some(true)
     );
 }
@@ -1272,16 +1516,16 @@ fn optional_chain_concat_lengths_are_exact() {
     children.push(lit);
     let r = mk_re_concat(&mut terms, children);
     // Up to 12 optional characters, then a mandatory "z".
-    assert_eq!(RegExpSolver::evaluate(&terms, "z", r), Some(true));
+    assert_eq!(RegExpSolver::evaluate_fallback(&terms, "z", r), Some(true));
     assert_eq!(
-        RegExpSolver::evaluate(&terms, &format!("{}z", "x".repeat(12)), r),
+        RegExpSolver::evaluate_fallback(&terms, &format!("{}z", "x".repeat(12)), r),
         Some(true)
     );
     assert_eq!(
-        RegExpSolver::evaluate(&terms, &format!("{}z", "x".repeat(13)), r),
+        RegExpSolver::evaluate_fallback(&terms, &format!("{}z", "x".repeat(13)), r),
         Some(false)
     );
-    assert_eq!(RegExpSolver::evaluate(&terms, "x", r), Some(false));
+    assert_eq!(RegExpSolver::evaluate_fallback(&terms, "x", r), Some(false));
 }
 
 /// `((_ re.loop 2 4) (re.opt allchar))` — the loop memo key must carry `lo`
@@ -1303,11 +1547,23 @@ fn loop_memo_key_distinguishes_bounds() {
         Sort::RegLan,
     );
     // 2..4 iterations of an optional char accept "", "x", "xx", "xxx", "xxxx".
-    assert_eq!(RegExpSolver::evaluate(&terms, "xxxx", r24), Some(true));
-    assert_eq!(RegExpSolver::evaluate(&terms, "xxxxx", r24), Some(false));
+    assert_eq!(
+        RegExpSolver::evaluate_fallback(&terms, "xxxx", r24),
+        Some(true)
+    );
+    assert_eq!(
+        RegExpSolver::evaluate_fallback(&terms, "xxxxx", r24),
+        Some(false)
+    );
     // Exactly 2 iterations cannot reach 3 characters.
-    assert_eq!(RegExpSolver::evaluate(&terms, "xx", r22), Some(true));
-    assert_eq!(RegExpSolver::evaluate(&terms, "xxx", r22), Some(false));
+    assert_eq!(
+        RegExpSolver::evaluate_fallback(&terms, "xx", r22),
+        Some(true)
+    );
+    assert_eq!(
+        RegExpSolver::evaluate_fallback(&terms, "xxx", r22),
+        Some(false)
+    );
 }
 
 /// The work counter is monotone and actually charged by an evaluation.
@@ -1337,11 +1593,11 @@ fn bounded_nullable_shared_dag_is_memoised_and_exact() {
     let exact = 2 * DEPTH + 2;
 
     assert_eq!(
-        RegExpSolver::evaluate_with_work_limit(&terms, "", plus, exact - 1),
+        RegExpSolver::evaluate_fallback_with_work_limit(&terms, "", plus, exact - 1),
         Err(RegexWorkLimitExceeded)
     );
     assert_eq!(
-        RegExpSolver::evaluate_with_work_limit(&terms, "", plus, exact),
+        RegExpSolver::evaluate_fallback_with_work_limit(&terms, "", plus, exact),
         Ok(Some(true))
     );
 }
@@ -1359,8 +1615,8 @@ fn memo_cap_fails_closed_before_uncached_work() {
     let before = crate::regex_eval_work();
 
     assert_eq!(
-        RegExpSolver::evaluate_with_budget(&terms, "aaaa", r, &mut budget),
-        Ok(None)
+        RegExpSolver::evaluate_fallback_with_budget(&terms, "aaaa", r, &mut budget),
+        None
     );
     assert_eq!(crate::regex_eval_work().saturating_sub(before), 1);
 }
@@ -1372,20 +1628,41 @@ fn bounded_regex_replacements_share_the_whole_operation_budget() {
     let mut terms = TermStore::new();
     let a = mk_str_to_re(&mut terms, "a");
 
+    let before_replace = crate::regex_eval_work();
     assert_eq!(
-        crate::ground_eval_replace_re_with_work_limit(&terms, "bbb", a, "x", 9),
+        crate::ground_eval_replace_re(&terms, "bbb", a, "x"),
+        Some("bbb".to_string())
+    );
+    let replace_work = crate::regex_eval_work().saturating_sub(before_replace);
+    assert!(replace_work > 1);
+    assert_eq!(
+        crate::ground_eval_replace_re_with_work_limit(&terms, "bbb", a, "x", replace_work - 1),
         Err(RegexWorkLimitExceeded)
     );
     assert_eq!(
-        crate::ground_eval_replace_re_with_work_limit(&terms, "bbb", a, "x", 10),
+        crate::ground_eval_replace_re_with_work_limit(&terms, "bbb", a, "x", replace_work),
         Ok(Some("bbb".to_string()))
     );
+
+    let before_replace_all = crate::regex_eval_work();
     assert_eq!(
-        crate::ground_eval_replace_re_all_with_work_limit(&terms, "aaaa", a, "x", 7),
+        crate::ground_eval_replace_re_all(&terms, "aaaa", a, "x"),
+        Some("xxxx".to_string())
+    );
+    let replace_all_work = crate::regex_eval_work().saturating_sub(before_replace_all);
+    assert!(replace_all_work > 1);
+    assert_eq!(
+        crate::ground_eval_replace_re_all_with_work_limit(
+            &terms,
+            "aaaa",
+            a,
+            "x",
+            replace_all_work - 1,
+        ),
         Err(RegexWorkLimitExceeded)
     );
     assert_eq!(
-        crate::ground_eval_replace_re_all_with_work_limit(&terms, "aaaa", a, "x", 8),
+        crate::ground_eval_replace_re_all_with_work_limit(&terms, "aaaa", a, "x", replace_all_work),
         Ok(Some("xxxx".to_string()))
     );
 }

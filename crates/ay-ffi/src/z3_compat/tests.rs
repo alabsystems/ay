@@ -777,35 +777,35 @@ fn test_z3_compat_null_safety() {
     }
 }
 
-/// ast_to_term(0) panics in debug mode (catches null sentinel early) (#5519)
 #[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "null Z3_ast")]
-fn test_ast_to_term_null_sentinel_debug() {
-    let _ = ast_to_term(0);
+fn checked_ast_to_term_rejects_null() {
+    unsafe {
+        let cfg = Z3_mk_config();
+        let ctx = Z3_mk_context(cfg);
+        Z3_del_config(cfg);
+        assert_eq!(checked_ast_to_term(&*ctx, 0), None);
+        Z3_del_context(ctx);
+    }
 }
 
-/// ast_to_term(0) returns Term(0) defensively in release mode (#5519)
-#[test]
-#[cfg(not(debug_assertions))]
-fn test_ast_to_term_null_sentinel_release() {
-    let term = ast_to_term(0);
-    assert_eq!(
-        term.to_raw(),
-        0,
-        "null Z3_ast should map to Term(0), not underflow"
-    );
-}
-
-/// Round-trip: term_to_ast and ast_to_term are inverses for valid terms
+/// Round-trip: context-salted ASTs decode to their live source terms.
 #[test]
 fn test_ast_term_roundtrip() {
-    for i in 0..10u32 {
-        let term = Term::from_raw(i);
-        let ast = term_to_ast(term);
-        assert_ne!(ast, 0, "valid term should not map to null Z3_ast");
-        let back = ast_to_term(ast);
-        assert_eq!(back.to_raw(), i, "round-trip failed for Term({i})");
+    unsafe {
+        let cfg = Z3_mk_config();
+        let ctx = Z3_mk_context(cfg);
+        Z3_del_config(cfg);
+        let terms = [
+            (*ctx).solver.bool_const(false),
+            (*ctx).solver.bool_const(true),
+            (*ctx).solver.int_const(7),
+        ];
+        for term in terms {
+            let ast = term_to_ast(&*ctx, term);
+            assert_ne!(ast, 0, "valid term should not map to null Z3_ast");
+            assert_eq!(checked_ast_to_term(&*ctx, ast), Some(term));
+        }
+        Z3_del_context(ctx);
     }
 }
 

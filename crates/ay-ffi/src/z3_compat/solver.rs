@@ -18,14 +18,15 @@ use ay_dpll::api::{
 use ay_frontend::Command;
 
 use super::{
-    apply_supported_params, ast_to_term, cache_ast_vector, cache_string,
+    apply_supported_params, cache_ast_vector, cache_string,
     ensure_cross_context_translation_semantics, ffi_count_within_limit, ffi_guard_ast,
     ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_uint, ffi_guard_void,
-    ffi_read_bounded_parser_file, ffi_read_bounded_parser_text, ffi_read_bounded_text, term_to_ast,
-    transfer_cross_context_ffi_metadata, DecisionOwnerFamily, ModelHandle, SolverCheckOutcome,
-    Z3Context, Z3SolverHandle, Z3_ast, Z3_ast_vector, Z3_context, Z3_func_decl, Z3_model,
-    Z3_params, Z3_solver, Z3_sort, Z3_string, Z3_symbol, Z3_EXCEPTION, Z3_INVALID_ARG,
-    Z3_INVALID_USAGE, Z3_L_FALSE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK,
+    ffi_read_bounded_parser_file, ffi_read_bounded_parser_text, ffi_read_bounded_text,
+    require_term_ast, require_term_asts, term_to_ast, transfer_cross_context_ffi_metadata,
+    DecisionOwnerFamily, ModelHandle, SolverCheckOutcome, Z3Context, Z3SolverHandle, Z3_ast,
+    Z3_ast_vector, Z3_context, Z3_func_decl, Z3_model, Z3_params, Z3_solver, Z3_sort, Z3_string,
+    Z3_symbol, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_FALSE, Z3_L_TRUE, Z3_L_UNDEF,
+    Z3_OK,
 };
 
 /// Translate a `VerifiedSolveResult` into the Z3 C API lbool return value,
@@ -319,7 +320,9 @@ pub unsafe extern "C" fn Z3_solver_assert(c: Z3_context, s: Z3_solver, a: Z3_ast
                 note_null_solver_handle(ctx, "Z3_solver_assert");
                 return;
             };
-            let term = ast_to_term(a);
+            let Some(term) = require_term_ast(ctx, a, "Z3_solver_assert", "formula") else {
+                return;
+            };
             // Same sort validation (and error text) as `Solver::try_assert_term`,
             // performed eagerly at assert time like the Z3 C API.
             let sort = ctx.solver.term_sort(term);
@@ -1139,9 +1142,11 @@ pub unsafe extern "C" fn Z3_solver_check_assumptions(
         };
     }
 
-    // Pre-extract assumption terms before entering the guard, since raw pointer
-    // dereferences need to happen in the unsafe extern "C" context.
-    let terms: Vec<_> = if num_assumptions == 0 {
+    // Pre-extract raw handles before entering the guard, since raw pointer
+    // dereferences need to happen in the unsafe extern "C" context. Decode
+    // only while holding the owning context so the salt and arena membership
+    // are authenticated before either solver path can consume an assumption.
+    let assumption_asts: Vec<_> = if num_assumptions == 0 {
         Vec::new()
     } else {
         (0..num_assumptions as usize)
@@ -1149,10 +1154,36 @@ pub unsafe extern "C" fn Z3_solver_check_assumptions(
             // least the declared number of elements. The count was range-checked above, and
             // null-checked before entering this block, so `assumptions.add(i)` stays within
             // the caller's allocation.
-            .map(|i| ast_to_term(unsafe { *assumptions.add(i) }))
+            .map(|i| unsafe { *assumptions.add(i) })
             .collect()
     };
     let has_assumptions = num_assumptions > 0;
+    let mut terms = None;
+    // SAFETY: `c` is valid-or-null by contract. The guard releases its borrow
+    // before the user-propagator path below is allowed to re-enter the API.
+    let decoded = unsafe {
+        ffi_guard_int(c, 0, |ctx| {
+            let Some(decoded) =
+                require_term_asts(ctx, &assumption_asts, "Z3_solver_check_assumptions")
+            else {
+                if let Some(handle) = s.as_mut() {
+                    let reason = ctx.error_msg.clone().unwrap_or_else(|| {
+                        "Z3_solver_check_assumptions: invalid assumption AST".to_string()
+                    });
+                    handle.clear_check_artifacts();
+                    handle.last_reason_unknown = Some(reason);
+                    handle.record_check_outcome(SolverCheckOutcome::Unknown);
+                }
+                return 0;
+            };
+            terms = Some(decoded);
+            1
+        })
+    };
+    if decoded == 0 {
+        return Z3_L_UNDEF;
+    }
+    let terms = terms.unwrap_or_default();
 
     // A handle with a registered user propagator runs the SOUND FINAL-CHECK
     // LOOP instead (SAT only after the user's final check raises no objection).
@@ -1334,7 +1365,12 @@ pub unsafe extern "C" fn Z3_solver_get_assertions(c: Z3_context, s: Z3_solver) -
                 note_null_solver_handle(ctx, "Z3_solver_get_assertions");
                 return ptr::null_mut();
             };
-            let asts = handle.assertions.iter().copied().map(term_to_ast).collect();
+            let asts = handle
+                .assertions
+                .iter()
+                .copied()
+                .map(|term| term_to_ast(ctx, term))
+                .collect();
             cache_ast_vector(ctx, asts)
         })
     }
@@ -1362,9 +1398,11 @@ pub unsafe extern "C" fn Z3_solver_get_unsat_core(c: Z3_context, s: Z3_solver) -
                 return ptr::null_mut();
             };
             let asts = match (handle.last_check_outcome, &handle.last_unsat_core) {
-                (Some(SolverCheckOutcome::Unsat), Some(terms)) => {
-                    terms.iter().copied().map(term_to_ast).collect()
-                }
+                (Some(SolverCheckOutcome::Unsat), Some(terms)) => terms
+                    .iter()
+                    .copied()
+                    .map(|term| term_to_ast(ctx, term))
+                    .collect(),
                 _ => Vec::new(),
             };
             cache_ast_vector(ctx, asts)
@@ -1435,7 +1473,10 @@ pub unsafe extern "C" fn Z3_parse_smtlib2_string(
             };
             let terms =
                 parse_solver_transaction(ctx, input, "Z3_parse_smtlib2_string").unwrap_or_default();
-            let asts = terms.into_iter().map(term_to_ast).collect();
+            let asts = terms
+                .into_iter()
+                .map(|term| term_to_ast(ctx, term))
+                .collect();
             cache_ast_vector(ctx, asts)
         })
     }
@@ -1482,8 +1523,15 @@ pub unsafe extern "C" fn Z3_solver_assert_and_track(
             }
             // SAFETY: null-checked above; arena-owned and single-threaded.
             let handle = &mut *s;
-            let a_term = ast_to_term(a);
-            let p_term = ast_to_term(p);
+            let Some(a_term) = require_term_ast(ctx, a, "Z3_solver_assert_and_track", "formula")
+            else {
+                return;
+            };
+            let Some(p_term) =
+                require_term_ast(ctx, p, "Z3_solver_assert_and_track", "tracking literal")
+            else {
+                return;
+            };
             // Precondition: `a` must be Boolean (same error text as assert).
             let a_sort = ctx.solver.term_sort(a_term);
             if a_sort != Sort::Bool {
@@ -1813,10 +1861,19 @@ pub unsafe extern "C" fn Z3_solver_get_consequences(
             // `base_original`/`vars_original` are what consequences are BUILT
             // from (faithful output terms); the `*_probe` twins are what the
             // engine actually solves (rec-def-expanded when definitions exist).
-            let mut base_original: Vec<Term> =
-                assumption_asts.iter().map(|&a| ast_to_term(a)).collect();
+            let Some(mut base_original) = require_term_asts(
+                ctx,
+                &assumption_asts,
+                "Z3_solver_get_consequences assumptions",
+            ) else {
+                return Z3_L_UNDEF;
+            };
             base_original.extend(tracked.iter().copied());
-            let vars_original: Vec<Term> = variable_asts.iter().map(|&a| ast_to_term(a)).collect();
+            let Some(vars_original) =
+                require_term_asts(ctx, &variable_asts, "Z3_solver_get_consequences variables")
+            else {
+                return Z3_L_UNDEF;
+            };
             let mut goal = goal;
             let mut base = base_original.clone();
             let mut vars_probe = vars_original.clone();
@@ -1923,7 +1980,7 @@ pub unsafe extern "C" fn Z3_solver_get_consequences(
                 probe.push(not_v);
                 if ctx.solver.check_sat_assuming(&probe).is_unsat() {
                     let cons = build_consequence(ctx, &base_original, v_orig);
-                    out.push(term_to_ast(cons));
+                    out.push(term_to_ast(ctx, cons));
                     continue;
                 }
                 // Forced false? `base ∧ v` is UNSAT.
@@ -1932,7 +1989,7 @@ pub unsafe extern "C" fn Z3_solver_get_consequences(
                 if ctx.solver.check_sat_assuming(&probe).is_unsat() {
                     let not_v_orig = ctx.solver.not(v_orig);
                     let cons = build_consequence(ctx, &base_original, not_v_orig);
-                    out.push(term_to_ast(cons));
+                    out.push(term_to_ast(ctx, cons));
                 }
             }
             // Append to the caller's consequences vector.
@@ -2014,7 +2071,7 @@ unsafe fn collect_literal_assertions(
         .iter()
         .copied()
         .filter(|&t| is_unit_literal(ctx, t) == keep_units)
-        .map(term_to_ast)
+        .map(|term| term_to_ast(ctx, term))
         .collect();
     cache_ast_vector(ctx, asts)
 }

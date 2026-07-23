@@ -468,7 +468,7 @@ fn render_index(
         String::new(),
         "## Final Copy Guardrail".to_string(),
         String::new(),
-        "Do not publish a public broad public-launch claim from this packet until `release-gate-summary.json` reports `status: pass`, `evidence_gate_failures: 0`, and `launch_blocker_count: 0`, and the public mirror evidence plus release manifest both name the exact release commit above. If any required artifact is missing, stale, or blocked, describe the packet as private or public-candidate evidence.".to_string(),
+        "Do not publish a broad public-launch claim from this packet until `release-gate-summary.json` reports `status: pass`, `evidence_gate_failures: 0`, and `launch_blocker_count: 0`, and the public mirror evidence plus release manifest both name the exact release commit above. If any required artifact is missing, stale, or blocked, describe the packet as private or public-candidate evidence.".to_string(),
         String::new(),
         "## Native Gate Replay".to_string(),
         String::new(),

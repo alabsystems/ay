@@ -293,4 +293,26 @@ theorem tester_node_leaf_excl {x : Tree} (h1 : isNode x = true) (h2 : x = leaf) 
 theorem tester_node_leaf_excl' {x : Tree} (h1 : isNode x = true) (h2 : leaf = x) :
     False := tester_node_leaf_excl h1 h2.symm
 
+/-! ## dt_residual_4 — `f³ = f` on a 2-element enum (kernel-verified refutation).
+
+    Integrated verbatim from the verified `F3.lean`: on a two-element enumeration,
+    every self-map `f` satisfies `f x = f (f (f x))`, so ay's dt_residual_4
+    conflict `f v1 = v2 ∧ f v1 ≠ f (f v2)` is unsatisfiable.  Axioms:
+    [propext] ⊆ {propext, Quot.sound}. -/
+
+namespace F3
+
+inductive En | c0 | c1 deriving DecidableEq
+
+/-- **f³ = f on a 2-element type.** Case on x, then f's values at both points. -/
+theorem f3_eq_f (f : En → En) (x : En) : f x = f (f (f x)) := by
+  cases x <;> cases hc0 : f En.c0 <;> cases hc1 : f En.c1 <;> simp_all
+
+/-- The dt_residual_4 conflict `f v1 = v2 ∧ f v1 ≠ f (f v2)` is unsat. -/
+theorem f3_conflict (f : En → En) (v1 v2 : En)
+    (h1 : f v1 = v2) (h2 : f v1 ≠ f (f v2)) : False := by
+  subst h1; exact h2 (f3_eq_f f v1)
+
+end F3
+
 end AySoundness.Datatype

@@ -137,3 +137,238 @@ fn unused_datatype_declaration_does_not_block_seq_route() {
         Some(UnknownReason::UnsupportedMixedCollection)
     );
 }
+
+/// Cross-theory model extraction can discover only after the LIA model is
+/// merged that two rows of a Seq-returning UF have the same argument tuple.
+/// The result tokens are opaque EUF representatives, so the collision repair
+/// must unify them just as it does Array-result tokens instead of discarding
+/// the otherwise-valid model as an unrepresentable compound conflict.
+#[test]
+#[timeout(60_000)]
+fn seq_result_uf_rows_congruent_after_lia_merge_keep_validated_sat_model() {
+    let mut solver = Solver::try_new(Logic::Auflia).unwrap();
+    let seq_sort = Sort::seq(Sort::Int);
+    let push = solver
+        .try_declare_fun(
+            "seq_push_back",
+            &[seq_sort.clone(), Sort::Int],
+            seq_sort.clone(),
+        )
+        .unwrap();
+    let len = solver
+        .try_declare_fun("seq_len", std::slice::from_ref(&seq_sort), Sort::Int)
+        .unwrap();
+
+    // Keep the reducer on verification-consumer's quantified AUFLIA lane: its Seq carrier
+    // is native, but all operations are UFs tied together by length axioms.
+    let bound_seq = solver.fresh_var("seq_result_bound", seq_sort.clone());
+    let bound_len = solver.try_apply(&len, &[bound_seq]).unwrap();
+    let zero = solver.int_const(0);
+    let nonnegative = solver.try_ge(bound_len, zero).unwrap();
+    let nonnegative_axiom = solver
+        .try_forall_with_triggers(&[bound_seq], nonnegative, &[&[bound_len]])
+        .unwrap();
+    solver.try_assert_term(nonnegative_axiom).unwrap();
+    let one = solver.int_const(1);
+
+    let empty = solver.declare_const("seq_empty", seq_sort.clone());
+    let x = solver.declare_const("seq_result_x", Sort::Int);
+    let seven = solver.int_const(7);
+    let at_x = solver.try_apply(&push, &[empty, x]).unwrap();
+    let at_seven = solver.try_apply(&push, &[empty, seven]).unwrap();
+    let empty_len = solver.try_apply(&len, &[empty]).unwrap();
+    let at_x_len = solver.try_apply(&len, &[at_x]).unwrap();
+    let at_seven_len = solver.try_apply(&len, &[at_seven]).unwrap();
+
+    let x_is_seven = solver.try_eq(x, seven).unwrap();
+    let empty_is_empty = solver.try_eq(empty_len, zero).unwrap();
+    let at_x_is_unit_len = solver.try_eq(at_x_len, one).unwrap();
+    let at_seven_is_unit_len = solver.try_eq(at_seven_len, one).unwrap();
+    solver.try_assert_term(x_is_seven).unwrap();
+    solver.try_assert_term(empty_is_empty).unwrap();
+    solver.try_assert_term(at_x_is_unit_len).unwrap();
+    solver.try_assert_term(at_seven_is_unit_len).unwrap();
+
+    let details = solver.check_sat_with_details();
+    assert!(
+        details.result.is_sat(),
+        "congruent Seq-result UF rows must keep the genuine SAT model: {details:?}"
+    );
+    assert!(
+        details.result.was_model_validated() && details.verification.sat_model_validated,
+        "the repaired Seq-result model must pass the full SAT validation funnel: {details:?}"
+    );
+}
+
+/// The Seq-token repair is recover-only: an explicit disequality between the
+/// now-congruent results is real evidence and must never be erased by choosing
+/// one opaque representative. The solver may prove UNSAT directly or fail
+/// closed if the cross-theory contradiction reaches only model validation.
+#[test]
+#[timeout(60_000)]
+fn seq_result_uf_rows_keep_explicit_disequality_fail_closed() {
+    let mut solver = Solver::try_new(Logic::Auflia).unwrap();
+    let seq_sort = Sort::seq(Sort::Int);
+    let push = solver
+        .try_declare_fun(
+            "seq_push_back",
+            &[seq_sort.clone(), Sort::Int],
+            seq_sort.clone(),
+        )
+        .unwrap();
+
+    let empty = solver.declare_const("seq_empty", seq_sort.clone());
+    let x = solver.declare_const("seq_result_diseq_x", Sort::Int);
+    let seven = solver.int_const(7);
+    let at_x = solver.try_apply(&push, &[empty, x]).unwrap();
+    let at_seven = solver.try_apply(&push, &[empty, seven]).unwrap();
+    let x_is_seven = solver.try_eq(x, seven).unwrap();
+    let results_differ = solver.try_neq(at_x, at_seven).unwrap();
+    solver.try_assert_term(x_is_seven).unwrap();
+    solver.try_assert_term(results_differ).unwrap();
+
+    let details = solver.check_sat_with_details();
+    assert!(
+        details.result.is_unsat() || details.result.is_unknown(),
+        "explicitly disequal results at one UF point must never validate SAT: {details:?}"
+    );
+    assert!(
+        !details.result.was_model_validated() && !details.verification.sat_model_validated,
+        "the explicit-disequality conflict must not mint SAT validation evidence: {details:?}"
+    );
+}
+
+/// Repairing congruent Seq-returning rows changes the model value used as an
+/// argument to downstream UFs. Their table keys were extracted before that
+/// repair, so the final function graph must be checked again: two observations
+/// of the now-identical Seq value cannot retain contradictory Int results.
+#[test]
+#[timeout(60_000)]
+fn seq_result_repair_keeps_downstream_uf_congruence_fail_closed() {
+    let mut solver = Solver::try_new(Logic::Auflia).unwrap();
+    let seq_sort = Sort::seq(Sort::Int);
+    let push = solver
+        .try_declare_fun(
+            "seq_push_back",
+            &[seq_sort.clone(), Sort::Int],
+            seq_sort.clone(),
+        )
+        .unwrap();
+    let len = solver
+        .try_declare_fun("seq_len", std::slice::from_ref(&seq_sort), Sort::Int)
+        .unwrap();
+
+    // Match the quantified AUFLIA route whose late LIA merge exposes the
+    // collision. The operations themselves remain UFs.
+    let bound_seq = solver.fresh_var("seq_result_conflict_bound", seq_sort.clone());
+    let bound_len = solver.try_apply(&len, &[bound_seq]).unwrap();
+    let zero = solver.int_const(0);
+    let nonnegative = solver.try_ge(bound_len, zero).unwrap();
+    let nonnegative_axiom = solver
+        .try_forall_with_triggers(&[bound_seq], nonnegative, &[&[bound_len]])
+        .unwrap();
+    solver.try_assert_term(nonnegative_axiom).unwrap();
+
+    let empty = solver.declare_const("seq_conflict_empty", seq_sort.clone());
+    let x = solver.declare_const("seq_result_conflict_x", Sort::Int);
+    let seven = solver.int_const(7);
+    let at_x = solver.try_apply(&push, &[empty, x]).unwrap();
+    let at_seven = solver.try_apply(&push, &[empty, seven]).unwrap();
+    let at_x_len = solver.try_apply(&len, &[at_x]).unwrap();
+    let at_seven_len = solver.try_apply(&len, &[at_seven]).unwrap();
+    let one = solver.int_const(1);
+    let two = solver.int_const(2);
+
+    let x_is_seven = solver.try_eq(x, seven).unwrap();
+    let at_x_is_one = solver.try_eq(at_x_len, one).unwrap();
+    let at_seven_is_two = solver.try_eq(at_seven_len, two).unwrap();
+    solver.try_assert_term(x_is_seven).unwrap();
+    solver.try_assert_term(at_x_is_one).unwrap();
+    solver.try_assert_term(at_seven_is_two).unwrap();
+
+    let details = solver.check_sat_with_details();
+    assert!(
+        details.result.is_unsat() || details.result.is_unknown(),
+        "downstream observations of congruent Seq results must never validate SAT: {details:?}"
+    );
+    assert!(
+        !details.result.was_model_validated() && !details.verification.sat_model_validated,
+        "a transitive Seq-result congruence conflict must not mint SAT evidence: {details:?}"
+    );
+}
+
+/// Congruent Seq-result rows may be unified only as an opaque model
+/// completion. Native sequence structure remains authoritative: repairing the
+/// row table must not erase incompatible contents or lengths, including on
+/// the quantified AUFLIA route where the generic non-string-Seq fail-close is
+/// intentionally narrower.
+#[test]
+#[timeout(60_000)]
+fn seq_result_uf_row_repair_preserves_native_sequence_conflicts() {
+    #[derive(Clone, Copy, Debug)]
+    enum NativeConflict {
+        DistinctUnits,
+        UnitVsEmpty,
+    }
+
+    for conflict in [NativeConflict::DistinctUnits, NativeConflict::UnitVsEmpty] {
+        let mut solver = Solver::try_new(Logic::Auflia).unwrap();
+        let seq_sort = Sort::seq(Sort::Int);
+        let push = solver
+            .try_declare_fun(
+                "native_seq_result",
+                &[seq_sort.clone(), Sort::Int],
+                seq_sort.clone(),
+            )
+            .unwrap();
+        let opaque_len = solver
+            .try_declare_fun(
+                "native_seq_result_len",
+                std::slice::from_ref(&seq_sort),
+                Sort::Int,
+            )
+            .unwrap();
+
+        // Preserve the quantified AUFLIA routing shape from the positive
+        // regression while constraining the result rows with native Seq terms.
+        let bound_seq = solver.fresh_var("native_seq_bound", seq_sort.clone());
+        let bound_len = solver.try_apply(&opaque_len, &[bound_seq]).unwrap();
+        let zero = solver.int_const(0);
+        let nonnegative = solver.try_ge(bound_len, zero).unwrap();
+        let axiom = solver
+            .try_forall_with_triggers(&[bound_seq], nonnegative, &[&[bound_len]])
+            .unwrap();
+        solver.try_assert_term(axiom).unwrap();
+
+        let input = solver.declare_const("native_seq_input", seq_sort);
+        let x = solver.declare_const("native_seq_key", Sort::Int);
+        let seven = solver.int_const(7);
+        let at_x = solver.try_apply(&push, &[input, x]).unwrap();
+        let at_seven = solver.try_apply(&push, &[input, seven]).unwrap();
+        let one = solver.int_const(1);
+        let two = solver.int_const(2);
+        let unit_one = solver.try_seq_unit(one).unwrap();
+        let incompatible = match conflict {
+            NativeConflict::DistinctUnits => solver.try_seq_unit(two).unwrap(),
+            NativeConflict::UnitVsEmpty => solver.seq_empty(Sort::Int),
+        };
+
+        let keys_coincide = solver.try_eq(x, seven).unwrap();
+        let first_value = solver.try_eq(at_x, unit_one).unwrap();
+        let second_value = solver.try_eq(at_seven, incompatible).unwrap();
+        solver.try_assert_term(keys_coincide).unwrap();
+        solver.try_assert_term(first_value).unwrap();
+        solver.try_assert_term(second_value).unwrap();
+
+        let details = solver.check_sat_with_details();
+        assert!(
+            details.result.is_unsat() || details.result.is_unknown(),
+            "native Seq conflict {conflict:?} at one UF point must never validate SAT: \
+             {details:?}"
+        );
+        assert!(
+            !details.result.was_model_validated() && !details.verification.sat_model_validated,
+            "native Seq conflict {conflict:?} must not mint SAT validation evidence: {details:?}"
+        );
+    }
+}

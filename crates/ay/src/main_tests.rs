@@ -478,6 +478,73 @@ fn test_bench_run_omitted_runs_uses_registry_default() {
 }
 
 #[test]
+fn test_bench_run_requires_complete_shard_pair() {
+    let missing_size = <Cli as Parser>::try_parse_from(strings(&[
+        "ay",
+        "bench",
+        "run",
+        "smt-smtcomp-qf-lia",
+        "--shard-index",
+        "0",
+    ]));
+    assert!(missing_size.is_err());
+
+    let missing_index = <Cli as Parser>::try_parse_from(strings(&[
+        "ay",
+        "bench",
+        "run",
+        "smt-smtcomp-qf-lia",
+        "--shard-size",
+        "64",
+    ]));
+    assert!(missing_index.is_err());
+}
+
+#[test]
+fn test_bench_run_preserves_shard_selection() {
+    let cli = <Cli as Parser>::try_parse_from(strings(&[
+        "ay",
+        "bench",
+        "run",
+        "smt-smtcomp-qf-lia",
+        "--shard-index",
+        "7",
+        "--shard-size",
+        "64",
+    ]))
+    .expect("parse bench run shard selection");
+
+    match cli.command {
+        Some(Command::Bench(cmd_bench::BenchCommand::Run {
+            shard_index,
+            shard_size,
+            ..
+        })) => {
+            assert_eq!(shard_index, Some(7));
+            assert_eq!(shard_size, Some(64));
+        }
+        _ => panic!("unexpected command"),
+    }
+}
+
+#[test]
+fn test_bench_run_rejects_out_of_range_shard_size() {
+    for size in ["0", "4097"] {
+        let parsed = <Cli as Parser>::try_parse_from(strings(&[
+            "ay",
+            "bench",
+            "run",
+            "smt-smtcomp-qf-lia",
+            "--shard-index",
+            "0",
+            "--shard-size",
+            size,
+        ]));
+        assert!(parsed.is_err(), "accepted shard size {size}");
+    }
+}
+
+#[test]
 fn test_preprocess_preserves_launch_gate_subcommand() {
     let raw = strings(&[
         "ay",

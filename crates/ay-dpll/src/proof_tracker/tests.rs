@@ -179,6 +179,69 @@ fn test_theory_lemma() {
 }
 
 #[test]
+fn certified_singleton_theory_lemma_is_reused_as_solver_assumption() {
+    let mut tracker = ProofTracker::new();
+    tracker.enable();
+    tracker.set_theory("arrays");
+    let packed_row = TermId(17);
+
+    let lemma = tracker
+        .add_theory_lemma_with_kind(
+            vec![packed_row],
+            TheoryLemmaKind::ArraySelectStore { index_eq: false },
+        )
+        .expect("proof tracking enabled");
+    let registered = tracker
+        .add_assumption(packed_row, None)
+        .expect("proof tracking enabled");
+
+    assert_eq!(registered, lemma);
+    assert_eq!(tracker.num_steps(), 1);
+    assert!(matches!(
+        tracker.proof.get_step(lemma),
+        Some(ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::ArraySelectStore { index_eq: false },
+            ..
+        })
+    ));
+}
+
+#[test]
+fn scoped_singleton_alias_preserves_outer_generic_lemma() {
+    let mut tracker = ProofTracker::new();
+    tracker.enable();
+    tracker.set_theory("arrays");
+    let packed_axiom = TermId(18);
+
+    let outer = tracker
+        .add_theory_lemma(vec![packed_axiom])
+        .expect("proof tracking enabled");
+    tracker.push();
+    let inner = tracker
+        .add_theory_lemma_with_kind(
+            vec![packed_axiom],
+            TheoryLemmaKind::ArraySelectStore { index_eq: true },
+        )
+        .expect("proof tracking enabled");
+    assert_ne!(inner, outer);
+    assert!(tracker.pop());
+
+    let registered = tracker
+        .add_assumption(packed_axiom, None)
+        .expect("proof tracking enabled");
+    assert_eq!(registered, outer);
+    assert_eq!(tracker.num_steps(), 1);
+    assert_internal_id_invariants(&tracker);
+    assert!(matches!(
+        tracker.proof.get_step(outer),
+        Some(ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::Generic,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn test_uncertified_arithmetic_kind_records_generic_8866() {
     let mut tracker = ProofTracker::new();
     tracker.enable();
@@ -245,11 +308,62 @@ fn test_reset() {
 fn test_take_proof() {
     let mut tracker = ProofTracker::new();
     tracker.enable();
-    tracker.add_assumption(TermId(1), None);
+    let first_id = tracker.add_assumption(TermId(1), None);
 
     let proof = tracker.take_proof();
     assert_eq!(proof.len(), 1);
     assert_eq!(tracker.num_steps(), 0);
+
+    let second_id = tracker.add_assumption(TermId(1), None);
+    assert_eq!(second_id, first_id);
+    assert_eq!(
+        tracker.num_steps(),
+        1,
+        "a term from the taken proof must be recorded in the new ledger"
+    );
+    assert!(matches!(
+        tracker.take_proof().steps.as_slice(),
+        [ProofStep::Assume(TermId(1))]
+    ));
+}
+
+#[test]
+fn test_take_proof_clears_singleton_lemma_dedup() {
+    let mut tracker = ProofTracker::new();
+    tracker.enable();
+    tracker.set_theory("arrays");
+    let packed_row = TermId(19);
+
+    let first_id = tracker
+        .add_theory_lemma_with_kind(
+            vec![packed_row],
+            TheoryLemmaKind::ArraySelectStore { index_eq: false },
+        )
+        .expect("proof tracking enabled");
+    let first = tracker.take_proof();
+    assert!(matches!(
+        first.get_step(first_id),
+        Some(ProofStep::TheoryLemma {
+            kind: TheoryLemmaKind::ArraySelectStore { index_eq: false },
+            ..
+        })
+    ));
+
+    let second_id = tracker
+        .add_theory_lemma_with_kind(
+            vec![packed_row],
+            TheoryLemmaKind::ArraySelectStore { index_eq: false },
+        )
+        .expect("the new ledger must record the singleton again");
+    assert_eq!(second_id, ProofId(0));
+    assert_eq!(tracker.num_steps(), 1);
+    assert_eq!(
+        tracker.add_assumption(packed_row, None),
+        Some(second_id),
+        "solver registration must reuse the new ledger's real lemma step"
+    );
+    assert_eq!(tracker.num_steps(), 1);
+    assert_internal_id_invariants(&tracker);
 }
 
 // -- Push/pop scoping tests (#4534) --
@@ -547,11 +661,11 @@ fn test_push_pop_proof_isolation() {
     // Simulate check-sat producing a proof and taking it
     let proof_1 = tracker.take_proof();
     assert_eq!(proof_1.len(), 2);
-    // After take_proof, the tracker's proof is empty but maps have entries
+    // After take_proof, the tracker starts a coherent empty ledger.
 
     // --- Pop scope 1 ---
     tracker.pop();
-    // After pop, the stale map entries from scope 1 are removed
+    // Pop remains balanced even though take_proof zeroed the scope watermark.
 
     // --- Scope 2: assert B (no push needed if this is the outer scope) ---
     // Reset for the new check-sat (as the executor does)

@@ -25,16 +25,18 @@
 //! 2. every candidate conjunct of the failing head predicate that concretely
 //!    evaluates to FALSE under that model is dropped from the CANDIDATE
 //!    (frames are untouched);
-//! 3. repeat, bounded by `MAX_REPAIR_ROUNDS` per call and
+//! 3. immediately run the full strict verifier on the weakened candidate,
+//!    before observing cancellation at another search boundary;
+//! 4. repeat, bounded by `MAX_REPAIR_ROUNDS` per call and
 //!    `MAX_REPAIR_ROUNDS_PER_SOLVE` per solve.
 //!
 //! SOUNDNESS: repair only ever REMOVES conjuncts from an invariant
 //! CANDIDATE, i.e. weakens it — it can never manufacture a false Safe. The
-//! repaired candidate is returned to `finish_safe_or_continue`, which runs
-//! the full unmodified strict validation gate (`finish_safe_with_result_trace`,
-//! #9227) before any Safe leaves the solver. A candidate weakened below the
-//! safety threshold simply fails the query-clause check there and demotes
-//! exactly as before. The strict checker itself is never loosened.
+//! result type can only be constructed after the full unmodified fresh-context
+//! strict gate succeeds. A candidate weakened below the safety threshold
+//! simply fails that gate and demotes exactly as before. The strict checker
+//! itself is never loosened, and it still observes the existing solve deadline
+//! and cancellation token.
 
 use super::{ChcExpr, ChcOp, InvariantModel, PdrSolver, PredicateId};
 use crate::expr::evaluate_expr;
@@ -49,20 +51,66 @@ pub(crate) const MAX_REPAIR_ROUNDS: usize = 8;
 /// unbounded sequence of full strict verifications.
 pub(crate) const MAX_REPAIR_ROUNDS_PER_SOLVE: usize = 32;
 
+pub(in crate::pdr::solver) type CandidateValidationFailure =
+    (PredicateId, ChcExpr, PredicateId, ChcExpr);
+
+/// A repaired candidate that already passed fresh-context strict verification.
+///
+/// Keeping this wrapper private to the PDR solver prevents a caller from
+/// publishing a merely weakened candidate without the mandatory recheck.
+pub(in crate::pdr::solver) struct StrictlyVerifiedRepair(InvariantModel);
+
+impl StrictlyVerifiedRepair {
+    pub(in crate::pdr::solver) fn into_model(self) -> InvariantModel {
+        self.0
+    }
+}
+
 impl PdrSolver {
+    fn strict_candidate_validation_failure(
+        &mut self,
+        model: &InvariantModel,
+    ) -> Option<CandidateValidationFailure> {
+        let previous_strict_proofs = self.config.strict_proofs;
+        self.config.strict_proofs = true;
+        let failure = self.verify_model_fresh_with_failure(model);
+        self.config.strict_proofs = previous_strict_proofs;
+        failure
+    }
+
     /// Try to repair a strictly-demoted Safe candidate by dropping the
     /// conjuncts falsified by the verifier's concrete counterexamples.
     ///
-    /// Returns `Some(repaired_model)` when a bounded number of rounds reaches
-    /// a candidate that passes strict per-rule verification AND at least one
-    /// conjunct was actually dropped (an unmodified pass means the earlier
-    /// demotion came from budget noise — the caller's normal retry paths
-    /// handle that). Returns `None` when the candidate is not repairable this
-    /// way; the caller keeps the pre-existing demotion flow.
+    /// The standalone entry point obtains its own initial teacher failure.
+    /// Production demotion handling uses
+    /// [`repair_demoted_candidate_after_failure`](Self::repair_demoted_candidate_after_failure)
+    /// to reuse the failure from the mandatory publication gate.
+    #[cfg(test)]
     pub(in crate::pdr::solver) fn repair_demoted_candidate(
         &mut self,
+        model: InvariantModel,
+    ) -> Option<StrictlyVerifiedRepair> {
+        if self.is_cancelled() {
+            return None;
+        }
+        let failure = self.strict_candidate_validation_failure(&model)?;
+        self.repair_demoted_candidate_after_failure(model, failure)
+    }
+
+    /// Repair a candidate using the failure already produced by the strict
+    /// publication gate.
+    ///
+    /// Every mutation is followed immediately by a fresh-context strict
+    /// recheck. There is deliberately no cancellation check between weakening
+    /// the candidate and invoking that verifier: the verifier itself observes
+    /// the unchanged deadline/token and fails closed, while avoiding the old
+    /// race where cancellation at the next loop boundary skipped the recheck
+    /// entirely.
+    pub(in crate::pdr::solver) fn repair_demoted_candidate_after_failure(
+        &mut self,
         mut model: InvariantModel,
-    ) -> Option<InvariantModel> {
+        mut failure: CandidateValidationFailure,
+    ) -> Option<StrictlyVerifiedRepair> {
         // The array-scalarized flow validates through a dedicated verifier on
         // the original problem; keep it on the pre-existing path.
         if !self.array_scalarization_maps.is_empty() {
@@ -75,7 +123,6 @@ impl PdrSolver {
             return None;
         }
 
-        let mut repaired_any = false;
         let mut dropped_optimistic_fallback = false;
         for _round in 0..MAX_REPAIR_ROUNDS {
             if self.is_cancelled()
@@ -83,20 +130,7 @@ impl PdrSolver {
             {
                 return None;
             }
-            self.candidate_repair_rounds_used += 1;
-
-            // Teacher step: strict per-rule verification with failure info,
-            // under the same strict_proofs setting as the final gate.
-            let previous_strict_proofs = self.config.strict_proofs;
-            self.config.strict_proofs = true;
-            let failure = self.verify_model_fresh_with_failure(&model);
-            self.config.strict_proofs = previous_strict_proofs;
-
-            let Some((_body_pred, _pre_state, fail_pred, cex_state)) = failure else {
-                // Verified. Only report success if we actually changed the
-                // candidate — the final strict gate re-verifies regardless.
-                return repaired_any.then_some(model);
-            };
+            let (_body_pred, _pre_state, fail_pred, cex_state) = failure;
 
             // Learner step: drop exactly the concretely-falsified conjuncts.
             let dropped =
@@ -134,7 +168,15 @@ impl PdrSolver {
             // evidence justified these flags; fail closed to full validation.
             model.individually_inductive = false;
             model.convergence_proven = false;
-            repaired_any = true;
+
+            // Recheck the modified candidate immediately. The strict verifier
+            // observes the same global deadline and cancellation token, so this
+            // cannot extend the solve budget. `None` is the verified outcome.
+            self.candidate_repair_rounds_used += 1;
+            match self.strict_candidate_validation_failure(&model) {
+                None => return Some(StrictlyVerifiedRepair(model)),
+                Some(next_failure) => failure = next_failure,
+            }
         }
         None
     }

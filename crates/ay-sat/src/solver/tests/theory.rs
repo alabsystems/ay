@@ -52,6 +52,667 @@ fn test_add_theory_lemma_discards_tautology_after_dedup() {
 }
 
 #[test]
+fn test_batched_all_false_theory_lemmas_preserve_every_conflict_fifo() {
+    let mut solver = Solver::new(3);
+    let x0 = Literal::positive(Variable(0));
+    let x1 = Literal::positive(Variable(1));
+    let x2 = Literal::positive(Variable(2));
+
+    for decision in [x0, x1, x2] {
+        solver.decide(decision);
+        solver.qhead = solver.trail.len();
+    }
+    assert_eq!(solver.decision_level, 3);
+
+    let first = solver
+        .add_theory_lemma(vec![x0.negated(), x1.negated()])
+        .expect("first all-false theory lemma");
+    let second = solver
+        .add_theory_lemma(vec![x0.negated(), x2.negated()])
+        .expect("second all-false theory lemma");
+
+    assert_eq!(
+        solver.pending_theory_conflicts.len(),
+        2,
+        "a theory batch must not overwrite an earlier live conflict",
+    );
+    assert_eq!(solver.take_pending_theory_conflict(), Some(first));
+    assert_eq!(solver.take_pending_theory_conflict(), Some(second));
+    assert_eq!(solver.take_pending_theory_conflict(), None);
+}
+
+#[test]
+fn test_all_false_unit_theory_lemma_is_queued_at_nonzero_level() {
+    let mut solver = Solver::new(1);
+    let x0 = Literal::positive(Variable(0));
+
+    solver.decide(x0);
+    solver.qhead = solver.trail.len();
+
+    let conflict_ref = solver
+        .add_theory_lemma(vec![x0.negated()])
+        .expect("all-false unit theory lemma");
+
+    assert_eq!(
+        solver.take_live_pending_theory_conflict(),
+        Some(conflict_ref),
+        "a callback may ignore add_theory_lemma's return value, so every \
+         immediately falsified non-root theory lemma must enter the queue",
+    );
+}
+
+#[test]
+fn test_unassigned_nonroot_theory_unit_is_installed_at_root_and_persists() {
+    let mut solver = Solver::new(2);
+    let decision = Literal::positive(Variable(0));
+    let unit = Literal::positive(Variable(1));
+
+    solver.decide(decision);
+    solver.qhead = solver.trail.len();
+    let unit_ref = solver
+        .add_theory_lemma(vec![unit])
+        .expect("unassigned non-root unit must be stored");
+    assert_eq!(solver.var_level(unit.variable()), Some(1));
+
+    assert_eq!(
+        solver.take_live_pending_theory_conflict(),
+        Some(unit_ref),
+        "current-level enqueue alone is not durable; root work must be queued",
+    );
+    solver.analyze_and_backtrack(unit_ref, "unassigned queued theory unit", |_, _| {});
+    assert_eq!(solver.var_level(unit.variable()), Some(0));
+    assert_eq!(
+        solver.search_propagate(),
+        None,
+        "the installed root unit must reach BCP quiescence before a decision",
+    );
+
+    solver.decide(decision);
+    solver.backtrack(0);
+    assert_eq!(
+        solver.lit_value(unit),
+        Some(true),
+        "a later backtrack must preserve the root theory unit",
+    );
+
+    assert!(solver.add_clause(vec![unit.negated()]));
+    assert!(
+        solver.solve().into_inner().is_unsat(),
+        "the installed theory unit must forbid its negation",
+    );
+}
+
+#[test]
+fn test_true_nonroot_theory_unit_is_stored_and_promoted_to_root() {
+    let mut solver = Solver::new(2);
+    let unit = Literal::positive(Variable(0));
+    let later_decision = Literal::positive(Variable(1));
+
+    solver.decide(unit);
+    solver.qhead = solver.trail.len();
+    let unit_ref = solver
+        .add_theory_lemma(vec![unit])
+        .expect("true-above-root unit must not be treated as permanently satisfied");
+
+    assert_eq!(
+        solver.take_live_pending_theory_conflict(),
+        Some(unit_ref),
+        "a true non-root unit remains mandatory root work",
+    );
+    solver.analyze_and_backtrack(unit_ref, "true non-root theory unit", |_, _| {});
+
+    assert_eq!(solver.var_level(unit.variable()), Some(0));
+    let clause_id = solver.clause_id(unit_ref);
+    assert_ne!(clause_id, 0);
+    assert_eq!(
+        solver.unit_proof_id[unit.variable().index()],
+        clause_id,
+        "root promotion must preserve the arena theory clause's trace ID",
+    );
+    assert_eq!(
+        solver.search_propagate(),
+        None,
+        "the promoted root unit must reach BCP quiescence before a decision",
+    );
+
+    solver.decide(later_decision);
+    solver.backtrack(0);
+    let model = match solver.solve().into_inner() {
+        SatResult::Sat(model) => model,
+        other => panic!("promoted true unit should remain SAT, got {other:?}"),
+    };
+    assert!(model[unit.variable().index()]);
+    assert_eq!(solver.var_level(unit.variable()), Some(0));
+}
+
+#[test]
+fn test_callback_false_unit_becomes_root_fact_with_or_without_chrono() {
+    for chrono_enabled in [true, false] {
+        let mut solver = Solver::new(2);
+        let x0 = Literal::positive(Variable(0));
+        let x1 = Literal::positive(Variable(1));
+        assert!(solver.add_clause(vec![x0, x1]));
+        solver.set_phase(x0.variable(), true);
+        solver.set_phase(x1.variable(), true);
+        solver.set_chrono_enabled(chrono_enabled);
+
+        let mut injected_unit = None;
+        let result = solver
+            .solve_with_theory(|solver| {
+                if injected_unit.is_none() && solver.current_decision_level() > 0 {
+                    let assigned = *solver
+                        .trail()
+                        .last()
+                        .expect("a non-root callback must see an assigned literal");
+                    let unit = assigned.negated();
+                    solver.add_theory_lemma(vec![unit]);
+                    injected_unit = Some(unit);
+                }
+                TheoryPropResult::Continue
+            })
+            .into_inner();
+
+        let unit = injected_unit.expect("the callback must inject a false unit");
+        let model = match result {
+            SatResult::Sat(model) => model,
+            other => panic!(
+                "false unit callback should re-search to SAT with chrono={chrono_enabled}, \
+                 got {other:?}",
+            ),
+        };
+        assert_eq!(
+            model[unit.variable().index()],
+            unit.is_positive(),
+            "the returned model must satisfy the theory unit",
+        );
+        assert_eq!(
+            solver.var_level(unit.variable()),
+            Some(0),
+            "a global unit theory axiom must remain fixed at level 0",
+        );
+    }
+}
+
+#[test]
+fn test_callback_unit_theory_propagation_is_installed_at_root() {
+    let mut solver = Solver::new(3);
+    let x0 = Literal::positive(Variable(0));
+    let unit = Literal::positive(Variable(1));
+    let x2 = Literal::positive(Variable(2));
+    assert!(solver.add_clause(vec![x0, x2]));
+    solver.set_phase(x0.variable(), true);
+
+    let mut injected = false;
+    let result = solver
+        .solve_with_theory(|solver| {
+            if !injected && solver.current_decision_level() > 0 && solver.lit_value(unit).is_none()
+            {
+                solver.add_theory_propagation(vec![unit], unit);
+                injected = true;
+            }
+            TheoryPropResult::Continue
+        })
+        .into_inner();
+
+    assert!(
+        injected,
+        "the callback must add the unit propagation above root"
+    );
+    let model = match result {
+        SatResult::Sat(model) => model,
+        other => panic!("unit theory propagation should remain SAT, got {other:?}"),
+    };
+    assert!(model[unit.variable().index()]);
+    assert_eq!(
+        solver.var_level(unit.variable()),
+        Some(0),
+        "length-1 theory propagation must survive callback-aware backtracking",
+    );
+}
+
+#[test]
+fn test_false_unit_behind_earlier_conflict_is_not_discarded_after_backtrack() {
+    let mut solver = Solver::new(3);
+    let x0 = Literal::positive(Variable(0));
+    let x1 = Literal::positive(Variable(1));
+    let x2 = Literal::positive(Variable(2));
+
+    for decision in [x0, x1, x2] {
+        solver.decide(decision);
+        solver.qhead = solver.trail.len();
+    }
+
+    let first = solver
+        .add_theory_lemma(vec![x0.negated(), x1.negated()])
+        .expect("earlier all-false theory conflict");
+    let unit = solver
+        .add_theory_lemma(vec![x2.negated()])
+        .expect("later false theory unit");
+
+    assert_eq!(solver.take_live_pending_theory_conflict(), Some(first));
+    solver.analyze_and_backtrack(first, "queued conflict before unit", |_, _| {});
+    assert_eq!(
+        solver.lit_value(x2),
+        None,
+        "the earlier conflict must retract the unit's opposite assignment",
+    );
+
+    assert_eq!(
+        solver.take_live_pending_theory_conflict(),
+        Some(unit),
+        "an active queued unit remains actionable after becoming unassigned",
+    );
+    solver.analyze_and_backtrack(unit, "queued unit after conflict", |_, _| {});
+    assert_eq!(solver.lit_value(x2.negated()), Some(true));
+    assert_eq!(solver.var_level(x2.variable()), Some(0));
+}
+
+#[test]
+fn test_solve_loop_installs_unassigned_unit_tail_after_head_backtracks_to_root() {
+    let mut solver = Solver::new(3);
+    solver.set_preprocess_enabled(false);
+    solver.disable_all_inprocessing();
+    solver.set_chrono_enabled(false);
+
+    let x0 = Literal::positive(Variable(0));
+    let x1 = Literal::positive(Variable(1));
+    let x2 = Literal::positive(Variable(2));
+    assert!(solver.add_clause(vec![x0.negated(), x1]));
+    assert!(solver.add_clause(vec![x0.negated(), x2]));
+    solver.set_phase(x0.variable(), true);
+
+    let mut injected = false;
+    let result = solver
+        .solve_with_theory(|solver| {
+            if !injected
+                && solver.current_decision_level() == 1
+                && solver.lit_value(x0) == Some(true)
+                && solver.lit_value(x1) == Some(true)
+                && solver.lit_value(x2) == Some(true)
+            {
+                solver.add_theory_lemma(vec![x0.negated(), x1.negated()]);
+                solver.add_theory_lemma(vec![x2.negated()]);
+                injected = true;
+            }
+            TheoryPropResult::Continue
+        })
+        .into_inner();
+
+    assert!(injected, "the callback must queue the head and unit tail");
+    let model = match result {
+        SatResult::Sat(model) => model,
+        other => panic!("root-drained unit tail must not cause false UNSAT, got {other:?}"),
+    };
+    assert!(!model[x0.variable().index()]);
+    assert!(!model[x2.variable().index()]);
+    assert_eq!(
+        solver.var_level(x2.variable()),
+        Some(0),
+        "the unit tail must be installed directly when queue drain reaches level 0",
+    );
+}
+
+#[test]
+fn test_scoped_assumption_path_processes_false_unit_with_or_without_chrono() {
+    for chrono_enabled in [true, false] {
+        let mut solver = Solver::new(1);
+        let x0 = Literal::positive(Variable(0));
+        solver.push();
+        assert!(solver.add_clause(vec![x0]));
+        solver.set_chrono_enabled(chrono_enabled);
+
+        let mut injected = false;
+        let scoped_result = solver
+            .solve_with_theory(|solver| {
+                if !injected
+                    && solver.current_decision_level() > 0
+                    && solver.lit_value(x0) == Some(true)
+                {
+                    solver.add_theory_lemma(vec![x0.negated()]);
+                    injected = true;
+                }
+                TheoryPropResult::Continue
+            })
+            .into_inner();
+
+        assert!(injected, "the scoped callback must inject its global unit");
+        assert!(
+            scoped_result.is_unsat(),
+            "the active scope requires x0 while the theory unit requires !x0 \
+             (chrono={chrono_enabled})",
+        );
+        assert!(solver.pop());
+
+        let base_result = solver.solve().into_inner();
+        let model = match base_result {
+            SatResult::Sat(model) => model,
+            other => panic!(
+                "after pop the base formula plus global theory unit must be SAT \
+                 (chrono={chrono_enabled}), got {other:?}",
+            ),
+        };
+        assert!(
+            !model[x0.variable().index()],
+            "the unscoped theory unit must survive pop (chrono={chrono_enabled})",
+        );
+        assert_eq!(
+            solver.var_level(x0.variable()),
+            Some(0),
+            "the surviving theory unit must remain a root fact (chrono={chrono_enabled})",
+        );
+    }
+}
+
+#[test]
+fn test_plain_theory_unit_and_multi_clause_survive_pop() {
+    let x0 = Literal::positive(Variable(0));
+
+    let mut unit_solver = Solver::new(1);
+    unit_solver.push();
+    let unit_ref = unit_solver
+        .add_theory_lemma(vec![x0.negated()])
+        .expect("plain theory unit");
+    assert_eq!(unit_solver.arena.scope_lim(unit_ref.index()), 0);
+    assert!(unit_solver.pop());
+    assert!(
+        unit_solver.arena.is_active(unit_ref.index()),
+        "plain theory unit must not be collected with the surrounding user scope",
+    );
+    let unit_model = match unit_solver.solve().into_inner() {
+        SatResult::Sat(model) => model,
+        other => panic!("global theory unit should remain satisfiable after pop, got {other:?}"),
+    };
+    assert!(!unit_model[x0.variable().index()]);
+
+    let mut clause_solver = Solver::new(2);
+    let x1 = Literal::positive(Variable(1));
+    clause_solver.push();
+    let clause_ref = clause_solver
+        .add_theory_lemma(vec![x0.negated(), x1.negated()])
+        .expect("plain multi-literal theory clause");
+    assert_eq!(clause_solver.arena.scope_lim(clause_ref.index()), 0);
+    assert!(clause_solver.pop());
+    assert!(
+        clause_solver.arena.is_active(clause_ref.index()),
+        "plain multi-literal theory clause must survive pop",
+    );
+    clause_solver.qhead = clause_solver.trail.len();
+    clause_solver.decide(x0);
+    assert_eq!(
+        clause_solver.propagate(),
+        None,
+        "surviving global theory clause should propagate rather than conflict",
+    );
+    assert_eq!(
+        clause_solver.lit_value(x1),
+        Some(false),
+        "the live global clause (!x0 | !x1) must propagate !x1 after deciding x0",
+    );
+}
+
+#[test]
+fn test_queued_theory_unit_preserves_clause_trace_id() {
+    let mut solver = Solver::new(2);
+    solver.enable_clause_trace();
+    let decision = Literal::positive(Variable(0));
+    let unit = Literal::positive(Variable(1));
+    solver.decide(decision);
+    solver.qhead = solver.trail.len();
+
+    let unit_ref = solver
+        .add_theory_lemma(vec![unit])
+        .expect("queued clause-trace theory unit");
+    let clause_id = solver.clause_id(unit_ref);
+    assert_ne!(clause_id, 0);
+    assert_eq!(
+        solver.unit_proof_id[unit.variable().index()],
+        clause_id,
+        "clause-trace mode has no separate proof-manager addition ID",
+    );
+
+    assert_eq!(solver.take_live_pending_theory_conflict(), Some(unit_ref),);
+    solver.analyze_and_backtrack(unit_ref, "clause-trace theory unit", |_, _| {});
+    assert_eq!(
+        solver.unit_proof_id[unit.variable().index()],
+        clause_id,
+        "root installation must retain the arena ID recorded in the clause trace",
+    );
+}
+
+#[test]
+fn test_queued_theory_unit_preserves_lrat_axiom_id_fallback() {
+    let proof = ProofOutput::lrat_text(Vec::<u8>::new(), 0);
+    let mut solver = Solver::with_proof_output(2, proof);
+    let decision = Literal::positive(Variable(0));
+    let unit = Literal::positive(Variable(1));
+    solver.decide(decision);
+    solver.qhead = solver.trail.len();
+
+    let unit_ref = solver
+        .add_theory_lemma(vec![unit])
+        .expect("queued LRAT Axiom theory unit");
+    let clause_id = solver.clause_id(unit_ref);
+    assert_ne!(clause_id, 0);
+    assert_eq!(
+        solver.unit_proof_id[unit.variable().index()],
+        clause_id,
+        "suppressed LRAT Axiom emission returns zero, so provenance falls back to the arena ID",
+    );
+
+    assert_eq!(solver.take_live_pending_theory_conflict(), Some(unit_ref),);
+    solver.analyze_and_backtrack(unit_ref, "LRAT Axiom theory unit", |_, _| {});
+    assert_eq!(
+        solver.unit_proof_id[unit.variable().index()],
+        clause_id,
+        "root installation must preserve the LRAT Axiom fallback ID",
+    );
+}
+
+#[test]
+fn test_queued_theory_unit_preserves_hidden_lrat_trusted_transform_id() {
+    let proof = ProofOutput::lrat_text(Vec::<u8>::new(), 0);
+    let mut solver = Solver::with_proof_output(2, proof);
+    solver.set_extension_trusted_lemmas(true);
+    let decision = Literal::positive(Variable(0));
+    let unit = Literal::positive(Variable(1));
+    solver.decide(decision);
+    solver.qhead = solver.trail.len();
+
+    let unit_ref = solver
+        .add_theory_lemma(vec![unit])
+        .expect("queued LRAT TrustedTransform theory unit");
+    let clause_id = solver.clause_id(unit_ref);
+    let emitted_id = solver.unit_proof_id[unit.variable().index()];
+    assert_ne!(clause_id, 0);
+    assert_ne!(emitted_id, 0);
+    assert_ne!(
+        emitted_id, clause_id,
+        "hidden LRAT TrustedTransform additions reserve a distinct proof-manager ID",
+    );
+    assert!(
+        !solver.lrat_hint_id_visible(emitted_id),
+        "the distinct TrustedTransform ID must remain hidden from serialized LRAT hints",
+    );
+
+    assert_eq!(solver.take_live_pending_theory_conflict(), Some(unit_ref),);
+    solver.analyze_and_backtrack(unit_ref, "LRAT TrustedTransform theory unit", |_, _| {});
+    assert_eq!(
+        solver.unit_proof_id[unit.variable().index()],
+        emitted_id,
+        "root installation must not replace the hidden emitted ID with the arena ID",
+    );
+}
+
+#[test]
+fn test_pending_theory_conflict_tail_defers_flush_until_drained() {
+    let mut solver = Solver::new(3);
+    let x0 = Literal::positive(Variable(0));
+    let x1 = Literal::positive(Variable(1));
+    let x2 = Literal::positive(Variable(2));
+
+    for decision in [x0, x1, x2] {
+        solver.decide(decision);
+        solver.qhead = solver.trail.len();
+    }
+
+    let head = solver
+        .add_theory_lemma(vec![x1.negated(), x2.negated()])
+        .expect("head all-false theory lemma");
+    let tail = solver
+        .add_theory_lemma(vec![x0.negated(), x1.negated()])
+        .expect("tail all-false theory lemma");
+    let tail_idx = tail.index();
+    let deletable_lbd = solver.tiers.tier2_lbd[0].saturating_add(1);
+    solver.arena.set_lbd(head.index(), deletable_lbd);
+    solver.arena.set_lbd(tail_idx, deletable_lbd);
+    solver.cold.next_flush = 0;
+
+    assert_eq!(solver.take_live_pending_theory_conflict(), Some(head));
+    solver.analyze_and_backtrack(head, "queued theory head", |_, _| {});
+
+    let reductions_before = solver.cold.num_reductions;
+    assert!(!solver.should_reduce_db());
+    solver.reduce_db();
+    assert_eq!(
+        solver.cold.num_reductions, reductions_before,
+        "flush must be deferred while a queued tail owns a ClauseRef",
+    );
+    assert!(
+        solver.arena.is_active(tail_idx),
+        "the tail must survive the deferred flush",
+    );
+    assert_eq!(
+        solver.take_live_pending_theory_conflict(),
+        Some(tail),
+        "the queued tail must remain available for conflict analysis",
+    );
+    solver.analyze_and_backtrack(tail, "queued theory tail", |_, _| {});
+
+    solver.reduce_db();
+    assert_eq!(
+        solver.cold.num_reductions,
+        reductions_before + 1,
+        "reduction may resume after the final queued conflict is consumed",
+    );
+    assert!(
+        solver.arena.is_active(tail_idx),
+        "the analyzed tail is now a live reason and remains protected",
+    );
+}
+
+#[test]
+fn test_deleted_pending_ref_is_not_vacuously_live() {
+    let mut solver = Solver::new(2);
+    let x0 = Literal::positive(Variable(0));
+    let x1 = Literal::positive(Variable(1));
+
+    for decision in [x0, x1] {
+        solver.decide(decision);
+        solver.qhead = solver.trail.len();
+    }
+    let conflict_ref = solver
+        .add_theory_lemma(vec![x0.negated(), x1.negated()])
+        .expect("all-false theory lemma");
+
+    // Model a stale ClauseRef left by any deletion path that bypassed the
+    // queue-owner guard. ClauseArena::delete leaves an empty arena slot, and
+    // `Iterator::all` over that empty literal slice must not revive it.
+    solver.arena.delete(conflict_ref.index());
+
+    assert_eq!(
+        solver.take_live_pending_theory_conflict(),
+        None,
+        "an inactive arena slot is not a live conflict",
+    );
+}
+
+#[test]
+fn test_stale_pending_head_cannot_hide_a_later_live_conflict() {
+    let mut solver = Solver::new(3);
+    let x0 = Literal::positive(Variable(0));
+    let x1 = Literal::positive(Variable(1));
+    let x2 = Literal::positive(Variable(2));
+
+    for decision in [x0, x1, x2] {
+        solver.decide(decision);
+        solver.qhead = solver.trail.len();
+    }
+
+    let stale_after_backtrack = solver
+        .add_theory_lemma(vec![x0.negated(), x2.negated()])
+        .expect("conflict that becomes stale");
+    let still_live = solver
+        .add_theory_lemma(vec![x0.negated(), x1.negated()])
+        .expect("conflict that remains live");
+    assert_ne!(stale_after_backtrack, still_live);
+
+    solver.backtrack(2);
+    assert_eq!(solver.lit_value(x2), None);
+    assert_eq!(solver.lit_value(x0), Some(true));
+    assert_eq!(solver.lit_value(x1), Some(true));
+
+    assert_eq!(
+        solver.take_live_pending_theory_conflict(),
+        Some(still_live),
+        "stale queue heads must be drained before BCP or a new decision",
+    );
+    assert!(
+        solver.pending_theory_conflicts.is_empty(),
+        "the stale head and returned live conflict must both be consumed",
+    );
+}
+
+#[test]
+fn test_nonchrono_fifo_conflict_below_current_level_researches_safely() {
+    let mut solver = Solver::new(3);
+    solver.set_preprocess_enabled(false);
+    solver.disable_all_inprocessing();
+    solver.set_chrono_enabled(false);
+
+    let x0 = Literal::positive(Variable(0));
+    let x1 = Literal::positive(Variable(1));
+    let x2 = Literal::positive(Variable(2));
+    assert!(solver.add_clause(vec![x0, x1, x2]));
+    for lit in [x0, x1, x2] {
+        solver.set_phase(lit.variable(), true);
+    }
+
+    let mut injected = false;
+    let result = solver
+        .solve_with_theory(|solver| {
+            if !injected && solver.current_decision_level() == 3 {
+                solver.add_theory_lemma(vec![x0.negated(), x1.negated()]);
+                solver.add_theory_lemma(vec![x0.negated(), x2.negated()]);
+                solver.add_theory_lemma(vec![x2.negated()]);
+                injected = true;
+            }
+            TheoryPropResult::Continue
+        })
+        .into_inner();
+
+    assert!(
+        injected,
+        "the callback must create the FIFO batch at level 3"
+    );
+    let model = match result {
+        SatResult::Sat(model) => model,
+        other => panic!("non-chrono fallback should re-search to SAT, got {other:?}"),
+    };
+    assert!(
+        !model[0] || !model[1],
+        "model must satisfy the lower-level head theory lemma",
+    );
+    assert!(
+        !model[0] || !model[2],
+        "model must satisfy the queued tail theory lemma",
+    );
+    assert!(
+        !model[2],
+        "a tail unit made unassigned by the head's root fallback must be installed, not reported UNSAT",
+    );
+}
+
+#[test]
 fn test_lazy_reason_materialization_rejects_literals_above_survivor_level() {
     use crate::extension::{ExtPropagateResult, Extension, SolverContext};
 
@@ -176,17 +837,19 @@ fn test_add_theory_lemma_scoped_conflicts_immediately_and_pops_8785() {
     assert!(solver.add_clause(vec![q]));
     assert!(matches!(solver.solve().into_inner(), SatResult::Sat(_)));
 
-    let added = solver.add_theory_lemma_scoped(vec![p, q.negated()]);
-    assert!(
-        added.is_some(),
-        "scoped theory lemma should enter the watched theory path"
-    );
+    let added = solver
+        .add_theory_lemma_scoped(vec![p, q.negated()])
+        .expect("scoped theory lemma should enter the watched theory path");
     assert!(
         solver.solve().into_inner().is_unsat(),
         "already-falsified scoped theory lemma must block the cached assignment"
     );
 
     assert!(solver.pop());
+    assert!(
+        !solver.arena.is_active(added.index()),
+        "the selector-guarded scoped wrapper must still be reclaimed after pop",
+    );
     assert!(
         matches!(solver.solve().into_inner(), SatResult::Sat(_)),
         "scoped theory lemma must be disabled after pop"

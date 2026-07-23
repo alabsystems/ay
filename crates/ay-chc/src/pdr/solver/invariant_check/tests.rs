@@ -4,6 +4,7 @@
 
 #![allow(clippy::unwrap_used)]
 use super::*;
+use crate::pdr::frame::PdrResult;
 use crate::pdr::model::{InvariantModel, PredicateInterpretation};
 use crate::pdr::PdrConfig;
 use crate::{ChcExpr, ChcParser, ChcSort, ChcVar};
@@ -528,6 +529,40 @@ fn pred_id_by_name(solver: &PdrSolver, name: &str) -> crate::PredicateId {
         .id
 }
 
+fn bouncy_poisoned_model(solver: &PdrSolver) -> (InvariantModel, crate::PredicateId, ChcExpr) {
+    let itp1 = pred_id_by_name(solver, "itp1");
+    let itp2 = pred_id_by_name(solver, "itp2");
+    let vars1: Vec<ChcVar> = solver.canonical_vars(itp1).expect("vars").to_vec();
+    let vars2: Vec<ChcVar> = solver.canonical_vars(itp2).expect("vars").to_vec();
+
+    // itp1 := (a1 = 0) AND (a0 = a2) — the true invariant.
+    let itp1_formula = ChcExpr::and(
+        ChcExpr::eq(ChcExpr::var(vars1[1].clone()), ChcExpr::int(0)),
+        ChcExpr::eq(
+            ChcExpr::var(vars1[0].clone()),
+            ChcExpr::var(vars1[2].clone()),
+        ),
+    );
+    // itp2 := (a0 = a1 + a2) AND (a0 <= 0) — true invariant plus the exact
+    // optimistically-admitted poison shape observed on bouncy (#4751 L4).
+    let itp2_good = ChcExpr::eq(
+        ChcExpr::var(vars2[0].clone()),
+        ChcExpr::add(
+            ChcExpr::var(vars2[1].clone()),
+            ChcExpr::var(vars2[2].clone()),
+        ),
+    );
+    let itp2_poison = ChcExpr::le(ChcExpr::var(vars2[0].clone()), ChcExpr::int(0));
+
+    let mut model = InvariantModel::new();
+    model.set(itp1, PredicateInterpretation::new(vars1, itp1_formula));
+    model.set(
+        itp2,
+        PredicateInterpretation::new(vars2, ChcExpr::and(itp2_good, itp2_poison.clone())),
+    );
+    (model, itp2, itp2_poison)
+}
+
 #[test]
 fn assignment_from_state_conjunction_extracts_constant_equalities() {
     let cube = ChcExpr::and_all([
@@ -600,36 +635,7 @@ fn drop_falsified_candidate_conjuncts_drops_exactly_the_poison() {
 fn repair_demoted_candidate_recovers_a_verifiable_model_from_poison() {
     let problem = ChcParser::parse(BOUNCY_STYLE_PROGRAM).expect("bouncy-style program parses");
     let mut solver = PdrSolver::new(problem, PdrConfig::default().with_verbose(true));
-    let itp1 = pred_id_by_name(&solver, "itp1");
-    let itp2 = pred_id_by_name(&solver, "itp2");
-    let vars1: Vec<ChcVar> = solver.canonical_vars(itp1).expect("vars").to_vec();
-    let vars2: Vec<ChcVar> = solver.canonical_vars(itp2).expect("vars").to_vec();
-
-    // itp1 := (a1 = 0) AND (a0 = a2) — the true invariant.
-    let itp1_formula = ChcExpr::and(
-        ChcExpr::eq(ChcExpr::var(vars1[1].clone()), ChcExpr::int(0)),
-        ChcExpr::eq(
-            ChcExpr::var(vars1[0].clone()),
-            ChcExpr::var(vars1[2].clone()),
-        ),
-    );
-    // itp2 := (a0 = a1 + a2) AND (a0 <= 0) — true invariant plus the exact
-    // optimistically-admitted poison shape observed on bouncy (#4751 L4).
-    let itp2_good = ChcExpr::eq(
-        ChcExpr::var(vars2[0].clone()),
-        ChcExpr::add(
-            ChcExpr::var(vars2[1].clone()),
-            ChcExpr::var(vars2[2].clone()),
-        ),
-    );
-    let itp2_poison = ChcExpr::le(ChcExpr::var(vars2[0].clone()), ChcExpr::int(0));
-
-    let mut model = InvariantModel::new();
-    model.set(itp1, PredicateInterpretation::new(vars1, itp1_formula));
-    model.set(
-        itp2,
-        PredicateInterpretation::new(vars2, ChcExpr::and(itp2_good, itp2_poison.clone())),
-    );
+    let (model, itp2, itp2_poison) = bouncy_poisoned_model(&solver);
 
     // Pre-repair the poisoned candidate must FAIL strict validation...
     assert!(
@@ -640,7 +646,12 @@ fn repair_demoted_candidate_recovers_a_verifiable_model_from_poison() {
     // ...and counterexample-guided repair must recover a verified candidate.
     let repaired = solver
         .repair_demoted_candidate(model)
-        .expect("repair should converge on the bouncy-style poison");
+        .expect("repair should converge on the bouncy-style poison")
+        .into_model();
+    assert_eq!(
+        solver.candidate_repair_rounds_used, 1,
+        "the one weakening round must include its immediate strict recheck"
+    );
     assert!(
         !repaired
             .get(&itp2)
@@ -653,5 +664,32 @@ fn repair_demoted_candidate_recovers_a_verifiable_model_from_poison() {
     assert!(
         solver.verify_model_fresh(&repaired),
         "repaired candidate must pass the unmodified strict gate"
+    );
+}
+
+#[test]
+fn finish_safe_or_continue_reuses_failure_and_publishes_checked_repair() {
+    let problem = ChcParser::parse(BOUNCY_STYLE_PROGRAM).expect("bouncy-style program parses");
+    let mut solver = PdrSolver::new(problem, PdrConfig::default());
+    let (model, itp2, poison) = bouncy_poisoned_model(&solver);
+
+    let result = solver
+        .finish_safe_or_continue(model, "candidate-repair regression")
+        .expect("the repaired candidate is a terminal verified result");
+    let PdrResult::Safe(repaired) = result else {
+        panic!("strictly repaired candidate must publish Safe");
+    };
+    assert_eq!(
+        solver.candidate_repair_rounds_used, 1,
+        "the publication failure must be reused; only the repaired model is rechecked"
+    );
+    assert!(
+        !repaired
+            .get(&itp2)
+            .expect("itp2 interpretation")
+            .formula
+            .collect_conjuncts()
+            .contains(&poison),
+        "the published, strictly checked model must not contain the poison"
     );
 }

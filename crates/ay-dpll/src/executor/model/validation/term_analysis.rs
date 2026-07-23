@@ -2061,7 +2061,7 @@ impl Executor {
                 }
                 TermData::Var(name, _) => {
                     // Internal variable check: solver-generated Skolem witnesses
-                    // (extensionality __ext_diff_*, store decomposition __ay_*)
+                    // (extensionality/store decomposition `__ay_*`)
                     // should be treated as internal for model validation (#6731).
                     //
                     // EXCEPTION (inc-14): `__ay_eqdv!*` difference variables
@@ -2081,7 +2081,7 @@ impl Executor {
                     // supplied no hard constraints, every relaxation clause
                     // mentions one, and skipping them all degrades a genuine SAT
                     // to Unknown via the "all assertions skipped" rejection.
-                    if (name.starts_with("__ext_diff_") || name.starts_with("__ay_"))
+                    if name.starts_with("__ay_")
                         && !name.starts_with("__ay_eqdv")
                         && !name.starts_with("__ay_soft_")
                     {

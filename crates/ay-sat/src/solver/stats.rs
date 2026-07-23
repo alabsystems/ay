@@ -2218,14 +2218,147 @@ impl Solver {
         self.has_empty_clause
     }
 
-    /// Take and clear the pending theory conflict, if any (#6262).
+    /// Pop the oldest pending theory conflict, if any (#6262).
     ///
-    /// Returns `Some(clause_ref)` if `add_theory_lemma` detected a clause where
-    /// both watched literals are false at level > 0. BCP cannot discover this
-    /// conflict through normal watch propagation, so the main solve loop must
-    /// handle it explicitly.
+    /// Returns `Some(clause_ref)` for immediately false clauses and mandatory
+    /// non-root unit work queued by `add_theory_lemma`. BCP cannot rediscover
+    /// an all-false watched conflict through a future watch event, and units
+    /// must be installed at root before they can be considered consumed. A
+    /// callback may queue multiple entries in one batch, so callers must
+    /// continue draining until the queue is empty.
     pub fn take_pending_theory_conflict(&mut self) -> Option<ClauseRef> {
-        self.pending_theory_conflict.take()
+        self.pending_theory_conflicts.pop_front()
+    }
+
+    /// Whether the pending-conflict queue still owns this arena reference.
+    ///
+    /// Queue entries are short-lived, so a linear scan avoids another
+    /// allocation in the solver state. The empty-queue common case is O(1).
+    #[inline]
+    pub(super) fn is_pending_theory_conflict_clause(&self, clause_idx: usize) -> bool {
+        self.pending_theory_conflicts
+            .iter()
+            .any(|conflict_ref| conflict_ref.index() == clause_idx)
+    }
+
+    /// Consume any proof-manager ID retained for a queued theory unit.
+    ///
+    /// LRAT `TrustedTransform` additions reserve a hidden ID that intentionally
+    /// differs from the arena clause ID. Other modes have no distinct emitted
+    /// ID, so the arena ID is the correct clause-trace provenance.
+    fn record_theory_unit_proof_id(&mut self, unit_ref: ClauseRef, unit: Literal) {
+        let retained_id = self
+            .pending_theory_unit_proof_ids
+            .iter()
+            .position(|(pending_ref, _)| *pending_ref == unit_ref)
+            .map(|position| self.pending_theory_unit_proof_ids.swap_remove(position).1);
+        let var_idx = unit.variable().index();
+        let existing_id = self.unit_proof_id.get(var_idx).copied().unwrap_or(0);
+        let existing_sign = self.unit_proof_sign.get(var_idx).copied().unwrap_or(0);
+        let proof_id = retained_id
+            .or_else(|| {
+                (existing_id != 0 && existing_sign == unit.sign_i8()).then_some(existing_id)
+            })
+            .unwrap_or_else(|| self.clause_id(unit_ref));
+        if proof_id != 0 {
+            self.record_unit_proof_id_for_lit(unit, proof_id);
+        }
+    }
+
+    fn discard_theory_unit_proof_id(&mut self, unit_ref: ClauseRef) {
+        if let Some(position) = self
+            .pending_theory_unit_proof_ids
+            .iter()
+            .position(|(pending_ref, _)| *pending_ref == unit_ref)
+        {
+            self.pending_theory_unit_proof_ids.swap_remove(position);
+        }
+    }
+
+    /// Install an active length-1 theory clause as a root fact.
+    ///
+    /// Requires decision level 0. Returns `false` only when the unit is
+    /// contradicted by an existing root assignment; callers must then process
+    /// the ClauseRef as a genuine level-0 conflict. A successful installation
+    /// also preserves the arena clause ID for LRAT/clause-trace unit chains.
+    pub(super) fn install_theory_unit_at_root(&mut self, unit_ref: ClauseRef) -> bool {
+        debug_assert_eq!(
+            self.decision_level, 0,
+            "install_theory_unit_at_root requires decision level 0",
+        );
+        let unit_idx = unit_ref.index();
+        debug_assert_eq!(self.arena.len_of(unit_idx), 1);
+        let unit = self.arena.literal(unit_idx, 0);
+        if self.lit_val(unit) < 0 {
+            return false;
+        }
+
+        let var_idx = unit.variable().index();
+        if self.lit_val(unit) == 0 {
+            self.enqueue(unit, None);
+        } else {
+            debug_assert_eq!(
+                self.var_data[var_idx].level, 0,
+                "true theory unit must already be assigned at root",
+            );
+        }
+        if !self.var_lifecycle.is_inactive(var_idx) && !self.var_lifecycle.is_fixed(var_idx) {
+            self.fixed_count += 1;
+            self.var_lifecycle.mark_fixed(var_idx);
+            self.l0_gc_dirty[var_idx] = true;
+        }
+        self.record_theory_unit_proof_id(unit_ref, unit);
+        true
+    }
+
+    /// Pop the oldest theory conflict that is still live under the current
+    /// assignment, discarding every stale queue head first (#8480).
+    ///
+    /// Backtracking after an earlier queued conflict may make later clauses
+    /// non-conflicting. Conversely, a stale head must never hide a later live
+    /// conflict long enough for BCP or a new decision to run. Centralizing the
+    /// drain loop keeps all solve entry points on that invariant.
+    pub(crate) fn take_live_pending_theory_conflict(&mut self) -> Option<ClauseRef> {
+        while let Some(conflict_ref) = self.take_pending_theory_conflict() {
+            let conflict_idx = conflict_ref.index();
+            // Deleted entries have a zero literal length, for which `all`
+            // would be vacuously true. Garbage-kept husks retain literals but
+            // are no longer clauses in the live formula. Neither can be
+            // handed to conflict analysis.
+            if !self.arena.is_active(conflict_idx) || self.arena.is_garbage_any(conflict_idx) {
+                self.discard_theory_unit_proof_id(conflict_ref);
+                continue;
+            }
+            if self.arena.len_of(conflict_idx) == 1 {
+                let unit = self.arena.literal(conflict_idx, 0);
+                let unit_is_root_fact =
+                    self.lit_val(unit) > 0 && self.var_data[unit.variable().index()].level == 0;
+                if unit_is_root_fact {
+                    self.record_theory_unit_proof_id(conflict_ref, unit);
+                    continue;
+                }
+                if self.decision_level == 0 {
+                    if self.install_theory_unit_at_root(conflict_ref) {
+                        continue;
+                    }
+                    // Only a genuinely false root unit is a conflict.
+                    return Some(conflict_ref);
+                }
+                // A unit may become unassigned (or true only above root) while
+                // an earlier queued conflict is analyzed. It remains mandatory
+                // callback-aware root work and must not be discarded as stale.
+                return Some(conflict_ref);
+            }
+            let still_conflict = self
+                .arena
+                .literals(conflict_idx)
+                .iter()
+                .all(|&lit| self.lit_val(lit) < 0);
+            if still_conflict {
+                return Some(conflict_ref);
+            }
+        }
+        None
     }
 
     /// Debug: dump all unit clauses in the arena as DIMACS literals.
@@ -2310,7 +2443,8 @@ impl Solver {
         self.has_empty_clause = false;
         self.cold.empty_clause_in_proof = false;
         self.cold.empty_clause_lrat_id = None;
-        self.pending_theory_conflict = None;
+        self.pending_theory_conflicts.clear();
+        self.pending_theory_unit_proof_ids.clear();
     }
 
     /// Dump all active clauses in DIMACS format to a file (debug only).

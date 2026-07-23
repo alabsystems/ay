@@ -1,0 +1,5 @@
+c Canary SAT benchmark: simplest possible satisfiable formula.
+c Satisfiable with x1=true, x2=true.
+p cnf 2 2
+1 2 0
+-1 2 0

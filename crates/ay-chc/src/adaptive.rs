@@ -743,7 +743,19 @@ impl AdaptivePortfolio {
     /// REQUIRES: `problem` is a valid ChcProblem with at least one clause.
     ///
     /// ENSURES: Returns a solver ready to invoke `solve()`.
-    pub fn new(problem: ChcProblem, config: AdaptiveConfig) -> Self {
+    pub fn new(mut problem: ChcProblem, config: AdaptiveConfig) -> Self {
+        // Strip provably-dead-end predicates (no path to any query) when — and
+        // only when — that removes the sole dependency cycle blocking the
+        // complete bounded acyclic-BMC lane. Sound because a predicate that
+        // cannot reach the query never contributes to a query derivation, so
+        // dropping its defining clauses is verdict-preserving. Done here, at
+        // the single portfolio chokepoint, so the pruned problem flows
+        // consistently into classification, every engine lane, and the final
+        // certificate-discharge check (`solver.problem()`). A no-op for all
+        // problems outside the acyclic-modulo-dead-end class (see
+        // `strip_dead_end_cycle_predicates`).
+        problem.strip_dead_end_cycle_predicates();
+
         // Part of #6047: keep the original (non-scalarized) problem for PDR,
         // which has native array MBP support and doesn't need scalarization.
         // Scalarize a separate copy for engines that need it (Kind, TRL, TPA).

@@ -618,6 +618,48 @@ fn test_warm_cache_disequalities_update_assignment_indices_incrementally() {
 }
 
 #[test]
+fn test_fresh_same_name_vars_keep_distinct_affine_identity() {
+    let mut store = TermStore::new();
+    let x1 = store.mk_fresh_named_var("x", Sort::Int);
+    let x2 = store.mk_fresh_named_var("x", Sort::Int);
+    assert_ne!(
+        x1, x2,
+        "fresh named variables must retain distinct internal identities"
+    );
+
+    let opaque_arg = store.mk_var("opaque_arg", Sort::Int);
+    let opaque = store.mk_app(
+        Symbol::named("opaque_index_leaf"),
+        vec![opaque_arg],
+        Sort::Int,
+    );
+    let index1 = store.mk_app(Symbol::named("+"), vec![x1, opaque], Sort::Int);
+    let index2 = store.mk_app(Symbol::named("+"), vec![x2, opaque], Sort::Int);
+
+    let solver = ArraySolver::new(&store);
+    assert!(
+        !solver.equal_by_affine_form(x1, x2),
+        "same visible name must not erase fresh declaration identity"
+    );
+    assert_eq!(
+        solver.explain_equal_if_provable(x1, x2),
+        None,
+        "distinct fresh declarations have no equality explanation"
+    );
+    assert_eq!(
+        solver.explain_equal_if_provable(index1, index2),
+        None,
+        "affine leaf congruence must preserve fresh declaration identity"
+    );
+
+    let partition = solver.index_conflict_partition(&[index1, index2]);
+    assert_ne!(
+        partition[&index1], partition[&index2],
+        "unrelated mixed opaque indices may remain in distinct conflict blocks"
+    );
+}
+
+#[test]
 fn test_late_registered_true_equality_avoids_full_assignment_rebuild() {
     let mut store = TermStore::new();
     let a = store.mk_var("a", Sort::Int);

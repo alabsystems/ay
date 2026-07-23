@@ -14,9 +14,9 @@ use std::ptr;
 use ay_dpll::api::{Logic, Solver};
 
 use super::{
-    apply_supported_params, ast_to_term, cache_int_symbol, cache_string, cache_symbol,
-    ffi_guard_const_ptr, ffi_guard_ptr, ffi_guard_void, ffi_read_bounded_text, Z3Config, Z3Context,
-    Z3_ast, Z3_config, Z3_context, Z3_symbol, Z3_DEC_REF_ERROR, Z3_OK,
+    apply_supported_params, cache_int_symbol, cache_string, cache_symbol, ffi_guard_const_ptr,
+    ffi_guard_ptr, ffi_guard_void, ffi_read_bounded_text, require_term_ast_or_return, Z3Config,
+    Z3Context, Z3_ast, Z3_config, Z3_context, Z3_symbol, Z3_DEC_REF_ERROR, Z3_OK,
 };
 
 /// Create a new configuration object.
@@ -249,7 +249,8 @@ pub unsafe extern "C" fn Z3_inc_ref(c: Z3_context, a: Z3_ast) {
         ffi_guard_void(c, |ctx| {
             if ctx.ref_counted {
                 // Track the count; NEVER allocate/free the underlying term.
-                *ctx.ast_refcounts.entry(ast_to_term(a)).or_insert(0) += 1;
+                let term = require_term_ast_or_return!(ctx, a, "Z3_inc_ref", "AST");
+                *ctx.ast_refcounts.entry(term).or_insert(0) += 1;
             }
             // Non-RC contexts: no-op (Z3 only ref-counts on RC contexts).
         });
@@ -290,7 +291,7 @@ pub unsafe extern "C" fn Z3_dec_ref(c: Z3_context, a: Z3_ast) {
                 // Non-RC contexts: no-op (no counts are tracked).
                 return;
             }
-            let term = ast_to_term(a);
+            let term = require_term_ast_or_return!(ctx, a, "Z3_dec_ref", "AST");
             match ctx.ast_refcounts.get_mut(&term) {
                 Some(count) if *count > 1 => {
                     *count -= 1;

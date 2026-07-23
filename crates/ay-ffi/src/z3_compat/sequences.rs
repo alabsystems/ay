@@ -30,8 +30,9 @@ use std::ffi::{c_char, c_uint};
 use ay_dpll::api::{Sort, Term};
 
 use super::{
-    ast_to_term, ffi_count_within_limit, ffi_guard_ast, ffi_read_bounded_text, record_ast_sort,
-    term_to_ast, Z3Context, Z3_ast, Z3_context, Z3_sort, Z3_INVALID_ARG, Z3_SORT_ERROR,
+    ffi_count_within_limit, ffi_guard_ast, ffi_read_bounded_text, record_ast_sort,
+    require_term_ast_or_return, require_term_asts_or_return, term_to_ast, Z3Context, Z3_ast,
+    Z3_context, Z3_sort, Z3_INVALID_ARG, Z3_SORT_ERROR,
 };
 
 /// Whether a term is AY's first-class String sort.
@@ -82,7 +83,7 @@ pub unsafe extern "C" fn Z3_mk_string(c: Z3_context, s: *const c_char) -> Z3_ast
                 }
             };
             let t = ctx.solver.string_const(value);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::String);
             a
         })
@@ -114,13 +115,13 @@ pub unsafe extern "C" fn Z3_mk_seq_empty(c: Z3_context, seq: Z3_sort) -> Z3_ast 
         ffi_guard_ast(c, |ctx| match sort {
             Sort::String => {
                 let t = ctx.solver.string_const("");
-                let a = term_to_ast(t);
+                let a = term_to_ast(ctx, t);
                 record_ast_sort(ctx, a, Sort::String);
                 a
             }
             Sort::Seq(elem) => {
                 let t = ctx.solver.seq_empty((*elem).clone());
-                let a = term_to_ast(t);
+                let a = term_to_ast(ctx, t);
                 record_ast_sort(ctx, a, Sort::seq((*elem).clone()));
                 a
             }
@@ -145,10 +146,10 @@ pub unsafe extern "C" fn Z3_mk_seq_unit(c: Z3_context, a: Z3_ast) -> Z3_ast {
     // SAFETY: see module-level note; `ffi_guard_ast` handles null `c` and panic isolation.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let elem = ast_to_term(a);
+            let elem = require_term_ast_or_return!(ctx, a, "Z3_mk_seq_unit", "element", 0);
             let elem_sort = ctx.solver.sort_of(elem);
             let t = ctx.solver.seq_unit(elem);
-            let r = term_to_ast(t);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, Sort::seq(elem_sort));
             r
         })
@@ -177,19 +178,19 @@ pub unsafe extern "C" fn Z3_mk_seq_concat(c: Z3_context, n: c_uint, args: *const
     // SAFETY: see module-level note; `ffi_guard_ast` handles null `c` and panic isolation.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let first = ast_to_term(terms[0]);
+            let decoded = require_term_asts_or_return!(ctx, &terms, "Z3_mk_seq_concat", 0);
+            let first = decoded[0];
             let is_str = is_string(ctx, first);
             let result_sort = ctx.solver.sort_of(first);
             let mut acc = first;
-            for raw in &terms[1..] {
-                let next = ast_to_term(*raw);
+            for &next in &decoded[1..] {
                 acc = if is_str {
                     ctx.solver.str_concat(acc, next)
                 } else {
                     ctx.solver.seq_concat(acc, next)
                 };
             }
-            let a = term_to_ast(acc);
+            let a = term_to_ast(ctx, acc);
             record_ast_sort(ctx, a, result_sort);
             a
         })
@@ -211,13 +212,13 @@ pub unsafe extern "C" fn Z3_mk_seq_length(c: Z3_context, s: Z3_ast) -> Z3_ast {
     // SAFETY: see module-level note; `ffi_guard_ast` handles null `c` and panic isolation.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let seq = ast_to_term(s);
+            let seq = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_length", "sequence", 0);
             let t = if is_string(ctx, seq) {
                 ctx.solver.str_len(seq)
             } else {
                 ctx.solver.seq_len(seq)
             };
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Int);
             a
         })
@@ -241,11 +242,11 @@ pub unsafe extern "C" fn Z3_mk_seq_at(c: Z3_context, s: Z3_ast, index: Z3_ast) -
     // SAFETY: see module-level note; `ffi_guard_ast` handles null `c` and panic isolation.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let seq = ast_to_term(s);
-            let idx = ast_to_term(index);
+            let seq = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_at", "sequence", 0);
+            let idx = require_term_ast_or_return!(ctx, index, "Z3_mk_seq_at", "index", 0);
             if is_string(ctx, seq) {
                 let t = ctx.solver.str_at(seq, idx);
-                let a = term_to_ast(t);
+                let a = term_to_ast(ctx, t);
                 record_ast_sort(ctx, a, Sort::String);
                 a
             } else {
@@ -253,7 +254,7 @@ pub unsafe extern "C" fn Z3_mk_seq_at(c: Z3_context, s: Z3_ast, index: Z3_ast) -
                 // seq.at(s, i) == seq.extract(s, i, 1) — exactly Z3's semantics.
                 let one = ctx.solver.int_const(1);
                 let t = ctx.solver.seq_extract(seq, idx, one);
-                let a = term_to_ast(t);
+                let a = term_to_ast(ctx, t);
                 record_ast_sort(ctx, a, result_sort);
                 a
             }
@@ -275,12 +276,12 @@ pub unsafe extern "C" fn Z3_mk_seq_nth(c: Z3_context, s: Z3_ast, index: Z3_ast) 
     // SAFETY: see module-level note; `ffi_guard_ast` handles null `c` and panic isolation.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let seq = ast_to_term(s);
+            let seq = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_nth", "sequence", 0);
             match ctx.solver.sort_of(seq) {
                 Sort::Seq(elem) => {
-                    let idx = ast_to_term(index);
+                    let idx = require_term_ast_or_return!(ctx, index, "Z3_mk_seq_nth", "index", 0);
                     let t = ctx.solver.seq_nth(seq, idx);
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, (*elem).clone());
                     a
                 }
@@ -312,16 +313,16 @@ pub unsafe extern "C" fn Z3_mk_seq_extract(
     // SAFETY: see module-level note; `ffi_guard_ast` handles null `c` and panic isolation.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let seq = ast_to_term(s);
-            let off = ast_to_term(offset);
-            let len = ast_to_term(length);
+            let seq = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_extract", "sequence", 0);
+            let off = require_term_ast_or_return!(ctx, offset, "Z3_mk_seq_extract", "offset", 0);
+            let len = require_term_ast_or_return!(ctx, length, "Z3_mk_seq_extract", "length", 0);
             let result_sort = ctx.solver.sort_of(seq);
             let t = if is_string(ctx, seq) {
                 ctx.solver.str_substr(seq, off, len)
             } else {
                 ctx.solver.seq_extract(seq, off, len)
             };
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, result_sort);
             a
         })
@@ -348,14 +349,16 @@ pub unsafe extern "C" fn Z3_mk_seq_contains(
     // SAFETY: see module-level note; `ffi_guard_ast` handles null `c` and panic isolation.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let s = ast_to_term(container);
-            let t = ast_to_term(containee);
+            let s =
+                require_term_ast_or_return!(ctx, container, "Z3_mk_seq_contains", "container", 0);
+            let t =
+                require_term_ast_or_return!(ctx, containee, "Z3_mk_seq_contains", "containee", 0);
             let r = if is_string(ctx, s) {
                 ctx.solver.str_contains(s, t)
             } else {
                 ctx.solver.seq_contains(s, t)
             };
-            let a = term_to_ast(r);
+            let a = term_to_ast(ctx, r);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -374,14 +377,14 @@ pub unsafe extern "C" fn Z3_mk_seq_prefix(c: Z3_context, prefix: Z3_ast, s: Z3_a
     // SAFETY: see module-level note; `ffi_guard_ast` handles null `c` and panic isolation.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let p = ast_to_term(prefix);
-            let seq = ast_to_term(s);
+            let p = require_term_ast_or_return!(ctx, prefix, "Z3_mk_seq_prefix", "prefix", 0);
+            let seq = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_prefix", "sequence", 0);
             let r = if is_string(ctx, seq) {
                 ctx.solver.str_prefixof(p, seq)
             } else {
                 ctx.solver.seq_prefixof(p, seq)
             };
-            let a = term_to_ast(r);
+            let a = term_to_ast(ctx, r);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -400,14 +403,14 @@ pub unsafe extern "C" fn Z3_mk_seq_suffix(c: Z3_context, suffix: Z3_ast, s: Z3_a
     // SAFETY: see module-level note; `ffi_guard_ast` handles null `c` and panic isolation.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let suf = ast_to_term(suffix);
-            let seq = ast_to_term(s);
+            let suf = require_term_ast_or_return!(ctx, suffix, "Z3_mk_seq_suffix", "suffix", 0);
+            let seq = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_suffix", "sequence", 0);
             let r = if is_string(ctx, seq) {
                 ctx.solver.str_suffixof(suf, seq)
             } else {
                 ctx.solver.seq_suffixof(suf, seq)
             };
-            let a = term_to_ast(r);
+            let a = term_to_ast(ctx, r);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -440,15 +443,16 @@ pub unsafe extern "C" fn Z3_mk_seq_index(
     // SAFETY: see module-level note; `ffi_guard_ast` handles null `c` and panic isolation.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let seq = ast_to_term(s);
-            let needle = ast_to_term(substr);
-            let off = ast_to_term(offset);
+            let seq = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_index", "sequence", 0);
+            let needle =
+                require_term_ast_or_return!(ctx, substr, "Z3_mk_seq_index", "substring", 0);
+            let off = require_term_ast_or_return!(ctx, offset, "Z3_mk_seq_index", "offset", 0);
             let t = if is_string(ctx, seq) {
                 ctx.solver.str_indexof(seq, needle, off)
             } else {
                 ctx.solver.seq_indexof(seq, needle, off)
             };
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Int);
             a
         })
@@ -476,16 +480,16 @@ pub unsafe extern "C" fn Z3_mk_seq_replace(
     // SAFETY: see module-level note; `ffi_guard_ast` handles null `c` and panic isolation.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let seq = ast_to_term(s);
-            let from = ast_to_term(src);
-            let to = ast_to_term(dst);
+            let seq = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_replace", "sequence", 0);
+            let from = require_term_ast_or_return!(ctx, src, "Z3_mk_seq_replace", "source", 0);
+            let to = require_term_ast_or_return!(ctx, dst, "Z3_mk_seq_replace", "replacement", 0);
             let result_sort = ctx.solver.sort_of(seq);
             let t = if is_string(ctx, seq) {
                 ctx.solver.str_replace(seq, from, to)
             } else {
                 ctx.solver.seq_replace(seq, from, to)
             };
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, result_sort);
             a
         })
@@ -508,8 +512,9 @@ pub unsafe extern "C" fn Z3_mk_str_to_int(c: Z3_context, s: Z3_ast) -> Z3_ast {
     // SAFETY: see module-level note; `ffi_guard_ast` handles null `c` and panic isolation.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.str_to_int(ast_to_term(s));
-            let a = term_to_ast(t);
+            let s = require_term_ast_or_return!(ctx, s, "Z3_mk_str_to_int", "string", 0);
+            let t = ctx.solver.str_to_int(s);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Int);
             a
         })
@@ -528,8 +533,9 @@ pub unsafe extern "C" fn Z3_mk_int_to_str(c: Z3_context, s: Z3_ast) -> Z3_ast {
     // SAFETY: see module-level note; `ffi_guard_ast` handles null `c` and panic isolation.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.str_from_int(ast_to_term(s));
-            let a = term_to_ast(t);
+            let s = require_term_ast_or_return!(ctx, s, "Z3_mk_int_to_str", "integer", 0);
+            let t = ctx.solver.str_from_int(s);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::String);
             a
         })

@@ -35,7 +35,7 @@ mod types;
 pub(crate) use types::CachedExtensionData;
 pub(crate) use types::TheoryAxiomKey;
 pub(crate) use types::TheoryExtension;
-use types::{BoundRefinementHandoff, ProofContext};
+use types::{BoundRefinementHandoff, ProofContext, UNASSIGNED_NIL};
 
 impl<T: TheorySolver> Extension for TheoryExtension<'_, T> {
     fn propagate(&mut self, ctx: &dyn SolverContext) -> ExtPropagateResult {
@@ -74,6 +74,9 @@ impl<T: TheorySolver> Extension for TheoryExtension<'_, T> {
         // Previously decided theory atoms may have been unassigned, so we
         // must re-scan from the start to find unassigned ones.
         self.theory_decision_idx.set(0);
+        // #skip-assigned: the backjump may have unassigned theory vars, so the
+        // free-list is stale — force a rebuild on the next suggest_decision.
+        self.unassigned_dirty.set(true);
         self.pending_bound_refinements.clear();
         // #4919: Reset batching state on backtrack — theory state changed.
         // Preserving the streak caused false-UNSAT on sat benchmarks (sc-6,
@@ -128,6 +131,8 @@ impl<T: TheorySolver> Extension for TheoryExtension<'_, T> {
         self.pending_split = None;
         self.level_trail_positions.clear();
         self.theory_decision_idx.set(0);
+        // #skip-assigned: restart clears the SAT trail — rebuild the free-list.
+        self.unassigned_dirty.set(true);
         self.can_propagate_scan_pos.set(0);
         self.ite_deferred_atoms.clear();
         // #8008: Reset deferred mode counters on full restart.
@@ -333,7 +338,15 @@ impl<T: TheorySolver> Extension for TheoryExtension<'_, T> {
         // order, not conflict-history order.
         //
         // Atoms with None phase are left to VSIDS (#6303).
-        let atoms = self.theory_atoms;
+        // #suggest-decision-precompute: iterate the precomputed dense
+        // (sat_var, atom) index instead of theory_atoms + a per-atom
+        // term_to_var HashMap lookup. seed_index preserves theory_atoms order
+        // and contains exactly the atoms that HAVE a term_to_var entry — i.e.
+        // exactly the atoms the old per-atom `if let Some(..) = get(&atom)`
+        // guard let through. So Mode A's max/tie-break and Mode B's round-robin
+        // selection sequence are byte-identical, only faster (kills the 8227
+        // self-time hash + Variable::new-from-hash on the hot loop).
+        let atoms = &self.seed_index;
         // #9505: When in adaptive theory-every-decision mode, prefer round-robin
         // (Z3-style) over activity-based selection. Round-robin ensures all theory
         // atoms are decided sequentially, matching Z3's priority-queue approach.
@@ -345,13 +358,37 @@ impl<T: TheorySolver> Extension for TheoryExtension<'_, T> {
             count % 4 < 2 // 50% activity, 50% round-robin (default)
         };
 
-        if use_activity_mode {
-            // Mode A: activity-based selection (original #8420 behavior).
-            let mut best_lit: Option<Literal> = None;
-            let mut best_activity: f64 = -1.0;
-            for &atom in atoms.iter() {
-                if let Some(&sat_var) = self.term_to_var.get(&atom) {
+        // #skip-assigned (`AY_LRA_UNASSIGNED_SKIP`): O(unassigned) selection via
+        // the intrusive free-list of currently-unassigned seed positions. Picks
+        // the byte-identical literal the full scan below would — the free-list
+        // threads the SAME unassigned atoms in the SAME ascending seed order, so
+        // Mode A's max/first-tie and Mode B's cyclic-first-from-cursor are
+        // reproduced exactly, only skipping the assigned atoms the full scan
+        // would have visited and rejected via `ctx.value(..).is_none()`.
+        if self.unassigned_skip {
+            // Bring the free-list in sync with the SAT trail before walking it.
+            // A dirty flag (set by backtrack()/init(), the only paths that
+            // unassign theory vars) forces a full rebuild from ctx.value();
+            // otherwise the trail has only grown, so incrementally unlink the
+            // positions that became assigned since the last maintenance.
+            if self.unassigned_dirty.get() {
+                self.rebuild_unassigned_list(ctx);
+            } else {
+                self.advance_unassigned_scan(ctx);
+            }
+            let next = self.unassigned_next.borrow();
+            let len = self.seed_index.len();
+            if use_activity_mode {
+                // Mode A: activity-based, highest-activity first-max wins ties.
+                let mut best_lit: Option<Literal> = None;
+                let mut best_activity: f64 = -1.0;
+                let mut node = self.unassigned_head.get();
+                while node != UNASSIGNED_NIL {
+                    let (sat_var, atom) = self.seed_index[node as usize];
                     let var = Variable::new(sat_var);
+                    // Free-list entries are unassigned by construction; the guard
+                    // matches the full-scan filter exactly and is defense in depth
+                    // against a stale list.
                     if ctx.value(var).is_none() {
                         if let Some(phase) = self.theory.suggest_phase(atom) {
                             let act = ctx.activity(var);
@@ -366,22 +403,28 @@ impl<T: TheorySolver> Extension for TheoryExtension<'_, T> {
                             }
                         }
                     }
+                    node = next[node as usize];
                 }
-            }
-            if best_lit.is_some() {
-                return best_lit;
-            }
-        } else {
-            // Mode B: round-robin sequential scan (Z3-style).
-            let start = self.theory_decision_idx.get();
-            for (offset, _) in atoms.iter().enumerate() {
-                let i = (start + offset) % atoms.len();
-                let atom = atoms[i];
-                if let Some(&sat_var) = self.term_to_var.get(&atom) {
+                if best_lit.is_some() {
+                    return best_lit;
+                }
+            } else {
+                // Mode B: round-robin from the seed-position cursor. The list is
+                // ascending by position; the cyclic order start..len-1 then
+                // 0..start-1 is the tail portion (pos >= start) followed by the
+                // head portion (pos < start).
+                let start = self.theory_decision_idx.get();
+                // Phase 1: positions >= start (list tail), ascending.
+                let mut node = self.unassigned_head.get();
+                while node != UNASSIGNED_NIL && (node as usize) < start {
+                    node = next[node as usize];
+                }
+                while node != UNASSIGNED_NIL {
+                    let (sat_var, atom) = self.seed_index[node as usize];
                     let var = Variable::new(sat_var);
                     if ctx.value(var).is_none() {
                         if let Some(phase) = self.theory.suggest_phase(atom) {
-                            self.theory_decision_idx.set((i + 1) % atoms.len());
+                            self.theory_decision_idx.set((node as usize + 1) % len);
                             let lit = if phase {
                                 Literal::positive(var)
                             } else {
@@ -390,9 +433,73 @@ impl<T: TheorySolver> Extension for TheoryExtension<'_, T> {
                             return Some(lit);
                         }
                     }
+                    node = next[node as usize];
                 }
-                // Suppress unused variable warning from the initial loop binding.
-                let _ = atom;
+                // Phase 2: wrap — positions < start (list head), ascending.
+                let mut node = self.unassigned_head.get();
+                while node != UNASSIGNED_NIL && (node as usize) < start {
+                    let (sat_var, atom) = self.seed_index[node as usize];
+                    let var = Variable::new(sat_var);
+                    if ctx.value(var).is_none() {
+                        if let Some(phase) = self.theory.suggest_phase(atom) {
+                            self.theory_decision_idx.set((node as usize + 1) % len);
+                            let lit = if phase {
+                                Literal::positive(var)
+                            } else {
+                                Literal::negative(var)
+                            };
+                            return Some(lit);
+                        }
+                    }
+                    node = next[node as usize];
+                }
+                self.theory_decision_idx.set(0);
+            }
+            return None;
+        }
+
+        if use_activity_mode {
+            // Mode A: activity-based selection (original #8420 behavior).
+            let mut best_lit: Option<Literal> = None;
+            let mut best_activity: f64 = -1.0;
+            for &(sat_var, atom) in atoms.iter() {
+                let var = Variable::new(sat_var);
+                if ctx.value(var).is_none() {
+                    if let Some(phase) = self.theory.suggest_phase(atom) {
+                        let act = ctx.activity(var);
+                        if act > best_activity {
+                            best_activity = act;
+                            let lit = if phase {
+                                Literal::positive(var)
+                            } else {
+                                Literal::negative(var)
+                            };
+                            best_lit = Some(lit);
+                        }
+                    }
+                }
+            }
+            if best_lit.is_some() {
+                return best_lit;
+            }
+        } else {
+            // Mode B: round-robin sequential scan (Z3-style).
+            let start = self.theory_decision_idx.get();
+            for offset in 0..atoms.len() {
+                let i = (start + offset) % atoms.len();
+                let (sat_var, atom) = atoms[i];
+                let var = Variable::new(sat_var);
+                if ctx.value(var).is_none() {
+                    if let Some(phase) = self.theory.suggest_phase(atom) {
+                        self.theory_decision_idx.set((i + 1) % atoms.len());
+                        let lit = if phase {
+                            Literal::positive(var)
+                        } else {
+                            Literal::negative(var)
+                        };
+                        return Some(lit);
+                    }
+                }
             }
             self.theory_decision_idx.set(0);
         }
@@ -573,6 +680,90 @@ impl<T: TheorySolver> Extension for TheoryExtension<'_, T> {
             .iter()
             .filter_map(|term| self.term_to_var.get(term).map(|&v| Variable::new(v)))
             .collect()
+    }
+}
+
+impl<T: TheorySolver> TheoryExtension<'_, T> {
+    /// #skip-assigned: rebuild the unassigned free-list from `ctx.value()` (the
+    /// source of truth). Threads only currently-unassigned seed positions
+    /// head->tail in ascending seed order, resets the incremental scan cursor to
+    /// the current trail length, and clears the dirty flag.
+    fn rebuild_unassigned_list(&self, ctx: &dyn SolverContext) {
+        let mut prev = self.unassigned_prev.borrow_mut();
+        let mut next = self.unassigned_next.borrow_mut();
+        let mut linked = self.unassigned_linked.borrow_mut();
+        let n = self.seed_index.len();
+        let mut head = UNASSIGNED_NIL;
+        let mut last = UNASSIGNED_NIL;
+        for pos in 0..n {
+            let (sat_var, _atom) = self.seed_index[pos];
+            if ctx.value(Variable::new(sat_var)).is_none() {
+                prev[pos] = last;
+                next[pos] = UNASSIGNED_NIL;
+                linked[pos] = true;
+                if last == UNASSIGNED_NIL {
+                    head = pos as u32;
+                } else {
+                    next[last as usize] = pos as u32;
+                }
+                last = pos as u32;
+            } else {
+                linked[pos] = false;
+            }
+        }
+        self.unassigned_head.set(head);
+        self.unassigned_scan_pos.set(ctx.trail().len());
+        self.unassigned_dirty.set(false);
+    }
+
+    /// #skip-assigned: incrementally unlink seed positions whose SAT variable
+    /// became assigned since the last maintenance. The trail only grows between
+    /// rebuilds, so every seed variable appearing in `trail[scan_pos..]` was
+    /// unassigned (hence linked) at rebuild time; the `linked` guard keeps the
+    /// unlink idempotent regardless.
+    fn advance_unassigned_scan(&self, ctx: &dyn SolverContext) {
+        let trail = ctx.trail();
+        let scan_pos = self.unassigned_scan_pos.get();
+        let trail_len = trail.len();
+        // Backtrack normally marks the list dirty before the next query. Keep
+        // this defensive recovery as well: a context that exposes a shorter
+        // trail without that callback must lose performance, never candidates.
+        if scan_pos > trail_len {
+            self.rebuild_unassigned_list(ctx);
+            return;
+        }
+        if scan_pos == trail_len {
+            return;
+        }
+        let mut prev = self.unassigned_prev.borrow_mut();
+        let mut next = self.unassigned_next.borrow_mut();
+        let mut linked = self.unassigned_linked.borrow_mut();
+        for &lit in &trail[scan_pos..] {
+            let var_id = lit.variable().id() as usize;
+            if var_id >= self.sat_var_to_seed_pos.len() {
+                continue;
+            }
+            let pos = self.sat_var_to_seed_pos[var_id];
+            if pos == UNASSIGNED_NIL {
+                continue;
+            }
+            let pos_u = pos as usize;
+            if !linked[pos_u] {
+                continue;
+            }
+            linked[pos_u] = false;
+            let p = prev[pos_u];
+            let nx = next[pos_u];
+            if p == UNASSIGNED_NIL {
+                self.unassigned_head.set(nx);
+            } else {
+                next[p as usize] = nx;
+            }
+            if nx != UNASSIGNED_NIL {
+                prev[nx as usize] = p;
+            }
+        }
+        self.unassigned_scan_pos.set(trail_len);
     }
 }
 

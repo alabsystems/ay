@@ -10,6 +10,24 @@
 use super::*;
 
 impl Solver {
+    /// Store an unscoped theory clause without inheriting the current user
+    /// assertion depth.
+    ///
+    /// `add_clause_db_checked` stamps every learned clause with the active
+    /// scope depth. Plain theory lemmas and propagation reasons are global by
+    /// API contract within the live search, so that generic stamp would let
+    /// `pop()` delete them immediately.
+    /// Scoped theory APIs append a positive selector guard; those clauses are
+    /// still reclaimed by `gc_scoped_clauses` after the selector is popped.
+    /// This does not make learned theory clauses permanent across an
+    /// incremental reset: they retain their bounded, deletable, theory-re-driven
+    /// lifetime and are intentionally absent from the immutable input ledger.
+    fn add_unscoped_theory_clause_db(&mut self, literals: &[Literal]) -> usize {
+        let idx = self.add_clause_db_checked(literals, true, false, &[]);
+        self.arena.set_scope_lim(idx, 0);
+        idx
+    }
+
     /// Determine the proof emission kind for theory lemmas.
     ///
     /// Preprocessing extension lemmas (e.g., XOR Gauss-Jordan) use
@@ -119,76 +137,65 @@ impl Solver {
         if literals.len() == 1 {
             let lit = literals[0];
             let var = lit.variable();
-            match self.var_value_from_vals(var.index()) {
-                Some(v) if v == lit.is_positive() => {
-                    // Already satisfied
-                    return None;
-                }
-                Some(_) => {
-                    // Conflict with current assignment.
-                    // At level 0, the conflicting assignment is permanent —
-                    // the unit axiom contradicts a root-level fact, so UNSAT.
-                    // Still route it through record_level0_conflict_chain()
-                    // so the empty clause trace keeps the theory-clause and
-                    // level-0 reason IDs needed for SMT proof reconstruction.
-                    // At level > 0, don't declare UNSAT — the assignment may
-                    // be retractable. Add the clause to the DB and return it
-                    // as a conflict so the caller can backtrack (#6242).
-                    let idx = self.add_clause_db_checked(&literals, true, false, &[]);
-                    self.provenance
-                        .tag(idx, crate::clause_provenance::ClauseProvenance::TheoryLemma);
-                    // Theory lemmas are always kept (LBD 0) — mark dirty (#7393).
-                    self.mark_subsume_dirty_if_kept(idx);
-                    let _ = self.proof_emit_add_prechecked(
-                        &literals,
-                        &[],
-                        self.theory_lemma_proof_kind(),
-                    );
-                    #[cfg(debug_assertions)]
-                    {
-                        self.cold.pending_forward_check = None;
-                    }
-                    let clause_ref = ClauseRef(idx as u32);
-                    if self.decision_level == 0 {
-                        self.record_level0_conflict_chain(clause_ref);
-                        return None;
-                    }
-                    return Some(clause_ref);
-                }
-                None => {
-                    // Enqueue as unit propagation
-                    debug_assert!(
-                        literals.len() == 1,
-                        "BUG: theory lemma unit path reached with {} literals",
-                        literals.len(),
-                    );
-                    // Theory lemmas are axioms from the SMT layer, NOT derived
-                    // by SAT resolution. Use forward_check_derived=false so the
-                    // forward checker adds them as originals (not RUP-checked).
-                    let idx = self.add_clause_db_checked(&literals, true, false, &[]);
-                    self.provenance
-                        .tag(idx, crate::clause_provenance::ClauseProvenance::TheoryLemma);
-                    // Theory lemmas are always kept (LBD 0) — mark dirty (#7393).
-                    self.mark_subsume_dirty_if_kept(idx);
-                    // Write to proof to keep LRAT clause ID counters in sync (#4123).
-                    let pid = self
-                        .proof_emit_add_prechecked(&literals, &[], self.theory_lemma_proof_kind())
-                        .unwrap_or(0);
-                    #[cfg(debug_assertions)]
-                    {
-                        self.cold.pending_forward_check = None;
-                    }
-                    let clause_ref = ClauseRef(idx as u32);
-                    // Unit theory axiom: enqueue with reason=None (#6242).
-                    // Store proof ID in unit_proof_id so LRAT chain collection
-                    // can reference it (#6257).
-                    if pid != 0 {
-                        self.record_unit_proof_id_for_lit(lit, pid);
-                    }
-                    self.enqueue(lit, None);
-                    return Some(clause_ref);
-                }
+            let value = self.var_value_from_vals(var.index());
+            if value == Some(lit.is_positive()) && self.var_data[var.index()].level == 0 {
+                // Already established permanently at root.
+                return None;
             }
+
+            // Every other unit must be stored. In particular, a true assignment
+            // above root is retractable and an unassigned unit enqueued at the
+            // current level has no watches that can restore it after backtrack.
+            let idx = self.add_unscoped_theory_clause_db(&literals);
+            self.provenance
+                .tag(idx, crate::clause_provenance::ClauseProvenance::TheoryLemma);
+            self.mark_subsume_dirty_if_kept(idx);
+            let pid = self
+                .proof_emit_add_prechecked(&literals, &[], self.theory_lemma_proof_kind())
+                .unwrap_or(0);
+            #[cfg(debug_assertions)]
+            {
+                self.cold.pending_forward_check = None;
+            }
+            let clause_ref = ClauseRef(idx as u32);
+            let clause_id = self.clause_id(clause_ref);
+
+            if value == Some(!lit.is_positive()) && self.decision_level == 0 {
+                self.record_level0_conflict_chain(clause_ref);
+                return None;
+            }
+
+            // The arena and proof-manager IDs are deliberately distinct for
+            // hidden LRAT TrustedTransform additions. Preserve the emitted ID
+            // until queued installation; clause-trace and suppressed-Axiom
+            // modes fall back to the arena ID because `pid` is zero there.
+            if pid != 0 && pid != clause_id {
+                self.pending_theory_unit_proof_ids.push((clause_ref, pid));
+            }
+
+            if self.decision_level == 0 {
+                debug_assert!(value.is_none());
+                let installed = self.install_theory_unit_at_root(clause_ref);
+                debug_assert!(installed);
+                return Some(clause_ref);
+            }
+
+            // Queue before an optional immediate enqueue. The queue owns
+            // mandatory callback-aware root installation for false, true
+            // non-root, and unassigned unit axioms alike.
+            self.pending_theory_conflicts.push_back(clause_ref);
+
+            if value.is_none() {
+                // Preserve immediate theory-propagation semantics. Above root,
+                // the queued entry will subsequently re-install this at root.
+                let proof_id = if pid != 0 { pid } else { clause_id };
+                if proof_id != 0 {
+                    self.record_unit_proof_id_for_lit(lit, proof_id);
+                }
+                self.enqueue(lit, None);
+            }
+
+            return Some(clause_ref);
         }
 
         // Reorder literals to find best watched literals.
@@ -204,7 +211,7 @@ impl Solver {
         // Theory lemmas are axioms from the SMT layer, NOT derived
         // by SAT resolution. Use forward_check_derived=false so the
         // forward checker adds them as originals (not RUP-checked).
-        let idx = self.add_clause_db_checked(&literals, true, false, &[]);
+        let idx = self.add_unscoped_theory_clause_db(&literals);
         self.provenance
             .tag(idx, crate::clause_provenance::ClauseProvenance::TheoryLemma);
         // Theory lemmas default to LBD 0, which `reduce_permanent_protect_lbd`
@@ -249,10 +256,15 @@ impl Solver {
             } else {
                 // At level > 0, BCP won't discover this conflict because
                 // both watched literals are already assigned — no trail event
-                // will trigger watch propagation for this clause. Store as
-                // pending so the main solve loop can initiate conflict
-                // analysis (#6262).
-                self.pending_theory_conflict = Some(clause_ref);
+                // will trigger watch propagation for this clause. Queue it so
+                // the main solve loop can initiate conflict analysis (#6262).
+                //
+                // A theory callback may add a whole batch before returning to
+                // the CDCL loop. Every all-false lemma is an independent live
+                // conflict; overwriting a single pending slot would silently
+                // drop all but the last and violate the conflict-free-trail
+                // invariant before the next decision.
+                self.pending_theory_conflicts.push_back(clause_ref);
             }
             return Some(clause_ref);
         } else if lit0_val.is_none() && lit1_val == Some(false) {
@@ -407,6 +419,14 @@ impl Solver {
             }
         }
 
+        // A length-1 propagation is an unconditional theory unit, not a
+        // reasoned propagation. Route it through the unit-lemma path so
+        // non-root assignments get mandatory callback-aware root handling
+        // and the same proof provenance as every other theory unit.
+        if clause.len() == 1 {
+            return self.add_theory_lemma(clause);
+        }
+
         // Fast check: if propagated literal is already assigned, skip or detect conflict.
         let var = propagated.variable();
         if var.index() >= self.num_vars {
@@ -458,35 +478,25 @@ impl Solver {
         // With watches on clause[0] (propagated) and clause[1] (highest
         // false reason), BCP will re-discover unit propagation after
         // backtracking past the propagated literal's level.
-        let idx = self.add_clause_db_checked(&clause, true, false, &[]);
+        let idx = self.add_unscoped_theory_clause_db(&clause);
         self.provenance.tag(
             idx,
             crate::clause_provenance::ClauseProvenance::TheoryPropagation,
         );
         // Theory lemmas are always kept (LBD 0) — mark dirty (#7393).
         self.mark_subsume_dirty_if_kept(idx);
-        let pid = self
-            .proof_emit_add_prechecked(&clause, &[], self.theory_lemma_proof_kind())
-            .unwrap_or(0);
+        let _ = self.proof_emit_add_prechecked(&clause, &[], self.theory_lemma_proof_kind());
         #[cfg(debug_assertions)]
         {
             self.cold.pending_forward_check = None;
         }
         let clause_ref = ClauseRef(idx as u32);
 
-        if clause.len() <= 1 {
-            // Unit clause: enqueue with reason=None (#6242).
-            if pid != 0 {
-                self.record_unit_proof_id_for_lit(propagated, pid);
-            }
-            self.enqueue(propagated, None);
-        } else {
-            // Multi-literal: set up watches before enqueue.
-            // clause[0] = propagated (about to be true), clause[1] = first reason (false).
-            // This is the standard unit-propagation watch state.
-            self.attach_clause_watches(clause_ref, (clause[0], clause[1]), clause.len() == 2);
-            self.enqueue(propagated, Some(clause_ref));
-        }
+        // Multi-literal: set up watches before enqueue.
+        // clause[0] = propagated (about to be true), clause[1] = first reason (false).
+        // This is the standard unit-propagation watch state.
+        self.attach_clause_watches(clause_ref, (clause[0], clause[1]), clause.len() == 2);
+        self.enqueue(propagated, Some(clause_ref));
 
         Some(clause_ref)
     }
@@ -749,7 +759,7 @@ impl Solver {
             }
         }
 
-        let arena_idx = self.add_clause_db_checked(&clause, true, false, &[]);
+        let arena_idx = self.add_unscoped_theory_clause_db(&clause);
         self.provenance.tag(
             arena_idx,
             crate::clause_provenance::ClauseProvenance::TheoryPropagation,

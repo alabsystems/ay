@@ -28,7 +28,7 @@ use num_traits::Zero;
 
 use ay_core::term::{Symbol, TermData};
 use ay_core::{DatatypeSort, Sort, TermId, TermStore};
-use ay_frontend::Command;
+use ay_frontend::{is_reserved_symbol, Command};
 
 use super::types::{FuncDecl, NativeReplayEventKind, SolverError, SortExt, Term};
 use super::Solver;
@@ -58,25 +58,78 @@ impl Solver {
     ///
     /// # Panics
     ///
-    /// Panics if `name` is already bound to a different constant sort or to a
-    /// function. Repeating the same constant declaration is idempotent.
+    /// Panics if `name` is already bound to a function or a different constant
+    /// sort. Repeating the exact declaration is idempotent. The sole surface
+    /// refinement accepted is a same-named `Uninterpreted("T")` placeholder to
+    /// a concrete `Datatype` named `T`; the reverse spelling reuses the term but
+    /// retains its more informative datatype metadata.
     pub fn declare_const(&mut self, name: &str, sort: Sort) -> Term {
+        self.try_declare_const(name, sort)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible variant of [`declare_const`](Self::declare_const).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SolverError::InvalidArgument`] for reserved names, declaration
+    /// collisions, or an inconsistent repeated declaration.
+    #[must_use = "this returns a Result that must be checked"]
+    pub fn try_declare_const(&mut self, name: &str, sort: Sort) -> Result<Term, SolverError> {
+        if is_reserved_symbol(name) {
+            return Err(SolverError::InvalidArgument {
+                operation: "declare_const",
+                message: format!("symbol name '{name}' is reserved"),
+            });
+        }
         // Looking up the exact native identity through the reverse index keeps
         // repeated declaration O(1); scanning `var_names` (or every overload
         // of a surface name) would make large declaration sets quadratic.
         if let Some(&term_id) = self.var_terms_by_name.get(name) {
             match self.var_sorts.get(&term_id) {
-                Some(existing_sort) if existing_sort == &sort => return Term(term_id),
-                Some(existing_sort) => panic!(
-                    "constant '{name}' is already declared with sort {existing_sort}, not {sort}"
-                ),
-                None => panic!("native constant '{name}' is missing its sort metadata"),
+                Some(existing_sort) if existing_sort == &sort => return Ok(Term(term_id)),
+                // The verification-consumer `__upgraded` path intentionally replaces an
+                // opaque placeholder with its full datatype definition. Both
+                // use one core uninterpreted carrier, but this is a deliberately
+                // NARROW surface upgrade: `as_term_sort` also collapses distinct
+                // Char/Int, finite-domain, type-variable, nested-array, and
+                // same-named-but-different-datatype sorts. Accepting every equal
+                // core lowering would erase the bounds/schema metadata that the
+                // native API must preserve.
+                Some(Sort::Uninterpreted(existing_name)) if matches!(&sort, Sort::Datatype(datatype) if datatype.name == *existing_name) =>
+                {
+                    self.var_sorts.insert(term_id, sort);
+                    return Ok(Term(term_id));
+                }
+                // An opaque spelling after the concrete definition is the same
+                // placeholder relationship in reverse. Reuse the identity, but
+                // NEVER downgrade the stored datatype schema.
+                Some(Sort::Datatype(existing_datatype)) if matches!(&sort, Sort::Uninterpreted(name) if *name == existing_datatype.name) =>
+                {
+                    return Ok(Term(term_id));
+                }
+                Some(existing_sort) => {
+                    return Err(SolverError::InvalidArgument {
+                        operation: "declare_const",
+                        message: format!(
+                            "constant '{name}' is already declared with sort {existing_sort}, not {sort}"
+                        ),
+                    });
+                }
+                None => {
+                    return Err(SolverError::InvalidArgument {
+                        operation: "declare_const",
+                        message: format!("native constant '{name}' is missing its sort metadata"),
+                    });
+                }
             }
         }
-        assert!(
-            !self.executor.context().has_symbol_binding(name),
-            "symbol '{name}' is already bound to a different declaration"
-        );
+        if self.executor.context().has_symbol_binding(name) {
+            return Err(SolverError::InvalidArgument {
+                operation: "declare_const",
+                message: format!("symbol '{name}' is already bound to a different declaration"),
+            });
+        }
 
         let term_sort = sort.as_term_sort();
         // A compatibility adapter can retain this display name under a
@@ -96,7 +149,7 @@ impl Solver {
             term: term_id,
             sort: self.terms().sort(term_id).clone(),
         });
-        Term(term_id)
+        Ok(Term(term_id))
     }
 
     /// Declare a constant with a fresh term identity while retaining a
@@ -118,11 +171,37 @@ impl Solver {
         identity_name: &str,
         sort: Sort,
     ) -> Term {
-        assert!(
-            !self.var_terms_by_name.contains_key(identity_name)
-                && !self.executor.context().has_symbol_binding(identity_name),
-            "native constant identity '{identity_name}' is already in use"
-        );
+        self.try_declare_const_with_fresh_identity(_display_name, identity_name, sort)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible variant of
+    /// [`declare_const_with_fresh_identity`](Self::declare_const_with_fresh_identity).
+    ///
+    /// The private core identity is security-relevant; the adapter-owned
+    /// display name may use any spelling because it is not stored in the core
+    /// term DAG.
+    #[must_use = "this returns a Result that must be checked"]
+    pub fn try_declare_const_with_fresh_identity(
+        &mut self,
+        _display_name: &str,
+        identity_name: &str,
+        sort: Sort,
+    ) -> Result<Term, SolverError> {
+        if is_reserved_symbol(identity_name) {
+            return Err(SolverError::InvalidArgument {
+                operation: "declare_const_with_fresh_identity",
+                message: format!("symbol identity '{identity_name}' is reserved"),
+            });
+        }
+        if self.var_terms_by_name.contains_key(identity_name)
+            || self.executor.context().has_symbol_binding(identity_name)
+        {
+            return Err(SolverError::InvalidArgument {
+                operation: "declare_const_with_fresh_identity",
+                message: format!("native constant identity '{identity_name}' is already in use"),
+            });
+        }
         let term_sort = sort.as_term_sort();
         // Keep the private declaration identity in the core DAG.  Datatype
         // constructors and several theory paths are keyed by core symbol text;
@@ -149,7 +228,7 @@ impl Solver {
             term: term_id,
             sort: self.terms().sort(term_id).clone(),
         });
-        Term(term_id)
+        Ok(Term(term_id))
     }
 
     /// Declare an integer constant (0-arity) variable.
@@ -177,8 +256,24 @@ impl Solver {
     /// This is primarily useful for constructing quantified formulas, where bound variables
     /// should not appear as top-level symbols in models.
     pub fn fresh_var(&mut self, prefix: &str, sort: Sort) -> Term {
+        self.try_fresh_var(prefix, sort)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// Fallible variant of [`fresh_var`](Self::fresh_var).
+    #[must_use = "this returns a Result that must be checked"]
+    pub fn try_fresh_var(&mut self, prefix: &str, sort: Sort) -> Result<Term, SolverError> {
+        // `mk_fresh_var` emits `<prefix>_<id>`. Check that generated namespace,
+        // rather than the bare prefix, so ordinary prefixes such as `select`
+        // remain legal while `__ay` cannot mint an internal-looking identity.
+        if is_reserved_symbol(&format!("{prefix}_")) {
+            return Err(SolverError::InvalidArgument {
+                operation: "fresh_var",
+                message: format!("fresh-variable prefix '{prefix}' enters a reserved namespace"),
+            });
+        }
         let term_sort = sort.as_term_sort();
-        Term(self.terms_mut().mk_fresh_var(prefix, term_sort))
+        Ok(Term(self.terms_mut().mk_fresh_var(prefix, term_sort)))
     }
 
     /// Declare a function (n-arity) with the given name, domain, and range sorts.
@@ -452,6 +547,7 @@ impl Solver {
                 params: param_entries,
                 body: body.0,
                 return_sort: expected_sort,
+                assertion_derived: false,
             },
         );
         self.executor.invalidate_for_native_api_mutation();
@@ -525,6 +621,7 @@ impl Solver {
                 params: param_entries,
                 body: body.0,
                 return_sort: expected_sort,
+                assertion_derived: false,
             },
         );
         self.executor.invalidate_for_native_api_mutation();

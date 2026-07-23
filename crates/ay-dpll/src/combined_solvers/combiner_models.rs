@@ -720,14 +720,15 @@ impl TheoryCombiner<'_> {
                 rows.iter()
                     .filter_map(|row| row.hard_bool.map(|value| value.to_string())),
             );
-            let known_disequal_results =
-                matches!(result_sort, Sort::Uninterpreted(_) | Sort::Array(_))
-                    && rows.iter().enumerate().any(|(index, lhs)| {
-                        rows[index + 1..].iter().any(|rhs| {
-                            self.euf.are_known_disequal(lhs.source, rhs.source)
-                                || self.euf.are_known_disequal(rhs.source, lhs.source)
-                        })
-                    });
+            let known_disequal_results = matches!(
+                result_sort,
+                Sort::Uninterpreted(_) | Sort::Array(_) | Sort::Seq(_)
+            ) && rows.iter().enumerate().any(|(index, lhs)| {
+                rows[index + 1..].iter().any(|rhs| {
+                    self.euf.are_known_disequal(lhs.source, rhs.source)
+                        || self.euf.are_known_disequal(rhs.source, lhs.source)
+                })
+            });
             // #A1 (#8373 gate-over-select class): two rows of one table whose
             // keys coincide under the FINAL arithmetic values are congruent
             // applications, so their results MUST be equal in any consistent
@@ -735,7 +736,9 @@ impl TheoryCombiner<'_> {
             // AUFLIA preprocessing in pre-/post-substitution form — the row
             // "values" are opaque e-class tokens; unifying them onto one
             // representative is the same congruence restoration this pass
-            // performs for scalars, NOT a choice between conflicting evidence
+            // performs for scalars. Seq-returning UF rows use the same opaque
+            // e-class-token representation and are repairable for the same
+            // reason. This is NOT a choice between conflicting evidence
             // (contradictory hard pins and known-disequal results are excluded
             // by the guards above and keep the fail-closed conflict marker).
             // Downstream array extraction then builds ONE interpretation for
@@ -752,7 +755,7 @@ impl TheoryCombiner<'_> {
                     | Sort::BitVec(_)
                     | Sort::String
                     | Sort::Uninterpreted(_)
-            ) || (matches!(result_sort, Sort::Array(_))
+            ) || (matches!(result_sort, Sort::Array(_) | Sort::Seq(_))
                 && hard_values.is_empty());
             if hard_values.len() > 1 || known_disequal_results || !directly_repairable {
                 // A contradictory hard pin cannot be repaired by choosing one

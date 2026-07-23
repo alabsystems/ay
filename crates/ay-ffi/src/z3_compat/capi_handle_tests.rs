@@ -5,7 +5,7 @@
 //! Battery for the P3 C-API stub completion (wavec-p3-capi-stubs):
 //!
 //! * GAP 1 — `Z3_sort_to_ast` / `Z3_func_decl_to_ast` tagged, value-canonical
-//!   handles; the `ast_to_term` poison guard (a tagged handle in a
+//!   handles; authenticated term-handle decoding (a tagged handle in a
 //!   term-consuming entry point must FAIL CLOSED, never alias a real term —
 //!   the wrong-verdict channel this work closes).
 //! * GAP 2 — `Z3_global_param_set/get/reset_all` measured z3 4.15.4 parity.
@@ -663,6 +663,9 @@ fn foreign_context_tagged_handles_fail_closed() {
         let sa = Z3_sort_to_ast(c1, int1);
         // In-context: renders "Int".
         assert_eq!(cstr(Z3_ast_to_string(c1, sa)), "Int");
+        // The producer must not re-salt a foreign pointer handle into c2.
+        assert_eq!(Z3_sort_to_ast(c2, int1), 0);
+        assert_eq!(Z3_get_error_code(c2), Z3_INVALID_ARG);
         // Foreign context: must fail closed (null), never render c2's sort.
         assert!(
             Z3_ast_to_string(c2, sa).is_null(),
@@ -677,6 +680,8 @@ fn foreign_context_tagged_handles_fail_closed() {
             int1,
         );
         let fa = Z3_func_decl_to_ast(c1, f);
+        assert_eq!(Z3_func_decl_to_ast(c2, f), 0);
+        assert_eq!(Z3_get_error_code(c2), Z3_INVALID_ARG);
         assert!(
             !Z3_to_func_decl(c1, fa).is_null(),
             "in-context decode works"

@@ -19,7 +19,7 @@ pub(crate) use types::{Visit, Watch};
 use crate::drat_parser::ProofStep;
 use crate::error::DratCheckError;
 use crate::literal::Literal;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 const INITIAL_HASH_CAPACITY: usize = 1024;
 
@@ -68,7 +68,7 @@ pub struct DratChecker {
     /// Reusable buffer for RAT resolvent construction.
     pub(super) scratch_resolvent: Vec<Literal>,
     /// Retained scratch for exact, order-independent O(k) clause matching.
-    clause_match_counts: HashMap<Literal, usize>,
+    clause_match_counts: FxHashMap<Literal, usize>,
     clause_match_consumed: Vec<Literal>,
     /// Core-first BCP mode. When enabled, `propagate()` processes ACTIVE
     /// watch entries before non-ACTIVE ones (drat-trim.c:196-230).
@@ -126,7 +126,7 @@ impl DratChecker {
             conflict_marked: vec![false; num_vars],
             conflict_marked_dirty: Vec::new(),
             scratch_resolvent: Vec::new(),
-            clause_match_counts: HashMap::new(),
+            clause_match_counts: FxHashMap::default(),
             clause_match_consumed: Vec::new(),
             core_first: false,
             prep: false,

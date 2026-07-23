@@ -57,6 +57,14 @@ pub(crate) enum BenchCommand {
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         runs: Option<u32>,
 
+        /// Zero-based deterministic corpus shard cursor.
+        #[arg(long, requires = "shard_size")]
+        shard_index: Option<usize>,
+
+        /// Maximum benchmarks in this invocation (1..=4096).
+        #[arg(long, requires = "shard_index", value_parser = parse_shard_size)]
+        shard_size: Option<usize>,
+
         /// Reference solver for comparison as name=path; repeatable, e.g.
         /// --reference-solver kissat=reference/kissat-sc2025/build/kissat.
         ///
@@ -537,6 +545,28 @@ pub(crate) enum ScoringMethod {
     HwmccComp,
 }
 
+// Keep CLI parsing available in `cli`-only builds where the optional
+// `ay-bench` dependency is intentionally absent. The execution layer repeats
+// this fail-closed bound in `ay_bench::native::MAX_NATIVE_SHARD_SIZE`.
+const MAX_NATIVE_SHARD_SIZE: usize = 4096;
+
+#[cfg(feature = "bench")]
+const _: () = assert!(MAX_NATIVE_SHARD_SIZE == ay_bench::native::MAX_NATIVE_SHARD_SIZE);
+
+fn parse_shard_size(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| format!("invalid shard size {value:?}"))?;
+    if (1..=MAX_NATIVE_SHARD_SIZE).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(format!(
+            "shard size must be in 1..={}, got {parsed}",
+            MAX_NATIVE_SHARD_SIZE
+        ))
+    }
+}
+
 /// Entry point for `ay bench` subcommands.
 #[cfg(not(feature = "bench"))]
 pub(crate) fn run(_command: BenchCommand) -> anyhow::Result<()> {
@@ -557,6 +587,8 @@ pub(crate) fn run(command: BenchCommand) -> anyhow::Result<()> {
             timeout,
             output,
             runs,
+            shard_index,
+            shard_size,
             reference_solvers,
             run_class,
             quiet,
@@ -579,6 +611,8 @@ pub(crate) fn run(command: BenchCommand) -> anyhow::Result<()> {
                 timeout,
                 output,
                 runs,
+                shard_index,
+                shard_size,
                 reference_solvers,
                 run_class: run_class.map(|c| c.to_string()),
                 quiet,

@@ -69,9 +69,10 @@ use ay_chc::{
 use ay_dpll::api::{Solver, Term, TermKind};
 
 use super::{
-    ast_to_term, cache_string, ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_void,
-    FixedpointHandle, FixedpointLemmaHint, RegisteredRelation, Z3_ast, Z3_context, Z3_fixedpoint,
-    Z3_func_decl, Z3_string, Z3_symbol, Z3_L_FALSE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK,
+    cache_string, ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_void,
+    require_term_ast_or_return, FixedpointHandle, FixedpointLemmaHint, RegisteredRelation, Z3_ast,
+    Z3_context, Z3_fixedpoint, Z3_func_decl, Z3_string, Z3_symbol, Z3_L_FALSE, Z3_L_TRUE,
+    Z3_L_UNDEF, Z3_OK,
 };
 
 // ---- Fixedpoint lifecycle ----
@@ -188,7 +189,7 @@ pub unsafe extern "C" fn Z3_fixedpoint_add_rule(
     rule: Z3_ast,
     name: Z3_symbol,
 ) {
-    if d.is_null() || rule == 0 {
+    if d.is_null() {
         return;
     }
     // Read the optional rule name outside the guard (raw-pointer deref). A null
@@ -199,8 +200,10 @@ pub unsafe extern "C" fn Z3_fixedpoint_add_rule(
     // SAFETY: see ffi_guard_void; `d` is kept alive by the context arena.
     unsafe {
         ffi_guard_void(c, |ctx| {
+            let rule_term =
+                require_term_ast_or_return!(ctx, rule, "Z3_fixedpoint_add_rule", "rule");
             let handle = &mut *d;
-            handle.rules.push(ast_to_term(rule));
+            handle.rules.push(rule_term);
             // Keep `rule_names` index-aligned with `rules`.
             handle.rule_names.push(rule_name);
             ctx.last_error = Z3_OK;
@@ -224,14 +227,15 @@ pub unsafe extern "C" fn Z3_fixedpoint_query(
     d: Z3_fixedpoint,
     query: Z3_ast,
 ) -> c_int {
-    if d.is_null() || query == 0 {
+    if d.is_null() {
         return Z3_L_UNDEF;
     }
     // SAFETY: see ffi_guard_int; `d` is kept alive by the context arena.
     unsafe {
         ffi_guard_int(c, Z3_L_UNDEF, |ctx| {
+            let query_term =
+                require_term_ast_or_return!(ctx, query, "Z3_fixedpoint_query", "query", Z3_L_UNDEF);
             let handle = &mut *d;
-            let query_term = ast_to_term(query);
             // Recursive-definition gate (P1.1): the fixedpoint path neither
             // injects the defining axioms nor expands rec-f applications, so
             // a rule/assertion/query mentioning a `Z3_add_rec_def` name would

@@ -187,8 +187,32 @@ impl LpNodeBound {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViolatingBranchRule {
+    First,
+    ViolDegree,
+}
+
+impl ViolatingBranchRule {
+    fn from_selector(value: Option<&std::ffi::OsStr>) -> Self {
+        if value == Some(std::ffi::OsStr::new("viol")) {
+            Self::ViolDegree
+        } else {
+            Self::First
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::from_selector(std::env::var_os("TWO_CLUB_BRANCH").as_deref())
+    }
+}
+
 struct TwoClub {
     n: usize,
+    /// Snapshotted once at recognition so a long proof does not perform a
+    /// process-global environment read at every node or change traversal order
+    /// if another thread mutates the selector mid-search.
+    branch_rule: ViolatingBranchRule,
     /// Non-adjacent pairs: (i, j, common-neighbour list), 0-based vertices.
     pairs: Vec<(u32, u32, Vec<u32>)>,
     /// G-adjacency bitset: `adj_bits[v]` bit `u` set iff `{u,v} in E`
@@ -322,6 +346,7 @@ fn recognize(instance: &PbInstance, objective: &PbObjective) -> Option<TwoClub> 
 
     Some(TwoClub {
         n,
+        branch_rule: ViolatingBranchRule::from_env(),
         pairs,
         adj_bits,
         pair_of_vertex,
@@ -366,13 +391,43 @@ impl SearchState {
         self.c_size += 1;
     }
     /// A violating pair: both endpoints in C and zero surviving common neighbours.
-    fn find_violating(&self) -> Option<usize> {
-        // Prefer the pair with the smallest surviving CN count overall — but a
-        // simple first-active-zero scan is O(pairs) and sufficient at this size.
-        self.both_in
-            .iter()
-            .enumerate()
-            .position(|(idx, &active)| active && self.cn_alive[idx] == 0)
+    fn find_violating(&self, tc: &TwoClub) -> Option<usize> {
+        // BRANCHING RULE: among the active violating pairs, pick the one whose
+        // endpoints carry the maximum total VIOLATING-DEGREE (memberships in
+        // other active violating pairs). Removing a high-viol-degree endpoint
+        // resolves many pairs at once — the classic fail-fast branching
+        // preference; the previous first-by-index scan was arbitrary. Two
+        // passes over the same O(pairs) scan: collect violating pairs +
+        // per-vertex counts, then score. Env A/B: TWO_CLUB_BRANCH=first
+        // restores the old rule.
+        // DEFAULT: first-by-index. The viol-degree rule (TWO_CLUB_BRANCH=viol)
+        // cuts pure tree size ~5x on band-only synthetics but MEASURED NEGATIVE
+        // on the real instance: it concentrates the DFS in matching-rich bottom
+        // territory (frontier 145 -> 112, dives 5 -> 1) — kill HEIGHT beats
+        // kill volume here. Re-evaluate together with marked branching.
+        if tc.branch_rule == ViolatingBranchRule::First {
+            return self
+                .both_in
+                .iter()
+                .enumerate()
+                .position(|(idx, &active)| active && self.cn_alive[idx] == 0);
+        }
+        let mut viol: Vec<u32> = Vec::new();
+        let mut deg = [0u32; 512];
+        for (idx, &active) in self.both_in.iter().enumerate() {
+            if active && self.cn_alive[idx] == 0 {
+                viol.push(idx as u32);
+                let (a, b, _) = &tc.pairs[idx];
+                deg[*a as usize] += 1;
+                deg[*b as usize] += 1;
+            }
+        }
+        viol.into_iter()
+            .max_by_key(|&idx| {
+                let (a, b, _) = &tc.pairs[idx as usize];
+                deg[*a as usize] + deg[*b as usize]
+            })
+            .map(|idx| idx as usize)
     }
 }
 
@@ -849,6 +904,26 @@ fn build_solve_rows(
 /// DOWN onto this grid (`m = ⌊y·SCALE⌋ ≥ 0`), which preserves `y ≥ 0` and hence
 /// soundness — rounding only weakens the bound, never inflates it.
 const DUAL_SCALE: i128 = 1 << 20;
+
+/// Return whether an exact scaled lower bound on the negated objective proves
+/// that an integral objective cannot improve on `best_floor`.
+///
+/// If `upper_bound = -scaled_neg_upper_bound / DUAL_SCALE`, integrality permits
+/// pruning exactly when `upper_bound < best_floor + 1`. The comparison is
+/// strict: equality still permits an integer solution of size
+/// `best_floor + 1`. Arithmetic overflow declines the prune.
+fn scaled_dual_bound_prunes(scaled_neg_upper_bound: i128, best_floor: i128) -> bool {
+    let Some(next_floor) = best_floor.checked_add(1) else {
+        return false;
+    };
+    let Some(threshold) = next_floor
+        .checked_mul(DUAL_SCALE)
+        .and_then(i128::checked_neg)
+    else {
+        return false;
+    };
+    scaled_neg_upper_bound > threshold
+}
 /// Per-row dual clamp on the scaled grid (≈ `y ≤ 2^20`); any clamped value is
 /// still a valid `y ≥ 0`, and the cap keeps every downstream sum well inside
 /// i128 (see the overflow audit at [`refresh_dual_snapshot`]).
@@ -1125,7 +1200,7 @@ fn refresh_dual_snapshot(
         }
         let d: Vec<i128> = ay.iter().map(|&a| -DUAL_SCALE - a).collect();
         let sum: i128 = (0..n).filter(|&v| state.in_c[v]).map(|v| d[v].min(0)).sum();
-        let prune = base + sum >= -best_floor * DUAL_SCALE;
+        let prune = scaled_dual_bound_prunes(base + sum, best_floor);
         return Some((
             RefreshOutcome {
                 base,
@@ -1297,9 +1372,9 @@ fn refresh_dual_snapshot(
     let mut d: Vec<i128> = ay.iter().map(|&a| -DUAL_SCALE - a).collect();
     let mut sum: i128 = (0..n).filter(|&v| state.in_c[v]).map(|v| d[v].min(0)).sum();
 
-    // Prune decisions, all on the exact scaled grid: UB ≤ floor  ⇔
-    // base + sum ≥ -floor·SCALE.
-    let mut prune = base + sum >= -best_floor * DUAL_SCALE;
+    // Prune decisions are exact on the scaled grid. Because 2-club size is
+    // integral, UB < floor+1 proves that no solution can improve the floor.
+    let mut prune = scaled_dual_bound_prunes(base + sum, best_floor);
     // 2-DOMINATION CUT ROUND (near-misses only): separate the facet family at
     // x*, append violated cuts, resolve ONCE, re-price exactly, and adopt the
     // strengthened pricing when tighter. Diagnostic history: exact-triple
@@ -1419,7 +1494,7 @@ fn refresh_dual_snapshot(
                 base = base2;
                 d = d2;
                 sum = sum2;
-                prune = base + sum >= -best_floor * DUAL_SCALE;
+                prune = scaled_dual_bound_prunes(base + sum, best_floor);
             }
             x_cur = x2;
             if !improved {
@@ -1561,8 +1636,9 @@ fn solve_exact_cell(
     let mut rx_lo: u64 = 0; //  < 150
     let mut lp_ceil_kill_a: u64 = 0; // float-solve tier
     let lp_ceil_kill_b: u64 = 0; // exact LP+cuts tier
-                                 // Dual SUPPORT pairs from the most recent FULL refresh; Support solves
-                                 // re-optimize y on just these rows (~100x cheaper) at nearby nodes.
+
+    // Dual SUPPORT pairs from the most recent FULL refresh; Support solves
+    // re-optimize y on just these rows (~100x cheaper) at nearby nodes.
     let mut dual_support: Option<Vec<u32>> = None;
 
     // Explicit DFS: each frame is (vertex_removed, undo_log, phase).
@@ -1674,12 +1750,11 @@ fn solve_exact_cell(
                     }
                 }
                 // O(1) dual-snapshot prune — as sound as the cardinality prune
-                // (`-(base+sum)/SCALE` upper-bounds every 2-club in C):
-                // UB ≤ floor  ⇔  base + sum ≥ -floor·SCALE.
+                // (`-(base+sum)/SCALE` upper-bounds every 2-club in C).
+                // Integrality permits pruning exactly when UB < floor+1.
                 let mut fresh: Option<RefreshOutcome> = None;
                 if lp.enabled {
-                    let floor_scaled = -(best_floor as i128) * DUAL_SCALE;
-                    if dual_base + dual_sum >= floor_scaled {
+                    if scaled_dual_bound_prunes(dual_base + dual_sum, best_floor as i128) {
                         lp_prunes += 1;
                         lp_prunes_o1 += 1;
                         cascade = true;
@@ -1786,7 +1861,7 @@ fn solve_exact_cell(
                         }
                     }
                 }
-                match state.find_violating() {
+                match state.find_violating(tc) {
                     None => {
                         // C is a 2-club: the subtree was NOT killed — ancestors
                         // contain it and will not LP-prune; disarm the cascade.
@@ -1969,6 +2044,23 @@ fn solve_exact_cell(
                             // the TRUE strength of the pair+clique float
                             // relaxation.
                             ceil_spent += t0.elapsed();
+                            // CDCL-oracle go/no-go: dump the frontier fixing
+                            // set (removed vertices) at ceiling FAILURES so the
+                            // offline probe can measure PB-CDCL refutation cost
+                            // on the real sets. TRACE-gated.
+                            if lift_kill.is_none()
+                                && std::env::var_os("TWO_CLUB_DUMP_FRONTIER").is_some()
+                            {
+                                let out: Vec<String> = (0..tc.n)
+                                    .filter(|&v| !state.in_c[v])
+                                    .map(|v| v.to_string())
+                                    .collect();
+                                eprintln!(
+                                    "  [frontier-set] c={} out={}",
+                                    state.c_size,
+                                    out.join(",")
+                                );
+                            }
                             if progress {
                                 eprintln!(
                                     "  [ceil] c={} lfront={} kill={} ub={} t={:.1}s spent={:.0}s",
@@ -2317,8 +2409,9 @@ pub(crate) fn two_club_prove_pivot_worker(
         _ => return None,
     };
     let k = k.min(n).min(20); // 2^k patterns — keep it sane
-                              // Pivots: the k highest-degree vertices (fewest non-adjacent pairs). Degree
-                              // ties broken by index for determinism across workers.
+
+    // Pivots: the k highest-degree vertices (fewest non-adjacent pairs). Degree
+    // ties broken by index for determinism across workers.
     let mut non_adj_ct = vec![0usize; n];
     for &(a, b, _) in &tc.pairs {
         non_adj_ct[a as usize] += 1;
@@ -2547,6 +2640,50 @@ mod tests {
             self.0 ^= self.0 << 17;
             self.0
         }
+    }
+
+    #[test]
+    fn violating_branch_rule_defaults_to_first_and_requires_exact_opt_in() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            ViolatingBranchRule::from_selector(None),
+            ViolatingBranchRule::First
+        );
+        for value in ["", "first", "VIOL", "viol "] {
+            assert_eq!(
+                ViolatingBranchRule::from_selector(Some(OsStr::new(value))),
+                ViolatingBranchRule::First,
+                "only the exact `viol` selector may change proof traversal"
+            );
+        }
+        assert_eq!(
+            ViolatingBranchRule::from_selector(Some(OsStr::new("viol"))),
+            ViolatingBranchRule::ViolDegree
+        );
+    }
+
+    #[test]
+    fn integral_dual_prune_is_strict_at_next_integer_boundary() {
+        let floor = 17_i128;
+        let next_integer = -(floor + 1) * DUAL_SCALE;
+
+        assert!(
+            !scaled_dual_bound_prunes(next_integer, floor),
+            "UB == floor + 1 can still improve the incumbent"
+        );
+        assert!(
+            scaled_dual_bound_prunes(next_integer + 1, floor),
+            "one exact grid tick below floor + 1 cannot reach another integer"
+        );
+        assert!(
+            scaled_dual_bound_prunes(-floor * DUAL_SCALE, floor),
+            "UB == floor is prunable"
+        );
+        assert!(
+            !scaled_dual_bound_prunes(0, i128::MAX),
+            "overflow must decline rather than manufacture a prune"
+        );
     }
 
     /// Differential: the exact solver must match brute force on random graphs.

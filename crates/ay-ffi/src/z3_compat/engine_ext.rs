@@ -28,13 +28,14 @@
 
 use std::ffi::c_uint;
 
-use ay_dpll::api::{FuncDecl, Model, Sort, Term};
+use ay_dpll::api::{FuncDecl, Model, SolverError, Sort, Term};
 
 use super::{
-    ast_to_term, ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast, ffi_guard_ptr,
-    ffi_guard_uint, lookup_ast_sort, record_ast_sort, term_to_ast, ModelHandle, Z3_ast,
-    Z3_ast_vector, Z3_context, Z3_func_decl, Z3_model, Z3_sort, Z3_symbol, Z3_INVALID_ARG, Z3_IOB,
-    Z3_SORT_ERROR,
+    checked_ast_to_term, ffi_count_within_limit, ffi_counts_within_limit, ffi_guard_ast,
+    ffi_guard_ptr, ffi_guard_uint, lookup_ast_sort, record_ast_sort, require_term_ast_or_return,
+    require_term_asts_or_return, term_ast_belongs_to, term_to_ast, ModelHandle, Z3Context, Z3_ast,
+    Z3_ast_vector, Z3_context, Z3_func_decl, Z3_model, Z3_sort, Z3_symbol, HANDLE_TAG_MASK,
+    TERM_AST_PAYLOAD_MASK, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_IOB, Z3_SORT_ERROR,
 };
 
 // ============================================================================
@@ -55,7 +56,12 @@ pub unsafe extern "C" fn Z3_is_ground(c: Z3_context, a: Z3_ast) -> bool {
     }
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_uint` null-checks it
     // and catches panics so none cross the FFI boundary. Bool encoded as 0/1.
-    let r = unsafe { ffi_guard_uint(c, 0, |ctx| u32::from(ctx.solver.is_ground(ast_to_term(a)))) };
+    let r = unsafe {
+        ffi_guard_uint(c, 0, |ctx| {
+            let term = require_term_ast_or_return!(ctx, a, "Z3_is_ground", "AST", 0);
+            u32::from(ctx.solver.is_ground(term))
+        })
+    };
     r != 0
 }
 
@@ -89,17 +95,19 @@ pub unsafe extern "C" fn Z3_substitute_vars(
     if num_exprs == 0 || to.is_null() {
         return a;
     }
-    let to_terms: Vec<Term> = (0..num_exprs as usize)
+    let to_asts: Vec<Z3_ast> = (0..num_exprs as usize)
         // SAFETY: caller's contract guarantees `to` points to `num_exprs` elements;
         // count range-checked and null-checked above.
-        .map(|i| ast_to_term(unsafe { *to.add(i) }))
+        .map(|i| unsafe { *to.add(i) })
         .collect();
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it
     // and catches panics so none cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let result = ctx.solver.substitute_vars(ast_to_term(a), &to_terms);
-            let r = term_to_ast(result);
+            let source = require_term_ast_or_return!(ctx, a, "Z3_substitute_vars", "input", a);
+            let to_terms = require_term_asts_or_return!(ctx, &to_asts, "Z3_substitute_vars", a);
+            let result = ctx.solver.substitute_vars(source, &to_terms);
+            let r = term_to_ast(ctx, result);
             let sort = ctx.solver.term_sort(result);
             record_ast_sort(ctx, r, sort);
             r
@@ -162,17 +170,17 @@ pub unsafe extern "C" fn Z3_substitute_funs(
         // the owning context (single-threaded per context).
         from_decls.push(unsafe { (*d).decl.clone() });
     }
-    let to_terms: Vec<Term> = (0..num_funs as usize)
+    let to_asts: Vec<Z3_ast> = (0..num_funs as usize)
         // SAFETY: caller's contract guarantees `to` points to `num_funs` elements.
-        .map(|i| ast_to_term(unsafe { *to.add(i) }))
+        .map(|i| unsafe { *to.add(i) })
         .collect();
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let result = ctx
-                .solver
-                .substitute_funs(ast_to_term(a), &from_decls, &to_terms);
-            let r = term_to_ast(result);
+            let source = require_term_ast_or_return!(ctx, a, "Z3_substitute_funs", "input", a);
+            let to_terms = require_term_asts_or_return!(ctx, &to_asts, "Z3_substitute_funs", a);
+            let result = ctx.solver.substitute_funs(source, &from_decls, &to_terms);
+            let r = term_to_ast(ctx, result);
             let sort = ctx.solver.term_sort(result);
             record_ast_sort(ctx, r, sort);
             r
@@ -180,10 +188,53 @@ pub unsafe extern "C" fn Z3_substitute_funs(
     }
 }
 
+/// Decode one raw term handle only after authenticating its representation and
+/// membership in this context's term store.
+fn checked_update_term_ast(ctx: &Z3Context, ast: Z3_ast, role: &str) -> Result<Term, SolverError> {
+    if ast == 0 {
+        return Err(SolverError::InvalidArgument {
+            operation: "update_term",
+            message: format!("{role} AST handle is null"),
+        });
+    }
+    if ast & HANDLE_TAG_MASK != 0 {
+        return Err(SolverError::InvalidArgument {
+            operation: "update_term",
+            message: format!("{role} AST handle {ast} is tagged and does not denote a term"),
+        });
+    }
+    if !term_ast_belongs_to(ctx, ast) {
+        return Err(SolverError::InvalidArgument {
+            operation: "update_term",
+            message: format!("{role} AST handle {ast} belongs to a different context"),
+        });
+    }
+    let payload = ast & TERM_AST_PAYLOAD_MASK;
+    let max_term_ast = u64::from(u32::MAX) + 1;
+    if payload > max_term_ast {
+        return Err(SolverError::InvalidArgument {
+            operation: "update_term",
+            message: format!(
+                "{role} AST handle {ast} exceeds the maximum term payload {max_term_ast}"
+            ),
+        });
+    }
+    let Some(term) = checked_ast_to_term(ctx, ast) else {
+        return Err(SolverError::InvalidArgument {
+            operation: "update_term",
+            message: format!("{role} AST handle {ast} is not live in this context"),
+        });
+    };
+    Ok(term)
+}
+
 /// Rebuild `a` keeping its operator/binder but swapping in `args` as children.
 ///
 /// Arg-count mismatch (against the node's child count) sets `Z3_IOB` and returns
-/// `a` unchanged. Delegates to `Solver::update_term`.
+/// `a` unchanged. Invalid handles, replacement-sort mismatches, and other
+/// checked rebuild failures set `Z3_EXCEPTION`, preserve the complete
+/// `SolverError` diagnostic, and likewise return `a` unchanged. Delegates to
+/// `Solver::try_update_term`; no unchecked term-store access occurs here.
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `args`, when non-null, must point to
@@ -195,36 +246,70 @@ pub unsafe extern "C" fn Z3_update_term(
     num_args: c_uint,
     args: *const Z3_ast,
 ) -> Z3_ast {
-    if a == 0 {
-        return 0;
-    }
     // SAFETY: this public entry point requires `c` to be null or a live,
     // exclusively borrowed context; the bound checker only updates its error state.
     if !unsafe { ffi_count_within_limit(c, "Z3_update_term", num_args) } {
-        return 0;
+        return a;
     }
-    let arg_terms: Vec<Term> = if num_args == 0 || args.is_null() {
-        Vec::new()
-    } else {
-        (0..num_args as usize)
-            // SAFETY: caller's contract guarantees `args` points to `num_args`
-            // elements; count range-checked and null-checked above.
-            .map(|i| ast_to_term(unsafe { *args.add(i) }))
-            .collect()
-    };
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            match ctx.solver.update_term(ast_to_term(a), &arg_terms) {
-                Some(result) => {
-                    let r = term_to_ast(result);
+            let source = match checked_update_term_ast(ctx, a, "source") {
+                Ok(source) => source,
+                Err(error) => {
+                    ctx.last_error = Z3_EXCEPTION;
+                    ctx.error_msg = Some(error.to_string());
+                    return a;
+                }
+            };
+            if num_args > 0 && args.is_null() {
+                let error = SolverError::InvalidArgument {
+                    operation: "update_term",
+                    message: "replacement AST array is null for a nonzero argument count"
+                        .to_string(),
+                };
+                ctx.last_error = Z3_EXCEPTION;
+                ctx.error_msg = Some(error.to_string());
+                return a;
+            }
+            let mut arg_terms = Vec::with_capacity(num_args as usize);
+            for position in 0..num_args as usize {
+                // SAFETY: the public function contract requires `args` to point
+                // to `num_args` elements; the count is capped above and the
+                // nonzero-count null case was rejected before this dereference.
+                let raw = *args.add(position);
+                let role = format!("replacement at position {position}");
+                match checked_update_term_ast(ctx, raw, &role) {
+                    Ok(term) => arg_terms.push(term),
+                    Err(error) => {
+                        ctx.last_error = Z3_EXCEPTION;
+                        ctx.error_msg = Some(error.to_string());
+                        return a;
+                    }
+                }
+            }
+
+            match ctx.solver.try_update_term(source, &arg_terms) {
+                Ok(result) => {
+                    let r = term_to_ast(ctx, result);
                     let sort = ctx.solver.term_sort(result);
                     record_ast_sort(ctx, r, sort);
                     r
                 }
-                None => {
-                    ctx.last_error = Z3_IOB;
-                    ctx.error_msg = Some("Z3_update_term: argument count mismatch".to_string());
+                Err(error) => {
+                    let is_count_mismatch = matches!(
+                        &error,
+                        SolverError::InvalidArgument { operation, message }
+                            if *operation == "update_term"
+                                && message.starts_with("term expects ")
+                                && message.contains(" immediate children, got ")
+                    );
+                    ctx.last_error = if is_count_mismatch {
+                        Z3_IOB
+                    } else {
+                        Z3_EXCEPTION
+                    };
+                    ctx.error_msg = Some(error.to_string());
                     a
                 }
             }
@@ -246,8 +331,10 @@ pub unsafe extern "C" fn Z3_mk_array_default(c: Z3_context, array: Z3_ast) -> Z3
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.array_default(ast_to_term(array));
-            let r = term_to_ast(t);
+            let array_term =
+                require_term_ast_or_return!(ctx, array, "Z3_mk_array_default", "array", 0);
+            let t = ctx.solver.array_default(array_term);
+            let r = term_to_ast(ctx, t);
             let elem = lookup_ast_sort(ctx, array).and_then(|s| s.array_element().cloned());
             let sort = elem.unwrap_or_else(|| ctx.solver.term_sort(t));
             record_ast_sort(ctx, r, sort);
@@ -285,7 +372,7 @@ pub unsafe extern "C" fn Z3_mk_as_array(c: Z3_context, f: Z3_func_decl) -> Z3_as
             };
             let array_sort = Sort::array(dom0, range.clone());
             let t = ctx.solver.as_array(&name, array_sort.clone());
-            let r = term_to_ast(t);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, array_sort);
             r
         })
@@ -356,11 +443,13 @@ pub unsafe extern "C" fn Z3_mk_lambda(
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let body = require_term_ast_or_return!(ctx, body, "Z3_mk_lambda", "body", 0);
             let vars: Vec<Term> = decl_data
                 .iter()
                 .map(|(sort, name)| {
                     let v = ctx.solver.declare_const(name, sort.clone());
-                    record_ast_sort(ctx, term_to_ast(v), sort.clone());
+                    let ast = term_to_ast(ctx, v);
+                    record_ast_sort(ctx, ast, sort.clone());
                     v
                 })
                 .collect();
@@ -369,12 +458,12 @@ pub unsafe extern "C" fn Z3_mk_lambda(
             // indices to the enclosing scope — otherwise `__db{k}` leaks into
             // the lambda as a free variable and `select` beta-reduction
             // produces an OPEN term (a wrong value).
-            let mut acc = ctx.solver.bind_de_bruijn(&vars, ast_to_term(body));
+            let mut acc = ctx.solver.bind_de_bruijn(&vars, body);
             // Curry: lambda(x0, lambda(x1, .. lambda(x_{n-1}, body))).
             for &var in vars.iter().rev() {
                 acc = ctx.solver.lambda_array(var, acc);
             }
-            let r = term_to_ast(acc);
+            let r = term_to_ast(ctx, acc);
             let sort = ctx.solver.term_sort(acc);
             record_ast_sort(ctx, r, sort);
             r
@@ -413,19 +502,21 @@ pub unsafe extern "C" fn Z3_mk_lambda_const(
             })
         };
     }
-    let vars: Vec<Term> = (0..num_bound as usize)
+    let bound_asts: Vec<Z3_ast> = (0..num_bound as usize)
         // SAFETY: caller's contract guarantees `bound` points to `num_bound`
         // elements; count range-checked and null-checked above.
-        .map(|i| ast_to_term(unsafe { *bound.add(i) }))
+        .map(|i| unsafe { *bound.add(i) })
         .collect();
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let mut acc = ast_to_term(body);
+            let vars =
+                require_term_asts_or_return!(ctx, &bound_asts, "Z3_mk_lambda_const bounds", 0);
+            let mut acc = require_term_ast_or_return!(ctx, body, "Z3_mk_lambda_const", "body", 0);
             for &var in vars.iter().rev() {
                 acc = ctx.solver.lambda_array(var, acc);
             }
-            let r = term_to_ast(acc);
+            let r = term_to_ast(ctx, acc);
             let sort = ctx.solver.term_sort(acc);
             record_ast_sort(ctx, r, sort);
             r
@@ -466,6 +557,7 @@ pub unsafe extern "C" fn Z3_mk_map(
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let arg_terms = require_term_asts_or_return!(ctx, &arg_asts, "Z3_mk_map arrays", 0);
             // Full sort gate (z3's checked builder; AY's map term captures `f`
             // by NAME only, so an ill-sorted map could silently conflate
             // functions — refuse up front instead).
@@ -480,10 +572,10 @@ pub unsafe extern "C" fn Z3_mk_map(
                 return 0;
             }
             let mut idx_sort: Option<Sort> = None;
-            for (i, &a) in arg_asts.iter().enumerate() {
+            for (i, (&a, &term)) in arg_asts.iter().zip(&arg_terms).enumerate() {
                 let sort = match lookup_ast_sort(ctx, a).cloned() {
                     Some(s) => s,
-                    None => ctx.solver.term_sort(ast_to_term(a)),
+                    None => ctx.solver.term_sort(term),
                 };
                 let Sort::Array(arr) = &sort else {
                     ctx.last_error = Z3_SORT_ERROR;
@@ -544,12 +636,11 @@ pub unsafe extern "C" fn Z3_mk_map(
                         .insert(decl.name().to_string(), decl.clone());
                 }
             }
-            let arg_terms: Vec<Term> = arg_asts.iter().map(|&a| ast_to_term(a)).collect();
             let result_sort = Sort::array(idx_sort, decl.range().clone());
             let t = ctx
                 .solver
                 .array_map(decl.name(), &arg_terms, result_sort.clone());
-            let r = term_to_ast(t);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, result_sort);
             r
         })
@@ -558,10 +649,10 @@ pub unsafe extern "C" fn Z3_mk_map(
 
 /// Read the set (array) sort of `set_ast`, falling back to the solver's own
 /// term sort when the side table has no record.
-fn set_sort_of(ctx: &super::Z3Context, set_ast: Z3_ast) -> Sort {
+fn set_sort_of(ctx: &Z3Context, set_ast: Z3_ast, set_term: Term) -> Sort {
     match lookup_ast_sort(ctx, set_ast).cloned() {
         Some(s) => s,
-        None => ctx.solver.term_sort(ast_to_term(set_ast)),
+        None => ctx.solver.term_sort(set_term),
     }
 }
 
@@ -631,21 +722,23 @@ unsafe fn mk_set_nary(
     }
     // SAFETY: `args` null-checked and `num_args >= 1`, so `*args` is in bounds.
     let first = unsafe { *args };
-    if num_args == 1 {
-        return first;
-    }
-    let arg_terms: Vec<Term> = (0..num_args as usize)
+    let arg_asts: Vec<Z3_ast> = (0..num_args as usize)
         // SAFETY: caller's contract guarantees `args` points to `num_args` elements.
-        .map(|i| ast_to_term(unsafe { *args.add(i) }))
+        .map(|i| unsafe { *args.add(i) })
         .collect();
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let set_sort = set_sort_of(ctx, first);
+            let arg_terms =
+                require_term_asts_or_return!(ctx, &arg_asts, "set combinator arguments", 0);
+            if num_args == 1 {
+                return term_to_ast(ctx, arg_terms[0]);
+            }
+            let set_sort = set_sort_of(ctx, first, arg_terms[0]);
             let t = ctx
                 .solver
                 .array_map(combinator, &arg_terms, set_sort.clone());
-            let r = term_to_ast(t);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, set_sort);
             r
         })
@@ -663,14 +756,16 @@ pub unsafe extern "C" fn Z3_mk_set_difference(c: Z3_context, arg1: Z3_ast, arg2:
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let set_sort = set_sort_of(ctx, arg1);
-            let not_arg2 = ctx
-                .solver
-                .array_map("not", &[ast_to_term(arg2)], set_sort.clone());
+            let arg1_term =
+                require_term_ast_or_return!(ctx, arg1, "Z3_mk_set_difference", "left set", 0);
+            let arg2_term =
+                require_term_ast_or_return!(ctx, arg2, "Z3_mk_set_difference", "right set", 0);
+            let set_sort = set_sort_of(ctx, arg1, arg1_term);
+            let not_arg2 = ctx.solver.array_map("not", &[arg2_term], set_sort.clone());
             let t = ctx
                 .solver
-                .array_map("and", &[ast_to_term(arg1), not_arg2], set_sort.clone());
-            let r = term_to_ast(t);
+                .array_map("and", &[arg1_term, not_arg2], set_sort.clone());
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, set_sort);
             r
         })
@@ -687,11 +782,10 @@ pub unsafe extern "C" fn Z3_mk_set_complement(c: Z3_context, arg: Z3_ast) -> Z3_
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let set_sort = set_sort_of(ctx, arg);
-            let t = ctx
-                .solver
-                .array_map("not", &[ast_to_term(arg)], set_sort.clone());
-            let r = term_to_ast(t);
+            let arg_term = require_term_ast_or_return!(ctx, arg, "Z3_mk_set_complement", "set", 0);
+            let set_sort = set_sort_of(ctx, arg, arg_term);
+            let t = ctx.solver.array_map("not", &[arg_term], set_sort.clone());
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, set_sort);
             r
         })
@@ -712,8 +806,10 @@ pub unsafe extern "C" fn Z3_mk_str_le(c: Z3_context, prefix: Z3_ast, s: Z3_ast) 
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.str_le(ast_to_term(prefix), ast_to_term(s));
-            let r = term_to_ast(t);
+            let prefix = require_term_ast_or_return!(ctx, prefix, "Z3_mk_str_le", "prefix", 0);
+            let s = require_term_ast_or_return!(ctx, s, "Z3_mk_str_le", "string", 0);
+            let t = ctx.solver.str_le(prefix, s);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, Sort::Bool);
             r
         })
@@ -730,8 +826,10 @@ pub unsafe extern "C" fn Z3_mk_str_lt(c: Z3_context, prefix: Z3_ast, s: Z3_ast) 
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.str_lt(ast_to_term(prefix), ast_to_term(s));
-            let r = term_to_ast(t);
+            let prefix = require_term_ast_or_return!(ctx, prefix, "Z3_mk_str_lt", "prefix", 0);
+            let s = require_term_ast_or_return!(ctx, s, "Z3_mk_str_lt", "string", 0);
+            let t = ctx.solver.str_lt(prefix, s);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, Sort::Bool);
             r
         })
@@ -748,8 +846,9 @@ pub unsafe extern "C" fn Z3_mk_string_from_code(c: Z3_context, a: Z3_ast) -> Z3_
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.string_from_code(ast_to_term(a));
-            let r = term_to_ast(t);
+            let a = require_term_ast_or_return!(ctx, a, "Z3_mk_string_from_code", "code", 0);
+            let t = ctx.solver.string_from_code(a);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, Sort::String);
             r
         })
@@ -766,8 +865,9 @@ pub unsafe extern "C" fn Z3_mk_string_to_code(c: Z3_context, a: Z3_ast) -> Z3_as
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.string_to_code(ast_to_term(a));
-            let r = term_to_ast(t);
+            let a = require_term_ast_or_return!(ctx, a, "Z3_mk_string_to_code", "string", 0);
+            let t = ctx.solver.string_to_code(a);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, Sort::Int);
             r
         })
@@ -784,10 +884,11 @@ pub unsafe extern "C" fn Z3_mk_seq_last_index(c: Z3_context, s: Z3_ast, substr: 
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx
-                .solver
-                .seq_last_index(ast_to_term(s), ast_to_term(substr));
-            let r = term_to_ast(t);
+            let s = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_last_index", "sequence", 0);
+            let substr =
+                require_term_ast_or_return!(ctx, substr, "Z3_mk_seq_last_index", "substring", 0);
+            let t = ctx.solver.seq_last_index(s, substr);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, Sort::Int);
             r
         })
@@ -810,10 +911,12 @@ pub unsafe extern "C" fn Z3_mk_seq_replace_re(
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx
-                .solver
-                .seq_replace_re(ast_to_term(s), ast_to_term(re), ast_to_term(dst));
-            let r = term_to_ast(t);
+            let s = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_replace_re", "string", 0);
+            let re = require_term_ast_or_return!(ctx, re, "Z3_mk_seq_replace_re", "regex", 0);
+            let dst =
+                require_term_ast_or_return!(ctx, dst, "Z3_mk_seq_replace_re", "replacement", 0);
+            let t = ctx.solver.seq_replace_re(s, re, dst);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, Sort::String);
             r
         })
@@ -836,10 +939,12 @@ pub unsafe extern "C" fn Z3_mk_seq_replace_re_all(
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t =
-                ctx.solver
-                    .seq_replace_re_all(ast_to_term(s), ast_to_term(re), ast_to_term(dst));
-            let r = term_to_ast(t);
+            let s = require_term_ast_or_return!(ctx, s, "Z3_mk_seq_replace_re_all", "string", 0);
+            let re = require_term_ast_or_return!(ctx, re, "Z3_mk_seq_replace_re_all", "regex", 0);
+            let dst =
+                require_term_ast_or_return!(ctx, dst, "Z3_mk_seq_replace_re_all", "replacement", 0);
+            let t = ctx.solver.seq_replace_re_all(s, re, dst);
+            let r = term_to_ast(ctx, t);
             record_ast_sort(ctx, r, Sort::String);
             r
         })
@@ -903,9 +1008,10 @@ pub unsafe extern "C" fn Z3_qe_lite(c: Z3_context, vars: Z3_ast_vector, body: Z3
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let var_terms: Vec<Term> = var_asts.iter().map(|&a| ast_to_term(a)).collect();
-            let result = ctx.solver.qe_lite(ast_to_term(body), &var_terms);
-            let r = term_to_ast(result);
+            let var_terms = require_term_asts_or_return!(ctx, &var_asts, "Z3_qe_lite variables", 0);
+            let body = require_term_ast_or_return!(ctx, body, "Z3_qe_lite", "body", 0);
+            let result = ctx.solver.qe_lite(body, &var_terms);
+            let r = term_to_ast(ctx, result);
             let sort = ctx.solver.term_sort(result);
             record_ast_sort(ctx, r, sort);
             r

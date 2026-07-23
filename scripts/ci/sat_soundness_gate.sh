@@ -15,11 +15,70 @@
 #   10 = SAT,  20 = UNSAT (+ proof internally verified),  1 = proof REJECTED,
 #   other = UNKNOWN/timeout.
 #
+# A standalone invocation acquires the host-wide `_oom_guard.py` lease before
+# planning its single solver child. The continuous campaign already owns that
+# lease and passes an explicit, validated parent envelope instead.
+#
 # Usage: scripts/ci/sat_soundness_gate.sh [ay-binary] [proof-format] [timeout-s]
 set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
+
+OOM_GUARD="$REPO_ROOT/scripts/_oom_guard.py"
+PROOF_DIR=""
+LEASE_READ_FD=""
+LEASE_WRITE_FD=""
+LEASE_PID=""
+
+cleanup() {
+    local rc=$?
+    local lease_rc=0
+    trap - EXIT INT TERM HUP
+    if [ -n "$PROOF_DIR" ]; then
+        rm -rf -- "$PROOF_DIR"
+    fi
+    if [ -n "$LEASE_WRITE_FD" ]; then
+        exec {LEASE_WRITE_FD}>&-
+    fi
+    if [ -n "$LEASE_READ_FD" ]; then
+        exec {LEASE_READ_FD}<&-
+    fi
+    if [ -n "$LEASE_PID" ]; then
+        wait "$LEASE_PID" || lease_rc=$?
+        if [ "$rc" -eq 0 ] && [ "$lease_rc" -ne 0 ]; then
+            echo "FATAL: oom-guard lease sidecar exited with status $lease_rc" >&2
+            rc=2
+        fi
+    fi
+    exit "$rc"
+}
+
+fatal() {
+    echo "FATAL: $*" >&2
+    exit 2
+}
+
+require_positive_decimal() {
+    local name="$1"
+    local value="$2"
+    if ! [[ "$value" =~ ^[1-9][0-9]*$ ]] || [ "${#value}" -gt 9 ]; then
+        fatal "$name must be a positive decimal integer"
+    fi
+}
+
+require_nonnegative_decimal() {
+    local name="$1"
+    local value="$2"
+    if ! [[ "$value" =~ ^(0|[1-9][0-9]*)$ ]] || [ "${#value}" -gt 9 ]; then
+        fatal "$name must be a non-negative decimal integer"
+    fi
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 BIN="${1:-}"
 if [ -z "$BIN" ]; then
@@ -29,6 +88,142 @@ if [ -z "$BIN" ]; then
 fi
 FMT="${2:-drat}"     # drat (SAT-COMP Main canonical) or lrat
 TIMEOUT="${3:-60}"
+
+RESOURCE_JOBS=""
+RESOURCE_MEMLIMIT_MB=""
+RESOURCE_NBCORE=""
+RESOURCE_HEADROOM_MB=""
+RESOURCE_LEASE=""
+RESOURCE_SOURCE=""
+
+if [ "${AY_OOM_GUARD_PARENT_LEASE:-}" = "1" ]; then
+    require_positive_decimal "AY_CONTINUOUS_JOBS" "${AY_CONTINUOUS_JOBS:-}"
+    require_positive_decimal \
+        "AY_CONTINUOUS_MEMLIMIT_MB" "${AY_CONTINUOUS_MEMLIMIT_MB:-}"
+    require_positive_decimal "MEMLIMIT" "${MEMLIMIT:-}"
+    require_positive_decimal "NBCORE" "${NBCORE:-}"
+    require_nonnegative_decimal \
+        "AY_CONTINUOUS_HEADROOM_MB" "${AY_CONTINUOUS_HEADROOM_MB:-}"
+
+    RESOURCE_JOBS=$((10#$AY_CONTINUOUS_JOBS))
+    RESOURCE_MEMLIMIT_MB=$((10#$AY_CONTINUOUS_MEMLIMIT_MB))
+    RESOURCE_NBCORE=$((10#$NBCORE))
+    RESOURCE_HEADROOM_MB=$((10#$AY_CONTINUOUS_HEADROOM_MB))
+    if [ "$RESOURCE_JOBS" -ne 1 ]; then
+        fatal "parent resource plan must admit exactly one SAT gate child"
+    fi
+    if [ "$RESOURCE_MEMLIMIT_MB" -ne "$((10#$MEMLIMIT))" ]; then
+        fatal "AY_CONTINUOUS_MEMLIMIT_MB and MEMLIMIT must match"
+    fi
+    RESOURCE_LEASE="parent-held"
+    RESOURCE_SOURCE="parent-plan"
+elif [ -n "${AY_OOM_GUARD_PARENT_LEASE:-}" ]; then
+    fatal "AY_OOM_GUARD_PARENT_LEASE must be 1 when set"
+else
+    [ -f "$OOM_GUARD" ] || fatal "missing resource planner: $OOM_GUARD"
+    coproc SAT_OOM_LEASE {
+        python3 "$OOM_GUARD" lease --label "sat-soundness-gate"
+    }
+    LEASE_READ_FD="${SAT_OOM_LEASE[0]:-}"
+    LEASE_WRITE_FD="${SAT_OOM_LEASE[1]:-}"
+    LEASE_PID="${SAT_OOM_LEASE_PID:-}"
+    if [ -z "$LEASE_READ_FD" ] \
+        || [ -z "$LEASE_WRITE_FD" ] \
+        || [ -z "$LEASE_PID" ]; then
+        fatal "could not start oom-guard lease sidecar"
+    fi
+    lease_ready=""
+    if ! IFS= read -r lease_ready <&"$LEASE_READ_FD"; then
+        fatal "oom-guard lease sidecar exited before readiness"
+    fi
+    if [ "$lease_ready" != "AY_OOM_HARNESS_LEASE_READY_V1" ]; then
+        fatal "unexpected oom-guard lease readiness marker"
+    fi
+
+    plan_output=""
+    if ! plan_output="$(
+        python3 "$OOM_GUARD" plan \
+            --jobs 1 \
+            --label "sat-soundness-gate" \
+            --warn-concurrent-build
+    )"; then
+        fatal "oom-guard could not plan the SAT soundness gate"
+    fi
+    while IFS='=' read -r key value; do
+        case "$key" in
+            PLAN_JOBS)
+                [ -z "$RESOURCE_JOBS" ] || fatal "duplicate PLAN_JOBS"
+                RESOURCE_JOBS="$value"
+                ;;
+            PLAN_MEMLIMIT_MB)
+                [ -z "$RESOURCE_MEMLIMIT_MB" ] || \
+                    fatal "duplicate PLAN_MEMLIMIT_MB"
+                RESOURCE_MEMLIMIT_MB="$value"
+                ;;
+            PLAN_NBCORE)
+                [ -z "$RESOURCE_NBCORE" ] || fatal "duplicate PLAN_NBCORE"
+                RESOURCE_NBCORE="$value"
+                ;;
+            PLAN_HEADROOM_MB)
+                [ -z "$RESOURCE_HEADROOM_MB" ] || \
+                    fatal "duplicate PLAN_HEADROOM_MB"
+                RESOURCE_HEADROOM_MB="$value"
+                ;;
+            *)
+                fatal "unexpected oom-guard plan output: $key"
+                ;;
+        esac
+    done <<< "$plan_output"
+
+    require_positive_decimal "PLAN_JOBS" "$RESOURCE_JOBS"
+    require_positive_decimal "PLAN_MEMLIMIT_MB" "$RESOURCE_MEMLIMIT_MB"
+    require_positive_decimal "PLAN_NBCORE" "$RESOURCE_NBCORE"
+    require_nonnegative_decimal "PLAN_HEADROOM_MB" "$RESOURCE_HEADROOM_MB"
+    RESOURCE_JOBS=$((10#$RESOURCE_JOBS))
+    RESOURCE_MEMLIMIT_MB=$((10#$RESOURCE_MEMLIMIT_MB))
+    RESOURCE_NBCORE=$((10#$RESOURCE_NBCORE))
+    RESOURCE_HEADROOM_MB=$((10#$RESOURCE_HEADROOM_MB))
+    if [ "$RESOURCE_JOBS" -ne 1 ]; then
+        fatal "oom-guard plan did not admit exactly one SAT gate child"
+    fi
+
+    RESOURCE_SOURCE="auto-plan"
+    for resource_cap in \
+        "AY_CONTINUOUS_MEMLIMIT_MB=${AY_CONTINUOUS_MEMLIMIT_MB:-}" \
+        "MEMLIMIT=${MEMLIMIT:-}"
+    do
+        cap_name="${resource_cap%%=*}"
+        cap_value="${resource_cap#*=}"
+        [ -z "$cap_value" ] && continue
+        require_positive_decimal "$cap_name" "$cap_value"
+        cap_value=$((10#$cap_value))
+        if [ "$cap_value" -lt "$RESOURCE_MEMLIMIT_MB" ]; then
+            RESOURCE_MEMLIMIT_MB="$cap_value"
+        fi
+        RESOURCE_SOURCE="auto-plan-capped"
+    done
+    if [ -n "${NBCORE:-}" ]; then
+        require_positive_decimal "NBCORE" "$NBCORE"
+        caller_nbcore=$((10#$NBCORE))
+        if [ "$caller_nbcore" -lt "$RESOURCE_NBCORE" ]; then
+            RESOURCE_NBCORE="$caller_nbcore"
+        fi
+        RESOURCE_SOURCE="auto-plan-capped"
+    fi
+    RESOURCE_LEASE="sidecar"
+fi
+
+export AY_CONTINUOUS_JOBS="$RESOURCE_JOBS"
+export AY_CONTINUOUS_MEMLIMIT_MB="$RESOURCE_MEMLIMIT_MB"
+export AY_CONTINUOUS_HEADROOM_MB="$RESOURCE_HEADROOM_MB"
+export MEMLIMIT="$RESOURCE_MEMLIMIT_MB"
+export NBCORE="$RESOURCE_NBCORE"
+MEMORY_ARGS=(--memory "$RESOURCE_MEMLIMIT_MB")
+RESOURCE_ENVELOPE="RESOURCE_ENVELOPE_V1 requested_jobs=1 jobs=$RESOURCE_JOBS \
+memlimit_mb_per_child=$RESOURCE_MEMLIMIT_MB \
+nbcore_per_child=$RESOURCE_NBCORE headroom_mb=$RESOURCE_HEADROOM_MB \
+memory_enforcement=ay-main--memory lease=$RESOURCE_LEASE \
+source=$RESOURCE_SOURCE"
 
 # Labeled instances: "<expected> <path>"; everything under sat/unsat/ is UNSAT.
 declare -a CASES=(
@@ -44,27 +239,30 @@ if command -v timeout >/dev/null 2>&1; then TO="timeout ${TIMEOUT}s"
 elif command -v gtimeout >/dev/null 2>&1; then TO="gtimeout ${TIMEOUT}s"; fi
 
 PROOF_DIR="$(mktemp -d)"
-trap 'rm -rf "$PROOF_DIR"' EXIT
 
-wrong=0; rejected=0; solved=0; unknown=0; total=0
+wrong=0; rejected=0; solved=0; unknown=0; harness_error=0; total=0
 echo "SAT soundness gate: binary=$BIN format=$FMT timeout=${TIMEOUT}s"
+echo "$RESOURCE_ENVELOPE"
 echo "------------------------------------------------------------"
 for case in "${CASES[@]}"; do
     expected="${case%% *}"; path="${case##* }"
     [ -f "$path" ] || { echo "SKIP  (missing) $path"; continue; }
     total=$((total + 1))
     proof="$PROOF_DIR/$(basename "$path").$FMT"
-    $TO "$BIN" "$path" --proof "$proof" --proof-format "$FMT" --verify-proof >/dev/null 2>&1
+    $TO "$BIN" "$path" "${MEMORY_ARGS[@]}" --proof "$proof" --proof-format "$FMT" --verify-proof >/dev/null 2>&1
     rc=$?
     case "$rc" in
         10) verdict=SAT ;;
         20) verdict=UNSAT ;;       # UNSAT + proof verified
         1)  verdict=PROOF_REJECTED ;;
-        *)  verdict=UNKNOWN ;;
+        0|124) verdict=UNKNOWN ;;  # solver-declared unknown or wall timeout
+        *)  verdict=HARNESS_ERROR ;;
     esac
     rm -f "$proof"
     if [ "$verdict" = "PROOF_REJECTED" ]; then
         echo "REJECT proof failed verification  $path"; rejected=$((rejected + 1))
+    elif [ "$verdict" = "HARNESS_ERROR" ]; then
+        echo "ERROR unexpected solver/checker exit=$rc  $path"; harness_error=$((harness_error + 1))
     elif [ "$verdict" = "UNKNOWN" ]; then
         echo "warn  UNKNOWN/timeout   ($expected) $path"; unknown=$((unknown + 1))
     elif [ "$verdict" = "$expected" ]; then
@@ -74,9 +272,9 @@ for case in "${CASES[@]}"; do
     fi
 done
 echo "------------------------------------------------------------"
-echo "total=$total solved=$solved unknown=$unknown WRONG=$wrong PROOF_REJECTED=$rejected"
-if [ "$wrong" -gt 0 ] || [ "$rejected" -gt 0 ]; then
-    echo "FAIL: $wrong wrong verdict(s) + $rejected rejected proof(s) — soundness regression, blocking."
+echo "total=$total solved=$solved unknown=$unknown WRONG=$wrong PROOF_REJECTED=$rejected HARNESS_ERROR=$harness_error"
+if [ "$wrong" -gt 0 ] || [ "$rejected" -gt 0 ] || [ "$harness_error" -gt 0 ]; then
+    echo "FAIL: $wrong wrong verdict(s) + $rejected rejected proof(s) + $harness_error harness error(s) — soundness regression, blocking."
     exit 1
 fi
 echo "PASS: zero wrong answers, all UNSAT proofs verified."

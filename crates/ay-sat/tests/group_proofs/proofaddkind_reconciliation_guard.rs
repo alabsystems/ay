@@ -10,6 +10,10 @@ fn count_occurrences(source: &str, needle: &str) -> usize {
     source.match_indices(needle).count()
 }
 
+fn without_whitespace(source: &str) -> String {
+    source.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
 fn block_body<'a>(source: &'a str, marker: &str) -> &'a str {
     let start = source
         .find(marker)
@@ -94,6 +98,11 @@ fn proof_add_kind_has_three_variants() {
 #[test]
 fn add_clause_db_checked_decoupling_contract_is_preserved() {
     let source = clause_db_source();
+    let theory_source = include_str!("../../src/solver/clause_add_theory.rs");
+    let unscoped_helper = without_whitespace(block_body(
+        theory_source,
+        "fn add_unscoped_theory_clause_db(",
+    ));
 
     assert!(
         source.contains("self.add_clause_db_checked(literals, learned, learned, &[])")
@@ -107,8 +116,26 @@ fn add_clause_db_checked_decoupling_contract_is_preserved() {
         "forward checker classification split must remain explicit"
     );
     assert!(
-        source.contains("self.add_clause_db_checked(&literals, true, false, &[])"),
-        "theory lemma path must use forward_check_derived=false"
+        unscoped_helper.contains("self.add_clause_db_checked(literals,true,false,&[])"),
+        "unscoped theory clauses must use forward_check_derived=false"
+    );
+    assert_eq!(
+        count_occurrences(
+            theory_source,
+            "self.add_unscoped_theory_clause_db(&literals)"
+        ),
+        2,
+        "unit and multi-literal theory lemmas must share the unscoped axiom path"
+    );
+    assert_eq!(
+        count_occurrences(theory_source, "self.add_unscoped_theory_clause_db(&clause)"),
+        2,
+        "theory propagation clauses must share the unscoped axiom path"
+    );
+    assert_eq!(
+        count_occurrences(theory_source, "self.add_clause_db_checked("),
+        1,
+        "theory clauses must not bypass the audited unscoped helper"
     );
 }
 
@@ -160,31 +187,73 @@ fn inprocessing_axiom_emit_add_mapping() {
 
 #[test]
 fn inprocessing_trusted_transform_emit_add_mapping() {
-    let src = inprocessing_source();
+    let factorize = without_whitespace(include_str!("../../src/solver/inprocessing/factorize.rs"));
+    let sbva = without_whitespace(include_str!("../../src/solver/inprocessing/sbva.rs"));
+
+    // Factorization has two distinct TrustedTransform sites: an LRAT
+    // admission check for unproved dividers and the DRAT emission helper.
+    // The former is side-effect-free and deliberately rejects until a
+    // checker-visible divider proof is available; it is not a duplicate emit.
     for (needle, expected) in [
         (
-            "preflight_forward_lrat_add(divider, &[], ProofAddKind::TrustedTransform)",
+            "preflight_forward_lrat_add_with_planned_ids(\
+             divider,&[],ProofAddKind::TrustedTransform,planned_visible_ids,)",
             1usize,
         ),
         (
-            "proof_emit_add(&app.blocked_clause, &[], ProofAddKind::TrustedTransform)",
-            1,
-        ),
-        (
-            "preflight_forward_lrat_add(quotient, &[], ProofAddKind::TrustedTransform)",
-            1,
-        ),
-        (
-            "proof_emit_add(clause, &[], ProofAddKind::TrustedTransform)",
+            "proof_emit_add(clause,&[],ProofAddKind::TrustedTransform)",
             1,
         ),
     ] {
+        let needle = without_whitespace(needle);
         assert_eq!(
-            count_occurrences(&src, needle),
+            count_occurrences(&factorize, &needle),
             expected,
-            "drifted: `{needle}`"
+            "factorization mapping drifted: `{needle}`"
         );
     }
+    assert_eq!(
+        count_occurrences(&factorize, "ProofAddKind::TrustedTransform"),
+        2,
+        "factorization must keep one TrustedTransform preflight and one emit"
+    );
+
+    // The blocked and quotient clauses now carry signed Derived witnesses.
+    // Reintroducing their former empty-hint TrustedTransform preflights would
+    // weaken the fail-closed LRAT transaction contract.
+    for needle in [
+        "preflight_forward_lrat_add_signed_with_planned_ids(\
+         &app.blocked_clause,&sidecar.blocked_signed_lrat_hints,\
+         ProofAddKind::Derived,planned_visible_ids,)",
+        "preflight_forward_lrat_add_signed_with_planned_ids(\
+         quotient,&signed_hints,ProofAddKind::Derived,planned_visible_ids,)",
+    ] {
+        let needle = without_whitespace(needle);
+        assert_eq!(
+            count_occurrences(&factorize, &needle),
+            1,
+            "factorization signed Derived mapping drifted: `{needle}`"
+        );
+    }
+
+    // SBVA's definition, proof-only blocked clause, and tail clauses are
+    // separate DRAT transaction steps and therefore three legitimate emits.
+    for needle in [
+        "proof_emit_add(&app.definition_clause,&[],ProofAddKind::TrustedTransform,)",
+        "proof_emit_add(&app.blocked_clause,&[],ProofAddKind::TrustedTransform)",
+        "proof_emit_add(tail,&[],ProofAddKind::TrustedTransform)",
+    ] {
+        assert_eq!(
+            count_occurrences(&sbva, needle),
+            1,
+            "SBVA mapping drifted: `{needle}`"
+        );
+    }
+    assert_eq!(
+        count_occurrences(&sbva, "ProofAddKind::TrustedTransform"),
+        3,
+        "SBVA must emit exactly its three documented DRAT transaction steps"
+    );
 }
 
 #[test]

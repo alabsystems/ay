@@ -228,10 +228,23 @@ impl ProofTracker {
             return Some(id);
         }
 
+        let generic_unit_key =
+            (clause.len() == 1).then(|| LemmaKey::new(TheoryLemmaKind::Generic, &clause, None));
         let id = self
             .proof
             .add_theory_lemma_with_kind(&self.theory_name, clause, kind);
         self.lemma_map.insert(key, id);
+        // Solver-visible packed axioms are registered later through
+        // `add_assumption(term)`. Index an already certified singleton under
+        // that generic unit lookup too, so registration reuses the theorem
+        // instead of adding a stronger free `Assume` for the same term.
+        if let Some(generic_unit_key) = generic_unit_key {
+            // Preserve an older certified singleton at an outer scope. If an
+            // inner specialized lemma shadowed this alias, `pop()` could remove
+            // the inner id but could not reconstruct the overwritten mapping,
+            // orphaning the still-live outer proof step from deduplication.
+            self.lemma_map.entry(generic_unit_key).or_insert(id);
+        }
         Some(id)
     }
 
@@ -778,9 +791,18 @@ impl ProofTracker {
         Some(current_id)
     }
 
-    /// Take ownership of the accumulated proof
+    /// Take ownership of the accumulated proof and start a coherent new ledger.
+    ///
+    /// Deduplication maps contain `ProofId`s into `self.proof`.  Retaining them
+    /// after moving that proof out leaves dangling IDs: a later solve can
+    /// "reuse" a step that exists only in the previously returned proof.  Clear
+    /// those maps and zero scope watermarks exactly as for a new proof session.
     pub(crate) fn take_proof(&mut self) -> Proof {
-        std::mem::take(&mut self.proof)
+        let proof = std::mem::take(&mut self.proof);
+        self.assumption_map.clear();
+        self.lemma_map.clear();
+        self.scope_stack.fill(0);
+        proof
     }
 
     /// Get the number of proof steps

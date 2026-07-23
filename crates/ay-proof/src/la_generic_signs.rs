@@ -22,10 +22,10 @@
 //!   - inequality coefficients are applied in magnitude (Carcara fixes the
 //!     inequality orientation, ignoring the printed sign), equalities signed;
 //!   - the step is accepted iff the weighted sum eliminates every variable and
-//!     leaves a STRICTLY NEGATIVE constant — a contradiction under both `>= 0`
-//!     and `> 0`, and one that survives integer strengthening, so the check
-//!     never false-accepts (a `= 0`-constant strict combination is soundly but
-//!     conservatively rejected).
+//!     leaves either a STRICTLY NEGATIVE constant, or zero with at least one
+//!     nonzero-weighted strict inequality. Both are contradictions under the
+//!     normalized hypotheses (and survive integer strengthening), so the check
+//!     never false-accepts.
 //!
 //! Emission-only: this changes only the printed coefficients of an
 //! already-decided UNSAT proof; it never affects a verdict, and it substitutes
@@ -257,6 +257,13 @@ fn parse_lin(s: &str) -> Option<Lin> {
     }
 }
 
+/// Parse an exact printed arithmetic constant using the same linear grammar
+/// used to validate emitted `la_generic` steps.
+pub(crate) fn parse_numeric_constant(s: &str) -> Option<BigRational> {
+    let parsed = parse_lin(s)?;
+    parsed.is_constant().then_some(parsed.constant)
+}
+
 /// The normalized hypothesis for one conflict literal (`printed` atom asserted
 /// with truth value `value`): `(e, strict, is_equality)` with the hypothesis
 /// equivalent to `e >= 0` / `e > 0` / `e = 0`, `e` in `lhs - rhs` orientation.
@@ -312,14 +319,17 @@ fn coeffs_valid(hyps: &[(Lin, bool, bool)], coeffs: &[Rational64]) -> bool {
         return false;
     }
     let mut sum = Lin::default();
-    for ((expr, _strict, is_eq), &c) in hyps.iter().zip(coeffs.iter()) {
+    let mut has_strict = false;
+    for ((expr, strict, is_eq), &c) in hyps.iter().zip(coeffs.iter()) {
         let scale = if *is_eq { c } else { c.abs() };
         if scale.is_zero() {
             continue;
         }
+        has_strict |= *strict;
         sum.add_scaled(expr, &to_big(&scale));
     }
-    sum.coeffs.is_empty() && sum.constant < BigRational::zero()
+    sum.coeffs.is_empty()
+        && (sum.constant < BigRational::zero() || (sum.constant.is_zero() && has_strict))
 }
 
 /// Choose the coefficient vector to PRINT for an Alethe `la_generic` step whose

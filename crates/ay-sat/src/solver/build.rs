@@ -56,6 +56,7 @@ impl Solver {
             // reconstruction, so unit proof IDs must also always be available.
             unit_proof_id: vec![0; num_vars],
             unit_proof_sign: vec![0; num_vars],
+            pending_theory_unit_proof_ids: Vec::new(),
             // Pre-size to arena capacity for ensure_reason_clause_marks_current()
             // lazy rebuild (#8569). BCP no longer calls mark_reason_clause().
             // Arena word count = clauses * HEADER_WORDS + literals.
@@ -173,7 +174,7 @@ impl Solver {
             wander_abort_tripped: false,
             wander_abort_base_conflicts: 0,
             wander_abort_base_decisions: 0,
-            pending_theory_conflict: None,
+            pending_theory_conflicts: std::collections::VecDeque::new(),
             #[cfg(feature = "jit")]
             jit_conflict_processor: None,
             #[cfg(feature = "jit")]

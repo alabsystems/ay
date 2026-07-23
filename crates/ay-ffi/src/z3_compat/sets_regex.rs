@@ -38,9 +38,10 @@ use std::ptr;
 use ay_dpll::api::Sort;
 
 use super::{
-    alloc_sort, ast_to_term, cache_string, ffi_count_within_limit, ffi_guard_ast,
-    ffi_guard_const_ptr, ffi_guard_ptr, ffi_guard_uint, lookup_ast_sort, record_ast_sort,
-    term_to_ast, Z3_ast, Z3_context, Z3_sort, Z3_INVALID_ARG, Z3_SORT_ERROR,
+    alloc_sort, cache_string, ffi_count_within_limit, ffi_guard_ast, ffi_guard_const_ptr,
+    ffi_guard_ptr, ffi_guard_uint, lookup_ast_sort, record_ast_sort, require_term_ast_or_return,
+    require_term_asts_or_return, term_to_ast, Z3_ast, Z3_context, Z3_sort, Z3_INVALID_ARG,
+    Z3_SORT_ERROR,
 };
 
 // ============================================================================
@@ -91,7 +92,7 @@ pub unsafe extern "C" fn Z3_mk_empty_set(c: Z3_context, domain: Z3_sort) -> Z3_a
         ffi_guard_ast(c, |ctx| {
             let f = ctx.solver.bool_const(false);
             let t = ctx.solver.const_array(domain_sort.clone(), f);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::array(domain_sort.clone(), Sort::Bool));
             a
         })
@@ -118,7 +119,7 @@ pub unsafe extern "C" fn Z3_mk_full_set(c: Z3_context, domain: Z3_sort) -> Z3_as
         ffi_guard_ast(c, |ctx| {
             let tt = ctx.solver.bool_const(true);
             let t = ctx.solver.const_array(domain_sort.clone(), tt);
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::array(domain_sort.clone(), Sort::Bool));
             a
         })
@@ -138,8 +139,10 @@ pub unsafe extern "C" fn Z3_mk_set_add(c: Z3_context, set: Z3_ast, elem: Z3_ast)
     unsafe {
         ffi_guard_ast(c, |ctx| {
             let tt = ctx.solver.bool_const(true);
-            let t = ctx.solver.store(ast_to_term(set), ast_to_term(elem), tt);
-            let a = term_to_ast(t);
+            let set_term = require_term_ast_or_return!(ctx, set, "Z3_mk_set_add", "set", 0);
+            let elem = require_term_ast_or_return!(ctx, elem, "Z3_mk_set_add", "element", 0);
+            let t = ctx.solver.store(set_term, elem, tt);
+            let a = term_to_ast(ctx, t);
             // The result is the same array (set) sort as the input set.
             if let Some(sort) = lookup_ast_sort(ctx, set).cloned() {
                 record_ast_sort(ctx, a, sort);
@@ -162,8 +165,10 @@ pub unsafe extern "C" fn Z3_mk_set_del(c: Z3_context, set: Z3_ast, elem: Z3_ast)
     unsafe {
         ffi_guard_ast(c, |ctx| {
             let f = ctx.solver.bool_const(false);
-            let t = ctx.solver.store(ast_to_term(set), ast_to_term(elem), f);
-            let a = term_to_ast(t);
+            let set_term = require_term_ast_or_return!(ctx, set, "Z3_mk_set_del", "set", 0);
+            let elem = require_term_ast_or_return!(ctx, elem, "Z3_mk_set_del", "element", 0);
+            let t = ctx.solver.store(set_term, elem, f);
+            let a = term_to_ast(ctx, t);
             if let Some(sort) = lookup_ast_sort(ctx, set).cloned() {
                 record_ast_sort(ctx, a, sort);
             }
@@ -184,8 +189,10 @@ pub unsafe extern "C" fn Z3_mk_set_member(c: Z3_context, elem: Z3_ast, set: Z3_a
     // and catches panics so none cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            let t = ctx.solver.select(ast_to_term(set), ast_to_term(elem));
-            let a = term_to_ast(t);
+            let set = require_term_ast_or_return!(ctx, set, "Z3_mk_set_member", "set", 0);
+            let elem = require_term_ast_or_return!(ctx, elem, "Z3_mk_set_member", "element", 0);
+            let t = ctx.solver.select(set, elem);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -222,8 +229,8 @@ pub unsafe extern "C" fn Z3_mk_set_has_size(c: Z3_context, set: Z3_ast, k: Z3_as
                 ctx.error_msg = Some("Z3_mk_set_has_size: null AST argument".to_string());
                 return 0;
             }
-            let set_t = ast_to_term(set);
-            let k_t = ast_to_term(k);
+            let set_t = require_term_ast_or_return!(ctx, set, "Z3_mk_set_has_size", "set", 0);
+            let k_t = require_term_ast_or_return!(ctx, k, "Z3_mk_set_has_size", "size", 0);
             let set_sort = ctx.solver.sort_of(set_t);
             let Sort::Array(arr) = &set_sort else {
                 ctx.last_error = Z3_SORT_ERROR;
@@ -280,7 +287,7 @@ pub unsafe extern "C" fn Z3_mk_set_has_size(c: Z3_context, set: Z3_ast, k: Z3_as
                 // `unknown` (see the function doc).
                 None => ctx.solver.set_has_size(set_t, k_t),
             };
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::Bool);
             a
         })
@@ -304,15 +311,18 @@ pub unsafe extern "C" fn Z3_mk_seq_to_re(c: Z3_context, seq: Z3_ast) -> Z3_ast {
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it
     // and catches panics so none cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| match ctx.solver.try_str_to_re(ast_to_term(seq)) {
-            Ok(t) => {
-                let a = term_to_ast(t);
-                record_ast_sort(ctx, a, Sort::RegLan);
-                a
-            }
-            Err(_) => {
-                ctx.last_error = Z3_SORT_ERROR;
-                0
+        ffi_guard_ast(c, |ctx| {
+            let seq = require_term_ast_or_return!(ctx, seq, "Z3_mk_seq_to_re", "sequence", 0);
+            match ctx.solver.try_str_to_re(seq) {
+                Ok(t) => {
+                    let a = term_to_ast(ctx, t);
+                    record_ast_sort(ctx, a, Sort::RegLan);
+                    a
+                }
+                Err(_) => {
+                    ctx.last_error = Z3_SORT_ERROR;
+                    0
+                }
             }
         })
     }
@@ -331,9 +341,11 @@ pub unsafe extern "C" fn Z3_mk_seq_in_re(c: Z3_context, seq: Z3_ast, re: Z3_ast)
     // and catches panics so none cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            match ctx.solver.try_str_in_re(ast_to_term(seq), ast_to_term(re)) {
+            let seq = require_term_ast_or_return!(ctx, seq, "Z3_mk_seq_in_re", "sequence", 0);
+            let re = require_term_ast_or_return!(ctx, re, "Z3_mk_seq_in_re", "regex", 0);
+            match ctx.solver.try_str_in_re(seq, re) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::Bool);
                     a
                 }
@@ -355,15 +367,18 @@ pub unsafe extern "C" fn Z3_mk_re_star(c: Z3_context, re: Z3_ast) -> Z3_ast {
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it
     // and catches panics so none cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| match ctx.solver.try_re_star(ast_to_term(re)) {
-            Ok(t) => {
-                let a = term_to_ast(t);
-                record_ast_sort(ctx, a, Sort::RegLan);
-                a
-            }
-            Err(_) => {
-                ctx.last_error = Z3_SORT_ERROR;
-                0
+        ffi_guard_ast(c, |ctx| {
+            let re = require_term_ast_or_return!(ctx, re, "Z3_mk_re_star", "regex", 0);
+            match ctx.solver.try_re_star(re) {
+                Ok(t) => {
+                    let a = term_to_ast(ctx, t);
+                    record_ast_sort(ctx, a, Sort::RegLan);
+                    a
+                }
+                Err(_) => {
+                    ctx.last_error = Z3_SORT_ERROR;
+                    0
+                }
             }
         })
     }
@@ -378,15 +393,18 @@ pub unsafe extern "C" fn Z3_mk_re_plus(c: Z3_context, re: Z3_ast) -> Z3_ast {
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it
     // and catches panics so none cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| match ctx.solver.try_re_plus(ast_to_term(re)) {
-            Ok(t) => {
-                let a = term_to_ast(t);
-                record_ast_sort(ctx, a, Sort::RegLan);
-                a
-            }
-            Err(_) => {
-                ctx.last_error = Z3_SORT_ERROR;
-                0
+        ffi_guard_ast(c, |ctx| {
+            let re = require_term_ast_or_return!(ctx, re, "Z3_mk_re_plus", "regex", 0);
+            match ctx.solver.try_re_plus(re) {
+                Ok(t) => {
+                    let a = term_to_ast(ctx, t);
+                    record_ast_sort(ctx, a, Sort::RegLan);
+                    a
+                }
+                Err(_) => {
+                    ctx.last_error = Z3_SORT_ERROR;
+                    0
+                }
             }
         })
     }
@@ -416,15 +434,16 @@ pub unsafe extern "C" fn Z3_mk_re_union(c: Z3_context, n: c_uint, args: *const Z
             });
         }
     }
-    let terms: Vec<_> = (0..n as usize)
+    let term_asts: Vec<_> = (0..n as usize)
         // SAFETY: caller guarantees `args` points to at least `n` elements; the
         // count was range-checked and `args` null-checked above.
-        .map(|i| ast_to_term(unsafe { *args.add(i) }))
+        .map(|i| unsafe { *args.add(i) })
         .collect();
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it
     // and catches panics so none cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let terms = require_term_asts_or_return!(ctx, &term_asts, "Z3_mk_re_union", 0);
             let mut acc = terms[0];
             for &t in &terms[1..] {
                 match ctx.solver.try_re_union(acc, t) {
@@ -435,7 +454,7 @@ pub unsafe extern "C" fn Z3_mk_re_union(c: Z3_context, n: c_uint, args: *const Z
                     }
                 }
             }
-            let a = term_to_ast(acc);
+            let a = term_to_ast(ctx, acc);
             record_ast_sort(ctx, a, Sort::RegLan);
             a
         })
@@ -466,15 +485,16 @@ pub unsafe extern "C" fn Z3_mk_re_concat(c: Z3_context, n: c_uint, args: *const 
             });
         }
     }
-    let terms: Vec<_> = (0..n as usize)
+    let term_asts: Vec<_> = (0..n as usize)
         // SAFETY: caller guarantees `args` points to at least `n` elements; the
         // count was range-checked and `args` null-checked above.
-        .map(|i| ast_to_term(unsafe { *args.add(i) }))
+        .map(|i| unsafe { *args.add(i) })
         .collect();
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it
     // and catches panics so none cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let terms = require_term_asts_or_return!(ctx, &term_asts, "Z3_mk_re_concat", 0);
             let mut acc = terms[0];
             for &t in &terms[1..] {
                 match ctx.solver.try_re_concat(acc, t) {
@@ -485,7 +505,7 @@ pub unsafe extern "C" fn Z3_mk_re_concat(c: Z3_context, n: c_uint, args: *const 
                     }
                 }
             }
-            let a = term_to_ast(acc);
+            let a = term_to_ast(ctx, acc);
             record_ast_sort(ctx, a, Sort::RegLan);
             a
         })
@@ -505,15 +525,18 @@ pub unsafe extern "C" fn Z3_mk_re_option(c: Z3_context, re: Z3_ast) -> Z3_ast {
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it
     // and catches panics so none cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| match ctx.solver.try_re_opt(ast_to_term(re)) {
-            Ok(t) => {
-                let a = term_to_ast(t);
-                record_ast_sort(ctx, a, Sort::RegLan);
-                a
-            }
-            Err(_) => {
-                ctx.last_error = Z3_SORT_ERROR;
-                0
+        ffi_guard_ast(c, |ctx| {
+            let re = require_term_ast_or_return!(ctx, re, "Z3_mk_re_option", "regex", 0);
+            match ctx.solver.try_re_opt(re) {
+                Ok(t) => {
+                    let a = term_to_ast(ctx, t);
+                    record_ast_sort(ctx, a, Sort::RegLan);
+                    a
+                }
+                Err(_) => {
+                    ctx.last_error = Z3_SORT_ERROR;
+                    0
+                }
             }
         })
     }
@@ -531,15 +554,18 @@ pub unsafe extern "C" fn Z3_mk_re_complement(c: Z3_context, re: Z3_ast) -> Z3_as
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it
     // and catches panics so none cross the FFI boundary.
     unsafe {
-        ffi_guard_ast(c, |ctx| match ctx.solver.try_re_comp(ast_to_term(re)) {
-            Ok(t) => {
-                let a = term_to_ast(t);
-                record_ast_sort(ctx, a, Sort::RegLan);
-                a
-            }
-            Err(_) => {
-                ctx.last_error = Z3_SORT_ERROR;
-                0
+        ffi_guard_ast(c, |ctx| {
+            let re = require_term_ast_or_return!(ctx, re, "Z3_mk_re_complement", "regex", 0);
+            match ctx.solver.try_re_comp(re) {
+                Ok(t) => {
+                    let a = term_to_ast(ctx, t);
+                    record_ast_sort(ctx, a, Sort::RegLan);
+                    a
+                }
+                Err(_) => {
+                    ctx.last_error = Z3_SORT_ERROR;
+                    0
+                }
             }
         })
     }
@@ -573,15 +599,16 @@ pub unsafe extern "C" fn Z3_mk_re_intersect(
             });
         }
     }
-    let terms: Vec<_> = (0..n as usize)
+    let term_asts: Vec<_> = (0..n as usize)
         // SAFETY: caller guarantees `args` points to at least `n` elements; the
         // count was range-checked and `args` null-checked above.
-        .map(|i| ast_to_term(unsafe { *args.add(i) }))
+        .map(|i| unsafe { *args.add(i) })
         .collect();
     // SAFETY: `c` is the caller's context pointer; `ffi_guard_ast` null-checks it
     // and catches panics so none cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
+            let terms = require_term_asts_or_return!(ctx, &term_asts, "Z3_mk_re_intersect", 0);
             let mut acc = terms[0];
             for &t in &terms[1..] {
                 match ctx.solver.try_re_inter(acc, t) {
@@ -592,7 +619,7 @@ pub unsafe extern "C" fn Z3_mk_re_intersect(
                     }
                 }
             }
-            let a = term_to_ast(acc);
+            let a = term_to_ast(ctx, acc);
             record_ast_sort(ctx, a, Sort::RegLan);
             a
         })
@@ -614,9 +641,11 @@ pub unsafe extern "C" fn Z3_mk_re_range(c: Z3_context, lo: Z3_ast, hi: Z3_ast) -
     // and catches panics so none cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            match ctx.solver.try_re_range(ast_to_term(lo), ast_to_term(hi)) {
+            let lo = require_term_ast_or_return!(ctx, lo, "Z3_mk_re_range", "lower bound", 0);
+            let hi = require_term_ast_or_return!(ctx, hi, "Z3_mk_re_range", "upper bound", 0);
+            match ctx.solver.try_re_range(lo, hi) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::RegLan);
                     a
                 }
@@ -661,9 +690,10 @@ pub unsafe extern "C" fn Z3_mk_re_loop(
     // and catches panics so none cross the FFI boundary.
     unsafe {
         ffi_guard_ast(c, |ctx| {
-            match ctx.solver.try_re_loop(ast_to_term(re), lo, hi) {
+            let re = require_term_ast_or_return!(ctx, re, "Z3_mk_re_loop", "regex", 0);
+            match ctx.solver.try_re_loop(re, lo, hi) {
                 Ok(t) => {
-                    let a = term_to_ast(t);
+                    let a = term_to_ast(ctx, t);
                     record_ast_sort(ctx, a, Sort::RegLan);
                     a
                 }
@@ -702,7 +732,7 @@ pub unsafe extern "C" fn Z3_mk_re_full(c: Z3_context, re_sort: Z3_sort) -> Z3_as
                 return 0;
             }
             let t = ctx.solver.re_all();
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::RegLan);
             a
         })
@@ -732,7 +762,7 @@ pub unsafe extern "C" fn Z3_mk_re_empty(c: Z3_context, re_sort: Z3_sort) -> Z3_a
                 return 0;
             }
             let t = ctx.solver.re_none();
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::RegLan);
             a
         })
@@ -762,7 +792,7 @@ pub unsafe extern "C" fn Z3_mk_re_allchar(c: Z3_context, re_sort: Z3_sort) -> Z3
                 return 0;
             }
             let t = ctx.solver.re_allchar();
-            let a = term_to_ast(t);
+            let a = term_to_ast(ctx, t);
             record_ast_sort(ctx, a, Sort::RegLan);
             a
         })
@@ -789,7 +819,7 @@ pub unsafe extern "C" fn Z3_is_string(c: Z3_context, a: Z3_ast) -> bool {
     // and catches panics so none cross the FFI boundary. Encode bool as 0/1.
     let r = unsafe {
         ffi_guard_uint(c, 0, |ctx| {
-            let t = ast_to_term(a);
+            let t = require_term_ast_or_return!(ctx, a, "Z3_is_string", "AST", 0);
             let is_str_lit =
                 ctx.solver.is_numeral(t) && matches!(ctx.solver.sort_of(t), Sort::String);
             u32::from(is_str_lit)
@@ -815,7 +845,7 @@ pub unsafe extern "C" fn Z3_get_string(c: Z3_context, a: Z3_ast) -> *const c_cha
     // null-checks it and catches panics so none cross the FFI boundary.
     unsafe {
         ffi_guard_const_ptr(c, |ctx| {
-            let t = ast_to_term(a);
+            let t = require_term_ast_or_return!(ctx, a, "Z3_get_string", "AST", ptr::null());
             // Only a genuine string literal yields a value; guessing for a
             // non-literal would be unsound.
             if ctx.solver.is_numeral(t) && matches!(ctx.solver.sort_of(t), Sort::String) {
@@ -845,7 +875,7 @@ pub unsafe extern "C" fn Z3_get_string_length(c: Z3_context, a: Z3_ast) -> c_uin
     // and catches panics so none cross the FFI boundary.
     unsafe {
         ffi_guard_uint(c, 0, |ctx| {
-            let t = ast_to_term(a);
+            let t = require_term_ast_or_return!(ctx, a, "Z3_get_string_length", "AST", 0);
             if ctx.solver.is_numeral(t) && matches!(ctx.solver.sort_of(t), Sort::String) {
                 match ctx.solver.numeral_string(t) {
                     // Z3 counts code points; AY string literals are unescaped

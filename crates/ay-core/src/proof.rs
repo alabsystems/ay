@@ -447,6 +447,27 @@ pub enum TheoryLemmaKind {
     /// Uses Alethe rule `string_length`.
     StringLengthAxiom,
 
+    /// Universally-valid `str.len` theorem over SYMBOLIC subjects — the certified
+    /// counterpart of the solver's injected length axioms
+    /// (`collect_str_len_axioms_from_roots`). The clause carries a literal that
+    /// is one of: the concat-length sum
+    /// `(= (str.len (str.++ a…)) (+ (str.len a)…))`, the empty↔zero-length
+    /// biconditional `(or ±(= x "") ∓(= (str.len x) 0))`, non-negativity
+    /// `(<= 0 (str.len x))`, the constant length `(= k (str.len c))`, the
+    /// equal-length congruence `(or (not (= s t)) (= (str.len s) (str.len t)))`,
+    /// or a containment/prefix/suffix length bound
+    /// `(or (not (str.contains x s)) (<= (str.len s) (str.len x)))`. Each holds
+    /// under EVERY interpretation, so the unit clause introducing it is a valid
+    /// theory lemma.
+    ///
+    /// Uses Alethe rule `string_length_lemma`; validated by `ay-proof` with an
+    /// INDEPENDENT structural checker that re-derives the exact algebraic
+    /// identity (multiset-matched concat operands, opposite-polarity `or`,
+    /// exact bound/constant), fail-closed on any near-miss. This lets the
+    /// injected length facts carry a certified rule instead of surfacing as
+    /// foreign `assume` leaves the #8821 provenance gate rejects (#selfcert-strlen).
+    StringLengthLemma,
+
     /// String content axiom: substr, contains, replace, indexof rewriting.
     ///
     /// Uses Alethe rule `string_decompose`.
@@ -535,9 +556,37 @@ pub enum TheoryLemmaKind {
         operation: FpOp,
     },
 
+    /// IEEE-754 rounding-mode finite-domain axiom.
+    ///
+    /// `RoundingMode` has exactly the five SMT-LIB values `RNE`, `RNA`, `RTP`,
+    /// `RTN`, and `RTZ`, even though AY's core term representation uses an
+    /// uninterpreted sort. This kind certifies the exact pairwise distinctness
+    /// conjunction for those five constants, one of its exact disequality
+    /// leaves after top-level conjunction flattening, the exact coverage
+    /// disjunction saying that a rounding-mode term equals one of them, or the
+    /// complete six-term pigeonhole theorem for that five-value domain. Clauses
+    /// may contain additional weakening literals once one exact theorem is
+    /// present.
+    ///
+    /// Uses Alethe rule `fp_rm_domain`; strict validation independently checks
+    /// the closed schemas and rejects every partial/extra variant.
+    FpRoundingModeDomain,
+
     /// Generic/unspecified (uses `trust` rule)
     #[default]
     Generic,
+
+    /// Fixed-domain axiom for SMT-LIB's built-in five-element
+    /// `RoundingMode` sort.
+    ///
+    /// Accepted instances are checked independently against the exact
+    /// `{RNE, RNA, RTP, RTN, RTZ}` domain: either a disequality between two
+    /// distinct mode literals, the conjunction containing every such
+    /// pairwise disequality, or total coverage of one RoundingMode-sorted term
+    /// by all five literals. It also accepts the complete pigeonhole theorem
+    /// that six or more RoundingMode-sorted values cannot all be distinct.
+    /// Uses AY's `fp_rounding_mode_domain` proof rule.
+    RoundingModeDomain,
 }
 
 impl TheoryLemmaKind {
@@ -558,6 +607,7 @@ impl TheoryLemmaKind {
             Self::ArrayExtensionality => "extensionality",
             Self::FpToBv { .. } => "fp_to_bv",
             Self::StringLengthAxiom => "string_length",
+            Self::StringLengthLemma => "string_length_lemma",
             Self::StringContentAxiom => "string_decompose",
             Self::StringNormalForm => "string_code_inj",
             Self::StringGroundEval => "string_ground_eval",
@@ -567,7 +617,9 @@ impl TheoryLemmaKind {
             Self::BoolTautology => "bool_tautology",
             Self::IteSame => "ite_same",
             Self::FpClassification { .. } => "fp_classification",
+            Self::FpRoundingModeDomain => "fp_rm_domain",
             Self::Generic => "trust",
+            Self::RoundingModeDomain => "fp_rounding_mode_domain",
         }
     }
 

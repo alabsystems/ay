@@ -1757,8 +1757,8 @@ impl Executor {
         // (#8284) which caused spurious UNSAT (#8480). The AddClauses path
         // injected thousands of new-variable clauses into a complete model
         // via add_theory_lemma, which interacted badly with the CDCL loop
-        // (pending_theory_conflict overwrite, level-0 unit conflicts from
-        // partial propagation during batch addition). The re-solve loop is
+        // (the former pending-theory-conflict single-slot overwrite, level-0
+        // unit conflicts from partial propagation during batch addition). The re-solve loop is
         // simpler, correct, and matches Z3's actual implementation: Z3's
         // bv_solver::check() returns a status that causes the outer DPLL(T)
         // loop to restart from scratch with the new clauses.

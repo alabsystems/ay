@@ -36,13 +36,12 @@
 
 use std::ptr;
 
-use ay_dpll::api::Term;
 use ay_frontend::{Probe, ProbeCmp, SExpr};
 
 use super::{
-    ast_to_term, cache_probe, cache_string, ffi_guard_const_ptr, ffi_guard_double, ffi_guard_ptr,
-    ffi_guard_uint, ffi_read_bounded_text, Z3_context, Z3_goal, Z3_probe, Z3_string,
-    Z3_INVALID_ARG, Z3_OK,
+    cache_probe, cache_string, ffi_guard_const_ptr, ffi_guard_double, ffi_guard_ptr,
+    ffi_guard_uint, ffi_read_bounded_text, require_term_asts_or_return, Z3_context, Z3_goal,
+    Z3_probe, Z3_string, Z3_INVALID_ARG, Z3_OK,
 };
 use std::os::raw::{c_double, c_uint};
 
@@ -457,8 +456,8 @@ pub unsafe extern "C" fn Z3_probe_apply(c: Z3_context, p: Z3_probe, g: Z3_goal) 
                 ctx.error_msg = Some("Z3_probe_apply: null probe or goal handle".to_string());
                 return 0.0;
             };
+            let terms = require_term_asts_or_return!(ctx, &formulas, "Z3_probe_apply", 0.0);
             ctx.last_error = Z3_OK;
-            let terms: Vec<Term> = formulas.iter().map(|&a| ast_to_term(a)).collect();
             ctx.solver.apply_probe(&probe, &terms, depth)
         })
     }

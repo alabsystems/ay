@@ -139,6 +139,7 @@ pub(crate) const EXECUTOR_STACK_RED_ZONE: usize = if cfg!(debug_assertions) {
 /// 16 MiB provides ample room for the entire solve pipeline including
 /// theory solvers, model validation, and proof checking in debug mode.
 pub(crate) const EXECUTOR_STACK_SIZE: usize = 16 * 1024 * 1024;
+pub(crate) use theories::ArrayExtWitnessCache;
 pub(crate) use theories::BoundRefinementReplayKey;
 pub(crate) use theories::{SharedRescuePairCounter, DEFAULT_RESCUE_PAIR_BUDGET};
 
@@ -162,7 +163,7 @@ pub(crate) use theories::{SharedRescuePairCounter, DEFAULT_RESCUE_PAIR_BUDGET};
 /// D1 shadow instrumentation for the on-assert lazy-extensionality campaign.
 ///
 /// The eager path (`add_array_extensionality_axioms_up_to`) emits one
-/// `__ext_diff(a,b)` witness clause per SYNTACTIC array-equality atom whose
+/// `__ay_ext_diff(a,b)` witness clause per SYNTACTIC array-equality atom whose
 /// negation appears anywhere in the term store — an over-approximation that
 /// balloons on qlock-style AUFLIA (many witnesses vs z3's few demand-driven).
 /// This struct records, per solve, the EAGER set of pairs actually emitted so
@@ -1072,7 +1073,7 @@ pub struct Executor {
     /// certify the model against the formula the USER actually asserted. The
     /// gate's ordinary denominator is `ctx.assertions` at validation time, which
     /// under `--self-check` (proofs forced on) also carries solver-injected
-    /// theory axioms over fresh internal symbols (`__ay_*`, `__ext_diff_*`).
+    /// theory axioms over fresh internal symbols (`__ay_*`).
     /// Those are skipped as `Internal` and counted "unverified", so a QF_AX
     /// model that satisfies every authored assertion was degraded to `unknown`.
     /// See `self_check_authored_model_certified`.
@@ -1274,9 +1275,15 @@ pub struct Executor {
     /// suites disables the gate.
     independent_gate_disabled: bool,
     /// D1 shadow instrumentation for the on-assert lazy-extensionality campaign.
-    /// Records the EAGER `__ext_diff` witnesses emitted this solve so the
+    /// Records the EAGER `__ay_ext_diff` witnesses emitted this solve so the
     /// finalizer can surface `auflia.ext.*` on `-st`. Measurement only.
     pub(crate) array_ext_shadow: ArrayExtShadow,
+    /// Per-public-query array-extensionality witness provenance and pair cache.
+    ///
+    /// Active entries are reused across internal retries only. Public query
+    /// boundaries retire them, preventing a native raw Term handle from
+    /// capturing the next query's fresh Skolem.
+    pub(crate) array_ext_witness_cache: ArrayExtWitnessCache,
     /// M-A2 lazy-persistent-combiner SHADOW arm flag
     /// (ARRAY-PROCEDURE-CLOSER-BLUEPRINT §5 A2 / LAZY-M3 §M3.2).
     ///

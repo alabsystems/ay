@@ -63,6 +63,22 @@ const QF_UFLIA_UNSAT: &str = r#"
 (check-sat)
 "#;
 
+const QF_ABV_PINNED_CONCAT_UNSAT: &str = r#"
+(set-logic QF_ABV)
+(declare-const tbl (Array (_ BitVec 24) (_ BitVec 32)))
+(declare-const op (_ BitVec 8))
+(declare-const lhs (_ BitVec 8))
+(declare-const rhs (_ BitVec 8))
+(declare-const out (_ BitVec 32))
+(assert (= out (select tbl (concat op (concat lhs rhs)))))
+(assert (= op #x01))
+(assert (= (select tbl (concat #x01 (concat #x3f #x40))) #x40400000))
+(assert (= lhs #x3f))
+(assert (= rhs #x40))
+(assert (distinct out #x40400000))
+(check-sat)
+"#;
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -388,6 +404,39 @@ fn test_carcara_trust_free_qf_uf() {
     );
 }
 
+/// The exact QF_ABV regression must remain self-contained: the authored nested
+/// concat and binary `distinct` are bridged explicitly, while the closed
+/// constant folds use Carcara's checked `evaluate` rule.
+#[test]
+#[timeout(60_000)]
+fn test_carcara_trust_free_qf_abv_pinned_concat_substitution() {
+    let Some(carcara) = require_carcara_or_skip() else {
+        return;
+    };
+    let label = "trust_free_qf_abv_pinned_concat_substitution";
+    let proof = solve_unsat_and_get_proof(QF_ABV_PINNED_CONCAT_UNSAT, label);
+    assert!(
+        !proof.contains(":rule trust") && !proof.contains(":rule hole"),
+        "QF_ABV regression proof must not contain unchecked rules:\n{proof}"
+    );
+    assert!(
+        !proof.contains(":rule bv_bitblast"),
+        "closed concat folding must use Carcara's evaluate rule, not AY's private bv_bitblast rule:\n{proof}"
+    );
+    assert!(
+        proof.contains(":rule evaluate"),
+        "closed concat folding must be certified by evaluate:\n{proof}"
+    );
+    assert!(
+        proof.contains(":rule distinct_elim"),
+        "surface distinct must be linked to its canonical disequality:\n{proof}"
+    );
+    assert!(
+        run_carcara_trust_free(&carcara, label, QF_ABV_PINNED_CONCAT_UNSAT, &proof),
+        "QF_ABV pinned-concat proof must be verified by Carcara without allowed trust"
+    );
+}
+
 /// The `ay z3-audit` canonical QF_UF transitivity fixture must export a
 /// genuine `eq_transitive` + `th_resolution` derivation that carcara accepts
 /// WITHOUT `--allowed-rules trust`. This is the exact fixture used by the audit
@@ -459,12 +508,13 @@ fn test_carcara_qf_lia_normalized_assumes_no_trust_anchor_valid() {
         !proof.contains(":rule trust"),
         "expected a trust-free proof, got:\n{proof}"
     );
+    let assumes = extract_assume_terms(&proof);
     assert!(
-        proof.contains("(assume t0 (and (>= a 0) (<= a 5)))"),
+        assumes.contains(&"(and (>= a 0) (<= a 5))".to_string()),
         "and-assume must print with the problem file's surface syntax:\n{proof}"
     );
     assert!(
-        proof.contains("(assume t1 (> a 5))"),
+        assumes.contains(&"(> a 5)".to_string()),
         "bound assume must print with the problem file's surface syntax:\n{proof}"
     );
     verify_alethe_with_carcara(

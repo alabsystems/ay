@@ -11,8 +11,8 @@
 use ay_core::{AletheRule, Proof, ProofId, ProofStep, TermId, TermStore, TheoryLemmaKind};
 
 use crate::checker::{
-    ensure_terminal_empty_clause, quantifier, validate_step, validate_step_with_datatypes,
-    ExtDiffRegistry, ProofCheckError,
+    ensure_terminal_empty_clause, quantifier, validate_problem_assumptions, validate_step,
+    validate_step_with_datatypes, ExtDiffRegistry, ProofCheckError,
 };
 use crate::partial::PartialProofCheck;
 
@@ -362,6 +362,10 @@ pub fn check_proof_strict_with_context(
         return Err(ProofCheckError::EmptyProof);
     }
 
+    if let Some(assertions) = problem_assertions {
+        validate_problem_assumptions(proof, terms, assertions)?;
+    }
+
     // Built ONCE, before any step is validated: construction is where the
     // whole-proof conditions (bound once, fresh against the problem, not
     // self-referential) are enforced, so a bad introduction fails the check
@@ -405,8 +409,8 @@ pub fn check_proof_strict_with_context(
 ///
 ///  * every diff-witness introduction is well formed, bound ONCE, and names a
 ///    symbol that occurs in NO problem assertion and NO `assume` of the proof;
-///  * every extensionality lemma matches the exact schema and cites the pair
-///    its own witness was introduced for.
+///  * every extensionality lemma matches the exact one-or-more-level schema and
+///    every witness cites the intermediate pair it was introduced for.
 ///
 /// Returns `Ok(())` for a proof with no extensionality content at all.
 ///

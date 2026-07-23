@@ -22,8 +22,14 @@ use ay_core::{Sort, TermId};
 
 use crate::preprocess::{PreprocessingPass, QeLight};
 
-use super::types::{FuncDecl, Term};
+use super::types::{FuncDecl, SolverError, Term};
 use super::Solver;
+
+/// Aggregate work envelope for validating preserved binders during one
+/// `update_term` call.  A caller-controlled replacement may be a large DAG and
+/// the source binder may contain many variables, so the cap is shared across
+/// every body/trigger scan rather than resetting for each root.
+const UPDATE_TERM_BINDER_WORK_LIMIT: usize = 100_000;
 
 impl Solver {
     // =========================================================================
@@ -344,11 +350,10 @@ impl Solver {
     /// immediate children with `args`, mirroring the child order of
     /// [`Solver::term_children`].
     ///
-    /// Returns `None` when `args.len()` does not match `term`'s child count
-    /// (the FFI reports the arg-count mismatch and returns the input). Positional
-    /// (not identity-keyed) so children that happen to be equal are still each
-    /// replaced by the corresponding `args` entry. Backs the Z3-compat
-    /// `Z3_update_term` FFI entry point.
+    /// Returns `None` when the checked rebuild fails (the FFI reports the error
+    /// and returns the input). Positional (not identity-keyed) so children that
+    /// happen to be equal are still each replaced by the corresponding `args`
+    /// entry. Backs the Z3-compat `Z3_update_term` FFI entry point.
     ///
     /// Child order (matching `term_children`):
     /// - `App(f, xs)` → `xs`
@@ -358,68 +363,254 @@ impl Solver {
     /// - `Var` / `Const` → `[]`
     #[must_use]
     pub fn update_term(&mut self, term: Term, args: &[Term]) -> Option<Term> {
-        let ids: Vec<TermId> = args.iter().map(|t| t.0).collect();
-        let new = match self.terms().get(term.0).clone() {
-            TermData::Var(_, _) | TermData::Const(_) => {
-                if !ids.is_empty() {
-                    return None;
-                }
-                term.0
+        self.try_update_term(term, args).ok()
+    }
+
+    /// Return whether an opaque native-API term handle names an entry in this
+    /// solver's term store.
+    ///
+    /// This is intentionally a narrow validity query: compatibility layers
+    /// can authenticate an encoded handle before calling APIs that otherwise
+    /// index the store. It does not inspect the term or mutate solver state.
+    #[must_use]
+    pub fn is_valid_term(&self, term: Term) -> bool {
+        term.0.index() < self.terms().len()
+    }
+
+    /// Check that occurrences captured by a preserved named binder retain the
+    /// sort declared by that binder.  Nested binders with the same name shadow
+    /// the preserved binder; `let` values remain in the outer scope while its
+    /// body is shadowed.
+    fn validate_update_bound_name(
+        &self,
+        root: TermId,
+        bound_name: &str,
+        expected_sort: &Sort,
+        work: &mut usize,
+    ) -> Result<(), SolverError> {
+        let mut seen: HashMap<(TermId, bool), ()> = HashMap::default();
+        let mut pending = vec![(root, false)];
+
+        while let Some((current, shadowed)) = pending.pop() {
+            if seen.insert((current, shadowed), ()).is_some() {
+                continue;
             }
-            TermData::App(symbol, old_args) => {
-                if ids.len() != old_args.len() {
-                    return None;
+            *work = work.saturating_add(1);
+            if *work > UPDATE_TERM_BINDER_WORK_LIMIT {
+                return Err(SolverError::InvalidArgument {
+                    operation: "update_term",
+                    message: format!(
+                        "binder validation exceeds the {UPDATE_TERM_BINDER_WORK_LIMIT}-node work limit"
+                    ),
+                });
+            }
+
+            match self.terms().get(current) {
+                TermData::Var(name, _) => {
+                    if !shadowed
+                        && name == bound_name
+                        && self.terms().sort(current) != expected_sort
+                    {
+                        return Err(SolverError::InvalidArgument {
+                            operation: "update_term",
+                            message: format!(
+                                "bound variable `{bound_name}` is declared as {expected_sort} but occurs as {} in a replacement",
+                                self.terms().sort(current)
+                            ),
+                        });
+                    }
                 }
+                TermData::Const(_) => {}
+                TermData::App(_, children) => {
+                    pending.extend(children.iter().copied().map(|child| (child, shadowed)));
+                }
+                TermData::Not(inner) => pending.push((*inner, shadowed)),
+                TermData::Ite(condition, then_value, else_value) => {
+                    pending.push((*condition, shadowed));
+                    pending.push((*then_value, shadowed));
+                    pending.push((*else_value, shadowed));
+                }
+                TermData::Let(bindings, body) => {
+                    pending.extend(bindings.iter().map(|(_, value)| (*value, shadowed)));
+                    let body_shadowed =
+                        shadowed || bindings.iter().any(|(name, _)| name == bound_name);
+                    pending.push((*body, body_shadowed));
+                }
+                TermData::Forall(vars, body, triggers) | TermData::Exists(vars, body, triggers) => {
+                    let nested_shadowed =
+                        shadowed || vars.iter().any(|(name, _)| name == bound_name);
+                    pending.push((*body, nested_shadowed));
+                    for trigger in triggers {
+                        pending.extend(trigger.iter().copied().map(|term| (term, nested_shadowed)));
+                    }
+                }
+                // `TermData` is non-exhaustive.  Updating through an unknown
+                // node could hide an ill-sorted occurrence, so fail closed.
+                _ => {
+                    return Err(SolverError::InvalidArgument {
+                        operation: "update_term",
+                        message:
+                            "replacement contains a term kind unsupported by binder validation"
+                                .to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Checked variant of [`Self::update_term`].
+    ///
+    /// This validates every opaque handle before indexing the term store and
+    /// requires each replacement to have exactly the sort of the child in the
+    /// same position. The positional sort check is security-relevant for
+    /// applications: rebuilding an existing privileged operator such as
+    /// `select` with arbitrary child sorts would bypass its normal checked
+    /// constructor while retaining the privileged symbol and result sort.
+    /// Validation completes before the term store is mutated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SolverError::InvalidArgument`] for an out-of-range handle, an
+    /// argument-count mismatch, a term kind whose child layout is unknown, or
+    /// a replacement that would give a preserved named binder an occurrence of
+    /// the wrong sort.
+    /// Returns [`SolverError::SortMismatch`] when a replacement's sort differs
+    /// from the corresponding original child sort.
+    #[must_use = "this returns a Result that must be checked"]
+    pub fn try_update_term(&mut self, term: Term, args: &[Term]) -> Result<Term, SolverError> {
+        let term_count = self.terms().len();
+        if term.0.index() >= term_count {
+            return Err(SolverError::InvalidArgument {
+                operation: "update_term",
+                message: format!("source term handle {} is out of range", term.to_raw()),
+            });
+        }
+        for (position, replacement) in args.iter().enumerate() {
+            if replacement.0.index() >= term_count {
+                return Err(SolverError::InvalidArgument {
+                    operation: "update_term",
+                    message: format!(
+                        "replacement handle {} at position {position} is out of range",
+                        replacement.to_raw()
+                    ),
+                });
+            }
+        }
+
+        let data = self.terms().get(term.0).clone();
+        let old_children: Vec<TermId> = match &data {
+            TermData::Var(_, _) | TermData::Const(_) => Vec::new(),
+            TermData::App(_, old_args) => old_args.clone(),
+            TermData::Not(inner) => vec![*inner],
+            TermData::Ite(condition, then_value, else_value) => {
+                vec![*condition, *then_value, *else_value]
+            }
+            TermData::Let(bindings, body) => {
+                let mut children: Vec<TermId> = bindings.iter().map(|(_, value)| *value).collect();
+                children.push(*body);
+                children
+            }
+            TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => vec![*body],
+            _ => {
+                return Err(SolverError::InvalidArgument {
+                    operation: "update_term",
+                    message: "term kind has no supported child layout".to_string(),
+                });
+            }
+        };
+
+        if args.len() != old_children.len() {
+            return Err(SolverError::InvalidArgument {
+                operation: "update_term",
+                message: format!(
+                    "term expects {} immediate children, got {}",
+                    old_children.len(),
+                    args.len()
+                ),
+            });
+        }
+        for (&old_child, replacement) in old_children.iter().zip(args) {
+            let expected_sort = self.terms().sort(old_child);
+            let actual_sort = self.terms().sort(replacement.0);
+            if actual_sort != expected_sort {
+                return Err(SolverError::SortMismatch {
+                    operation: "update_term",
+                    expected: "the sort of the corresponding original child",
+                    got: vec![actual_sort.clone()],
+                });
+            }
+        }
+
+        let ids: Vec<TermId> = args.iter().map(|replacement| replacement.0).collect();
+        let mut binder_work = 0usize;
+        match &data {
+            TermData::Let(bindings, _) => {
+                // `let` binding values are outside the scope of the names; only
+                // the trailing replacement body is captured by the preserved
+                // binders.  Its immediate result sort alone is insufficient:
+                // it may contain a same-named variable of another sort.
+                let body = ids[bindings.len()];
+                for (position, (name, _)) in bindings.iter().enumerate() {
+                    let expected_sort = self.terms().sort(ids[position]);
+                    self.validate_update_bound_name(body, name, expected_sort, &mut binder_work)?;
+                }
+            }
+            TermData::Forall(vars, _, triggers) | TermData::Exists(vars, _, triggers) => {
+                for (name, sort) in vars {
+                    self.validate_update_bound_name(ids[0], name, sort, &mut binder_work)?;
+                    // Triggers are preserved rather than supplied as immediate
+                    // children, but they are still in the binder's scope and
+                    // must satisfy the same invariant before reconstruction.
+                    for trigger in triggers {
+                        for &pattern in trigger {
+                            self.validate_update_bound_name(pattern, name, sort, &mut binder_work)?;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let new = match data {
+            TermData::Var(_, _) | TermData::Const(_) => term,
+            TermData::App(symbol, old_args) => {
                 if ids == old_args {
-                    term.0
+                    term
                 } else {
                     let sort = self.terms().sort(term.0).clone();
-                    self.terms_mut().mk_app(symbol, ids, sort)
+                    Term(self.terms_mut().mk_app(symbol, ids, sort))
                 }
             }
-            TermData::Not(_) => {
-                if ids.len() != 1 {
-                    return None;
-                }
-                self.terms_mut().mk_not(ids[0])
-            }
-            TermData::Ite(_, _, _) => {
-                if ids.len() != 3 {
-                    return None;
-                }
-                self.terms_mut().mk_ite(ids[0], ids[1], ids[2])
-            }
+            TermData::Not(_) => self.try_not(args[0])?,
+            TermData::Ite(_, _, _) => self.try_ite(args[0], args[1], args[2])?,
             TermData::Let(bindings, _) => {
-                if ids.len() != bindings.len() + 1 {
-                    return None;
-                }
                 let new_bindings: Vec<(String, TermId)> = bindings
                     .iter()
                     .zip(ids.iter())
                     .map(|((name, _), &v)| (name.clone(), v))
                     .collect();
-                // Length was checked == bindings.len() + 1, so `ids` is non-empty.
-                let &body = ids.last()?;
-                self.terms_mut().mk_let(new_bindings, body)
+                // The child-count check guarantees one trailing body ID.
+                let body = ids[bindings.len()];
+                Term(self.terms_mut().mk_let(new_bindings, body))
             }
-            TermData::Forall(vars, _, triggers) => {
-                if ids.len() != 1 {
-                    return None;
-                }
+            TermData::Forall(vars, _, triggers) => Term(
                 self.terms_mut()
-                    .mk_forall_with_triggers(vars, ids[0], triggers)
-            }
-            TermData::Exists(vars, _, triggers) => {
-                if ids.len() != 1 {
-                    return None;
-                }
+                    .mk_forall_with_triggers(vars, ids[0], triggers),
+            ),
+            TermData::Exists(vars, _, triggers) => Term(
                 self.terms_mut()
-                    .mk_exists_with_triggers(vars, ids[0], triggers)
+                    .mk_exists_with_triggers(vars, ids[0], triggers),
+            ),
+            // Future node kinds remain fail-closed even if the validation and
+            // rebuild matches are changed independently.
+            _ => {
+                return Err(SolverError::InvalidArgument {
+                    operation: "update_term",
+                    message: "term kind has no supported rebuild".to_string(),
+                });
             }
-            // Future node kinds: no known child layout — refuse rather than guess.
-            _ => return None,
         };
-        Some(Term(new))
+        Ok(new)
     }
 
     // =========================================================================

@@ -168,7 +168,8 @@ impl Solver {
         // clause, and the next solve's arena rebuild invalidates the offset
         // entirely. reset_search_state also clears this at solve entry; this
         // clear additionally protects resume-style flows that skip the reset.
-        self.pending_theory_conflict = None;
+        self.pending_theory_conflicts.clear();
+        self.pending_theory_unit_proof_ids.clear();
 
         // Restore forward checker state so it resumes active RUP checking
         // after a scoped UNSAT (#4481).

@@ -784,3 +784,52 @@ fn test_legacy_declare_datatypes_elaborates() {
     assert!(ctx.symbols.contains_key("hd"));
     assert!(ctx.symbols.contains_key("tl"));
 }
+
+/// An EXACTLY-identical datatype re-declaration is adopted as a no-op (the
+/// adopt-identical embedder contract, mirroring `try_declare_fun`). An embedder
+/// that re-asserts its canonical declaration before each selector/match use is
+/// therefore not rejected.
+#[test]
+fn test_identical_datatype_redeclaration_is_adopted() {
+    for script in [
+        "(declare-datatype Color ((Red) (Green) (Blue)))\n\
+         (declare-datatype Color ((Red) (Green) (Blue)))",
+        "(declare-datatype Pt ((mk (x Int) (y Int))))\n\
+         (declare-datatype Pt ((mk (x Int) (y Int))))",
+    ] {
+        let commands = parse(script).unwrap();
+        let mut ctx = Context::new();
+        for cmd in &commands {
+            ctx.process_command(cmd)
+                .expect("identical datatype re-declaration must be adopted as a no-op");
+        }
+    }
+}
+
+/// The adopt-identical path must NOT adopt a DIFFERENT datatype of the same name.
+/// Same constructor NAME but a different selector SORT is a distinct
+/// `DatatypeDec`, so it still hits the `SortRedeclaration` gate — the second
+/// declaration's members can never silently shadow the first's. (A
+/// constructor-names-only identity check would wrongly adopt this.)
+#[test]
+fn test_same_name_different_selector_sort_still_rejected() {
+    let script = "(declare-datatype Dd ((mk (f Int))))\n\
+                  (declare-datatype Dd ((mk (f Bool))))";
+    let commands = parse(script).unwrap();
+    let mut ctx = Context::new();
+    let mut rejected = false;
+    for cmd in &commands {
+        if let Err(e) = ctx.process_command(cmd) {
+            assert!(
+                matches!(e, ElaborateError::SortRedeclaration(_)),
+                "expected SortRedeclaration, got: {e:?}"
+            );
+            rejected = true;
+            break;
+        }
+    }
+    assert!(
+        rejected,
+        "a same-name datatype with a different selector sort must still be rejected"
+    );
+}

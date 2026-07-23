@@ -49,13 +49,22 @@ impl Solver {
         };
         static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let mut ids = self.executor.ctx.assertions.clone();
-        ids.extend(assumptions.iter().map(|t| t.0));
-        let script = self.executor.to_smtlib2_for(&ids);
+        let script = self.query_dump_script(assumptions);
         let path =
             std::path::Path::new(&dir).join(format!("query-{}-{:05}.smt2", std::process::id(), n));
         let _ = std::fs::create_dir_all(&dir);
         let _ = std::fs::write(path, script);
+    }
+
+    /// Build the exact script `AY_DUMP_QUERY_DIR` would write for a check with
+    /// the given assumptions: the live assertion stack plus the assumptions,
+    /// serialized as a self-contained SMT-LIB2 script (sort + symbol
+    /// declarations included). Exposed crate-internally so the dump format is
+    /// unit-testable without touching process-global environment state.
+    pub(crate) fn query_dump_script(&self, assumptions: &[Term]) -> String {
+        let mut ids = self.executor.ctx.assertions.clone();
+        ids.extend(assumptions.iter().map(|t| t.0));
+        self.executor.to_smtlib2_for(&ids)
     }
 
     /// Reject a solver state that contains both parser-owned and native-API
@@ -160,6 +169,33 @@ impl Solver {
         VerifiedSolveResult::from_validated(SolveResult::Unknown, None)
     }
 
+    /// Reject invalid raw handles and solver-generated array witnesses before
+    /// diagnostic query dumping or any other code can traverse caller roots.
+    fn reject_native_array_ext_witness_capture(
+        &mut self,
+        extra: &[Term],
+    ) -> Option<VerifiedSolveResult> {
+        let mut roots = self.executor.context().assertions.clone();
+        roots.extend(
+            self.executor
+                .context()
+                .soft_constraints()
+                .iter()
+                .map(|soft| soft.term),
+        );
+        roots.extend(
+            self.executor
+                .context()
+                .objectives()
+                .iter()
+                .map(|objective| objective.term),
+        );
+        roots.extend(extra.iter().map(|term| term.0));
+        self.executor
+            .array_ext_witness_registration_error(&roots)
+            .map(|_| self.preflight_unknown(UnknownReason::Incomplete))
+    }
+
     /// Pre-check interrupt, memory, and deadline before entering the executor.
     /// Returns `Some(Unknown)` with the appropriate reason if a preflight
     /// condition fires, or `None` if the solve should proceed.
@@ -241,9 +277,12 @@ impl Solver {
     /// provenance. Use [`was_model_validated()`](VerifiedSolveResult::was_model_validated)
     /// to check whether model validation actually ran. Part of #5748, #5973.
     pub fn check_sat(&mut self) -> VerifiedSolveResult {
-        self.dump_query_if_requested(&[]);
         self.clear_last_solve_state(true, false);
         self.record_native_replay_event(NativeReplayEventKind::CheckSat);
+        if let Some(rejected) = self.reject_native_array_ext_witness_capture(&[]) {
+            return rejected;
+        }
+        self.dump_query_if_requested(&[]);
         if let Some(rejected) = self.reject_mixed_soft_ownership() {
             return rejected;
         }
@@ -378,11 +417,14 @@ impl Solver {
     /// assert_eq!(solver.check_sat_assuming(&[x_eq_1]), SolveResult::Sat);
     /// ```
     pub fn check_sat_assuming(&mut self, assumptions: &[Term]) -> VerifiedSolveResult {
-        self.dump_query_if_requested(assumptions);
         self.clear_last_solve_state(false, false);
         self.record_native_replay_event(NativeReplayEventKind::CheckSatAssuming {
             assumptions: assumptions.iter().map(|term| term.0).collect(),
         });
+        if let Some(rejected) = self.reject_native_array_ext_witness_capture(assumptions) {
+            return rejected;
+        }
+        self.dump_query_if_requested(assumptions);
         if let Some(rejected) = self.reject_mixed_soft_ownership() {
             return rejected;
         }

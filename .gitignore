@@ -304,3 +304,6 @@ competition/minizinc/ay
 
 # SAT-COMP 2025 sample fetched by scripts/_fetch_sat2025_sample.sh (default DEST)
 benchmarks/sat/satcomp2025/
+
+# All-divisions corpus fetched by fetch-all.sh / `ay-z3-parity fetch` (gitignored like smtlib-sample)
+benchmarks/smtlib-all/

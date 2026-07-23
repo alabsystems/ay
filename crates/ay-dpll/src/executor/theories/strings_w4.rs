@@ -255,7 +255,8 @@ pub(super) fn w4_memo_reset() {
 
 /// The DETERMINISTIC work clock W4's search budget is measured against: the
 /// term evaluator's memo-missing node visits PLUS the regex evaluator's
-/// membership sub-problem consultations. Both halves are needed — the
+/// structural work (memo consultations, exact translation, and derivatives).
+/// Both halves are needed — the
 /// `full_str_int` refutation family burns 230M node visits and no regex work,
 /// while `denghang/instance50668` burns 65 s inside `str.in_re` atoms for only
 /// 370k node visits, so either counter alone leaves one family unbounded.

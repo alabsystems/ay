@@ -27,7 +27,7 @@
 //! declarations supplied), strict mode fails closed — it never assumes
 //! distinctness by shape alone, which would be unsound.
 
-use ay_core::{ProofId, TermData, TermId, TermStore};
+use ay_core::{ProofId, Sort, Symbol, TermData, TermId, TermStore};
 
 use super::ProofCheckError;
 
@@ -73,6 +73,14 @@ pub(crate) fn validate_datatype_distinct(
     if clause.is_empty() {
         return Err(invalid(
             "datatype distinctness clause must be non-empty".to_string(),
+        ));
+    }
+    if clause
+        .iter()
+        .any(|&literal| terms.sort(literal) != &Sort::Bool)
+    {
+        return Err(invalid(
+            "datatype distinctness clause literals must have sort Bool".to_string(),
         ));
     }
 
@@ -150,6 +158,12 @@ fn check_distinct_constructors(
         reason,
     };
 
+    if terms.sort(lhs) != terms.sort(rhs) {
+        return Err(invalid(
+            "datatype distinctness equality operands have different sorts".to_string(),
+        ));
+    }
+
     let (lhs_ctor, lhs_dt) = constructor_head(terms, dt_decls, lhs).ok_or_else(|| {
         invalid(
             "datatype distinctness: left side is not an application of a registered \
@@ -189,12 +203,23 @@ fn constructor_head<'a>(
     term: TermId,
 ) -> Option<(String, &'a str)> {
     let name = match terms.get(term) {
-        TermData::App(sym, _) => sym.name().to_string(),
+        TermData::App(Symbol::Named(name), _) => name.clone(),
         TermData::Var(n, _) => n.clone(),
         _ => return None,
     };
     let dt = constructor_datatype(dt_decls, &name)?;
+    if !sort_matches_datatype(terms.sort(term), dt) {
+        return None;
+    }
     Some((name, dt))
+}
+
+fn sort_matches_datatype(sort: &Sort, datatype: &str) -> bool {
+    match sort {
+        Sort::Uninterpreted(name) => name == datatype,
+        Sort::Datatype(definition) => definition.name.as_str() == datatype,
+        _ => false,
+    }
 }
 
 /// The datatype a constructor symbol belongs to, if registered.
@@ -251,6 +276,14 @@ pub(crate) fn validate_datatype_selector_project(
             "datatype selector-projection clause must be non-empty".to_string(),
         ));
     }
+    if clause
+        .iter()
+        .any(|&literal| terms.sort(literal) != &Sort::Bool)
+    {
+        return Err(invalid(
+            "datatype selector-projection clause literals must have sort Bool".to_string(),
+        ));
+    }
     let literals = flatten_clause_literals(terms, clause);
     if literals.len() != 1 {
         return Err(invalid(format!(
@@ -297,20 +330,22 @@ fn selector_over_constructor(
     terms: &TermStore,
     term: TermId,
 ) -> Option<(String, Vec<TermId>, String)> {
-    let TermData::App(sel_sym, sel_args) = terms.get(term) else {
+    let TermData::App(Symbol::Named(sel_name), sel_args) = terms.get(term) else {
         return None;
     };
     if sel_args.len() != 1 {
         return None;
     }
-    let TermData::App(ctor_sym, ctor_args) = terms.get(sel_args[0]) else {
+    if !matches!(
+        terms.sort(sel_args[0]),
+        Sort::Uninterpreted(_) | Sort::Datatype(_)
+    ) {
+        return None;
+    }
+    let TermData::App(Symbol::Named(ctor_name), ctor_args) = terms.get(sel_args[0]) else {
         return None;
     };
-    Some((
-        ctor_sym.name().to_string(),
-        ctor_args.clone(),
-        sel_sym.name().to_string(),
-    ))
+    Some((ctor_name.clone(), ctor_args.clone(), sel_name.clone()))
 }
 
 /// The field position of `sel_name` among `ctor_name`'s registered selectors.
@@ -326,7 +361,12 @@ fn selector_field_index(
 /// Decode a positive equality `(= a b)` into `(a, b)`.
 fn equality_sides(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
     match terms.get(term) {
-        TermData::App(sym, args) if sym.name() == "=" && args.len() == 2 => {
+        TermData::App(Symbol::Named(name), args)
+            if name == "="
+                && args.len() == 2
+                && terms.sort(term) == &Sort::Bool
+                && terms.sort(args[0]) == terms.sort(args[1]) =>
+        {
             Some((args[0], args[1]))
         }
         _ => None,
@@ -336,8 +376,11 @@ fn equality_sides(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
 /// Flatten a clause to its literals, unwrapping a single `(or ..)` literal.
 fn flatten_clause_literals(terms: &TermStore, clause: &[TermId]) -> Vec<TermId> {
     if clause.len() == 1 {
-        if let TermData::App(sym, args) = terms.get(clause[0]) {
-            if sym.name() == "or" {
+        if let TermData::App(Symbol::Named(name), args) = terms.get(clause[0]) {
+            if name == "or"
+                && terms.sort(clause[0]) == &Sort::Bool
+                && args.iter().all(|&arg| terms.sort(arg) == &Sort::Bool)
+            {
                 return args.clone();
             }
         }
@@ -350,10 +393,5 @@ fn negated_equality_sides(terms: &TermStore, term: TermId) -> Option<(TermId, Te
     let TermData::Not(inner) = terms.get(term) else {
         return None;
     };
-    match terms.get(*inner) {
-        TermData::App(sym, args) if sym.name() == "=" && args.len() == 2 => {
-            Some((args[0], args[1]))
-        }
-        _ => None,
-    }
+    equality_sides(terms, *inner)
 }

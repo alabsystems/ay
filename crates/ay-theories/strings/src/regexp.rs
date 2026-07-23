@@ -5,12 +5,10 @@
 //! Regex membership solver for ground `str.in_re` constraints.
 //!
 //! When both the string and regex resolve to concrete values, evaluates
-//! membership by recursive descent over the regex structure. Non-ground
-//! memberships are marked incomplete.
-//!
-//! The algorithm is equivalent to Brzozowski derivatives applied to concrete
-//! strings, but avoids creating intermediate regex terms (TermStore is
-//! immutable in the theory solver context).
+//! membership with exact Brzozowski derivatives when the regex translates
+//! within fixed limits. Unsupported or oversized translations fall back to
+//! the existing memoised recursive descent. Non-ground memberships are marked
+//! incomplete.
 //!
 //! Reference: CVC5 `regexp_eval.cpp` and `regexp_operation.cpp` (BSD license).
 //! Algorithm: Brzozowski, J.A. "Derivatives of Regular Expressions" (1964).
@@ -20,7 +18,204 @@ use ay_core::{Symbol, TheoryLit};
 
 use crate::infer::{InferenceKind, InferenceManager};
 use crate::state::SolverState;
+use crate::we_regex::WeRegex;
 use crate::RegexWorkLimitExceeded;
+
+/// Add `value` to a structural allocation bound, declining once `cap` would
+/// be exceeded. `None` is a fail-open signal for the derivative fast path.
+fn add_to_bound(total: &mut usize, value: usize, cap: usize) -> Option<()> {
+    *total = total.checked_add(value)?;
+    (*total <= cap).then_some(())
+}
+
+/// [`WeRegex::size`] with checked, early-capped arithmetic and cooperative
+/// traversal charging.
+fn regex_size_bounded(regex: &WeRegex, cap: usize, budget: &mut RegexWorkBudget) -> Option<usize> {
+    if !budget.charge() {
+        return None;
+    }
+    let total = match regex {
+        WeRegex::None | WeRegex::Eps | WeRegex::AnyChar | WeRegex::All | WeRegex::Range(..) => 1,
+        WeRegex::Lit(value) => 1usize.checked_add(value.len() / 8)?,
+        WeRegex::Concat(parts) | WeRegex::Union(parts) | WeRegex::Inter(parts) => {
+            let mut total = 1;
+            for part in parts {
+                add_to_bound(&mut total, regex_size_bounded(part, cap, budget)?, cap)?;
+            }
+            total
+        }
+        WeRegex::Star(inner) | WeRegex::Comp(inner) | WeRegex::Loop(inner, ..) => {
+            1usize.checked_add(regex_size_bounded(inner, cap, budget)?)?
+        }
+    };
+    if total > cap {
+        return None;
+    }
+    Some(total)
+}
+
+/// Conservative upper bound on structural regex material cloned or built by
+/// one call to [`WeRegex::derive`].
+///
+/// In particular, a nullable concat can derive every suffix and clone those
+/// suffixes into separate arms, so its transient work can be quadratic even
+/// when the post-simplification result is small. Computing this recurrence
+/// before calling `derive` prevents that speculative expansion from crossing
+/// the same cap as the retained derivative. A declined bound falls back to the
+/// memoised term evaluator without allocating the derivative.
+fn derivative_transient_bound(
+    regex: &WeRegex,
+    cap: usize,
+    budget: &mut RegexWorkBudget,
+) -> Option<usize> {
+    if !budget.charge() {
+        return None;
+    }
+    match regex {
+        WeRegex::None | WeRegex::Eps | WeRegex::AnyChar | WeRegex::All | WeRegex::Range(..) => {
+            (1 <= cap).then_some(1)
+        }
+        WeRegex::Lit(value) => {
+            let size = 1usize.checked_add(value.len() / 8)?;
+            (size <= cap).then_some(size)
+        }
+        WeRegex::Concat(parts) => concat_derivative_transient_bound(parts, cap, budget),
+        WeRegex::Union(parts) | WeRegex::Inter(parts) => {
+            let mut total = 1;
+            for part in parts {
+                add_to_bound(
+                    &mut total,
+                    derivative_transient_bound(part, cap, budget)?,
+                    cap,
+                )?;
+            }
+            Some(total)
+        }
+        WeRegex::Star(inner) => {
+            let mut total = 1;
+            add_to_bound(
+                &mut total,
+                derivative_transient_bound(inner, cap, budget)?,
+                cap,
+            )?;
+            // `derive(Star(r))` clones the complete star into the concat tail.
+            add_to_bound(&mut total, regex_size_bounded(regex, cap, budget)?, cap)?;
+            Some(total)
+        }
+        WeRegex::Comp(inner) => {
+            let mut total = 1;
+            add_to_bound(
+                &mut total,
+                derivative_transient_bound(inner, cap, budget)?,
+                cap,
+            )?;
+            Some(total)
+        }
+        WeRegex::Loop(inner, ..) => {
+            let mut total = 2;
+            add_to_bound(
+                &mut total,
+                derivative_transient_bound(inner, cap, budget)?,
+                cap,
+            )?;
+            // The counter step clones the body before rebuilding the loop.
+            add_to_bound(&mut total, regex_size_bounded(inner, cap, budget)?, cap)?;
+            Some(total)
+        }
+    }
+}
+
+fn nullable_with_budget(regex: &WeRegex, budget: &mut RegexWorkBudget) -> Option<bool> {
+    if !budget.charge() {
+        return None;
+    }
+    match regex {
+        WeRegex::None | WeRegex::Lit(_) | WeRegex::AnyChar | WeRegex::Range(..) => Some(false),
+        WeRegex::Eps | WeRegex::All | WeRegex::Star(_) => Some(true),
+        WeRegex::Concat(parts) | WeRegex::Inter(parts) => {
+            for part in parts {
+                if !nullable_with_budget(part, budget)? {
+                    return Some(false);
+                }
+            }
+            Some(true)
+        }
+        WeRegex::Union(parts) => {
+            for part in parts {
+                if nullable_with_budget(part, budget)? {
+                    return Some(true);
+                }
+            }
+            Some(false)
+        }
+        WeRegex::Comp(inner) => nullable_with_budget(inner, budget).map(|value| !value),
+        WeRegex::Loop(inner, lo, _) => {
+            if *lo == 0 {
+                Some(true)
+            } else {
+                nullable_with_budget(inner, budget)
+            }
+        }
+    }
+}
+
+fn concat_derivative_transient_bound(
+    parts: &[WeRegex],
+    cap: usize,
+    budget: &mut RegexWorkBudget,
+) -> Option<usize> {
+    if parts.is_empty() {
+        return (1 <= cap).then_some(1);
+    }
+
+    // Walk only the nullable prefix that `WeRegex::derive` can actually enter.
+    // Maintaining the remaining suffix size makes the preflight linear without
+    // allocating an attacker-width side table.
+    let mut suffix_parts_size = 0;
+    for part in parts {
+        add_to_bound(
+            &mut suffix_parts_size,
+            regex_size_bounded(part, cap, budget)?,
+            cap,
+        )?;
+    }
+    let mut total = 0;
+
+    for (index, first) in parts.iter().enumerate() {
+        suffix_parts_size =
+            suffix_parts_size.checked_sub(regex_size_bounded(first, cap, budget)?)?;
+        let remaining = parts.len() - index - 1;
+        if remaining == 0 {
+            add_to_bound(
+                &mut total,
+                derivative_transient_bound(first, cap, budget)?,
+                cap,
+            )?;
+            break;
+        }
+
+        // `derive(Concat)` clones the complete suffix to form `rest_re`, clones
+        // `rest_re` into the first arm, and may derive that suffix as a second
+        // arm. Three shells cover the suffix concat, first arm, and arm union.
+        add_to_bound(&mut total, 3, cap)?;
+        add_to_bound(&mut total, suffix_parts_size, cap)?;
+        add_to_bound(
+            &mut total,
+            derivative_transient_bound(first, cap, budget)?,
+            cap,
+        )?;
+        add_to_bound(&mut total, suffix_parts_size, cap)?;
+        if remaining > 1 {
+            // `rest_re` retains one concat shell in addition to its children.
+            add_to_bound(&mut total, 1, cap)?;
+        }
+        if !nullable_with_budget(first, budget)? {
+            break;
+        }
+    }
+
+    Some(total)
+}
 
 /// One memoised sub-problem of the concrete-membership evaluator.
 ///
@@ -91,28 +286,41 @@ impl RegexWorkBudget {
         }
     }
 
-    /// Charge one matcher consultation before its memo lookup or computation.
-    fn charge(&mut self) -> bool {
+    /// Charge deterministic structural work before performing it.
+    fn charge_many(&mut self, units: usize) -> bool {
+        let units = u64::try_from(units).unwrap_or(u64::MAX);
         if let Some(remaining) = &mut self.remaining {
-            if *remaining == 0 {
+            if *remaining < units {
+                *remaining = 0;
                 self.exhausted = true;
                 return false;
             }
-            *remaining -= 1;
+            *remaining -= units;
         }
-        RE_WORK.with(|c| c.set(c.get().saturating_add(1)));
+        record_work(units);
         true
+    }
+
+    /// Charge one memoised matcher consultation.
+    fn charge(&mut self) -> bool {
+        self.charge_many(1)
     }
 }
 
+fn record_work(units: u64) {
+    RE_WORK.with(|counter| counter.set(counter.get().saturating_add(units)));
+}
+
 thread_local! {
-    /// Monotone count of membership sub-problem CONSULTATIONS on this thread.
+    /// Monotone count of membership structural-work units on this thread.
     /// The regex matcher's whole cost lives inside one
     /// `evaluate_term` frame, so the evaluator's own node-visit clock cannot
     /// see it — a single `str.in_re` atom over an industrial regex can be
     /// four orders of magnitude more expensive than a whole `str.substr` nest.
-    /// Callers that budget work by counting (the W4 witness search) add this to
-    /// their clock so both shapes are bounded by one number.
+    /// Memo consultations cost one unit; derivative translation and scans cost
+    /// their structural size. Callers that budget work by counting (the W4
+    /// witness search) add this to their clock so both shapes are bounded by
+    /// one number.
     static RE_WORK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -226,12 +434,12 @@ impl RegExpSolver {
     ///
     /// Returns `Some(true/false)` for ground regexes, `None` for non-ground.
     ///
-    /// This is a recursive descent evaluator that works directly on the
-    /// term representation without creating intermediate terms.
+    /// Exactly translatable terms first use Brzozowski derivatives. Translation
+    /// or derivative size-limit failure falls through to the existing memoised
+    /// recursive descent, preserving support for every legacy term shape.
     pub(crate) fn evaluate(terms: &TermStore, s: &str, r: TermId) -> Option<bool> {
-        let mut memo = ReMemo::default();
         let mut budget = RegexWorkBudget::unlimited();
-        Self::eval_memo(terms, s, r, &mut memo, &mut budget)
+        Self::evaluate_with_budget(terms, s, r, &mut budget).unwrap_or_default()
     }
 
     /// Bounded counterpart of [`Self::evaluate`].
@@ -254,8 +462,90 @@ impl RegExpSolver {
         if budget.exhausted {
             return Err(RegexWorkLimitExceeded);
         }
+        let derivative = Self::evaluate_derivative_with_budget(terms, s, r, budget);
+        if budget.exhausted {
+            return Err(RegexWorkLimitExceeded);
+        }
+        if derivative.is_some() {
+            return Ok(derivative);
+        }
+
+        let out = Self::evaluate_fallback_with_budget(terms, s, r, budget);
+        if budget.exhausted {
+            return Err(RegexWorkLimitExceeded);
+        }
+        Ok(out)
+    }
+
+    /// Exact derivative fast path, bounded by the caller's existing work
+    /// budget. `None` means translation/derivative limits were reached and the
+    /// memoised term evaluator should be tried; an exhausted budget is recorded
+    /// on `budget` and must not fall through.
+    fn evaluate_derivative_with_budget(
+        terms: &TermStore,
+        s: &str,
+        r: TermId,
+        budget: &mut RegexWorkBudget,
+    ) -> Option<bool> {
+        let limits = crate::term_regex::TranslateLimits::for_ground_eval();
+        let mut regex = {
+            let mut charge = |units| budget.charge_many(units);
+            crate::term_regex::translate_with_charge(terms, r, &limits, &mut charge)?
+        };
+        let mut regex_size = regex.size();
+
+        for c in s.chars() {
+            // Preflight the complete transient expansion, not only the retained
+            // result: nullable concats can otherwise allocate a quadratic set
+            // of derivative arms before the post-derive size check sees it.
+            let derivative_work = derivative_transient_bound(&regex, limits.max_size, budget)?;
+            if !budget.charge_many(derivative_work) {
+                return None;
+            }
+            regex = regex.derive(c);
+            if regex.is_empty_lang() {
+                return Some(false);
+            }
+            regex_size = regex.size();
+            if regex_size > limits.max_size {
+                return None;
+            }
+        }
+
+        // `nullable` is another structural traversal and is part of the same
+        // in-evaluator budget (including the empty-subject case).
+        if !budget.charge_many(regex_size.max(1)) {
+            return None;
+        }
+        Some(regex.nullable())
+    }
+
+    /// Existing exact recursive-descent fallback with its current memo.
+    fn evaluate_fallback_with_budget(
+        terms: &TermStore,
+        s: &str,
+        r: TermId,
+        budget: &mut RegexWorkBudget,
+    ) -> Option<bool> {
         let mut memo = ReMemo::default();
-        let out = Self::eval_memo(terms, s, r, &mut memo, budget);
+        Self::eval_memo(terms, s, r, &mut memo, budget)
+    }
+
+    #[cfg(test)]
+    fn evaluate_fallback(terms: &TermStore, s: &str, r: TermId) -> Option<bool> {
+        let mut budget = RegexWorkBudget::unlimited();
+        Self::evaluate_fallback_with_budget(terms, s, r, &mut budget)
+    }
+
+    #[cfg(test)]
+    fn evaluate_fallback_with_work_limit(
+        terms: &TermStore,
+        s: &str,
+        r: TermId,
+        limit: u64,
+    ) -> Result<Option<bool>, RegexWorkLimitExceeded> {
+        let mut budget = RegexWorkBudget::limited(limit);
+        let out = Self::evaluate_fallback_with_budget(terms, s, r, &mut budget);
         if budget.exhausted {
             Err(RegexWorkLimitExceeded)
         } else {

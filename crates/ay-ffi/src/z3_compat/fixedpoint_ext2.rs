@@ -49,10 +49,10 @@ use super::fixedpoint::{
     solve_problem, QueryOutcome, TranslateErr, REASON_UNTRANSLATABLE,
 };
 use super::{
-    ast_to_term, cache_ast_vector, cache_string, cache_symbol, ffi_count_within_limit,
-    ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_void, term_to_ast,
-    Z3_ast, Z3_ast_vector, Z3_context, Z3_fixedpoint, Z3_func_decl, Z3_string, Z3_symbol,
-    Z3_EXCEPTION, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK,
+    cache_ast_vector, cache_string, cache_symbol, ffi_count_within_limit, ffi_guard_ast,
+    ffi_guard_const_ptr, ffi_guard_int, ffi_guard_ptr, ffi_guard_void, require_term_ast_or_return,
+    term_to_ast, Z3_ast, Z3_ast_vector, Z3_context, Z3_fixedpoint, Z3_func_decl, Z3_string,
+    Z3_symbol, Z3_EXCEPTION, Z3_INVALID_ARG, Z3_INVALID_USAGE, Z3_L_TRUE, Z3_L_UNDEF, Z3_OK,
 };
 
 // ============================================================================
@@ -73,15 +73,16 @@ use super::{
 /// a valid `Z3_ast`.
 #[no_mangle]
 pub unsafe extern "C" fn Z3_fixedpoint_assert(c: Z3_context, d: Z3_fixedpoint, axiom: Z3_ast) {
-    if d.is_null() || axiom == 0 {
+    if d.is_null() {
         return;
     }
     // SAFETY: `ffi_guard_void` null-checks `c` and catches panics; `d` is a
     // separate arena allocation, kept alive by the context.
     unsafe {
         ffi_guard_void(c, |ctx| {
+            let term = require_term_ast_or_return!(ctx, axiom, "Z3_fixedpoint_assert", "axiom");
             let handle = &mut *d;
-            handle.assertions.push(ast_to_term(axiom));
+            handle.assertions.push(term);
             ctx.last_error = Z3_OK;
         });
     }
@@ -103,7 +104,12 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_assertions(
     unsafe {
         ffi_guard_ptr(c, |ctx| {
             let asts: Vec<Z3_ast> = match f.as_ref() {
-                Some(handle) => handle.assertions.iter().copied().map(term_to_ast).collect(),
+                Some(handle) => handle
+                    .assertions
+                    .iter()
+                    .copied()
+                    .map(|term| term_to_ast(ctx, term))
+                    .collect(),
                 None => {
                     ctx.last_error = Z3_INVALID_ARG;
                     ctx.error_msg = Some("null Z3_fixedpoint handle in get_assertions".to_string());
@@ -138,7 +144,7 @@ pub unsafe extern "C" fn Z3_fixedpoint_update_rule(
     a: Z3_ast,
     name: Z3_symbol,
 ) {
-    if d.is_null() || a == 0 {
+    if d.is_null() {
         return;
     }
     // Read the optional rule name outside the guard (raw-pointer deref).
@@ -148,8 +154,8 @@ pub unsafe extern "C" fn Z3_fixedpoint_update_rule(
     // alive by the context arena.
     unsafe {
         ffi_guard_void(c, |ctx| {
+            let term = require_term_ast_or_return!(ctx, a, "Z3_fixedpoint_update_rule", "rule");
             let handle = &mut *d;
-            let term = ast_to_term(a);
             match &rule_name {
                 Some(nm) => {
                     if let Some(pos) = handle
@@ -416,7 +422,7 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_ground_sat_answer(
                 ctx.solver.and_many(&eqs)
             };
             ctx.last_error = Z3_OK;
-            term_to_ast(answer)
+            term_to_ast(ctx, answer)
         })
     }
 }
@@ -463,7 +469,7 @@ pub unsafe extern "C" fn Z3_fixedpoint_get_rules_along_trace(
                 for step in &cex.steps {
                     if let Some(i) = step.clause_index {
                         if let Some(&rule) = handle.last_query_rules.get(i) {
-                            asts.push(term_to_ast(rule));
+                            asts.push(term_to_ast(ctx, rule));
                         }
                     }
                 }

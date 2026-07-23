@@ -20,8 +20,8 @@ use std::ffi::c_uint;
 use std::ptr;
 
 use super::{
-    cache_func_interp, ffi_guard_ptr, ffi_guard_void, Z3_ast, Z3_context, Z3_func_decl,
-    Z3_func_interp, Z3_model, Z3_OK,
+    cache_func_interp, ffi_guard_ptr, ffi_guard_void, require_term_ast_or_return, Z3_ast,
+    Z3_context, Z3_func_decl, Z3_func_interp, Z3_model, Z3_OK,
 };
 
 /// Assign a constant interpretation `f := a` in model `m`.
@@ -53,6 +53,14 @@ pub unsafe extern "C" fn Z3_add_const_interp(
     // `&mut Z3Context`.
     unsafe {
         ffi_guard_void(c, |ctx| {
+            if a != 0 {
+                let _term = require_term_ast_or_return!(
+                    ctx,
+                    a,
+                    "Z3_add_const_interp",
+                    "interpretation value",
+                );
+            }
             let handle = &mut *m;
             handle.user_const_interps.push((decl, a));
             ctx.last_error = Z3_OK;
@@ -90,6 +98,15 @@ pub unsafe extern "C" fn Z3_add_func_interp(
     // separate arena allocation, so `&mut *m` cannot alias `&mut Z3Context`.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
+            if default_value != 0 {
+                let _term = require_term_ast_or_return!(
+                    ctx,
+                    default_value,
+                    "Z3_add_func_interp",
+                    "default value",
+                    ptr::null_mut()
+                );
+            }
             // Fresh, empty interpretation with the caller's else value. Arena
             // registration happens inside `cache_func_interp`.
             let interp = cache_func_interp(ctx, arity, Vec::new(), default_value);

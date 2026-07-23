@@ -37,9 +37,10 @@
 use std::ptr;
 
 use super::{
-    ast_to_term, cache_apply_result, cache_goal, cache_goal_with_depth, cache_string,
+    cache_apply_result, cache_goal, cache_goal_with_depth, cache_string, checked_ast_to_term,
     ensure_cross_context_translation_semantics, ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int,
-    ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, record_ast_sort, term_to_ast,
+    ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, record_ast_sort, require_term_ast_or_return,
+    require_term_asts, require_term_asts_or_return, term_to_ast,
     transfer_cross_context_ffi_metadata, ModelHandle, Z3_apply_result, Z3_ast, Z3_context, Z3_goal,
     Z3_model, Z3_params, Z3_string, Z3_tactic, Z3_EXCEPTION, Z3_GOAL_PRECISE, Z3_INVALID_ARG,
     Z3_OK,
@@ -108,11 +109,7 @@ pub unsafe extern "C" fn Z3_goal_assert(c: Z3_context, g: Z3_goal, a: Z3_ast) {
                 ctx.error_msg = Some("Z3_goal_assert: null goal handle".to_string());
                 return;
             };
-            if a == 0 {
-                ctx.last_error = Z3_INVALID_ARG;
-                ctx.error_msg = Some("Z3_goal_assert: null formula".to_string());
-                return;
-            }
+            let _term = require_term_ast_or_return!(ctx, a, "Z3_goal_assert", "formula");
             ctx.last_error = Z3_OK;
             goal.formulas.push(a);
         });
@@ -149,6 +146,8 @@ pub unsafe extern "C" fn Z3_goal_formula(c: Z3_context, g: Z3_goal, i: c_uint) -
                 ctx.last_error = Z3_INVALID_ARG;
                 ctx.error_msg = Some("Z3_goal_formula: index out of range".to_string());
             } else {
+                let _term =
+                    require_term_ast_or_return!(ctx, ast, "Z3_goal_formula", "stored formula", 0);
                 ctx.last_error = Z3_OK;
             }
             ast
@@ -237,7 +236,7 @@ unsafe fn apply_tactic_to_goal_impl(
                 return ptr::null_mut();
             };
 
-            let goal_terms: Vec<Term> = formulas.iter().map(|&a| ast_to_term(a)).collect();
+            let goal_terms = require_term_asts_or_return!(ctx, &formulas, label, ptr::null_mut());
             match ctx.solver.apply_tactic_subgoals(&tactic, &goal_terms) {
                 Ok(subgoals) => {
                     ctx.last_error = Z3_OK;
@@ -246,7 +245,8 @@ unsafe fn apply_tactic_to_goal_impl(
                     let subgoal_handles: Vec<Z3_goal> = subgoals
                         .into_iter()
                         .map(|(fs, depth)| {
-                            let asts: Vec<Z3_ast> = fs.iter().map(|&t| term_to_ast(t)).collect();
+                            let asts: Vec<Z3_ast> =
+                                fs.iter().map(|&t| term_to_ast(ctx, t)).collect();
                             cache_goal_with_depth(ctx, asts, depth)
                         })
                         .collect();
@@ -376,8 +376,13 @@ pub unsafe extern "C" fn Z3_goal_inconsistent(c: Z3_context, g: Z3_goal) -> bool
     // SAFETY: `ffi_guard_int` handles a null context and catches panics.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
-            ctx.last_error = Z3_OK;
-            c_int::from(goal_has_false(ctx, formulas.as_deref()))
+            match goal_has_false(ctx, formulas.as_deref(), "Z3_goal_inconsistent") {
+                Some(value) => {
+                    ctx.last_error = Z3_OK;
+                    c_int::from(value)
+                }
+                None => 0,
+            }
         }) != 0
     }
 }
@@ -399,7 +404,8 @@ pub unsafe extern "C" fn Z3_goal_num_exprs(c: Z3_context, g: Z3_goal) -> c_uint 
             ctx.last_error = Z3_OK;
             match data {
                 Some((formulas, depth)) => {
-                    let terms: Vec<Term> = formulas.iter().map(|&a| ast_to_term(a)).collect();
+                    let terms =
+                        require_term_asts_or_return!(ctx, &formulas, "Z3_goal_num_exprs", 0);
                     // `num-exprs` is depth-independent; pass the goal's depth for
                     // symmetry with the probe evaluator.
                     ctx.solver.apply_probe(&Probe::NumExprs, &terms, depth) as c_uint
@@ -444,8 +450,13 @@ pub unsafe extern "C" fn Z3_goal_is_decided_unsat(c: Z3_context, g: Z3_goal) -> 
     // SAFETY: `ffi_guard_int` handles a null context and catches panics.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
-            ctx.last_error = Z3_OK;
-            c_int::from(goal_has_false(ctx, formulas.as_deref()))
+            match goal_has_false(ctx, formulas.as_deref(), "Z3_goal_is_decided_unsat") {
+                Some(value) => {
+                    ctx.last_error = Z3_OK;
+                    c_int::from(value)
+                }
+                None => 0,
+            }
         }) != 0
     }
 }
@@ -454,11 +465,18 @@ pub unsafe extern "C" fn Z3_goal_is_decided_unsat(c: Z3_context, g: Z3_goal) -> 
 ///
 /// Shared by `Z3_goal_inconsistent` and `Z3_goal_is_decided_unsat`, which both
 /// key on the goal containing `false`. Uses the solver's REAL constant value.
-fn goal_has_false(ctx: &super::Z3Context, formulas: Option<&[Z3_ast]>) -> bool {
-    formulas.is_some_and(|fs| {
-        fs.iter()
-            .any(|&a| a != 0 && ctx.solver.bool_value(ast_to_term(a)) == Some(false))
-    })
+fn goal_has_false(
+    ctx: &mut super::Z3Context,
+    formulas: Option<&[Z3_ast]>,
+    operation: &str,
+) -> Option<bool> {
+    let formulas = formulas?;
+    let terms = require_term_asts(ctx, formulas, operation)?;
+    Some(
+        terms
+            .into_iter()
+            .any(|term| ctx.solver.bool_value(term) == Some(false)),
+    )
 }
 
 /// Erase all formulas from the goal, resetting its depth to 0 (Z3's
@@ -518,8 +536,15 @@ pub unsafe extern "C" fn Z3_goal_translate(
                 tgt.error_msg = Some("Z3_goal_translate: null goal handle".to_string());
                 return ptr::null_mut();
             };
-            // Same context: the handles are already valid here — copy directly.
+            // Same context: authenticate before copying so translation cannot
+            // launder formulas that came from a different context.
             if source == target {
+                let _terms = require_term_asts_or_return!(
+                    tgt,
+                    &formulas,
+                    "Z3_goal_translate",
+                    ptr::null_mut()
+                );
                 tgt.last_error = Z3_OK;
                 return cache_goal_with_depth(tgt, formulas, depth);
             }
@@ -532,10 +557,21 @@ pub unsafe extern "C" fn Z3_goal_translate(
                 tgt.error_msg = Some("Z3_goal_translate: null source context".to_string());
                 return ptr::null_mut();
             };
+            let Some(src_terms) = formulas
+                .iter()
+                .map(|&ast| checked_ast_to_term(src, ast))
+                .collect::<Option<Vec<Term>>>()
+            else {
+                tgt.last_error = Z3_INVALID_ARG;
+                tgt.error_msg = Some(
+                    "Z3_goal_translate: goal contains an invalid formula or one from a different source context"
+                        .to_string(),
+                );
+                return ptr::null_mut();
+            };
             if !ensure_cross_context_translation_semantics(src, tgt, "Z3_goal_translate") {
                 return ptr::null_mut();
             }
-            let src_terms: Vec<Term> = formulas.iter().map(|&a| ast_to_term(a)).collect();
             let new_terms = tgt.solver.translate_terms_from(&src.solver, &src_terms);
             if !transfer_cross_context_ffi_metadata(
                 src,
@@ -546,7 +582,7 @@ pub unsafe extern "C" fn Z3_goal_translate(
             ) {
                 return ptr::null_mut();
             }
-            let new_asts: Vec<Z3_ast> = new_terms.iter().map(|&t| term_to_ast(t)).collect();
+            let new_asts: Vec<Z3_ast> = new_terms.iter().map(|&t| term_to_ast(tgt, t)).collect();
             for ((&source_term, &_term), &ast) in src_terms.iter().zip(&new_terms).zip(&new_asts) {
                 let sort = src.solver.term_sort(source_term);
                 record_ast_sort(tgt, ast, sort);
@@ -620,8 +656,15 @@ pub unsafe extern "C" fn Z3_goal_to_string(c: Z3_context, g: Z3_goal) -> Z3_stri
                     let rendered = if a == 0 {
                         "?".to_string()
                     } else {
+                        let term = require_term_ast_or_return!(
+                            ctx,
+                            a,
+                            "Z3_goal_to_string",
+                            "goal formula",
+                            ptr::null()
+                        );
                         ctx.solver
-                            .format_term_checked(ast_to_term(a))
+                            .format_term_checked(term)
                             .unwrap_or_else(|| "?".to_string())
                     };
                     s.push_str("\n  ");

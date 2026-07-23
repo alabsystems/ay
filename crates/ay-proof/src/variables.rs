@@ -224,14 +224,6 @@ fn collect_free_vars_in_term(
 }
 
 fn is_auxiliary_proof_symbol(name: &str) -> bool {
-    const AUX_PREFIXES: &[&str] = &[
-        "_mod_",
-        "_div_",
-        "__ay_",
-        "__ext_diff",
-        "_sk_",
-        "sk_",
-        "skolem",
-    ];
+    const AUX_PREFIXES: &[&str] = &["_mod_", "_div_", "__ay_", "_sk_", "sk_", "skolem"];
     AUX_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
 }

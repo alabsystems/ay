@@ -242,6 +242,10 @@ pub enum AletheRule {
     Trust,
     /// Custom rule (extension)
     Custom(String),
+    /// Exact evaluation of a closed term.
+    ///
+    /// Appended to preserve serialized discriminants of the older variants.
+    Evaluate,
 }
 
 impl AletheRule {
@@ -331,6 +335,7 @@ impl AletheRule {
             Self::Drup => "drup",
             Self::Trust => "trust",
             Self::Custom(name) => name,
+            Self::Evaluate => "evaluate",
         }
     }
 }

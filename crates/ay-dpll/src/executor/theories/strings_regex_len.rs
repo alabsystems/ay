@@ -36,7 +36,7 @@
 use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::term::{Constant, Symbol, TermData, TermId};
 use ay_core::Sort;
-use ay_strings::we_regex::WeRegex;
+use ay_strings::we_regex::{WeRegex, WitnessWorkBudget};
 
 use crate::executor_types::{Result, SolveResult};
 
@@ -172,6 +172,73 @@ impl Executor {
             }
         }
 
+        Ok(None)
+    }
+
+    /// W1b: CONTENT-POSITIVE regex witness CONSTRUCTION, split out of
+    /// [`Self::try_regex_length_witnesses`] so it can run LATE in the pre-pass
+    /// cascade (TARGET strings_regex_len W1b-placement).
+    ///
+    /// PLACEMENT RATIONALE. This pass only ever produces SAT candidates — a
+    /// failed search means "not found", never "no witness exists" — so nothing
+    /// it computes can contribute to an UNSAT verdict. Running it before the
+    /// exact passes therefore charged its full derivative product search to
+    /// every file those passes decide outright: measured on
+    /// `automatark-lu/instance13338` (UNSAT), the search exhausted 11 137
+    /// product states / 64.7M derivative-node units in ~2.1 s, after which the
+    /// Nielsen pre-pass proved UNSAT in 4.6 ms. Ordering it after the exact
+    /// passes keeps every conversion (the candidate set, the pinning and the
+    /// full model validation are unchanged) and pays for the search only on
+    /// formulas nothing cheaper decides.
+    /// Derivative-work budget for the CHEAP W1b probe (see
+    /// [`Self::try_regex_construct_witnesses_cheap`]).
+    ///
+    /// The product-search per-state cost is UNIFORM across the automatark
+    /// family (~8k units regardless of outcome), so a per-state or per-length
+    /// cap cannot separate a real convergence from a doomed exhaust; only the
+    /// TOTAL work does. Calibrated on the pair that pulls in opposite
+    /// directions: `instance12580` (SAT) converges after ~1.6M units, while
+    /// `instance13338` (UNSAT) exhausts for ~65M. This budget clears the
+    /// former and caps the latter — and because the cheap probe runs AFTER the
+    /// exact passes that already decide `instance13338` (Nielsen, 4.6 ms), the
+    /// cap it hits there is never even reached. A budgeted `None` is
+    /// indistinguishable from "not found": the unrestricted
+    /// [`Self::try_regex_construct_witnesses`] retries every declined variable,
+    /// so no candidate is lost — only its position in the cascade changes.
+    const CHEAP_W1B_WORK_BUDGET: u64 = 3_000_000;
+
+    /// W1b with a CHEAP per-variable work budget, for the fast conversions that
+    /// should not be made to pay for the passes downstream of it. Everything it
+    /// declines (budget hit) is retried unbudgeted by
+    /// [`Self::try_regex_construct_witnesses`].
+    pub(in crate::executor) fn try_regex_construct_witnesses_cheap(
+        &mut self,
+    ) -> Result<Option<SolveResult>> {
+        self.regex_construct_witnesses(Some(Self::CHEAP_W1B_WORK_BUDGET))
+    }
+
+    pub(in crate::executor) fn try_regex_construct_witnesses(
+        &mut self,
+    ) -> Result<Option<SolveResult>> {
+        self.regex_construct_witnesses(None)
+    }
+
+    fn regex_construct_witnesses(
+        &mut self,
+        work_budget: Option<u64>,
+    ) -> Result<Option<SolveResult>> {
+        if self.pivot_enum_depth != 0 {
+            return Ok(None);
+        }
+        if !str_witness_w1b() {
+            return Ok(None);
+        }
+        let var_memberships = self.collect_var_memberships();
+        if var_memberships.is_empty() {
+            return Ok(None);
+        }
+        let length_bounds = self.regex_var_length_bounds();
+
         // W1b (default ON, `AY_STR_WITNESS=0` kill switch): CONTENT-POSITIVE construction
         // for the variables the finite enumeration above had to skip.
         //
@@ -192,7 +259,7 @@ impl Executor {
         // through to the normal pipeline; UNSAT is NEVER concluded from a
         // failed search (`find_witness` returning `None` means "not found",
         // never "no witness exists").
-        if str_witness_w1b() {
+        {
             for (var, memberships) in &var_memberships {
                 let Some(regexes) = self.translate_var_memberships(memberships) else {
                     continue;
@@ -200,6 +267,7 @@ impl Executor {
                 let candidates = Self::construct_regex_witnesses(
                     &regexes,
                     length_bounds.get(var).copied().unwrap_or((0, usize::MAX)),
+                    work_budget,
                 );
                 if candidates.is_empty() {
                     continue;
@@ -236,8 +304,13 @@ impl Executor {
     /// window's lowest feasible lengths are probed EXACTLY as well. Every
     /// candidate is validated downstream; producing more of them can only
     /// convert (or cost bounded time), never mis-answer.
-    fn construct_regex_witnesses(regexes: &[WeRegex], (lo, hi): (usize, usize)) -> Vec<String> {
+    fn construct_regex_witnesses(
+        regexes: &[WeRegex],
+        (lo, hi): (usize, usize),
+        work_budget: Option<u64>,
+    ) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
+        let mut shared_budget = work_budget.map(WitnessWorkBudget::new);
         let mut push = |w: String| {
             if !out.contains(&w) && out.len() < W1B_MAX_CANDIDATES {
                 out.push(w);
@@ -249,15 +322,35 @@ impl Executor {
             .min(start.saturating_add(W1B_MAX_CANDIDATES - 1))
             .min(WITNESS_SEARCH_MAX_LEN);
         for len in start..=end {
-            if let Some(w) = ay_strings::we_regex::find_witness_bounded(regexes, Some(len), len) {
+            let witness = match shared_budget.as_mut() {
+                Some(budget) if budget.is_exhausted() => break,
+                Some(budget) => ay_strings::we_regex::find_witness_with_work_budget(
+                    regexes,
+                    Some(len),
+                    len,
+                    budget,
+                ),
+                None => ay_strings::we_regex::find_witness_bounded(regexes, Some(len), len),
+            };
+            if let Some(w) = witness {
                 push(w);
             }
         }
         // Shortest witness of ANY length, as the fallback for variables with
         // no usable length window (or whose window the probes above missed).
-        if let Some(w) =
-            ay_strings::we_regex::find_witness_bounded(regexes, None, WITNESS_SEARCH_MAX_LEN)
-        {
+        let fallback = match shared_budget.as_mut() {
+            Some(budget) if budget.is_exhausted() => None,
+            Some(budget) => ay_strings::we_regex::find_witness_with_work_budget(
+                regexes,
+                None,
+                WITNESS_SEARCH_MAX_LEN,
+                budget,
+            ),
+            None => {
+                ay_strings::we_regex::find_witness_bounded(regexes, None, WITNESS_SEARCH_MAX_LEN)
+            }
+        };
+        if let Some(w) = fallback {
             push(w);
         }
         out
@@ -639,7 +732,7 @@ mod w1b_tests {
 
     #[test]
     fn constructs_exact_length_witness_inside_window() {
-        let cands = Executor::construct_regex_witnesses(&[range3()], (3, 3));
+        let cands = Executor::construct_regex_witnesses(&[range3()], (3, 3), None);
         assert_eq!(cands.len(), 1, "one exact length in the window: {cands:?}");
         assert_eq!(cands[0].chars().count(), 3);
         assert_eq!(range3().matches(&cands[0]), Some(true));
@@ -651,7 +744,7 @@ mod w1b_tests {
         // the shortest ("") witness alone — that is exactly the candidate the
         // length constraint refutes.
         let star = WeRegex::star(WeRegex::range("x", "z"));
-        let cands = Executor::construct_regex_witnesses(&[star], (2, usize::MAX));
+        let cands = Executor::construct_regex_witnesses(&[star], (2, usize::MAX), None);
         assert!(!cands.is_empty());
         assert!(
             cands.iter().all(|c| c.chars().count() >= 2),
@@ -665,7 +758,7 @@ mod w1b_tests {
         // `x ∈ [a-z]{1}` ∧ `x ∉ [a-b]{1}` must construct a letter outside a-b.
         let pos = WeRegex::range("a", "z");
         let neg = WeRegex::comp(WeRegex::range("a", "b"));
-        let cands = Executor::construct_regex_witnesses(&[pos.clone(), neg.clone()], (1, 1));
+        let cands = Executor::construct_regex_witnesses(&[pos.clone(), neg.clone()], (1, 1), None);
         assert!(!cands.is_empty(), "witness must exist");
         for c in &cands {
             assert_eq!(pos.matches(c), Some(true), "{c:?} ∈ [a-z]");
@@ -675,7 +768,7 @@ mod w1b_tests {
 
     #[test]
     fn empty_language_yields_no_candidate() {
-        assert!(Executor::construct_regex_witnesses(&[WeRegex::None], (0, 4)).is_empty());
+        assert!(Executor::construct_regex_witnesses(&[WeRegex::None], (0, 4), None).is_empty());
     }
 
     #[test]
@@ -683,7 +776,19 @@ mod w1b_tests {
         // A 90-character literal chain: far past the default
         // `AY_WE_WITNESS_MAX_LEN` (64 under S1), yet an ordinary witness.
         let lit: String = std::iter::repeat_n('q', 90).collect();
-        let cands = Executor::construct_regex_witnesses(&[WeRegex::lit(&lit)], (0, usize::MAX));
+        let cands =
+            Executor::construct_regex_witnesses(&[WeRegex::lit(&lit)], (0, usize::MAX), None);
         assert_eq!(cands, vec![lit]);
+    }
+
+    #[test]
+    fn cheap_probe_shares_one_work_budget_across_lengths() {
+        // `All` costs one derivative unit per character. A shared budget of
+        // four therefore finds lengths one and two (1 + 2 units), then stops
+        // during the length-three probe. Resetting four units for every probe
+        // would incorrectly admit all four candidates.
+        let cands = Executor::construct_regex_witnesses(&[WeRegex::All], (1, 4), Some(4));
+        let lengths: Vec<usize> = cands.iter().map(|word| word.chars().count()).collect();
+        assert_eq!(lengths, vec![1, 2]);
     }
 }

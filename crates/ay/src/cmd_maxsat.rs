@@ -1143,6 +1143,15 @@ impl Drop for MaxSatWatchdog {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc")),
+    )),
+    allow(dead_code)
+)]
 enum MaxSatUnreapedChildState {
     Running,
     Stopped,

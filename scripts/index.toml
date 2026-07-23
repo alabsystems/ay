@@ -100,6 +100,17 @@ requires = ["oom-guard"]
 cli_note = "campaign M0 methodology"
 
 [[script]]
+name    = "continuous-benchmark"
+path    = "scripts/continuous_benchmark.py"
+lang    = "python"
+group   = "campaign.core"
+summary = "Four-hour branch integration, correctness gates, rotating competition benchmarks, repair, and progress publication."
+publish = "public"
+requires = ["oom-guard"]
+docs    = "the development design notes"
+cli_note = "systemd campaign driver; native ay bench remains the scoring and resource-enforcement owner"
+
+[[script]]
 name    = "sat-compare"
 path    = "scripts/sat_bench/sat_compare.py"
 lang    = "python"
@@ -205,6 +216,15 @@ path    = "scripts/tests/test_oom_guard.py"
 lang    = "python"
 group   = "test"
 summary = "Tests for _oom_guard.py resource planning and the harness wiring."
+publish = "public"
+entrypoint = "test"
+
+[[script]]
+name    = "continuous-benchmark-tests"
+path    = "scripts/tests/test_continuous_benchmark.py"
+lang    = "python"
+group   = "test"
+summary = "Unit and disposable-Git-worktree tests for the continuous benchmark campaign driver."
 publish = "public"
 entrypoint = "test"
 

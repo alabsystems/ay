@@ -26,8 +26,8 @@
 //!      contract (1) A AND not(C|A) |= I, (2) B AND not(C|B) AND I unsat.
 //! 4. Verify the final I is a genuine Craig interpolant: (a) A AND (not I)
 //!    unsat, (b) I AND B unsat (both checked internally here, plus artifacts
-//!    written for external z3 + ay verification), (c) vars(I) within
-//!    shared(A, B) checked structurally.
+//!    written under the Cargo target root for external z3 + ay verification),
+//!    (c) vars(I) within shared(A, B) checked structurally.
 //!
 //! Two query instances:
 //! - `evals/repros/diag_syn2_indstep_k1_MIN.smt2` (the SYNAPSE conservation
@@ -1450,14 +1450,22 @@ fn run_spike(label: &str, src: &str, a_count: usize) -> (ProofShape, Option<Spik
     (shape, outcome)
 }
 
+fn interpolation_spike_artifact_dir() -> std::path::PathBuf {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("crate should live under repo/crates/ay-dpll")
+        .to_path_buf();
+    ay_test_support::cargo_target_root(&workspace)
+        .join("dpll-preflight-artifacts")
+        .join("interpolation-spike")
+}
+
 fn write_artifacts(name: &str, label: &str, a_count: usize, total: usize, out: &SpikeOutcome) {
-    let artifact_dir = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../evals/repros/interpolation_spike"
-    );
-    std::fs::create_dir_all(artifact_dir).expect("create artifact dir");
+    let artifact_dir = interpolation_spike_artifact_dir();
+    std::fs::create_dir_all(&artifact_dir).expect("create artifact dir");
     std::fs::write(
-        format!("{artifact_dir}/{name}_interpolant.txt"),
+        artifact_dir.join(format!("{name}_interpolant.txt")),
         format!(
             "; Craig interpolant ({label})\n\
              ; A = asserts 1-{a_count}, B = asserts {}-{total}\n\
@@ -1471,16 +1479,19 @@ fn write_artifacts(name: &str, label: &str, a_count: usize, total: usize, out: &
     )
     .expect("write interpolant artifact");
     std::fs::write(
-        format!("{artifact_dir}/{name}_check_a_implies_i.smt2"),
+        artifact_dir.join(format!("{name}_check_a_implies_i.smt2")),
         &out.check_a_script,
     )
     .expect("write A&!I artifact");
     std::fs::write(
-        format!("{artifact_dir}/{name}_check_i_and_b.smt2"),
+        artifact_dir.join(format!("{name}_check_i_and_b.smt2")),
         &out.check_b_script,
     )
     .expect("write I&B artifact");
-    eprintln!("[spike:{label}] artifacts written to {artifact_dir}/{name}_*");
+    eprintln!(
+        "[spike:{label}] artifacts written to {}/{name}_*",
+        artifact_dir.display()
+    );
 }
 
 // ============================================================================

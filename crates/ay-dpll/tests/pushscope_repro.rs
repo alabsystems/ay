@@ -57,7 +57,12 @@ fn build_live_terms(s: &mut Solver) -> (Term, Term) {
     let _ = s.try_declare_fun("Verdict_Accept_0", &[verdict.clone()], bv128.clone());
     let _ = s.try_declare_fun("is-Verdict_Accept", &[verdict.clone()], Sort::Bool);
     let _ = s.try_declare_fun("is-Verdict_Reject", &[verdict.clone()], Sort::Bool);
-    let verdict_reject = s.declare_const("Verdict_Reject", verdict.clone());
+    let verdict_reject = s
+        .try_declare_fun("Verdict_Reject", &[], verdict.clone())
+        .expect("declare nullary ctor fun");
+    let verdict_reject = s
+        .try_apply(&verdict_reject, &[])
+        .expect("apply nullary ctor fun");
 
     let claimed = s.declare_const("claimed", bv128.clone());
     let result = s.declare_const("result", verdict.clone());
@@ -109,6 +114,11 @@ fn repro_pushed() {
         r.result.result(),
         r.unknown_reason
     );
+    assert!(
+        r.result.result().is_unsat(),
+        "pushed datatype obligation must be UNSAT, got {:?}",
+        r.result.result()
+    );
     s.try_pop().unwrap();
 }
 
@@ -152,7 +162,12 @@ fn build_control_goal(s: &mut Solver) -> Term {
     let _ = s.try_declare_fun("Verdict_Accept_0", &[verdict.clone()], bv128.clone());
     let _ = s.try_declare_fun("is-Verdict_Accept", &[verdict.clone()], Sort::Bool);
     let _ = s.try_declare_fun("is-Verdict_Reject", &[verdict.clone()], Sort::Bool);
-    let verdict_reject = s.declare_const("Verdict_Reject", verdict.clone());
+    let verdict_reject = s
+        .try_declare_fun("Verdict_Reject", &[], verdict.clone())
+        .expect("declare nullary ctor fun");
+    let verdict_reject = s
+        .try_apply(&verdict_reject, &[])
+        .expect("apply nullary ctor fun");
     let claimed = s.declare_const("claimed", bv128.clone());
     let actual = s.declare_const("actual", bv128.clone());
     let has_claim = s.declare_const("has_claim", Sort::Bool);
@@ -216,6 +231,11 @@ fn repro_all_in_push() {
         r.result.result(),
         r.unknown_reason
     );
+    assert!(
+        r.result.result().is_unsat(),
+        "all-in-push datatype obligation must be UNSAT, got {:?}",
+        r.result.result()
+    );
     s.try_pop().unwrap();
 }
 
@@ -234,6 +254,11 @@ fn repro_incremental_base() {
         r.result.result(),
         r.unknown_reason
     );
+    assert!(
+        r.result.result().is_unsat(),
+        "incremental base datatype obligation must be UNSAT, got {:?}",
+        r.result.result()
+    );
 }
 
 #[test]
@@ -243,8 +268,18 @@ fn repro_assuming() {
     s.try_assert_term(body).unwrap();
     s.try_push().unwrap();
     s.try_assert_term(negated).unwrap();
-    let _ = s.check_sat_with_details();
+    let pushed = s.check_sat_with_details();
+    assert!(
+        pushed.result.result().is_unsat(),
+        "pushed datatype obligation must be UNSAT before assuming, got {:?}",
+        pushed.result.result()
+    );
     let fb = s.check_sat_assuming_with_details(&[negated]);
     eprintln!("ASSUMING = {:?}", fb.solve.result.result());
+    assert!(
+        fb.solve.result.result().is_unsat(),
+        "assuming datatype obligation must be UNSAT, got {:?}",
+        fb.solve.result.result()
+    );
     s.try_pop().unwrap();
 }

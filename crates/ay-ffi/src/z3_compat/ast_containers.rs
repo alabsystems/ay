@@ -25,9 +25,10 @@
 use std::ptr;
 
 use super::{
-    ast_to_term, cache_ast_map, cache_ast_vector, cache_string,
+    cache_ast_map, cache_ast_vector, cache_string, checked_ast_to_term,
     ensure_cross_context_translation_semantics, ffi_guard_ast, ffi_guard_const_ptr, ffi_guard_int,
-    ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, record_ast_sort, term_to_ast,
+    ffi_guard_ptr, ffi_guard_uint, ffi_guard_void, record_ast_sort, require_term_ast,
+    require_term_ast_or_return, require_term_asts_or_return, term_to_ast,
     transfer_cross_context_ffi_metadata, Z3Context, Z3_ast, Z3_ast_map, Z3_ast_vector, Z3_context,
     Z3_string, Z3_INVALID_ARG, Z3_OK,
 };
@@ -37,15 +38,16 @@ use std::os::raw::c_uint;
 /// Render one `Z3_ast` handle exactly as `Z3_ast_to_string` would, falling back
 /// to `?` for the null handle or an unformattable term. Shared by both the map
 /// and vector `to_string` renderers so their element text matches libz3's.
-fn render_ast(ctx: &Z3Context, a: Z3_ast) -> String {
+fn render_ast(ctx: &mut Z3Context, a: Z3_ast, operation: &str) -> Option<String> {
     if a == 0 {
-        return "?".to_string();
+        return Some("?".to_string());
     }
+    let term = require_term_ast(ctx, a, operation, "container element")?;
     let rendered = ctx
         .solver
-        .format_term_checked(ast_to_term(a))
+        .format_term_checked(term)
         .unwrap_or_else(|| "?".to_string());
-    super::ffi_surface_text(ctx, &rendered)
+    Some(super::ffi_surface_text(ctx, &rendered))
 }
 
 // ============================================================================
@@ -94,6 +96,7 @@ pub unsafe extern "C" fn Z3_ast_map_contains(c: Z3_context, m: Z3_ast_map, k: Z3
     // SAFETY: `ffi_guard_int` handles a null context and catches panics.
     unsafe {
         ffi_guard_int(c, 0, |ctx| {
+            let _term = require_term_ast_or_return!(ctx, k, "Z3_ast_map_contains", "map key", 0);
             ctx.last_error = Z3_OK;
             std::os::raw::c_int::from(present)
         }) != 0
@@ -114,15 +117,25 @@ pub unsafe extern "C" fn Z3_ast_map_find(c: Z3_context, m: Z3_ast_map, k: Z3_ast
     let value = unsafe { m.as_ref() }.and_then(|h| h.map.get(&k).copied());
     // SAFETY: `ffi_guard_ast` handles a null context and catches panics.
     unsafe {
-        ffi_guard_ast(c, |ctx| match value {
-            Some(v) => {
-                ctx.last_error = Z3_OK;
-                v
-            }
-            None => {
-                ctx.last_error = Z3_INVALID_ARG;
-                ctx.error_msg = Some("Z3_ast_map_find: key not present in map".to_string());
-                0
+        ffi_guard_ast(c, |ctx| {
+            let _key_term = require_term_ast_or_return!(ctx, k, "Z3_ast_map_find", "map key", 0);
+            match value {
+                Some(v) => {
+                    let _value_term = require_term_ast_or_return!(
+                        ctx,
+                        v,
+                        "Z3_ast_map_find",
+                        "stored map value",
+                        0
+                    );
+                    ctx.last_error = Z3_OK;
+                    v
+                }
+                None => {
+                    ctx.last_error = Z3_INVALID_ARG;
+                    ctx.error_msg = Some("Z3_ast_map_find: key not present in map".to_string());
+                    0
+                }
             }
         })
     }
@@ -142,6 +155,8 @@ pub unsafe extern "C" fn Z3_ast_map_insert(c: Z3_context, m: Z3_ast_map, k: Z3_a
     // so mutating `(*m)` does not alias the `&mut Z3Context` borrow.
     unsafe {
         ffi_guard_void(c, |ctx| {
+            let _key_term = require_term_ast_or_return!(ctx, k, "Z3_ast_map_insert", "map key");
+            let _value_term = require_term_ast_or_return!(ctx, v, "Z3_ast_map_insert", "map value");
             ctx.last_error = Z3_OK;
             (*m).insert(k, v);
         });
@@ -160,6 +175,7 @@ pub unsafe extern "C" fn Z3_ast_map_erase(c: Z3_context, m: Z3_ast_map, k: Z3_as
     // SAFETY: as in `Z3_ast_map_insert` — `(*m)` is a distinct, valid allocation.
     unsafe {
         ffi_guard_void(c, |ctx| {
+            let _key_term = require_term_ast_or_return!(ctx, k, "Z3_ast_map_erase", "map key");
             ctx.last_error = Z3_OK;
             (*m).erase(k);
         });
@@ -214,8 +230,11 @@ pub unsafe extern "C" fn Z3_ast_map_keys(c: Z3_context, m: Z3_ast_map) -> Z3_ast
     // SAFETY: `ffi_guard_ptr` handles a null context and catches panics.
     unsafe {
         ffi_guard_ptr(c, |ctx| {
+            let keys = keys.unwrap_or_default();
+            let _terms =
+                require_term_asts_or_return!(ctx, &keys, "Z3_ast_map_keys", ptr::null_mut());
             ctx.last_error = Z3_OK;
-            cache_ast_vector(ctx, keys.unwrap_or_default())
+            cache_ast_vector(ctx, keys)
         })
     }
 }
@@ -242,9 +261,15 @@ pub unsafe extern "C" fn Z3_ast_map_to_string(c: Z3_context, m: Z3_ast_map) -> Z
             if let Some(entries) = pairs {
                 for (k, v) in entries {
                     s.push_str("\n  (");
-                    s.push_str(&render_ast(ctx, k));
+                    let Some(key) = render_ast(ctx, k, "Z3_ast_map_to_string") else {
+                        return ptr::null();
+                    };
+                    s.push_str(&key);
                     s.push_str("\n   ");
-                    s.push_str(&render_ast(ctx, v));
+                    let Some(value) = render_ast(ctx, v, "Z3_ast_map_to_string") else {
+                        return ptr::null();
+                    };
+                    s.push_str(&value);
                     s.push(')');
                 }
             }
@@ -278,7 +303,10 @@ pub unsafe extern "C" fn Z3_ast_vector_to_string(c: Z3_context, v: Z3_ast_vector
             if let Some(items) = elems {
                 for a in items {
                     s.push_str("\n  ");
-                    s.push_str(&render_ast(ctx, a));
+                    let Some(rendered) = render_ast(ctx, a, "Z3_ast_vector_to_string") else {
+                        return ptr::null();
+                    };
+                    s.push_str(&rendered);
                 }
             }
             s.push(')');
@@ -319,8 +347,15 @@ pub unsafe extern "C" fn Z3_ast_vector_translate(
                 tgt.error_msg = Some("Z3_ast_vector_translate: null vector handle".to_string());
                 return ptr::null_mut();
             };
-            // Same context: the handles are already valid here — copy directly.
+            // Same context: authenticate before copying so translation cannot
+            // launder colliding handles from another context.
             if s == t {
+                let _terms = require_term_asts_or_return!(
+                    tgt,
+                    &elems,
+                    "Z3_ast_vector_translate",
+                    ptr::null_mut()
+                );
                 tgt.last_error = Z3_OK;
                 return cache_ast_vector(tgt, elems);
             }
@@ -332,10 +367,21 @@ pub unsafe extern "C" fn Z3_ast_vector_translate(
                 tgt.error_msg = Some("Z3_ast_vector_translate: null source context".to_string());
                 return ptr::null_mut();
             };
+            let Some(src_terms) = elems
+                .iter()
+                .map(|&ast| checked_ast_to_term(src, ast))
+                .collect::<Option<Vec<Term>>>()
+            else {
+                tgt.last_error = Z3_INVALID_ARG;
+                tgt.error_msg = Some(
+                    "Z3_ast_vector_translate: vector contains an invalid term or one from a different source context"
+                        .to_string(),
+                );
+                return ptr::null_mut();
+            };
             if !ensure_cross_context_translation_semantics(src, tgt, "Z3_ast_vector_translate") {
                 return ptr::null_mut();
             }
-            let src_terms: Vec<Term> = elems.iter().map(|&a| ast_to_term(a)).collect();
             let new_terms = tgt.solver.translate_terms_from(&src.solver, &src_terms);
             if !transfer_cross_context_ffi_metadata(
                 src,
@@ -346,7 +392,7 @@ pub unsafe extern "C" fn Z3_ast_vector_translate(
             ) {
                 return ptr::null_mut();
             }
-            let new_asts: Vec<Z3_ast> = new_terms.iter().map(|&t| term_to_ast(t)).collect();
+            let new_asts: Vec<Z3_ast> = new_terms.iter().map(|&t| term_to_ast(tgt, t)).collect();
             for ((&source_term, &_term), &ast) in src_terms.iter().zip(&new_terms).zip(&new_asts) {
                 let sort = src.solver.term_sort(source_term);
                 record_ast_sort(tgt, ast, sort);

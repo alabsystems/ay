@@ -119,6 +119,134 @@ fn plan_eq_refuses_to_fabricate_an_absent_defining_equality() {
     );
 }
 
+#[test]
+fn plan_eq_bridges_pinned_concat_to_folded_literal() {
+    let mut exec = Executor::new();
+    let terms = &mut exec.ctx.terms;
+    let op = terms.mk_var("op", Sort::bitvec(8));
+    let lhs = terms.mk_var("lhs", Sort::bitvec(8));
+    let rhs = terms.mk_var("rhs", Sort::bitvec(8));
+    let one = terms.mk_bitvec(BigInt::from(1_u8), 8);
+    let sixty_three = terms.mk_bitvec(BigInt::from(63_u8), 8);
+    let sixty_four = terms.mk_bitvec(BigInt::from(64_u8), 8);
+    let inner = terms.mk_app(Symbol::named("concat"), [lhs, rhs], Sort::bitvec(16));
+    let symbolic = terms.mk_app(Symbol::named("concat"), [op, inner], Sort::bitvec(24));
+    let folded = terms.mk_bitvec(BigInt::from(0x013f40_u32), 24);
+    let pin_op = terms.mk_app(Symbol::named("="), [op, one], Sort::Bool);
+    let pin_lhs = terms.mk_app(Symbol::named("="), [lhs, sixty_three], Sort::Bool);
+    let pin_rhs = terms.mk_app(Symbol::named("="), [rhs, sixty_four], Sort::Bool);
+    let originals = vec![pin_op, pin_lhs, pin_rhs];
+
+    let mut budget = EQ_PLAN_BUDGET;
+    let plan = exec
+        .plan_eq(symbolic, folded, &originals, 0, &mut budget)
+        .expect("authored component pins must certify the folded concat");
+    assert!(
+        plan.uses_ground_evaluate(),
+        "folded concat bridge must use the externally checkable evaluate rule"
+    );
+    let mut assumed = Vec::new();
+    plan.collect_assumed(&mut assumed);
+    assert_eq!(assumed.len(), originals.len());
+    assert!(originals.iter().all(|term| assumed.contains(term)));
+
+    let mut proof = Proof::new();
+    let assume_ids: HashMap<TermId, ProofId> = originals
+        .iter()
+        .map(|&term| (term, proof.add_assume(term, None)))
+        .collect();
+    let negated_goal = exec.ctx.terms.mk_not_raw(plan.eq);
+    let negated_goal_assume = proof.add_assume(negated_goal, None);
+    let goal_unit = Executor::emit_eq_plan(&mut proof, &plan, &assume_ids)
+        .expect("planned concat bridge must emit");
+    proof.add_resolution(Vec::new(), plan.eq, goal_unit, negated_goal_assume);
+    ay_proof::check_proof_strict(&proof, &exec.ctx.terms)
+        .expect("every emitted concat bridge step must pass the strict checker");
+}
+
+#[test]
+fn plan_eq_uses_direct_evaluate_for_an_already_ground_concat() {
+    let mut exec = Executor::new();
+    let terms = &mut exec.ctx.terms;
+    let op = terms.mk_bitvec(BigInt::from(1_u8), 8);
+    let lhs = terms.mk_bitvec(BigInt::from(63_u8), 8);
+    let rhs = terms.mk_bitvec(BigInt::from(64_u8), 8);
+    let inner = terms.mk_app(Symbol::named("concat"), [lhs, rhs], Sort::bitvec(16));
+    let ground = terms.mk_app(Symbol::named("concat"), [op, inner], Sort::bitvec(24));
+    let folded = terms.mk_bitvec(BigInt::from(0x013f40_u32), 24);
+
+    let mut budget = EQ_PLAN_BUDGET;
+    let plan = exec
+        .plan_eq(ground, folded, &[], 0, &mut budget)
+        .expect("the exact ground concat evaluation needs no authored equality");
+    assert!(
+        matches!(plan.kind, EqPlanKind::BvGroundEvaluate),
+        "a ground concat must not be wrapped in a redundant transitivity step"
+    );
+    let mut assumed = Vec::new();
+    plan.collect_assumed(&mut assumed);
+    assert!(
+        assumed.is_empty(),
+        "closed evaluation must not invent an authored premise"
+    );
+
+    let mut proof = Proof::new();
+    let negated_goal = exec.ctx.terms.mk_not_raw(plan.eq);
+    let negated_goal_assume = proof.add_assume(negated_goal, None);
+    let goal_unit = Executor::emit_eq_plan(&mut proof, &plan, &HashMap::default())
+        .expect("direct ground evaluation must emit");
+    proof.add_resolution(Vec::new(), plan.eq, goal_unit, negated_goal_assume);
+    ay_proof::check_proof_strict(&proof, &exec.ctx.terms)
+        .expect("direct evaluate plus resolution must pass the strict checker");
+}
+
+#[test]
+fn plan_eq_refuses_folded_concat_without_all_pins() {
+    let mut exec = Executor::new();
+    let terms = &mut exec.ctx.terms;
+    let op = terms.mk_var("op", Sort::bitvec(8));
+    let lhs = terms.mk_var("lhs", Sort::bitvec(8));
+    let rhs = terms.mk_var("rhs", Sort::bitvec(8));
+    let one = terms.mk_bitvec(BigInt::from(1_u8), 8);
+    let sixty_three = terms.mk_bitvec(BigInt::from(63_u8), 8);
+    let inner = terms.mk_app(Symbol::named("concat"), [lhs, rhs], Sort::bitvec(16));
+    let symbolic = terms.mk_app(Symbol::named("concat"), [op, inner], Sort::bitvec(24));
+    let folded = terms.mk_bitvec(BigInt::from(0x013f40_u32), 24);
+    let pin_op = terms.mk_app(Symbol::named("="), [op, one], Sort::Bool);
+    let pin_lhs = terms.mk_app(Symbol::named("="), [lhs, sixty_three], Sort::Bool);
+    // `rhs = #x40` is deliberately absent: no closed BV lemma may replace an
+    // authored premise that the problem did not provide.
+    let originals = vec![pin_op, pin_lhs];
+
+    let mut budget = EQ_PLAN_BUDGET;
+    assert!(
+        exec.plan_eq(symbolic, folded, &originals, 0, &mut budget)
+            .is_none(),
+        "the folded concat bridge must fail closed when one pin is missing"
+    );
+}
+
+#[test]
+fn plan_eq_refuses_folded_concat_above_64_bits() {
+    let mut exec = Executor::new();
+    let terms = &mut exec.ctx.terms;
+    let high = terms.mk_var("high", Sort::bitvec(1));
+    let low = terms.mk_var("low", Sort::bitvec(64));
+    let high_value = terms.mk_bitvec(BigInt::from(1_u8), 1);
+    let low_value = terms.mk_bitvec(BigInt::from(0_u8), 64);
+    let symbolic = terms.mk_app(Symbol::named("concat"), [high, low], Sort::bitvec(65));
+    let folded = terms.mk_bitvec(BigInt::from(1_u8) << 64_u32, 65);
+    let pin_high = terms.mk_app(Symbol::named("="), [high, high_value], Sort::Bool);
+    let pin_low = terms.mk_app(Symbol::named("="), [low, low_value], Sort::Bool);
+
+    let mut budget = EQ_PLAN_BUDGET;
+    assert!(
+        exec.plan_eq(symbolic, folded, &[pin_high, pin_low], 0, &mut budget)
+            .is_none(),
+        "concat planning must fail before splitting a BV literal above the exact u64 envelope"
+    );
+}
+
 /// NEGATIVE: nothing at all is authored. Even the first link must not appear.
 #[test]
 fn plan_eq_refuses_a_chain_with_no_authored_definitions() {
@@ -192,6 +320,43 @@ fn plan_eq_respects_its_work_budget() {
     assert!(exec
         .plan_eq(chain.b2, chain.expanded, &originals, 0, &mut budget)
         .is_some());
+}
+
+/// The bridge budget is total for the GOAL, not reset for every same-head
+/// authored candidate. With one node, the bad first candidate consumes the
+/// allowance and the later derivable candidate must not receive a fresh one.
+#[test]
+fn substitution_bridge_budget_spans_all_source_candidates() {
+    let mut exec = Executor::new();
+    let sort = Sort::Uninterpreted("T".to_string());
+    let (bad_source, good_source, definition, goal) = {
+        let terms = &mut exec.ctx.terms;
+        let x = terms.mk_var("x", sort.clone());
+        let a = terms.mk_var("a", sort.clone());
+        let b = terms.mk_var("b", sort);
+        let bad_source = terms.mk_app(Symbol::named("P"), [x], Sort::Bool);
+        let good_source = terms.mk_app(Symbol::named("P"), [a], Sort::Bool);
+        let definition = terms.mk_app(Symbol::named("="), [a, b], Sort::Bool);
+        let goal = terms.mk_app(Symbol::named("P"), [b], Sort::Bool);
+        (bad_source, good_source, definition, goal)
+    };
+    let originals = vec![bad_source, good_source, definition];
+
+    let mut one_node = 1;
+    assert!(
+        exec.plan_substitution_bridge_with_budget(goal, &originals, &mut one_node)
+            .is_none(),
+        "a failed source candidate must not reset the goal's work budget"
+    );
+    assert_eq!(one_node, 0);
+
+    let mut two_nodes = 2;
+    assert!(
+        exec.plan_substitution_bridge_with_budget(goal, &originals, &mut two_nodes)
+            .is_some(),
+        "the later authored source is derivable when the total budget permits it"
+    );
+    assert_eq!(two_nodes, 0);
 }
 
 /// `reachable_step_mask` must agree with the #8821 gate's own cone walk: the
