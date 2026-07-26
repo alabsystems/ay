@@ -64,7 +64,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/ay"
@@ -285,62 +285,62 @@ pollster = "0.3"
 wgpu = { version = "0.19", default-features = false, features = ["wgsl", "dx12", "metal"] }
 
 # Internal crates
-ay = { version = "0.3.0", path = "crates/ay" }
-ay-core = { version = "0.3.0", path = "crates/ay-core" }
-ay-count = { version = "0.3.0", path = "crates/ay-count" }
-ay-model-check = { version = "0.3.0", path = "crates/ay-model-check" }
-ay-sat = { version = "0.3.0", path = "crates/ay-sat", default-features = false }
-ay-test-support = { version = "0.3.0", path = "crates/ay-test-support" }
-ay-sat-congruence-core = { version = "0.3.0", path = "crates/ay-sat-congruence-core" }
-ay-dpll = { version = "0.3.0", path = "crates/ay-dpll", default-features = false, features = ["proof-checker", "jit"] }
-ay-frontend = { version = "0.3.0", path = "crates/ay-frontend" }
-ay-proof = { version = "0.3.0", path = "crates/ay-proof" }
-ay-tla-bridge = { version = "0.3.0", path = "crates/ay-tla-bridge" }
-ay-euf = { version = "0.3.0", path = "crates/ay-theories/euf" }
-ay-lra = { version = "0.3.0", path = "crates/ay-theories/lra", default-features = false }
-ay-lia = { version = "0.3.0", path = "crates/ay-theories/lia" }
-ay-bv = { version = "0.3.0", path = "crates/ay-theories/bv" }
-ay-arrays = { version = "0.3.0", path = "crates/ay-theories/arrays" }
-ay-seq = { version = "0.3.0", path = "crates/ay-theories/seq" }
-ay-set = { version = "0.3.0", path = "crates/ay-theories/set" }
-ay-multiset = { version = "0.3.0", path = "crates/ay-theories/multiset" }
-ay-map = { version = "0.3.0", path = "crates/ay-theories/map" }
-ay-strings = { version = "0.3.0", path = "crates/ay-theories/strings" }
-ay-fp = { version = "0.3.0", path = "crates/ay-theories/fp" }
-ay-dt = { version = "0.3.0", path = "crates/ay-theories/dt" }
-ay-nia = { version = "0.3.0", path = "crates/ay-theories/nia" }
-ay-nra = { version = "0.3.0", path = "crates/ay-theories/nra" }
-ay-nonlinear-common = { version = "0.3.0", path = "crates/ay-theories/nonlinear-common" }
-ay-intsat = { version = "0.3.0", path = "crates/ay-theories/intsat" }
-ay-diff-logic = { version = "0.3.0", path = "crates/ay-theories/diff-logic" }
-ay-chc = { version = "0.3.0", path = "crates/ay-chc" }
-ay-dispatch = { version = "0.3.0", path = "crates/ay-dispatch" }
-ay-qbf = { version = "0.3.0", path = "crates/ay-qbf" }
-ay-maxsat = { version = "0.3.0", path = "crates/ay-maxsat" }
-ay-pb = { version = "0.3.0", path = "crates/ay-pb" }
-ay-lp = { version = "0.3.0", path = "crates/ay-lp" }
-ay-milp = { version = "0.3.0", path = "crates/ay-milp" }
-ay-allsat = { version = "0.3.0", path = "crates/ay-allsat" }
-ay-proof-complexity = { version = "0.3.0", path = "crates/ay-proof-complexity" }
-ay-lean-bridge = { version = "0.3.0", path = "crates/ay-lean-bridge" }
-ay-xor = { version = "0.3.0", path = "crates/ay-xor" }
-ay-translate = { version = "0.3.0", path = "crates/ay-translate" }
-ay-bindings = { version = "0.3.0", path = "crates/ay-bindings" }
-ay-drat-check = { version = "0.3.0", path = "crates/ay-drat-check" }
-ay-lrat-check = { version = "0.3.0", path = "crates/ay-lrat-check" }
-ay-proof-common = { version = "0.3.0", path = "crates/ay-proof-common" }
-ay-flatzinc-parser = { version = "0.3.0", path = "crates/ay-flatzinc-parser" }
-ay-flatzinc-smt = { version = "0.3.0", path = "crates/ay-flatzinc-smt" }
-ay-fzn2smt = { version = "0.3.0", path = "crates/ay-fzn2smt" }
-ay-cp = { version = "0.3.0", path = "crates/ay-cp" }
-ay-search = { version = "0.3.0", path = "crates/ay-search" }
-ay-sys = { version = "0.3.0", path = "crates/ay-sys" }
-ay-bench = { version = "0.3.0", path = "crates/ay-bench" }
-ay-bisect = { version = "0.3.0", path = "crates/ay-bisect" }
-ay-prefetch = { version = "0.3.0", path = "crates/ay-prefetch" }
-ay-jit = { version = "0.3.0", path = "crates/ay-jit" }
-ay-replay = { version = "0.3.0", path = "crates/ay-replay" }
-ay-approx-bcp = { version = "0.3.0", path = "crates/ay-approx-bcp" }
+ay = { version = "0.4.0", path = "crates/ay" }
+ay-core = { version = "0.4.0", path = "crates/ay-core" }
+ay-count = { version = "0.4.0", path = "crates/ay-count" }
+ay-model-check = { version = "0.4.0", path = "crates/ay-model-check" }
+ay-sat = { version = "0.4.0", path = "crates/ay-sat", default-features = false }
+ay-test-support = { version = "0.4.0", path = "crates/ay-test-support" }
+ay-sat-congruence-core = { version = "0.4.0", path = "crates/ay-sat-congruence-core" }
+ay-dpll = { version = "0.4.0", path = "crates/ay-dpll", default-features = false, features = ["proof-checker", "jit"] }
+ay-frontend = { version = "0.4.0", path = "crates/ay-frontend" }
+ay-proof = { version = "0.4.0", path = "crates/ay-proof" }
+ay-tla-bridge = { version = "0.4.0", path = "crates/ay-tla-bridge" }
+ay-euf = { version = "0.4.0", path = "crates/ay-theories/euf" }
+ay-lra = { version = "0.4.0", path = "crates/ay-theories/lra", default-features = false }
+ay-lia = { version = "0.4.0", path = "crates/ay-theories/lia" }
+ay-bv = { version = "0.4.0", path = "crates/ay-theories/bv" }
+ay-arrays = { version = "0.4.0", path = "crates/ay-theories/arrays" }
+ay-seq = { version = "0.4.0", path = "crates/ay-theories/seq" }
+ay-set = { version = "0.4.0", path = "crates/ay-theories/set" }
+ay-multiset = { version = "0.4.0", path = "crates/ay-theories/multiset" }
+ay-map = { version = "0.4.0", path = "crates/ay-theories/map" }
+ay-strings = { version = "0.4.0", path = "crates/ay-theories/strings" }
+ay-fp = { version = "0.4.0", path = "crates/ay-theories/fp" }
+ay-dt = { version = "0.4.0", path = "crates/ay-theories/dt" }
+ay-nia = { version = "0.4.0", path = "crates/ay-theories/nia" }
+ay-nra = { version = "0.4.0", path = "crates/ay-theories/nra" }
+ay-nonlinear-common = { version = "0.4.0", path = "crates/ay-theories/nonlinear-common" }
+ay-intsat = { version = "0.4.0", path = "crates/ay-theories/intsat" }
+ay-diff-logic = { version = "0.4.0", path = "crates/ay-theories/diff-logic" }
+ay-chc = { version = "0.4.0", path = "crates/ay-chc" }
+ay-dispatch = { version = "0.4.0", path = "crates/ay-dispatch" }
+ay-qbf = { version = "0.4.0", path = "crates/ay-qbf" }
+ay-maxsat = { version = "0.4.0", path = "crates/ay-maxsat" }
+ay-pb = { version = "0.4.0", path = "crates/ay-pb" }
+ay-lp = { version = "0.4.0", path = "crates/ay-lp" }
+ay-milp = { version = "0.4.0", path = "crates/ay-milp" }
+ay-allsat = { version = "0.4.0", path = "crates/ay-allsat" }
+ay-proof-complexity = { version = "0.4.0", path = "crates/ay-proof-complexity" }
+ay-lean-bridge = { version = "0.4.0", path = "crates/ay-lean-bridge" }
+ay-xor = { version = "0.4.0", path = "crates/ay-xor" }
+ay-translate = { version = "0.4.0", path = "crates/ay-translate" }
+ay-bindings = { version = "0.4.0", path = "crates/ay-bindings" }
+ay-drat-check = { version = "0.4.0", path = "crates/ay-drat-check" }
+ay-lrat-check = { version = "0.4.0", path = "crates/ay-lrat-check" }
+ay-proof-common = { version = "0.4.0", path = "crates/ay-proof-common" }
+ay-flatzinc-parser = { version = "0.4.0", path = "crates/ay-flatzinc-parser" }
+ay-flatzinc-smt = { version = "0.4.0", path = "crates/ay-flatzinc-smt" }
+ay-fzn2smt = { version = "0.4.0", path = "crates/ay-fzn2smt" }
+ay-cp = { version = "0.4.0", path = "crates/ay-cp" }
+ay-search = { version = "0.4.0", path = "crates/ay-search" }
+ay-sys = { version = "0.4.0", path = "crates/ay-sys" }
+ay-bench = { version = "0.4.0", path = "crates/ay-bench" }
+ay-bisect = { version = "0.4.0", path = "crates/ay-bisect" }
+ay-prefetch = { version = "0.4.0", path = "crates/ay-prefetch" }
+ay-jit = { version = "0.4.0", path = "crates/ay-jit" }
+ay-replay = { version = "0.4.0", path = "crates/ay-replay" }
+ay-approx-bcp = { version = "0.4.0", path = "crates/ay-approx-bcp" }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
