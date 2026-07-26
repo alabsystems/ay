@@ -14,8 +14,9 @@
 //! present in the original clause's own constraint, so ground unit propagation
 //! recovers them: repeatedly bind any variable that some equality conjunct
 //! determines from already-bound values. Arrays that survive only as reads get
-//! reassembled from their ground `select` pins. Whatever remains genuinely
-//! unconstrained is filled with a sort default.
+//! reassembled from their ground `select` pins. A projected integer constrained
+//! only by ground affine bounds is placed at a satisfying extremum. Whatever
+//! remains genuinely unconstrained is filled with a sort default.
 //!
 //! # Soundness
 //!
@@ -28,8 +29,10 @@
 use super::{eval_ground, is_concrete};
 use crate::clause::HornClause;
 use crate::smt::SmtValue;
-use crate::{ChcExpr, ChcOp, ChcSort};
+use crate::{ChcExpr, ChcOp, ChcSort, ChcVar};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
+use num_bigint::BigInt;
+use num_integer::Integer;
 
 /// Maximum unit-propagation rounds before giving up.
 ///
@@ -105,16 +108,17 @@ pub(crate) fn complete_env_for_clause_with_fallback(
         .unwrap_or_default();
 
     propagate(&conjuncts, env);
-    reconstruct_arrays(&conjuncts, clause, env);
+    reconstruct_arrays(&conjuncts, env);
     propagate(&conjuncts, env);
 
     // Anything still unbound is determined by no equality of this clause
     // (typically a sliced-away dead parameter, a value the transform proved
     // irrelevant, or an existential the clause touches only through an ITE, a
-    // tester or a disjunction). Four sources fill those in, in DECREASING
+    // tester or a disjunction). Five sources fill those in, in DECREASING
     // order of authority: the witness the search actually used, a value the
-    // clause's own testers force, a bounded per-clause solve, and finally an
-    // arbitrary sort default. The validator decides whether the result was
+    // clause's own testers force, a satisfying extremum forced by ground affine
+    // integer bounds, a bounded per-clause solve for the residuals, and finally
+    // an arbitrary sort default. The validator decides whether the result was
     // acceptable, so provenance affects completeness only, never soundness.
     //
     // CORRECTION OF A PRIOR RECORD: a bounded solve here was tried before and
@@ -131,37 +135,72 @@ pub(crate) fn complete_env_for_clause_with_fallback(
     // few-ms remainder no matter what it requested. See `super::witness` for
     // the mechanism and the deadline-scope fix.
     //
-    // First expose the structure hiding behind determined ITE branches, then
-    // let the ordinary propagation loop consume what that reveals. Every
-    // rewrite is an identity under the current environment; see
-    // `simplify_determined_ites`.
-    let simplified = simplify_determined_ites_fixpoint(&conjuncts, env);
+    // First exhaust exact inexpensive completion. Besides avoiding needless
+    // solver calls, the fixpoint lets a carried array/index value ground an
+    // affine local bound before we decide which variables are true residuals.
+    let mut filled_names: Vec<String> = Vec::new();
+    deterministic_complete_fixpoint(clause, &conjuncts, env, fallback, &mut filled_names);
 
-    // The bounded solve fills ONLY what the carried witness cannot. Solving for
-    // a variable the search already pinned would replace a value that is
-    // globally consistent BY CONSTRUCTION (it is the model the counterexample
-    // was found in) with a merely locally-satisfying one — and it was measured
-    // costing 4.6s of wasted solving on the archetype while contributing
-    // nothing. So exclude anything `fallback` covers; the solve remains the
-    // last resort before sort defaults for genuinely uncarried variables.
+    // The bounded solve fills ONLY what the carried witness and deterministic
+    // rules cannot. Solving for a variable the search already pinned would
+    // replace a value that is globally consistent BY CONSTRUCTION (it is the
+    // model the counterexample was found in) with a merely locally-satisfying
+    // one. Asking SMT to rediscover an affine extremum likewise wastes the
+    // per-step budget on the Solidity array shards. So exclude anything
+    // `fallback` covers and solve only the true residuals.
     let unbound: Vec<crate::ChcVar> = clause_vars(clause)
         .into_iter()
         .filter(|var| !env.contains_key(&var.name) && !fallback.contains_key(&var.name))
         .collect();
+    if super::ground_backtranslation_debug() && !unbound.is_empty() {
+        let simplified = simplify_determined_ites_fixpoint(&conjuncts, env);
+        let summary: Vec<String> = unbound
+            .iter()
+            .take(32)
+            .map(|var| {
+                let disposition = match complete_int_from_ground_bounds(&simplified, var, env) {
+                    IntBoundCompletion::NotApplicable => "not-applicable",
+                    IntBoundCompletion::Value(_) => "value",
+                    IntBoundCompletion::Reject => "reject",
+                };
+                format!("{}:{:?}:{disposition}", var.name, var.sort)
+            })
+            .collect();
+        super::log_ground_translation_detail(format_args!(
+            "complete: {} residual vars before SMT: {summary:?}",
+            unbound.len()
+        ));
+        for var in unbound.iter().take(32) {
+            let occurrences: Vec<String> = simplified
+                .iter()
+                .filter(|conjunct| conjunct.vars().contains(var))
+                .take(3)
+                .map(|conjunct| bounded_expr_debug(conjunct, 480))
+                .collect();
+            super::log_ground_translation_detail(format_args!(
+                "complete: residual {} occurs in {} shown conjunct(s): {occurrences:?}",
+                var.name,
+                occurrences.len()
+            ));
+        }
+    }
     if !unbound.is_empty() {
         super::witness::witness_unbound_vars(clause, &conjuncts, &unbound, env);
         propagate(&conjuncts, env);
+        reconstruct_arrays(&conjuncts, env);
+        deterministic_complete_fixpoint(clause, &conjuncts, env, fallback, &mut filled_names);
     }
 
+    let simplified = simplify_determined_ites_fixpoint(&conjuncts, env);
     let mut defaulted = false;
-    let mut defaulted_names: Vec<String> = Vec::new();
     for var in clause_vars(clause) {
         if env.contains_key(&var.name) {
             continue;
         }
         // 1. The witness the search actually used, if it reached us (Part 1).
         // 2. Failing that, a value the clause's own testers FORCE (Part 2).
-        // 3. Failing that, an arbitrary sort default, as before.
+        // 3. Failing that, satisfy ground affine integer bounds exactly.
+        // 4. Failing that, an arbitrary sort default, as before.
         let (value, source) = match fallback
             .get(&var.name)
             .filter(|value| is_concrete(value) && value_matches_sort(value, &var.sort))
@@ -175,24 +214,28 @@ pub(crate) fn complete_env_for_clause_with_fallback(
                 8,
             ) {
                 Some(value) => (Some(value), "tester"),
-                None => (sort_default(&var.sort), "default"),
+                None => match complete_int_from_ground_bounds(&simplified, &var, env) {
+                    IntBoundCompletion::NotApplicable => (sort_default(&var.sort), "default"),
+                    IntBoundCompletion::Value(value) => (Some(value), "bound"),
+                    IntBoundCompletion::Reject => return false,
+                },
             },
         };
         let Some(value) = value else {
             return false;
         };
         if super::ground_backtranslation_debug() {
-            defaulted_names.push(format!("{}<-{source}", var.name));
+            filled_names.push(format!("{}<-{source}", var.name));
         }
         env.insert(var.name.clone(), value);
         defaulted = true;
     }
-    if !defaulted_names.is_empty() {
+    if !filled_names.is_empty() {
         super::log_ground_translation_detail(format_args!(
             "complete: {} clause vars had no determining equality; filled from \
-             witness/tester/sort-default: {:?}",
-            defaulted_names.len(),
-            &defaulted_names[..defaulted_names.len().min(10)]
+             witness/tester/bound/sort-default: {:?}",
+            filled_names.len(),
+            &filled_names[..filled_names.len().min(10)]
         ));
     }
     if defaulted {
@@ -202,6 +245,463 @@ pub(crate) fn complete_env_for_clause_with_fallback(
     clause_vars(clause)
         .iter()
         .all(|var| env.contains_key(&var.name))
+}
+
+fn bounded_expr_debug(expr: &ChcExpr, max_chars: usize) -> String {
+    let rendered = format!("{expr:?}");
+    let Some((cut, _)) = rendered.char_indices().nth(max_chars) else {
+        return rendered;
+    };
+    format!("{}…", &rendered[..cut])
+}
+
+enum IntBoundCompletion {
+    /// The variable is not an integer constrained by any conjunct.
+    NotApplicable,
+    /// A concrete satisfying extremal value.
+    Value(SmtValue),
+    /// The variable is mentioned, but its bounds are symbolic, ambiguous, or
+    /// inconsistent. Never replace that uncertainty with a sort default.
+    Reject,
+}
+
+enum GroundIntBound {
+    Lower(BigInt),
+    Upper(BigInt),
+}
+
+/// Apply exact, inexpensive completion rules until no new binding appears.
+///
+/// This deliberately runs before the bounded SMT witness solve. In particular,
+/// local-variable elimination commonly projects an affine one-sided bound such
+/// as `0 <= (select table i) + 2*x`; once `table` and `i` are ground, choosing
+/// the integer extremum is arithmetic, not a reason to spend the whole clause
+/// solve budget. A rejected or not-yet-ground rule simply leaves the variable
+/// for SMT. Full original-clause validation remains the trust anchor.
+fn deterministic_complete_fixpoint(
+    clause: &HornClause,
+    conjuncts: &[ChcExpr],
+    env: &mut FxHashMap<String, SmtValue>,
+    fallback: &FxHashMap<String, SmtValue>,
+    filled_names: &mut Vec<String>,
+) {
+    for _ in 0..MAX_ROUNDS {
+        let before = env.len();
+        let simplified = simplify_determined_ites_fixpoint(conjuncts, env);
+        for var in clause_vars(clause) {
+            if env.contains_key(&var.name) {
+                continue;
+            }
+            let candidate = fallback
+                .get(&var.name)
+                .filter(|value| is_concrete(value) && value_matches_sort(value, &var.sort))
+                .map(|value| (value.clone(), "witness"))
+                .or_else(|| {
+                    tester_driven_value(&simplified, &ChcExpr::var(var.clone()), &var.sort, env, 8)
+                        .map(|value| (value, "tester"))
+                })
+                .or_else(
+                    || match complete_int_from_ground_bounds(&simplified, &var, env) {
+                        IntBoundCompletion::Value(value) => Some((value, "bound")),
+                        IntBoundCompletion::NotApplicable | IntBoundCompletion::Reject => None,
+                    },
+                );
+            let Some((value, source)) = candidate else {
+                continue;
+            };
+            if super::ground_backtranslation_debug() {
+                filled_names.push(format!("{}<-{source}", var.name));
+            }
+            env.insert(var.name.clone(), value);
+        }
+        complete_int_alias_classes(&simplified, clause, env, filled_names);
+        propagate(conjuncts, env);
+        reconstruct_arrays(conjuncts, env);
+        propagate(conjuncts, env);
+        if env.len() == before {
+            break;
+        }
+    }
+}
+
+/// Complete connected classes of unbound integer variables equated by bare
+/// aliases, for example `x = y ∧ 0 <= x ∧ x <= 255`.
+///
+/// Per-variable completion must reject that shape: while `x` and `y` are both
+/// unknown, the equality is a non-bound occurrence and neither variable alone
+/// has a justified value. As a CLASS, however, the equality says that both
+/// names denote one integer. Replace every class member by one representative,
+/// ignore only the alias equalities that become tautologies, and require every
+/// other occurrence to be an exact ground affine bound. The intersection then
+/// supplies one value for every member.
+///
+/// This is the shape produced by Solidity preprocessing: eleven independent
+/// alias pairs survive in the richer pre-LVE clause while their bounded
+/// representative was projected out. Binding the class before propagation
+/// avoids a large mixed array/arithmetic SMT query. Any unsupported occurrence,
+/// symbolic bound, or empty intersection leaves the whole class untouched for
+/// the ordinary fail-closed SMT/validation path.
+fn complete_int_alias_classes(
+    conjuncts: &[ChcExpr],
+    clause: &HornClause,
+    env: &mut FxHashMap<String, SmtValue>,
+    filled_names: &mut Vec<String>,
+) {
+    fn find(parent: &mut [usize], index: usize) -> usize {
+        let mut root = index;
+        while parent[root] != root {
+            root = parent[root];
+        }
+        let mut current = index;
+        while parent[current] != current {
+            let next = parent[current];
+            parent[current] = root;
+            current = next;
+        }
+        root
+    }
+
+    fn union(parent: &mut [usize], left: usize, right: usize) {
+        let left = find(parent, left);
+        let right = find(parent, right);
+        if left != right {
+            parent[right] = left;
+        }
+    }
+
+    fn bare_int_alias(conjunct: &ChcExpr) -> Option<(&ChcVar, &ChcVar)> {
+        let ChcExpr::Op(ChcOp::Eq, args) = conjunct else {
+            return None;
+        };
+        let [left, right] = args.as_slice() else {
+            return None;
+        };
+        let (ChcExpr::Var(left), ChcExpr::Var(right)) = (left.as_ref(), right.as_ref()) else {
+            return None;
+        };
+        (left.sort == ChcSort::Int && right.sort == ChcSort::Int).then_some((left, right))
+    }
+
+    let vars: Vec<ChcVar> = clause_vars(clause)
+        .into_iter()
+        .filter(|var| var.sort == ChcSort::Int && !env.contains_key(&var.name))
+        .collect();
+    if vars.len() < 2 {
+        return;
+    }
+    let indices: FxHashMap<String, usize> = vars
+        .iter()
+        .enumerate()
+        .map(|(index, var)| (var.name.clone(), index))
+        .collect();
+    let mut parent: Vec<usize> = (0..vars.len()).collect();
+    for conjunct in conjuncts {
+        let Some((left, right)) = bare_int_alias(conjunct) else {
+            continue;
+        };
+        let (Some(&left), Some(&right)) = (indices.get(&left.name), indices.get(&right.name))
+        else {
+            continue;
+        };
+        union(&mut parent, left, right);
+    }
+
+    let mut classes: FxHashMap<usize, Vec<ChcVar>> = FxHashMap::default();
+    for (index, var) in vars.into_iter().enumerate() {
+        let root = find(&mut parent, index);
+        classes.entry(root).or_default().push(var);
+    }
+    for mut members in classes.into_values().filter(|members| members.len() > 1) {
+        members.sort_by(|left, right| left.name.cmp(&right.name));
+        let representative = members[0].clone();
+        let substitutions: Vec<(ChcVar, ChcExpr)> = members
+            .iter()
+            .skip(1)
+            .cloned()
+            .map(|var| (var, ChcExpr::var(representative.clone())))
+            .collect();
+        let mut lower: Option<BigInt> = None;
+        let mut upper: Option<BigInt> = None;
+        let mut saw_bound = false;
+        let mut complete = true;
+
+        for conjunct in conjuncts {
+            let conjunct_vars = conjunct.vars();
+            if !members.iter().any(|member| conjunct_vars.contains(member)) {
+                continue;
+            }
+            if bare_int_alias(conjunct)
+                .is_some_and(|(left, right)| members.contains(left) && members.contains(right))
+            {
+                continue;
+            }
+            let rewritten = conjunct.substitute(&substitutions);
+            let Some(bound) = ground_int_bound(&rewritten, &representative, env) else {
+                complete = false;
+                break;
+            };
+            saw_bound = true;
+            match bound {
+                GroundIntBound::Lower(value) => {
+                    if lower.as_ref().is_none_or(|current| value > *current) {
+                        lower = Some(value);
+                    }
+                }
+                GroundIntBound::Upper(value) => {
+                    if upper.as_ref().is_none_or(|current| value < *current) {
+                        upper = Some(value);
+                    }
+                }
+            }
+        }
+
+        if !complete
+            || !saw_bound
+            || lower
+                .as_ref()
+                .zip(upper.as_ref())
+                .is_some_and(|(lo, hi)| lo > hi)
+        {
+            continue;
+        }
+        let Some(value) = lower.or(upper).map(SmtValue::int_from_bigint) else {
+            continue;
+        };
+        for member in members {
+            if super::ground_backtranslation_debug() {
+                filled_names.push(format!("{}<-alias-bound", member.name));
+            }
+            env.insert(member.name, value.clone());
+        }
+    }
+}
+
+/// Choose a satisfying value for an otherwise-unbound integer constrained by
+/// ground affine bounds.
+///
+/// Lower bounds select their maximum, upper bounds their minimum, and strict
+/// bounds are shifted by one because the domain is integral. A mixture is
+/// accepted only when the resulting closed interval is non-empty. Any
+/// non-bound occurrence or a bound whose other side is not ground rejects
+/// completion rather than silently guessing zero.
+fn complete_int_from_ground_bounds(
+    conjuncts: &[ChcExpr],
+    var: &ChcVar,
+    env: &FxHashMap<String, SmtValue>,
+) -> IntBoundCompletion {
+    if var.sort != ChcSort::Int {
+        return IntBoundCompletion::NotApplicable;
+    }
+
+    let mut lower: Option<BigInt> = None;
+    let mut upper: Option<BigInt> = None;
+    let mut saw_bound = false;
+    let mut saw_other_occurrence = false;
+    for conjunct in conjuncts {
+        if !conjunct.vars().contains(var) {
+            continue;
+        }
+        let Some(bound) = ground_int_bound(conjunct, var, env) else {
+            // An ordering relation that mentions `var` but is not a ground
+            // affine bound is symbolic or structurally ambiguous (for example
+            // `x >= y` with unbound `y`, or `x*y >= 4`). It must not fall
+            // through to the integer sort default.
+            if matches!(
+                conjunct,
+                ChcExpr::Op(ChcOp::Ge | ChcOp::Gt | ChcOp::Le | ChcOp::Lt, _)
+            ) {
+                return IntBoundCompletion::Reject;
+            }
+            saw_other_occurrence = true;
+            continue;
+        };
+        saw_bound = true;
+        match bound {
+            GroundIntBound::Lower(value) => {
+                if lower.as_ref().is_none_or(|current| value > *current) {
+                    lower = Some(value);
+                }
+            }
+            GroundIntBound::Upper(value) => {
+                if upper.as_ref().is_none_or(|current| value < *current) {
+                    upper = Some(value);
+                }
+            }
+        }
+    }
+
+    if !saw_bound {
+        return IntBoundCompletion::NotApplicable;
+    }
+    // The extremal rule is complete only when every constraint on `var` is one
+    // of the bounds it analyzed. A mixture with an equality, disjunction, or
+    // other occurrence is not guessed through; the caller rejects this replay.
+    if saw_other_occurrence {
+        return IntBoundCompletion::Reject;
+    }
+    if lower
+        .as_ref()
+        .zip(upper.as_ref())
+        .is_some_and(|(lo, hi)| lo > hi)
+    {
+        return IntBoundCompletion::Reject;
+    }
+    lower.or(upper).map_or(IntBoundCompletion::Reject, |value| {
+        IntBoundCompletion::Value(SmtValue::int_from_bigint(value))
+    })
+}
+
+fn ground_int_bound(
+    conjunct: &ChcExpr,
+    var: &ChcVar,
+    env: &FxHashMap<String, SmtValue>,
+) -> Option<GroundIntBound> {
+    let ChcExpr::Op(op @ (ChcOp::Ge | ChcOp::Gt | ChcOp::Le | ChcOp::Lt), args) = conjunct else {
+        return None;
+    };
+    if args.len() != 2 {
+        return None;
+    }
+
+    // Normalize a linear inequality to `coefficient * var OP target`.
+    //
+    // LocalVarEliminator projects not only direct `x >= t` bounds, but affine
+    // one-sided bounds such as `0 <= (select S u) + x` and
+    // `3*x - y < 7`. The old completion recognized only a bare-variable side,
+    // so replay reached these Solidity clauses with every shared value ground
+    // yet rejected the projected local and fell into a futile whole-clause SMT
+    // solve. Mirror the transform's linear class here and choose the exact
+    // integer extremum.
+    let lhs_coeff = ground_linear_coefficient(args[0].as_ref(), var, env)?;
+    let rhs_coeff = ground_linear_coefficient(args[1].as_ref(), var, env)?;
+    let coefficient = lhs_coeff - rhs_coeff;
+    if coefficient == BigInt::from(0) {
+        return None;
+    }
+    let lhs_zero = eval_ground_int_with_var_zero(args[0].as_ref(), var, env)?;
+    let rhs_zero = eval_ground_int_with_var_zero(args[1].as_ref(), var, env)?;
+    let mut target = rhs_zero - lhs_zero;
+
+    // Over integers, `a*x > b` is `a*x >= b+1`, and `<` is `<= b-1`.
+    let greater = matches!(*op, ChcOp::Ge | ChcOp::Gt);
+    match *op {
+        ChcOp::Gt => target += 1,
+        ChcOp::Lt => target -= 1,
+        ChcOp::Ge | ChcOp::Le => {}
+        _ => return None,
+    }
+
+    let zero = BigInt::from(0);
+    if coefficient > zero {
+        Some(if greater {
+            GroundIntBound::Lower(target.div_ceil(&coefficient))
+        } else {
+            GroundIntBound::Upper(target.div_floor(&coefficient))
+        })
+    } else {
+        let positive = -coefficient;
+        let reflected = -target;
+        Some(if greater {
+            GroundIntBound::Upper(reflected.div_floor(&positive))
+        } else {
+            GroundIntBound::Lower(reflected.div_ceil(&positive))
+        })
+    }
+}
+
+/// Coefficient of `var` in a ground-linear integer expression.
+///
+/// Every subexpression not mentioning `var` must evaluate under `env`; a
+/// product may have at most one `var`-bearing factor. Anything nonlinear or
+/// indeterminate returns `None` and completion stays fail-closed.
+fn ground_linear_coefficient(
+    expr: &ChcExpr,
+    var: &ChcVar,
+    env: &FxHashMap<String, SmtValue>,
+) -> Option<BigInt> {
+    crate::expr::maybe_grow_expr_stack(|| match expr {
+        ChcExpr::Var(found) if found == var => Some(BigInt::from(1)),
+        ChcExpr::Op(ChcOp::Add, args) => {
+            let mut coefficient = BigInt::from(0);
+            for arg in args {
+                coefficient += ground_linear_coefficient(arg, var, env)?;
+            }
+            Some(coefficient)
+        }
+        ChcExpr::Op(ChcOp::Sub, args) if args.len() == 2 => Some(
+            ground_linear_coefficient(&args[0], var, env)?
+                - ground_linear_coefficient(&args[1], var, env)?,
+        ),
+        ChcExpr::Op(ChcOp::Neg, args) if args.len() == 1 => {
+            Some(-ground_linear_coefficient(&args[0], var, env)?)
+        }
+        ChcExpr::Op(ChcOp::Mul, args) if !args.is_empty() => {
+            let mut coefficient: Option<BigInt> = None;
+            let mut ground_product = BigInt::from(1);
+            for arg in args {
+                if arg.vars().contains(var) {
+                    if coefficient.is_some() {
+                        return None;
+                    }
+                    coefficient = Some(ground_linear_coefficient(arg, var, env)?);
+                } else {
+                    ground_product *= eval_ground_int(arg, env)?;
+                }
+            }
+            Some(coefficient.unwrap_or_else(|| BigInt::from(0)) * ground_product)
+        }
+        _ if !expr.vars().contains(var) => Some(BigInt::from(0)),
+        _ => None,
+    })
+}
+
+fn eval_ground_int_with_var_zero(
+    expr: &ChcExpr,
+    var: &ChcVar,
+    env: &FxHashMap<String, SmtValue>,
+) -> Option<BigInt> {
+    let mut zero_env = env.clone();
+    zero_env.insert(var.name.clone(), SmtValue::Int(0));
+    eval_ground_int(expr, &zero_env)
+}
+
+fn eval_ground_int(expr: &ChcExpr, env: &FxHashMap<String, SmtValue>) -> Option<BigInt> {
+    crate::expr::maybe_grow_expr_stack(|| match expr {
+        ChcExpr::Int(value) => Some(BigInt::from(*value)),
+        ChcExpr::Op(ChcOp::Neg, args) if args.len() == 1 => Some(-eval_ground_int(&args[0], env)?),
+        ChcExpr::Op(ChcOp::Add, args) => {
+            let mut sum = BigInt::from(0);
+            for arg in args {
+                sum += eval_ground_int(arg, env)?;
+            }
+            Some(sum)
+        }
+        ChcExpr::Op(ChcOp::Sub, args) if !args.is_empty() => {
+            let mut value = eval_ground_int(&args[0], env)?;
+            if args.len() == 1 {
+                return Some(-value);
+            }
+            for arg in &args[1..] {
+                value -= eval_ground_int(arg, env)?;
+            }
+            Some(value)
+        }
+        ChcExpr::Op(ChcOp::Mul, args) => {
+            let mut product = BigInt::from(1);
+            for arg in args {
+                product *= eval_ground_int(arg, env)?;
+            }
+            Some(product)
+        }
+        // Variables, array reads, and any other ground integer atom stay on
+        // the canonical evaluator. Only arithmetic trees are intercepted above
+        // so their intermediate values cannot overflow i128.
+        _ => match eval_ground(expr, env)? {
+            SmtValue::Int(value) => Some(BigInt::from(value)),
+            SmtValue::BigInt(value) => Some(value.as_ref().clone()),
+            _ => None,
+        },
+    })
 }
 
 /// Instantiate a clause's body-argument variables from the premises that
@@ -386,11 +886,7 @@ fn decompose_constructor(
 /// clause never reads — which is precisely why it cannot matter to any
 /// constraint the validator then evaluates, and if it does, the step is
 /// rejected.
-fn reconstruct_arrays(
-    conjuncts: &[ChcExpr],
-    clause: &HornClause,
-    env: &mut FxHashMap<String, SmtValue>,
-) {
+fn reconstruct_arrays(conjuncts: &[ChcExpr], env: &mut FxHashMap<String, SmtValue>) {
     let mut pins: FxHashMap<String, Vec<(SmtValue, SmtValue)>> = FxHashMap::default();
     let mut sorts: FxHashMap<String, ChcSort> = FxHashMap::default();
 
@@ -471,25 +967,6 @@ fn reconstruct_arrays(
                     SmtValue::ArrayMap {
                         default: Box::new(default),
                         entries,
-                    },
-                );
-            }
-        }
-    }
-
-    // A head-only array argument (never read in this clause) still needs SOME
-    // value for the step to be total.
-    for var in clause_vars(clause) {
-        if env.contains_key(&var.name) {
-            continue;
-        }
-        if let ChcSort::Array(_, element) = &var.sort {
-            if let Some(default) = sort_default(element) {
-                env.insert(
-                    var.name.clone(),
-                    SmtValue::ArrayMap {
-                        default: Box::new(default),
-                        entries: Vec::new(),
                     },
                 );
             }
@@ -873,6 +1350,6 @@ pub(crate) fn propagate_env_for_clause(clause: &HornClause, env: &mut FxHashMap<
         .map(ChcExpr::collect_conjuncts)
         .unwrap_or_default();
     propagate(&conjuncts, env);
-    reconstruct_arrays(&conjuncts, clause, env);
+    reconstruct_arrays(&conjuncts, env);
     propagate(&conjuncts, env);
 }

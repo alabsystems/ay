@@ -11,6 +11,52 @@
 
 use super::*;
 
+/// RAII borrow of a reused reason-collection scratch set (reason-alloc-wip).
+///
+/// Moves the set out of its `RefCell` (leaving an empty placeholder), CLEARS
+/// it so no stale membership from a prior call leaks into this traversal, and
+/// moves it back on drop. Only momentary `RefCell` borrows are taken (the
+/// `mem::take` on acquire and the restore on drop) — the set is owned by the
+/// guard for the whole traversal, so nested reason collection can never panic
+/// on a double `borrow_mut`. Clearing on acquire is load-bearing for
+/// byte-identity: a leftover `visited`/`on_stack`/`seen` entry would drop a
+/// real antecedent and change the collected reason set.
+struct ReasonScratch<'a, E> {
+    cell: &'a std::cell::RefCell<HashSet<E>>,
+    val: HashSet<E>,
+}
+
+impl<'a, E> ReasonScratch<'a, E> {
+    /// Take the scratch set out of `cell` and clear it for a fresh traversal.
+    fn new(cell: &'a std::cell::RefCell<HashSet<E>>) -> Self {
+        let mut val = std::mem::take(&mut *cell.borrow_mut());
+        val.clear();
+        Self { cell, val }
+    }
+}
+
+impl<E> Drop for ReasonScratch<'_, E> {
+    fn drop(&mut self) {
+        // Restore the (now capacity-retaining) set for the next call. Momentary
+        // borrow only; if re-entrancy left a different set here it is simply
+        // clobbered — correctness holds because every acquire clears.
+        *self.cell.borrow_mut() = std::mem::take(&mut self.val);
+    }
+}
+
+impl<E> std::ops::Deref for ReasonScratch<'_, E> {
+    type Target = HashSet<E>;
+    fn deref(&self) -> &HashSet<E> {
+        &self.val
+    }
+}
+
+impl<E> std::ops::DerefMut for ReasonScratch<'_, E> {
+    fn deref_mut(&mut self) -> &mut HashSet<E> {
+        &mut self.val
+    }
+}
+
 impl LraSolver {
     /// Collect reasons using eagerly-stored explanation data (#6617).
     /// See `implied_bounds.rs::collect_reasons_from_explanation` for docs.
@@ -238,11 +284,13 @@ impl LraSolver {
             };
             if let Some(ib) = ib {
                 if let Some(ref expl) = ib.explanation {
-                    let mut visited_vars = HashSet::default();
+                    // reason-alloc-wip: reuse the DFS scratch sets (cleared on
+                    // acquire) instead of a per-call HashSet::default().
+                    let mut visited_vars = ReasonScratch::new(&self.scratch_reason_visited);
                     // Seed the DFS stack with the ROOT bound being explained:
                     // a chain that transitively cites (var, need_upper) is
                     // self-supporting (cyclic) and must fail closed.
-                    let mut on_stack = HashSet::default();
+                    let mut on_stack = ReasonScratch::new(&self.scratch_reason_on_stack);
                     on_stack.insert((var, need_upper));
                     if self.collect_reasons_from_explanation(
                         expl,
@@ -285,7 +333,9 @@ impl LraSolver {
         }
         // Fallback: depth-limited recursive walk — only reached when no
         // eager explanation exists (legacy implied bounds or direct bounds).
-        let mut visited_vars = HashSet::default();
+        // reason-alloc-wip: reuse cleared DFS scratch (the eager block above
+        // always returns, so this never coexists with its visited scratch).
+        let mut visited_vars = ReasonScratch::new(&self.scratch_reason_visited);
         if self.collect_row_reasons_recursive(var, need_upper, reasons, seen, &mut visited_vars, 0)
         {
             // #8764: Post-collection stale-reason guard. The recursive
@@ -331,7 +381,11 @@ impl LraSolver {
         let bv = row.basic_var;
         let is_basic = bv == var;
         let mut reasons = Vec::new();
-        let mut seen = HashSet::default();
+        // reason-alloc-wip: reuse the cleared `seen` dedup set. `reasons` is the
+        // returned value and stays an owned Vec; only `seen` is scratch. This
+        // borrows a different cell than collect_row_reasons_dedup's visited/
+        // on_stack scratch, so passing `&mut seen` into it cannot self-conflict.
+        let mut seen = ReasonScratch::new(&self.scratch_reason_seen);
 
         if !is_basic {
             // Target is nonbasic: determine sum direction from coefficient
@@ -531,12 +585,14 @@ impl LraSolver {
             return None;
         }
         let mut reasons = Vec::new();
-        let mut seen = HashSet::default();
-        let mut visited_vars = HashSet::default();
+        // reason-alloc-wip: reuse cleared DFS scratch instead of per-call
+        // HashSet::default(). `reasons` is returned and stays an owned Vec.
+        let mut seen = ReasonScratch::new(&self.scratch_reason_seen);
+        let mut visited_vars = ReasonScratch::new(&self.scratch_reason_visited);
         // Seed the DFS stack with the ROOT bound being explained: a chain
         // that transitively cites (var_idx, need_upper) is self-supporting
         // (cyclic) and must fail closed (false-UNSAT otherwise; _hhk2008).
-        let mut on_stack = HashSet::default();
+        let mut on_stack = ReasonScratch::new(&self.scratch_reason_on_stack);
         on_stack.insert((var_idx as u32, need_upper));
         if self.collect_reasons_from_explanation(
             explanation,

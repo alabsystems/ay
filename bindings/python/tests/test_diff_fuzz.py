@@ -7,8 +7,8 @@
 #
 # This is the pytest entry point for the fuzzer in ayz3_fuzz/. It runs a bounded,
 # DETERMINISTIC campaign per fragment (fixed seed sequence) so a failure
-# reproduces exactly. It SKIPS gracefully if real z3py is not installed, since a
-# differential test is meaningless without a reference solver.
+# reproduces exactly. The version-pinned real z3py oracle is a required dev
+# dependency; conftest fails collection clearly when it is unavailable.
 #
 # CLASSIFICATION RULE: the comparison treats either side's `unknown` (or a binding
 # gap) as a SKIP -- sound incompleteness is NOT a bug. Only a genuine
@@ -32,13 +32,10 @@
 import os
 
 import pytest
+import z3
 
 from ayz3_fuzz import differential
 from ayz3_fuzz.gen import FRAGMENTS
-
-z3 = pytest.importorskip(
-    "z3", reason="real z3py not installed; differential fuzz needs a reference solver"
-)
 
 # Per-fragment formula count. Override with AYZ3_FUZZ_COUNT for a heavier local
 # run (e.g. AYZ3_FUZZ_COUNT=2000 pytest -k diff_fuzz).

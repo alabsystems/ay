@@ -42,6 +42,7 @@ use crate::cancellation::CancellationToken;
 use crate::engine_config::ChcEngineConfig;
 use crate::engine_result::ChcEngineResult;
 use crate::expr::evaluate::evaluate_expr;
+use crate::expr::MAX_PREPROCESSING_NODES;
 use crate::ground_derivation::{GroundDerivation, GroundDerivationStep};
 use crate::pdr::counterexample::{
     Counterexample, CounterexampleStep, DerivationWitness, DerivationWitnessEntry,
@@ -90,6 +91,32 @@ const TRIVIAL_DEPTH_THRESHOLD_SECS: f64 = 0.01;
 /// Maximum adaptive step size (depth increment). Prevents skipping too far
 /// ahead and missing a counterexample at a moderate depth.
 const MAX_ADAPTIVE_STEP: usize = 16;
+
+/// Hard work budget for observed values in the candidate-only nested-array
+/// abstraction.
+///
+/// The CHC-COMP25 Solidity array-slice depth-16 window remains below this
+/// bound, while 512 leaves prevent an unbounded candidate formula. Hitting the
+/// cap remains a completeness-only `Unknown`; every SAT candidate below is
+/// still accepted only after exact original-clause replay.
+const MAX_NESTED_SELECT_CANDIDATE_ALIASES: usize = 512;
+
+/// Hard work budget for scalar tokens replacing the remaining nested-array
+/// state terms in a candidate formula.
+///
+/// Tokens are much cheaper than observations (they carry no finite cells), but
+/// the cap still prevents a malformed depth formula from creating unbounded
+/// declarations. Exceeding it only disables this incomplete candidate route.
+const MAX_NESTED_ARRAY_CANDIDATE_TOKENS: usize = 4096;
+
+/// Direct nested-array equality edges retained for finite model completion.
+const MAX_NESTED_ARRAY_CANDIDATE_EQUALITIES: usize = 8192;
+
+fn log_nested_array_candidate(args: std::fmt::Arguments<'_>) {
+    if std::env::var("AY_CHC_BMC_NESTED_DEBUG").is_ok_and(|value| value != "0") {
+        safe_eprintln!("BMC nested-array candidate: {args}");
+    }
+}
 
 /// Minimum consecutive UNSAT depths before attempting k-induction.
 const K_INDUCTION_MIN_CONSECUTIVE_UNSAT: usize = 3;
@@ -582,10 +609,17 @@ impl BmcConfig {
 #[derive(Debug, Clone)]
 enum BmcTraceValue {
     Var(ChcVar),
-    ArraySelect {
+    /// A scalar-valued read through one or more nested arrays.
+    ///
+    /// Keeping the whole path matters for arrays indexed by arrays. The
+    /// executor can assign exact values to the scalar leaves while its
+    /// printable array model collapses two distinct array-valued indices to
+    /// the same default-only `const` array. Reconstructing every observed cell
+    /// below preserves the finite part of the model that the BMC witness
+    /// actually used.
+    ArraySelectPath {
         array: ChcVar,
-        index: ChcExpr,
-        index_sort: ChcSort,
+        indices: Vec<(ChcExpr, ChcSort)>,
         value_sort: ChcSort,
     },
 }
@@ -594,17 +628,119 @@ impl BmcTraceValue {
     fn sort(&self) -> &ChcSort {
         match self {
             Self::Var(var) => &var.sort,
-            Self::ArraySelect { value_sort, .. } => value_sort,
+            Self::ArraySelectPath { value_sort, .. } => value_sort,
         }
     }
 
     fn term(&self) -> ChcExpr {
         match self {
             Self::Var(var) => ChcExpr::var(var.clone()),
-            Self::ArraySelect { array, index, .. } => {
-                ChcExpr::select(ChcExpr::var(array.clone()), index.clone())
-            }
+            Self::ArraySelectPath { array, indices, .. } => indices
+                .iter()
+                .fold(ChcExpr::var(array.clone()), |read, (index, _)| {
+                    ChcExpr::select(read, index.clone())
+                }),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BmcArrayObservation {
+    array: ChcVar,
+    indices: Vec<(ChcExpr, ChcSort)>,
+    value: SmtValue,
+}
+
+/// One non-nested value read from nested-array state and replaced by a fresh
+/// candidate variable.
+///
+/// The abstraction is used only after the exact Executor returned `unknown`.
+/// The value may itself be a flat array. A SAT assignment supplies a finite
+/// observation for model completion; it is never itself a verdict. The
+/// completed model must still reconstruct and ground-replay a derivation over
+/// the original CHC clauses.
+#[derive(Debug, Clone)]
+struct BmcNestedSelectAlias {
+    original: ChcExpr,
+    alias: ChcVar,
+    array: ChcVar,
+    indices: Vec<(ChcExpr, ChcSort)>,
+    value_sort: ChcSort,
+}
+
+/// One remaining nested-array-valued term replaced by a fresh scalar token.
+///
+/// This preserves equality/disequality structure needed to select a candidate
+/// branch while deliberately forgetting nested-array theory. Token values are
+/// never interpreted as arrays and never participate in the final verdict.
+#[derive(Debug, Clone)]
+struct BmcNestedArrayTokenAlias {
+    original: ChcExpr,
+    alias: ChcVar,
+}
+
+/// Directly equal nested-array variables in the original depth formula.
+///
+/// The relaxed scalar tokens choose a branch, but exact witness replay still
+/// needs finite array values for level-to-rule plumbing. Observations are
+/// copied across these components before replay. Collecting equalities from an
+/// inactive branch can only over-constrain and reject a candidate; it cannot
+/// validate a false derivation because original-clause replay remains final.
+#[derive(Debug, Clone)]
+struct BmcNestedArrayEquivalence {
+    variables: Vec<ChcVar>,
+}
+
+#[derive(Debug, Clone)]
+struct BmcNestedArrayCandidateFormula {
+    prefix_conjuncts: Vec<ChcExpr>,
+    query_groups: Vec<Vec<ChcExpr>>,
+    select_aliases: Vec<BmcNestedSelectAlias>,
+    state_tokens: Vec<BmcNestedArrayTokenAlias>,
+    equal_state: Vec<BmcNestedArrayEquivalence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BmcNestedArrayCandidateAbort {
+    NodeBudgetOrDeadline,
+    ObservationCap,
+    StateTokenCap,
+    EqualityCap,
+    UnsupportedNestedBoundary,
+}
+
+struct BmcNestedArrayTraversalBudget {
+    remaining_nodes: usize,
+    nodes_until_deadline_check: usize,
+    deadline: Option<ay_core::time::Instant>,
+}
+
+impl BmcNestedArrayTraversalBudget {
+    fn new(remaining_nodes: usize, deadline: Option<ay_core::time::Instant>) -> Self {
+        Self {
+            remaining_nodes,
+            nodes_until_deadline_check: 0,
+            deadline,
+        }
+    }
+
+    fn consume(&mut self) -> Result<(), BmcNestedArrayCandidateAbort> {
+        self.remaining_nodes = self
+            .remaining_nodes
+            .checked_sub(1)
+            .ok_or(BmcNestedArrayCandidateAbort::NodeBudgetOrDeadline)?;
+        if self.nodes_until_deadline_check == 0 {
+            if self
+                .deadline
+                .is_some_and(|limit| ay_core::time::Instant::now() >= limit)
+            {
+                return Err(BmcNestedArrayCandidateAbort::NodeBudgetOrDeadline);
+            }
+            self.nodes_until_deadline_check = 1023;
+        } else {
+            self.nodes_until_deadline_check -= 1;
+        }
+        Ok(())
     }
 }
 
@@ -4924,21 +5060,36 @@ impl BmcSolver {
         env: &mut FxHashMap<String, IntInterval>,
         deadline: Option<ay_core::time::Instant>,
     ) -> Result<bool, DagBudgetExpired> {
+        // `simplify_bmc_expr` is a pure, deterministic rewrite of an immutable
+        // conjunct: its result is independent of `env` and identical on every
+        // round. Precompute it once instead of paying two full tree rewrites
+        // per conjunct *per round* (up to 32 rounds) inside the loop below —
+        // both `collect_int_var_equality` and `collect_conjunct_interval_bound`
+        // previously recomputed the same simplification. Byte-identical: the
+        // simplified value drives exactly the same equality/bound extraction.
+        let mut simplified = Vec::with_capacity(conjuncts.len());
+        for (conjunct_idx, conjunct) in conjuncts.iter().enumerate() {
+            // Poll every 64 conjuncts: each pays a full `simplify_bmc_expr`
+            // tree rewrite.
+            if conjunct_idx % 64 == 0 && dag_deadline_passed(deadline) {
+                return Err(DagBudgetExpired);
+            }
+            simplified.push(Self::simplify_bmc_expr(conjunct.clone()));
+        }
+
         let mut equalities = Vec::new();
         let max_rounds = conjuncts.len().saturating_add(4).clamp(1, 32);
         for _ in 0..max_rounds {
             let before = env.clone();
             equalities.clear();
-            for (conjunct_idx, conjunct) in conjuncts.iter().enumerate() {
-                // Poll every 64 conjuncts: each conjunct below pays two full
-                // `simplify_bmc_expr` tree rewrites.
+            for (conjunct_idx, simplified_conjunct) in simplified.iter().enumerate() {
                 if conjunct_idx % 64 == 0 && dag_deadline_passed(deadline) {
                     return Err(DagBudgetExpired);
                 }
-                if let Some(equality) = Self::collect_int_var_equality(conjunct) {
+                if let Some(equality) = Self::collect_int_var_equality(simplified_conjunct) {
                     equalities.push(equality);
                 }
-                if !Self::collect_conjunct_interval_bound(conjunct, env) {
+                if !Self::collect_conjunct_interval_bound(simplified_conjunct, env) {
                     return Ok(false);
                 }
             }
@@ -4952,9 +5103,10 @@ impl BmcSolver {
         Ok(true)
     }
 
-    fn collect_int_var_equality(conjunct: &ChcExpr) -> Option<(String, String)> {
-        let simplified = Self::simplify_bmc_expr(conjunct.clone());
-        let ChcExpr::Op(ChcOp::Eq, args) = &simplified else {
+    /// `simplified` must already be `simplify_bmc_expr`-normalized (the caller
+    /// precomputes it once per conjunct and reuses it across rounds).
+    fn collect_int_var_equality(simplified: &ChcExpr) -> Option<(String, String)> {
+        let ChcExpr::Op(ChcOp::Eq, args) = simplified else {
             return None;
         };
         if args.len() != 2 {
@@ -5003,17 +5155,17 @@ impl BmcSolver {
         true
     }
 
+    /// `simplified` must already be `simplify_bmc_expr`-normalized (the caller
+    /// precomputes it once per conjunct and reuses it across rounds).
     fn collect_conjunct_interval_bound(
-        conjunct: &ChcExpr,
+        simplified: &ChcExpr,
         env: &mut FxHashMap<String, IntInterval>,
     ) -> bool {
-        let simplified = Self::simplify_bmc_expr(conjunct.clone());
-
-        if let Some((op, lhs, rhs)) = Self::interval_comparison_atom(&simplified) {
+        if let Some((op, lhs, rhs)) = Self::interval_comparison_atom(simplified) {
             return Self::collect_direct_interval_bound(op, lhs, rhs, env);
         }
 
-        if let ChcExpr::Op(ChcOp::Not, args) = &simplified {
+        if let ChcExpr::Op(ChcOp::Not, args) = simplified {
             if args.len() == 1 {
                 if let Some((op, lhs, rhs)) = Self::interval_comparison_atom(args[0].as_ref()) {
                     return Self::collect_direct_interval_bound(
@@ -8062,6 +8214,14 @@ impl BmcSolver {
             let cmds = ay_frontend::parse(&query_smt).ok()?;
             let outputs = Self::exec_commands_with_deadline(&mut exec, &cmds, depth_deadline)?;
 
+            // The `(declare-const ...)` commands just emitted are PERMANENT in the
+            // persistent executor, but `query_declared` is per-iteration. Without
+            // folding them back, `add_levels_to_executor` re-declares the same names
+            // at the next level, the elaborator rejects the duplicate, and this whole
+            // lane bails to the non-incremental `solve_per_depth_fresh` fallback —
+            // which restarts at depth 0 and never reaches the depths this shard needs.
+            declared_vars.extend(query_declared.iter().cloned());
+
             // Find the check-sat result
             let result_str = outputs
                 .iter()
@@ -8208,6 +8368,7 @@ impl BmcSolver {
         let logic = self.detect_bmc_logic();
         let mut smt_prefix = format!("(set-logic {logic})\n(set-option :produce-models true)\n");
         let mut declared_vars: FxHashSet<String> = FxHashSet::default();
+        let mut prefix_conjuncts = Vec::new();
         let mut ema_depth_time: f64 = 0.0;
         let mut consecutive_unsat: usize = initial_consecutive_unsat;
         let mut encountered_unknown = false;
@@ -8232,6 +8393,7 @@ impl BmcSolver {
                 let s = InvariantModel::expr_to_smtlib(conjunct);
                 smt_prefix.push_str(&format!("(assert {s})\n"));
             }
+            prefix_conjuncts.extend(level_conjuncts);
         }
 
         for k in start_depth..=max_depth {
@@ -8261,6 +8423,7 @@ impl BmcSolver {
                 let s = InvariantModel::expr_to_smtlib(conjunct);
                 smt_prefix.push_str(&format!("(assert {s})\n"));
             }
+            prefix_conjuncts.extend(level_conjuncts);
 
             // Build query at depth k. Several queries are alternatives, not a
             // conjunction: see `compile_query_groups`.
@@ -8367,6 +8530,25 @@ impl BmcSolver {
                     }
                 }
             } else {
+                if let Some(model) = self.try_nested_select_observation_candidate(
+                    &prefix_conjuncts,
+                    &query_groups,
+                    k,
+                    disable_lra_propagation,
+                    depth_deadline,
+                ) {
+                    if !self.sweep_past_spurious_sat() {
+                        // The compatibility kill switch may stop the sweep,
+                        // but the relaxed assignment still passes through the
+                        // unchanged original-clause replay in `bmc_sat_result`.
+                        return Some(self.bmc_sat_result(&model, k, queries));
+                    }
+                    if let FlatSatOutcome::Confirmed(result) =
+                        self.classify_flat_sat(&model, k, queries)
+                    {
+                        return Some(result);
+                    }
+                }
                 encountered_unknown = true;
                 consecutive_unsat = 0;
             }
@@ -8905,22 +9087,16 @@ impl BmcSolver {
     ) {
         match expr {
             ChcExpr::Op(ChcOp::Select, args) if args.len() == 2 => {
-                if let ChcExpr::Var(array) = args[0].as_ref() {
-                    if let ChcSort::Array(index_sort, value_sort) = &array.sort {
-                        if Self::trace_assignment_sort_supported(value_sort)
-                            && Self::trace_assignment_sort_supported(index_sort)
-                        {
-                            let index = args[1].as_ref().clone();
-                            let key = format!("{}::{index:?}", array.name);
-                            if seen.insert(key) {
-                                values.push(BmcTraceValue::ArraySelect {
-                                    array: array.clone(),
-                                    index,
-                                    index_sort: index_sort.as_ref().clone(),
-                                    value_sort: value_sort.as_ref().clone(),
-                                });
-                            }
-                        }
+                if let Some((array, indices, value_sort)) =
+                    Self::trace_scalar_array_select_path(expr)
+                {
+                    let key = format!("{expr:?}");
+                    if seen.insert(key) {
+                        values.push(BmcTraceValue::ArraySelectPath {
+                            array,
+                            indices,
+                            value_sort,
+                        });
                     }
                 }
                 for arg in args {
@@ -8945,6 +9121,836 @@ impl BmcSolver {
             | ChcExpr::ConstArrayMarker(_)
             | ChcExpr::IsTesterMarker(_) => {}
         }
+    }
+
+    /// Decompose a scalar-valued nested select into its base variable and
+    /// outer-to-inner index path.
+    ///
+    /// For example, `(select (select F P) 0)` becomes
+    /// `F, [(P, Array Int Int), (0, Int)]`. The old trace collector only kept
+    /// `(select A i)` when BOTH `A` and `i` were scalar-addressed, so it missed
+    /// exactly these array-indexed Solidity reads.
+    fn trace_scalar_array_select_path(
+        expr: &ChcExpr,
+    ) -> Option<(ChcVar, Vec<(ChcExpr, ChcSort)>, ChcSort)> {
+        let (array, indices, value_sort) = Self::trace_array_select_path(expr)?;
+        if !Self::trace_assignment_sort_supported(&value_sort) {
+            return None;
+        }
+        Some((array, indices, value_sort))
+    }
+
+    /// Decompose any concretely modelable select chain. Unlike
+    /// `trace_scalar_array_select_path`, this also accepts an array-valued
+    /// result so a collided composite key such as `(select^4 C h)` can be
+    /// completed at its finite base-array path.
+    fn trace_array_select_path(
+        expr: &ChcExpr,
+    ) -> Option<(ChcVar, Vec<(ChcExpr, ChcSort)>, ChcSort)> {
+        let value_sort = expr.sort();
+        if !Self::trace_model_sort_supported(&value_sort) {
+            return None;
+        }
+        let mut current = expr;
+        let mut reversed = Vec::new();
+        loop {
+            let ChcExpr::Op(ChcOp::Select, args) = current else {
+                break;
+            };
+            let [array_expr, index_expr] = args.as_slice() else {
+                return None;
+            };
+            let ChcSort::Array(index_sort, _) = array_expr.sort() else {
+                return None;
+            };
+            if !Self::trace_model_sort_supported(&index_sort) {
+                return None;
+            }
+            reversed.push((index_expr.as_ref().clone(), index_sort.as_ref().clone()));
+            current = array_expr.as_ref();
+        }
+
+        let ChcExpr::Var(array) = current else {
+            return None;
+        };
+        if reversed.is_empty() || !Self::trace_model_sort_supported(&array.sort) {
+            return None;
+        }
+        reversed.reverse();
+        Some((array.clone(), reversed, value_sort))
+    }
+
+    fn trace_model_sort_supported(sort: &ChcSort) -> bool {
+        match sort {
+            ChcSort::Bool | ChcSort::Int | ChcSort::BitVec(_) => true,
+            ChcSort::Array(index, value) => {
+                Self::trace_model_sort_supported(index) && Self::trace_model_sort_supported(value)
+            }
+            ChcSort::Real | ChcSort::Uninterpreted(_) | ChcSort::Datatype { .. } => false,
+        }
+    }
+
+    fn sort_mentions_array_deep(sort: &ChcSort) -> bool {
+        fn visit(sort: &ChcSort, visiting_datatypes: &mut FxHashSet<String>) -> bool {
+            match sort {
+                ChcSort::Array(_, _) => true,
+                ChcSort::Datatype { name, constructors } => {
+                    if !visiting_datatypes.insert(name.clone()) {
+                        return false;
+                    }
+                    let contains = constructors.iter().any(|constructor| {
+                        constructor
+                            .selectors
+                            .iter()
+                            .any(|selector| visit(&selector.sort, visiting_datatypes))
+                    });
+                    visiting_datatypes.remove(name);
+                    contains
+                }
+                ChcSort::Bool
+                | ChcSort::Int
+                | ChcSort::Real
+                | ChcSort::BitVec(_)
+                | ChcSort::Uninterpreted(_) => false,
+            }
+        }
+
+        visit(sort, &mut FxHashSet::default())
+    }
+
+    /// Match the same sort shape that the public Executor's nested-array
+    /// UNSAT quarantine recognizes: an array whose index or element sort
+    /// itself contains an array.
+    fn is_nested_array_sort(sort: &ChcSort) -> bool {
+        let ChcSort::Array(index, value) = sort else {
+            return false;
+        };
+        Self::sort_mentions_array_deep(index) || Self::sort_mentions_array_deep(value)
+    }
+
+    fn push_nested_candidate_children<'a>(expr: &'a ChcExpr, stack: &mut Vec<&'a ChcExpr>) {
+        match expr {
+            ChcExpr::Op(_, args)
+            | ChcExpr::PredicateApp(_, _, args)
+            | ChcExpr::FuncApp(_, _, args) => {
+                stack.extend(args.iter().rev().map(AsRef::as_ref));
+            }
+            ChcExpr::ConstArray(_, value) => stack.push(value.as_ref()),
+            ChcExpr::Bool(_)
+            | ChcExpr::Int(_)
+            | ChcExpr::Real(_, _)
+            | ChcExpr::BitVec(_, _)
+            | ChcExpr::Var(_)
+            | ChcExpr::ConstArrayMarker(_)
+            | ChcExpr::IsTesterMarker(_) => {}
+        }
+    }
+
+    /// Collect maximal non-nested values read from nested-array state.
+    ///
+    /// This includes flat-array-valued reads such as
+    /// `(select (select C key) field) : (Array Int Int)`. Identical reads are
+    /// recorded once so congruent occurrences share one abstraction variable.
+    fn collect_nested_select_alias_terms(
+        expr: &ChcExpr,
+        leaves: &mut Vec<(ChcExpr, ChcVar, Vec<(ChcExpr, ChcSort)>, ChcSort)>,
+        seen: &mut FxHashSet<ChcExpr>,
+        budget: &mut BmcNestedArrayTraversalBudget,
+    ) -> Result<(), BmcNestedArrayCandidateAbort> {
+        let mut stack = vec![expr];
+        while let Some(current) = stack.pop() {
+            budget.consume()?;
+            if let Some((array, indices, value_sort)) = Self::trace_array_select_path(current) {
+                if Self::is_nested_array_sort(&array.sort)
+                    && !Self::is_nested_array_sort(&value_sort)
+                {
+                    if seen.insert(current.clone()) {
+                        leaves.push((current.clone(), array, indices, value_sort));
+                        if leaves.len() > MAX_NESTED_SELECT_CANDIDATE_ALIASES {
+                            return Err(BmcNestedArrayCandidateAbort::ObservationCap);
+                        }
+                    }
+                    continue;
+                }
+            }
+            Self::push_nested_candidate_children(current, &mut stack);
+        }
+        Ok(())
+    }
+
+    /// Collect maximal terms whose values still have nested-array sort.
+    ///
+    /// These are candidate state-plumbing terms, normally level arguments,
+    /// rule-local variables, or a complete `store`/`ite` term. Stopping at the
+    /// maximal term keeps the later Int substitution well-sorted at equality
+    /// boundaries instead of substituting an Int into the middle of an array
+    /// operation.
+    fn collect_nested_array_token_terms(
+        expr: &ChcExpr,
+        terms: &mut Vec<ChcExpr>,
+        seen: &mut FxHashSet<ChcExpr>,
+        budget: &mut BmcNestedArrayTraversalBudget,
+    ) -> Result<(), BmcNestedArrayCandidateAbort> {
+        let mut stack = vec![expr];
+        while let Some(current) = stack.pop() {
+            budget.consume()?;
+            if Self::is_nested_array_sort(&current.sort()) {
+                if seen.insert(current.clone()) {
+                    terms.push(current.clone());
+                    if terms.len() > MAX_NESTED_ARRAY_CANDIDATE_TOKENS {
+                        return Err(BmcNestedArrayCandidateAbort::StateTokenCap);
+                    }
+                }
+                continue;
+            }
+            Self::push_nested_candidate_children(current, &mut stack);
+        }
+        Ok(())
+    }
+
+    fn expr_contains_nested_array_sort(
+        expr: &ChcExpr,
+        budget: &mut BmcNestedArrayTraversalBudget,
+    ) -> Result<bool, BmcNestedArrayCandidateAbort> {
+        let mut stack = vec![expr];
+        while let Some(current) = stack.pop() {
+            budget.consume()?;
+            if Self::is_nested_array_sort(&current.sort()) {
+                return Ok(true);
+            }
+            Self::push_nested_candidate_children(current, &mut stack);
+        }
+        Ok(false)
+    }
+
+    /// Reject any non-nested parent that would receive an Int token where its
+    /// original child sort was nested-array. Equality/disequality are the only
+    /// supported boundaries: replacing both same-sorted operands with Int
+    /// preserves their Boolean structure. A surviving `select(store(...), i)`
+    /// or nested-array UF argument would otherwise serialize as ill-typed SMT.
+    fn validate_nested_array_token_boundaries(
+        expr: &ChcExpr,
+        budget: &mut BmcNestedArrayTraversalBudget,
+    ) -> Result<(), BmcNestedArrayCandidateAbort> {
+        let mut stack = vec![expr];
+        while let Some(current) = stack.pop() {
+            budget.consume()?;
+            if Self::is_nested_array_sort(&current.sort()) {
+                continue;
+            }
+            match current {
+                ChcExpr::Op(ChcOp::Eq | ChcOp::Ne, args) => {
+                    let nested_children = args
+                        .iter()
+                        .filter(|arg| Self::is_nested_array_sort(&arg.sort()))
+                        .count();
+                    if nested_children != 0 {
+                        if args.len() != 2 || nested_children != 2 {
+                            return Err(BmcNestedArrayCandidateAbort::UnsupportedNestedBoundary);
+                        }
+                        continue;
+                    }
+                    stack.extend(args.iter().rev().map(AsRef::as_ref));
+                }
+                ChcExpr::Op(_, args)
+                | ChcExpr::PredicateApp(_, _, args)
+                | ChcExpr::FuncApp(_, _, args) => {
+                    if args
+                        .iter()
+                        .any(|arg| Self::is_nested_array_sort(&arg.sort()))
+                    {
+                        return Err(BmcNestedArrayCandidateAbort::UnsupportedNestedBoundary);
+                    }
+                    stack.extend(args.iter().rev().map(AsRef::as_ref));
+                }
+                ChcExpr::ConstArray(_, value) => {
+                    if Self::is_nested_array_sort(&value.sort()) {
+                        return Err(BmcNestedArrayCandidateAbort::UnsupportedNestedBoundary);
+                    }
+                    stack.push(value.as_ref());
+                }
+                ChcExpr::Bool(_)
+                | ChcExpr::Int(_)
+                | ChcExpr::Real(_, _)
+                | ChcExpr::BitVec(_, _)
+                | ChcExpr::Var(_)
+                | ChcExpr::ConstArrayMarker(_)
+                | ChcExpr::IsTesterMarker(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_nested_array_var_equalities(
+        expr: &ChcExpr,
+        adjacency: &mut FxHashMap<ChcVar, FxHashSet<ChcVar>>,
+        equality_count: &mut usize,
+        budget: &mut BmcNestedArrayTraversalBudget,
+    ) -> Result<(), BmcNestedArrayCandidateAbort> {
+        let mut stack = vec![expr];
+        while let Some(current) = stack.pop() {
+            budget.consume()?;
+            if let ChcExpr::Op(ChcOp::Eq, args) = current {
+                if let [lhs, rhs] = args.as_slice() {
+                    if let (ChcExpr::Var(lhs), ChcExpr::Var(rhs)) = (lhs.as_ref(), rhs.as_ref()) {
+                        if lhs != rhs
+                            && lhs.sort == rhs.sort
+                            && Self::is_nested_array_sort(&lhs.sort)
+                        {
+                            let inserted = adjacency
+                                .entry(lhs.clone())
+                                .or_default()
+                                .insert(rhs.clone());
+                            adjacency
+                                .entry(rhs.clone())
+                                .or_default()
+                                .insert(lhs.clone());
+                            if inserted {
+                                *equality_count = (*equality_count).saturating_add(1);
+                                if *equality_count > MAX_NESTED_ARRAY_CANDIDATE_EQUALITIES {
+                                    return Err(BmcNestedArrayCandidateAbort::EqualityCap);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Self::push_nested_candidate_children(current, &mut stack);
+        }
+        Ok(())
+    }
+
+    fn nested_array_var_equivalences<'a>(
+        exprs: impl IntoIterator<Item = &'a ChcExpr>,
+        budget: &mut BmcNestedArrayTraversalBudget,
+    ) -> Result<Vec<BmcNestedArrayEquivalence>, BmcNestedArrayCandidateAbort> {
+        let mut adjacency: FxHashMap<ChcVar, FxHashSet<ChcVar>> = FxHashMap::default();
+        let mut equality_count = 0usize;
+        for expr in exprs {
+            Self::collect_nested_array_var_equalities(
+                expr,
+                &mut adjacency,
+                &mut equality_count,
+                budget,
+            )?;
+        }
+
+        let mut roots: Vec<ChcVar> = adjacency.keys().cloned().collect();
+        roots.sort();
+        let mut visited = FxHashSet::default();
+        let mut components = Vec::new();
+        for root in roots {
+            if !visited.insert(root.clone()) {
+                continue;
+            }
+            let mut stack = vec![root];
+            let mut variables = Vec::new();
+            while let Some(variable) = stack.pop() {
+                variables.push(variable.clone());
+                for neighbor in adjacency.get(&variable).into_iter().flatten() {
+                    if visited.insert(neighbor.clone()) {
+                        stack.push(neighbor.clone());
+                    }
+                }
+            }
+            variables.sort();
+            if variables.len() > 1 {
+                components.push(BmcNestedArrayEquivalence { variables });
+            }
+        }
+        components.sort_by(|left, right| left.variables[0].cmp(&right.variables[0]));
+        Ok(components)
+    }
+
+    /// Relax nested reads and state plumbing across one complete depth formula.
+    ///
+    /// This is a candidate generator, not an equisatisfiable transform:
+    /// observation aliases and scalar state tokens are intentionally
+    /// unconstrained beyond the surrounding formula. Consequently only a SAT
+    /// model is useful; abstraction UNSAT/Unknown is ignored.
+    fn abstract_nested_select_formula(
+        prefix_conjuncts: &[ChcExpr],
+        query_groups: &[Vec<ChcExpr>],
+        depth: usize,
+        reserved_names: &FxHashSet<String>,
+        deadline: Option<ay_core::time::Instant>,
+    ) -> Option<BmcNestedArrayCandidateFormula> {
+        let mut budget = BmcNestedArrayTraversalBudget::new(MAX_PREPROCESSING_NODES, deadline);
+        let mut leaves = Vec::new();
+        let mut seen_leaves = FxHashSet::default();
+        for expr in prefix_conjuncts.iter().chain(query_groups.iter().flatten()) {
+            if let Err(abort) = Self::collect_nested_select_alias_terms(
+                expr,
+                &mut leaves,
+                &mut seen_leaves,
+                &mut budget,
+            ) {
+                log_nested_array_candidate(format_args!(
+                    "depth={depth} skipped during observation collection: {abort:?}"
+                ));
+                return None;
+            }
+        }
+
+        let mut used_names = reserved_names.clone();
+        for var in prefix_conjuncts
+            .iter()
+            .chain(query_groups.iter().flatten())
+            .flat_map(|expr| expr.vars())
+        {
+            used_names.insert(var.name);
+        }
+        let mut aliases = Vec::with_capacity(leaves.len());
+        for (index, (original, array, indices, value_sort)) in leaves.into_iter().enumerate() {
+            let mut nonce = index;
+            let alias = loop {
+                let name = format!("__bmc_nested_obs_{depth}_{nonce}");
+                if used_names.insert(name.clone()) {
+                    break ChcVar::new(name, value_sort.clone());
+                }
+                nonce = nonce.saturating_add(1);
+            };
+            aliases.push(BmcNestedSelectAlias {
+                original,
+                alias,
+                array,
+                indices,
+                value_sort,
+            });
+        }
+
+        let select_replacements: Vec<(ChcExpr, ChcExpr)> = aliases
+            .iter()
+            .map(|entry| (entry.original.clone(), ChcExpr::var(entry.alias.clone())))
+            .collect();
+        let select_prefix: Vec<ChcExpr> = prefix_conjuncts
+            .iter()
+            .map(|expr| expr.substitute_expr_pairs(&select_replacements))
+            .collect();
+        let select_groups: Vec<Vec<ChcExpr>> = query_groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|expr| expr.substitute_expr_pairs(&select_replacements))
+                    .collect()
+            })
+            .collect();
+
+        for expr in select_prefix.iter().chain(select_groups.iter().flatten()) {
+            if let Err(abort) = Self::validate_nested_array_token_boundaries(expr, &mut budget) {
+                log_nested_array_candidate(format_args!(
+                    "depth={depth} skipped during token-boundary validation: {abort:?}"
+                ));
+                return None;
+            }
+        }
+
+        let mut state_terms = Vec::new();
+        let mut seen_state_terms = FxHashSet::default();
+        for expr in select_prefix.iter().chain(select_groups.iter().flatten()) {
+            if let Err(abort) = Self::collect_nested_array_token_terms(
+                expr,
+                &mut state_terms,
+                &mut seen_state_terms,
+                &mut budget,
+            ) {
+                log_nested_array_candidate(format_args!(
+                    "depth={depth} skipped during state-token collection: {abort:?}"
+                ));
+                return None;
+            }
+        }
+        if aliases.is_empty() && state_terms.is_empty() {
+            log_nested_array_candidate(format_args!(
+                "depth={depth} skipped: no nested reads or state"
+            ));
+            return None;
+        }
+
+        let mut state_tokens = Vec::with_capacity(state_terms.len());
+        for (index, original) in state_terms.into_iter().enumerate() {
+            let mut nonce = index;
+            let alias = loop {
+                let name = format!("__bmc_nested_state_{depth}_{nonce}");
+                if used_names.insert(name.clone()) {
+                    break ChcVar::new(name, ChcSort::Int);
+                }
+                nonce = nonce.saturating_add(1);
+            };
+            state_tokens.push(BmcNestedArrayTokenAlias { original, alias });
+        }
+
+        let state_replacements: Vec<(ChcExpr, ChcExpr)> = state_tokens
+            .iter()
+            .map(|entry| (entry.original.clone(), ChcExpr::var(entry.alias.clone())))
+            .collect();
+        let rewritten_prefix: Vec<ChcExpr> = select_prefix
+            .iter()
+            .map(|expr| expr.substitute_expr_pairs(&state_replacements))
+            .collect();
+        let rewritten_groups: Vec<Vec<ChcExpr>> = select_groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|expr| expr.substitute_expr_pairs(&state_replacements))
+                    .collect()
+            })
+            .collect();
+
+        for expr in rewritten_prefix
+            .iter()
+            .chain(rewritten_groups.iter().flatten())
+        {
+            match Self::expr_contains_nested_array_sort(expr, &mut budget) {
+                Ok(false) => {}
+                Ok(true) => {
+                    log_nested_array_candidate(format_args!(
+                        "depth={depth} skipped: nested-array root remained after {} observations and {} tokens",
+                        aliases.len(),
+                        state_tokens.len()
+                    ));
+                    tracing::debug!(
+                        "BMC nested-array candidate at depth {depth} retained a nested-array root; \
+                         failing closed"
+                    );
+                    return None;
+                }
+                Err(abort) => {
+                    log_nested_array_candidate(format_args!(
+                        "depth={depth} skipped during residual-root validation: {abort:?}"
+                    ));
+                    return None;
+                }
+            }
+        }
+
+        let equal_state = match Self::nested_array_var_equivalences(
+            prefix_conjuncts.iter().chain(query_groups.iter().flatten()),
+            &mut budget,
+        ) {
+            Ok(equal_state) => equal_state,
+            Err(abort) => {
+                log_nested_array_candidate(format_args!(
+                    "depth={depth} skipped during equality collection: {abort:?}"
+                ));
+                return None;
+            }
+        };
+        log_nested_array_candidate(format_args!(
+            "depth={depth} abstracted: observations={} state_tokens={} equality_components={}",
+            aliases.len(),
+            state_tokens.len(),
+            equal_state.len()
+        ));
+        Some(BmcNestedArrayCandidateFormula {
+            prefix_conjuncts: rewritten_prefix,
+            query_groups: rewritten_groups,
+            select_aliases: aliases,
+            state_tokens,
+            equal_state,
+        })
+    }
+
+    /// Turn abstraction-variable values into finite nested-array cells.
+    ///
+    /// These cells are still only a candidate model. No caller may accept it
+    /// without the ordinary original-clause ground derivation replay.
+    fn reconstruct_nested_select_aliases(
+        model: &mut FxHashMap<String, SmtValue>,
+        aliases: &[BmcNestedSelectAlias],
+        state_tokens: &[BmcNestedArrayTokenAlias],
+        equal_state: &[BmcNestedArrayEquivalence],
+    ) -> usize {
+        let observations: Vec<BmcArrayObservation> = aliases
+            .iter()
+            .filter_map(|entry| {
+                let value = model
+                    .get(&entry.alias.name)
+                    .and_then(|value| Self::model_smt_value_for_sort(value, &entry.value_sort))?;
+                Some(BmcArrayObservation {
+                    array: entry.array.clone(),
+                    indices: entry.indices.clone(),
+                    value,
+                })
+            })
+            .collect();
+        let completed = observations.len();
+
+        // Candidate tokens sever nested state from the SMT formula. Start its
+        // finite reconstruction from deterministic defaults, not from any
+        // arbitrary printable values the relaxed model happened to assign.
+        let mut state_variables: FxHashMap<String, ChcVar> = FxHashMap::default();
+        for observation in &observations {
+            state_variables.insert(observation.array.name.clone(), observation.array.clone());
+        }
+        for token in state_tokens {
+            for variable in token.original.vars() {
+                if Self::is_nested_array_sort(&variable.sort) {
+                    state_variables.insert(variable.name.clone(), variable);
+                }
+            }
+        }
+        for component in equal_state {
+            for variable in &component.variables {
+                state_variables.insert(variable.name.clone(), variable.clone());
+            }
+        }
+        for variable in state_variables.values() {
+            if let Some(default) = Self::default_smt_value_for_sort(&variable.sort) {
+                model.insert(variable.name.clone(), default);
+            }
+        }
+
+        let mut component_by_name = FxHashMap::default();
+        for (index, component) in equal_state.iter().enumerate() {
+            for variable in &component.variables {
+                component_by_name.insert(variable.name.clone(), index);
+            }
+        }
+        let mut canonical_observations = Vec::new();
+        for observation in observations {
+            if let Some(index) = component_by_name.get(&observation.array.name) {
+                let component = &equal_state[*index];
+                if let Some(canonical) = component
+                    .variables
+                    .iter()
+                    .find(|variable| variable.sort == observation.array.sort)
+                {
+                    canonical_observations.push(BmcArrayObservation {
+                        array: canonical.clone(),
+                        indices: observation.indices,
+                        value: observation.value,
+                    });
+                }
+            } else {
+                canonical_observations.push(observation);
+            }
+        }
+        Self::reconstruct_trace_array_observations(model, &canonical_observations);
+
+        // All observations for a component were installed on its canonical
+        // member above. Copy that finite value to every member so the original
+        // level-to-rule array equalities hold during exact replay.
+        for component in equal_state {
+            let Some(first) = component.variables.first() else {
+                continue;
+            };
+            let canonical = model
+                .get(&first.name)
+                .and_then(|value| Self::model_smt_value_for_sort(value, &first.sort))
+                .or_else(|| Self::default_smt_value_for_sort(&first.sort));
+            let Some(canonical) = canonical else {
+                continue;
+            };
+            for variable in &component.variables {
+                model.insert(variable.name.clone(), canonical.clone());
+            }
+        }
+        for entry in aliases {
+            model.remove(&entry.alias.name);
+        }
+        for entry in state_tokens {
+            model.remove(&entry.alias.name);
+        }
+        completed
+    }
+
+    /// After an exact depth query returned `unknown`, ask a relaxed copy of
+    /// that complete prefix-plus-query formula for one finite candidate model.
+    ///
+    /// Abstraction UNSAT/Unknown has no meaning here and returns `None`.
+    /// Abstraction SAT is likewise not a verdict: the caller must pass the
+    /// reconstructed model through `classify_flat_sat`, whose only accepting
+    /// arm is unchanged original-clause ground replay.
+    fn try_nested_select_observation_candidate(
+        &self,
+        prefix_conjuncts: &[ChcExpr],
+        query_groups: &[Vec<ChcExpr>],
+        depth: usize,
+        disable_lra_propagation: bool,
+        deadline: Option<ay_core::time::Instant>,
+    ) -> Option<FxHashMap<String, SmtValue>> {
+        let Some(candidate) = Self::abstract_nested_select_formula(
+            prefix_conjuncts,
+            query_groups,
+            depth,
+            &FxHashSet::default(),
+            deadline,
+        ) else {
+            return None;
+        };
+        let BmcNestedArrayCandidateFormula {
+            prefix_conjuncts: abstract_prefix,
+            query_groups: abstract_groups,
+            select_aliases: aliases,
+            state_tokens,
+            equal_state,
+        } = candidate;
+        let abstract_conjuncts: Vec<ChcExpr> = abstract_groups.iter().flatten().cloned().collect();
+        let mut smt = format!(
+            "(set-logic {})\n(set-option :produce-models true)\n",
+            self.detect_bmc_logic()
+        );
+        let mut declared_vars = FxHashSet::default();
+        for conjunct in prefix_conjuncts
+            .iter()
+            .chain(query_groups.iter().flatten())
+            .chain(abstract_prefix.iter())
+            .chain(abstract_conjuncts.iter())
+        {
+            for var in &conjunct.vars() {
+                if declared_vars.insert(var.name.clone()) {
+                    smt.push_str(&format!(
+                        "(declare-const {} {})\n",
+                        quote_symbol(&var.name),
+                        sort_to_smtlib(&var.sort),
+                    ));
+                }
+            }
+        }
+        for conjunct in &abstract_prefix {
+            smt.push_str(&format!(
+                "(assert {})\n",
+                InvariantModel::expr_to_smtlib(conjunct)
+            ));
+        }
+        if abstract_groups.len() > 1 {
+            let formula =
+                InvariantModel::expr_to_smtlib(&Self::query_groups_formula(&abstract_groups));
+            smt.push_str(&format!("(assert {formula})\n"));
+        } else {
+            for conjunct in &abstract_conjuncts {
+                smt.push_str(&format!(
+                    "(assert {})\n",
+                    InvariantModel::expr_to_smtlib(conjunct)
+                ));
+            }
+        }
+        smt.push_str("(check-sat)\n");
+
+        tracing::debug!(
+            "BMC nested-array candidate depth={depth}: observations={}, state_tokens={}, \
+             equality_components={}, prefix_conjuncts={}, query_conjuncts={}, declared={}, \
+             smt_bytes={}",
+            aliases.len(),
+            state_tokens.len(),
+            equal_state.len(),
+            prefix_conjuncts.len(),
+            abstract_conjuncts.len(),
+            declared_vars.len(),
+            smt.len()
+        );
+        log_nested_array_candidate(format_args!(
+            "depth={depth} solving: observations={} state_tokens={} equality_components={} \
+             prefix={} query={} declared={} smt_bytes={}",
+            aliases.len(),
+            state_tokens.len(),
+            equal_state.len(),
+            prefix_conjuncts.len(),
+            abstract_conjuncts.len(),
+            declared_vars.len(),
+            smt.len()
+        ));
+        let Ok(commands) = ay_frontend::parse(&smt) else {
+            log_nested_array_candidate(format_args!("depth={depth} candidate SMT parse failed"));
+            tracing::debug!("BMC nested-array candidate at depth {depth} failed to parse");
+            return None;
+        };
+        let mut exec = ay_dpll::Executor::new();
+        if disable_lra_propagation {
+            exec.set_no_lra_theory_propagation(true);
+        }
+        let Some(outputs) = Self::exec_commands_with_deadline(&mut exec, &commands, deadline)
+        else {
+            log_nested_array_candidate(format_args!(
+                "depth={depth} candidate executor/deadline failed"
+            ));
+            tracing::debug!("BMC nested-array candidate at depth {depth} did not execute");
+            return None;
+        };
+        let result = outputs.first().map_or("<no-output>", String::as_str);
+        log_nested_array_candidate(format_args!("depth={depth} relaxed_result={result}"));
+        tracing::debug!("BMC nested-array candidate at depth {depth} returned {result}");
+        if result != "sat" {
+            return None;
+        }
+
+        // Exact nested reads and nested state terms are deliberately absent
+        // from the relaxed candidate formula. Do not ask the Executor to
+        // evaluate the reads again: their alias values below are the finite
+        // observations. Scalar variables and all non-abstracted flat-array
+        // reads remain observed by the ordinary path.
+        let mut observation_conjuncts: Vec<ChcExpr> =
+            query_groups.iter().flatten().cloned().collect();
+        observation_conjuncts.extend(
+            aliases
+                .iter()
+                .map(|entry| ChcExpr::var(entry.alias.clone())),
+        );
+        let excluded_terms: Vec<ChcExpr> =
+            aliases.iter().map(|entry| entry.original.clone()).collect();
+        let Some(mut model) = self.observe_bmc_sat_model_excluding_array_terms(
+            &mut exec,
+            depth,
+            &observation_conjuncts,
+            &[&declared_vars],
+            &excluded_terms,
+            deadline,
+        ) else {
+            log_nested_array_candidate(format_args!(
+                "depth={depth} candidate observation batch failed"
+            ));
+            tracing::debug!("BMC nested-array candidate observation failed at depth {depth}");
+            return None;
+        };
+        let missing_scalar = aliases
+            .iter()
+            .filter(|entry| {
+                Self::trace_assignment_sort_supported(&entry.value_sort)
+                    && !model.contains_key(&entry.alias.name)
+            })
+            .count();
+        let missing_array = aliases
+            .iter()
+            .filter(|entry| {
+                matches!(&entry.value_sort, ChcSort::Array(_, _))
+                    && !model.contains_key(&entry.alias.name)
+            })
+            .count();
+        log_nested_array_candidate(format_args!(
+            "depth={depth} observed_model_entries={} missing_scalar_aliases={} \
+             missing_array_aliases={}",
+            model.len(),
+            missing_scalar,
+            missing_array
+        ));
+        let observed = Self::reconstruct_nested_select_aliases(
+            &mut model,
+            &aliases,
+            &state_tokens,
+            &equal_state,
+        );
+        if observed != aliases.len() {
+            log_nested_array_candidate(format_args!(
+                "depth={depth} reconstruction incomplete: {observed}/{}",
+                aliases.len()
+            ));
+            tracing::debug!(
+                "BMC nested-array observation candidate incomplete: {observed}/{} aliases",
+                aliases.len()
+            );
+            return None;
+        }
+        log_nested_array_candidate(format_args!(
+            "depth={depth} reconstruction complete: {observed}; exact replay next"
+        ));
+        tracing::debug!(
+            "BMC nested-array observation abstraction supplied {} finite values at depth {depth}; replaying original clauses",
+            aliases.len()
+        );
+        Some(model)
     }
 
     fn append_trace_get_value_commands(smt: &mut String, values: &[BmcTraceValue]) {
@@ -8972,11 +9978,41 @@ impl BmcSolver {
         declared: &[&FxHashSet<String>],
         deadline: Option<ay_core::time::Instant>,
     ) -> Option<FxHashMap<String, SmtValue>> {
+        self.observe_bmc_sat_model_excluding_array_terms(
+            exec,
+            max_depth,
+            query_conjuncts,
+            declared,
+            &[],
+            deadline,
+        )
+    }
+
+    /// Candidate-only observation variant. Each excluded exact array term has
+    /// a scalar alias whose value is reconstructed before original-clause
+    /// replay, so querying the unsupported exact term again would only repeat
+    /// the `unknown` that triggered this fallback.
+    fn observe_bmc_sat_model_excluding_array_terms(
+        &self,
+        exec: &mut ay_dpll::Executor,
+        max_depth: usize,
+        query_conjuncts: &[ChcExpr],
+        declared: &[&FxHashSet<String>],
+        excluded_array_terms: &[ChcExpr],
+        deadline: Option<ay_core::time::Instant>,
+    ) -> Option<FxHashMap<String, SmtValue>> {
         if deadline.is_some_and(|limit| ay_core::time::Instant::now() >= limit) {
             return None;
         }
 
         let mut trace_values = self.bmc_trace_values(max_depth, query_conjuncts);
+        trace_values.retain(|value| {
+            !matches!(
+                value,
+                BmcTraceValue::ArraySelectPath { .. }
+                    if excluded_array_terms.contains(&value.term())
+            )
+        });
         Self::retain_declared_trace_values(&mut trace_values, declared);
 
         let mut smt = String::from("(get-model)\n");
@@ -9143,68 +10179,427 @@ impl BmcSolver {
         // positional association so an error is skipped locally instead of
         // shifting later values onto the wrong trace term.
         let trace_outputs = &outputs[outputs.len() - values.len()..];
-        for (output, trace_value) in trace_outputs.iter().zip(values) {
-            let Some(value_expr) = Self::singleton_get_value_rhs(output) else {
-                continue;
-            };
-            let Some(value) = Self::trace_get_value_smt_value(&value_expr, trace_value.sort())
-            else {
-                continue;
-            };
-            match trace_value {
-                BmcTraceValue::Var(var) => {
-                    model.insert(var.name.clone(), value);
+        let parsed: Vec<Option<SmtValue>> = trace_outputs
+            .iter()
+            .zip(values)
+            .map(|(output, trace_value)| {
+                let value_expr = Self::singleton_get_value_rhs(output)?;
+                Self::trace_get_value_smt_value(&value_expr, trace_value.sort())
+            })
+            .collect();
+
+        // Variables first, regardless of command order: array path indices can
+        // mention a scalar whose observation happened to be emitted later.
+        for (trace_value, value) in values.iter().zip(&parsed) {
+            if let (BmcTraceValue::Var(var), Some(value)) = (trace_value, value) {
+                model.insert(var.name.clone(), value.clone());
+            }
+        }
+
+        let observations: Vec<BmcArrayObservation> = values
+            .iter()
+            .zip(parsed)
+            .filter_map(|(trace_value, value)| match (trace_value, value) {
+                (BmcTraceValue::ArraySelectPath { array, indices, .. }, Some(value)) => {
+                    Some(BmcArrayObservation {
+                        array: array.clone(),
+                        indices: indices.clone(),
+                        value,
+                    })
                 }
-                BmcTraceValue::ArraySelect {
-                    array,
-                    index,
-                    index_sort,
-                    value_sort,
-                } => {
-                    let env = Self::model_i128_env(model);
-                    if let Some(index_value) =
-                        Self::model_expr_smt_value_for_sort(index, index_sort, model, &env)
-                    {
-                        Self::insert_array_select_observation(
-                            model,
-                            array,
-                            value_sort,
-                            index_value,
-                            value,
-                        );
-                    }
-                }
+                _ => None,
+            })
+            .collect();
+        Self::reconstruct_trace_array_observations(model, &observations);
+    }
+
+    /// Materialize the finite nested-array cells returned by trace
+    /// `(get-value ...)` commands.
+    ///
+    /// The scalar leaf values are exact observations from the SAT model. Array
+    /// values printed by the executor are less expressive: two distinct
+    /// array-valued indices can both render as the same default-only constant
+    /// array, even when differing leaf reads prove they cannot be equal. Before
+    /// installing cells, separate ONLY those collided array keys that are
+    /// forced apart by incompatible observed leaves. The completed model still
+    /// decides nothing by itself; `validate_ground_derivation` re-evaluates
+    /// every clause and premise link before Unsafe can be returned.
+    fn reconstruct_trace_array_observations(
+        model: &mut FxHashMap<String, SmtValue>,
+        observations: &[BmcArrayObservation],
+    ) {
+        // A path may use another reconstructed array as its index:
+        // `F[E][0]`, with a separate observation that later refines `E[5]`.
+        // One source-order pass would install the outer `F` cell under E's OLD
+        // concrete value and then change the lookup key. Iterate to a semantic
+        // fixpoint so dependencies settle regardless of observation order.
+        //
+        // The cap is a completeness bound only. A non-convergent or longer
+        // dependency chain leaves an incomplete model which the unchanged
+        // ground validator rejects; it can never manufacture Unsafe.
+        const MAX_RECONSTRUCTION_ROUNDS: usize = 32;
+        let rounds = observations
+            .len()
+            .saturating_add(1)
+            .min(MAX_RECONSTRUCTION_ROUNDS);
+        for _ in 0..rounds {
+            let mut changed = Self::separate_colliding_trace_array_keys(model, observations);
+            for observation in observations {
+                changed |= Self::insert_trace_array_observation(model, observation);
+            }
+            if !changed {
+                break;
             }
         }
     }
 
-    fn insert_array_select_observation(
+    /// Repair the executor renderer's one lossy case needed by nested reads:
+    /// syntactically different ARRAY-SORTED index variables rendered to one
+    /// concrete value while exact scalar observations at the resulting full
+    /// path disagree.
+    ///
+    /// A conflicting pair is a proof that the two keys cannot denote the same
+    /// array in the SAT model (array congruence would make the leaves equal).
+    /// Give one key expression a fresh finite concrete array and rebuild all
+    /// observations against it. A direct variable is replaced in the model;
+    /// a composite select such as `(select^4 C h)` is completed by installing
+    /// the fresh value at that finite path in `C`. Equal-valued observations
+    /// and scalar key collisions are left untouched and fail closed later if
+    /// the printable model remains insufficient.
+    fn separate_colliding_trace_array_keys(
         model: &mut FxHashMap<String, SmtValue>,
-        array: &ChcVar,
-        value_sort: &ChcSort,
-        index: SmtValue,
+        observations: &[BmcArrayObservation],
+    ) -> bool {
+        let mut nonce = 0usize;
+        let mut changed = false;
+        for _ in 0..observations.len().saturating_mul(2).max(1) {
+            let mut repair: Option<(ChcVar, Vec<(ChcExpr, ChcSort)>, ChcSort)> = None;
+            let mut paths: FxHashMap<String, (usize, Vec<SmtValue>)> = FxHashMap::default();
+            for (right_index, right) in observations.iter().enumerate() {
+                let Some(right_values) = Self::trace_observation_indices(right, model) else {
+                    continue;
+                };
+                let Some(path_key) = Self::trace_values_semantic_key(&right_values) else {
+                    continue;
+                };
+                let key = format!("{:?}::{path_key:?}", right.array.name);
+                let Some((left_index, left_values)) = paths.get(&key) else {
+                    paths.insert(key, (right_index, right_values));
+                    continue;
+                };
+                let left = &observations[*left_index];
+                if left.array.name != right.array.name
+                    || Self::trace_values_semantically_equal(
+                        std::slice::from_ref(&left.value),
+                        std::slice::from_ref(&right.value),
+                    ) == Some(true)
+                    || Self::trace_values_semantically_equal(left_values, &right_values)
+                        != Some(true)
+                {
+                    continue;
+                }
+
+                for (((left_expr, left_sort), (right_expr, right_sort)), (lv, rv)) in left
+                    .indices
+                    .iter()
+                    .zip(&right.indices)
+                    .zip(left_values.iter().zip(&right_values))
+                {
+                    if left_expr == right_expr
+                        || left_sort != right_sort
+                        || Self::trace_values_semantically_equal(
+                            std::slice::from_ref(lv),
+                            std::slice::from_ref(rv),
+                        ) != Some(true)
+                        || !matches!(right_sort, ChcSort::Array(_, _))
+                    {
+                        continue;
+                    }
+                    let target = match right_expr {
+                        ChcExpr::Var(var) => Some((var.clone(), Vec::new(), right_sort.clone())),
+                        _ => Self::trace_array_select_path(right_expr),
+                    };
+                    let Some((array, indices, value_sort)) = target else {
+                        continue;
+                    };
+                    if &value_sort != right_sort {
+                        continue;
+                    }
+                    repair = Some((array, indices, value_sort));
+                    break;
+                }
+                if repair.is_some() {
+                    break;
+                }
+            }
+
+            let Some((array, indices, value_sort)) = repair else {
+                break;
+            };
+            let path_values: Vec<SmtValue> = observations
+                .iter()
+                .filter_map(|observation| Self::trace_observation_indices(observation, model))
+                .flatten()
+                .collect();
+            let mut replacement = None;
+            for _ in 0..128 {
+                nonce = nonce.saturating_add(1);
+                let Some(candidate) = Self::fresh_trace_array_key(&value_sort, nonce) else {
+                    break;
+                };
+                let Some(candidate_key) = Self::trace_value_semantic_key(&candidate) else {
+                    break;
+                };
+                let used_by_model = model.values().any(|value| {
+                    Self::trace_value_semantic_key(value)
+                        .is_some_and(|value_key| value_key == candidate_key)
+                });
+                let used_by_path = path_values.iter().any(|value| {
+                    Self::trace_value_semantic_key(value)
+                        .is_some_and(|value_key| value_key == candidate_key)
+                });
+                if !used_by_model && !used_by_path {
+                    replacement = Some(candidate);
+                    break;
+                }
+            }
+            let Some(replacement) = replacement else {
+                break;
+            };
+            let repaired = if indices.is_empty() {
+                model.insert(array.name, replacement);
+                true
+            } else {
+                Self::insert_trace_array_observation(
+                    model,
+                    &BmcArrayObservation {
+                        array,
+                        indices,
+                        value: replacement,
+                    },
+                )
+            };
+            if !repaired {
+                break;
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    fn trace_observation_indices(
+        observation: &BmcArrayObservation,
+        model: &FxHashMap<String, SmtValue>,
+    ) -> Option<Vec<SmtValue>> {
+        let env = Self::model_i128_env(model);
+        observation
+            .indices
+            .iter()
+            .map(|(index, sort)| Self::model_expr_smt_value_for_sort(index, sort, model, &env))
+            .collect()
+    }
+
+    /// Canonical finite value key using the same extensional interpretation as
+    /// ground array evaluation.
+    ///
+    /// `ArrayMap(default=0, [5 -> 0])` and `ConstArray(0)` intentionally share
+    /// a key; store order and shadowed writes are normalized away. An Opaque
+    /// component has no concrete extensional meaning and returns `None`, so it
+    /// can never justify separating two rendered keys.
+    fn trace_value_semantic_key(value: &SmtValue) -> Option<String> {
+        match value {
+            SmtValue::Bool(value) => Some(format!("bool:{value}")),
+            SmtValue::Int(value) => Some(format!("int:{value}")),
+            SmtValue::BigInt(value) => Some(format!("bigint:{value}")),
+            SmtValue::Real(value) => Some(format!("real:{value}")),
+            SmtValue::BitVec(value, width) => Some(format!("bv:{width}:{value}")),
+            SmtValue::Opaque(_) => None,
+            SmtValue::ConstArray(default) => {
+                let default = Self::trace_value_semantic_key(default)?;
+                Some(format!("array:{default:?}:[]"))
+            }
+            SmtValue::ArrayMap { default, entries } => {
+                let default = Self::trace_value_semantic_key(default)?;
+                let mut normalized: Vec<(String, String)> = Vec::new();
+                for (index, value) in entries {
+                    let index = Self::trace_value_semantic_key(index)?;
+                    let value = Self::trace_value_semantic_key(value)?;
+                    normalized.retain(|(stored_index, _)| stored_index != &index);
+                    if value != default {
+                        normalized.push((index, value));
+                    }
+                }
+                normalized.sort();
+                Some(format!("array:{default:?}:{normalized:?}"))
+            }
+            SmtValue::Datatype(constructor, fields) => {
+                let fields: Option<Vec<String>> =
+                    fields.iter().map(Self::trace_value_semantic_key).collect();
+                Some(format!("datatype:{constructor:?}:{:?}", fields?))
+            }
+        }
+    }
+
+    fn trace_values_semantic_key(values: &[SmtValue]) -> Option<Vec<String>> {
+        values.iter().map(Self::trace_value_semantic_key).collect()
+    }
+
+    fn trace_values_semantically_equal(left: &[SmtValue], right: &[SmtValue]) -> Option<bool> {
+        if left.len() != right.len() {
+            return Some(false);
+        }
+        for (left, right) in left.iter().zip(right) {
+            match (left, right) {
+                (SmtValue::Opaque(left), SmtValue::Opaque(right)) if left == right => continue,
+                (SmtValue::Opaque(_), _) | (_, SmtValue::Opaque(_)) => return None,
+                _ => {}
+            }
+            let (Some(left), Some(right)) = (
+                Self::trace_value_semantic_key(left),
+                Self::trace_value_semantic_key(right),
+            ) else {
+                return None;
+            };
+            if left != right {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    /// A finite array value distinct from the default-only renderer output.
+    ///
+    /// The point index varies with `nonce`, so integer/bitvector-indexed arrays
+    /// admit many deterministic fingerprints. Unsupported or finite-exhausted
+    /// sorts simply return `None`; witness reconstruction then remains
+    /// incomplete and validation rejects it.
+    fn fresh_trace_array_key(sort: &ChcSort, nonce: usize) -> Option<SmtValue> {
+        let ChcSort::Array(index_sort, value_sort) = sort else {
+            return None;
+        };
+        let default = Self::default_smt_value_for_sort(value_sort)?;
+        let index = Self::trace_fingerprint_value(index_sort, nonce)?;
+        let value = Self::trace_nondefault_value(value_sort, nonce)?;
+        if value == default {
+            return None;
+        }
+        Some(SmtValue::ArrayMap {
+            default: Box::new(default),
+            entries: vec![(index, value)],
+        })
+    }
+
+    fn trace_fingerprint_value(sort: &ChcSort, nonce: usize) -> Option<SmtValue> {
+        let n = i128::try_from(nonce).ok()?;
+        match sort {
+            ChcSort::Bool => Some(SmtValue::Bool(nonce % 2 != 0)),
+            ChcSort::Int => Some(SmtValue::Int(n.checked_neg()?.checked_sub(1)?)),
+            ChcSort::BitVec(width) if *width != 0 => {
+                Some(SmtValue::BitVec((nonce as u128) & bv_mask(*width), *width))
+            }
+            ChcSort::Array(_, _) => Self::fresh_trace_array_key(sort, nonce),
+            ChcSort::BitVec(_)
+            | ChcSort::Real
+            | ChcSort::Uninterpreted(_)
+            | ChcSort::Datatype { .. } => None,
+        }
+    }
+
+    fn trace_nondefault_value(sort: &ChcSort, nonce: usize) -> Option<SmtValue> {
+        let n = i128::try_from(nonce).ok()?;
+        match sort {
+            ChcSort::Bool => Some(SmtValue::Bool(true)),
+            ChcSort::Int => Some(SmtValue::Int(n.checked_add(1)?)),
+            ChcSort::BitVec(width) if *width != 0 => {
+                let value = ((nonce as u128) & bv_mask(*width)).max(1);
+                Some(SmtValue::BitVec(value, *width))
+            }
+            ChcSort::Array(_, _) => Self::fresh_trace_array_key(sort, nonce),
+            ChcSort::BitVec(_)
+            | ChcSort::Real
+            | ChcSort::Uninterpreted(_)
+            | ChcSort::Datatype { .. } => None,
+        }
+    }
+
+    fn insert_trace_array_observation(
+        model: &mut FxHashMap<String, SmtValue>,
+        observation: &BmcArrayObservation,
+    ) -> bool {
+        let Some(indices) = Self::trace_observation_indices(observation, model) else {
+            return false;
+        };
+        let existing = model
+            .get(&observation.array.name)
+            .and_then(|value| Self::model_smt_value_for_sort(value, &observation.array.sort))
+            .or_else(|| Self::default_smt_value_for_sort(&observation.array.sort));
+        let Some(existing) = existing else {
+            return false;
+        };
+        let old_key = Self::trace_value_semantic_key(&existing);
+        let Some(updated) = Self::trace_array_value_with_observation(
+            existing,
+            &observation.array.sort,
+            &indices,
+            observation.value.clone(),
+        ) else {
+            return false;
+        };
+        let new_key = Self::trace_value_semantic_key(&updated);
+        model.insert(observation.array.name.clone(), updated);
+        old_key != new_key
+    }
+
+    fn trace_array_value_with_observation(
+        array: SmtValue,
+        sort: &ChcSort,
+        indices: &[SmtValue],
         value: SmtValue,
-    ) {
-        let Some(fallback_default) = Self::default_smt_value_for_sort(value_sort) else {
-            return;
+    ) -> Option<SmtValue> {
+        let (index, remaining) = indices.split_first()?;
+        let ChcSort::Array(_, element_sort) = sort else {
+            return None;
         };
-        let existing = model.remove(&array.name);
-        let (default, mut entries) = match existing {
-            Some(SmtValue::ConstArray(default))
-                if Self::model_smt_value_for_sort(&default, value_sort).is_some() =>
-            {
-                (default, Vec::new())
-            }
-            Some(SmtValue::ArrayMap { default, entries })
-                if Self::model_smt_value_for_sort(&default, value_sort).is_some() =>
-            {
-                (default, entries)
-            }
-            _ => (Box::new(fallback_default), Vec::new()),
+        let array = match array {
+            value @ (SmtValue::ConstArray(_) | SmtValue::ArrayMap { .. }) => value,
+            _ => Self::default_smt_value_for_sort(sort)?,
         };
-        entries.retain(|(stored_index, _)| stored_index != &index);
-        entries.push((index, value));
-        model.insert(array.name.clone(), SmtValue::ArrayMap { default, entries });
+        let child = crate::expr::eval_array_select(&array, index)
+            .and_then(|value| Self::model_smt_value_for_sort(&value, element_sort))
+            .or_else(|| Self::default_smt_value_for_sort(element_sort))?;
+        let child = if remaining.is_empty() {
+            Self::model_smt_value_for_sort(&value, element_sort)?
+        } else {
+            Self::trace_array_value_with_observation(child, element_sort, remaining, value)?
+        };
+        Some(Self::trace_array_point_override(
+            array,
+            index.clone(),
+            child,
+        ))
+    }
+
+    fn trace_array_point_override(array: SmtValue, index: SmtValue, value: SmtValue) -> SmtValue {
+        match array {
+            SmtValue::ConstArray(default) => SmtValue::ArrayMap {
+                default,
+                entries: vec![(index, value)],
+            },
+            SmtValue::ArrayMap {
+                default,
+                mut entries,
+            } => {
+                entries.retain(|(stored_index, _)| {
+                    Self::trace_values_semantically_equal(
+                        std::slice::from_ref(stored_index),
+                        std::slice::from_ref(&index),
+                    ) != Some(true)
+                });
+                entries.push((index, value));
+                SmtValue::ArrayMap { default, entries }
+            }
+            other => other,
+        }
     }
 
     fn default_smt_value_for_sort(sort: &ChcSort) -> Option<SmtValue> {

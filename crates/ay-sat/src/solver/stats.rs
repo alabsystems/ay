@@ -592,6 +592,21 @@ impl Solver {
         self.stats.assumption_cache_misses
     }
 
+    /// #unguarded-tvalid-lemmas STAGE 0: conflicts whose conflicting clause
+    /// was born in a PRIOR incremental solve — the direct measure of
+    /// cross-solve clause carryover. See
+    /// `SolverStats::conflicts_from_prior_solve_clauses`.
+    pub fn conflicts_from_prior_solve_clauses(&self) -> u64 {
+        self.stats.conflicts_from_prior_solve_clauses
+    }
+
+    /// #unguarded-tvalid-lemmas STAGE 0: conflicts that fired within the
+    /// assumption prefix (scope selectors + user assumptions). See
+    /// `SolverStats::assumption_level_conflicts`.
+    pub fn assumption_level_conflicts(&self) -> u64 {
+        self.stats.assumption_level_conflicts
+    }
+
     /// Cumulative conflict count across all incremental solve calls (#8208).
     ///
     /// Returns `lifetime_conflicts + num_conflicts` where `lifetime_conflicts`

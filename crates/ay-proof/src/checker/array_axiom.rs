@@ -733,6 +733,11 @@ impl<'a> FoldedReadWorkBudget<'a> {
     // current Trust compiler deprecates its semantics-identical old name.
     #[allow(deprecated)]
     fn consume(&mut self) -> bool {
+        // `fetch_update` is the stable equivalent of the unstable
+        // `atomic_try_update::try_update` (identical signature and
+        // Ok(prev)/Err(prev) semantics). Using it keeps ay-proof buildable as a
+        // dependency under model-checker-consumer's pinned nightly, which does not enable the
+        // `atomic_try_update` feature.
         if self
             .remaining
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {

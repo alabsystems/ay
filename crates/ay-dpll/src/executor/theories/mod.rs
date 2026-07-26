@@ -55,6 +55,7 @@ mod model_helpers;
 mod multiset;
 mod nra;
 mod propositional;
+mod rdl;
 mod seq;
 mod set;
 mod skolem_cache;

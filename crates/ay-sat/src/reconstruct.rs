@@ -21,38 +21,6 @@ mod tests;
 #[cfg(kani)]
 mod verification;
 
-/// Minimum stack length before `suppress_prior_witness_entries` attempts compaction.
-/// Below this threshold the bookkeeping cost outweighs the memory savings.
-/// (#8672)
-const RECONSTRUCT_COMPACT_MIN_LEN: usize = 4_096;
-/// Fraction of suppressed entries that triggers opportunistic compaction.
-/// Measured as (suppressed_count * 100) / steps.len() >= this value.
-/// (#8672)
-const RECONSTRUCT_COMPACT_SUPPRESSED_PCT: usize = 25;
-
-/// Kill-switch for the O(1) `suppress_prior_witness_entries` early return
-/// (wf_0552d0f0 BVE inner-loop lever #1). Default ON.
-///
-/// Per-operation the guard is semantics-identical by construction: it skips
-/// the suppression scan only when a per-variable upper bound proves the scan
-/// would mark nothing, and the opportunistic-compaction trigger is evaluated
-/// with an exactly maintained live count so compaction fires at the same
-/// calls either way. Note that BVE budgets measured in WALL TIME therefore
-/// complete more eliminations per second with the guard on, so time-truncated
-/// totals (e.g. `bve_eliminated` on a run that hits the fastelim wall) can
-/// increase — that is the point of the lever, not a semantic divergence.
-/// Set `AY_AB_BVE_FAST_INNER=0` to force the full scan on every call.
-fn bve_fast_inner_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        !matches!(
-            std::env::var("AY_AB_BVE_FAST_INNER").ok().as_deref(),
-            Some("0")
-        )
-    })
-}
-
 /// Result of draining witness entries from the reconstruction stack.
 ///
 /// Carries both the restored clauses and the exact variable indices that
@@ -77,27 +45,6 @@ pub(crate) struct WitnessClause {
     pub(crate) witness: Vec<Literal>,
     /// The full clause that was removed
     pub(crate) clause: Vec<Literal>,
-    /// When true, this entry is skipped during reconstruction.
-    ///
-    /// CaDiCaL deduplicates witness literals via `marked()` in
-    /// `push_witness_literal_on_extension_stack` (extend.cpp:42-45).
-    /// When CCE/BCE removes a clause containing variable V before BVE
-    /// eliminates V, both push reconstruction entries with V as witness.
-    /// During reverse reconstruction, the BVE entry processes first
-    /// (setting V correctly), then the earlier CCE entry flips V again,
-    /// breaking clauses. Suppressing pre-BVE entries for the same
-    /// witness variable prevents this double-flip. (#8179)
-    pub(crate) suppressed: bool,
-    /// When true, this entry is immune to `suppress_prior_witness_entries`.
-    ///
-    /// Backward-subsumed clause reconstruction entries (#8367) must
-    /// survive suppression: the subsumed clause D was already deleted
-    /// from occ lists, so when the witness variable is later eliminated
-    /// by BVE, BVE won't push D (it's dead). Our entry is the only
-    /// record of D on the reconstruction stack. Unlike BCE/CCE entries,
-    /// these don't cause double-flipping because BVE pushes entries for
-    /// its own alive clauses separately.
-    pub(crate) preserve: bool,
 }
 
 /// A single reconstruction step.
@@ -120,35 +67,12 @@ pub(crate) enum ReconstructionStep {
 pub(crate) struct ReconstructionStack {
     /// Steps in order they were applied (reconstruction reverses this)
     steps: Vec<ReconstructionStep>,
-    /// Per-external-var-index UPPER BOUND on the number of unsuppressed,
-    /// non-preserved witness entries whose witness mentions the variable
-    /// (wf_0552d0f0 lever #1). `0` proves there is nothing for
-    /// `suppress_prior_witness_entries` to suppress, allowing an O(1)
-    /// early return instead of an O(stack) scan.
-    ///
-    /// Invariant (why this is exact, not heuristic): counts can only be
-    /// stale-HIGH (a redundant scan is safe); a false zero is impossible
-    /// because every non-preserved `push_witness_clause` increments the
-    /// count for each witness variable, and a count is only zeroed after
-    /// a completed scan suppressed every matching entry (or after a full
-    /// witness drain emptied the stack of witness entries).
-    witness_var_counts: Vec<u32>,
-    /// Exact count of suppressed, non-preserved witness entries currently
-    /// in `steps`. Lets the early-return path evaluate the opportunistic
-    /// compaction trigger (#8672) with the same value the full scan would
-    /// have computed, keeping compaction timing byte-identical whether or
-    /// not the scan is skipped.
-    suppressed_live: usize,
 }
 
 impl ReconstructionStack {
     /// Create an empty reconstruction stack.
     pub(crate) fn new() -> Self {
-        Self {
-            steps: Vec::new(),
-            witness_var_counts: Vec::new(),
-            suppressed_live: 0,
-        }
+        Self { steps: Vec::new() }
     }
 
     /// Number of reconstruction steps.
@@ -156,40 +80,11 @@ impl ReconstructionStack {
         self.steps.len()
     }
 
-    /// Remove suppressed witness entries that no longer participate in reconstruction.
-    ///
-    /// Preserved witness entries and all `Sweep` steps are retained. Returns the
-    /// number of entries removed so callers can assert or report compaction.
-    pub(crate) fn compact_suppressed(&mut self) -> usize {
-        let original_len = self.steps.len();
-        self.steps.retain(|step| match step {
-            ReconstructionStep::Witness(wc) => !wc.suppressed || wc.preserve,
-            ReconstructionStep::Sweep { .. } => true,
-        });
-
-        let removed = original_len - self.steps.len();
-        if removed > 0 && self.steps.capacity() > self.steps.len().saturating_mul(2) {
-            self.steps.shrink_to_fit();
-        }
-        // Every suppressed non-preserved entry was just removed (the scan
-        // never suppresses preserved entries, so suppressed && preserve
-        // entries do not exist).
-        self.suppressed_live = 0;
-        removed
-    }
-
-    /// Estimated heap memory usage in bytes (#8672).
+    /// Estimated heap memory usage in bytes.
     ///
     /// Includes the Vec<ReconstructionStep> backbone and the heap allocations
     /// within each step (witness and clause Vecs for Witness entries, lit_map
     /// for Sweep entries).
-    ///
-    /// Deliberately EXCLUDES `witness_var_counts` (wf_0552d0f0 lever #1):
-    /// this value feeds the clause-DB reduction trigger
-    /// (`clause_db_memory_bytes`), and the counts vector is a small
-    /// (4 bytes/var), bounded index rather than clause data — including it
-    /// would shift the reduction trigger relative to the pre-lever solver
-    /// and break behavior-identity of the O(1) suppress guard.
     pub(crate) fn memory_bytes(&self) -> usize {
         let backbone = self.steps.capacity() * size_of::<ReconstructionStep>();
         let step_contents: usize = self
@@ -219,8 +114,6 @@ impl ReconstructionStack {
     #[cfg(kani)]
     pub(crate) fn clear(&mut self) {
         self.steps.clear();
-        self.witness_var_counts.clear();
-        self.suppressed_live = 0;
     }
 
     /// Drain witness entries from the reconstruction stack, preserving non-witness steps.
@@ -249,10 +142,6 @@ impl ReconstructionStack {
             }
         }
         self.steps = retained;
-        // No witness entries remain: every count is exactly 0 and no
-        // suppressed entry survives (Sweep steps are neither).
-        self.witness_var_counts.iter_mut().for_each(|c| *c = 0);
-        self.suppressed_live = 0;
 
         WitnessDrainResult {
             reactivate_vars: var_set.into_iter().collect(),
@@ -277,14 +166,6 @@ impl ReconstructionStack {
         for step in tail {
             match step {
                 ReconstructionStep::Witness(wc) => {
-                    // Keep `suppressed_live` exact: drained suppressed
-                    // non-preserved entries no longer count toward the
-                    // opportunistic-compaction trigger. `witness_var_counts`
-                    // is intentionally left stale-HIGH (a redundant scan is
-                    // safe; a false zero is what must never happen).
-                    if wc.suppressed && !wc.preserve {
-                        self.suppressed_live = self.suppressed_live.saturating_sub(1);
-                    }
                     for &lit in &wc.witness {
                         var_set.insert(lit.variable().index());
                     }
@@ -360,131 +241,10 @@ impl ReconstructionStack {
             !clause.is_empty(),
             "BUG: empty clause in reconstruction entry"
         );
-        // Maintain the per-variable upper bound for the O(1) suppress guard
-        // (wf_0552d0f0 lever #1). Saturating: a pinned-high count only costs
-        // a redundant scan, never a missed suppression.
-        for w in &witness {
-            let vi = w.variable().index();
-            if vi >= self.witness_var_counts.len() {
-                self.witness_var_counts.resize(vi + 1, 0);
-            }
-            self.witness_var_counts[vi] = self.witness_var_counts[vi].saturating_add(1);
-        }
         self.steps.push(ReconstructionStep::Witness(WitnessClause {
             witness,
             clause,
-            suppressed: false,
-            preserve: false,
         }));
-    }
-
-    /// Push a preserved witness-clause reconstruction entry (#8367).
-    ///
-    /// Identical to `push_witness_clause` but sets `preserve: true`, making
-    /// the entry immune to `suppress_prior_witness_entries`. Used for
-    /// backward-subsumed clauses: the subsumed clause D is already dead in
-    /// occ lists when the witness variable is later eliminated by BVE, so
-    /// BVE won't push D. Our entry is the only record of D on the
-    /// reconstruction stack, and suppressing it would lose D permanently.
-    #[allow(dead_code)] // audited-unused: kept pending the next dead-code cleanup slice
-    pub(crate) fn push_preserved_witness_clause(
-        &mut self,
-        witness: Vec<Literal>,
-        clause: Vec<Literal>,
-    ) {
-        debug_assert!(
-            !witness.is_empty(),
-            "BUG: empty witness in preserved reconstruction entry"
-        );
-        debug_assert!(
-            !clause.is_empty(),
-            "BUG: empty clause in preserved reconstruction entry"
-        );
-        self.steps.push(ReconstructionStep::Witness(WitnessClause {
-            witness,
-            clause,
-            suppressed: false,
-            preserve: true,
-        }));
-    }
-
-    /// Suppress all prior witness entries whose witness literal matches the
-    /// given external variable index.
-    ///
-    /// CaDiCaL deduplicates witness literals via `marked()` checks in
-    /// `push_witness_literal_on_extension_stack` (extend.cpp:42-45). When
-    /// CCE/BCE removes a clause with witness variable V before BVE eliminates
-    /// V, both techniques push reconstruction entries for V. During reverse
-    /// reconstruction, the later BVE entries process first (correctly setting
-    /// V), but then the earlier CCE/BCE entries flip V again, corrupting the
-    /// model.
-    ///
-    /// This method marks all existing witness entries for `ext_var_idx` as
-    /// suppressed so they are skipped during reconstruction. Called from
-    /// `apply_bve_elimination_result` before pushing BVE witness entries.
-    /// Reference: CaDiCaL extend.cpp:42-45, elim.cpp:625. (#8179)
-    pub(crate) fn suppress_prior_witness_entries(&mut self, ext_var_idx: usize) {
-        let total = self.steps.len();
-
-        // O(1) early return (wf_0552d0f0 lever #1): a zero upper bound
-        // proves the scan below would suppress nothing, so skipping it is
-        // semantics-preserving. Without this guard, BVE after a large
-        // substitution collapse rescans a few-hundred-thousand-entry stack
-        // once per elimination — O(elims x stack), the measured 9-30K
-        // elims/s plateau. The opportunistic-compaction trigger (#8672) is
-        // still evaluated, using the exactly-maintained `suppressed_live`,
-        // so compaction fires at the same calls as the full scan would.
-        if bve_fast_inner_enabled()
-            && self
-                .witness_var_counts
-                .get(ext_var_idx)
-                .copied()
-                .unwrap_or(0)
-                == 0
-        {
-            if total >= RECONSTRUCT_COMPACT_MIN_LEN
-                && self.suppressed_live.saturating_mul(100)
-                    >= RECONSTRUCT_COMPACT_SUPPRESSED_PCT.saturating_mul(total)
-            {
-                self.compact_suppressed();
-            }
-            return;
-        }
-
-        let mut suppressed_count: usize = 0;
-
-        for step in &mut self.steps {
-            if let ReconstructionStep::Witness(wc) = step {
-                if wc.suppressed && !wc.preserve {
-                    suppressed_count += 1;
-                } else if !wc.preserve
-                    && wc
-                        .witness
-                        .iter()
-                        .any(|w| w.variable().index() == ext_var_idx)
-                {
-                    wc.suppressed = true;
-                    suppressed_count += 1;
-                }
-            }
-        }
-
-        // Every unsuppressed non-preserved entry mentioning ext_var_idx was
-        // just suppressed by the completed scan: the upper bound is exactly
-        // 0 again, and `suppressed_count` is the exact number of suppressed
-        // non-preserved entries in the stack (the scan re-counts previously
-        // suppressed ones), so it re-synchronizes `suppressed_live`.
-        if let Some(c) = self.witness_var_counts.get_mut(ext_var_idx) {
-            *c = 0;
-        }
-        self.suppressed_live = suppressed_count;
-
-        if total >= RECONSTRUCT_COMPACT_MIN_LEN
-            && suppressed_count.saturating_mul(100)
-                >= RECONSTRUCT_COMPACT_SUPPRESSED_PCT.saturating_mul(total)
-        {
-            self.compact_suppressed();
-        }
     }
 
     /// Push sweep (equivalence merging) as per-equivalence binary clause
@@ -571,9 +331,6 @@ impl ReconstructionStack {
         for step in self.steps.iter().rev() {
             match step {
                 ReconstructionStep::Witness(wc) => {
-                    if wc.suppressed {
-                        continue;
-                    }
                     reconstruct_witness(model, &wc.witness, &wc.clause);
                 }
                 ReconstructionStep::Sweep { num_vars, lit_map } => {

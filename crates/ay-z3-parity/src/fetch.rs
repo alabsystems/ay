@@ -1,29 +1,47 @@
 // Copyright 2026 Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! `fetch` subcommand — re-download and DETERMINISTICALLY sample the SMT-LIB
-//! test corpus, in-tree.
+//! `fetch` subcommand — materialize the SMT-LIB test corpus in-tree.
 //!
-//! This is a faithful Rust port of `benchmarks/smtlib-sample/fetch-all.sh`:
-//! it queries the Zenodo API for a record (default `11061097` = SMT-LIB release
+//! Queries the Zenodo API for a record (default `11061097` = SMT-LIB release
 //! 2024, non-incremental), lists the per-division `<DIV>.tar.zst` archives with
 //! their published md5 + size, downloads each, verifies the md5, extracts the
-//! zstd tarball, and writes an evenly-spaced sample of its `.smt2` files flat
-//! into `<dest>/<DIV>/` (archive-relative `/` → `__`).
+//! zstd tarball, and writes its `.smt2` files flat into `<dest>/<DIV>/`
+//! (archive-relative `/` → `__`).
 //!
-//! Determinism (identical rule to both fetch scripts): list every `*.smt2`
-//! path in the archive, sort byte-wise (`LC_ALL=C`), then take `n` files at
-//! indices `floor(i*total/n)` for `i` in `0..n`, de-duplicated. The same
-//! archive therefore yields the same sample and byte-identical output files.
+//! # Coverage is complete by default
+//!
+//! **Every division, every file.** There is no default size cap and no default
+//! sampling. This matters more than it sounds: this tool previously defaulted to
+//! a 60 MB archive cap, which silently dropped the ten largest divisions —
+//! `QF_BV` (1.7 GB), `QF_LIA` (689 MB), `QF_IDL`, `QF_LRA`, `QF_NIA`, `QF_NRA`,
+//! `QF_ABV`, `BV`, `AUFBV`, `QF_UFBV` — i.e. exactly the logics z3 is most used
+//! for. Every AY-vs-z3 completeness and speed number measured against such a
+//! corpus silently excluded them, and nothing in the output said so.
+//!
+//! Narrowing is therefore always opt-in (`--sample`, `--max-mb`, `--divisions`)
+//! and always **loudly reported**: a `coverage:` line up front, and a
+//! `!! INCOMPLETE COVERAGE` block naming every excluded division at the end. A
+//! run whose output carries no such block fetched the whole record.
+//!
+//! Use `--list` to inspect what a given option set would include or exclude
+//! without touching the network beyond the record metadata.
+//!
+//! Determinism (only relevant under `--sample`): list every `*.smt2` path in
+//! the archive, sort byte-wise (`LC_ALL=C`), then take `n` files at indices
+//! `floor(i*total/n)` for `i` in `0..n`, de-duplicated. The same archive
+//! therefore yields the same sample and byte-identical output files. This is the
+//! rule the retired `fetch.sh` / `fetch-all.sh` shell scripts used, so
+//! `--divisions QF_AX,QF_S,QF_SLIA,QF_UF,QF_UFLIA --sample 300` reproduces the
+//! historical 1,500-file `benchmarks/smtlib-sample` tree byte-for-byte.
 //!
 //! Robustness: a failed download, metadata mismatch, unsafe archive, extract
 //! failure, or empty division skips ONLY that division with a warning — the run
 //! continues and exits non-zero after attempting the remaining divisions.
 //! Destination replacement is staged, collision-checked, and stale-file-free.
 //! Network and extraction are done by shelling out to `curl`, `md5`/`md5sum`,
-//! and `tar --use-compress-program=unzstd`, exactly as the shell scripts do
-//! (no new dependencies); the API JSON is parsed with the crate's existing
-//! `serde_json`.
+//! and `tar --use-compress-program=unzstd` (no new dependencies); the API JSON
+//! is parsed with the crate's existing `serde_json`.
 
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -32,14 +50,31 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_RECORD: &str = "11061097";
+/// Files sampled per division when `--sample N` is given. There is no default
+/// sample: omitting the flag takes every file in the division.
 const DEFAULT_SAMPLE: usize = 500;
-const DEFAULT_MAX_MB: u64 = 60;
-/// Bound decompressed regular-file bytes relative to the checksum-pinned
-/// archive. SMT-LIB text compresses well, so keep generous headroom while
-/// still preventing an unbounded decompression bomb from a caller-selected
-/// record.
-const MAX_ARCHIVE_EXPANSION_RATIO: u64 = 256;
-const MIN_ARCHIVE_EXPANSION_BUDGET: u64 = 1_000_000_000;
+// Bound decompressed regular-file bytes so a caller-selected `--record` cannot
+// expand without limit. All three numbers are MEASURED against SMT-LIB 2024
+// non-incremental (Zenodo 11061097), all 84 divisions extracted 2026-07-24:
+//
+//   * worst expansion ratio: UFBV at >=741x (1.7 MB compressed -> >1.26 GB).
+//     zstd on highly repetitive SMT-LIB text routinely exceeds 100x; 12 of 84
+//     divisions exceed 45x.
+//   * largest single division: QF_BV at 37.3 GB extracted.
+//
+// The previous 256x / 1 GB pair was a guess, and it rejected UFBV - a legitimate
+// division - by 8.7 KB, silently costing one of 84 divisions on every fetch. A
+// ratio alone is also the wrong shape: 4096x on a 1.7 GB archive would authorize
+// 7 TB, so the ratio is paired with an absolute ceiling.
+/// Per-byte-of-archive expansion allowance (~5.5x headroom over the worst
+/// measured division).
+const MAX_ARCHIVE_EXPANSION_RATIO: u64 = 4096;
+/// Floor, so a SMALL archive with a large legitimate ratio still fits: UFBV
+/// needs >1.26 GB from 1.7 MB, which `size * ratio` alone would not grant.
+const MIN_ARCHIVE_EXPANSION_BUDGET: u64 = 8_000_000_000;
+/// Absolute ceiling regardless of archive size (~3.4x the largest measured
+/// division), so the ratio cannot authorize a disk-filling expansion.
+const MAX_ARCHIVE_EXPANSION_BYTES: u64 = 128_000_000_000;
 
 /// One `<DIV>.tar.zst` archive as advertised by the Zenodo record.
 #[derive(Debug)]
@@ -55,7 +90,9 @@ struct FetchArgs {
     dest: Option<PathBuf>,
     sample: usize,
     all: bool,
-    max_mb: u64,
+    /// `None` means NO size cap, which is the default. `Some(m)` is an explicit
+    /// caller-selected cap and is reported as incomplete coverage.
+    max_mb: Option<u64>,
     divisions: Option<Vec<String>>,
     record: String,
     list: bool,
@@ -66,16 +103,45 @@ fn usage() -> &'static str {
 ay-z3-parity fetch <dest-dir> [--sample N | --all] [--max-mb M]
                    [--divisions d1,d2,...] [--record ID] [--list]
 
-  Re-download & DETERMINISTICALLY sample the SMT-LIB corpus from Zenodo into
-  <dest-dir>/<DIVISION>/. In-tree equivalent of fetch-all.sh.
+  Materialize the SMT-LIB corpus from Zenodo into <dest-dir>/<DIVISION>/,
+  verifying each archive against its published md5.
 
-  --sample N     files sampled per division (default 500)
-  --all          sample every file (no per-division cap)
-  --max-mb M     skip archives larger than M MB (default 60; excludes the
-                 giants QF_BV/QF_LIA/QF_IDL/AUFBV unless raised)
-  --divisions    comma-separated allowlist of divisions
-  --record ID    Zenodo record id (default 11061097)
-  --list         print available divisions + sizes, download nothing
+  DEFAULT IS COMPLETE: every division, every file, no size cap. SMT-LIB 2024
+  non-incremental is 84 divisions / ~4.8 GB compressed. Narrowing is opt-in and
+  is always reported as INCOMPLETE COVERAGE, because a corpus that silently
+  omits divisions produces AY-vs-z3 numbers that silently mean nothing.
+
+  Selection (all optional; each one narrows coverage):
+    --divisions d1,d2,...  only these divisions (default: all in the record)
+    --sample N             evenly-spaced N files per division (default: all).
+                           Deterministic: byte-wise sort, indices
+                           floor(i*total/N), de-duplicated — the same archive
+                           always yields the same sample.
+    --all                  explicitly take every file (the default; accepted so
+                           existing invocations keep working)
+    --max-mb M             skip archives over M MB. NOT set by default. At M=60
+                           this drops QF_BV, QF_LIA, QF_IDL, QF_LRA, QF_NIA,
+                           QF_NRA, QF_ABV, BV, AUFBV and QF_UFBV — the logics z3
+                           is most used for.
+
+  Other:
+    --record ID            Zenodo record id (default 11061097 = SMT-LIB 2024
+                           non-incremental)
+    --list                 print the divisions, sizes, and exactly what the
+                           current options would include or exclude, then exit
+                           without downloading anything
+
+  Examples:
+    # the whole corpus, which is what a parity claim needs
+    ay-z3-parity fetch benchmarks/smtlib-all
+
+    # see what you would get, download nothing
+    ay-z3-parity fetch --list
+
+    # a fast smoke corpus, knowingly incomplete
+    ay-z3-parity fetch /tmp/smoke --divisions QF_UF,QF_AX --sample 50
+
+  Then: ay-z3-parity scoreboard <dest-dir> --ay <libay_ffi> --jobs 4
 "
 }
 
@@ -120,7 +186,7 @@ pub(crate) fn run(rest: &[String]) -> i32 {
     };
 
     if args.list {
-        print_list(&args, &selected);
+        print_list(&args, &selected, entries.len());
         return 0;
     }
 
@@ -138,31 +204,50 @@ pub(crate) fn run(rest: &[String]) -> i32 {
         eprintln!("error: mkdir {}: {e}", dest.display());
         return 1;
     }
+    let swept = sweep_stale_fetch_dirs(&dest);
+    if swept > 0 {
+        println!(
+            "== swept {swept} stale .fetch-staging/.fetch-backup dir(s) from {}",
+            dest.display()
+        );
+    }
 
     let per = if args.all {
-        "all".to_string()
+        "all files".to_string()
     } else {
-        args.sample.to_string()
+        format!("{} files", args.sample)
+    };
+    let cap = match args.max_mb {
+        None => "no size cap".to_string(),
+        Some(m) => format!("max {m}MB"),
     };
     println!(
-        "== {} divisions (max {}MB each, {}/division) -> {}",
+        "== {} divisions ({}/division, {}) -> {}",
         selected.len(),
-        args.max_mb,
         per,
+        cap,
         dest.display()
     );
+    let notes = narrowing_notes(&args, selected.len(), entries.len());
+    if notes.is_empty() {
+        println!("   coverage: COMPLETE — every division and every file in the record");
+    } else {
+        println!("   coverage: NARROWED by caller options (see the summary at the end)");
+    }
 
     let mut done = 0usize;
-    let mut skipped_cap = 0usize;
+    let mut excluded_by_cap: Vec<String> = Vec::new();
     let mut failed = 0usize;
     for e in selected {
         let size_mb = e.size / 1_000_000;
         if archive_exceeds_cap(e.size, args.max_mb) {
+            // Unwrap-free: archive_exceeds_cap is only true when a cap is set.
+            let m = args.max_mb.unwrap_or_default();
             println!(
-                "-- {}: {}MB > {}MB cap — skipped (raise --max-mb to include)",
-                e.div, size_mb, args.max_mb
+                "-- {}: {}MB > {}MB cap — SKIPPED (raise --max-mb)",
+                e.div, size_mb, m
             );
-            skipped_cap += 1;
+            excluded_by_cap.push(format!("{} ({}MB)", e.div, size_mb));
             continue;
         }
         match fetch_one(&api, e, &dest, args.sample, args.all) {
@@ -175,11 +260,35 @@ pub(crate) fn run(rest: &[String]) -> i32 {
     }
 
     println!(
-        "== done: {done} divisions fetched into {} \
-         ({skipped_cap} over the {}MB cap, {failed} failed)",
+        "== done: {done} divisions fetched into {} ({} skipped by --max-mb, {failed} failed)",
         dest.display(),
-        args.max_mb
+        excluded_by_cap.len()
     );
+    // The original sin this block exists to prevent: a 60 MB default cap dropped
+    // the ten largest divisions and NOTHING in the output said so, so every
+    // downstream parity number silently excluded them. Never let a narrowed
+    // corpus look complete.
+    if notes.is_empty() && failed == 0 {
+        println!("== COVERAGE COMPLETE: the whole record is materialized.");
+    } else {
+        println!("\n!! INCOMPLETE COVERAGE — this corpus does NOT represent the full record.");
+        for n in &notes {
+            println!("!!   {n}");
+        }
+        if !excluded_by_cap.is_empty() {
+            println!("!!   divisions excluded by --max-mb:");
+            for d in &excluded_by_cap {
+                println!("!!     - {d}");
+            }
+        }
+        if failed > 0 {
+            println!("!!   {failed} division(s) failed to fetch (see the log above)");
+        }
+        println!(
+            "!! Any AY-vs-z3 completeness or speed number measured on this tree must state \
+             these exclusions alongside it."
+        );
+    }
     println!(
         "   run: ay-z3-parity scoreboard {} --ay <libay_ffi> --jobs 4",
         dest.display()
@@ -195,8 +304,11 @@ fn parse_args(rest: &[String]) -> Result<FetchArgs, String> {
     let mut dest = None;
     let mut sample = DEFAULT_SAMPLE;
     let mut sample_explicit = false;
-    let mut all = false;
-    let mut max_mb = DEFAULT_MAX_MB;
+    // Complete by default: every file, no size cap. Both are narrowed only by an
+    // explicit flag, and any narrowing is reported as incomplete coverage.
+    let mut all = true;
+    let mut all_explicit = false;
+    let mut max_mb = None;
     let mut divisions = None;
     let mut record = DEFAULT_RECORD.to_string();
     let mut list = false;
@@ -206,6 +318,7 @@ fn parse_args(rest: &[String]) -> Result<FetchArgs, String> {
         match arg.as_str() {
             "--sample" => {
                 sample_explicit = true;
+                all = false;
                 sample = it
                     .next()
                     .ok_or("--sample needs a number")?
@@ -215,13 +328,17 @@ fn parse_args(rest: &[String]) -> Result<FetchArgs, String> {
                     return Err("--sample must be at least 1".to_string());
                 }
             }
-            "--all" => all = true,
+            "--all" => {
+                all = true;
+                all_explicit = true;
+            }
             "--max-mb" => {
-                max_mb = it
-                    .next()
-                    .ok_or("--max-mb needs a number")?
-                    .parse()
-                    .map_err(|_| "--max-mb must be an integer number of MB")?;
+                max_mb = Some(
+                    it.next()
+                        .ok_or("--max-mb needs a number")?
+                        .parse()
+                        .map_err(|_| "--max-mb must be an integer number of MB")?,
+                );
             }
             "--divisions" => {
                 let listv = it
@@ -254,7 +371,7 @@ fn parse_args(rest: &[String]) -> Result<FetchArgs, String> {
             }
         }
     }
-    if all && sample_explicit {
+    if all_explicit && sample_explicit {
         return Err("--sample and --all are mutually exclusive".to_string());
     }
     if record.is_empty() || !record.bytes().all(|b| b.is_ascii_digit()) {
@@ -297,27 +414,94 @@ fn selected_entries<'a>(
         .collect())
 }
 
-fn archive_exceeds_cap(size: u64, max_mb: u64) -> bool {
-    size > max_mb.saturating_mul(1_000_000)
+/// Decompression-bomb budget for one archive of `archive_bytes`: a generous
+/// per-byte ratio, floored so tiny-but-legitimately-expansive divisions fit, and
+/// capped absolutely so the ratio cannot authorize filling the disk.
+fn expansion_budget(archive_bytes: u64) -> u64 {
+    archive_bytes
+        .saturating_mul(MAX_ARCHIVE_EXPANSION_RATIO)
+        .max(MIN_ARCHIVE_EXPANSION_BUDGET)
+        .min(MAX_ARCHIVE_EXPANSION_BYTES)
 }
 
-fn print_list(args: &FetchArgs, entries: &[&DivEntry]) {
+/// No cap (`None`, the default) never excludes anything. A caller-selected cap
+/// excludes strictly-larger archives.
+fn archive_exceeds_cap(size: u64, max_mb: Option<u64>) -> bool {
+    match max_mb {
+        None => false,
+        Some(m) => size > m.saturating_mul(1_000_000),
+    }
+}
+
+/// Human-readable description of every active narrowing option, or `None` when
+/// the run covers the whole record. Drives both the up-front `coverage:` line
+/// and the closing `!! INCOMPLETE COVERAGE` block.
+fn narrowing_notes(args: &FetchArgs, selected: usize, in_record: usize) -> Vec<String> {
+    let mut notes = Vec::new();
+    if selected < in_record {
+        notes.push(format!(
+            "--divisions restricted this run to {selected} of {in_record} divisions in the record"
+        ));
+    }
+    if !args.all {
+        notes.push(format!(
+            "--sample {} kept only an evenly-spaced subset of each division's files",
+            args.sample
+        ));
+    }
+    if let Some(m) = args.max_mb {
+        notes.push(format!("--max-mb {m} skipped every archive over {m} MB"));
+    }
+    notes
+}
+
+/// `--list`: the dry-run control surface. Shows every selected division and
+/// marks the ones the current options would exclude, so a caller can confirm
+/// coverage BEFORE spending the download.
+fn print_list(args: &FetchArgs, entries: &[&DivEntry], in_record: usize) {
     println!(
-        "== {} divisions in Zenodo record {}:",
+        "== {} of {} divisions in Zenodo record {}:",
         entries.len(),
+        in_record,
         args.record
     );
+    let mut included = 0usize;
+    let mut included_bytes = 0u64;
+    let mut excluded_bytes = 0u64;
     for e in entries {
         let mb = e.size as f64 / 1_000_000.0;
         let over = if archive_exceeds_cap(e.size, args.max_mb) {
-            "  (over --max-mb)"
+            excluded_bytes += e.size;
+            "  EXCLUDED (over --max-mb)"
         } else {
+            included += 1;
+            included_bytes += e.size;
             ""
         };
         println!(
             "  {:<22} {:>10.2} MB  {:>14} B  {}{}",
             e.div, mb, e.size, e.md5, over
         );
+    }
+    println!(
+        "== would fetch {} divisions, {:.2} GB compressed",
+        included,
+        included_bytes as f64 / 1e9
+    );
+    let notes = narrowing_notes(args, entries.len(), in_record);
+    if notes.is_empty() {
+        println!("== coverage: COMPLETE — every division and every file in the record");
+    } else {
+        println!("!! coverage: INCOMPLETE");
+        for n in &notes {
+            println!("!!   {n}");
+        }
+        if excluded_bytes > 0 {
+            println!(
+                "!!   {:.2} GB of archives would be skipped by the size cap",
+                excluded_bytes as f64 / 1e9
+            );
+        }
     }
 }
 
@@ -370,13 +554,7 @@ fn fetch_one_inner(
 
     let xd = tmp.join("x");
     std::fs::create_dir_all(&xd).map_err(|_| "extract failed".to_string())?;
-    extract(
-        &archive,
-        &xd,
-        e.size
-            .saturating_mul(MAX_ARCHIVE_EXPANSION_RATIO)
-            .max(MIN_ARCHIVE_EXPANSION_BUDGET),
-    )?;
+    extract(&archive, &xd, expansion_budget(e.size))?;
 
     let mut keys = collect_smt2(&xd).map_err(|_| "extract failed".to_string())?;
     sort_keys(&mut keys);
@@ -460,9 +638,11 @@ fn install_sample(
         return Err(format!("install sample {}: {err}", dest_div.display()));
     }
     if had_old {
-        if let Err(err) = remove_path(&backup) {
+        if let Err(err) = remove_path_retrying(&backup) {
             eprintln!(
-                "warning: installed {}, but could not remove backup {}: {err}",
+                "warning: installed {}, but could not remove backup {} after retries: {err}. \
+                 It will be swept at the start of the next fetch into this root; until then, \
+                 corpus scanners that do not skip dot-directories may double-count its files.",
                 dest_div.display(),
                 backup.display()
             );
@@ -478,6 +658,56 @@ fn remove_path(path: &Path) -> std::io::Result<()> {
     } else {
         std::fs::remove_file(path)
     }
+}
+
+/// `remove_dir_all` intermittently fails with `ENOTEMPTY` on APFS even when this
+/// process is the only writer (readdir/unlink interleaving), so retry briefly.
+///
+/// This is not cosmetic. A leaked `.{div}.fetch-backup-*` directory sits inside
+/// the corpus root, and corpus scanners walk `<root>/*` — so a leftover is
+/// picked up as if it were a real division and silently duplicates its files
+/// into a measurement. That happened: 4 of 84 divisions leaked on the
+/// 2026-07-24 full fetch and the scoreboard began scoring
+/// `.AUFDTLIRA.fetch-backup-...` as a division.
+fn remove_path_retrying(path: &Path) -> std::io::Result<()> {
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..5u32 {
+        match remove_path(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                last = Some(err);
+                std::thread::sleep(std::time::Duration::from_millis(
+                    50 * u64::from(attempt + 1),
+                ));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("remove failed")))
+}
+
+/// Sweep `.{div}.fetch-staging-*` / `.{div}.fetch-backup-*` left behind by an
+/// earlier interrupted or partially-failed run, so a leak is self-healing rather
+/// than permanently poisoning every later scan of this corpus root.
+fn sweep_stale_fetch_dirs(dest: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dest) else {
+        return 0;
+    };
+    let mut swept = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with('.') {
+            continue;
+        }
+        if !(name.contains(".fetch-staging-") || name.contains(".fetch-backup-")) {
+            continue;
+        }
+        if remove_path_retrying(&entry.path()).is_ok() {
+            swept += 1;
+        }
+    }
+    swept
 }
 
 // ---------------------------------------------------------------------------
@@ -920,11 +1150,134 @@ mod tests {
         assert!(parse_args(&bad_record).unwrap_err().contains("numeric"));
     }
 
+    /// Regression pin for a real loss: at 256x / 1 GB the budget rejected UFBV
+    /// (1,707,837 B compressed, >1.26 GB extracted) by 8.7 KB, dropping 1 of 84
+    /// divisions from every fetch. Uses UFBV's real archive size.
+    #[test]
+    fn expansion_budget_admits_the_worst_measured_real_division() {
+        const UFBV_ARCHIVE: u64 = 1_707_837;
+        const UFBV_EXTRACTED_LOWER_BOUND: u64 = 1_265_403_520;
+        assert!(
+            expansion_budget(UFBV_ARCHIVE) > UFBV_EXTRACTED_LOWER_BOUND,
+            "UFBV must fit: budget {} <= observed {}",
+            expansion_budget(UFBV_ARCHIVE),
+            UFBV_EXTRACTED_LOWER_BOUND
+        );
+        // QF_BV: largest measured division, 37.3 GB extracted from 1.73 GB.
+        assert!(expansion_budget(1_734_941_977) > 37_342_277_361);
+    }
+
+    /// The ratio must never authorize an unbounded expansion on a big archive.
+    #[test]
+    fn expansion_budget_is_absolutely_capped() {
+        assert_eq!(expansion_budget(u64::MAX), MAX_ARCHIVE_EXPANSION_BYTES);
+        assert_eq!(expansion_budget(0), MIN_ARCHIVE_EXPANSION_BUDGET);
+        assert!(expansion_budget(u64::MAX / 2) <= MAX_ARCHIVE_EXPANSION_BYTES);
+    }
+
     #[test]
     fn exact_byte_cap_does_not_admit_a_sub_megabyte_archive_at_zero() {
-        assert!(archive_exceeds_cap(1, 0));
-        assert!(!archive_exceeds_cap(1_000_000, 1));
-        assert!(archive_exceeds_cap(1_000_001, 1));
+        assert!(archive_exceeds_cap(1, Some(0)));
+        assert!(!archive_exceeds_cap(1_000_000, Some(1)));
+        assert!(archive_exceeds_cap(1_000_001, Some(1)));
+    }
+
+    /// A leaked `.{div}.fetch-backup-*` sits INSIDE the corpus root, so any
+    /// scanner that walks `<root>/*` double-counts that division under a bogus
+    /// name. 4 of 84 divisions leaked on the 2026-07-24 full fetch (APFS
+    /// `remove_dir_all` -> ENOTEMPTY) and the scoreboard began scoring them.
+    /// The sweep makes it self-healing; real divisions must survive untouched.
+    #[test]
+    fn sweep_removes_only_stale_fetch_dirs() {
+        let root = make_tmpdir("sweep-test").expect("tmpdir");
+        let real = root.join("QF_UF");
+        let backup = root.join(".QF_UF.fetch-backup-123-456");
+        let staging = root.join(".QF_AX.fetch-staging-123-456");
+        let other_hidden = root.join(".git");
+        for d in [&real, &backup, &staging, &other_hidden] {
+            fs::create_dir_all(d).expect("mkdir");
+        }
+        // Non-empty, because ENOTEMPTY is the failure being defended against.
+        fs::write(backup.join("a.smt2"), b"(check-sat)").expect("write");
+        fs::write(real.join("a.smt2"), b"(check-sat)").expect("write");
+
+        assert_eq!(sweep_stale_fetch_dirs(&root), 2);
+        assert!(real.is_dir(), "a real division must not be swept");
+        assert!(real.join("a.smt2").is_file());
+        assert!(
+            other_hidden.is_dir(),
+            "unrelated dot-dirs must not be swept"
+        );
+        assert!(!backup.exists());
+        assert!(!staging.exists());
+        // Idempotent: a clean root sweeps nothing.
+        assert_eq!(sweep_stale_fetch_dirs(&root), 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The default must admit EVERY archive. A 60 MB default cap silently
+    /// dropped the ten largest SMT-LIB divisions (QF_BV 1.7 GB, QF_LIA 689 MB,
+    /// ...) out of every corpus this tool built, so "no cap unless asked" is a
+    /// pinned contract, not a preference.
+    #[test]
+    fn no_cap_is_the_default_and_admits_the_largest_division() {
+        let args = parse_args(&["out".to_string()]).expect("bare dest parses");
+        assert_eq!(args.max_mb, None, "a size cap must never be defaulted on");
+        assert!(
+            !archive_exceeds_cap(1_734_941_977, args.max_mb),
+            "QF_BV (1.7GB) must be admitted by default"
+        );
+        assert!(args.all, "every file per division must be the default");
+        assert!(
+            narrowing_notes(&args, 84, 84).is_empty(),
+            "a default run must report COMPLETE coverage"
+        );
+    }
+
+    /// Every narrowing option must surface in the coverage report, so a
+    /// partial corpus can never read as a complete one.
+    #[test]
+    fn each_narrowing_option_is_reported_as_incomplete_coverage() {
+        let sampled = parse_args(&["out".to_string(), "--sample".to_string(), "50".to_string()])
+            .expect("sample parses");
+        assert!(!sampled.all);
+        let notes = narrowing_notes(&sampled, 84, 84);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("--sample 50"), "{notes:?}");
+
+        let capped = parse_args(&["out".to_string(), "--max-mb".to_string(), "60".to_string()])
+            .expect("max-mb parses");
+        assert_eq!(capped.max_mb, Some(60));
+        let notes = narrowing_notes(&capped, 84, 84);
+        assert!(notes.iter().any(|n| n.contains("--max-mb 60")), "{notes:?}");
+
+        // A division subset is narrowing even with no other flag set.
+        let subset = parse_args(&[
+            "out".to_string(),
+            "--divisions".to_string(),
+            "QF_UF".to_string(),
+        ])
+        .expect("divisions parses");
+        let notes = narrowing_notes(&subset, 1, 84);
+        assert!(notes.iter().any(|n| n.contains("1 of 84")), "{notes:?}");
+    }
+
+    /// `--all` is the default, but must stay accepted so existing invocations
+    /// keep working — and must still conflict with `--sample`.
+    #[test]
+    fn explicit_all_is_accepted_and_still_conflicts_with_sample() {
+        let a = parse_args(&["out".to_string(), "--all".to_string()]).expect("--all parses");
+        assert!(a.all);
+        assert!(narrowing_notes(&a, 84, 84).is_empty());
+        let both = vec![
+            "out".to_string(),
+            "--all".to_string(),
+            "--sample".to_string(),
+            "2".to_string(),
+        ];
+        assert!(parse_args(&both)
+            .unwrap_err()
+            .contains("mutually exclusive"));
     }
 
     #[test]
@@ -1007,7 +1360,7 @@ mod tests {
             dest: None,
             sample: 1,
             all: false,
-            max_mb: 1,
+            max_mb: Some(1),
             divisions: Some(vec!["QF_BV".to_string()]),
             record: "1".to_string(),
             list: true,

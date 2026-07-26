@@ -554,29 +554,54 @@ impl Executor {
     /// last model.  The global term interner also contains popped, generated,
     /// and query-only select terms; those are not constraints and must not make
     /// otherwise-free array completion fail.
+    ///
+    /// Served from `required_terms_index`: the reachability closure is computed
+    /// once and revalidated by a BYTE-EXACT `(assertions, assumptions)`
+    /// snapshot compare per query — any change rebuilds, so a stale closure can
+    /// never be consulted. Previously the full-forest DFS ran PER CANDIDATE
+    /// READ during array completion (O(reads × forest), fresh hash-set churn
+    /// each call — the dominant completion cost on the pairwise-expanded
+    /// `distinct` family).
     fn term_is_required_by_last_query(&self, needle: TermId) -> bool {
-        let mut seen = HashSet::default();
-        let mut stack = self.ctx.assertions.clone();
-        stack.extend(self.last_assumptions.iter().flatten().copied());
-        while let Some(term) = stack.pop() {
-            if term == needle {
-                return true;
-            }
-            if !seen.insert(term) {
-                continue;
-            }
-            match self.ctx.terms.get(term) {
-                TermData::App(_, args) => stack.extend(args.iter().copied()),
-                TermData::Not(inner) => stack.push(*inner),
-                TermData::Ite(condition, then_term, else_term) => {
-                    stack.extend([*condition, *then_term, *else_term]);
+        let mut cache = self.required_terms_index.borrow_mut();
+        let valid = cache.as_ref().is_some_and(|(asnap, usnap, _)| {
+            *asnap == self.ctx.assertions && *usnap == self.last_assumptions
+        });
+        if !valid {
+            // Reachability closure with the SAME traversal cutoffs as the
+            // original per-call DFS: App/Not/Ite descend; Let/Forall/Exists do
+            // not (bound observations do not name ground model cells). The set
+            // holds every VISITED term — exactly the terms the original walk
+            // compared against `needle`.
+            let mut seen = HashSet::default();
+            let mut stack = self.ctx.assertions.clone();
+            stack.extend(self.last_assumptions.iter().flatten().copied());
+            while let Some(term) = stack.pop() {
+                if !seen.insert(term) {
+                    continue;
                 }
-                // Bound observations do not name ground model cells.
-                TermData::Let(_, _) | TermData::Forall(_, _, _) | TermData::Exists(_, _, _) => {}
-                _ => {}
+                match self.ctx.terms.get(term) {
+                    TermData::App(_, args) => stack.extend(args.iter().copied()),
+                    TermData::Not(inner) => stack.push(*inner),
+                    TermData::Ite(condition, then_term, else_term) => {
+                        stack.extend([*condition, *then_term, *else_term]);
+                    }
+                    TermData::Let(_, _) | TermData::Forall(_, _, _) | TermData::Exists(_, _, _) => {
+                    }
+                    _ => {}
+                }
             }
+            *cache = Some((
+                self.ctx.assertions.clone(),
+                self.last_assumptions.clone(),
+                seen,
+            ));
         }
-        false
+        cache
+            .as_ref()
+            .expect("required_terms_index populated above")
+            .2
+            .contains(&needle)
     }
 
     /// Store-axiom-consistent witness interpretation of an array-sorted term:
@@ -843,14 +868,13 @@ impl Executor {
 
         let mut stores: Vec<(String, String)> = Vec::new();
         // Directly constrained `select(array_term, i)` reads are authoritative.
-        for raw in 0..self.ctx.terms.len() {
-            let tid = TermId(raw as u32);
-            let TermData::App(sym, args) = self.ctx.terms.get(tid) else {
+        // Served by the prefix-extended reverse index (ascending id order,
+        // identical to the former whole-term-store scan — which was
+        // O(arrays × terms) across the completion pass).
+        for tid in self.selects_of_array(array_term) {
+            let TermData::App(_, args) = self.ctx.terms.get(tid) else {
                 continue;
             };
-            if sym.name() != "select" || args.len() != 2 || args[0] != array_term {
-                continue;
-            }
             // The global interner also retains popped assertions, generated
             // terms, and prior get-value reads.  Once completion installs a
             // default those inactive reads become evaluable; treating them as

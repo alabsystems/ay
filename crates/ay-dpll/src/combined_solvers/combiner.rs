@@ -3119,13 +3119,52 @@ impl TheorySolver for TheoryCombiner<'_> {
         None
     }
 
+    fn suggest_decision_atom(&self) -> Option<(TermId, bool)> {
+        // Inc2 (eager-theory-propagation design 2026-07-20 §2): forward the
+        // arithmetic solver's LP-model-guided decision-atom suggestion
+        // (`LraSolver::suggest_decision_atom`, #8445; LIA is a pure delegate
+        // to its inner LRA). The combiner never forwarded this (git-verified
+        // never-wired), so UF+arith extension lanes always fell through to
+        // activity-based atom selection. Mirrors `suggest_phase` above minus
+        // the arrays arm: ArraySolver has no decision-atom suggestion (trait
+        // default `None`), so there is nothing to override.
+        //
+        // Env-gated DEFAULT OFF (`AY_UFLIA_ARITH_DECISIONS=1`, single cached
+        // env read): unset keeps the historical `None` and the byte-identical
+        // trajectory. The consumer's wander suppression (extension wander
+        // latch + relevancy_should_engage) sits upstream and is unaffected.
+        if !ay_core::debug_channel::uflia_arith_decisions_enabled() {
+            return None;
+        }
+        if let Some(lia) = &self.lia {
+            return lia.suggest_decision_atom();
+        }
+        if let Some(lra) = &self.lra {
+            return lra.suggest_decision_atom();
+        }
+        None
+    }
+
     fn phase_hint_epoch(&self) -> Option<u64> {
-        // Every suggestion this combiner emits is a pure function of the
-        // arithmetic solver's phase state: `suggest_phase` delegates to LIA
+        // SCOPE: this epoch covers `suggest_phase` ONLY. Every *phase*
+        // suggestion this combiner emits is a pure function of the arithmetic
+        // solver's phase state: `suggest_phase` delegates to LIA
         // (itself a pure delegate to its inner LRA) or LRA, and the
         // `suggest_phase_with_arrays` overrides are STATIC term-shape
-        // predicates that never change for a given atom. So the arithmetic
-        // epoch fully covers suggestion change, and forwarding it revives the
+        // predicates that never change for a given atom.
+        //
+        // It does NOT cover `suggest_decision_atom` (Inc2, #8445).
+        // `LraSolver::suggest_decision_atom` additionally depends on
+        // `last_simplex_feasible`, `feasible_value_snapshot`,
+        // `registered_atoms.len() >= 100`, and — on the default fast path —
+        // the incremental `decision_index`. None of those are tracked by this
+        // epoch. Harmless today because nothing epoch-gates the decision rank;
+        // it becomes a CORRECTNESS BUG the day something does. If you extend
+        // the epoch skip to decision-atom suggestion, you must first widen the
+        // epoch to include the simplex-feasibility and atom-registration state.
+        //
+        // So the arithmetic epoch fully covers *phase* suggestion change, and
+        // forwarding it revives the
         // SAT seeder's O(atoms)-scan epoch skip on combined lanes
         // (#certora-phase-epoch — the scan ran on EVERY BCP quiescence, ~19%
         // of the solve window on 10^5-atom Certora QF_UFLIA files). The LIA

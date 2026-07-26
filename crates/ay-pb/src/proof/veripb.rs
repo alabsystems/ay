@@ -66,6 +66,14 @@ pub enum ProofError {
     #[error("VeriPB proof already concluded as {0}")]
     AlreadyConcluded(ProofConclusionKind),
 
+    /// No derivation of the claimed objective lower bound could be produced, so
+    /// `conclusion BOUNDS opt opt;` must not be emitted (fail closed).
+    #[error(
+        "no derivation of the objective lower bound could be produced; \
+         refusing to emit an unjustified OPT conclusion"
+    )]
+    UnjustifiedObjectiveLowerBound,
+
     /// Proof-tap id reconciliation failed: the solver-side allocator and the
     /// serializer-side writer disagreed on the id of an emitted line. The
     /// proof is void (fail closed) — every later id would be shifted.
@@ -626,6 +634,115 @@ mod tests {
             String::from_utf8(writer.writer).expect("proof output is valid UTF-8"),
             "pseudo-Boolean proof version 3.0\nf 1 ;\nred +1 x1 >= 1: x1 -> 1 ;\n",
         );
+    }
+
+    #[test]
+    fn test_weaken_emits_a_bare_variable_for_both_polarities() {
+        // VeriPB v3 `pol_constraint ::= ... | pol_constraint, skip,
+        // (variable | aux_variable), skip, "w"` (the development design notes:1076): the
+        // weaken operand is a VARIABLE, never a literal. Emitting `~x2 w` is a
+        // hard PARSE error in VeriPB 3.0.2 ("...but found `w` (there are 2
+        // elements on the stack)"), which voids the whole proof file, so the
+        // negated literal must render exactly like the positive one.
+        for lit in [lit(2), neg(2)] {
+            let mut writer =
+                VeriPbWriter::new(Vec::new(), 1).expect("header writes to an in-memory buffer");
+
+            let derived = writer
+                .log_step(ProofStep::Weaken(
+                    ConstraintId::new(1).expect("proof IDs are 1-indexed"),
+                    lit,
+                ))
+                .expect("weakening allocates a derived ID");
+
+            assert_eq!(derived.get(), 2, "weaken is an output rule: it allocates 1");
+            let text = String::from_utf8(writer.writer).expect("proof output is valid UTF-8");
+            assert_eq!(
+                text, "pseudo-Boolean proof version 3.0\nf 1 ;\npol 1 x2 w ;\n",
+                "weaken operand must be the bare variable, got: {text}"
+            );
+            assert!(
+                !text.contains('~'),
+                "a negated weaken operand is a VeriPB parse error: {text}"
+            );
+        }
+    }
+
+    /// VeriPB's ID-allocation contract, restated independently of the writer: a
+    /// step allocates a constraint ID **iff** its rule is an `output_rule` /
+    /// `top_output_rule` in the v3 grammar (the development design notes:1014-1046).
+    ///
+    /// The match is deliberately EXHAUSTIVE. Adding a `ProofStep` variant must
+    /// not compile until its allocation behaviour is decided here — in
+    /// particular `obju`, which is a bare `top_rule` (grammar.tex:1003) and
+    /// allocates NOTHING; treating it as allocating shifts every later ID by
+    /// one and the checker then reports either "Accessing the database out of
+    /// bound" or, worse, silently uses the wrong constraint.
+    fn rule_allocates_constraint_id(step: &ProofStep) -> bool {
+        match step {
+            // `output_rule`: pol / rup / red all add a constraint.
+            ProofStep::Addition(..)
+            | ProofStep::Multiply(..)
+            | ProofStep::Divide(..)
+            | ProofStep::Saturate(..)
+            | ProofStep::Polynomial(..)
+            | ProofStep::Weaken(..)
+            | ProofStep::Rup(..)
+            | ProofStep::Red(..) => true,
+            // `top_output_rule`: soli logs the solution AND adds exactly one
+            // objective-improving constraint (verified against VeriPB 3.0.2).
+            ProofStep::SolutionImproving(..) => true,
+            // `top_rule`, not an output rule: deletion adds nothing.
+            ProofStep::Delete(..) => false,
+        }
+    }
+
+    #[test]
+    fn test_every_step_matches_the_veripb_id_allocation_contract() {
+        let id = ConstraintId::new(1).expect("proof IDs are 1-indexed");
+        let steps = [
+            ProofStep::Addition(id, id),
+            ProofStep::Multiply(id, 3),
+            ProofStep::Divide(id, 2),
+            ProofStep::Saturate(id),
+            ProofStep::Polynomial(String::from("1 ;")),
+            ProofStep::Weaken(id, neg(1)),
+            ProofStep::Rup(String::from("+1 x1 >= 1 ;")),
+            ProofStep::Red(String::from("+1 x1 >= 1"), String::from("x1 -> 1 ;")),
+            ProofStep::Delete(id),
+            ProofStep::SolutionImproving(String::from("x1")),
+        ];
+
+        for step in steps {
+            let mut writer =
+                VeriPbWriter::new(Vec::new(), 1).expect("header writes to an in-memory buffer");
+            let before = writer
+                .allocated_constraint_count()
+                .expect("id space is not exhausted");
+
+            let expected_allocation = rule_allocates_constraint_id(&step);
+            let returned = writer.log_step(step.clone()).expect("step is logged");
+
+            let after = writer
+                .allocated_constraint_count()
+                .expect("id space is not exhausted");
+            let allocated = after - before;
+
+            assert_eq!(
+                allocated,
+                u64::from(expected_allocation),
+                "{step:?} allocated {allocated} ids, contract says {expected_allocation}",
+            );
+            if expected_allocation {
+                assert_eq!(returned.get(), after, "{step:?} must return the new id");
+            } else {
+                assert_eq!(
+                    returned.get(),
+                    1,
+                    "{step:?} must echo the referenced id, not a fresh one",
+                );
+            }
+        }
     }
 
     #[test]

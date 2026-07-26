@@ -30,6 +30,46 @@ The 168-function signature list is a subset ported from
 `bindings/python/ayz3/_lib.py`'s `_SIGS`. The exported C headers and ABI are the
 authority; each language binding exposes its own documented subset.
 
+## Declarative search API
+
+The package exports a typed, finite-domain application API at `ayz3/search`:
+
+```js
+import { Model } from "ayz3/search";
+
+const m = new Model("assignment");
+const worker = m.choice("worker", ["cpu", "gpu"]);
+const cost = m.int("cost", 0, 20);
+m.table(
+  [worker, cost],
+  [
+    ["cpu", 7],
+    ["gpu", 3],
+  ],
+);
+m.minimize(cost);
+
+const result = m.solve();
+if (result.status !== "optimal")
+  throw new Error(`need a proved optimum, got ${result.status}`);
+console.log(result.requireSolution().get(worker)); // gpu
+```
+
+`search.d.ts` is a first-class declaration surface. Equation strings are data
+parsed by AY's restricted grammar—never JavaScript passed to `eval`. The
+`examples/search-*.mjs` programs cover 4x4 Sudoku, an LLM token router, and
+Minesweeper.
+
+```sh
+# after cargo build -p ay-ffi && (cd bindings/js && npm install)
+node bindings/js/examples/search-sudoku.mjs
+node bindings/js/examples/search-token-router.mjs
+node bindings/js/examples/search-minesweeper.mjs
+```
+
+Enumeration is satisfaction-only: `enumerate()` rejects a model after
+`minimize()` or `maximize()` instead of silently changing the requested mode.
+
 ## Requirements
 
 - Node.js ≥ 18 (developed/verified on Node v26).
@@ -44,12 +84,13 @@ authority; each language binding exposes its own documented subset.
 ```sh
 cd bindings/js
 npm install          # installs koffi
-npm test             # runs test.mjs against the real solver
+npm test             # runs the z3-shaped and declarative APIs against AY
 ```
 
 The loader finds the library via, in order:
 
-1. `AYZ3_LIB` — full path to the `.dylib`/`.so`/`.dll` (highest priority);
+1. `AYSEARCH_LIB`, then `AYZ3_LIB` — full path to the
+   `.dylib`/`.so`/`.dll` (highest priority);
 2. a library bundled next to `_lib.mjs` (installed-package layout);
 3. the in-tree Cargo output: `target/{debug,release}/libay_ffi.*`.
 
@@ -64,7 +105,7 @@ const ctx = new Context();
 const x = ctx.Int("x");
 const s = ctx.Solver();
 s.add(x.gt(3), x.lt(6));
-console.log(s.check());              // "sat"  (from AY)
+console.log(s.check()); // "sat"  (from AY)
 console.log(s.model().eval(x).asNumber()); // 4 or 5
 
 // Bit-vectors (8-bit)
@@ -72,13 +113,16 @@ const a = ctx.BitVec("a", 8);
 const b = ctx.BitVec("b", 8);
 const bv = ctx.Solver();
 bv.add(a.add(b).eq(ctx.BitVecVal(16, 8)), a.eq(ctx.BitVecVal(10, 8)));
-bv.check();                          // "sat"
-bv.model().eval(b).asNumber();       // 6
+bv.check(); // "sat"
+bv.model().eval(b).asNumber(); // 6
 
 // Uninterpreted functions
 const Int = ctx.IntSort();
 const f = ctx.Function("f", Int, Int);
-ctx.Solver().add(f.call(x).eq(f.call(ctx.Int("y")))).check();
+ctx
+  .Solver()
+  .add(f.call(x).eq(f.call(ctx.Int("y"))))
+  .check();
 ```
 
 Each `Context` (like a Z3 context) interns a declared constant by its symbol
@@ -120,12 +164,15 @@ exports ~800 `Z3_*` symbols in total; extend `SIGS` in `_lib.mjs` to bind more.
 
 ## Files
 
-| File          | Purpose                                                             |
-| ------------- | ------------------------------------------------------------------- |
-| `ayz3.mjs`    | Idiomatic, z3-shaped wrapper (Context/Sort/Expr/FuncDecl/Model/Solver). |
-| `_lib.mjs`    | Low-level koffi binding: library loader + `Z3_*` signatures.        |
-| `test.mjs`    | Node test: SAT (x∈{4,5}), UNSAT, BitVector, Real+push/pop, UF.      |
-| `package.json`| Package metadata; `npm test` → `node test.mjs`.                     |
+| File              | Purpose                                                                 |
+| ----------------- | ----------------------------------------------------------------------- |
+| `ayz3.mjs`        | Idiomatic, z3-shaped wrapper (Context/Sort/Expr/FuncDecl/Model/Solver). |
+| `search.mjs`      | Declarative finite-domain modeling, solving, and optimization API.      |
+| `search.d.ts`     | TypeScript declarations for `ayz3/search`.                              |
+| `_lib.mjs`        | Low-level koffi binding: library loader + native function signatures.   |
+| `test.mjs`        | Node test: SAT (x∈{4,5}), UNSAT, BitVector, Real+push/pop, UF.          |
+| `test-search.mjs` | Search API, ownership, status, enumeration, and hardening tests.        |
+| `package.json`    | Package metadata; `npm test` runs both API suites.                      |
 
 `test.mjs` exercises the native-FFI encoding and result mapping for the cases
 listed above. `test-wasm.mjs` separately exercises SAT, UNSAT, and model cases
@@ -161,7 +208,7 @@ cargo build --release --target wasm32-unknown-unknown -p ay-ffi --lib --no-defau
 node bindings/js/test-wasm.mjs   # → real sat/unsat/model from ay_ffi.wasm
 ```
 
-| file | role |
-|---|---|
-| `wasm.mjs` | Instantiates `ay_ffi.wasm` (imports `ay_wasm_now_ms`) + string marshaling. |
-| `test-wasm.mjs` | Exercises SAT, UNSAT, and model cases inside the `.wasm`. |
+| file            | role                                                                       |
+| --------------- | -------------------------------------------------------------------------- |
+| `wasm.mjs`      | Instantiates `ay_ffi.wasm` (imports `ay_wasm_now_ms`) + string marshaling. |
+| `test-wasm.mjs` | Exercises SAT, UNSAT, and model cases inside the `.wasm`.                  |

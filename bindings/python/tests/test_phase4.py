@@ -422,7 +422,7 @@ def _run_z3py(name):
     return str(res), vals
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 @pytest.mark.parametrize("name", CROSS)
 def test_crosscheck_phase4(name):
     ay_res, ay_vals = _run_ayz3_inner(name)
@@ -437,7 +437,7 @@ def test_crosscheck_phase4(name):
 
 # --- Determinate model-value cross-checks (values, not just verdicts) --------
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_crosscheck_string_model_value():
     # s == "xyz" pins a unique model; both engines must report "xyz".
     with z._ctx_scope(z.Context()):
@@ -454,7 +454,7 @@ def test_crosscheck_string_model_value():
     assert ay_val == z3_val == "xyz"
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_crosscheck_array_model_value():
     # Store(K(Int,0), 5, 42)[5] == 42 in both engines.
     with z._ctx_scope(z.Context()):

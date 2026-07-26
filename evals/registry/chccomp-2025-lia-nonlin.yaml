@@ -1,0 +1,23 @@
+# Andrew Yates <andrewyates.name@gmail.com>
+# Eval spec for the CHC-COMP 2025 nonlinear LIA benchmark suite
+id: chccomp-2025-lia-nonlin
+version: 1
+description: CHC-COMP 2025 official nonlinear LIA benchmark suite
+owner: andrewyates.name@gmail.com
+inputs:
+  benchmarks_dir: benchmarks/chc/chc-comp25-benchmarks
+  set_file: LIA.set
+  timeout_sec: 30
+  runs: 3
+  reference_solver: z3
+metrics:
+  - passed
+  - total
+  - sat
+  - unsat
+  - wrong
+  - timeout
+  - unknown
+  - error
+outputs:
+  results_dir: evals/results/chccomp-2025-lia-nonlin/{run_id}

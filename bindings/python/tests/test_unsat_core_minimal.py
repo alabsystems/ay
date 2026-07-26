@@ -278,7 +278,7 @@ def test_single_tracker_core_is_minimal():
 # Differential cross-check against the real z3py oracle (4.15.4).
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_crosscheck_unique_core_equals_z3py():
     # Unique minimal core → ayz3 and z3py MUST agree exactly on the set.
     # ayz3 side.
@@ -306,7 +306,7 @@ def test_crosscheck_unique_core_equals_z3py():
     assert ay_names == z_names == {"hi", "lo"}
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_crosscheck_multiple_cores_same_minimal_size():
     # Multiple minimal cores → sizes must match z3py (both minimal), set may
     # differ. Verdicts must agree.
@@ -334,7 +334,7 @@ def test_crosscheck_multiple_cores_same_minimal_size():
     assert z_names.issubset({"gt5", "lt3", "eq4"})
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_crosscheck_triple_core_equals_z3py():
     # x==1, y==1, x+y==3 : the unique minimal core is the whole triple.
     s = fresh_solver()
@@ -357,7 +357,7 @@ def test_crosscheck_triple_core_equals_z3py():
     assert ay_names == z_names == {"x1", "y1", "sum3"}
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_crosscheck_many_distractors_size_matches():
     # Larger over-determined instance: 1 conflict pair + many distractors.
     # ayz3's minimal core size must equal z3py's.

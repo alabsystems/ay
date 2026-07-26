@@ -4,6 +4,25 @@
 use super::*;
 
 #[test]
+fn z3_audit_requests_the_native_chc_certificate_format() {
+    assert!(
+        CHC_CERTIFICATE_FILENAME.ends_with(".chccert"),
+        "the CHC solver rejects generic .smt2 proof output"
+    );
+}
+
+#[test]
+fn portfolio_mode_is_a_valid_chc_stats_envelope() {
+    let payload = serde_json::to_vec(&json!({
+        "mode": "portfolio",
+        "chc_evidence_manifest": {}
+    }))
+    .expect("serialize stats envelope");
+    let parsed = unique_chc_stats_json(&[], &payload).expect("accept CHC portfolio stats");
+    assert_eq!(parsed["mode"], "portfolio");
+}
+
+#[test]
 fn embedded_compatibility_inventory_is_complete_and_honestly_scoped() {
     let inventory = load_compatibility_inventory().expect("embedded compatibility inventory");
 

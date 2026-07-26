@@ -8,7 +8,7 @@ use ay_core::{EqualityPropagationResult, TermId, TheoryLit, TheoryResult, Theory
 use ay_euf::EufSolver;
 use std::collections::BTreeMap;
 
-use self::affine::distinct_by_affine_offset;
+use self::affine::{affine_euf_equality_reasons, distinct_by_affine_offset};
 
 mod affine;
 
@@ -420,6 +420,30 @@ pub(super) fn propagate_array_index_info<V: PartialEq>(
             if !keep {
                 continue;
             }
+        }
+        // #7956: an asserted EUF equality between opaque Int leaves induces
+        // equality of their affine contexts.  Example:
+        //
+        //   seq_offset(final) = seq_offset(current)
+        //   seq_offset(final) + 1 = seq_offset(current) + 1
+        //
+        // Neither leaf needs a concrete LIA value, so the model-value path
+        // below cannot discover this relationship.  Preserve EUF's
+        // SAT-visible explanation on the external array edge; a ROW conflict
+        // can then backtrack the responsible equality branch instead of
+        // repeatedly producing a conflicted `select` function table that the
+        // final model funnel must discard.  The helper fails closed when a
+        // representative substitution has no SAT premise; that pair falls
+        // through to the ordinary equality/disequality split below rather
+        // than installing an unconditional array edge.
+        if let Some(reasons) = affine_euf_equality_reasons(terms, euf, pair.idx1, pair.idx2) {
+            arrays.assert_external_equality_with_reasons(pair.idx1, pair.idx2, &reasons);
+            // `undecided_index_pairs` excludes relationships already present
+            // in the array equality graph, so this snapshot entry witnesses a
+            // newly inserted edge.  Restart once to let ROW checks consume it;
+            // the next snapshot omits the now-known pair, preventing thrash.
+            propagated_new = true;
+            continue;
         }
         if let (Some((v1, r1)), Some((v2, r2))) = (
             get_value_with_reasons(pair.idx1),

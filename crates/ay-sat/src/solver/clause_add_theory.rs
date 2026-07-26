@@ -56,6 +56,64 @@ impl Solver {
         self.add_theory_lemma(literals)
     }
 
+    /// Add a THEORY-CONFLICT lemma (#unguarded-tvalid-lemmas STAGE 1).
+    ///
+    /// Routing gate for T-VALID conflict lemmas — clauses that are theory
+    /// tautologies over term-semantic atom literals (e.g. an LRA Farkas-core
+    /// conflict lemma: the negation of a theory-inconsistent atom
+    /// conjunction), valid at every scope forever. Callers must route ONLY
+    /// such clauses here; theory PROPAGATION reasons and lazily-added
+    /// circuit/definition clauses stay on the scoped APIs.
+    ///
+    /// Default (`unguarded_theory_conflict_lemmas` off): identical to
+    /// [`Self::add_theory_lemma_scoped`] — the innermost scope selector is
+    /// appended and the lemma dies with its scope. Unchanged behavior.
+    ///
+    /// Flag on (the incremental QF_LRA engine lane, which excludes proof
+    /// sessions): route to the EXISTING unscoped [`Self::add_theory_lemma`]
+    /// path, whose `add_unscoped_theory_clause_db` stamps `scope_lim = 0` —
+    /// OpenSMT-style permanent retention across `pop()`. Invariants that
+    /// make this sound (each verified in this codebase state):
+    ///
+    /// * T-validity provenance: the swapped call sites map conflicts from
+    ///   `TermId`-keyed atom maps with fail-closed partial-mapping guards
+    ///   (`map_conflict_lits` in ay-dpll `split_incremental.rs` returns
+    ///   `Unmapped` => no clause; the eager extension's `term_to_literal`
+    ///   mapping in `extension/check.rs` returns `Unknown` on a partial
+    ///   clause, #3826), and any pre-minimization removes only literals
+    ///   falsified at level 0 — root facts that are themselves
+    ///   session-permanent (level-0 propagation can only fire from
+    ///   unguarded/permanent clauses; scoped clauses carry an unassigned
+    ///   `+selector` at level 0).
+    /// * Atom binding stability: `pop()` never shrinks `num_vars` or reuses
+    ///   variable indices (see `Solver::pop`), so a persisted lemma's
+    ///   literals keep their term semantics for the whole session.
+    /// * Ledger sync: the unscoped path never touches `original_ledger`
+    ///   (theory lemmas are learned-tier, "intentionally absent from the
+    ///   immutable input ledger" — see `add_unscoped_theory_clause_db`), so
+    ///   the `reset_search_state` census (`active_original_count`, which
+    ///   filters `is_learned`) cannot be desynced by these lemmas, and a
+    ///   destructive-rebuild fallback simply DROPS them (sound: they are
+    ///   re-derivable theory axioms).
+    /// * Pop-time GC: `gc_scoped_clauses` deletes only clauses CONTAINING
+    ///   the popped `+selector` (an unguarded lemma has none) and
+    ///   `gc_leaked_learned_clauses` deletes only `scope_lim > new_depth`
+    ///   (an unguarded lemma is stamped 0; the ic3-mode inc-engine lane
+    ///   skips that sweep entirely).
+    /// * Stale-ref hazards from the #inc-scoped-lemmas autopsy are closed
+    ///   centrally: `pop()` drops `pending_theory_conflicts`
+    ///   unconditionally, and the ledger arena rebuild normalizes every
+    ///   `var_data.reason` to `NO_REASON` (#inc-rebuild-reasons).
+    /// * Memory bound: the lemma lands in the DELETABLE tier
+    ///   (`reduce_permanent_protect_lbd() + 1` below), so `reduce_db`
+    ///   bounds the retained pool exactly as for every other theory lemma.
+    pub fn add_theory_conflict_lemma(&mut self, literals: Vec<Literal>) -> Option<ClauseRef> {
+        if self.cold.unguarded_theory_conflict_lemmas {
+            return self.add_theory_lemma(literals);
+        }
+        self.add_theory_lemma_scoped(literals)
+    }
+
     /// Add a theory lemma clause during solving.
     ///
     /// Unlike `add_clause`, this properly sets up watches so the clause can

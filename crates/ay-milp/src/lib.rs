@@ -35,12 +35,18 @@
 mod bab;
 #[doc(hidden)]
 pub use bab::{
+    bump_lu_diff_on_model,
+    bump_lu_diff_on_model_lanes,
+    diag_bump_lu_diff,
     diag_dump_root_basis,
     diag_exact_probe,
     diag_float_lp,
     diag_pin_probe,
     diag_presolve,
     diag_refine_probe,
+    // W0 measurement: root dual bound before/after the cut loop, no branching.
+    diag_root_closure,
+    BumpLuDiff,
     // STAGE-0 COLD-CLONE READINESS PoC (inert to the serial path; see bab.rs):
     // driven only by tests/parallel_ready.rs.
     NodeBound,
@@ -63,6 +69,7 @@ mod opts;
 mod outcome;
 mod parity;
 mod presolve;
+mod probe;
 mod session;
 mod simplex;
 #[cfg(feature = "smt")]
@@ -77,8 +84,15 @@ pub use cert::{
 pub use error::{MilpError, ModelError};
 pub use model::{Col, ColKind, Model, PointViolation, Row, Sense};
 pub use mps::{read_mps, MpsError, MpsProblem};
-pub use opts::SolveOpts;
+pub use opts::{FixedAssignmentTreeWarmStart, SolveOpts};
 pub use outcome::{Outcome, UnknownReason};
-pub use session::{BabSession, LpSession, ObbtOpts, ObbtReport};
+pub use session::{
+    AdaptiveFiveLeafCombTargetFsbReport, AdaptiveFourLeafCombTargetFsbReport,
+    AdaptiveThreeLeafTargetFsbReport, BabSession, CertifiedAdaptiveFiveLeafComb,
+    CertifiedAdaptiveFourLeafComb, CertifiedAdaptiveThreeLeafHarvest,
+    CertifiedAdaptiveThreeLeafTree, CertifiedBinaryAssignmentTree, CertifiedBinaryTreeHarvest,
+    CertifiedSplitHarvest, LpSession, ObbtOpts, ObbtReport, TargetFsbOpts, TargetFsbReport,
+    MAX_CERTIFIED_BINARY_ASSIGNMENT_TREE_LEAVES, MAX_TARGET_FSB_CANDIDATES,
+};
 pub use simplex::{px_profile_line, rt_profile_line, sb_profile_line, upd_profile_line};
 pub use tree_cert::{MilpInfeasibilityCertificate, TreeNode};

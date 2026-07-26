@@ -720,6 +720,26 @@ impl ArraySolver<'_> {
 
             match (sel1.resolution, sel2.resolution) {
                 (SelectResolution::Base(base1), SelectResolution::Base(base2)) => {
+                    // M6 weak-component prune (verdict-preserving, work-only):
+                    // this Base/Base arm fires only when `base1 = base2` is
+                    // provable, which implies `weakly_connected(array1, array2)`
+                    // by construction (the weak-eq graph ingests a superset of the
+                    // store/eq edges the base resolution can traverse). So a pair
+                    // whose select arrays lie in different weak-eq components can
+                    // never fire — skip before the base explain-BFS. SCOPED TO THIS
+                    // ARM ONLY: the (Value, Value) arm below fires on equal concrete
+                    // values across DIFFERENT components and must NOT be pruned.
+                    // Fail-safe: only prune when both arrays resolve (they always
+                    // do — every select in the map came from `select_cache`). Same
+                    // graph API as the M5 SingletonOnly witness.
+                    if let (Some(&(array1, _)), Some(&(array2, _))) = (
+                        self.select_cache.get(&sel1.select_term),
+                        self.select_cache.get(&sel2.select_term),
+                    ) {
+                        if !self.weakly_connected(array1, array2) {
+                            continue;
+                        }
+                    }
                     let Some(base_reasons) = self.explain_equal_if_provable(base1, base2) else {
                         continue;
                     };

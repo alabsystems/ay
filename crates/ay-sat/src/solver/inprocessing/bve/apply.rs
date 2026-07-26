@@ -776,18 +776,14 @@ impl Solver {
             );
         }
 
-        // Suppress any prior reconstruction entries (from CCE/BCE) whose
-        // witness literal matches this variable. CaDiCaL deduplicates via
-        // `marked()` in push_witness_literal_on_extension_stack (extend.cpp:42-45).
-        // Without this, CCE entries pushed earlier for the same variable would
-        // flip the variable again during reverse reconstruction, corrupting the
-        // model. (#8179)
-        let ext_var_idx = self.cold.i2e[var.index()] as usize;
-
-        self.inproc
-            .reconstruction
-            .suppress_prior_witness_entries(ext_var_idx);
-
+        // Keep every earlier conditional-autarky entry, including BCE/CCE
+        // witnesses on this pivot. Those entries can describe clauses already
+        // deleted from the occurrence lists, so this BVE transaction cannot
+        // replace their reconstruction obligations. Reverse chronological
+        // replay composes the transformations soundly. CaDiCaL likewise pushes
+        // the witness before checking its external `marked(witness, lit)` bit;
+        // that bit tracks external witness literals and does not deduplicate
+        // entries.
         for entry in &result.witness_entries {
             let idx = entry.clause_idx;
             if scratch.kept_strengthened.binary_search(&idx).is_ok() {

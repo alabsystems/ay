@@ -2063,77 +2063,63 @@ mod tests {
         assert_eq!(sbp_clauses.len(), 2, "orbit of size 3 needs 2 SBP clauses");
     }
 
-    /// #8011 isolated DRAT-RAT feasibility probe (ignored; manual).
+    /// A complete, bounded replacement for the former file-emitting DRAT probe.
     ///
-    /// Reads a DIMACS CNF from `AY_CLIQUE_CNF`, runs the composite-symmetry
-    /// detector + per-generator lex-leader encoder, and writes a standalone
-    /// DRAT proof to `AY_SBP_PROOF_OUT` consisting ONLY of the SBP clause
-    /// additions (one `a`-line each, encode order) followed by a final empty
-    /// clause. Run `ay check drat CNF PROOF`: if every SBP add is RAT-valid the
-    /// checker reaches the final empty clause and fails ONLY there
-    /// (NoEmptyClause), proving the additions are checker-accepted; if any SBP
-    /// add is not RAT it fails at that earlier step. `AY_SAT_IR_MAX_GENERATORS`
-    /// caps the number of generators (set 1 for the single-generator probe).
+    /// The single positive clause has the verified swap `(x0 x1)` as an
+    /// automorphism. Its full lex-leader tower includes both a genuine
+    /// symmetry-breaking clause and fresh equal-prefix definitions. Feed every
+    /// generated addition directly through the native checker and require at
+    /// least one RAT check. `NoEmptyClause` is the expected conclusion because
+    /// this is an addition-fragment check, not a refutation.
     #[test]
-    #[ignore = "manual DRAT-RAT probe requires AY_CLIQUE_CNF and AY_SBP_PROOF_OUT"]
-    fn probe_sbp_drat_rat() {
-        let path = std::env::var("AY_CLIQUE_CNF").expect("set AY_CLIQUE_CNF");
-        let out = std::env::var("AY_SBP_PROOF_OUT").expect("set AY_SBP_PROOF_OUT");
-        let text = std::fs::read_to_string(&path).unwrap();
-        let mut clauses: Vec<Vec<Literal>> = Vec::new();
-        let mut max_var = 0u32;
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('p') || line.starts_with('c') {
-                continue;
-            }
-            let mut c = Vec::new();
-            for tok in line.split_whitespace() {
-                let v: i64 = tok.parse().unwrap();
-                if v == 0 {
-                    break;
-                }
-                let raw = v.unsigned_abs() as u32 - 1;
-                max_var = max_var.max(raw);
-                c.push(if v > 0 {
-                    Literal::positive(Variable(raw))
-                } else {
-                    Literal::negative(Variable(raw))
-                });
-            }
-            if !c.is_empty() {
-                c.sort_unstable_by_key(|l| l.raw());
-                clauses.push(c);
-            }
-        }
-        let fresh_base = max_var + 1; // first unused AY variable id
-        let detector = SymmetryDetector::new(128, 64);
-        let (sbp, aux) = detector.detect_and_encode_composite(&clauses, fresh_base);
-        // Dedup against existing formula (mirrors the solver path).
+    fn test_sbp_tower_additions_are_drat_rat() {
+        use ay_drat_check::checker::DratChecker;
+        use ay_drat_check::{ConcludeFailure, ConcludeResult};
+
+        let clauses = vec![vec![
+            Literal::positive(Variable(0)),
+            Literal::positive(Variable(1)),
+        ]];
         let existing = build_formula_counts(&clauses);
-        let unique = deduplicate_sbp_clauses(sbp, &existing);
-        eprintln!(
-            "probe_sbp_drat_rat: {} clauses, {} SBP clauses, {} aux vars, fresh_base={}",
-            clauses.len(),
-            unique.len(),
-            aux,
-            fresh_base
+        let mut swap = BTreeMap::new();
+        swap.insert(Variable(0), Variable(1));
+        swap.insert(Variable(1), Variable(0));
+        assert!(
+            permutation_preserves_formula(&existing, &swap),
+            "the hand-built swap must pass the same automorphism gate as IR"
         );
-        let mut buf = String::new();
-        for clause in &unique {
-            for l in clause {
-                let d = if l.is_positive() {
-                    (l.variable().0 + 1) as i64
-                } else {
-                    -((l.variable().0 + 1) as i64)
-                };
-                buf.push_str(&d.to_string());
-                buf.push(' ');
-            }
-            buf.push_str("0\n");
+
+        let fresh_base = 2;
+        let (sbp, aux) = encode_perm_lex_leader(&swap, fresh_base);
+        let unique = deduplicate_sbp_clauses(sbp, &existing);
+        assert!(!unique.is_empty(), "the swap must emit an SBP tower");
+        assert!(aux > 0, "the full tower must exercise fresh aux clauses");
+
+        let to_checker_clause = |clause: &[Literal]| {
+            clause
+                .iter()
+                .map(|lit| ay_drat_check::literal::Literal::from_index(lit.index()))
+                .collect::<Vec<_>>()
+        };
+        let mut checker = DratChecker::new((fresh_base + aux) as usize, true);
+        for clause in &clauses {
+            checker.add_original(&to_checker_clause(clause));
         }
-        buf.push_str("0\n"); // final empty clause: only reachable if all SBP adds passed
-        std::fs::write(&out, buf).unwrap();
+        for clause in &unique {
+            checker
+                .add_derived(&to_checker_clause(clause))
+                .unwrap_or_else(|error| panic!("SBP addition {clause:?} is not DRAT: {error}"));
+        }
+
+        assert_eq!(checker.stats().failures, 0);
+        assert!(
+            checker.stats().rat_checks > 0,
+            "the bounded probe must exercise the RAT path, not only RUP"
+        );
+        assert_eq!(
+            checker.conclude_unsat(),
+            ConcludeResult::Failed(ConcludeFailure::NoEmptyClause)
+        );
     }
 
     /// Build a pure pigeonhole CNF `PHP(P=H+1, H)` over 0-indexed variables

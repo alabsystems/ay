@@ -488,9 +488,8 @@ impl BucketSelector {
 /// advisory, every incumbent is independently re-verified).
 ///
 /// # Measured default (honest-measurement rule)
-/// The default is decided by the in-file microbenchmark
-/// (`bench_bucketed_vs_bms_flip_rate`, 10k/100k-var mixed Ge/Eq synthetic
-/// instances with negated literals, fixed 400k-flip budgets, release build):
+/// The default was decided by a fixed-seed 10k/100k-variable mixed Ge/Eq
+/// campaign (negated literals, fixed 400k-flip budgets, release build):
 /// the bucketed selector becomes the default ONLY if it at least matches the
 /// BMS flip rate on BOTH sizes. Measured 2026-07-11 (busy host, best of 2,
 /// i64 core): 10k vars — BMS 1.69M flips/s vs bucketed 1.53M (0.90×);
@@ -2190,12 +2189,10 @@ mod tests {
         assert_eq!(s.pick_var(&mut rng, 50, 10), None);
     }
 
-    // ---- microbenchmarks (design §4 performance contract) ----
+    // ---- distilled microbenchmark invariants (design §4) ----
     //
-    // Ignored by default: run explicitly, release build, e.g.
-    //   cargo test -p ay-pb --release -j 4 --lib -- --ignored bench_ --nocapture
-    // Deterministic instances and flip budgets; wall clock printed. These
-    // justify (a) the MoveSelector default and (b) the i64 fast path.
+    // Fixed deterministic trajectories retain the selector and integer-width
+    // equivalence checks without making wall-clock throughput a test contract.
 
     /// Deterministic synthetic instance: mixed Ge/Eq rows (every 3rd Eq),
     /// ~half negated literals, small coefficients (i64-fitting), objective
@@ -2239,86 +2236,52 @@ mod tests {
         num_vars: usize,
         sel: MoveSelector,
         flips: u64,
-    ) -> (f64, i128) {
+    ) -> (Vec<bool>, i128, bool) {
         let init = vec![false; num_vars];
         let mut s = core::<T>(constraints, objective, num_vars, &init, sel);
         let mut rng = SplitMix64::new(0xBE2C_4001_2026_0711);
-        let t0 = std::time::Instant::now();
         for _ in 0..flips {
             let Some(v) = s.pick_var(&mut rng, 10, 50) else {
                 break;
             };
             s.flip(v);
         }
-        (t0.elapsed().as_secs_f64(), s.obj_value())
+        (s.assignment().to_vec(), s.obj_value(), s.is_feasible())
     }
 
     #[test]
-    #[ignore = "microbench: run explicitly with --ignored --nocapture (release)"]
-    fn bench_bucketed_vs_bms_flip_rate() {
-        println!("\n=== scorer selector flip-rate: BMS vs bucketed (i64 core) ===");
-        println!(
-            "{:>8} {:>9} {:>10} {:>10} {:>12} {:>12}",
-            "vars", "rows", "selector", "flips", "secs", "flips/sec"
-        );
-        for &(num_vars, rows, flips) in &[
-            (10_000usize, 20_000usize, 400_000u64),
-            (100_000, 200_000, 400_000),
-        ] {
-            let (constraints, objective) = synth_mixed(num_vars, rows, 5, 0x5EED_0001, 1);
-            for sel in [MoveSelector::Bms, MoveSelector::Bucketed] {
-                let (secs, obj) =
-                    run_flip_loop::<i64>(&constraints, &objective, num_vars, sel, flips);
-                println!(
-                    "{:>8} {:>9} {:>10} {:>10} {:>12.3} {:>12.0}   (obj {obj})",
-                    num_vars,
-                    rows,
-                    format!("{sel:?}"),
-                    flips,
-                    secs,
-                    flips as f64 / secs
-                );
-            }
+    fn scorer_selectors_are_deterministic_and_exact_on_mixed_rows() {
+        let num_vars = 128usize;
+        let (constraints, objective) = synth_mixed(num_vars, 256, 5, 0x5EED_0001, 1);
+        for selector in [MoveSelector::Bms, MoveSelector::Bucketed] {
+            let first = run_flip_loop::<i64>(&constraints, &objective, num_vars, selector, 2_000);
+            let second = run_flip_loop::<i64>(&constraints, &objective, num_vars, selector, 2_000);
+            assert_eq!(
+                first, second,
+                "{selector:?} trajectory must be deterministic"
+            );
+            assert_eq!(first.1, eval_objective(&objective, &first.0));
+            assert_eq!(
+                first.2,
+                crate::eval::verify_all_constraints(&constraints, &first.0),
+                "{selector:?} feasibility tracker must match the exact oracle"
+            );
         }
     }
 
     #[test]
-    #[ignore = "microbench: run explicitly with --ignored --nocapture (release)"]
-    fn bench_scorer_i64_vs_i128_flip_rate() {
-        println!("\n=== scorer core flip-rate: i64 fast path vs i128 (default selector) ===");
-        println!(
-            "{:>8} {:>9} {:>6} {:>10} {:>12} {:>12}",
-            "vars", "rows", "width", "flips", "secs", "flips/sec"
+    fn scorer_i64_and_i128_follow_identical_mixed_row_trajectory() {
+        let num_vars = 128usize;
+        let (constraints, objective) = synth_mixed(num_vars, 256, 5, 0x5EED_0002, 1);
+        let selector = MoveSelector::default();
+        let narrow = run_flip_loop::<i64>(&constraints, &objective, num_vars, selector, 2_000);
+        let wide = run_flip_loop::<i128>(&constraints, &objective, num_vars, selector, 2_000);
+
+        assert_eq!(narrow, wide, "integer widths must agree bit-for-bit");
+        assert_eq!(narrow.1, eval_objective(&objective, &narrow.0));
+        assert_eq!(
+            narrow.2,
+            crate::eval::verify_all_constraints(&constraints, &narrow.0)
         );
-        for &(num_vars, rows, flips) in &[
-            (10_000usize, 20_000usize, 400_000u64),
-            (100_000, 200_000, 400_000),
-        ] {
-            let (constraints, objective) = synth_mixed(num_vars, rows, 5, 0x5EED_0002, 1);
-            let sel = MoveSelector::default();
-            let (s64, o64) = run_flip_loop::<i64>(&constraints, &objective, num_vars, sel, flips);
-            let (s128, o128) =
-                run_flip_loop::<i128>(&constraints, &objective, num_vars, sel, flips);
-            assert_eq!(o64, o128, "widths must agree on the trajectory");
-            println!(
-                "{:>8} {:>9} {:>6} {:>10} {:>12.3} {:>12.0}",
-                num_vars,
-                rows,
-                "i64",
-                flips,
-                s64,
-                flips as f64 / s64
-            );
-            println!(
-                "{:>8} {:>9} {:>6} {:>10} {:>12.3} {:>12.0}   (speedup {:.2}x)",
-                num_vars,
-                rows,
-                "i128",
-                flips,
-                s128,
-                flips as f64 / s128,
-                s128 / s64
-            );
-        }
     }
 }

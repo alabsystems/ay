@@ -8,7 +8,7 @@
 //!
 //! This is the CHC that Trust's compiler emits for a provably-dead match arm:
 //!
-//! ```rust,ignore
+//! ```rust
 //! pub fn lane_select(n: u32) -> u32 {
 //!     match n % 3 { 0 => 100, 1 => 200, 2 => 300, _ => unreachable!() }
 //! }

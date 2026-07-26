@@ -2275,3 +2275,148 @@ fn character_literal_range_is_enforced() {
         );
     }
 }
+
+#[test]
+fn reset_assertions_clears_named_formula_provenance() {
+    let commands = parse(
+        "(declare-const p Bool) \
+         (push 1) \
+         (assert (! p :named stale)) \
+         (reset-assertions)",
+    )
+    .expect("reset-assertions fixture parses");
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command)
+            .expect("reset-assertions fixture elaborates");
+    }
+
+    assert!(ctx.assertions.is_empty());
+    assert!(ctx.assertions_parsed().is_empty());
+    assert_eq!(ctx.scope_depth(), 0);
+    assert!(
+        ctx.named_terms_iter().next().is_none(),
+        "labels owned by removed assertions must not survive reset-assertions"
+    );
+}
+
+/// `let` binds in PARALLEL (SMT-LIB 2.6 §3.6.1): a binding's value is
+/// elaborated in the environment as it stood BEFORE its own level, so siblings
+/// are not in scope for one another. `let*` must be written as nested `let`s.
+///
+/// Binding sequentially was a wrong-verdict defect in the CORE language,
+/// theory-independent and able to flip a verdict in either direction. Against
+/// z3 5.0.0: `(let ((a 0)) (let ((a 1) (b a)) (= b 0)))` is a tautology (`b` is
+/// the outer `a`) but ay answered `unsat`; `(let ((a false)) (let ((a true)
+/// (b a)) b))` is unsatisfiable but ay answered `sat`.
+///
+/// These tests compare interned `TermId`s inside ONE context: the term store
+/// hash-conses, so two assertions share an id exactly when they elaborate to
+/// the same term.
+fn elaborated_assertions(input: &str) -> Vec<TermId> {
+    let commands = parse(input).unwrap();
+    let mut ctx = Context::new();
+    for cmd in &commands {
+        ctx.process_command(cmd).unwrap();
+    }
+    ctx.assertions.clone()
+}
+
+#[test]
+fn test_let_bindings_are_parallel_not_sequential() {
+    // The swap idiom: under parallel binding this is `(= y x)`. Bound
+    // sequentially the second binding would see the new `x` and it would
+    // collapse to `(= y y)`, i.e. `true`.
+    let ids = elaborated_assertions(
+        r"
+            (declare-const x Int)
+            (declare-const y Int)
+            (assert (let ((x y) (y x)) (= x y)))
+            (assert (= y x))
+        ",
+    );
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        ids[0], ids[1],
+        "let must bind in parallel: (let ((x y) (y x)) (= x y)) is (= y x)"
+    );
+}
+
+#[test]
+fn test_let_sibling_sees_outer_binding_not_its_sibling() {
+    // `b` must resolve to the OUTER `a`, so the body is `(= a 1)`.
+    let ids = elaborated_assertions(
+        r"
+            (declare-const a Int)
+            (assert (let ((a 1) (b a)) (= b a)))
+            (assert (= a 1))
+        ",
+    );
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        ids[0], ids[1],
+        "a sibling binding resolves outward, never to its sibling"
+    );
+}
+
+#[test]
+fn test_nested_let_levels_are_not_collapsed() {
+    // Exercises the chain-flatten path specifically. Level boundaries are
+    // semantically load-bearing: the inner `b` is the OUTER let's `a` (0), so
+    // the whole assertion is a tautology. Collapsing the two levels into one
+    // ordered list — which the flatten optimization used to do — makes `b`
+    // pick up the inner `a` (1) and turns this into a false assertion.
+    let ids = elaborated_assertions(
+        r"
+            (assert (let ((a 0)) (let ((a 1) (b a)) (= b 0))))
+            (assert true)
+        ",
+    );
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], ids[1], "nested let levels must not be collapsed");
+}
+
+#[test]
+fn test_let_sibling_reference_to_unbound_name_is_rejected() {
+    // Direct evidence of the scope leak: with nothing named `a` in scope, the
+    // sibling reference must be an error. It was silently accepted while the
+    // environment was extended before siblings were elaborated.
+    let commands = parse(
+        r"
+            (declare-const q Bool)
+            (assert (let ((a q) (b a)) b))
+        ",
+    )
+    .unwrap();
+    let mut ctx = Context::new();
+    let mut err = None;
+    for cmd in &commands {
+        if let Err(e) = ctx.process_command(cmd) {
+            err = Some(e);
+            break;
+        }
+    }
+    assert!(
+        err.is_some(),
+        "a sibling reference to an otherwise-unbound name must be rejected"
+    );
+}
+
+#[test]
+fn test_let_dead_binding_elimination_survives_parallel_fix() {
+    // Dead-binding elimination (#arr_lia561) must still hold: a binding the
+    // body never mentions is not elaborated. Kept alongside parallel binding,
+    // with liveness computed per level by the free-variable rule.
+    let ids = elaborated_assertions(
+        r"
+            (declare-const p Bool)
+            (assert (let ((dead (and p (not p))) (livevar p)) livevar))
+            (assert p)
+        ",
+    );
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        ids[0], ids[1],
+        "live binding resolves to p; dead one dropped"
+    );
+}

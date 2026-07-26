@@ -190,12 +190,17 @@ fn checked_diagnostic_source_total(current: usize, next: usize) -> Option<usize>
 // Embed the complete trusted source base needed by every runtime firewall. This
 // prevents a same-named module in the current working directory (or a stale,
 // replaced project `.olean`) from redefining the theorem the gate claims to
-// check. FpThy and Datatype are included because two specialized emitters use
-// their verified lemmas in addition to the common Firewall/Lrat base.
+// check. FpThy, Datatype and NiaProduct are included because specialized
+// emitters use their verified lemmas in addition to the common Firewall/Lrat
+// base. NiaProduct carries the McCormick bilinear-product bridge that the
+// nonlinear-integer emitter injects; like the others it is import-free, so it
+// concatenates cleanly after the imports have been stripped.
 const LRAT_SOURCE: &str = include_str!("../../../verification/lean/AySoundness/Lrat.lean");
 const FIREWALL_SOURCE: &str = include_str!("../../../verification/lean/AySoundness/Firewall.lean");
 const FP_SOURCE: &str = include_str!("../../../verification/lean/AySoundness/FpThy.lean");
 const DATATYPE_SOURCE: &str = include_str!("../../../verification/lean/AySoundness/Datatype.lean");
+const NIA_PRODUCT_SOURCE: &str =
+    include_str!("../../../verification/lean/AySoundness/NiaProduct.lean");
 const LAKEFILE_SOURCE: &str = include_str!("../../../verification/lean/lakefile.toml");
 const LEAN_TOOLCHAIN_SOURCE: &str = include_str!("../../../verification/lean/lean-toolchain");
 
@@ -573,13 +578,22 @@ struct StandaloneParts<'a> {
     audit_at: usize,
 }
 
+/// The import allow-list, in the ORDER an emitted artifact must write it. The
+/// strip below is an ordered `strip_prefix` walk, so an emitter whose header
+/// lists these modules in a different relative order leaves a residual `import `
+/// line and is rejected as untrusted. `AySoundness.NiaProduct` therefore sits
+/// immediately AFTER `AySoundness.Firewall`, matching
+/// `render_nia_product_lean`'s two-line header.
+const ALLOWED_EMITTED_IMPORTS: [&str; 4] = [
+    "import AySoundness.Firewall\n",
+    "import AySoundness.NiaProduct\n",
+    "import AySoundness.FpThy\n",
+    "import AySoundness.Datatype\n",
+];
+
 fn standalone_parts(emitted: &str) -> Result<StandaloneParts<'_>, String> {
     let mut body = emitted;
-    for import in [
-        "import AySoundness.Firewall\n",
-        "import AySoundness.FpThy\n",
-        "import AySoundness.Datatype\n",
-    ] {
+    for import in ALLOWED_EMITTED_IMPORTS {
         if let Some(rest) = body.strip_prefix(import) {
             body = rest;
         }
@@ -616,6 +630,8 @@ fn standalone_firewall_source_len(emitted: &str) -> Result<usize, String> {
         1,
         DATATYPE_SOURCE.len(),
         1,
+        NIA_PRODUCT_SOURCE.len(),
+        1,
         parts.body.len(),
         AXIOM_AUDIT_PREFIX.len(),
         AXIOM_AUDIT_SENTINEL.len(),
@@ -641,6 +657,8 @@ fn standalone_firewall_source(emitted: &str) -> Result<String, String> {
     source.push_str(FP_SOURCE);
     source.push('\n');
     source.push_str(DATATYPE_SOURCE);
+    source.push('\n');
+    source.push_str(NIA_PRODUCT_SOURCE);
     source.push('\n');
     source.push_str(&parts.body[..parts.audit_at]);
     source.push_str(AXIOM_AUDIT_PREFIX);
@@ -1288,6 +1306,111 @@ mod tests {
         let end = source.rfind("end Example").expect("namespace end");
         assert!(audit < end);
         assert!(source.contains(AXIOM_AUDIT_SENTINEL));
+    }
+
+    /// The verbatim body of a real `--emit-firewall-lean` artifact from the
+    /// nonlinear-integer product emitter (`benchmarks/smt/QF_NIA/`
+    /// `sign_consistency.smt2`), doc comment elided. It is a FIXTURE, not a
+    /// golden output: the point is that this exact byte shape — two allow-listed
+    /// imports in the emitter's order, and a `AySoundness.NiaProduct` corner
+    /// lemma applied inside the proof — survives the standalone embedding and is
+    /// accepted by the Lean kernel with no project `.olean` in sight.
+    const NIA_PRODUCT_ARTIFACT: &str = r#"import AySoundness.Firewall
+import AySoundness.NiaProduct
+set_option linter.unusedSimpArgs false
+
+namespace AySoundness.Emitted.NiaProd_77b5a9d756ebabfd
+open AySoundness
+
+abbrev Val := Nat → Int
+
+def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide ((m 0) > (0 : Int))
+  | 2 => decide ((m 1) > (0 : Int))
+  | 3 => decide (((m 0) * (m 1)) < (0 : Int))
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1]), (2, [2]), (3, [3])]
+def lemmas   : List (Cid × Clause) := [(4, [-1, -2, -3])]
+def proof    : List (Cid × Clause × List Int) := [(5, [], [1, 2, 3, 4])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1, -2, -3] = true := by
+  simp only [clauseSat, litSat, atomVal, List.any_cons, List.any_nil,
+    Int.reduceGT, Int.reduceNeg, Int.reduceToNat, reduceIte, Bool.or_false,
+    Bool.or_eq_true, Bool.not_eq_eq_eq_not, Bool.not_true, decide_eq_false_iff_not]
+  exact
+    if h1 : (m 0) > (0 : Int) then
+  if h2 : (m 1) > (0 : Int) then
+  if h3 : ((m 0) * (m 1)) < (0 : Int) then (show False by have hb0 := AySoundness.NiaProduct.mul_lb_ll (x := (m 0)) (y := (m 1)) (a := (1 : Int)) (c := (1 : Int)) (by omega) (by omega); omega).elim else Or.inr (Or.inr (h3))
+else Or.inr (Or.inl h2)
+else Or.inl h1
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.NiaProd_77b5a9d756ebabfd
+"#;
+
+    /// The nonlinear-integer emitter imports `AySoundness.NiaProduct` on top of
+    /// the common base, so the standalone build must EMBED that module's source
+    /// too. Without the embedding the artifact would either lose its bridge
+    /// lemma or fall back on a mutable project `.olean` — the exact substitution
+    /// the embedding exists to prevent.
+    #[test]
+    fn standalone_source_embeds_the_nia_product_bridge() {
+        let source = standalone_firewall_source(NIA_PRODUCT_ARTIFACT).expect("standalone source");
+        assert_eq!(
+            source.len(),
+            standalone_firewall_source_len(NIA_PRODUCT_ARTIFACT).expect("standalone source length")
+        );
+        // Nothing is imported: every trusted module is inlined from this binary.
+        assert!(!source.lines().any(|line| line.starts_with("import ")));
+        assert!(source.contains("namespace AySoundness.NiaProduct"));
+        assert!(source.contains("theorem mul_lb_ll"));
+        assert!(source.contains("theorem firewall_combined_unsat"));
+        // The bridge must be DEFINED before the emitted proof applies it.
+        let bridge = source
+            .find("theorem mul_lb_ll")
+            .expect("bridge lemma in the embedded base");
+        let use_site = source
+            .find("AySoundness.NiaProduct.mul_lb_ll (x := (m 0))")
+            .expect("bridge application in the emitted body");
+        assert!(bridge < use_site);
+        assert!(source.contains(AXIOM_AUDIT_SENTINEL));
+        eprintln!("----STANDALONE-BEGIN----\n{source}\n----STANDALONE-END----");
+    }
+
+    /// O4: `standalone_parts` strips the allow-list with an ORDERED
+    /// `strip_prefix` walk, so the emitter's header order is load-bearing. An
+    /// artifact that lists `NiaProduct` BEFORE `Firewall` leaves a residual
+    /// `import` line and must be rejected as untrusted rather than silently
+    /// accepted — this pins the coupling that
+    /// `lean_firewall::render_nia_product_lean` has to honour.
+    #[test]
+    fn standalone_source_rejects_allow_listed_imports_out_of_order() {
+        let reordered = NIA_PRODUCT_ARTIFACT.replace(
+            "import AySoundness.Firewall\nimport AySoundness.NiaProduct\n",
+            "import AySoundness.NiaProduct\nimport AySoundness.Firewall\n",
+        );
+        assert!(standalone_firewall_source(&reordered).is_err());
+        // Sanity: the allow-list itself is in the order emitters must write.
+        assert_eq!(
+            ALLOWED_EMITTED_IMPORTS[..2],
+            [
+                "import AySoundness.Firewall\n",
+                "import AySoundness.NiaProduct\n"
+            ]
+        );
     }
 
     #[test]

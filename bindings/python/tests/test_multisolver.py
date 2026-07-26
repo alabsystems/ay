@@ -59,7 +59,7 @@ def test_two_solvers_contradictory_constraints_both_sat_independently():
     assert m2[x].as_long() < 0
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_two_solvers_contradictory_agree_with_z3py():
     # ayz3
     x = z.Int("x")
@@ -113,7 +113,7 @@ def test_same_formula_added_to_two_solvers():
     assert sb.model()[x].as_long() == -2
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_shared_formula_agrees_with_z3py():
     def run(m, Solver):
         x = m.Int("x")
@@ -161,7 +161,7 @@ def test_solver_and_optimize_same_vars():
     assert o.model()[y].as_long() == 10
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_solver_and_optimize_agree_with_z3py():
     def run(m):
         y = m.Int("y")
@@ -214,7 +214,7 @@ def test_independent_push_pop_two_solvers():
     assert q.check() == z.sat and 0 < q.model()[a].as_long() < 5
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_push_pop_unsat_then_recover_agrees_with_z3py():
     def run(m):
         a = m.Int("a")
@@ -256,7 +256,7 @@ def test_models_are_independent():
 # rebuild source here is a fresh per-case Context (not the shared _main_ctx), so
 # cases never accumulate colliding names — and the source-ctx != solver-ctx
 # difference still forces the cross-context rebuild path under test.
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 @pytest.mark.parametrize("name,buildf", [
     ("bv_add", lambda m: m.BitVec("bv_p", 8) + m.BitVec("bv_q", 8) == 5),
     ("bv_signed_lt", lambda m: m.BitVec("bv_r", 8) < m.BitVec("bv_s", 8)),
@@ -406,7 +406,7 @@ def test_explicit_shared_context_solvers_are_independent():
     assert sb.model()[a].as_long() < 0
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_explicit_shared_context_matches_z3py():
     # Oracle for the corrected behavior above: in real z3py, two Solvers on
     # ONE shared Context are independent assertion stacks.

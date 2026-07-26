@@ -1182,6 +1182,10 @@ impl Context {
                 self.objectives.clear();
                 self.soft_constraints.clear();
                 self.scopes.clear();
+                // Named formulas are assertion provenance. Keeping them after
+                // their assertions and scope frames are gone can make a later
+                // syntactically identical assertion inherit a stale core label.
+                self.named_terms.clear();
                 // #quantprod-g3: an adopted definitional macro is justified
                 // ONLY by its (now removed) assertion — un-adopt it, or later
                 // asserts would keep expanding an unconstrained `f`. Plain

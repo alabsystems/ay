@@ -770,7 +770,9 @@ def _ancestor_pids_ps(pid=None):
 
 
 def _ancestor_pids(pid=None):
-    """Linux ancestor PID set, used to ignore the supervising cargo command."""
+    """Ancestor PID set, used to ignore the supervising cargo command."""
+    if not os.path.isdir("/proc"):
+        return _ancestor_pids_ps(pid)
     current = os.getpid() if pid is None else int(pid)
     ancestors = set()
     visited = set()

@@ -1374,6 +1374,45 @@ use crate::simplex::{Candidate, FloatLp, NbBound};
 /// have, clique/odd-hole for air05's set-partitioning rows. This engine carries two families
 /// against the dozen a competitive solver carries, and the two it has are the two that cannot see
 /// the structure these instances are made of.
+///
+/// **2026-07-25, ten rounds, and why the two above is not the refutation it looks like.** The
+/// note above measured rounds against a per-round budget of FOUR cuts, and the sweep it cites
+/// ("6/16, 12/40 rounds/cuts changes nothing") was run on rout — a degenerate LP where no cut
+/// of any family moves the bound, which is the one instance whose answer does not generalise.
+/// Measured on the 130 MIPLIB instances with a published optimum (W0):
+///
+/// ```text
+///   root budget 40, rounds 2      +6.00pp mean root closure   (worst instance −3.10pp)
+///   root budget  4, rounds 10     +3.83pp                     (worst −19.06pp: b-ball)
+///   root budget 40, rounds 10     +9.83pp                     (worst −0.48pp)
+/// ```
+///
+/// The two levers COMPOUND, and — the load-bearing detail — the b-ball regression that ten
+/// rounds cause on their own DISAPPEARS once the budget is 40. Ten shallow rounds re-derive
+/// near-copies of the same few rows; ten rounds each allowed forty rows reach different
+/// structure. Rounds were never the problem on their own, and neither was the budget; the
+/// pair of them at four-by-two was.
+///
+/// **AND THE BOTTOM LINE REFUSED IT.** Root closure is a LEADING indicator, and it did not
+/// transfer. Gated on full 15s solves over 154 instances, twice, `40 × 10` gives:
+///
+/// ```text
+///   proved            38 -> 37
+///   verdicts           1 gained, 7 LOST  (qnet1 OPTIMAL->FEASIBLE; four FEASIBLE->UNKNOWN)
+///   wall               1 faster, 10 slower  (p0201 +899%, gt2 +881%, f2gap40400 +450%)
+///   soundness alarms   0 in every arm
+/// ```
+///
+/// Every row the root adopts is a row in every LP of every node, and ay's node LP cannot
+/// carry a Gurobi-sized pool: the bound arrives and the throughput that would have used it
+/// does not. The bound-driven final retention below recovers part of the wall (gt2 +881%
+/// rather than +5932%, ten slower rather than twelve) and does not recover the verdicts.
+///
+/// So the defaults STAY at two-by-four, and the finding is the deliverable: **the root cut
+/// gap is downstream of the LP-throughput gap.** More cut quality is not affordable until
+/// W5 makes a node LP cheap enough to carry it, which reorders the plan — W5 is the
+/// prerequisite for W1/W2, not a parallel stream. `AY_MILP_ROOT_CUTS_PER_ROUND=40
+/// AY_MILP_GMI_ROUNDS=10` reproduces the +9.25pp closure arm on demand.
 pub(crate) const MAX_GMI_ROUNDS: usize = 2;
 
 /// Cut effort, overridable for measurement. The shipped values were tuned on the dense binary
@@ -1391,6 +1430,39 @@ pub(crate) fn cuts_per_round() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(MAX_CUTS_PER_ROUND)
+}
+
+/// The ROOT loop's per-round cut budget, which is a different economy from a node's.
+///
+/// `MAX_CUTS_PER_ROUND`'s four is charged at every NODE as well, where a wider batch is a
+/// direct tax on the throughput that proves the tree. At the root the same four rows are
+/// paid for once and are the only thing standing between the relaxation and the bound the
+/// whole tree prunes against — and MEASURED (W0, 130 MIPLIB instances with a published
+/// optimum, the development design notes), four is far too few:
+/// the adopted cut counts cluster on 4/8/12 while the mean root closure sits at 7.0%
+/// against Gurobi's 54.7%.
+///
+/// Raising the ROOT budget alone to 40 moves mean root closure by +6.0pp (+779pp summed
+/// over 130 instances) with three regressions, the worst −3.1pp; with ten rounds it is
+/// +9.25pp and mean closure goes 7.02% → 16.27%.
+///
+/// **The default is nonetheless still four**, because the full-solve gate refused it — see
+/// [`MAX_GMI_ROUNDS`] for the numbers. The value of this function is that the root budget is
+/// now SEPARABLE from the node budget at all, so the next attempt does not have to buy the
+/// node regression along with the root gain.
+///
+/// `AY_MILP_ROOT_CUTS_PER_ROUND` overrides; the historical `AY_MILP_CUTS_PER_ROUND` still
+/// overrides both, so every measurement taken through the old knob keeps its meaning.
+pub(crate) fn root_cuts_per_round() -> usize {
+    std::env::var("AY_MILP_ROOT_CUTS_PER_ROUND")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(|| {
+            std::env::var("AY_MILP_CUTS_PER_ROUND")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(ROOT_CUTS_PER_ROUND)
 }
 
 /// The cap on the root loop's CLIQUE-ONLY extension rounds (see `add_root_cuts`): the loop ends
@@ -1680,8 +1752,14 @@ pub(crate) fn mir_ext_cuts_per_round() -> usize {
 
 /// Don't cut on a value that is essentially integral already.
 const FRAC_TOL: f64 = 1e-6;
-/// Cap the cuts per round so the LP does not bloat faster than it tightens.
+/// Cap the cuts per round so the LP does not bloat faster than it tightens. This is the
+/// NODE budget; the root has its own — see [`root_cuts_per_round`].
 const MAX_CUTS_PER_ROUND: usize = 4;
+
+/// The root loop's per-round cut budget. Equal to the node budget by default — the raised
+/// value that improves root closure did not survive the full-solve gate. See
+/// [`root_cuts_per_round`] and [`MAX_GMI_ROUNDS`].
+const ROOT_CUTS_PER_ROUND: usize = MAX_CUTS_PER_ROUND;
 
 /// Separate Gomory mixed-integer cuts from the basis `cand`.
 ///
@@ -1717,7 +1795,9 @@ pub(crate) fn separate_gmi(
     cand: &Candidate,
     deadline: Option<std::time::Instant>,
 ) -> Vec<Cut> {
-    separate_gmi_budget(model, lp, cand, deadline, cuts_per_round())
+    // Only the ROOT loop calls this entry point; every node site calls
+    // `separate_gmi_budget` with its own budget, so the root budget stays root-scoped.
+    separate_gmi_budget(model, lp, cand, deadline, root_cuts_per_round())
 }
 
 /// [`separate_gmi`] with an explicit per-call cut budget. The root loop keeps its tuned
@@ -1754,16 +1834,24 @@ pub(crate) fn separate_gmi_budget(
         }
         is_basic[j] = true;
     }
-    // A free non-basic has no bound to shift to, so `t_j >= 0` is meaningless and
-    // the derivation does not hold. Bail rather than produce a cut we cannot stand
-    // behind.
+    // A free non-basic has no bound to shift to, so `t_j >= 0` is meaningless and the
+    // derivation does not hold FOR A ROW THAT USES IT. This used to bail on the whole
+    // model at the first free column, which is far more than the derivation requires and
+    // was measured to be expensive: a free non-basic appears in a tableau row only where
+    // its ᾱ_ij is nonzero, and a row where it is zero never mentions it. On the
+    // 133-instance Gurobi-comparable tier the model-wide bail was a large part of why the
+    // root cut loop separated NOTHING on half the corpus (control30-3-2-3: 512 rows, a
+    // 2.1e7 integrality gap, and GMI — the only family its structure admits — returned dry).
+    //
+    // The check now lives per row, at the one place the derivation actually needs it (see
+    // `free_nb` below): the row is abandoned if a free non-basic has a NONZERO coefficient
+    // in it, and kept otherwise. Strictly fewer rows are refused and no row is accepted
+    // that the old code would have derived differently — the cuts are the same cuts.
     let nonbasic: Vec<usize> = (0..lp.cols).filter(|&j| !is_basic[j]).collect();
-    if nonbasic
-        .iter()
-        .any(|&j| matches!(cand.at[j], NbBound::Zero))
-    {
-        return Vec::new();
-    }
+    let free_nb: Vec<bool> = (0..lp.cols)
+        .map(|j| matches!(cand.at[j], NbBound::Zero))
+        .collect();
+    let any_free = free_nb.iter().any(|&f| f);
 
     let is_int = |j: usize| -> bool {
         j < n && !matches!(model.col_kind(Col(j as u32)), ColKind::Continuous)
@@ -1893,6 +1981,16 @@ pub(crate) fn separate_gmi_budget(
                 }
             } else {
                 raw = -&ur[j - n];
+            }
+            // THE FREE-NON-BASIC TEST, at the one place it is needed. `t_j = x_j − l_j`
+            // does not exist for a free column, so a row whose ᾱ_ij is nonzero there
+            // cannot be shifted into the `t >= 0` frame the GMI derivation rests on and
+            // is abandoned. A zero coefficient means the row does not mention the column
+            // at all, and refusing that row would refuse a cut for a variable it is
+            // independent of.
+            if any_free && free_nb[j] && !raw.is_zero() {
+                ok = false;
+                break;
             }
             let Some(val) = nb_value(j) else {
                 ok = false;
@@ -3354,6 +3452,114 @@ fn efficacy(cut: &Cut, x: &[f64]) -> f64 {
     violation(cut, x) / norm
 }
 
+/// W1 CUT SELECTION — efficacy ranking plus an orthogonality filter.
+///
+/// The measured diagnosis in the development design notes was that
+/// ay separates the same cut FAMILIES as the commercial solvers and still reaches a weaker
+/// root bound, because it *keeps* differently: everything above an absolute efficacy floor
+/// went into the pool, in separation order, however redundant.
+///
+/// Two rows that are nearly parallel say nearly the same thing. The second one moves the
+/// bound by almost nothing and yet is carried by every LP of the loop and of every node
+/// under it — that is the "dense redundant cut" failure the plan attributes to the
+/// asymmetric lift-and-project family. Selecting in efficacy order and rejecting a
+/// candidate that is near-parallel to something already selected spends the round's budget
+/// on rows that cut in *different directions*.
+///
+/// ```text
+///   accept c  iff  |⟨c, s⟩| / (‖c‖·‖s‖)  <=  max_parallel   for every already-selected s
+/// ```
+///
+/// SOUNDNESS. This function only ever DROPS cuts, and every cut it is given is already
+/// valid for the integer hull. Dropping a valid cut changes which relaxation the search
+/// carries — never which points are feasible — so no verdict and no objective can move.
+/// That is why the plan rates W1 highest-leverage *and* lowest-risk.
+///
+/// `x` is the point the cuts were separated from, so `efficacy` is their depth against the
+/// vertex they were built to cut off. Returns the kept cuts in rank order, and (as a
+/// parallel vector) the caller's per-cut tag permuted the same way — the MIR-family
+/// accounting in the root loop depends on tag and cut staying in step.
+pub(crate) fn select_cuts<T: Copy>(
+    cuts: Vec<Cut>,
+    tags: Vec<T>,
+    x: &[f64],
+    max_keep: usize,
+    max_parallel: f64,
+    ncols: usize,
+) -> (Vec<Cut>, Vec<T>) {
+    debug_assert_eq!(cuts.len(), tags.len());
+    if cuts.is_empty() || (max_keep >= cuts.len() && max_parallel >= 1.0) {
+        return (cuts, tags);
+    }
+    // Rank by depth, deepest first. `sort_by` with a total-order fallback keeps this
+    // deterministic on ties and on any NaN a degenerate row could produce — the engine's
+    // determinism guarantee is not negotiable for a ranking heuristic.
+    let mut order: Vec<usize> = (0..cuts.len()).collect();
+    let depth: Vec<f64> = cuts.iter().map(|c| efficacy(c, x)).collect();
+    let norm: Vec<f64> = cuts
+        .iter()
+        .map(|c| {
+            c.coeffs
+                .iter()
+                .map(|&(_, a)| a * a)
+                .sum::<f64>()
+                .sqrt()
+                .max(1e-12)
+        })
+        .collect();
+    order.sort_by(|&a, &b| {
+        depth[b]
+            .partial_cmp(&depth[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+
+    // Dense scratch for the dot products: the cuts are sparse but the pairwise dot of two
+    // sparse rows is otherwise quadratic in their lengths. Scattering the selected row once
+    // and gathering each candidate against it makes each test linear in the CANDIDATE's
+    // nonzeros, which is what the cap on cut nnz already bounds.
+    let mut scratch = vec![0.0f64; ncols];
+    let mut kept_idx: Vec<usize> = Vec::with_capacity(max_keep.min(cuts.len()));
+    for &i in &order {
+        if kept_idx.len() >= max_keep {
+            break;
+        }
+        let mut parallel = false;
+        for &k in &kept_idx {
+            for &(c, a) in &cuts[k].coeffs {
+                scratch[c.index()] = a;
+            }
+            let dot: f64 = cuts[i]
+                .coeffs
+                .iter()
+                .map(|&(c, a)| a * scratch[c.index()])
+                .sum();
+            for &(c, _) in &cuts[k].coeffs {
+                scratch[c.index()] = 0.0;
+            }
+            if (dot / (norm[i] * norm[k])).abs() > max_parallel {
+                parallel = true;
+                break;
+            }
+        }
+        if !parallel {
+            kept_idx.push(i);
+        }
+    }
+
+    // Emit in the SELECTED order (deepest first), not the original separation order: the
+    // pool's own `MAX_POOL` truncation and the LP's row order then both see the strong rows
+    // first, and a round that overflows drops the shallow end.
+    let mut cuts: Vec<Option<Cut>> = cuts.into_iter().map(Some).collect();
+    let mut out_cuts = Vec::with_capacity(kept_idx.len());
+    let mut out_tags = Vec::with_capacity(kept_idx.len());
+    for &i in &kept_idx {
+        out_cuts.push(cuts[i].take().expect("each index selected once"));
+        out_tags.push(tags[i]);
+    }
+    (out_cuts, out_tags)
+}
+
 /// The MIR rounding itself, on the substituted row divided by `delta`, mapped back to `x`.
 ///
 /// ```text
@@ -3734,6 +3940,242 @@ fn next_up(v: f64) -> f64 {
     }
     let b = v.to_bits();
     f64::from_bits(if v > 0.0 { b + 1 } else { b - 1 })
+}
+
+#[cfg(test)]
+mod gmi_tests {
+    use super::*;
+    use crate::model::Sense;
+    use crate::simplex::FloatLp;
+
+    /// A GMI CUT MAY NOT DELETE AN INTEGER POINT — with FREE non-basic columns present.
+    ///
+    /// `separate_gmi` used to refuse a model outright the moment any non-basic column was
+    /// free, because `t_j = x_j − l_j` does not exist for a column with no finite bound.
+    /// The refusal is now per ROW and per COEFFICIENT: a row is abandoned only when a free
+    /// column has a nonzero ᾱ_ij in it. That is a strictly larger set of accepted rows, so
+    /// it is exactly the change that could manufacture an invalid cut, and an invalid cut
+    /// is a wrong OPTIMAL — the one failure this engine may never have.
+    ///
+    /// So: random models carrying free integer columns whose range is pinned by ROWS
+    /// rather than by column bounds (which is what makes them free to the LP while
+    /// leaving the feasible set finite and enumerable), separate GMI from the relaxation
+    /// optimum, then enumerate every integer point of the box and check that every point
+    /// the MODEL admits satisfies every cut.
+    #[test]
+    fn gmi_cuts_never_remove_an_integer_point_with_free_columns() {
+        let mut seed = 0x6D11_2026_u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) as i64
+        };
+        const HI: i64 = 4;
+        const FREE_HI: i64 = 3;
+
+        let mut cases_with_cuts = 0usize;
+        for _case in 0..300 {
+            let mut m = Model::new();
+            // Two ordinary bounded integer columns, one bounded continuous column...
+            let b0 = m.add_int_col(0.0, HI as f64);
+            let b1 = m.add_int_col(0.0, HI as f64);
+            let c0 = m.add_col(0.0, HI as f64);
+            // ...and a FREE integer column: infinite column bounds, so the simplex may
+            // rest it non-basic at zero (`NbBound::Zero`), which is the state the old
+            // model-wide bail existed for.
+            let fr = m.add_int_col(f64::NEG_INFINITY, f64::INFINITY);
+            let cols = [b0, b1, c0, fr];
+
+            // The free column's range comes from ROWS, so enumeration below is complete.
+            m.add_row(f64::NEG_INFINITY, FREE_HI as f64, &[(fr, 1.0)]);
+            m.add_row(-(FREE_HI as f64), f64::INFINITY, &[(fr, 1.0)]);
+
+            let mut rows: Vec<(Vec<f64>, f64, f64)> = Vec::new();
+            for _ in 0..3 {
+                let a: Vec<f64> = (0..4).map(|_| (rnd().rem_euclid(7) - 3) as f64).collect();
+                if a.iter().all(|&v| v == 0.0) {
+                    continue;
+                }
+                let ub = (rnd().rem_euclid(13) - 2) as f64;
+                m.add_row(
+                    f64::NEG_INFINITY,
+                    ub,
+                    &a.iter()
+                        .enumerate()
+                        .filter(|&(_, &v)| v != 0.0)
+                        .map(|(j, &v)| (cols[j], v))
+                        .collect::<Vec<_>>(),
+                );
+                rows.push((a, f64::NEG_INFINITY, ub));
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            let obj: Vec<(Col, f64)> = (0..4)
+                .map(|j| (cols[j], (rnd().rem_euclid(5) - 2) as f64))
+                .collect();
+            m.set_objective(&obj, Sense::Minimize);
+
+            let objective: Vec<(u32, f64)> = (0..m.num_cols())
+                .map(|j| (j as u32, m.obj_coeff(Col(j as u32))))
+                .filter(|&(_, a)| a != 0.0)
+                .collect();
+            let Some(lp) = FloatLp::from_model(&m, &objective, Sense::Minimize) else {
+                continue;
+            };
+            let cand = lp.solve_bounded(&lp.lower.clone(), &lp.upper.clone(), None, None);
+            if cand.status != crate::simplex::SimplexStatus::Optimal {
+                continue;
+            }
+            let cuts = separate_gmi(&m, &lp, &cand, None);
+            if cuts.is_empty() {
+                continue;
+            }
+            cases_with_cuts += 1;
+
+            // Enumerate every integer point of the box the rows confine the model to.
+            // `c0` is continuous, so it is swept on the integer lattice too: that is a
+            // SUBSET of the feasible set, which is all a "must not delete" check needs.
+            for x0 in 0..=HI {
+                for x1 in 0..=HI {
+                    for x2 in 0..=HI {
+                        for y in -FREE_HI..=FREE_HI {
+                            let pt = [x0 as f64, x1 as f64, x2 as f64, y as f64];
+                            let feasible = rows.iter().all(|(a, lb, ub)| {
+                                let act: f64 = a.iter().zip(pt).map(|(&ai, xi)| ai * xi).sum();
+                                act >= *lb - 1e-9 && act <= *ub + 1e-9
+                            });
+                            if !feasible {
+                                continue;
+                            }
+                            for cut in &cuts {
+                                let act: f64 =
+                                    cut.coeffs.iter().map(|&(c, a)| a * pt[c.index()]).sum();
+                                assert!(
+                                    act <= cut.ub + 1e-6 && act >= cut.lb - 1e-6,
+                                    "GMI cut deleted the feasible integer point {pt:?}: \
+                                     {} <= {act} <= {} (seed {seed:#x})",
+                                    cut.lb,
+                                    cut.ub
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // A separator that returns nothing passes a "never deletes a point" test
+        // vacuously, so the test asserts it actually SEPARATED on this population —
+        // otherwise the model-wide bail could come back and the guard would not notice.
+        assert!(
+            cases_with_cuts >= 10,
+            "only {cases_with_cuts} cases produced GMI cuts; the guard is near-vacuous"
+        );
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+
+    fn cut(coeffs: &[(u32, f64)], ub: f64) -> Cut {
+        Cut {
+            coeffs: coeffs.iter().map(|&(c, a)| (Col(c), a)).collect(),
+            lb: f64::NEG_INFINITY,
+            ub,
+        }
+    }
+
+    /// The identity settings must return the input UNTOUCHED — same cuts, same order.
+    /// This is what makes `AY_MILP_CUT_MAX_PARALLEL=1 AY_MILP_CUT_TOPK=0` a valid A/B
+    /// control: if the identity path perturbed the order, every ablation against it would
+    /// be measuring the reordering rather than the selection.
+    #[test]
+    fn identity_settings_are_the_identity() {
+        let cuts = vec![
+            cut(&[(0, 1.0), (1, 1.0)], 1.0),
+            cut(&[(0, 1.0)], 0.5),
+            cut(&[(1, 3.0), (2, -1.0)], 2.0),
+        ];
+        let want: Vec<Vec<(Col, f64)>> = cuts.iter().map(|c| c.coeffs.clone()).collect();
+        let x = vec![1.0, 1.0, 1.0];
+        let (got, tags) = select_cuts(cuts, vec![0u8, 1, 2], &x, usize::MAX, 1.0, 3);
+        assert_eq!(tags, vec![0, 1, 2]);
+        let got: Vec<Vec<(Col, f64)>> = got.into_iter().map(|c| c.coeffs).collect();
+        assert_eq!(got, want);
+    }
+
+    /// A duplicate row — same inequality written twice — must not survive the filter, and
+    /// the one that DOES survive must be the deeper of the two.
+    #[test]
+    fn exact_duplicates_are_rejected_keeping_the_deeper() {
+        // Both cuts are `x0 + x1 <= b`; the second is scaled by 10, which leaves the
+        // inequality (and so the cosine) identical while multiplying the raw violation.
+        // Ranking on raw violation would call them different; ranking on EFFICACY does not.
+        let shallow = cut(&[(0, 1.0), (1, 1.0)], 1.5);
+        let deep = cut(&[(0, 10.0), (1, 10.0)], 5.0); // depth 1.5/√2 vs 0.5/√2
+        let x = vec![1.0, 1.0, 0.0];
+        let (got, tags) = select_cuts(
+            vec![shallow, deep],
+            vec!["shallow", "deep"],
+            &x,
+            usize::MAX,
+            0.99,
+            3,
+        );
+        assert_eq!(got.len(), 1, "a duplicated inequality must be kept once");
+        assert_eq!(tags, vec!["deep"], "the survivor must be the deeper row");
+    }
+
+    /// Cuts pointing in genuinely different directions all survive: the filter must reject
+    /// redundancy, not diversity. An orthogonality filter that dropped independent rows
+    /// would cost bound, which is the whole point of the exercise.
+    #[test]
+    fn orthogonal_cuts_all_survive() {
+        let cuts = vec![
+            cut(&[(0, 1.0)], 0.5),
+            cut(&[(1, 1.0)], 0.5),
+            cut(&[(2, 1.0)], 0.5),
+        ];
+        let x = vec![1.0, 1.0, 1.0];
+        let (got, _) = select_cuts(cuts, vec![0u8, 1, 2], &x, usize::MAX, 0.5, 3);
+        assert_eq!(got.len(), 3);
+    }
+
+    /// The top-K cap keeps the K DEEPEST, not the first K separated.
+    #[test]
+    fn topk_keeps_the_deepest() {
+        // Three mutually orthogonal rows so the parallelism filter cannot interfere;
+        // depths are 0.9, 0.1, 0.5 in separation order.
+        let cuts = vec![
+            cut(&[(0, 1.0)], 0.1),
+            cut(&[(1, 1.0)], 0.9),
+            cut(&[(2, 1.0)], 0.5),
+        ];
+        let x = vec![1.0, 1.0, 1.0];
+        let (got, tags) = select_cuts(cuts, vec!["a", "b", "c"], &x, 2, 1.0, 3);
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            tags,
+            vec!["a", "c"],
+            "deepest first: a (0.9), c (0.5), then b (0.1)"
+        );
+    }
+
+    /// Anti-parallel rows (cosine −1) are as redundant as parallel ones for this purpose:
+    /// `a·x <= b` and `−a·x <= −b'` bracket the same hyperplane direction, so one of them
+    /// adds a dimension of freight the other already priced. The filter tests |cos|.
+    #[test]
+    fn antiparallel_counts_as_parallel() {
+        let up = cut(&[(0, 1.0), (1, 1.0)], 1.0);
+        let down = Cut {
+            coeffs: vec![(Col(0), -1.0), (Col(1), -1.0)],
+            lb: 2.5,
+            ub: f64::INFINITY,
+        };
+        let x = vec![1.0, 1.0, 0.0];
+        let (got, _) = select_cuts(vec![up, down], vec![0u8, 1], &x, usize::MAX, 0.9, 3);
+        assert_eq!(got.len(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -8777,7 +9219,7 @@ mod lnp_tests {
             "hull depth at (1/2,1) is ~0.2236; the CGLP found only {best}"
         );
         // ...and the hull's own integer points must all survive every cut.
-        for p in [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0]] {
+        for p in [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 0.5]] {
             for c in &cuts {
                 let act: f64 = c.coeffs.iter().map(|&(col, a)| a * p[col.index()]).sum();
                 assert!(
@@ -8972,13 +9414,59 @@ mod lnp_tests {
         assert!(produced > 0, "the guard never exercised a single cut");
     }
 
-    /// Standalone CGLP probe against a real MPS file (dev harness, not a gate):
-    /// `AY_MILP_LNP_PROBE=<file.mps> cargo test -p ay-milp --lib lnp_probe -- --ignored --nocapture`.
+    /// Exercise the root-LP-to-CGLP pipeline on a deterministic in-memory
+    /// model. `AY_MILP_LNP_PROBE=<file.mps>` optionally runs the same
+    /// diagnostic on a developer model after the mandatory regression.
     #[test]
-    #[ignore = "requires AY_MILP_LNP_PROBE to name an external MPS file"]
-    fn lnp_probe() {
+    fn lnp_root_lp_pipeline_produces_a_valid_cut() {
+        let mut model = Model::new();
+        let x1 = model.add_binary_col();
+        let x2 = model.add_col(0.0, 1.0);
+        model.add_row(f64::NEG_INFINITY, 3.0, &[(x1, 2.0), (x2, 2.0)]);
+        // Weight x2 more heavily so the unique root optimum is (1/2, 1):
+        // the integer column itself is fractional and must be separated.
+        model.set_objective(&[(x1, -1.0), (x2, -3.0)], Sense::Minimize);
+        let objective = vec![(x1.index() as u32, -1.0), (x2.index() as u32, -3.0)];
+        let lp = FloatLp::from_model(&model, &objective, Sense::Minimize).expect("bounded root LP");
+        let candidate = lp.solve_bounded(&lp.lower.clone(), &lp.upper.clone(), None, None);
+        assert_eq!(
+            candidate.status,
+            crate::simplex::SimplexStatus::Optimal,
+            "textbook root relaxation must solve"
+        );
+        assert!(
+            (candidate.values[x1.index()] - 0.5).abs() <= 1e-9
+                && (candidate.values[x2.index()] - 1.0).abs() <= 1e-9,
+            "weighted root objective must expose the intended fractional point, got {:?}",
+            &candidate.values[..model.num_cols()]
+        );
+        let cuts = separate_lift_project(
+            &model,
+            &candidate.values[..model.num_cols()],
+            model.num_rows(),
+            4,
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(5)),
+        );
+        assert!(
+            cuts.iter()
+                .any(|cut| violation(cut, &candidate.values) > 1e-7),
+            "root-LP pipeline must separate its fractional optimum"
+        );
+        for point in [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0], [1.0, 0.5]] {
+            for cut in &cuts {
+                let activity: f64 = cut
+                    .coeffs
+                    .iter()
+                    .map(|&(col, coeff)| coeff * point[col.index()])
+                    .sum();
+                assert!(
+                    activity >= cut.lb - 1e-9,
+                    "root-pipeline cut removed integer point {point:?}"
+                );
+            }
+        }
+
         let Ok(path) = std::env::var("AY_MILP_LNP_PROBE") else {
-            eprintln!("set AY_MILP_LNP_PROBE=<file.mps>");
             return;
         };
         let text = std::fs::read_to_string(&path).expect("readable mps");

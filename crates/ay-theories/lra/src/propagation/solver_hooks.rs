@@ -189,6 +189,15 @@ impl LraSolver {
             self.bounds_tightened_since_simplex = true;
             self.last_simplex_feasible = false;
             self.discard_lra_basis_region_candidate();
+            // #warm-simplex: a violation slipped past the incremental
+            // candidate tracking — fail safe by forcing the next simplex
+            // through the full heap rebuild + full non-basic scan (which
+            // re-arms the warm invariants). Without this, a warm-tracking gap
+            // could livelock: targeted Sat -> guard demotes -> targeted Sat.
+            if self.warm.enabled {
+                self.heap_stale = true;
+                self.warm_invalidate();
+            }
             *result = TheoryResult::Unknown;
         } else {
             // #inc-guard-memo: full scan verified clean — memoize until the
@@ -245,6 +254,15 @@ impl LraSolver {
         self.last_simplex_feasible = matches!(result, TheoryResult::Sat);
         if self.last_simplex_feasible {
             self.save_feasible_snapshot();
+            // #warm-simplex: anchor the last-feasible value delta here.
+            self.warm_reanchor_delta();
+        } else if matches!(
+            result,
+            TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
+        ) {
+            // #warm-simplex conflict recovery (see check_impl). check() will
+            // re-derive and report the conflict from the (unchanged) bounds.
+            self.warm_restore_last_feasible();
         }
         // Do not package conflicts here — check() owns conflict reporting.
         self.last_simplex_feasible

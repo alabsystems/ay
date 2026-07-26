@@ -61,6 +61,21 @@ pub(crate) enum Presolved {
 /// spent before the search has looked at a single node. A caller's time limit is a limit on the
 /// whole solve, not on the part of it that happens to be branch-and-bound.
 pub(crate) fn tighten_bounds(model: &Model, deadline: Option<std::time::Instant>) -> Presolved {
+    tighten_bounds_opt(model, deadline, true)
+}
+
+/// [`tighten_bounds`], with the second (coefficient-strengthening) phase made optional.
+///
+/// Root probing ([`crate::probe`]) fixes a binary and re-propagates purely to *detect
+/// infeasibility and forced point-collapses*. Coefficient tightening rewrites feasible rows
+/// but never collapses a column bound and never reports infeasibility, so on the probing
+/// path it is pure cost and is skipped (`coef_tighten = false`). The bound-propagation lane
+/// — the only part a probe reads — is byte-identical to the shipped presolve.
+pub(crate) fn tighten_bounds_opt(
+    model: &Model,
+    deadline: Option<std::time::Instant>,
+    coef_tighten: bool,
+) -> Presolved {
     // FAIL-CLOSED for inexact models. Presolve derives tighter bounds (and
     // tightens row coefficients) by reading the row `f64`s; on a model whose
     // true coefficients are rounded proxies that reasoning is over the WRONG
@@ -321,7 +336,7 @@ pub(crate) fn tighten_bounds(model: &Model, deadline: Option<std::time::Instant>
     // (see `tighten_coefficients`). This must read the box `out` actually carries — not the
     // tighter rational bounds above — because its validity argument quantifies over exactly
     // the points the output model admits.
-    if std::env::var_os("AY_MILP_NO_COEF_TIGHTEN").is_none() {
+    if coef_tighten && std::env::var_os("AY_MILP_NO_COEF_TIGHTEN").is_none() {
         let _t_coef = std::time::Instant::now();
         let tightened = tighten_coefficients(&mut out, deadline);
         if trace {
@@ -886,6 +901,443 @@ fn next_toward(f: f64, to: f64) -> f64 {
     f64::from_bits(next)
 }
 
+// ---------------------------------------------------------------------------
+// STRUCTURAL REDUCTION: free / implied-free singleton-column substitution.
+//
+// The rest of this module TIGHTENS bounds and coefficients; it never changes a
+// model's row/column identity, which is why its output is consumed
+// transparently by a search and a certificate machinery that both re-derive in
+// the caller's frame. This section is the one exception: it removes a column
+// AND a row, and so it comes with an explicit postsolve map (`SingletonPostsolve`)
+// that lifts a reduced-model solution back to the caller's column space. It is
+// used exactly like the duplicate-column presolve in `bab.rs` (build a reduced
+// model + map, solve, expand the outcome, fail-closed on any tree certificate).
+// ---------------------------------------------------------------------------
+
+use crate::model::ColKind;
+
+/// The recovery rule for one eliminated singleton column: its value is a linear
+/// function of the SURVIVING columns of its defining (equality) row.
+///
+/// `x = (b − Σ_k a_k · z_k) / a`, where the `z_k` are the surviving columns,
+/// indexed by their ORIGINAL column number (they are all populated in the
+/// widened vector before any recovery runs, because an eliminated column has
+/// degree 1 — it appears in no other column's defining row).
+struct Recover {
+    /// Original column index of the eliminated variable `x`.
+    col: usize,
+    /// `x`'s coefficient in its defining row (nonzero, exact).
+    a: BigRational,
+    /// The defining row's right-hand side `b` (it is an equality).
+    b: BigRational,
+    /// `(original survivor column, its coefficient a_k)` for every other column
+    /// of the defining row.
+    rest: Vec<(usize, BigRational)>,
+}
+
+/// What becomes of the defining row of an eliminated singleton.
+enum RowFate {
+    /// The row is copied unchanged (no singleton eliminated from it).
+    Keep,
+    /// `x` was implied-free: recovering it lands inside its box for every
+    /// feasible survivor assignment, so the row is redundant and dropped.
+    Drop,
+    /// `x` was NOT implied-free: the row survives as a forcing inequality over
+    /// the survivors, `lb ≤ Σ a_k z_k ≤ ub`, encoding `x ∈ [lo, up]`.
+    Rebound(f64, f64),
+}
+
+/// How to lift a solution of the singleton-reduced model back to the caller's
+/// full column space, and how to correct a reported objective value.
+pub(crate) struct SingletonPostsolve {
+    n_orig: usize,
+    /// Original column -> reduced column, or `None` if the column was eliminated.
+    map: Vec<Option<Col>>,
+    /// One entry per eliminated column.
+    recover: Vec<Recover>,
+    /// The constant the eliminated columns' objective contributions fold into.
+    /// It is NOT carried in the reduced model's `f64` offset (it need not be
+    /// representable): it is added to the reported value at expansion time,
+    /// where the value is an exact `BigRational`.
+    const_delta: BigRational,
+}
+
+impl SingletonPostsolve {
+    /// The constant to add to a reduced-model objective value / dual bound to
+    /// recover the caller-frame value.
+    pub(crate) fn const_delta(&self) -> &BigRational {
+        &self.const_delta
+    }
+
+    /// Widen a reduced-model point (length = reduced column count) to the
+    /// caller's full column space, recovering each eliminated column exactly.
+    pub(crate) fn widen(&self, reduced: &[BigRational]) -> Vec<BigRational> {
+        let mut full = vec![BigRational::zero(); self.n_orig];
+        for (orig, slot) in self.map.iter().enumerate() {
+            if let Some(nc) = slot {
+                if let Some(v) = reduced.get(nc.index()) {
+                    full[orig] = v.clone();
+                }
+            }
+        }
+        // Every recovery references SURVIVORS only (already filled above), so a
+        // single pass suffices — no dependency ordering among eliminations.
+        for rec in &self.recover {
+            let mut s = rec.b.clone();
+            for (k, ak) in &rec.rest {
+                s -= ak * &full[*k];
+            }
+            full[rec.col] = &s / &rec.a;
+        }
+        full
+    }
+}
+
+/// Substitute out continuous singleton columns on equality rows, deleting one
+/// column and either deleting or rebounding its defining row.
+///
+/// # The rule, and why it preserves the exact optimum
+///
+/// A column `x` that is CONTINUOUS and appears in exactly ONE row `r`, where
+/// `r` is an equality `a·x + Σ_k a_k z_k = b` (`a ≠ 0`), is UNIQUELY determined
+/// by the others: `x = (b − Σ_k a_k z_k) / a`. Delete `x`; when its declared
+/// box is implied by the survivors' boxes, delete `r` as redundant. Otherwise
+/// replace `r` by the equivalent range on the survivors that enforces `x`'s
+/// lower and upper bounds. Fold `x`'s objective contribution
+/// `c_x·x = (c_x/a)·b − Σ_k (c_x·a_k/a)·z_k` into the surviving objective (the
+/// linear part onto the `z_k`, the constant into `const_delta`).
+///
+/// * **Forward** (original → reduced): drop `x`; the surviving rows never
+///   mention it (degree 1). Drop an implied-free defining row, or replace it by
+///   the range obtained by substituting `x`'s box. The folded objective equals
+///   the original at the surviving columns, so feasible maps to feasible at
+///   equal cost.
+/// * **Backward** (reduced → original): recover `x` by the formula. It satisfies
+///   row `r` by construction. Its box follows either from the implied-free test
+///   or from the retained forcing range. All other rows are unchanged and
+///   independent of `x`.
+///
+/// The two feasible sets are therefore in exact objective-preserving
+/// correspondence: the optima are EQUAL, and every witness lifts by `widen`.
+///
+/// # Guards (all fail-closed — a skipped column is always sound)
+///
+/// * inexact-coefficient models are declined wholesale (the reasoning reads the
+///   `f64` matrix as exact, as the rest of presolve does);
+/// * a row is a candidate only if it has EXACTLY ONE eligible degree-1 column,
+///   so deleting it cannot orphan a second one;
+/// * a non-implied-free box is translated to a forcing range only when both
+///   finite sides convert back to `f64` exactly;
+/// * the objective fold is applied only if every changed survivor coefficient
+///   converts back to `f64` EXACTLY (the constant rides an exact `BigRational`,
+///   so it is unconstrained).
+///
+/// Returns `None` when nothing is eliminated (the caller then solves the
+/// original model untouched).
+pub(crate) fn substitute_singletons(model: &Model) -> Option<(Model, SingletonPostsolve)> {
+    if model.has_inexact_coeffs() {
+        return None;
+    }
+    let n = model.num_cols();
+    let nr = model.num_rows();
+
+    // Column degree: how many rows each column appears in.
+    let mut deg = vec![0u32; n];
+    for r in 0..nr {
+        let (coeffs, _, _) = model.row(Row(r as u32));
+        for &(c, _) in coeffs {
+            deg[c as usize] += 1;
+        }
+    }
+
+    if std::env::var_os("AY_MILP_SINGLETON_DIAG").is_some() {
+        let cont = (0..n)
+            .filter(|&j| model.col_kind(Col(j as u32)) == ColKind::Continuous)
+            .count();
+        let cont_deg1 = (0..n)
+            .filter(|&j| model.col_kind(Col(j as u32)) == ColKind::Continuous && deg[j] == 1)
+            .count();
+        let eq_rows = (0..nr)
+            .filter(|&r| {
+                let (_, lb, ub) = model.row(Row(r as u32));
+                lb.is_finite() && ub.is_finite() && lb == ub
+            })
+            .count();
+        // Degree-1 continuous columns whose single row is an equality.
+        let mut singleton_in_eq = 0;
+        for r in 0..nr {
+            let (coeffs, lb, ub) = model.row(Row(r as u32));
+            if !(lb.is_finite() && ub.is_finite() && lb == ub) {
+                continue;
+            }
+            for &(c, _) in coeffs {
+                if deg[c as usize] == 1 && model.col_kind(Col(c)) == ColKind::Continuous {
+                    singleton_in_eq += 1;
+                }
+            }
+        }
+        eprintln!(
+            "AY_MILP_SINGLETON_DIAG: cols={n} cont={cont} cont_deg1={cont_deg1} eq_rows={eq_rows}/{nr} cont_singletons_in_eq={singleton_in_eq}"
+        );
+    }
+
+    // Objective as exact rationals; folded in place as columns are eliminated.
+    let mut obj: Vec<BigRational> = (0..n)
+        .map(|j| exact(model.obj_coeff(Col(j as u32))).expect("finite objective coefficient"))
+        .collect();
+    let mut const_delta = BigRational::zero();
+    let mut eliminated = vec![false; n];
+    let mut recover: Vec<Recover> = Vec::new();
+    let mut row_fate: Vec<RowFate> = (0..nr).map(|_| RowFate::Keep).collect();
+    let diag = std::env::var_os("AY_MILP_SINGLETON_DIAG").is_some();
+    let (mut sk_multi, mut sk_range, mut sk_obj, mut n_drop, mut n_rebound) = (0, 0, 0, 0, 0);
+
+    // Cached exact box bounds (None == infinite).
+    let bound = |j: usize| -> (Option<BigRational>, Option<BigRational>) {
+        let (l, u) = model.col_bounds(Col(j as u32));
+        (exact(l), exact(u))
+    };
+
+    for r in 0..nr {
+        let (coeffs, rlb, rub) = model.row(Row(r as u32));
+        // Equality rows only: a range or one-sided row does not pin `x`.
+        if !(rlb.is_finite() && rub.is_finite() && rlb == rub) {
+            continue;
+        }
+        // The eligible degree-1 continuous columns of this row.
+        let mut eligible = coeffs.iter().map(|&(c, _)| c as usize).filter(|&c| {
+            deg[c] == 1 && !eliminated[c] && model.col_kind(Col(c as u32)) == ColKind::Continuous
+        });
+        let Some(x) = eligible.next() else {
+            continue;
+        };
+        if eligible.next().is_some() {
+            // Two degree-1 columns here: eliminating one orphans the other
+            // (it would appear in no row). Leave the whole row alone.
+            sk_multi += 1;
+            continue;
+        }
+        let a = coeffs
+            .iter()
+            .find(|&&(c, _)| c as usize == x)
+            .map(|&(_, a)| a)
+            .expect("x is in this row");
+        if a == 0.0 {
+            continue;
+        }
+        let a = exact(a).expect("finite");
+        let b = exact(rlb).expect("finite equality rhs");
+        let a_pos = a.is_positive();
+
+        // The rest of the row's reachable activity range over the current boxes.
+        // `None` on a side means it is infinite (an open survivor bound in the
+        // direction that side reads).
+        let mut rest_min = Some(BigRational::zero());
+        let mut rest_max = Some(BigRational::zero());
+        let mut rest: Vec<(usize, BigRational)> =
+            Vec::with_capacity(coeffs.len().saturating_sub(1));
+        for &(c, ak) in coeffs {
+            let c = c as usize;
+            if c == x {
+                continue;
+            }
+            let ak = exact(ak).expect("finite");
+            let (lo_k, up_k) = bound(c);
+            let (at_min, at_max) = if ak.is_positive() {
+                (&lo_k, &up_k)
+            } else {
+                (&up_k, &lo_k)
+            };
+            rest_min = match (rest_min, at_min) {
+                (Some(s), Some(bk)) => Some(s + &ak * bk),
+                _ => None,
+            };
+            rest_max = match (rest_max, at_max) {
+                (Some(s), Some(bk)) => Some(s + &ak * bk),
+                _ => None,
+            };
+            rest.push((c, ak));
+        }
+
+        // Implied bounds on x = (b − rest)/a, and the IMPLIED-FREE test against
+        // x's declared box. `a > 0`: x_ub uses rest_min, x_lb uses rest_max.
+        let (decl_lo, decl_up) = bound(x);
+        let implied_ub = if a_pos { &rest_min } else { &rest_max };
+        let implied_lb = if a_pos { &rest_max } else { &rest_min };
+        // Upper side free: x's declared upper is +inf, or the implied upper
+        // exists and does not exceed it.
+        let upper_free = match &decl_up {
+            None => true,
+            Some(u) => implied_ub
+                .as_ref()
+                .is_some_and(|rest_side| &(&(&b - rest_side) / &a) <= u),
+        };
+        let lower_free = match &decl_lo {
+            None => true,
+            Some(l) => implied_lb
+                .as_ref()
+                .is_some_and(|rest_side| &(&(&b - rest_side) / &a) >= l),
+        };
+        let implied_free = upper_free && lower_free;
+
+        // When NOT implied-free, `x`'s box `[lo, up]` must still be enforced.
+        // Substitute `a·x = b − Σ a_k z_k` into `lo ≤ x ≤ up`: the equality row
+        // becomes a forcing inequality on the survivors,
+        //   a > 0:  b − a·up  ≤  Σ a_k z_k  ≤  b − a·lo
+        //   a < 0:  b − a·lo  ≤  Σ a_k z_k  ≤  b − a·up
+        // (an infinite `x`-bound leaves the corresponding row side infinite).
+        // The bounds must convert to f64 EXACTLY or the reduction is declined
+        // for this column (fail closed). Implied-free rows skip this — they are
+        // redundant and simply dropped.
+        let fate = if implied_free {
+            RowFate::Drop
+        } else {
+            let (nlb_r, nub_r) = if a_pos {
+                (
+                    decl_up.as_ref().map(|u| &b - &(&a * u)),
+                    decl_lo.as_ref().map(|l| &b - &(&a * l)),
+                )
+            } else {
+                (
+                    decl_lo.as_ref().map(|l| &b - &(&a * l)),
+                    decl_up.as_ref().map(|u| &b - &(&a * u)),
+                )
+            };
+            let to_f = |o: &Option<BigRational>, inf: f64| match o {
+                None => Some(inf),
+                Some(v) => as_exact_f64(v),
+            };
+            let (Some(nlb_f), Some(nub_f)) =
+                (to_f(&nlb_r, f64::NEG_INFINITY), to_f(&nub_r, f64::INFINITY))
+            else {
+                sk_range += 1;
+                continue; // range bound not exactly f64-representable: decline
+            };
+            RowFate::Rebound(nlb_f, nub_f)
+        };
+
+        // Objective fold, exact-f64 fail-closed. c_x·x = (c_x/a)·b − Σ (c_x·a_k/a)·z_k.
+        let cx = obj[x].clone();
+        if !cx.is_zero() {
+            // Tentative new coefficients for the survivors; commit only if ALL
+            // convert back to f64 exactly (else the reduced objective would be a
+            // rounded proxy and could hide the true optimum).
+            let mut updates: Vec<(usize, BigRational)> = Vec::with_capacity(rest.len());
+            let mut ok = true;
+            for (c, ak) in &rest {
+                let new_c = &obj[*c] - &(&cx * ak) / &a;
+                if as_exact_f64(&new_c).is_none() {
+                    ok = false;
+                    break;
+                }
+                updates.push((*c, new_c));
+            }
+            if !ok {
+                sk_obj += 1;
+                continue;
+            }
+            for (c, new_c) in updates {
+                obj[c] = new_c;
+            }
+            const_delta += &(&cx * &b) / &a;
+            obj[x] = BigRational::zero();
+        }
+
+        match fate {
+            RowFate::Drop => n_drop += 1,
+            RowFate::Rebound(..) => n_rebound += 1,
+            RowFate::Keep => {}
+        }
+        eliminated[x] = true;
+        row_fate[r] = fate;
+        recover.push(Recover { col: x, a, b, rest });
+    }
+
+    if diag {
+        eprintln!(
+            "AY_MILP_SINGLETON_DIAG: eliminated={} (drop={n_drop} rebound={n_rebound}) skipped: multi_deg1={sk_multi} range_inexact={sk_range} obj_inexact={sk_obj}",
+            recover.len()
+        );
+    }
+
+    if recover.is_empty() {
+        return None;
+    }
+
+    // Build the reduced model: surviving columns in original order, surviving
+    // rows remapped (dropped or reboundd per `row_fate`), the folded objective
+    // (exact f64), the ORIGINAL offset (the eliminated constant rides
+    // `const_delta`, applied at expansion).
+    let mut out = Model::new();
+    let mut map: Vec<Option<Col>> = vec![None; n];
+    for j in 0..n {
+        if eliminated[j] {
+            continue;
+        }
+        let col = Col(j as u32);
+        let (lb, ub) = model.col_bounds(col);
+        let nc = match model.col_kind(col) {
+            ColKind::Continuous => out.add_col(lb, ub),
+            ColKind::Binary => out.add_binary_col(),
+            ColKind::Integer => out.add_int_col(lb, ub),
+        };
+        out.cols[nc.index()].lb = lb;
+        out.cols[nc.index()].ub = ub;
+        map[j] = Some(nc);
+    }
+    for r in 0..nr {
+        let (lb, ub) = match row_fate[r] {
+            RowFate::Drop => continue,
+            RowFate::Keep => {
+                let (_, lb, ub) = model.row(Row(r as u32));
+                (lb, ub)
+            }
+            RowFate::Rebound(lb, ub) => (lb, ub),
+        };
+        let (coeffs, _, _) = model.row(Row(r as u32));
+        let mapped: Vec<(Col, f64)> = coeffs
+            .iter()
+            .filter_map(|&(c, a)| map[c as usize].map(|nc| (nc, a)))
+            .collect();
+        out.add_row(lb, ub, &mapped);
+    }
+    let obj_terms: Vec<(Col, f64)> = (0..n)
+        .filter_map(|j| {
+            map[j].and_then(|nc| {
+                let f = as_exact_f64(&obj[j]).expect("survivor objective is exact by construction");
+                (f != 0.0).then_some((nc, f))
+            })
+        })
+        .collect();
+    out.set_objective(&obj_terms, model.sense());
+    out.set_objective_offset(model.objective_offset());
+
+    if std::env::var_os("AY_MILP_TRACE").is_some() {
+        let onz: usize = (0..nr).map(|r| model.row(Row(r as u32)).0.len()).sum();
+        let rnz: usize = (0..out.num_rows())
+            .map(|r| out.row(Row(r as u32)).0.len())
+            .sum();
+        eprintln!(
+            "AY_MILP_TRACE singleton-sub: eliminated {} col ({n_drop} row-drop, {n_rebound} row-rebound); model {}r/{}c/{}nnz -> {}r/{}c/{}nnz",
+            recover.len(),
+            nr,
+            n,
+            onz,
+            out.num_rows(),
+            out.num_cols(),
+            rnz,
+        );
+    }
+
+    let post = SingletonPostsolve {
+        n_orig: n,
+        map,
+        recover,
+        const_delta,
+    };
+    Some((out, post))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1139,6 +1591,246 @@ mod tests {
         // The discarded continuous bound really is discarded (output policy).
         let (_, xu) = out.col_bounds(x);
         assert_eq!(xu, 100.0);
+    }
+
+    // --- Free / implied-free singleton-column substitution --------------------
+
+    /// The obvious clean case: a FREE continuous column that appears in exactly
+    /// one equality row is substituted out, deleting the column and dropping the
+    /// (now redundant) row; the eliminated value is recovered exactly by `widen`.
+    #[test]
+    fn free_singleton_is_dropped_and_recovered_exactly() {
+        let mut m = Model::new();
+        let z = m.add_int_col(0.0, 5.0);
+        let x = m.add_col(f64::NEG_INFINITY, f64::INFINITY); // free continuous singleton
+                                                             // x + 2 z = 7  =>  x = 7 - 2 z, x is free so this is IMPLIED-FREE.
+        m.add_row(7.0, 7.0, &[(x, 1.0), (z, 2.0)]);
+        m.set_objective(&[(x, 3.0), (z, 1.0)], Sense::Minimize);
+
+        let (reduced, post) = substitute_singletons(&m).expect("x is an eligible singleton");
+        assert_eq!(reduced.num_cols(), 1, "x removed");
+        assert_eq!(reduced.num_rows(), 0, "the redundant equality dropped");
+
+        // Reduced objective: 3x + z = 3(7-2z) + z = 21 - 5z; const_delta = 21,
+        // the surviving linear coefficient on z is -5.
+        assert_eq!(post.const_delta(), &BigRational::from_integer(21.into()));
+        assert_eq!(reduced.obj_coeff(Col(0)), -5.0);
+
+        // widen a reduced point z = 2  =>  full (z=2, x=7-4=3).
+        let full = post.widen(&[BigRational::from_integer(2.into())]);
+        assert_eq!(full.len(), 2);
+        assert_eq!(full[0], BigRational::from_integer(2.into())); // z
+        assert_eq!(full[1], BigRational::from_integer(3.into())); // x = 7 - 2*2
+        assert!(m.check_point(&full).is_ok(), "recovered point is feasible");
+    }
+
+    /// A BOUNDED singleton is not implied-free: its box must still be enforced,
+    /// so the equality becomes a forcing inequality over the survivors. The
+    /// column is still removed and recovered exactly.
+    #[test]
+    fn bounded_singleton_becomes_a_forcing_inequality() {
+        let mut m = Model::new();
+        let z = m.add_int_col(0.0, 10.0);
+        let x = m.add_col(0.0, 4.0); // bounded continuous singleton
+                                     // x + z = 10  =>  x = 10 - z, and x in [0,4]  =>  z in [6,10].
+        m.add_row(10.0, 10.0, &[(x, 1.0), (z, 1.0)]);
+        m.set_objective(&[(z, 1.0)], Sense::Minimize);
+
+        let (reduced, post) = substitute_singletons(&m).expect("eligible");
+        assert_eq!(reduced.num_cols(), 1);
+        assert_eq!(
+            reduced.num_rows(),
+            1,
+            "row survives as a forcing inequality"
+        );
+        // The forcing row on z: a>0, [b - a*up, b - a*lo] = [10-4, 10-0] = [6, 10].
+        let (coeffs, lb, ub) = reduced.row(Row(0));
+        assert_eq!(coeffs, &[(0, 1.0)]);
+        assert_eq!(lb, 6.0);
+        assert_eq!(ub, 10.0);
+
+        // z = 6 recovers x = 4 (at its upper bound); feasible.
+        let full = post.widen(&[BigRational::from_integer(6.into())]);
+        assert_eq!(full[1], BigRational::from_integer(4.into()));
+        assert!(m.check_point(&full).is_ok());
+        // z = 5 would recover x = 5 > 4 — and the forcing inequality (z >= 6)
+        // correctly forbids it in the reduced model.
+        let bad = m.check_point(&[
+            BigRational::from_integer(5.into()),
+            BigRational::from_integer(5.into()),
+        ]);
+        assert!(bad.is_err(), "x=5 violates x<=4 in the original too");
+    }
+
+    /// A row with TWO degree-1 continuous columns must be left alone: eliminating
+    /// one would orphan the other (leave it in no row at all).
+    #[test]
+    fn a_row_with_two_singletons_is_left_alone() {
+        let mut m = Model::new();
+        let x = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        let y = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        m.add_row(5.0, 5.0, &[(x, 1.0), (y, 1.0)]); // both x and y are singletons here
+        m.set_objective(&[(x, 1.0), (y, 1.0)], Sense::Minimize);
+        assert!(
+            substitute_singletons(&m).is_none(),
+            "two singletons in one row: no safe elimination"
+        );
+    }
+
+    /// An objective fold that does not land back on an exact f64 is declined
+    /// (fail-closed): the reduced objective must never be a rounded proxy.
+    #[test]
+    fn inexact_objective_fold_is_declined() {
+        let mut m = Model::new();
+        let z = m.add_int_col(0.0, 10.0);
+        let x = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        // 3 x + z = 1  =>  x = (1 - z)/3.  Objective 1·x folds z's coefficient by
+        // -1/3, which is not representable in f64 — so x must NOT be eliminated.
+        m.add_row(1.0, 1.0, &[(x, 3.0), (z, 1.0)]);
+        m.set_objective(&[(x, 1.0)], Sense::Minimize);
+        assert!(
+            substitute_singletons(&m).is_none(),
+            "an inexact objective fold must be declined"
+        );
+    }
+
+    /// A zero-objective singleton has nothing to fold, so it is always eligible
+    /// (the exactness guard is vacuous) regardless of coefficients.
+    #[test]
+    fn zero_objective_singleton_folds_with_no_exactness_risk() {
+        let mut m = Model::new();
+        let z = m.add_int_col(0.0, 10.0);
+        let x = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        // 3 x + z = 1, but x has NO objective — the /3 never touches the objective.
+        m.add_row(1.0, 1.0, &[(x, 3.0), (z, 1.0)]);
+        m.set_objective(&[(z, 1.0)], Sense::Minimize);
+        let (reduced, post) = substitute_singletons(&m).expect("eligible, no objective fold");
+        assert_eq!(reduced.num_cols(), 1);
+        assert!(post.const_delta().is_zero());
+    }
+
+    /// The load-bearing property, checked by brute force: substitution preserves
+    /// the EXACT optimum. Random models with a continuous singleton in an equality
+    /// row (plus survivor-only side rows) are minimized two ways — directly, and
+    /// through `substitute_singletons` (+ `const_delta`, + `widen` re-check) — and
+    /// the optima must match. Non-vacuous: the reduction is asserted to fire.
+    #[test]
+    fn singleton_substitution_preserves_the_optimum() {
+        let mut seed = 0x51_9101_2026u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) as i64
+        };
+        let mut fired = 0usize;
+        for _case in 0..400 {
+            let k = 3usize; // integer survivor columns
+            let mut m = Model::new();
+            let survivors: Vec<Col> = (0..k).map(|_| m.add_int_col(0.0, 4.0)).collect();
+            // The continuous singleton: half the time free, half bounded.
+            let (xlo, xup) = if rnd() % 2 == 0 {
+                (f64::NEG_INFINITY, f64::INFINITY)
+            } else {
+                (0.0, (2 + rnd().rem_euclid(6)) as f64)
+            };
+            let x = m.add_col(xlo, xup);
+            // Equality row: a·x + Σ a_k z_k = b, a ∈ {±1, ±2}. Keep a ∈ {±1} most
+            // of the time so the objective fold is usually exact (a=±2 halves).
+            let a = [1.0, -1.0, 1.0, 2.0][(rnd().rem_euclid(4)) as usize];
+            let mut terms = vec![(x, a)];
+            for &z in &survivors {
+                let c = rnd().rem_euclid(5) - 2;
+                if c != 0 {
+                    terms.push((z, c as f64));
+                }
+            }
+            let b = (rnd().rem_euclid(9) - 2) as f64;
+            m.add_row(b, b, &terms);
+            // A survivor-only side inequality, so x stays a genuine singleton.
+            let sterms: Vec<(Col, f64)> = survivors
+                .iter()
+                .map(|&z| (z, (rnd().rem_euclid(5) - 2) as f64))
+                .filter(|&(_, c)| c != 0.0)
+                .collect();
+            if !sterms.is_empty() {
+                m.add_row(f64::NEG_INFINITY, (rnd().rem_euclid(10)) as f64, &sterms);
+            }
+            // Objective over survivors and (sometimes) x.
+            let mut obj: Vec<(Col, f64)> = survivors
+                .iter()
+                .map(|&z| (z, (rnd().rem_euclid(7) - 3) as f64))
+                .collect();
+            if rnd() % 2 == 0 {
+                obj.push((x, (rnd().rem_euclid(5) - 2) as f64));
+            }
+            m.set_objective(&obj, Sense::Minimize);
+
+            let Some((reduced, post)) = substitute_singletons(&m) else {
+                continue;
+            };
+            fired += 1;
+
+            // Brute-force the ORIGINAL optimum over integer survivor assignments;
+            // x is pinned by the equality and must land in its box.
+            let val = |model: &Model, p: &[BigRational]| -> BigRational {
+                let mut v = exact(model.objective_offset()).unwrap();
+                for (j, pj) in p.iter().enumerate() {
+                    v += exact(model.obj_coeff(Col(j as u32))).unwrap() * pj;
+                }
+                v
+            };
+            let mut best_orig: Option<BigRational> = None;
+            let mut best_reduced: Option<BigRational> = None;
+            let ra = exact(a).unwrap();
+            let rb = exact(b).unwrap();
+            let rest: Vec<(usize, BigRational)> = terms
+                .iter()
+                .filter(|&&(c, _)| c != x)
+                .map(|&(c, ak)| (c.index(), exact(ak).unwrap()))
+                .collect();
+            for code in 0..5i64.pow(k as u32) {
+                let zi: Vec<i64> = (0..k).map(|t| (code / 5i64.pow(t as u32)) % 5).collect();
+                // x = (b - Σ a_k z_k)/a.
+                let mut s = rb.clone();
+                for (c, ak) in &rest {
+                    s -= ak * BigRational::from_integer(zi[*c].into());
+                }
+                let xval = &s / &ra;
+                // Full original point.
+                let mut full = vec![BigRational::zero(); m.num_cols()];
+                for (t, &z) in survivors.iter().enumerate() {
+                    full[z.index()] = BigRational::from_integer(zi[t].into());
+                }
+                full[x.index()] = xval.clone();
+                if m.check_point(&full).is_ok() {
+                    let v = val(&m, &full);
+                    best_orig = Some(best_orig.map_or(v.clone(), |cur| cur.min(v)));
+                }
+                // Reduced point: survivors in reduced order.
+                let mut rp = vec![BigRational::zero(); reduced.num_cols()];
+                for (t, &z) in survivors.iter().enumerate() {
+                    if let Some(nc) = post.map[z.index()] {
+                        rp[nc.index()] = BigRational::from_integer(zi[t].into());
+                    }
+                }
+                if reduced.check_point(&rp).is_ok() {
+                    let v = val(&reduced, &rp) + post.const_delta();
+                    best_reduced = Some(best_reduced.map_or(v.clone(), |cur| cur.min(v.clone())));
+                    // The widened reduced point must be feasible in the original
+                    // and attain exactly the same value.
+                    let w = post.widen(&rp);
+                    assert!(
+                        m.check_point(&w).is_ok(),
+                        "widened reduced point infeasible in the original"
+                    );
+                    assert_eq!(val(&m, &w), v, "widened value mismatch");
+                }
+            }
+            assert_eq!(
+                best_orig, best_reduced,
+                "substitution changed the optimum (case seed {seed:#x})"
+            );
+        }
+        assert!(fired > 50, "test is vacuous: only {fired} cases fired");
     }
 
     /// SCOUT GUARD: when nothing output-visible can move, the sweeps are

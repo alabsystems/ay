@@ -9,15 +9,22 @@ license.workspace = true
 description = "OPB/WBO pseudo-Boolean format parser for PB competition instances"
 readme.workspace = true
 repository.workspace = true
+autobins = false
 
 [lints]
 workspace = true
 
 [features]
 default = []
-# Large checked-in proof sidecars for exact benchmark certification routes.
-# Keep this opt-in so library consumers do not require benchmark proof data.
-certified-proof-artifacts = []
+# Large checked-in proof sidecars and external-checker certification gates.
+# Tests enabled by this feature require VeriPB through VERIPB_BIN or PATH and
+# fail closed when the checker is absent or rejects a generated proof.
+# Keep this opt-in so ordinary library consumers need no external checker.
+certified-proof-artifacts = ["dep:nix"]
+# Explicit, non-default developer campaigns and fixture generators. Keeping
+# these behind a feature lets the tools call crate-internal solver lanes without
+# widening the production library API.
+dev-tools = ["dep:nix"]
 
 [dependencies]
 serde.workspace = true
@@ -43,10 +50,16 @@ ay-milp.workspace = true
 # not wall time, so the solver must be able to stand down on its own CPU clock.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+nix = { workspace = true, optional = true }
 
 [[bin]]
 name = "ay-pb"
 path = "src/bin/ay.rs"
+
+[[bin]]
+name = "ay-pb-dev"
+path = "src/bin/dev.rs"
+required-features = ["dev-tools"]
 
 [dev-dependencies]
 ay-test-support.workspace = true

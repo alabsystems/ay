@@ -2593,139 +2593,74 @@ fn bounded_tree_refutation_no_false_unsafe_on_safe() {
     );
 }
 
-// Diagnostic (ignored, opt-in): run the datatype refutation directly on a raw
-// corpus ADT-LIA unsafe instance to isolate the lane from the portfolio's
-// other routes. Not part of CI. Point it at a file with
-// `AY_DIAG_ADT_FILE=<path>` (and optionally `AY_DIAG_SECS`, `AY_DIAG_DEPTH`,
-// `AY_DT_BMC_TRACE=1`); with no file set it is a no-op.
+// Datatype refutation isolation pin. The built-in Nat instance exercises the
+// lane without consulting ambient files or process configuration.
 #[test]
-#[ignore = "manual corpus diagnostic; set AY_DIAG_ADT_FILE and run explicitly"]
-fn diag_datatype_refutation_on_corpus_instance() {
-    let Ok(path) = std::env::var("AY_DIAG_ADT_FILE") else {
-        eprintln!("DIAG: set AY_DIAG_ADT_FILE=<path> to run; skipping");
-        return;
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        eprintln!("DIAG: corpus file {path} not present; skipping");
-        return;
-    };
-    let problem = crate::parser::ChcParser::parse(&text).expect("parse corpus file");
-    eprintln!(
-        "DIAG: has_dt={} has_real={} clauses={} preds={}",
-        problem.has_datatype_sorts(),
-        problem.has_real_sorts(),
-        problem.clauses().len(),
-        problem.predicates().len(),
-    );
-    let depth: usize = std::env::var("AY_DIAG_DEPTH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(12);
-    let secs: u64 = std::env::var("AY_DIAG_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60);
-    let solver = BmcSolver::new(
-        problem,
-        BmcConfig {
-            max_depth: depth,
-            acyclic_safe: false,
-            ..BmcConfig::default()
-        },
-    );
-    let start = std::time::Instant::now();
-    let r = solver.solve_datatype_bounded_refutation(
-        depth,
-        std::time::Duration::from_secs(secs),
-        24_000,
-    );
-    eprintln!(
-        "DIAG result: {:?} in {:.2}s (depth={depth})",
-        std::mem::discriminant(&r),
-        start.elapsed().as_secs_f64()
-    );
-    match r {
-        ChcEngineResult::Unsafe(_) => eprintln!("DIAG: UNSAFE (converted!)"),
-        ChcEngineResult::Unknown => eprintln!("DIAG: UNKNOWN (not converted)"),
-        other => eprintln!("DIAG: {other:?}"),
+#[timeout(120_000)]
+fn datatype_refutation_on_bounded_instance() {
+    fn run(input: &str, depth: usize, budget: std::time::Duration) -> ChcEngineResult {
+        let problem = crate::parser::ChcParser::parse(input).expect("datatype CHC should parse");
+        assert!(
+            problem.has_datatype_sorts(),
+            "datatype diagnostic must actually exercise datatype sorts"
+        );
+        let solver = BmcSolver::new(
+            problem,
+            BmcConfig {
+                max_depth: depth,
+                acyclic_safe: false,
+                ..BmcConfig::default()
+            },
+        );
+        solver.solve_datatype_bounded_refutation(depth, budget, 24_000)
     }
+
+    const BUILTIN: &str = r#"
+(set-logic HORN)
+(declare-datatypes ((Nat 0)) (((zero) (succ (pred Nat)))))
+(declare-fun P (Nat) Bool)
+(assert (P zero))
+(assert (forall ((n Nat)) (=> (P n) (P (succ n)))))
+(assert (forall ((n Nat)) (=> (and (P n) (= n (succ (succ zero)))) false)))
+(check-sat)
+"#;
+    let _guard = lock_env();
+    let _enabled = ScopedEnvVar::unset("AY_CHC_DISABLE_DT_BMC");
+    let builtin = run(BUILTIN, 3, std::time::Duration::from_secs(15));
+    assert!(
+        matches!(builtin, ChcEngineResult::Unsafe(_)),
+        "built-in datatype chain must produce validated Unsafe, got {builtin:?}"
+    );
 }
 
-// Diagnostic (ignored, opt-in): run the GENERAL BMC `solve()` on a corpus file
-// IN ISOLATION (single thread, full CPU, no competing portfolio engines) to
-// separate a capability gap from a budget/contention gap. Point it with
-// `AY_DIAG_BMC_FILE=<path>` (optional `AY_DIAG_SECS`, `AY_DIAG_DEPTH`,
-// `AY_DIAG_ADAPTIVE=1` to enable adaptive stepping). Prints the verdict and BMC
-// stats (max_depth_reached, num_checks, budget_exhausted, time). Not CI.
+// General BMC isolation pin. The built-in linear counter proves that the
+// isolated solve performs checks and returns a validated counterexample.
 #[test]
-#[ignore = "manual isolated corpus diagnostic; set AY_DIAG_BMC_FILE and run explicitly"]
-fn diag_bmc_solve_on_file() {
-    let Ok(path) = std::env::var("AY_DIAG_BMC_FILE") else {
-        eprintln!("DIAG: set AY_DIAG_BMC_FILE=<path> to run; skipping");
-        return;
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        eprintln!("DIAG: file {path} not present; skipping");
-        return;
-    };
-    let problem = crate::parser::ChcParser::parse(&text).expect("parse corpus file");
-    eprintln!(
-        "DIAG: has_array={} has_bv={} has_real={} has_dt={} clauses={} preds={}",
-        problem.has_array_sorts(),
-        problem.has_bv_sorts(),
-        problem.has_real_sorts(),
-        problem.has_datatype_sorts(),
-        problem.clauses().len(),
-        problem.predicates().len(),
+fn bmc_isolation_solves_bounded_fixture() {
+    let mut builtin_config = BmcConfig::with_engine_config(8, true, None);
+    builtin_config.time_budget = Some(std::time::Duration::from_secs(10));
+    let builtin_solver = BmcSolver::new(create_simple_unsafe_problem(), builtin_config);
+    let builtin = builtin_solver.solve();
+    let builtin_stats = builtin_solver.stats.borrow();
+    assert!(
+        matches!(builtin, ChcEngineResult::Unsafe(_)),
+        "built-in isolated BMC must produce validated Unsafe, got {builtin:?}"
     );
-    let depth: usize = std::env::var("AY_DIAG_DEPTH")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60);
-    let secs: u64 = std::env::var("AY_DIAG_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60);
-    let adaptive = std::env::var("AY_DIAG_ADAPTIVE").is_ok();
-    let mut config = BmcConfig::with_engine_config(depth, true, None);
-    config.time_budget = Some(std::time::Duration::from_secs(secs));
-    config.enable_adaptive_stepping = adaptive;
-    let solver = BmcSolver::new(problem, config);
-    let start = std::time::Instant::now();
-    let r = solver.solve();
-    let s = solver.stats.borrow();
-    eprintln!(
-        "DIAG stats: max_depth_reached={} num_checks={} budget_exhausted={} \
-         exhausted_search={} executor={} legacy={} total_time_secs={:.2}",
-        s.max_depth_reached,
-        s.num_checks,
-        s.budget_exhausted,
-        s.exhausted_search,
-        s.used_executor_path,
-        s.used_legacy_fallback,
-        s.total_time_secs,
+    assert!(
+        builtin_stats.num_checks > 0,
+        "isolated BMC must issue at least one satisfiability check"
     );
-    eprintln!(
-        "DIAG result: {:?} in {:.2}s (depth={depth}, secs={secs}, adaptive={adaptive})",
-        std::mem::discriminant(&r),
-        start.elapsed().as_secs_f64()
-    );
-    match r {
-        ChcEngineResult::Unsafe(_) => eprintln!("DIAG: UNSAFE (converted!)"),
-        ChcEngineResult::Safe(_) => eprintln!("DIAG: SAFE"),
-        ChcEngineResult::Unknown => eprintln!("DIAG: UNKNOWN (not converted)"),
-        other => eprintln!("DIAG: {other:?}"),
-    }
+    drop(builtin_stats);
 }
 
-// Diagnostic (ignored, opt-in): compares the datatype-BMC lane's formula forms.
-// Dumps the drop_inj1 depth-0 top-level conjuncts and probes the RAW
+// Compares the datatype-BMC lane's formula forms on a built-in fixture. Probes
+// the drop_inj1 depth-0 RAW
 // indicator-gated disjunction, the node-arg-eliminated disjunction, and a
 // COMMITTED conjunction. Solver improvements may make more than one form SAT;
-// the diagnostic records current capability rather than asserting an obsolete
-// incompleteness boundary. Not part of CI.
+// the test asserts only sound capability boundaries plus the known committed
+// conjunction result.
 #[test]
-#[ignore = "manual datatype-BMC formula-form diagnostic; run explicitly"]
+#[timeout(60_000)]
 fn diag_dt_bmc_formula_forms() {
     let input = r#"
 (set-logic HORN)
@@ -2766,11 +2701,12 @@ fn diag_dt_bmc_formula_forms() {
             SmtResult::Unknown => "UNKNOWN",
         };
         eprintln!("FORM {label}: executor-first -> {tag}");
+        tag
     };
     // Compare raw and node-arg-eliminated disjunctions with one committed form.
-    probe("raw_disjunction", &ChcExpr::and_all(raw.clone()));
+    let raw_tag = probe("raw_disjunction", &ChcExpr::and_all(raw.clone()));
     let (elim, _) = BmcSolver::eliminate_dt_bmc_intermediate_defs(&raw);
-    probe("node_arg_elim_disjunction", &elim);
+    let elim_tag = probe("node_arg_elim_disjunction", &elim);
     // Committed conjunction (premise1 = clause 0, premise2 = clause 2): SAT.
     let mut m: FxHashMap<String, ChcExpr> = FxHashMap::default();
     for (n, v) in [
@@ -2787,7 +2723,19 @@ fn diag_dt_bmc_formula_forms() {
             BmcSolver::simplify_bmc_expr(c.substitute_name_map(&m)).collect_conjuncts_nontrivial()
         })
         .collect();
-    probe("committed_conjunction", &ChcExpr::and_all(committed));
+    let committed_tag = probe("committed_conjunction", &ChcExpr::and_all(committed));
+    assert_ne!(
+        raw_tag, "UNSAT",
+        "raw indicator disjunction has a known satisfying branch"
+    );
+    assert_ne!(
+        elim_tag, "UNSAT",
+        "node-eliminated disjunction has a known satisfying branch"
+    );
+    assert_eq!(
+        committed_tag, "SAT",
+        "selected committed branch must be decisively satisfiable"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3030,17 +2978,11 @@ fn datatype_bounded_refutation_elimination_round_trips_drop_inj1() {
 // Committed-chain refutation on the IntDualyzer BV programs (CHC-COMP26
 // eldarica-misc/BV/IntDualyzer). Their counterexample is a single deep
 // straight-line derivation to the asserted-failure point (no branching);
-// `solve_committed_chain_refutation` finds and VALIDATES it. `#[ignore]`d
-// because it reads the (large) competition corpus, absent from CI.
-#[cfg(test)]
-fn intdualyzer_committed_chain(name: &str) -> Option<ChcEngineResult> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(format!(
-            "benchmarks/chc/chc-comp26-benchmarks/eldarica-misc/BV/IntDualyzer/{name}.smt2"
-        ));
-    let input = std::fs::read_to_string(&path).ok()?;
-    let problem = crate::parser::ChcParser::parse(&input).expect("benchmark should parse");
+// `solve_committed_chain_refutation` finds and VALIDATES it. Built-in safe and
+// unsafe chains pin the behavior. External corpus campaigns live in bounded
+// examples so ordinary tests are hermetic.
+fn committed_chain(input: &str) -> ChcEngineResult {
+    let problem = crate::parser::ChcParser::parse(input).expect("benchmark should parse");
     let solver = BmcSolver::new(
         problem,
         BmcConfig {
@@ -3049,42 +2991,51 @@ fn intdualyzer_committed_chain(name: &str) -> Option<ChcEngineResult> {
             ..BmcConfig::default()
         },
     );
-    Some(solver.solve_committed_chain_refutation(std::time::Duration::from_secs(30)))
+    solver.solve_committed_chain_refutation(std::time::Duration::from_secs(15))
 }
 
 #[test]
-#[ignore = "requires the non-vendored CHC-COMP-26 IntDualyzer corpus"]
-fn committed_chain_refutes_intdualyzer_unsafe_targets() {
-    // expected_verdict:false (unsat / UNSAFE) — must be refuted with a
-    // VALIDATED counterexample.
-    for name in ["quicksort.c-bv_000", "SOR.c-bv_000", "LU.c-bv_000"] {
-        let Some(result) = intdualyzer_committed_chain(name) else {
-            eprintln!("SKIP {name}: corpus not present");
-            continue;
-        };
-        assert!(
-            matches!(result, ChcEngineResult::Unsafe(_)),
-            "{name} (expected_verdict:false) must be a VALIDATED Unsafe, got {result:?}"
-        );
-    }
+fn committed_chain_refutes_bounded_unsafe_target() {
+    const BUILTIN_UNSAFE: &str = r#"
+(set-logic HORN)
+(declare-fun P0 ((_ BitVec 8)) Bool)
+(declare-fun P1 ((_ BitVec 8)) Bool)
+(declare-fun P2 ((_ BitVec 8)) Bool)
+(assert (P0 #x00))
+(assert (forall ((x (_ BitVec 8)) (y (_ BitVec 8)))
+  (=> (and (P0 x) (= y (bvadd x #x01))) (P1 y))))
+(assert (forall ((x (_ BitVec 8)) (y (_ BitVec 8)))
+  (=> (and (P1 x) (= y (bvadd x #x01))) (P2 y))))
+(assert (forall ((x (_ BitVec 8))) (=> (and (P2 x) (= x #x02)) false)))
+(check-sat)
+"#;
+    let builtin = committed_chain(BUILTIN_UNSAFE);
+    assert!(
+        matches!(builtin, ChcEngineResult::Unsafe(_)),
+        "built-in committed chain must produce validated Unsafe, got {builtin:?}"
+    );
 }
 
 #[test]
-#[ignore = "requires the non-vendored CHC-COMP-26 IntDualyzer corpus"]
-fn committed_chain_leaves_intdualyzer_safe_guards_not_unsafe() {
-    // expected_verdict:true (sat / SAFE) — the sound gate must NEVER fabricate
-    // an Unsafe here; only Unknown is acceptable (the chain check either finds
-    // no chain, its formula is UNSAT, or the witness fails replay).
-    for name in ["mergesort.c-bv_000", "queens.c-bv_000"] {
-        let Some(result) = intdualyzer_committed_chain(name) else {
-            eprintln!("SKIP {name}: corpus not present");
-            continue;
-        };
-        assert!(
-            !matches!(result, ChcEngineResult::Unsafe(_)),
-            "{name} (expected_verdict:true) must NOT be refuted, got {result:?}"
-        );
-    }
+fn committed_chain_leaves_two_step_unreachable_guard_not_unsafe() {
+    const BUILTIN_SAFE: &str = r#"
+(set-logic HORN)
+(declare-fun P0 ((_ BitVec 8)) Bool)
+(declare-fun P1 ((_ BitVec 8)) Bool)
+(declare-fun P2 ((_ BitVec 8)) Bool)
+(assert (P0 #x00))
+(assert (forall ((x (_ BitVec 8)) (y (_ BitVec 8)))
+  (=> (and (P0 x) (= y (bvadd x #x01))) (P1 y))))
+(assert (forall ((x (_ BitVec 8)) (y (_ BitVec 8)))
+  (=> (and (P1 x) (= y (bvadd x #x01))) (P2 y))))
+(assert (forall ((x (_ BitVec 8))) (=> (and (P2 x) (= x #x03)) false)))
+(check-sat)
+"#;
+    let builtin = committed_chain(BUILTIN_SAFE);
+    assert!(
+        !matches!(builtin, ChcEngineResult::Unsafe(_)),
+        "two-step chain reaches only #x02, not #x03; got {builtin:?}"
+    );
 }
 
 // ===== #chc25-bmc-sweep: sweep past a spurious/unconfirmable shallow SAT =====
@@ -3192,16 +3143,14 @@ fn trace_get_value_keeps_exact_neighbors_of_unavailable_array_read_9185() {
     );
     let values = vec![
         BmcTraceValue::Var(ChcVar::new("Init#0", ChcSort::Bool)),
-        BmcTraceValue::ArraySelect {
+        BmcTraceValue::ArraySelectPath {
             array: array.clone(),
-            index: ChcExpr::BitVec(0, 32),
-            index_sort: bv32.clone(),
+            indices: vec![(ChcExpr::BitVec(0, 32), bv32.clone())],
             value_sort: bv32.clone(),
         },
-        BmcTraceValue::ArraySelect {
+        BmcTraceValue::ArraySelectPath {
             array: array.clone(),
-            index: ChcExpr::BitVec(38, 32),
-            index_sort: bv32.clone(),
+            indices: vec![(ChcExpr::BitVec(38, 32), bv32.clone())],
             value_sort: bv32,
         },
         BmcTraceValue::Var(ChcVar::new("Bad#1", ChcSort::Bool)),
@@ -3231,6 +3180,569 @@ fn trace_get_value_keeps_exact_neighbors_of_unavailable_array_read_9185() {
     let mut commands = String::new();
     BmcSolver::append_trace_get_value_commands(&mut commands, &values);
     assert_eq!(commands.matches("(get-value (").count(), values.len());
+}
+
+#[test]
+fn trace_get_value_reconstructs_nested_array_reads_with_collided_array_keys() {
+    let int_array = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let nested = ChcSort::Array(Box::new(int_array.clone()), Box::new(int_array.clone()));
+    let f = ChcVar::new("F", nested);
+    let p = ChcVar::new("P", int_array.clone());
+    let e = ChcVar::new("E", int_array.clone());
+    let p_read = ChcExpr::select(
+        ChcExpr::select(ChcExpr::var(f.clone()), ChcExpr::var(p.clone())),
+        ChcExpr::int(0),
+    );
+    let e_read = ChcExpr::select(
+        ChcExpr::select(ChcExpr::var(f.clone()), ChcExpr::var(e.clone())),
+        ChcExpr::int(0),
+    );
+
+    let mut values = Vec::new();
+    let mut seen = FxHashSet::default();
+    BmcSolver::collect_trace_array_selects(&p_read, &mut values, &mut seen);
+    BmcSolver::collect_trace_array_selects(&e_read, &mut values, &mut seen);
+    assert_eq!(
+        values.len(),
+        2,
+        "each scalar nested leaf must be observed exactly once"
+    );
+    assert!(values.iter().all(|value| matches!(
+        value,
+        BmcTraceValue::ArraySelectPath { indices, .. } if indices.len() == 2
+    )));
+
+    // This is the lossy executor rendering seen on the Solidity shard: P and E
+    // print as the same const array even though the exact leaf observations
+    // differ. The finite completion must separate only that collided key and
+    // install both nested cells.
+    let zero_array = SmtValue::ConstArray(Box::new(SmtValue::Int(0)));
+    let mut model = FxHashMap::default();
+    model.insert("P".to_string(), zero_array.clone());
+    model.insert(
+        "E".to_string(),
+        SmtValue::ArrayMap {
+            default: Box::new(SmtValue::Int(0)),
+            // Extensionally equal to P despite a different representation.
+            entries: vec![(SmtValue::Int(5), SmtValue::Int(0))],
+        },
+    );
+    model.insert("F".to_string(), SmtValue::ConstArray(Box::new(zero_array)));
+    let outputs = vec![
+        "(((select (select F P) 0) 1))".to_string(),
+        "(((select (select F E) 0) 2))".to_string(),
+    ];
+    BmcSolver::parse_trace_get_value_outputs_into_model(&mut model, &values, &outputs);
+
+    assert_ne!(
+        model.get("P"),
+        model.get("E"),
+        "incompatible leaves force the rendered array-valued keys apart"
+    );
+    assert_eq!(evaluate_expr(&p_read, &model), Some(SmtValue::Int(1)));
+    assert_eq!(evaluate_expr(&e_read, &model), Some(SmtValue::Int(2)));
+    assert_eq!(
+        evaluate_expr(&ChcExpr::ne(p_read, e_read), &model),
+        Some(SmtValue::Bool(true))
+    );
+}
+
+#[test]
+fn trace_get_value_reconstruction_reaches_array_key_dependency_fixpoint() {
+    let int_array = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let nested = ChcSort::Array(Box::new(int_array.clone()), Box::new(int_array.clone()));
+    let f = ChcVar::new("F", nested);
+    let e = ChcVar::new("E", int_array);
+    let outer_read = ChcExpr::select(
+        ChcExpr::select(ChcExpr::var(f.clone()), ChcExpr::var(e.clone())),
+        ChcExpr::int(0),
+    );
+    let key_read = ChcExpr::select(ChcExpr::var(e.clone()), ChcExpr::int(5));
+
+    // Deliberately collect the dependent outer read first. A one-pass
+    // reconstruction installs F's cell under E=const(0), then changes E while
+    // installing E[5]=9, and loses the outer observation.
+    let mut values = Vec::new();
+    let mut seen = FxHashSet::default();
+    BmcSolver::collect_trace_array_selects(&outer_read, &mut values, &mut seen);
+    BmcSolver::collect_trace_array_selects(&key_read, &mut values, &mut seen);
+
+    let zero_array = SmtValue::ConstArray(Box::new(SmtValue::Int(0)));
+    let mut model = FxHashMap::default();
+    model.insert("E".to_string(), zero_array.clone());
+    model.insert("F".to_string(), SmtValue::ConstArray(Box::new(zero_array)));
+    let outputs = vec![
+        "(((select (select F E) 0) 7))".to_string(),
+        "(((select E 5) 9))".to_string(),
+    ];
+    BmcSolver::parse_trace_get_value_outputs_into_model(&mut model, &values, &outputs);
+
+    assert_eq!(evaluate_expr(&key_read, &model), Some(SmtValue::Int(9)));
+    assert_eq!(
+        evaluate_expr(&outer_read, &model),
+        Some(SmtValue::Int(7)),
+        "the outer cell must be reinstalled under E's finalized concrete value"
+    );
+}
+
+#[test]
+fn trace_reconstruction_separates_collided_composite_array_keys() {
+    let int_array = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let key_source_sort = (0..4).fold(int_array.clone(), |value_sort, _| {
+        ChcSort::Array(Box::new(ChcSort::Int), Box::new(value_sort))
+    });
+    let nested = ChcSort::Array(Box::new(int_array.clone()), Box::new(int_array.clone()));
+    let j = ChcVar::new("J", nested);
+    let e = ChcVar::new("E", key_source_sort.clone());
+    let c = ChcVar::new("C", key_source_sort.clone());
+    let h = ChcVar::new("H", ChcSort::Int);
+    let select_four = |array: &ChcVar| {
+        (0..4).fold(ChcExpr::var(array.clone()), |read, _| {
+            ChcExpr::select(read, ChcExpr::var(h.clone()))
+        })
+    };
+    let e_key = select_four(&e);
+    let c_key = select_four(&c);
+    let e_read = ChcExpr::select(
+        ChcExpr::select(ChcExpr::var(j.clone()), e_key.clone()),
+        ChcExpr::int(0),
+    );
+    let c_read = ChcExpr::select(
+        ChcExpr::select(ChcExpr::var(j.clone()), c_key.clone()),
+        ChcExpr::int(0),
+    );
+
+    let mut model = FxHashMap::default();
+    model.insert(
+        "J".to_string(),
+        BmcSolver::default_smt_value_for_sort(&j.sort).expect("nested array has a default"),
+    );
+    let default_key_source =
+        BmcSolver::default_smt_value_for_sort(&key_source_sort).expect("array has a default");
+    model.insert("E".to_string(), default_key_source.clone());
+    model.insert("C".to_string(), default_key_source);
+    model.insert("H".to_string(), SmtValue::Int(0));
+
+    let observations = vec![
+        BmcArrayObservation {
+            array: j.clone(),
+            indices: vec![
+                (e_key.clone(), int_array.clone()),
+                (ChcExpr::int(0), ChcSort::Int),
+            ],
+            value: SmtValue::Int(1),
+        },
+        BmcArrayObservation {
+            array: j,
+            indices: vec![(c_key.clone(), int_array), (ChcExpr::int(0), ChcSort::Int)],
+            value: SmtValue::Int(2),
+        },
+    ];
+    BmcSolver::reconstruct_trace_array_observations(&mut model, &observations);
+
+    assert_ne!(
+        evaluate_expr(&e_key, &model),
+        evaluate_expr(&c_key, &model),
+        "the composite C[H][H][H][H] key must be finitely separated"
+    );
+    assert_eq!(evaluate_expr(&e_read, &model), Some(SmtValue::Int(1)));
+    assert_eq!(evaluate_expr(&c_read, &model), Some(SmtValue::Int(2)));
+}
+
+#[test]
+fn nested_select_formula_abstraction_covers_prefix_and_query_consistently() {
+    let int_array = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let nested = ChcSort::Array(Box::new(int_array.clone()), Box::new(int_array.clone()));
+    let f = ChcVar::new("F", nested);
+    let p = ChcVar::new("P", int_array);
+    let leaf = ChcExpr::select(
+        ChcExpr::select(ChcExpr::var(f), ChcExpr::var(p)),
+        ChcExpr::int(0),
+    );
+    let prefix = ChcExpr::ge(leaf.clone(), ChcExpr::int(0));
+    let query = ChcExpr::ne(leaf.clone(), ChcExpr::int(7));
+
+    let abstraction = BmcSolver::abstract_nested_select_formula(
+        std::slice::from_ref(&prefix),
+        &[vec![query.clone()]],
+        3,
+        &FxHashSet::default(),
+        None,
+    )
+    .expect("the nested scalar select should be abstracted across the full formula");
+    let abstract_prefix = abstraction.prefix_conjuncts;
+    let abstract_groups = abstraction.query_groups;
+    let aliases = abstraction.select_aliases;
+
+    assert_eq!(
+        aliases.len(),
+        1,
+        "structurally identical reads must share one alias"
+    );
+    assert_eq!(aliases[0].original, leaf);
+    let replacement = [(
+        aliases[0].original.clone(),
+        ChcExpr::var(aliases[0].alias.clone()),
+    )];
+    let expected_prefix = prefix.substitute_expr_pairs(&replacement);
+    let expected_query = query.substitute_expr_pairs(&replacement);
+    assert_eq!(
+        abstract_prefix,
+        vec![expected_prefix],
+        "the rule-prefix occurrence must be relaxed"
+    );
+    assert_eq!(
+        abstract_groups,
+        vec![vec![expected_query]],
+        "the same alias must be reused in the query without changing its Boolean skeleton"
+    );
+}
+
+#[test]
+fn nested_select_formula_abstraction_budget_covers_more_than_64_prefix_reads() {
+    let int_array = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let nested = ChcSort::Array(Box::new(int_array.clone()), Box::new(int_array.clone()));
+    let f = ChcVar::new("F", nested);
+    let p = ChcVar::new("P", int_array);
+    let make_prefix = |count: usize| {
+        (0..count)
+            .map(|index| {
+                let leaf = ChcExpr::select(
+                    ChcExpr::select(ChcExpr::var(f.clone()), ChcExpr::var(p.clone())),
+                    ChcExpr::int(i128::try_from(index).expect("small test index fits i128")),
+                );
+                ChcExpr::ge(leaf, ChcExpr::int(0))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let prefix = make_prefix(65);
+    let abstraction = BmcSolver::abstract_nested_select_formula(
+        &prefix,
+        &[vec![ChcExpr::Bool(true)]],
+        7,
+        &FxHashSet::default(),
+        None,
+    )
+    .expect("the bounded candidate abstraction must cover a 65-read accumulated prefix");
+    let abstract_prefix = abstraction.prefix_conjuncts;
+    let aliases = abstraction.select_aliases;
+    assert_eq!(aliases.len(), 65);
+    assert_eq!(abstract_prefix.len(), prefix.len());
+    let mut remaining_nested_leaves = Vec::new();
+    let mut seen_nested_leaves = FxHashSet::default();
+    let mut traversal_budget = BmcNestedArrayTraversalBudget::new(MAX_PREPROCESSING_NODES, None);
+    for expr in &abstract_prefix {
+        BmcSolver::collect_nested_select_alias_terms(
+            expr,
+            &mut remaining_nested_leaves,
+            &mut seen_nested_leaves,
+            &mut traversal_budget,
+        )
+        .expect("the test prefix stays within the traversal budget");
+    }
+    assert!(
+        remaining_nested_leaves.is_empty(),
+        "every nested leaf must be replaced while its surrounding constraint remains"
+    );
+
+    let over_budget = make_prefix(MAX_NESTED_SELECT_CANDIDATE_ALIASES + 1);
+    assert!(
+        BmcSolver::abstract_nested_select_formula(
+            &over_budget,
+            &[vec![ChcExpr::Bool(true)]],
+            16,
+            &FxHashSet::default(),
+            None,
+        )
+        .is_none(),
+        "candidate generation must remain hard-capped"
+    );
+}
+
+#[test]
+fn nested_array_candidate_walk_budget_fails_closed_during_traversal() {
+    let int_array = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let nested = ChcSort::Array(Box::new(int_array.clone()), Box::new(int_array.clone()));
+    let f = ChcVar::new("F", nested);
+    let p = ChcVar::new("P", int_array);
+    let leaf = ChcExpr::select(
+        ChcExpr::select(ChcExpr::var(f), ChcExpr::var(p)),
+        ChcExpr::int(0),
+    );
+    let formula = ChcExpr::and_all([
+        ChcExpr::eq(leaf.clone(), ChcExpr::int(0)),
+        ChcExpr::eq(leaf, ChcExpr::int(1)),
+    ]);
+    let mut leaves = Vec::new();
+    let mut seen = FxHashSet::default();
+    let mut budget = BmcNestedArrayTraversalBudget::new(1, None);
+
+    assert_eq!(
+        BmcSolver::collect_nested_select_alias_terms(&formula, &mut leaves, &mut seen, &mut budget,),
+        Err(BmcNestedArrayCandidateAbort::NodeBudgetOrDeadline),
+        "candidate traversal must stop at its shared node budget"
+    );
+}
+
+#[test]
+fn nested_array_candidate_equality_graph_is_hard_capped() {
+    let int_array = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let nested = ChcSort::Array(Box::new(int_array.clone()), Box::new(int_array));
+    let variables: Vec<ChcVar> = (0..=MAX_NESTED_ARRAY_CANDIDATE_EQUALITIES + 1)
+        .map(|index| ChcVar::new(format!("A{index}"), nested.clone()))
+        .collect();
+    let equalities: Vec<ChcExpr> = variables
+        .windows(2)
+        .map(|pair| ChcExpr::eq(ChcExpr::var(pair[0].clone()), ChcExpr::var(pair[1].clone())))
+        .collect();
+    let mut budget = BmcNestedArrayTraversalBudget::new(MAX_PREPROCESSING_NODES, None);
+
+    assert!(
+        matches!(
+            BmcSolver::nested_array_var_equivalences(equalities.iter(), &mut budget),
+            Err(BmcNestedArrayCandidateAbort::EqualityCap)
+        ),
+        "an adversarial equality graph must fail closed at the edge cap"
+    );
+}
+
+#[test]
+fn nested_array_candidate_rejects_nonvariable_select_roots_before_tokenization() {
+    let int_array = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let nested = ChcSort::Array(Box::new(ChcSort::Int), Box::new(int_array.clone()));
+    let f = ChcVar::new("F", nested);
+    let value = ChcVar::new("V", int_array.clone());
+    let output = ChcVar::new("O", int_array);
+    let stored = ChcExpr::store(ChcExpr::var(f), ChcExpr::int(0), ChcExpr::var(value));
+    let nonvariable_root_read = ChcExpr::select(stored, ChcExpr::int(0));
+    let formula = ChcExpr::eq(ChcExpr::var(output), nonvariable_root_read);
+
+    assert!(
+        BmcSolver::abstract_nested_select_formula(
+            std::slice::from_ref(&formula),
+            &[vec![ChcExpr::Bool(true)]],
+            4,
+            &FxHashSet::default(),
+            None,
+        )
+        .is_none(),
+        "tokenizing the store below this select would be ill-typed, so the candidate must fail closed"
+    );
+}
+
+#[test]
+fn nested_array_candidate_scalarizes_state_and_reconstructs_array_valued_reads() {
+    let int_array = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let field_map = ChcSort::Array(Box::new(ChcSort::Int), Box::new(int_array.clone()));
+    let nested = ChcSort::Array(Box::new(int_array.clone()), Box::new(field_map));
+    let f = ChcVar::new("F", nested.clone());
+    let g = ChcVar::new("G", nested);
+    let key = ChcVar::new("P", int_array.clone());
+    let output = ChcVar::new("O", int_array.clone());
+    let read = |array: &ChcVar| {
+        ChcExpr::select(
+            ChcExpr::select(ChcExpr::var(array.clone()), ChcExpr::var(key.clone())),
+            ChcExpr::int(3),
+        )
+    };
+    let f_read = read(&f);
+    let g_read = read(&g);
+    let prefix = ChcExpr::and_all([
+        ChcExpr::eq(ChcExpr::var(f.clone()), ChcExpr::var(g.clone())),
+        ChcExpr::eq(ChcExpr::var(output), f_read.clone()),
+    ]);
+    let query = ChcExpr::eq(g_read.clone(), ChcExpr::var(key.clone()));
+
+    let abstraction = BmcSolver::abstract_nested_select_formula(
+        std::slice::from_ref(&prefix),
+        &[vec![query]],
+        9,
+        &FxHashSet::default(),
+        None,
+    )
+    .expect("array-valued reads and nested state should both be abstracted");
+
+    assert_eq!(abstraction.select_aliases.len(), 2);
+    assert_eq!(abstraction.state_tokens.len(), 2);
+    assert_eq!(abstraction.equal_state.len(), 1);
+    let mut residual_budget = BmcNestedArrayTraversalBudget::new(MAX_PREPROCESSING_NODES, None);
+    assert!(
+        abstraction
+            .prefix_conjuncts
+            .iter()
+            .chain(abstraction.query_groups.iter().flatten())
+            .all(|expr| matches!(
+                BmcSolver::expr_contains_nested_array_sort(expr, &mut residual_budget),
+                Ok(false)
+            )),
+        "the candidate formula must contain no nested-array roots"
+    );
+
+    let candidate_exprs: Vec<&ChcExpr> = abstraction
+        .prefix_conjuncts
+        .iter()
+        .chain(abstraction.query_groups.iter().flatten())
+        .collect();
+    let mut declared = FxHashSet::default();
+    let mut candidate_smt = String::from("(set-logic AUFLIA)\n");
+    for expr in &candidate_exprs {
+        for variable in expr.vars() {
+            if declared.insert(variable.name.clone()) {
+                candidate_smt.push_str(&format!(
+                    "(declare-const {} {})\n",
+                    quote_symbol(&variable.name),
+                    sort_to_smtlib(&variable.sort)
+                ));
+            }
+        }
+        candidate_smt.push_str(&format!(
+            "(assert {})\n",
+            InvariantModel::expr_to_smtlib(expr)
+        ));
+    }
+    candidate_smt.push_str("(check-sat)\n");
+    assert!(
+        ay_frontend::parse(&candidate_smt).is_ok(),
+        "scalarizing nested state must preserve SMT typing"
+    );
+
+    let observed_value = SmtValue::ConstArray(Box::new(SmtValue::Int(7)));
+    let mut model = FxHashMap::default();
+    model.insert(
+        key.name.clone(),
+        BmcSolver::default_smt_value_for_sort(&key.sort).expect("flat array has a default"),
+    );
+    for alias in &abstraction.select_aliases {
+        model.insert(alias.alias.name.clone(), observed_value.clone());
+    }
+    let completed = BmcSolver::reconstruct_nested_select_aliases(
+        &mut model,
+        &abstraction.select_aliases,
+        &abstraction.state_tokens,
+        &abstraction.equal_state,
+    );
+
+    assert_eq!(completed, 2);
+    assert_eq!(evaluate_expr(&f_read, &model), Some(observed_value.clone()));
+    assert_eq!(evaluate_expr(&g_read, &model), Some(observed_value));
+    assert_eq!(
+        model.get(&f.name),
+        model.get(&g.name),
+        "directly equal nested state must share one reconstructed finite value"
+    );
+    assert!(
+        abstraction
+            .state_tokens
+            .iter()
+            .all(|token| !model.contains_key(&token.alias.name)),
+        "candidate-only scalar tokens must not leak into exact replay"
+    );
+}
+
+#[test]
+#[timeout(30_000)]
+fn nested_select_observation_candidate_is_not_a_verdict() {
+    let src = r#"
+(set-logic HORN)
+(declare-fun Observe () Bool)
+(assert
+  (forall
+    ((F (Array (Array Int Int) (Array Int Int)))
+     (G (Array (Array Int Int) (Array Int Int)))
+     (P (Array Int Int)))
+    (=>
+      (and
+        (= F G)
+        (not
+          (=
+            (select (select F P) 0)
+            (select (select G P) 0))))
+      Observe)))
+(assert (=> Observe false))
+"#;
+    let problem = crate::ChcParser::parse(src).expect("nested-array CHC should parse");
+    let solver = BmcSolver::new(
+        problem,
+        BmcConfig::default()
+            .with_max_depth(0)
+            .with_time_budget(std::time::Duration::from_secs(10))
+            .with_per_depth_timeout(std::time::Duration::from_secs(10)),
+    );
+    let queries: Vec<_> = solver.problem.queries().collect();
+
+    let mut level_conjuncts = Vec::new();
+    solver.compile_level_flat(0, &mut level_conjuncts);
+    let query_groups = solver.compile_query_groups(&queries, 0);
+    assert!(
+        BmcSolver::abstract_nested_select_formula(
+            &[],
+            &query_groups,
+            0,
+            &FxHashSet::default(),
+            None,
+        )
+        .is_none(),
+        "the nullary query has no leaves; this regression requires prefix abstraction"
+    );
+    let model = solver
+        .try_nested_select_observation_candidate(
+            &level_conjuncts,
+            &query_groups,
+            0,
+            false,
+            Some(ay_core::time::Instant::now() + std::time::Duration::from_secs(10)),
+        )
+        .expect("the relaxed disequality should yield a finite candidate");
+
+    assert!(
+        matches!(
+            solver.classify_flat_sat(&model, 0, &queries),
+            FlatSatOutcome::Advance
+        ),
+        "a relaxed SAT assignment that violates F = G must fail unchanged original-clause replay"
+    );
+}
+
+fn chccomp25_solidity_slice_result(name: &str) -> Option<ChcEngineResult> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("benchmarks/chc/chc-comp25-benchmarks/solidity/no_adts/unit_tests/abi")
+        .join(name);
+    let input = std::fs::read_to_string(path).ok()?;
+    let problem = crate::parser::ChcParser::parse(&input).expect("slice benchmark should parse");
+    let summary = crate::portfolio::PreprocessSummary::build(problem, false);
+    let bmc = BmcConfig::default()
+        .with_max_depth(16)
+        .with_time_budget(std::time::Duration::from_secs(10))
+        .with_per_depth_timeout(std::time::Duration::from_secs(10));
+    let config =
+        crate::portfolio::PortfolioConfig::with_engines(vec![crate::portfolio::EngineConfig::Bmc(
+            bmc,
+        )])
+        .parallel(false)
+        .timeout(Some(std::time::Duration::from_secs(10)))
+        .preprocessing(false);
+    Some(crate::portfolio::PortfolioSolver::from_summary(summary, config).solve())
+}
+
+#[test]
+#[ignore = "requires the downloaded CHC-COMP-25 Solidity corpus"]
+#[timeout(30_000)]
+fn nested_select_candidate_refutes_both_chccomp25_array_slice_targets() {
+    for name in [
+        "abi_encode_array_slice.sol_0_no_adts_000.smt2",
+        "abi_encode_packed_array_slice.sol_0_no_adts_000.smt2",
+    ] {
+        let Some(result) = chccomp25_solidity_slice_result(name) else {
+            eprintln!("SKIP {name}: corpus not present");
+            continue;
+        };
+        assert!(
+            matches!(result, ChcEngineResult::Unsafe(_)),
+            "{name} (Z3: unsat / CHC unsafe) must produce a replay-validated Unsafe, got {result:?}"
+        );
+    }
 }
 
 fn flat_observation_phase_problem(query_value: i128) -> ChcProblem {

@@ -1082,8 +1082,8 @@ fn quantified_dt_widen_noop() {
 
 #[test]
 fn z3_recognizer_truth_table_pins_measured_frontier() {
-    // Pins the STRUCTURAL set-logic recognizer to z3 4.15.4's measured
-    // accept/`unsupported` frontier (45-token adversarial sweep). z3 SILENTLY
+    // Pins the STRUCTURAL set-logic recognizer to z3 5.0.0's measured
+    // accept/`unsupported` frontier. z3 SILENTLY
     // accepts these (solve, exit 0):
     for accept in [
         "ALL",
@@ -1110,6 +1110,8 @@ fn z3_recognizer_truth_table_pins_measured_frontier() {
         "QF_SLRA",
         "QF_FPDTLIA",
         "UFBVDT", // substring / A-prefix / QF_A-prefix
+        "ZFP",
+        "FPX", // z3 5.0.0 recognizes FP as a substring (unlike 4.15.4)
         // the five named probes and their combined siblings:
         "QF_UFLIRA",
         "QF_ANIA",
@@ -1133,8 +1135,8 @@ fn z3_recognizer_truth_table_pins_measured_frontier() {
         "QF_FDX",
         "QF_X",
         "QF_",
-        "ZFP",
-        "FPX",
+        "PF",
+        "XPF",
         "M",
         "HORNBLOWER",
         "XHORN",

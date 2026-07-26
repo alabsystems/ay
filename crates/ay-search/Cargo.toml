@@ -1,0 +1,17 @@
+[package]
+name = "ay-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed finite-domain search and optimization powered by AY CP-SAT"
+readme.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ay-cp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

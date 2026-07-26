@@ -2,6 +2,7 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
+use ay_core::kani_compat::DetHashMap as HashMap;
 use ay_core::term::{Symbol, TermData};
 use ay_core::{Sort, TermId, TermStore};
 
@@ -15,7 +16,26 @@ use super::euf_patterns::decode_non_bool_eq;
 ///
 /// Uses `stacker::maybe_grow` for stack safety on deeply nested terms (#8414).
 pub(super) fn involves_uninterpreted_function(terms: &TermStore, term: TermId) -> bool {
-    stacker::maybe_grow(
+    // Hash-consed DAG: a subterm shared by many parents would otherwise be
+    // re-walked once per path (super-linear on the deep diamond terms seen on
+    // QF_ALIA/cs_fib-2). The result is a pure function of the immutable term
+    // DAG, so a per-call result-memo is byte-identical to the naive walk (same
+    // short-circuit order; each visited term's bool is just cached). The memo
+    // (`DetHashMap`) allocates lazily — a leaf-only top-level call inserts
+    // nothing, so shallow callers keep their prior cost.
+    let mut memo: HashMap<TermId, bool> = HashMap::default();
+    involves_uninterpreted_function_memo(terms, term, &mut memo)
+}
+
+fn involves_uninterpreted_function_memo(
+    terms: &TermStore,
+    term: TermId,
+    memo: &mut HashMap<TermId, bool>,
+) -> bool {
+    if let Some(&cached) = memo.get(&term) {
+        return cached;
+    }
+    let result = stacker::maybe_grow(
         TERM_ANALYSIS_STACK_RED_ZONE,
         TERM_ANALYSIS_STACK_SIZE,
         || match terms.get(term) {
@@ -46,20 +66,26 @@ pub(super) fn involves_uninterpreted_function(terms: &TermStore, term: TermId) -
                         | "store"
                 ) {
                     args.iter()
-                        .any(|&arg| involves_uninterpreted_function(terms, arg))
+                        .any(|&arg| involves_uninterpreted_function_memo(terms, arg, memo))
                 } else {
                     true
                 }
             }
-            TermData::Not(inner) => involves_uninterpreted_function(terms, *inner),
+            TermData::Not(inner) => involves_uninterpreted_function_memo(terms, *inner, memo),
             TermData::Ite(c, t, e) => {
-                involves_uninterpreted_function(terms, *c)
-                    || involves_uninterpreted_function(terms, *t)
-                    || involves_uninterpreted_function(terms, *e)
+                involves_uninterpreted_function_memo(terms, *c, memo)
+                    || involves_uninterpreted_function_memo(terms, *t, memo)
+                    || involves_uninterpreted_function_memo(terms, *e, memo)
             }
             _ => false,
         },
-    ) // stacker::maybe_grow
+    ); // stacker::maybe_grow
+       // Only compound terms can be revisited via a shared sub-DAG; caching leaves
+       // (which return in O(1)) would add allocation without avoiding any walk.
+    if !matches!(terms.get(term), TermData::Const(_) | TermData::Var(_, _)) {
+        memo.insert(term, result);
+    }
+    result
 }
 
 /// Extract interface arithmetic term from an equality between UF and arithmetic.

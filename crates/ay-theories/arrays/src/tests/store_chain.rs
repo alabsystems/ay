@@ -2395,6 +2395,11 @@ fn test_arrays_nested_select_conflict_emits_lemma() {
     solver.assert_literal(eq_sels, false);
     solver.populate_caches();
 
+    assert!(
+        !solver.weakly_connected(nested_row, row),
+        "nested normalization must not require the original select arrays to share a weak component"
+    );
+
     let TheoryResult::NeedLemmas(lemmas) = solver
         .check_nested_select_conflicts()
         .expect("nested select normalization should detect the conflict")

@@ -70,14 +70,14 @@ impl SmtContext {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```rust,no_run
     /// use ay_chc::{SmtContext, ChcExpr, ChcVar, ChcSort, InterpolationResult};
     ///
     /// let mut smt = SmtContext::new();
     ///
     /// let x = ChcVar::new("x", ChcSort::Int);
-    /// let a = vec![ChcExpr::ge(ChcExpr::var(x.clone()), ChcExpr::Int(10))];
-    /// let b = vec![ChcExpr::le(ChcExpr::var(x), ChcExpr::Int(5))];
+    /// let a = vec![ChcExpr::ge(ChcExpr::var(x.clone()), ChcExpr::int(10))];
+    /// let b = vec![ChcExpr::le(ChcExpr::var(x), ChcExpr::int(5))];
     ///
     /// match smt.get_interpolant(&a, &b) {
     ///     InterpolationResult::Unsat(interpolant) => {

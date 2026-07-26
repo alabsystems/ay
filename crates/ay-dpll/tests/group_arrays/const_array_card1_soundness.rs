@@ -260,3 +260,219 @@ fn extensionality_refutes_select_diseq_on_equal_arrays() {
     );
     assert_eq!(result, vec!["unsat"]);
 }
+
+/// Ground singleton arrays used only below UF applications must still be
+/// equated. The old pass inspected existing equality atoms, so neither `b0`
+/// nor `b1` was discovered and AY returned the wrong `sat`.
+#[test]
+#[timeout(10_000)]
+fn singleton_array_uf_arguments_are_equal_by_cardinality() {
+    let result = run_smt(
+        r#"
+        (set-logic ALL)
+        (declare-datatype D1 ((c)))
+        (declare-const b0 (Array Int D1))
+        (declare-const b1 (Array Int D1))
+        (declare-fun f ((Array Int D1)) Int)
+        (declare-fun p ((Array Int D1)) Bool)
+        (assert (distinct (f b0) (f b1)))
+        (assert (p (store b0 0 c)))
+        (assert (p (store b1 0 c)))
+        (check-sat)
+        "#,
+    );
+    assert_eq!(
+        result,
+        vec!["unsat"],
+        "singleton arrays are equal, so UF congruence must refute distinct outputs"
+    );
+}
+
+/// The closure equality must retain the original store/base array terms. The
+/// ordinary equality builder rewrites this shape to a select/value equality,
+/// which is equivalent in array theory but does not expose `a = store(...)` to
+/// UF congruence.
+#[test]
+#[timeout(10_000)]
+fn singleton_store_and_base_uf_arguments_are_equal_by_cardinality() {
+    let result = run_smt(
+        r#"
+        (set-logic ALL)
+        (declare-datatype D1 ((c)))
+        (declare-const a (Array Int D1))
+        (declare-fun f ((Array Int D1)) Int)
+        (assert (distinct (f a) (f (store a 0 c))))
+        (check-sat)
+        "#,
+    );
+    assert_eq!(
+        result,
+        vec!["unsat"],
+        "singleton store and base arrays must merge before UF congruence"
+    );
+}
+
+/// The closure is about every provably-singleton sort, not only arrays.
+#[test]
+#[timeout(10_000)]
+fn singleton_scalar_uf_arguments_are_equal_by_cardinality() {
+    let result = run_smt(
+        r#"
+        (set-logic ALL)
+        (declare-datatype D1 ((c)))
+        (declare-const x D1)
+        (declare-const y D1)
+        (declare-fun f (D1) Int)
+        (assert (distinct (f x) (f y)))
+        (check-sat)
+        "#,
+    );
+    assert_eq!(result, vec!["unsat"]);
+}
+
+/// Singleton cardinality composes through nested array element sorts.
+#[test]
+#[timeout(10_000)]
+fn nested_singleton_array_uf_arguments_are_equal_by_cardinality() {
+    let result = run_smt(
+        r#"
+        (set-logic ALL)
+        (declare-datatype D1 ((c)))
+        (declare-const a (Array Int (Array Int D1)))
+        (declare-const b (Array Int (Array Int D1)))
+        (declare-fun f ((Array Int (Array Int D1))) Int)
+        (assert (distinct (f a) (f b)))
+        (check-sat)
+        "#,
+    );
+    assert_ne!(
+        result,
+        vec!["sat"],
+        "nested singleton arrays cannot yield distinct UF outputs"
+    );
+    assert!(
+        result == vec!["unsat"] || result == vec!["unknown"],
+        "unsupported nested-array routes may fail closed, got {result:?}"
+    );
+}
+
+/// A two-constructor element sort makes the array sort non-singleton. This is
+/// the negative control against over-eager UF argument equality.
+#[test]
+#[timeout(10_000)]
+fn nonsingleton_array_uf_arguments_can_remain_distinct() {
+    let result = run_smt(
+        r#"
+        (set-logic ALL)
+        (declare-datatype D2 ((c0) (c1)))
+        (declare-const a (Array Int D2))
+        (declare-const b (Array Int D2))
+        (declare-fun f ((Array Int D2)) Int)
+        (assert (distinct (f a) (f b)))
+        (check-sat)
+        "#,
+    );
+    assert_ne!(
+        result,
+        vec!["unsat"],
+        "cardinality-two arrays must not be over-equated"
+    );
+    assert!(
+        result == vec!["sat"] || result == vec!["unknown"],
+        "the model gate may fail closed on opaque array-valued UF arguments, got {result:?}"
+    );
+}
+
+/// One constructor is insufficient when a field has non-singleton
+/// cardinality; such a datatype and arrays over it must remain unconstrained.
+#[test]
+#[timeout(10_000)]
+fn constructor_with_int_field_is_not_a_singleton() {
+    let result = run_smt(
+        r#"
+        (set-logic ALL)
+        (declare-datatype Box ((mk (value Int))))
+        (declare-const a (Array Int Box))
+        (declare-const b (Array Int Box))
+        (declare-fun f ((Array Int Box)) Int)
+        (assert (distinct (f a) (f b)))
+        (check-sat)
+        "#,
+    );
+    assert_ne!(
+        result,
+        vec!["unsat"],
+        "an Int field makes Box and arrays over Box non-singleton"
+    );
+    assert!(
+        result == vec!["sat"] || result == vec!["unknown"],
+        "the model gate may fail closed on opaque array-valued UF arguments, got {result:?}"
+    );
+}
+
+/// Direct assumption solvers bypass the ordinary check-sat preprocessing, so
+/// they must replay singleton closure over both the base and assumption roots.
+#[test]
+#[timeout(10_000)]
+fn singleton_array_uf_congruence_under_check_sat_assuming() {
+    let result = run_smt(
+        r#"
+        (set-logic ALL)
+        (declare-datatype D1 ((c)))
+        (declare-const a (Array Int D1))
+        (declare-fun f ((Array Int D1)) Int)
+        (declare-const guard Bool)
+        (assert (=> guard (distinct (f a) (f (store a 0 c)))))
+        (check-sat-assuming (guard))
+        "#,
+    );
+    assert_eq!(result, vec!["unsat"]);
+}
+
+/// Named-core mode redirects named assertions through the assumption route.
+/// The verdict must remain UNSAT when the load-bearing singleton terms occur
+/// in that redirected assertion.
+#[test]
+#[timeout(10_000)]
+fn singleton_array_uf_congruence_under_named_core_redirect() {
+    let result = run_smt(
+        r#"
+        (set-logic ALL)
+        (set-option :produce-unsat-cores true)
+        (declare-datatype D1 ((c)))
+        (declare-const a (Array Int D1))
+        (declare-fun f ((Array Int D1)) Int)
+        (assert (! (distinct (f a) (f (store a 0 c))) :named uf_diseq))
+        (check-sat)
+        (get-unsat-core)
+        "#,
+    );
+    assert_eq!(result, vec!["unsat"]);
+}
+
+/// Generated singleton equalities are solve-scoped: repeated checks and
+/// push/pop must not accumulate stale preprocessing assertions.
+#[test]
+#[timeout(10_000)]
+fn singleton_array_uf_closure_is_incrementally_stable() {
+    let result = run_smt(
+        r#"
+        (set-logic ALL)
+        (declare-datatype D1 ((c)))
+        (declare-const a (Array Int D1))
+        (declare-const b (Array Int D1))
+        (declare-fun f ((Array Int D1)) Int)
+        (push 1)
+        (assert (distinct (f a) (f b)))
+        (check-sat)
+        (pop 1)
+        (check-sat)
+        (push 1)
+        (assert (distinct (f a) (f b)))
+        (check-sat)
+        (pop 1)
+        (check-sat)
+        "#,
+    );
+    assert_eq!(result, vec!["unsat", "sat", "unsat", "sat"]);
+}

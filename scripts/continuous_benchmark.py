@@ -53,14 +53,19 @@ except ImportError:
 
 SCHEMA_VERSION = 1
 ISSUE_TITLE = "Continuous 2025–2026 competition benchmark scoreboard"
-STATUS_BRANCH = "continuous/status"
+# Compact remote progress lives outside refs/heads so operational state never
+# masquerades as an integration candidate or requires a permanent topic branch.
+STATUS_REF = "refs/notes/continuous/status"
 MAX_JSON_BYTES = 64 * 1024 * 1024
 MAX_MANIFEST_TEXT_BYTES = 8 * 1024 * 1024
+MAX_TASK_DEFINITION_BYTES = 64 * 1024 * 1024
+MAX_YAML_PATH_SCALAR_BYTES = 16 * 1024
 MAX_SOLVER_BYTES = 1024 * 1024 * 1024
 MAX_CHILD_FILE_BYTES = 10 * 1024 * 1024 * 1024
 DEFAULT_CYCLE_TIMEOUT_SEC = 3 * 60 * 60 + 30 * 60
 _ACTIVE_CHILD_PROCESS_GROUP: int | None = None
 BUILD_SANDBOX_MARKER = "AY_CONTINUOUS_BUILD_SANDBOX"
+BENCH_CORPUS_ROOT_ENV = "AY_BENCH_CORPUS_ROOT"
 CARGO_BUILD_JOBS_ENV = "CARGO_BUILD_JOBS"
 PARENT_LEASE_ENV = "AY_OOM_GUARD_PARENT_LEASE"
 CONTINUOUS_JOBS_ENV = "AY_CONTINUOUS_JOBS"
@@ -120,6 +125,41 @@ INTEGRATION_POLICY_PREFIXES = (
     "reference/",
     "scripts/",
 )
+CAMPAIGN_CHECK_COMMAND = ["{ay}", "bench", "compare", "campaign-check"]
+OFFICIAL_FIELD_PACKET = "continuous-official-field-2025-2026.json"
+AY_SCOREBOARD_PACKET = "continuous-ay-scoreboard.json"
+CANDIDATE_EXACT_CPU_TIME_SOURCE = "sandbox-posix-time-user+sys-v1"
+REFERENCE_EXACT_CPU_TIME_SOURCE = "posix-time-user+sys"
+CHC_COMPETITION_TIMEOUT_SEC = 1800.0
+CHC_COMPETITION_TIMEOUT_MS = str(int(CHC_COMPETITION_TIMEOUT_SEC * 1000))
+FIXED_OFFICIAL_CHC_LANE_ID = (
+    "chccomp-2025-lia-nonlin-arrays-official-shard-0"
+)
+FIXED_OFFICIAL_CHC_EVAL_ID = "chccomp-2025-lia-nonlin-arrays"
+FIXED_OFFICIAL_CHC_SHARD_SIZE = 64
+FIXED_OFFICIAL_CHC_SHARD_INDEX = 0
+FIXED_OFFICIAL_CHC_COMMAND_TIMEOUT_SEC = 12_000
+FIXED_OFFICIAL_CHC_MIN_BENCHMARKS = 1738
+FIXED_OFFICIAL_CHC_SET_PATH = (
+    "benchmarks/chc/chc-comp25-benchmarks/LIA-Arrays.set"
+)
+EXACT_CPU_TIME_SOURCES = frozenset(
+    {
+        CANDIDATE_EXACT_CPU_TIME_SOURCE,
+        REFERENCE_EXACT_CPU_TIME_SOURCE,
+    }
+)
+DEFINITIVE_RESULTS = frozenset(
+    {
+        "sat",
+        "unsat",
+        "safe",
+        "unsafe",
+        "satisfiable",
+        "unsatisfiable",
+        "optimal",
+    }
+)
 
 
 class CampaignError(RuntimeError):
@@ -128,6 +168,30 @@ class CampaignError(RuntimeError):
 
 class CycleInterrupted(BaseException):
     """Non-operational control flow for SIGALRM/SIGTERM cleanup."""
+
+
+def solver_mode_control_or_delimiter(argument: str) -> bool:
+    attached_short = argument.removeprefix("-t")
+    attached_digits = attached_short.removeprefix("+")
+    return (
+        argument == "--"
+        or argument == "--competition"
+        or argument == "--timeout"
+        or argument.startswith("--competition=")
+        or argument.startswith("--timeout=")
+        or argument == "-t"
+        or argument == "-T"
+        or argument.startswith("-t:")
+        or argument.startswith("-T:")
+        or argument.startswith("-t=")
+        or argument.startswith("timeout=")
+        or (
+            attached_short != argument
+            and bool(attached_digits)
+            and attached_digits.isascii()
+            and attached_digits.isdigit()
+        )
+    )
 
 
 def cycle_interrupt_handler(signum: int, _frame: Any) -> None:
@@ -960,10 +1024,9 @@ def sandbox_command(
         "HOME": "/tmp/home",
         "USER": os.environ.get("USER", "ay-continuous"),
         "LOGNAME": os.environ.get("LOGNAME", "ay-continuous"),
-        # The controller tests include live bubblewrap probes. Linux/AppArmor
-        # can forbid creating a second user namespace from inside this
-        # already-contained build namespace, so those probes must defer to the
-        # trusted host-side test run instead of weakening either boundary.
+        # Authenticate the build-only resource environment for nested tooling.
+        # This marker never grants a capability by itself; the outer controller
+        # still owns the host lease and supplies the bounded plan below.
         BUILD_SANDBOX_MARKER: "1",
         "PATH": f"{cargo_home}/bin:{local_bin}:/usr/local/bin:/usr/bin:/bin",
         "CARGO_HOME": str(cargo_home),
@@ -1342,6 +1405,8 @@ FORWARDED_ENV = (
     "AY_SAT_PROFILE_ID",
     "AY_SAT_COMPETITION_PROFILE",
 )
+CPU_TIMING_NONCE_ENV = "AY_BENCH_CPU_TIMING_NONCE"
+CPU_TIMING_PREFIX = "AY_BENCH_CPU_TIME_V1"
 
 
 def fail(message):
@@ -1419,7 +1484,18 @@ if (
 
 arguments = sys.argv[1:]
 version_only = arguments == ["--version"]
+cpu_timing_nonce = os.environ.get(CPU_TIMING_NONCE_ENV)
+if cpu_timing_nonce is not None and (
+    version_only
+    or not 1 <= len(cpu_timing_nonce) <= 128
+    or any(
+        not (character.isascii() and (character.isalnum() or character in "._-"))
+        for character in cpu_timing_nonce
+    )
+):
+    fail("invalid CPU timing nonce")
 proof_path = None
+proof_directory_fd = None
 input_path = None
 rewritten = list(arguments)
 if not version_only:
@@ -1443,10 +1519,27 @@ if not version_only:
             fail("missing proof output argument")
         proof_path = Path(arguments[proof_index + 1])
         require_under_results(proof_path, regular=False)
-        create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        create_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(proof_path, create_flags, 0o600)
-        os.close(descriptor)
+        proof_directory = proof_path.parent
+        proof_directory_metadata = proof_directory.lstat()
+        if proof_directory_metadata.st_uid != os.getuid():
+            fail(f"proof staging directory is not owned by this user: {proof_directory}")
+        if stat.S_IMODE(proof_directory_metadata.st_mode) != 0o700:
+            fail(f"proof staging directory is not private: {proof_directory}")
+        directory_flags = os.O_RDONLY
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        proof_directory_fd = os.open(proof_directory, directory_flags)
+        opened_metadata = os.fstat(proof_directory_fd)
+        if (
+            not stat.S_ISDIR(opened_metadata.st_mode)
+            or (opened_metadata.st_dev, opened_metadata.st_ino)
+            != (proof_directory_metadata.st_dev, proof_directory_metadata.st_ino)
+        ):
+            fail(f"proof staging directory changed while opening: {proof_directory}")
+        if os.listdir(proof_directory_fd):
+            fail(f"proof staging directory is not empty: {proof_directory}")
+        os.set_inheritable(proof_directory_fd, True)
         rewritten[proof_index + 1] = f"/run/ay-proof/{proof_path.name}"
     rewritten[-1] = "/run/ay-input/instance"
 
@@ -1506,9 +1599,9 @@ if not version_only:
             [
                 "--dir",
                 "/run/ay-proof",
-                "--bind",
-                str(proof_path),
-                f"/run/ay-proof/{proof_path.name}",
+                "--bind-fd",
+                str(proof_directory_fd),
+                "/run/ay-proof",
             ]
         )
 command.extend(
@@ -1543,7 +1636,19 @@ for key in FORWARDED_ENV:
         if len(value) > 256:
             fail(f"environment value is too long: {key}")
         command.extend(["--setenv", key, value])
-command.extend(["--", "/solver/ay", *rewritten])
+solver_command = ["/solver/ay", *rewritten]
+if cpu_timing_nonce is not None:
+    # This timer must be inside bubblewrap and immediately around the solver.
+    # Timing the outer bwrap supervisor omits CPU consumed by the sandboxed
+    # child on Linux. The nonce-bound footer gives the trusted Rust harness an
+    # unambiguous record while remaining separate from solver verdict parsing.
+    solver_command = [
+        "/usr/bin/time",
+        "-f",
+        f"{CPU_TIMING_PREFIX} {cpu_timing_nonce} %U %S",
+        *solver_command,
+    ]
+command.extend(["--", *solver_command])
 os.execv(BWRAP, command)
 '''
     return header + body
@@ -1562,6 +1667,37 @@ def create_solver_launcher(
     if bwrap_value is None:
         raise CampaignError("bubblewrap is required for solver containment")
     bwrap = Path(bwrap_value).resolve()
+    time_binary = Path("/usr/bin/time")
+    try:
+        time_metadata = time_binary.lstat()
+    except OSError as error:
+        raise CampaignError(
+            "GNU /usr/bin/time is required for exact sandbox CPU timing"
+        ) from error
+    if (
+        not stat.S_ISREG(time_metadata.st_mode)
+        or time_binary.is_symlink()
+        or not os.access(time_binary, os.X_OK)
+    ):
+        raise CampaignError(
+            "GNU /usr/bin/time must be an executable non-symlink regular file"
+        )
+    try:
+        time_version = subprocess.run(
+            [str(time_binary), "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise CampaignError("cannot probe GNU /usr/bin/time") from error
+    if time_version.returncode != 0 or "GNU Time" not in time_version.stdout:
+        raise CampaignError(
+            "GNU /usr/bin/time is required for nonce-bound sandbox CPU timing"
+        )
     runtime_read_only: list[Path] = []
     z3_library = Path.home() / ".local" / "bin" / "libz3.so"
     if z3_library.is_file():
@@ -1617,19 +1753,58 @@ def trusted_lane_environment(env: dict[str, str], run_dir: Path) -> dict[str, st
 
     trusted_home = run_dir / "trusted-home"
     trusted_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    results_root = Path(env["AY_BENCH_RESULTS_ROOT"])
+    native_tmp = results_root / ".tmp"
+    native_tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
+    native_tmp_metadata = native_tmp.lstat()
+    if (
+        not stat.S_ISDIR(native_tmp_metadata.st_mode)
+        or native_tmp_metadata.st_uid != os.getuid()
+        or stat.S_IMODE(native_tmp_metadata.st_mode) != 0o700
+    ):
+        raise CampaignError(
+            f"trusted native temporary path is not a private owned directory: {native_tmp}"
+        )
     local_bin = Path.home() / ".local" / "bin"
+    path_entries: list[str] = []
+    resolved_z3: Path | None = None
+    if z3_value := env.get("Z3_BIN"):
+        try:
+            resolved_z3 = Path(z3_value).resolve(strict=True)
+        except OSError as error:
+            raise CampaignError(
+                f"cannot resolve trusted Z3 binary {z3_value}: {error}"
+            ) from error
+        if (
+            not resolved_z3.is_file()
+            or resolved_z3.is_symlink()
+            or not os.access(resolved_z3, os.X_OK)
+        ):
+            raise CampaignError(
+                f"trusted Z3 binary is not an executable regular file: {resolved_z3}"
+            )
+        path_entries.append(str(resolved_z3.parent))
+    path_entries.extend((str(local_bin), "/usr/local/bin", "/usr/bin", "/bin"))
     value = {
         "HOME": str(trusted_home),
         "USER": os.environ.get("USER", "ay-continuous"),
         "LOGNAME": os.environ.get("LOGNAME", "ay-continuous"),
-        "PATH": f"{local_bin}:/usr/local/bin:/usr/bin:/bin",
+        "PATH": ":".join(path_entries),
+        # Native runner input snapshots must live below the launcher's private
+        # results root; the candidate boundary rejects ambient /tmp inputs.
+        "TMPDIR": str(native_tmp),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "TZ": "UTC",
+        # The candidate path is a trusted launcher that emits exact CPU usage
+        # from inside bubblewrap. Do not let the native runner accept the
+        # outer bwrap supervisor's near-zero usage as a fallback.
+        "AY_BENCH_REQUIRE_SANDBOX_CPU_TIME_V1": "1",
     }
     for key in (
         "AY_BENCH_RESULTS_ROOT",
         "AY_BENCH_STORE_PATH",
+        BENCH_CORPUS_ROOT_ENV,
         "MEMLIMIT",
         "NBCORE",
         "Z3_BIN",
@@ -1637,6 +1812,12 @@ def trusted_lane_environment(env: dict[str, str], run_dir: Path) -> dict[str, st
     ):
         if key in env:
             value[key] = env[key]
+    if corpus_value := value.get(BENCH_CORPUS_ROOT_ENV):
+        value[BENCH_CORPUS_ROOT_ENV] = str(
+            validate_shared_corpus_root(Path(corpus_value))
+        )
+    if resolved_z3 is not None:
+        value["Z3_BIN"] = str(resolved_z3)
     return value
 
 
@@ -1873,15 +2054,90 @@ def eval_registry_inputs(worktree: Path, eval_id: str) -> dict[str, Any]:
     return inputs
 
 
-def _repo_relative_input(worktree: Path, value: str, label: str) -> Path:
+def _normalized_repo_relative(value: str, label: str) -> Path:
     relative = Path(value)
     if (
         not value
         or relative.is_absolute()
         or any(part in {"", ".", ".."} for part in relative.parts)
+        or any(
+            ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F
+            for character in value
+        )
+        or str(relative) != value
     ):
         raise CampaignError(f"{label} is not a normalized repo-relative path: {value!r}")
-    return worktree / relative
+    return relative
+
+
+def _repo_relative_input(worktree: Path, value: str, label: str) -> Path:
+    return worktree / _normalized_repo_relative(value, label)
+
+
+def validate_shared_corpus_root(root: Path) -> Path:
+    """Validate the trusted persistent checkout used only for corpus payloads."""
+
+    if not root.is_absolute():
+        raise CampaignError(
+            f"{BENCH_CORPUS_ROOT_ENV} must be an absolute repository root: {root}"
+        )
+    try:
+        resolved = root.resolve(strict=True)
+        metadata = root.lstat()
+        cargo_metadata = (root / "Cargo.toml").lstat()
+        benchmarks_metadata = (root / "benchmarks").lstat()
+    except OSError as error:
+        raise CampaignError(
+            f"cannot validate {BENCH_CORPUS_ROOT_ENV} repository root {root}: {error}"
+        ) from error
+    if resolved != root:
+        raise CampaignError(
+            f"{BENCH_CORPUS_ROOT_ENV} must already be canonical: "
+            f"{root} resolves to {resolved}"
+        )
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or not stat.S_ISREG(cargo_metadata.st_mode)
+        or not stat.S_ISDIR(benchmarks_metadata.st_mode)
+    ):
+        raise CampaignError(
+            f"{BENCH_CORPUS_ROOT_ENV} must contain a regular Cargo.toml and "
+            f"non-symlink benchmarks directory: {root}"
+        )
+    return root
+
+
+def _benchmark_input(
+    worktree: Path,
+    corpus_root: Path | None,
+    value: str,
+    label: str,
+) -> Path:
+    relative = _normalized_repo_relative(value, label)
+    if corpus_root is None:
+        return worktree / relative
+    if not relative.parts or relative.parts[0] != "benchmarks":
+        raise CampaignError(
+            f"{label} must remain below benchmarks/ when "
+            f"{BENCH_CORPUS_ROOT_ENV} is set: {value!r}"
+        )
+    return corpus_root / relative
+
+
+def _required_lane_path(
+    worktree: Path,
+    corpus_root: Path | None,
+    value: str,
+) -> Path:
+    relative = _normalized_repo_relative(value, "lane requires_paths entry")
+    candidate = worktree / relative
+    # Candidate-worktree controls win whenever they exist. Ignored downloaded
+    # corpus paths are absent there and fall back to the persistent checkout.
+    if candidate.exists() or candidate.is_symlink():
+        return candidate
+    if corpus_root is not None and relative.parts[0] == "benchmarks":
+        return corpus_root / relative
+    return candidate
 
 
 def _benchmark_file(path: Path, eval_id: str) -> bool:
@@ -1893,18 +2149,217 @@ def _benchmark_file(path: Path, eval_id: str) -> bool:
     return name.endswith((".smt2", ".smt2.gz", ".smt2.bz2", ".smt2.xz"))
 
 
-def eval_corpus_preflight(worktree: Path, eval_id: str) -> tuple[int, list[str]]:
+def _yaml_value_without_comment(raw: str) -> str:
+    """Strip a YAML comment marker only when it is outside a quoted scalar."""
+
+    value = raw.strip()
+    quote: str | None = None
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if quote == '"' and character == "\\":
+            index += 2
+            continue
+        if (
+            quote == "'"
+            and character == "'"
+            and index + 1 < len(value)
+            and value[index + 1] == "'"
+        ):
+            index += 2
+            continue
+        if quote is not None and character == quote:
+            quote = None
+        elif quote is None and character in {'"', "'"}:
+            quote = character
+        elif (
+            quote is None
+            and character == "#"
+            and (index == 0 or value[index - 1].isspace())
+        ):
+            return value[:index].strip()
+        index += 1
+    return value
+
+
+def _task_definition_scalar(raw: str, path: Path, line_number: int) -> str:
+    """Parse the same narrow YAML string-scalar subset as the native runner."""
+
+    if len(raw.encode("utf-8")) > MAX_YAML_PATH_SCALAR_BYTES + 2:
+        raise CampaignError(
+            f"set_file task definition {path}:{line_number}: input_files "
+            f"exceeds the {MAX_YAML_PATH_SCALAR_BYTES}-byte scalar limit"
+        )
+    rendered = _yaml_value_without_comment(raw)
+    quoted = rendered.startswith(('"', "'"))
+    if rendered.startswith('"'):
+        body = rendered[1:]
+        if "\\" in body:
+            raise CampaignError(
+                f"set_file task definition {path}:{line_number}: input_files "
+                "uses an unsupported double-quoted YAML escape"
+            )
+        close = body.find('"')
+        if close < 0:
+            raise CampaignError(
+                f"set_file task definition {path}:{line_number}: input_files "
+                "has an unterminated double-quoted scalar"
+            )
+        if body[close + 1 :].strip():
+            raise CampaignError(
+                f"set_file task definition {path}:{line_number}: input_files "
+                "has content after its quoted scalar"
+            )
+        value = body[:close]
+    elif rendered.startswith("'"):
+        body = rendered[1:]
+        segments: list[str] = []
+        segment_start = 0
+        index = 0
+        while index < len(body):
+            if body[index] != "'":
+                index += 1
+                continue
+            segments.append(body[segment_start:index])
+            if index + 1 < len(body) and body[index + 1] == "'":
+                segments.append("'")
+                index += 2
+                segment_start = index
+                continue
+            if body[index + 1 :].strip():
+                raise CampaignError(
+                    f"set_file task definition {path}:{line_number}: "
+                    "input_files has content after its quoted scalar"
+                )
+            value = "".join(segments)
+            break
+        else:
+            raise CampaignError(
+                f"set_file task definition {path}:{line_number}: input_files "
+                "has an unterminated single-quoted scalar"
+            )
+    else:
+        value = rendered
+
+    reserved_plain = (
+        value == "~"
+        or value.lower() == "null"
+        or (value and value[0] in ">|[{&*!@`")
+    )
+    if (
+        not value
+        or len(value.encode("utf-8")) > MAX_YAML_PATH_SCALAR_BYTES
+        or (not quoted and reserved_plain)
+    ):
+        raise CampaignError(
+            f"set_file task definition {path}:{line_number}: input_files must "
+            "be a non-empty, well-formed scalar of at most "
+            f"{MAX_YAML_PATH_SCALAR_BYTES} bytes"
+        )
+    return value
+
+
+def _resolve_set_benchmark_entry(
+    benchmarks_dir: Path,
+    entry: str,
+    *,
+    eval_id: str,
+) -> Path:
+    # Organizer-generated CHC-COMP sets use one harmless "./" prefix. Strip
+    # only that exact prefix so repeated or other non-normal components still
+    # fail in the shared normalized-path validator.
+    normalized_entry = entry[2:] if entry.startswith("./") else entry
+    relative = _normalized_repo_relative(
+        normalized_entry,
+        f"eval {eval_id} set entry",
+    )
+    declared = benchmarks_dir / relative
+    if declared.suffix not in {".yml", ".yaml"}:
+        return declared
+
+    try:
+        metadata = declared.lstat()
+    except OSError as error:
+        raise CampaignError(
+            f"set_file task definition {declared} cannot be inspected: {error}"
+        ) from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise CampaignError(
+            "set_file task definition must be a regular non-symlink file: "
+            f"{declared}"
+        )
+    try:
+        text = read_bounded_regular_text(
+            declared,
+            max_bytes=MAX_TASK_DEFINITION_BYTES,
+        )
+    except CampaignError as error:
+        raise CampaignError(
+            f"cannot read set_file task definition {declared}: {error}"
+        ) from error
+
+    input_file: str | None = None
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        if ":" not in raw_line.lstrip():
+            continue
+        raw_key, raw_value = raw_line.lstrip().split(":", 1)
+        if raw_key.strip() != "input_files":
+            continue
+        if input_file is not None:
+            raise CampaignError(
+                f"set_file task definition {declared} repeats input_files"
+            )
+        value = _task_definition_scalar(raw_value, declared, line_number)
+        if value.startswith(("[", "{")):
+            raise CampaignError(
+                f"set_file task definition {declared} must declare exactly "
+                "one scalar input_files path"
+            )
+        input_file = value
+
+    if input_file is None:
+        raise CampaignError(
+            f"set_file task definition {declared} has no scalar input_files path"
+        )
+    input_relative = _normalized_repo_relative(
+        input_file,
+        "task-definition input_files path",
+    )
+    return declared.parent / input_relative
+
+
+def eval_corpus_preflight(
+    worktree: Path,
+    eval_id: str,
+    *,
+    corpus_root: Path | None = None,
+) -> tuple[int, list[str]]:
+    if corpus_root is not None:
+        corpus_root = validate_shared_corpus_root(corpus_root)
     inputs = eval_registry_inputs(worktree, eval_id)
     benchmarks_dir_value = str(inputs.get("benchmarks_dir", "")).strip()
     if benchmarks_dir_value:
-        benchmarks_dir = _repo_relative_input(
+        candidate_benchmarks_dir = _repo_relative_input(
             worktree,
+            benchmarks_dir_value.rstrip("/"),
+            f"eval {eval_id} benchmarks_dir",
+        )
+        benchmarks_dir = _benchmark_input(
+            worktree,
+            corpus_root,
             benchmarks_dir_value.rstrip("/"),
             f"eval {eval_id} benchmarks_dir",
         )
     else:
         domain = "sat" if eval_id.startswith("sat") else "smt"
-        benchmarks_dir = worktree / "benchmarks" / domain
+        relative_default = f"benchmarks/{domain}"
+        candidate_benchmarks_dir = worktree / "benchmarks" / domain
+        benchmarks_dir = _benchmark_input(
+            worktree,
+            corpus_root,
+            relative_default,
+            f"eval {eval_id} inferred benchmarks_dir",
+        )
 
     errors: list[str] = []
     paths: list[Path] = []
@@ -1924,45 +2379,46 @@ def eval_corpus_preflight(worktree: Path, eval_id: str) -> tuple[int, list[str]]
                 if not stripped or stripped.startswith("#"):
                     continue
                 value = stripped.split()[0]
-                path = _repo_relative_input(
+                path = _benchmark_input(
                     worktree,
+                    corpus_root,
                     value,
                     f"eval {eval_id} list entry",
                 )
                 paths.append(path)
         elif set_file:
-            set_relative = Path(set_file)
-            if set_relative.is_absolute() or ".." in set_relative.parts:
-                raise CampaignError(
-                    f"eval {eval_id} set_file is not relative: {set_file!r}"
-                )
-            manifest = benchmarks_dir / set_relative
+            set_relative = _normalized_repo_relative(
+                set_file,
+                f"eval {eval_id} set_file",
+            )
+            candidate_manifest = candidate_benchmarks_dir / set_relative
+            manifest = (
+                candidate_manifest
+                if candidate_manifest.is_file()
+                and not candidate_manifest.is_symlink()
+                else benchmarks_dir / set_relative
+            )
             text = read_bounded_regular_text(manifest)
             for raw in text.splitlines():
                 stripped = raw.strip()
                 if not stripped or stripped.startswith("#"):
                     continue
-                value = (
-                    stripped[:-4] + ".smt2"
-                    if stripped.endswith(".yml")
-                    else stripped
-                )
-                relative = Path(value)
-                if relative.is_absolute() or ".." in relative.parts:
-                    raise CampaignError(
-                        f"eval {eval_id} set entry is not relative: {value!r}"
+                paths.append(
+                    _resolve_set_benchmark_entry(
+                        benchmarks_dir,
+                        stripped,
+                        eval_id=eval_id,
                     )
-                paths.append(benchmarks_dir / relative)
+                )
         else:
             roots = [benchmarks_dir]
             if isinstance(suite_dirs, list) and suite_dirs:
                 roots = []
                 for value in suite_dirs:
-                    relative = Path(str(value))
-                    if relative.is_absolute() or ".." in relative.parts:
-                        raise CampaignError(
-                            f"eval {eval_id} suite directory is not relative: {value!r}"
-                        )
+                    relative = _normalized_repo_relative(
+                        str(value),
+                        f"eval {eval_id} suite directory",
+                    )
                     roots.append(benchmarks_dir / relative)
             for root in roots:
                 if not root.is_dir() or root.is_symlink():
@@ -2043,25 +2499,48 @@ def eval_corpus_preflight(worktree: Path, eval_id: str) -> tuple[int, list[str]]
     return len(canonical), errors
 
 
-def lane_blocker(lane: dict[str, Any], worktree: Path) -> str | None:
+def lane_blocker(
+    lane: dict[str, Any],
+    worktree: Path,
+    *,
+    corpus_root: Path | None = None,
+) -> str | None:
     if not lane.get("enabled", True):
         return lane.get("blocked_reason", "lane is disabled")
-    if lane.get("kind") == "official" or lane.get("official") is True:
+    if (
+        lane.get("kind") == "official" or lane.get("official") is True
+    ) and not is_fixed_official_chc_lane(lane):
         return (
             "verified official replay is not implemented: `bench compare` must "
-            "verify run class, host, corpus, checker, and reference packet"
+            "verify run class, host, corpus, checker, and reference packet; only "
+            "the exact bounded CHC competition-mode lane is admitted"
         )
-    missing_paths = [
-        value
-        for value in lane.get("requires_paths", [])
-        if not (worktree / value).exists()
-    ]
+    try:
+        if corpus_root is not None:
+            corpus_root = validate_shared_corpus_root(corpus_root)
+        missing_paths = [
+            value
+            for value in lane.get("requires_paths", [])
+            if (
+                not (
+                    required := _required_lane_path(
+                        worktree,
+                        corpus_root,
+                        value,
+                    )
+                ).exists()
+                or required.is_symlink()
+            )
+        ]
+    except CampaignError as error:
+        return str(error)
     if missing_paths:
         return "missing path(s): " + ", ".join(missing_paths)
     try:
         benchmark_count, corpus_errors = eval_corpus_preflight(
             worktree,
             str(lane["eval_id"]),
+            corpus_root=corpus_root,
         )
     except CampaignError as error:
         return str(error)
@@ -2081,6 +2560,37 @@ def lane_blocker(lane: dict[str, Any], worktree: Path) -> str | None:
     return None
 
 
+def is_fixed_official_chc_lane(lane: dict[str, Any]) -> bool:
+    command_timeout = lane.get("command_timeout_sec")
+    runs = lane.get("runs")
+    shard_index = lane.get("shard_index")
+    shard_size = lane.get("shard_size")
+    return (
+        lane.get("id") == FIXED_OFFICIAL_CHC_LANE_ID
+        and lane.get("kind") == "official"
+        and lane.get("eval_id") == FIXED_OFFICIAL_CHC_EVAL_ID
+        and lane.get("official") is True
+        and lane.get("enabled", True) is True
+        and isinstance(runs, int)
+        and not isinstance(runs, bool)
+        and runs == 1
+        and isinstance(shard_index, int)
+        and not isinstance(shard_index, bool)
+        and shard_index == FIXED_OFFICIAL_CHC_SHARD_INDEX
+        and isinstance(shard_size, int)
+        and not isinstance(shard_size, bool)
+        and shard_size == FIXED_OFFICIAL_CHC_SHARD_SIZE
+        and "timeout_sec" not in lane
+        and isinstance(command_timeout, int)
+        and not isinstance(command_timeout, bool)
+        and command_timeout == FIXED_OFFICIAL_CHC_COMMAND_TIMEOUT_SEC
+        and lane.get("min_benchmarks") == FIXED_OFFICIAL_CHC_MIN_BENCHMARKS
+        and lane.get("requires_tools") == ["z3"]
+        and lane.get("requires_paths") == [FIXED_OFFICIAL_CHC_SET_PATH]
+        and lane.get("competition_refs") == [FIXED_OFFICIAL_CHC_EVAL_ID]
+    )
+
+
 def select_lanes(
     manifest: dict[str, Any],
     state: dict[str, Any],
@@ -2088,6 +2598,7 @@ def select_lanes(
     *,
     smoke_only: bool,
     include_official: bool,
+    corpus_root: Path | None = None,
 ) -> tuple[list[dict[str, Any]], list[LaneOutcome], int, int]:
     lanes = manifest.get("lane", [])
     canaries = [lane for lane in lanes if lane.get("kind") == "canary"]
@@ -2101,7 +2612,11 @@ def select_lanes(
         for offset in range(len(rolling)):
             index = (cursor + offset) % len(rolling)
             lane = rolling[index]
-            blocker = lane_blocker(lane, worktree)
+            blocker = lane_blocker(
+                lane,
+                worktree,
+                corpus_root=corpus_root,
+            )
             next_cursor = (index + 1) % len(rolling)
             if blocker is None:
                 selected_lane = dict(lane)
@@ -2139,9 +2654,18 @@ def select_lanes(
                 index = (cursor + offset) % len(official)
                 lane = official[index]
                 next_official_cursor = (index + 1) % len(official)
-                blocker = lane_blocker(lane, worktree)
+                blocker = lane_blocker(
+                    lane,
+                    worktree,
+                    corpus_root=corpus_root,
+                )
                 if blocker is None:
-                    selected.append(lane)
+                    selected_lane = dict(lane)
+                    if is_fixed_official_chc_lane(selected_lane):
+                        selected_lane["_shard_index"] = int(
+                            selected_lane["shard_index"]
+                        )
+                    selected.append(selected_lane)
                     break
                 blocked.append(
                     LaneOutcome(
@@ -2189,12 +2713,572 @@ def valid_sha256(value: Any) -> bool:
     )
 
 
+def exact_cpu_timing_row(
+    row: dict[str, Any],
+    *,
+    expected_source: str,
+) -> bool:
+    return (
+        expected_source in EXACT_CPU_TIME_SOURCES
+        and row.get("cpu_time_source") == expected_source
+        and finite_nonnegative_number(row.get("cpu_time_sec"))
+    )
+
+
+def finite_nonnegative_number(value: Any) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        numeric = float(value)
+    except (OverflowError, ValueError):
+        return False
+    return math.isfinite(numeric) and numeric >= 0
+
+
+def same_evidence_number(left: Any, right: Any) -> bool:
+    return (
+        finite_nonnegative_number(left)
+        and finite_nonnegative_number(right)
+        and math.isclose(float(left), float(right), rel_tol=0.0, abs_tol=1e-9)
+    )
+
+
+def native_reference_agreement(ay_result: str, reference_result: str) -> str:
+    ay_definitive = ay_result in {"sat", "unsat"}
+    reference_definitive = reference_result in {"sat", "unsat"}
+    if ay_definitive and reference_definitive:
+        return "agree" if ay_result == reference_result else "disagree"
+    if ay_definitive:
+        return "ay_only"
+    if reference_definitive:
+        return "ref_only"
+    return "both_unknown"
+
+
+def round_nonnegative_6(value: float) -> float:
+    # Rust's f64::round rounds halfway cases away from zero. CPU and wall
+    # aggregates are non-negative, so floor(x + 0.5) reproduces it exactly.
+    if not math.isfinite(value):
+        return value
+    scaled = value * 1_000_000.0
+    if not math.isfinite(scaled):
+        return value
+    return math.floor(scaled + 0.5) / 1_000_000.0
+
+
+def native_score_evidence(
+    items: list[Any],
+    *,
+    domain: Any,
+    timeout_sec: Any,
+) -> tuple[dict[str, int | float] | None, list[str]]:
+    """Recompute promoted score fields from the native per-instance rows."""
+
+    if domain not in {"sat", "smt", "chc"}:
+        return None, [f"cannot reconstruct native score for domain {domain!r}"]
+    if domain == "smt" and (
+        not finite_nonnegative_number(timeout_sec) or float(timeout_sec) <= 0
+    ):
+        return None, ["cannot reconstruct SMT score without a positive timeout"]
+
+    errors: list[str] = []
+    solved = 0
+    solved_sat = 0
+    solved_unsat = 0
+    cpu_time = 0.0
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            # The outer native-evidence validator reports malformed rows.
+            continue
+        actual_value = item.get("result")
+        if not isinstance(actual_value, str):
+            errors.append(
+                f"native scoring row {index} lacks a string result identity"
+            )
+            continue
+        actual = actual_value.lower()
+        if actual not in {"sat", "unsat"}:
+            continue
+
+        expected_value = item.get("expected")
+        if expected_value is not None and not isinstance(expected_value, str):
+            errors.append(
+                f"native scoring row {index} has a malformed expected result"
+            )
+            continue
+        if (
+            isinstance(expected_value, str)
+            and expected_value.lower() != actual
+        ):
+            # The Rust scorers exclude wrong answers from solved/CPU totals.
+            continue
+
+        item_cpu = 0.0
+        if domain in {"smt", "chc"}:
+            cpu_value = item.get("cpu_time_sec")
+            if not finite_nonnegative_number(cpu_value):
+                errors.append(
+                    f"native scoring row {index} has an invalid CPU time"
+                )
+                continue
+            item_cpu = float(cpu_value)
+            # SMT-COMP sequential scoring discards an otherwise definitive
+            # result when CPU time exceeds the timeout.
+            if domain == "smt" and item_cpu > float(timeout_sec):
+                continue
+
+        solved += 1
+        if actual == "sat":
+            solved_sat += 1
+        else:
+            solved_unsat += 1
+        cpu_time += item_cpu
+
+    evidence: dict[str, int | float] = {
+        "solved": solved,
+        "solved_sat": solved_sat,
+        "solved_unsat": solved_unsat,
+    }
+    if domain in {"smt", "chc"}:
+        scaled_cpu = cpu_time * 1_000.0
+        if not math.isfinite(cpu_time) or not math.isfinite(scaled_cpu):
+            errors.append("native scoring CPU total is not finite")
+        else:
+            # Rust's score serializer rounds non-negative CPU totals to 3 places.
+            evidence["cpu_time"] = math.floor(scaled_cpu + 0.5) / 1_000.0
+    return evidence, errors
+
+
+def native_reference_comparison_evidence(
+    items: list[Any],
+    reference_comparisons: list[Any],
+    references: Any,
+    *,
+    expected_runs: Any,
+) -> tuple[set[str], set[str], int | None, list[str]]:
+    """Recompute reference identities and summaries from per-run evidence.
+
+    The native runner copies candidate fields into every comparison row and
+    selects the lower wall-time median reference run. Treat those copies and
+    summaries as checksums, not independent assertions: reconstruct them from
+    the candidate item plus nested reference runs and reject any mismatch.
+    """
+
+    errors: list[str] = []
+    if not reference_comparisons and not isinstance(references, list):
+        return set(), set(), None, errors
+
+    candidate_by_file: dict[str, dict[str, Any]] = {}
+    ambiguous_candidate_files: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        file_name = item.get("file")
+        if not isinstance(file_name, str) or not file_name:
+            continue
+        if file_name in candidate_by_file:
+            ambiguous_candidate_files.add(file_name)
+            continue
+        candidate_by_file[file_name] = item
+    for file_name in sorted(ambiguous_candidate_files):
+        candidate_by_file.pop(file_name, None)
+        errors.append(
+            f"candidate benchmark identity {file_name!r} occurs more than once"
+        )
+
+    summary_by_name: dict[str, dict[str, Any]] = {}
+    duplicate_summary_names: set[str] = set()
+    if isinstance(references, list):
+        for summary in references:
+            if not isinstance(summary, dict):
+                continue
+            name = summary.get("reference_solver")
+            if not isinstance(name, str) or not name:
+                continue
+            if name in summary_by_name:
+                duplicate_summary_names.add(name)
+                continue
+            summary_by_name[name] = summary
+    for name in sorted(duplicate_summary_names):
+        summary_by_name.pop(name, None)
+        errors.append(f"reference summary {name!r} occurs more than once")
+
+    validated_agree_files: set[str] = set()
+    agreeing_reference_names: set[str] = set()
+    comparison_names: set[str] = set()
+    duplicate_comparison_names: set[str] = set()
+    computed_disagreements = 0
+    saw_valid_comparison_block = False
+
+    integer_summary_fields = (
+        "agree",
+        "disagree",
+        "ay_only",
+        "ref_only",
+        "both_solved",
+        "ay_faster",
+        "ref_faster",
+        "cpu_comparable",
+        "ay_cpu_faster",
+        "ref_cpu_faster",
+    )
+    numeric_summary_fields = (
+        "ay_total_time",
+        "ref_total_time",
+        "ay_total_cpu_time",
+        "ref_total_cpu_time",
+    )
+
+    for reference in reference_comparisons:
+        if not isinstance(reference, dict):
+            continue
+        reference_name = reference.get("reference_solver")
+        comparisons = reference.get("items")
+        if (
+            not isinstance(reference_name, str)
+            or not reference_name
+            or not isinstance(comparisons, list)
+        ):
+            continue
+        if reference_name in comparison_names:
+            duplicate_comparison_names.add(reference_name)
+            continue
+        comparison_names.add(reference_name)
+        saw_valid_comparison_block = True
+
+        aggregate: dict[str, int | float] = {
+            field: 0 for field in integer_summary_fields
+        }
+        aggregate.update({field: 0.0 for field in numeric_summary_fields})
+        seen_files: set[str] = set()
+
+        for comparison_index, comparison in enumerate(comparisons):
+            prefix = (
+                f"reference comparison {reference_name!r} item "
+                f"{comparison_index}"
+            )
+            if not isinstance(comparison, dict):
+                continue
+            file_name = comparison.get("file")
+            if not isinstance(file_name, str) or not file_name:
+                errors.append(f"{prefix} lacks a benchmark file identity")
+                continue
+            if file_name in seen_files:
+                errors.append(
+                    f"reference comparison {reference_name!r} repeats "
+                    f"benchmark {file_name!r}"
+                )
+                continue
+            seen_files.add(file_name)
+            candidate = candidate_by_file.get(file_name)
+            if candidate is None:
+                errors.append(
+                    f"{prefix} does not identify exactly one candidate item"
+                )
+                continue
+
+            row_valid = True
+            candidate_hash = candidate.get("solver_input_hash")
+            comparison_hash = comparison.get("solver_input_hash")
+            if not valid_sha256(candidate_hash):
+                errors.append(
+                    f"candidate item {file_name!r} lacks a valid solver input hash"
+                )
+                row_valid = False
+            if comparison_hash != candidate_hash:
+                errors.append(
+                    f"{prefix} solver input hash does not match the candidate item"
+                )
+                row_valid = False
+
+            candidate_result = candidate.get("result")
+            if not isinstance(candidate_result, str) or not candidate_result:
+                errors.append(
+                    f"candidate item {file_name!r} lacks a result identity"
+                )
+                row_valid = False
+                candidate_result = ""
+            if comparison.get("ay_result") != candidate_result:
+                errors.append(
+                    f"{prefix} AY result does not match the candidate item"
+                )
+                row_valid = False
+            candidate_time = candidate.get("time_sec")
+            candidate_wall_valid = finite_nonnegative_number(candidate_time)
+            if not candidate_wall_valid:
+                errors.append(
+                    f"candidate item {file_name!r} has an invalid wall time"
+                )
+                row_valid = False
+            if not same_evidence_number(
+                comparison.get("ay_time_sec"),
+                candidate_time,
+            ):
+                errors.append(
+                    f"{prefix} AY wall time does not match the candidate item"
+                )
+                row_valid = False
+            candidate_cpu_time = candidate.get("cpu_time_sec")
+            if not finite_nonnegative_number(candidate_cpu_time):
+                errors.append(
+                    f"candidate item {file_name!r} has an invalid CPU time"
+                )
+                row_valid = False
+            if not same_evidence_number(
+                comparison.get("ay_cpu_time_sec"),
+                candidate_cpu_time,
+            ):
+                errors.append(
+                    f"{prefix} AY CPU time does not match the candidate item"
+                )
+                row_valid = False
+            candidate_cpu_source = candidate.get("cpu_time_source")
+            if comparison.get("ay_cpu_time_source") != candidate_cpu_source:
+                errors.append(
+                    f"{prefix} AY CPU source does not match the candidate item"
+                )
+                row_valid = False
+            if (
+                candidate_result in {"sat", "unsat"}
+                and not exact_cpu_timing_row(
+                    candidate,
+                    expected_source=CANDIDATE_EXACT_CPU_TIME_SOURCE,
+                )
+            ):
+                row_valid = False
+
+            reference_runs = comparison.get("reference_runs")
+            if not isinstance(reference_runs, list) or not reference_runs:
+                continue
+            if (
+                isinstance(expected_runs, int)
+                and not isinstance(expected_runs, bool)
+                and expected_runs > 0
+                and len(reference_runs) != expected_runs
+            ):
+                errors.append(
+                    f"{prefix} has {len(reference_runs)} reference run(s), "
+                    f"expected {expected_runs}"
+                )
+                row_valid = False
+
+            valid_runs: list[dict[str, Any]] = []
+            for run_index, reference_run in enumerate(reference_runs):
+                run_prefix = f"{prefix} reference run {run_index}"
+                if not isinstance(reference_run, dict):
+                    row_valid = False
+                    continue
+                run_result = reference_run.get("result")
+                run_time = reference_run.get("time_sec")
+                run_cpu_time = reference_run.get("cpu_time_sec")
+                run_cpu_source = reference_run.get("cpu_time_source")
+                if not isinstance(run_result, str) or not run_result:
+                    errors.append(f"{run_prefix} lacks a result identity")
+                    row_valid = False
+                if not finite_nonnegative_number(run_time):
+                    errors.append(f"{run_prefix} has an invalid wall time")
+                    row_valid = False
+                if not finite_nonnegative_number(run_cpu_time):
+                    errors.append(f"{run_prefix} has an invalid CPU time")
+                    row_valid = False
+                if not isinstance(run_cpu_source, str) or not run_cpu_source:
+                    errors.append(f"{run_prefix} lacks a CPU timing source")
+                    row_valid = False
+                if reference_run.get("solver_input_hash") != comparison_hash:
+                    errors.append(
+                        f"{run_prefix} solver input hash does not match "
+                        "the comparison row"
+                    )
+                    row_valid = False
+                if (
+                    run_result in {"sat", "unsat"}
+                    and not exact_cpu_timing_row(
+                        reference_run,
+                        expected_source=REFERENCE_EXACT_CPU_TIME_SOURCE,
+                    )
+                ):
+                    row_valid = False
+                if (
+                    isinstance(run_result, str)
+                    and run_result
+                    and finite_nonnegative_number(run_time)
+                    and finite_nonnegative_number(run_cpu_time)
+                    and isinstance(run_cpu_source, str)
+                    and run_cpu_source
+                ):
+                    valid_runs.append(reference_run)
+
+            if len(valid_runs) != len(reference_runs):
+                continue
+            consistent_runs = all(
+                run["result"] == valid_runs[0]["result"] for run in valid_runs
+            )
+            if not consistent_runs:
+                errors.append(f"{prefix} has inconsistent reference run results")
+                row_valid = False
+            representative = sorted(
+                valid_runs,
+                key=lambda run: float(run["time_sec"]),
+            )[(len(valid_runs) - 1) // 2]
+            representative_result = (
+                representative["result"] if consistent_runs else "error"
+            )
+            if comparison.get("ref_result") != representative_result:
+                errors.append(
+                    f"{prefix} reference result does not match its repeated runs"
+                )
+                row_valid = False
+            if not same_evidence_number(
+                comparison.get("ref_time_sec"),
+                representative.get("time_sec"),
+            ):
+                errors.append(
+                    f"{prefix} reference wall time does not match its "
+                    "wall-median run"
+                )
+                row_valid = False
+            if not same_evidence_number(
+                comparison.get("ref_cpu_time_sec"),
+                representative.get("cpu_time_sec"),
+            ):
+                errors.append(
+                    f"{prefix} reference CPU time does not match its "
+                    "wall-median run"
+                )
+                row_valid = False
+            if (
+                comparison.get("ref_cpu_time_source")
+                != representative.get("cpu_time_source")
+            ):
+                errors.append(
+                    f"{prefix} reference CPU source does not match its "
+                    "wall-median run"
+                )
+                row_valid = False
+
+            expected_agreement = native_reference_agreement(
+                candidate_result,
+                representative_result,
+            )
+            if comparison.get("agreement") != expected_agreement:
+                errors.append(
+                    f"{prefix} agreement does not match AY/reference results"
+                )
+                row_valid = False
+
+            if expected_agreement == "agree":
+                aggregate["agree"] += 1
+                aggregate["both_solved"] += 1
+                if candidate_wall_valid:
+                    aggregate["ay_total_time"] += float(candidate_time)
+                    aggregate["ref_total_time"] += float(
+                        representative["time_sec"]
+                    )
+                    if float(candidate_time) < float(
+                        representative["time_sec"]
+                    ):
+                        aggregate["ay_faster"] += 1
+                    elif float(candidate_time) > float(
+                        representative["time_sec"]
+                    ):
+                        aggregate["ref_faster"] += 1
+                if exact_cpu_timing_row(
+                    candidate,
+                    expected_source=CANDIDATE_EXACT_CPU_TIME_SOURCE,
+                ) and exact_cpu_timing_row(
+                    representative,
+                    expected_source=REFERENCE_EXACT_CPU_TIME_SOURCE,
+                ):
+                    aggregate["cpu_comparable"] += 1
+                    aggregate["ay_total_cpu_time"] += float(candidate_cpu_time)
+                    aggregate["ref_total_cpu_time"] += float(
+                        representative["cpu_time_sec"]
+                    )
+                    if float(candidate_cpu_time) < float(
+                        representative["cpu_time_sec"]
+                    ):
+                        aggregate["ay_cpu_faster"] += 1
+                    elif float(candidate_cpu_time) > float(
+                        representative["cpu_time_sec"]
+                    ):
+                        aggregate["ref_cpu_faster"] += 1
+            elif expected_agreement == "disagree":
+                aggregate["disagree"] += 1
+                computed_disagreements += 1
+            elif expected_agreement == "ay_only":
+                aggregate["ay_only"] += 1
+            elif expected_agreement == "ref_only":
+                aggregate["ref_only"] += 1
+
+            if row_valid and expected_agreement == "agree":
+                validated_agree_files.add(file_name)
+                agreeing_reference_names.add(reference_name)
+
+        missing_files = sorted(set(candidate_by_file) - seen_files)
+        if missing_files:
+            errors.append(
+                f"reference comparison {reference_name!r} lacks "
+                f"{len(missing_files)} candidate benchmark row(s)"
+            )
+
+        summary = summary_by_name.get(reference_name)
+        if summary is None:
+            errors.append(
+                f"reference comparison {reference_name!r} lacks a matching summary"
+            )
+            continue
+        for field in integer_summary_fields:
+            observed = summary.get(field)
+            expected = aggregate[field]
+            if (
+                isinstance(observed, int)
+                and not isinstance(observed, bool)
+                and observed >= 0
+                and observed != expected
+            ):
+                errors.append(
+                    f"reference summary {reference_name!r} {field}={observed} "
+                    f"does not match recomputed {expected}"
+                )
+        for field in numeric_summary_fields:
+            observed = summary.get(field)
+            expected = round_nonnegative_6(float(aggregate[field]))
+            if (
+                finite_nonnegative_number(observed)
+                and not math.isclose(
+                    float(observed),
+                    expected,
+                    rel_tol=0.0,
+                    abs_tol=1e-9,
+                )
+            ):
+                errors.append(
+                    f"reference summary {reference_name!r} {field}={observed} "
+                    f"does not match recomputed {expected}"
+                )
+
+    for name in sorted(duplicate_comparison_names):
+        errors.append(f"reference comparison {name!r} occurs more than once")
+    for name in sorted(summary_by_name.keys() - comparison_names):
+        errors.append(f"reference summary {name!r} lacks per-benchmark comparisons")
+
+    return (
+        validated_agree_files,
+        agreeing_reference_names,
+        computed_disagreements if saw_valid_comparison_block else None,
+        errors,
+    )
+
+
 def native_evidence_summary(
     payload: Any,
     *,
     expected_commit: str | None = None,
     expected_runs: int | None = None,
     expected_timeout_sec: float | None = None,
+    expected_corpus_root: Path | None = None,
+    expected_official: bool | None = None,
+    expected_domain: str | None = None,
 ) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
         return None
@@ -2205,9 +3289,10 @@ def native_evidence_summary(
         return None
     environment = environment if isinstance(environment, dict) else {}
 
-    reference_agree: set[str] = set()
-    agreeing_reference_names: set[str] = set()
     malformed_reference_comparison_rows = 0
+    inexact_reference_cpu_rows = 0
+    reference_harness_error_rows = 0
+    explicit_reference_error_rows = 0
     raw_reference_comparisons = payload.get("reference_comparisons")
     if raw_reference_comparisons is None:
         reference_comparisons: list[Any] = []
@@ -2230,36 +3315,57 @@ def native_evidence_summary(
             malformed_reference_comparison_rows += 1
             continue
         for comparison in comparisons:
-            if (
-                isinstance(comparison, dict)
-                and comparison.get("agreement") == "agree"
-                and isinstance(comparison.get("file"), str)
-                and comparison["file"]
-            ):
-                reference_agree.add(comparison["file"])
-                agreeing_reference_names.add(reference_name)
-            elif not isinstance(comparison, dict):
+            if not isinstance(comparison, dict):
                 malformed_reference_comparison_rows += 1
+                continue
+            reference_runs = comparison.get("reference_runs")
+            if not isinstance(reference_runs, list) or not reference_runs:
+                malformed_reference_comparison_rows += 1
+                continue
+            for reference_run in reference_runs:
+                if not isinstance(reference_run, dict):
+                    malformed_reference_comparison_rows += 1
+                    continue
+                reference_result = str(
+                    reference_run.get("result", "")
+                ).lower()
+                if reference_result == "error":
+                    explicit_reference_error_rows += 1
+                if reference_run.get("harness_error") not in (None, ""):
+                    reference_harness_error_rows += 1
+                if (
+                    reference_result in DEFINITIVE_RESULTS
+                    and not exact_cpu_timing_row(
+                        reference_run,
+                        expected_source=REFERENCE_EXACT_CPU_TIME_SOURCE,
+                    )
+                ):
+                    inexact_reference_cpu_rows += 1
 
     corpus_rows: list[tuple[str, str]] = []
     expected_sources: dict[str, int] = {}
     proof_validation: dict[str, int] = {}
     result_counts: dict[str, int] = {}
-    unverified_definitive = 0
+    candidate_solver_invocations: list[dict[str, Any]] = []
     incomplete_corpus_rows = 0
     malformed_item_rows = 0
     harness_error_rows = 0
     explicit_error_rows = 0
-    definitive_results = {
-        "sat",
-        "unsat",
-        "safe",
-        "unsafe",
-        "satisfiable",
-        "unsatisfiable",
-        "optimal",
-    }
+    inexact_candidate_cpu_rows = 0
     for item in items:
+        candidate_solver_invocations.append(
+            {
+                "file": item.get("file") if isinstance(item, dict) else None,
+                "solver_input_path": (
+                    item.get("solver_input_path")
+                    if isinstance(item, dict)
+                    else None
+                ),
+                "solver_argv": (
+                    item.get("solver_argv") if isinstance(item, dict) else None
+                ),
+            }
+        )
         if not isinstance(item, dict):
             malformed_item_rows += 1
             continue
@@ -2280,14 +3386,11 @@ def native_evidence_summary(
             explicit_error_rows += 1
         if item.get("harness_error") not in (None, ""):
             harness_error_rows += 1
-        file_value = item.get("file")
-        file_name = file_value if isinstance(file_value, str) else ""
-        if (
-            result in definitive_results
-            and item.get("expected") is None
-            and file_name not in reference_agree
+        if result in DEFINITIVE_RESULTS and not exact_cpu_timing_row(
+            item,
+            expected_source=CANDIDATE_EXACT_CPU_TIME_SOURCE,
         ):
-            unverified_definitive += 1
+            inexact_candidate_cpu_rows += 1
         artifacts = item.get("artifacts")
         if isinstance(artifacts, dict):
             validation = str(artifacts.get("proof_validation", "missing"))
@@ -2330,11 +3433,46 @@ def native_evidence_summary(
                         "ay_only",
                         "ref_only",
                         "both_solved",
+                        "ay_faster",
+                        "ref_faster",
+                        "ay_total_time",
+                        "ref_total_time",
+                        "cpu_comparable",
+                        "ay_cpu_faster",
+                        "ref_cpu_faster",
+                        "ay_total_cpu_time",
+                        "ref_total_cpu_time",
                     )
                 }
             )
     elif references is not None:
         malformed_reference_rows += 1
+    (
+        reference_agree,
+        agreeing_reference_names,
+        computed_reference_disagreements,
+        reference_comparison_evidence_errors,
+    ) = native_reference_comparison_evidence(
+        items,
+        reference_comparisons,
+        references,
+        expected_runs=settings.get("runs"),
+    )
+    if computed_reference_disagreements is not None:
+        reference_disagreements = computed_reference_disagreements
+    unverified_definitive = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        result = str(item.get("result", "")).lower()
+        file_value = item.get("file")
+        file_name = file_value if isinstance(file_value, str) else ""
+        if (
+            result in DEFINITIVE_RESULTS
+            and item.get("expected") is None
+            and file_name not in reference_agree
+        ):
+            unverified_definitive += 1
     resource_plan = settings.get("resource_plan")
     resource_enforcement = settings.get("resource_enforcement")
     artifact_max_bytes = settings.get("artifact_max_bytes")
@@ -2343,7 +3481,22 @@ def native_evidence_summary(
     native_benchmark_count = settings.get("benchmark_count")
     native_runs = settings.get("runs")
     native_shard = settings.get("shard")
+    native_benchmarks_dir = settings.get("benchmarks_dir")
+    raw_solver_args = settings.get("solver_args", [])
+    native_solver_args = (
+        list(raw_solver_args)
+        if isinstance(raw_solver_args, list)
+        and all(isinstance(argument, str) for argument in raw_solver_args)
+        else None
+    )
+    score_evidence, score_evidence_errors = native_score_evidence(
+        items,
+        domain=settings.get("domain"),
+        timeout_sec=native_timeout_sec,
+    )
     errors: list[str] = []
+    errors.extend(reference_comparison_evidence_errors)
+    errors.extend(score_evidence_errors)
     git_commit = environment.get("git_commit")
     if expected_commit is not None and git_commit != expected_commit:
         errors.append(
@@ -2369,6 +3522,26 @@ def native_evidence_summary(
         errors.append(
             f"{malformed_reference_rows} reference provenance row(s) are malformed"
         )
+    if inexact_candidate_cpu_rows:
+        errors.append(
+            f"{inexact_candidate_cpu_rows} definitive candidate result(s) lack "
+            "exact child CPU timing"
+        )
+    if inexact_reference_cpu_rows:
+        errors.append(
+            f"{inexact_reference_cpu_rows} definitive reference result(s) lack "
+            "exact child CPU timing"
+        )
+    if reference_harness_error_rows:
+        errors.append(
+            f"{reference_harness_error_rows} reference run(s) contain a "
+            "harness error"
+        )
+    if explicit_reference_error_rows:
+        errors.append(
+            f"{explicit_reference_error_rows} reference run(s) have an "
+            "explicit error result"
+        )
     if harness_error_rows:
         errors.append(
             f"{harness_error_rows} benchmark item(s) contain a harness error"
@@ -2385,6 +3558,85 @@ def native_evidence_summary(
         errors.append("native resource plan is missing")
     if not isinstance(resource_enforcement, str) or not resource_enforcement:
         errors.append("native resource enforcement is missing")
+    if expected_domain is not None and settings.get("domain") != expected_domain:
+        errors.append(
+            f"native domain {settings.get('domain')!r} does not match lane "
+            f"domain {expected_domain!r}"
+        )
+    if expected_official is not None and expected_domain == "chc":
+        expected_mode = "competition" if expected_official else "dev"
+        if native_solver_args is None:
+            errors.append(
+                f"native CHC {expected_mode} solver_args are missing or malformed"
+            )
+        elif expected_official:
+            expected_solver_args = [
+                "--competition",
+                "--timeout",
+                CHC_COMPETITION_TIMEOUT_MS,
+            ]
+            if native_solver_args != expected_solver_args:
+                errors.append(
+                    "native CHC competition solver_args must be exactly "
+                    f"{expected_solver_args!r}"
+                )
+            if (
+                not isinstance(native_timeout_sec, (int, float))
+                or isinstance(native_timeout_sec, bool)
+                or float(native_timeout_sec) != CHC_COMPETITION_TIMEOUT_SEC
+            ):
+                errors.append(
+                    "native CHC competition timeout must equal the standard "
+                    f"{CHC_COMPETITION_TIMEOUT_SEC:g}s"
+                )
+        elif any(
+            solver_mode_control_or_delimiter(argument)
+            for argument in native_solver_args
+        ):
+            errors.append(
+                "native CHC dev solver_args must omit competition/timeout controls "
+                "and argument delimiters"
+            )
+
+        memory_mib = (
+            resource_plan.get("memlimit_mb_per_child")
+            if isinstance(resource_plan, dict)
+            else None
+        )
+        if native_solver_args is not None:
+            for index, (item, invocation) in enumerate(
+                zip(items, candidate_solver_invocations, strict=True)
+            ):
+                if not isinstance(item, dict):
+                    continue
+                solver_input_path = invocation.get("solver_input_path")
+                solver_argv = invocation.get("solver_argv")
+                expected_suffix = [
+                    "--chc",
+                    *native_solver_args,
+                    "--memory",
+                    str(memory_mib),
+                    "--",
+                    solver_input_path,
+                ]
+                if (
+                    not isinstance(memory_mib, int)
+                    or isinstance(memory_mib, bool)
+                    or memory_mib < 1
+                    or not isinstance(solver_input_path, str)
+                    or not solver_input_path
+                    or not isinstance(solver_argv, list)
+                    or not solver_argv
+                    or not all(
+                        isinstance(argument, str) for argument in solver_argv
+                    )
+                    or not solver_argv[0]
+                    or solver_argv[1:] != expected_suffix
+                ):
+                    errors.append(
+                        f"native CHC {expected_mode} candidate solver_argv row "
+                        f"{index} does not match settings and the enforced envelope"
+                    )
     if settings.get("domain") == "sat":
         if (
             not isinstance(artifact_max_bytes, int)
@@ -2433,6 +3685,26 @@ def native_evidence_summary(
         errors.append(
             f"native runs {native_runs} does not match lane runs {expected_runs}"
         )
+    if expected_corpus_root is not None:
+        expected_benchmarks_root = expected_corpus_root / "benchmarks"
+        if not isinstance(native_benchmarks_dir, str):
+            errors.append("native benchmarks_dir is missing")
+        else:
+            try:
+                native_root_path = Path(native_benchmarks_dir)
+                resolved_native_root = native_root_path.resolve(strict=True)
+                if (
+                    not native_root_path.is_absolute()
+                    or resolved_native_root != native_root_path
+                ):
+                    raise ValueError
+                native_root_path.relative_to(expected_benchmarks_root)
+            except (OSError, ValueError):
+                errors.append(
+                    f"native benchmarks_dir {native_benchmarks_dir!r} is outside "
+                    f"or not canonical below trusted shared corpus root "
+                    f"{expected_benchmarks_root}"
+                )
     if native_shard is not None:
         if not isinstance(native_shard, dict):
             errors.append("native shard metadata is malformed")
@@ -2509,7 +3781,18 @@ def native_evidence_summary(
             or solver_size > MAX_SOLVER_BYTES
         ):
             errors.append(f"{prefix} has an invalid solver size")
-        for key in ("agree", "disagree", "ay_only", "ref_only", "both_solved"):
+        for key in (
+            "agree",
+            "disagree",
+            "ay_only",
+            "ref_only",
+            "both_solved",
+            "ay_faster",
+            "ref_faster",
+            "cpu_comparable",
+            "ay_cpu_faster",
+            "ref_cpu_faster",
+        ):
             value = reference.get(key)
             if (
                 not isinstance(value, int)
@@ -2517,6 +3800,20 @@ def native_evidence_summary(
                 or value < 0
             ):
                 errors.append(f"{prefix} has an invalid {key} counter")
+        for key in (
+            "ay_total_time",
+            "ref_total_time",
+            "ay_total_cpu_time",
+            "ref_total_cpu_time",
+        ):
+            value = reference.get(key)
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(float(value))
+                or float(value) < 0
+            ):
+                errors.append(f"{prefix} has an invalid {key}")
         enforcement = reference.get("reference_resource_enforcement")
         if isinstance(enforcement, str) and not enforcement.startswith(
             "ay-resource-v1:"
@@ -2540,6 +3837,18 @@ def native_evidence_summary(
         "timeout_sec": native_timeout_sec,
         "runs": native_runs,
         "domain": settings.get("domain"),
+        "expected_domain": expected_domain,
+        "solver_role": "candidate",
+        "solver_mode": (
+            "competition"
+            if expected_official is True
+            else "dev"
+            if expected_official is False
+            else None
+        ),
+        "solver_args": native_solver_args,
+        "candidate_solver_invocations": candidate_solver_invocations,
+        "benchmarks_dir": native_benchmarks_dir,
         "shard": native_shard,
         "corpus_identity_sha256": hashlib.sha256(corpus_bytes).hexdigest(),
         "resource_plan": resource_plan,
@@ -2552,8 +3861,13 @@ def native_evidence_summary(
         "reference_provenance": reference_provenance,
         "harness_error_count": harness_error_rows,
         "explicit_error_count": explicit_error_rows,
+        "inexact_candidate_cpu_count": inexact_candidate_cpu_rows,
+        "inexact_reference_cpu_count": inexact_reference_cpu_rows,
+        "reference_harness_error_count": reference_harness_error_rows,
+        "explicit_reference_error_count": explicit_reference_error_rows,
         "proof_validation": dict(sorted(proof_validation.items())),
         "result_counts": dict(sorted(result_counts.items())),
+        "score_evidence": score_evidence,
         "evidence_errors": errors,
     }
 
@@ -2759,6 +4073,34 @@ def scorecard_evidence_errors(
         or solved > total
     ):
         errors.append(f"score solved count is invalid: {solved!r}")
+    raw_score = evidence.get("score_evidence")
+    if not isinstance(raw_score, dict):
+        errors.append("validated native score evidence is missing")
+    else:
+        for field in ("solved", "solved_sat", "solved_unsat"):
+            expected_value = raw_score.get(field)
+            score_value = score.get(field)
+            if (
+                not isinstance(expected_value, int)
+                or isinstance(expected_value, bool)
+                or expected_value < 0
+            ):
+                errors.append(
+                    f"validated native score evidence has invalid {field}"
+                )
+            elif score_value != expected_value:
+                errors.append(
+                    f"score {field}={score_value!r} does not match raw native "
+                    f"{field}={expected_value}"
+                )
+        if evidence.get("domain") in {"smt", "chc"}:
+            expected_cpu = raw_score.get("cpu_time")
+            score_cpu = score.get("cpu_time")
+            if not same_evidence_number(score_cpu, expected_cpu):
+                errors.append(
+                    f"score cpu_time={score_cpu!r} does not match raw native "
+                    f"cpu_time={expected_cpu!r}"
+                )
     for field in ("ay_sha256", "solver_launcher_sha256", "candidate_sha256"):
         solver_hash = evidence.get(field)
         if not valid_sha256(solver_hash):
@@ -2810,6 +4152,9 @@ def new_native_evidence(
     expected_commit: str,
     expected_runs: int | None = None,
     expected_timeout_sec: float | None = None,
+    expected_corpus_root: Path | None = None,
+    expected_official: bool | None = None,
+    expected_domain: str | None = None,
 ) -> tuple[Path | None, dict[str, Any] | None]:
     eval_root = root / eval_id
     if not eval_root.is_dir() or eval_root.is_symlink():
@@ -2835,6 +4180,9 @@ def new_native_evidence(
         expected_commit=expected_commit,
         expected_runs=expected_runs,
         expected_timeout_sec=expected_timeout_sec,
+        expected_corpus_root=expected_corpus_root,
+        expected_official=expected_official,
+        expected_domain=expected_domain,
     )
 
 
@@ -2849,7 +4197,7 @@ def execute_lane(
     candidate: dict[str, Any],
     suffix: str = "",
 ) -> LaneOutcome:
-    blocker = lane_blocker(lane, worktree)
+    blocker = lane_blocker(lane, worktree, corpus_root=repo)
     if blocker is not None:
         return LaneOutcome(
             lane_id=lane["id"],
@@ -2923,6 +4271,13 @@ def execute_lane(
         expected_timeout_sec=(
             float(lane["timeout_sec"]) if "timeout_sec" in lane else None
         ),
+        expected_corpus_root=repo,
+        expected_official=bool(lane.get("official", False)),
+        expected_domain=(
+            "chc"
+            if lane["eval_id"].startswith(("chccomp-", "chc-"))
+            else None
+        ),
     )
     supervisor_hash_after = file_sha256(supervisor_ay)
     launcher_hash_after = file_sha256(launcher)
@@ -2961,7 +4316,7 @@ def execute_lane(
         if "shard_size" in lane:
             if not isinstance(shard, dict):
                 evidence.setdefault("evidence_errors", []).append(
-                    "selected rolling lane lacks native shard metadata"
+                    "selected sharded lane lacks native shard metadata"
                 )
             else:
                 if shard.get("requested_index") != int(
@@ -3373,7 +4728,7 @@ def full_git_sha(value: Any) -> bool:
     )
 
 
-def publish_status_branch(
+def publish_status_ref(
     repo: Path,
     remote: str,
     run_dir: Path,
@@ -3397,12 +4752,12 @@ def publish_status_branch(
         raise CampaignError("Git status publication produced a malformed tree ID")
 
     live = capture(
-        ["git", "ls-remote", remote, f"refs/heads/{STATUS_BRANCH}"],
+        ["git", "ls-remote", remote, STATUS_REF],
         repo,
     )
     parent = live.split()[0] if live else ""
     if parent and not full_git_sha(parent):
-        raise CampaignError("remote status branch has a malformed commit ID")
+        raise CampaignError("remote status ref has a malformed commit ID")
     if parent and git_code(repo, "cat-file", "-e", f"{parent}^{{commit}}") != 0:
         fetch = run_command(
             [
@@ -3410,15 +4765,14 @@ def publish_status_branch(
                 "fetch",
                 "--no-tags",
                 remote,
-                f"+refs/heads/{STATUS_BRANCH}:"
-                f"refs/remotes/{remote}/{STATUS_BRANCH}",
+                STATUS_REF,
             ],
             repo,
             run_dir / "git" / "status-fetch.log",
             timeout=120,
         )
         if fetch.exit_code != 0:
-            raise CampaignError("cannot fetch the current status branch parent")
+            raise CampaignError("cannot fetch the current status ref parent")
 
     commit_args = ["commit-tree", tree, "-m", f"continuous status {run_name}"]
     if parent:
@@ -3431,16 +4785,14 @@ def publish_status_branch(
             "git",
             "push",
             remote,
-            f"{commit}:refs/heads/{STATUS_BRANCH}",
+            f"{commit}:{STATUS_REF}",
         ],
         repo,
         run_dir / "git" / "status-push.log",
         timeout=120,
     )
     if push.exit_code != 0:
-        raise CampaignError(
-            "status branch changed concurrently or could not be published"
-        )
+        raise CampaignError("status ref changed concurrently or could not be published")
     return commit
 
 
@@ -3465,7 +4817,103 @@ def counter(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def competition_summary(path: Path) -> dict[str, Any]:
+def declared_packet_rows(path: Path, key: str) -> list[dict[str, Any]] | None:
+    value = read_json(path, None)
+    if not isinstance(value, dict):
+        return None
+    rows = value.get(key)
+    if (
+        not isinstance(rows, list)
+        or not all(
+            isinstance(row, dict)
+            and isinstance(row.get("disposition"), str)
+            and bool(row["disposition"])
+            for row in rows
+        )
+    ):
+        return None
+    return rows
+
+
+def normalized_packet_declarations(catalog_path: Path) -> dict[str, Any]:
+    """Summarize checked-in packet declarations without treating them as wins."""
+
+    official_path = catalog_path.with_name(OFFICIAL_FIELD_PACKET)
+    ay_path = catalog_path.with_name(AY_SCOREBOARD_PACKET)
+    official_rows = declared_packet_rows(official_path, "leaderboards")
+    ay_rows = declared_packet_rows(ay_path, "rows")
+    summary: dict[str, Any] = {
+        "source": "checked-in packet declarations",
+        "official_field": {
+            "present": official_rows is not None,
+            "path": official_path.name,
+        },
+        "ay_scoreboard": {
+            "present": ay_rows is not None,
+            "path": ay_path.name,
+        },
+    }
+    if official_rows is not None:
+        competitors = [row.get("competitors") for row in official_rows]
+        if all(
+            isinstance(entries, list)
+            and all(isinstance(entry, dict) for entry in entries)
+            for entries in competitors
+        ):
+            summary["official_field"].update(
+                {
+                    "dispositions": counter(official_rows, "disposition"),
+                    "competitor_count": sum(
+                        len(entries) for entries in competitors
+                    ),
+                }
+            )
+        else:
+            summary["official_field"]["present"] = False
+    if ay_rows is not None:
+        scored_rows = [
+            row for row in ay_rows if row.get("disposition") == "scored"
+        ]
+        summary["ay_scoreboard"].update(
+            {
+                "dispositions": counter(ay_rows, "disposition"),
+                "scored_rows": len(scored_rows),
+                "declared_win_rows": sum(
+                    row.get("win") is True for row in scored_rows
+                ),
+            }
+        )
+    return summary
+
+
+def campaign_check_gate_passed(
+    commands: Any,
+    records: list[CommandRecord] | None,
+) -> bool | None:
+    """Return the gate result only when command/record ordering proves it."""
+
+    if not isinstance(commands, list) or not isinstance(records, list):
+        return None
+    matches = [
+        index for index, command in enumerate(commands)
+        if command == CAMPAIGN_CHECK_COMMAND
+    ]
+    if len(matches) != 1 or len(records) > len(commands):
+        return None
+    index = matches[0]
+    if index >= len(records) or not all(
+        isinstance(record, CommandRecord) for record in records[: index + 1]
+    ):
+        return None
+    return records[index].exit_code == 0
+
+
+def competition_summary(
+    path: Path,
+    *,
+    build_commands: Any = None,
+    gate_records: list[CommandRecord] | None = None,
+) -> dict[str, Any]:
     value, rows = catalog_rows(path)
     if not value:
         return {"catalog_present": False, "total": 0, "statuses": {}}
@@ -3473,19 +4921,18 @@ def competition_summary(path: Path) -> dict[str, Any]:
     for row in rows:
         status = str(row.get("status", row.get("readiness", "unknown")))
         statuses[status] = statuses.get(status, 0) + 1
-    ranked_final = [
-        row
-        for row in rows
-        if row.get("status") == "final"
-        and row.get("official_score_direction") not in {None, "none", "pending"}
-    ]
-    winner_targets = [
-        row
-        for row in ranked_final
-        if isinstance(row.get("winner_name"), str)
-        and bool(row["winner_name"])
-        and row.get("winner_score") is not None
-    ]
+    packet_declarations = normalized_packet_declarations(path)
+    gate_passed = campaign_check_gate_passed(build_commands, gate_records)
+    if gate_passed is not None:
+        packet_declarations["campaign_check_passed"] = gate_passed
+    if gate_passed is True:
+        ay_declarations = packet_declarations.get("ay_scoreboard", {})
+        if ay_declarations.get("present"):
+            # The ordered Rust campaign gate hashes and parses these exact
+            # packets, then recomputes every scored row's rank and win claim.
+            ay_declarations["recomputed_retroactive_wins"] = (
+                ay_declarations["declared_win_rows"]
+            )
     return {
         "catalog_present": True,
         "total": len(rows),
@@ -3496,14 +4943,7 @@ def competition_summary(path: Path) -> dict[str, Any]:
         "retrieved_at": value.get("retrieved_at"),
         "scope": value.get("scope", "unknown"),
         "campaign_packet_status": value.get("campaign_packet_status", "unknown"),
-        "winner_targets": {
-            "ranked_final_tracks": len(ranked_final),
-            "harvested": len(winner_targets),
-            "pending": len(ranked_final) - len(winner_targets),
-            "ay_verified_retroactive_wins": sum(
-                row.get("ay_retroactive_win") is True for row in ranked_final
-            ),
-        },
+        "normalized_packet_declarations": packet_declarations,
     }
 
 
@@ -3511,14 +4951,10 @@ def validate_lane_manifest(manifest: dict[str, Any], catalog_path: Path) -> None
     _, official_rows = catalog_rows(catalog_path)
     official_ids = {str(row.get("id")) for row in official_rows}
     excluded = manifest.get("git", {}).get("exclude", [])
-    if (
-        not isinstance(excluded, list)
-        or not all(isinstance(pattern, str) for pattern in excluded)
-        or not excluded_branch(STATUS_BRANCH, excluded)
+    if not isinstance(excluded, list) or not all(
+        isinstance(pattern, str) for pattern in excluded
     ):
-        raise CampaignError(
-            f"lane manifest must exclude the publication branch {STATUS_BRANCH!r}"
-        )
+        raise CampaignError("git.exclude must be a list of branch glob strings")
     seen: set[str] = set()
     allowed_kinds = {"canary", "rolling", "official"}
     for lane in manifest.get("lane", []):
@@ -3537,6 +4973,17 @@ def validate_lane_manifest(manifest: dict[str, Any], catalog_path: Path) -> None
         if kind_is_official != flag_is_official:
             raise CampaignError(
                 f"lane {lane_id}: kind='official' and official=true must agree"
+            )
+        fixed_official_chc = is_fixed_official_chc_lane(lane)
+        if (
+            kind_is_official
+            and lane.get("enabled", True)
+            and not fixed_official_chc
+        ):
+            raise CampaignError(
+                f"lane {lane_id}: only the exact enabled fixed CHC competition-mode "
+                "shard-0 lane is admitted; other official replay lanes must remain "
+                "disabled"
             )
         eval_id = lane.get("eval_id")
         if (
@@ -3558,6 +5005,7 @@ def validate_lane_manifest(manifest: dict[str, Any], catalog_path: Path) -> None
                 f"lane {lane_id}: min_benchmarks must be a positive integer"
             )
         shard_size = lane.get("shard_size")
+        shard_index = lane.get("shard_index")
         if lane.get("kind") == "rolling":
             if (
                 not isinstance(shard_size, int)
@@ -3567,19 +5015,33 @@ def validate_lane_manifest(manifest: dict[str, Any], catalog_path: Path) -> None
                 raise CampaignError(
                     f"lane {lane_id}: rolling lanes require shard_size in 1..=4096"
                 )
-        elif shard_size is not None:
+            if shard_index is not None:
+                raise CampaignError(
+                    f"lane {lane_id}: rolling shard indices come from persisted "
+                    "scheduler state, not shard_index"
+                )
+        elif fixed_official_chc:
+            pass
+        elif shard_size is not None or shard_index is not None:
             raise CampaignError(
-                f"lane {lane_id}: shard_size is supported only for rolling lanes"
+                f"lane {lane_id}: fixed shard controls are supported only for the "
+                "exact bounded official CHC lane"
             )
         command_timeout = lane.get("command_timeout_sec", 2 * 60 * 60)
+        max_command_timeout = (
+            FIXED_OFFICIAL_CHC_COMMAND_TIMEOUT_SEC
+            if fixed_official_chc
+            else 2 * 60 * 60
+        )
         if (
             not isinstance(command_timeout, (int, float))
             or isinstance(command_timeout, bool)
             or not math.isfinite(float(command_timeout))
-            or not 60 <= float(command_timeout) <= 2 * 60 * 60
+            or not 60 <= float(command_timeout) <= max_command_timeout
         ):
             raise CampaignError(
-                f"lane {lane_id}: command_timeout_sec must be between 60 and 7200"
+                f"lane {lane_id}: command_timeout_sec must be between 60 and "
+                f"{max_command_timeout}"
             )
         unknown = [
             value
@@ -3893,7 +5355,32 @@ def render_markdown(packet: dict[str, Any]) -> str:
             f"{markdown_cell(score_dict_brief(row.get('score')))} |"
         )
     coverage = packet.get("competition_catalog", {})
-    winner_targets = coverage.get("winner_targets", {})
+    declarations = coverage.get("normalized_packet_declarations", {})
+    official = declarations.get("official_field", {})
+    ay = declarations.get("ay_scoreboard", {})
+    if official.get("present"):
+        official_declarations = (
+            "official dispositions "
+            f"`{json.dumps(official.get('dispositions', {}), sort_keys=True)}`, "
+            f"official competitors {official['competitor_count']}"
+        )
+    else:
+        official_declarations = "official field packet unavailable"
+    if ay.get("present"):
+        ay_declarations = [
+            "AY dispositions "
+            f"`{json.dumps(ay.get('dispositions', {}), sort_keys=True)}`, "
+            f"AY scored rows {ay['scored_rows']}, "
+            f"declared win rows {ay['declared_win_rows']}"
+        ]
+        if "recomputed_retroactive_wins" in ay:
+            ay_declarations.append(
+                ", recomputed retroactive wins "
+                f"{ay['recomputed_retroactive_wins']}"
+            )
+        ay_declarations = "".join(ay_declarations)
+    else:
+        ay_declarations = "AY scoreboard packet unavailable"
     lines.extend(
         [
             "",
@@ -3901,12 +5388,23 @@ def render_markdown(packet: dict[str, Any]) -> str:
             "",
             f"Tracked rows: {coverage.get('total', 0)}. "
             f"Scope: `{markdown_cell(coverage.get('scope', 'unknown'))}`. "
-            f"States: `{json.dumps(coverage.get('statuses', {}), sort_keys=True)}`.",
-            f"Winner targets harvested: {winner_targets.get('harvested', 0)}/"
-            f"{winner_targets.get('ranked_final_tracks', 0)} materialized final "
-            "leaderboard views; "
-            f"verified AY retroactive wins: "
-            f"{winner_targets.get('ay_verified_retroactive_wins', 0)}.",
+            f"States: `{json.dumps(coverage.get('statuses', {}), sort_keys=True)}`. "
+            "Readiness: "
+            f"`{json.dumps(coverage.get('readiness', {}), sort_keys=True)}`.",
+            "Checked-in packet declarations: "
+            f"{official_declarations}; {ay_declarations}.",
+            *(
+                [
+                    "Candidate campaign-check build gate: "
+                    + (
+                        "passed."
+                        if declarations["campaign_check_passed"]
+                        else "failed."
+                    )
+                ]
+                if "campaign_check_passed" in declarations
+                else []
+            ),
             "",
             "Raw logs, scorecards, binary provenance, corpus identity, and enforced "
             "resource envelopes remain in the host-local evidence store; only this "
@@ -3932,6 +5430,15 @@ def checkpoint_progress(
 ) -> bool:
     """Persist progress and refresh each explicitly requested remote channel."""
 
+    # The exact status-ref commit is a host-local publication receipt. It
+    # cannot be embedded in the commit that it identifies without creating a
+    # self-reference, so never copy a prior checkpoint's receipt into the next
+    # remote payload.
+    if publish_status:
+        # Drop both the current receipt and the legacy branch receipt so neither
+        # can become a stale/impossible self-reference in the remote packet.
+        packet.pop("status_ref_publication", None)
+        packet.pop("status_branch_publication", None)
     markdown = render_markdown(packet)
     atomic_json(run_dir / "packet.json", packet)
     atomic_text(run_dir / "status.md", markdown)
@@ -3954,22 +5461,22 @@ def checkpoint_progress(
             }
     if publish_status:
         try:
-            commit = publish_status_branch(
+            commit = publish_status_ref(
                 repo,
                 remote,
                 run_dir,
                 str(packet["run_id"]),
             )
-            packet["status_branch_publication"] = {
+            packet["status_ref_publication"] = {
                 "status": "published",
-                "branch": STATUS_BRANCH,
+                "ref": STATUS_REF,
                 "commit": commit,
             }
         except Exception as error:
             published = False
-            packet["status_branch_publication"] = {
+            packet["status_ref_publication"] = {
                 "status": "failed",
-                "branch": STATUS_BRANCH,
+                "ref": STATUS_REF,
                 "error": f"{type(error).__name__}: {error}",
             }
     if publish or publish_status:
@@ -4259,21 +5766,21 @@ def record_control_plane_failure(
     if publish_status and (repo / ".git").exists():
         try:
             ensure_git_identity(repo)
-            commit = publish_status_branch(
+            commit = publish_status_ref(
                 repo,
                 remote,
                 run_dir,
                 failure_run,
             )
-            packet["status_branch_publication"] = {
+            packet["status_ref_publication"] = {
                 "status": "published",
-                "branch": STATUS_BRANCH,
+                "ref": STATUS_REF,
                 "commit": commit,
             }
         except Exception as publication_error:
-            packet["status_branch_publication"] = {
+            packet["status_ref_publication"] = {
                 "status": "failed",
-                "branch": STATUS_BRANCH,
+                "ref": STATUS_REF,
                 "error": (
                     f"{type(publication_error).__name__}: {publication_error}"
                 ),
@@ -4284,7 +5791,7 @@ def record_control_plane_failure(
 
 
 def cycle(args: argparse.Namespace) -> int:
-    publish_status = bool(getattr(args, "publish_status_branch", False))
+    publish_status = bool(getattr(args, "publish_status_ref", False))
     if args.repair_with_codex and (
         args.push or args.publish_issue or publish_status
     ):
@@ -4293,6 +5800,7 @@ def cycle(args: argparse.Namespace) -> int:
             "with remote publication"
         )
     repo = Path(args.repo).resolve()
+    corpus_root = validate_shared_corpus_root(repo)
     state_root = Path(args.state_root).resolve()
     bootstrap_remote = getattr(args, "bootstrap_remote", "origin")
     bootstrap_branch = getattr(args, "bootstrap_branch", "main")
@@ -4379,6 +5887,13 @@ def cycle(args: argparse.Namespace) -> int:
                 if args.official
                 else "development-proxy"
             ),
+            "shared_corpus": {
+                "root": str(corpus_root),
+                "environment": BENCH_CORPUS_ROOT_ENV,
+                "payload_scope": "normalized-repo-relative-benchmarks-only",
+                "registry_and_controls": "candidate-worktree",
+                "candidate_solver_visibility": "private-input-snapshots-only",
+            },
         }
         worktree = state_root / "worktrees" / current_run
         target = continuous_target_root(state_root) / current_run
@@ -4398,6 +5913,7 @@ def cycle(args: argparse.Namespace) -> int:
             "CARGO_TARGET_DIR": str(target),
             "AY_BENCH_RESULTS_ROOT": str(results_root),
             "AY_BENCH_STORE_PATH": str(store_root / "results.sqlite"),
+            BENCH_CORPUS_ROOT_ENV: str(corpus_root),
         }
         for key in (
             "CC",
@@ -4410,7 +5926,7 @@ def cycle(args: argparse.Namespace) -> int:
         z3 = shutil.which("z3")
         z3_lib = Path.home() / ".local" / "bin" / "libz3.so"
         if z3 is not None:
-            env["Z3_BIN"] = z3
+            env["Z3_BIN"] = str(Path(z3).resolve())
         if z3_lib.is_file():
             env["Z3_LIB"] = str(z3_lib)
 
@@ -4565,6 +6081,11 @@ def cycle(args: argparse.Namespace) -> int:
                     build_writable_paths,
                 )
             packet["gates"] = [record.as_json() for record in gates]
+            packet["competition_catalog"] = competition_summary(
+                (worktree / args.catalog).resolve(),
+                build_commands=manifest.get("build", {}).get("commands"),
+                gate_records=gates,
+            )
             gates_clean = bool(gates) and all(
                 record.exit_code == 0 for record in gates
             )
@@ -4587,6 +6108,7 @@ def cycle(args: argparse.Namespace) -> int:
                 worktree,
                 smoke_only=args.smoke_only,
                 include_official=args.official,
+                corpus_root=corpus_root,
             )
             outcomes: list[LaneOutcome] = blocked
             scoreboard_outcomes = outcomes
@@ -4716,6 +6238,11 @@ def cycle(args: argparse.Namespace) -> int:
                     packet["repair_gates"] = [
                         record.as_json() for record in repair_gates
                     ]
+                    packet["competition_catalog"] = competition_summary(
+                        (worktree / args.catalog).resolve(),
+                        build_commands=manifest.get("build", {}).get("commands"),
+                        gate_records=repair_gates,
+                    )
                     gates_clean = bool(repair_gates) and all(
                         record.exit_code == 0 for record in repair_gates
                     )
@@ -4836,7 +6363,20 @@ def cycle(args: argparse.Namespace) -> int:
                         }
                         clean = push.exit_code == 0
             elif clean and args.push:
-                packet["push"] = {"status": "no-change"}
+                live = capture(
+                    ["git", "ls-remote", remote, f"refs/heads/{base_branch}"],
+                    worktree,
+                )
+                live_sha = live.split()[0] if live else ""
+                if live_sha != base_sha:
+                    packet["push"] = {
+                        "status": "race-rejected",
+                        "expected_base": base_sha,
+                        "live_base": live_sha,
+                    }
+                    clean = False
+                else:
+                    packet["push"] = {"status": "no-change"}
 
             admission_clean = clean
             packet["status"] = "passed" if clean else "failed"
@@ -5002,6 +6542,7 @@ def cycle(args: argparse.Namespace) -> int:
 
 def audit(args: argparse.Namespace) -> int:
     repo = Path(args.repo).resolve()
+    corpus_root = validate_shared_corpus_root(repo)
     lanes = load_toml((repo / args.lanes).resolve())
     catalog_path = (repo / args.catalog).resolve()
     validate_lane_manifest(lanes, catalog_path)
@@ -5013,7 +6554,7 @@ def audit(args: argparse.Namespace) -> int:
         counts[kind] = counts.get(kind, 0) + 1
     operational: dict[str, str] = {}
     for lane in lane_rows:
-        blocker = lane_blocker(lane, repo)
+        blocker = lane_blocker(lane, repo, corpus_root=corpus_root)
         operational[str(lane["id"])] = blocker or "ready"
     missing_tools = [
         tool
@@ -5128,9 +6669,11 @@ def parser() -> argparse.ArgumentParser:
         help="create/update one GitHub issue dashboard",
     )
     cycle_parser.add_argument(
+        "--publish-status-ref",
         "--publish-status-branch",
+        dest="publish_status_ref",
         action="store_true",
-        help=f"publish compact progress to the {STATUS_BRANCH} Git branch",
+        help=f"publish compact progress to the non-branch Git ref {STATUS_REF}",
     )
     cycle_parser.set_defaults(function=cycle)
     return result

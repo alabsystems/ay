@@ -168,7 +168,30 @@ impl Solver {
         // non-incremental lanes unaffected). Root cause of the eager-lazy
         // post-pop arena corruption: unscoped lemmas desynced the ledger and
         // the arena across pop (see the #inc campaign autopsy).
-        if self.add_theory_lemma_scoped(conflict).is_some() {
+        //
+        // #unguarded-tvalid-lemmas STAGE 1: routed through the conflict-lemma
+        // gate — scoped by default (exactly the line above), unscoped when
+        // `unguarded_theory_conflict_lemmas` is enabled (the incremental
+        // QF_LRA engine lane only). T-validity provenance of THIS conflict
+        // vector, verified: it is an Extension conflict
+        // (ExtPropagateResult/ExtCheckResult::Conflict or an all-false
+        // theory-lemma batch entry from theory_callback.rs), and the eager
+        // TheoryExtension builds those clauses by mapping theory `conflict_terms`
+        // through `term_to_literal` with the #3826 fail-closed guard (a
+        // partial mapping returns Unknown, never a partial clause), then
+        // weakens them only via `minimize_conflict_with_levels` (drops
+        // literals falsified at level 0 — session-permanent root facts). So
+        // every literal is a term-semantic atom literal and the clause is
+        // entailed by theory axioms + permanent root facts at EVERY scope.
+        // The autopsy hazards above are closed centrally since then: pop()
+        // unconditionally clears pending_theory_conflicts, the ledger rebuild
+        // normalizes reasons to NO_REASON (#inc-rebuild-reasons), and the
+        // reset census counts only non-learned clauses, so a surviving
+        // unscoped learned lemma cannot desync it. The
+        // `can_use_incremental_reset` FALLBACK (full reset) either preserves
+        // learned clauses (L0-GC rebuild) or DROPS them all (destructive
+        // rebuild) — both sound for re-derivable theory axioms.
+        if self.add_theory_conflict_lemma(conflict).is_some() {
             self.tla_trace_step(
                 CdclTraceState::Propagating,
                 Some(CdclTraceAction::AnalyzeAndLearn),

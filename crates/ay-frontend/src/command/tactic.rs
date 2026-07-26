@@ -49,11 +49,10 @@
 //!   inward to atoms and eliminate `=>`/`<->`/`xor`/`ite`-over-Bool into
 //!   `and`/`or`, then split the resulting top-level conjunction into goal
 //!   formulas. Equivalence-preserving.
-//! - `tseitin-cnf` (alias `cnf`) — Z3's Tseitin CNF conversion. The ONE tactic
+//! - `tseitin-cnf` — Z3's Tseitin CNF conversion. The ONE tactic
 //!   here that is *equisatisfiable but not equivalent*: it mints fresh auxiliary
 //!   Boolean variables, so the CNF's models differ from the input's on those new
-//!   variables while `check-sat` is preserved (aux treated as free). Both the
-//!   `tseitin-cnf` and the `cnf` spelling map to the same pass.
+//!   variables while `check-sat` is preserved (aux treated as free).
 //! - `bit-blast` — Z3's `bit-blast` tactic (AY's `BitBlast` pass): replace every
 //!   bit-vector variable with `n` fresh Boolean bit-variables and every BV
 //!   operator with its Boolean circuit, producing a pure-Boolean (SAT-level)
@@ -71,11 +70,11 @@
 //!   `(= var const)` equality; value equalities are re-emitted at the end of
 //!   the goal. Only drops and reorders — equivalence-preserving.
 //!
-//! # Full-registry names (the z3-4.15.4 batch) and their honest realizations
+//! # Full-registry names (the pinned Z3 5.0.0 batch) and their honest realizations
 //!
 //! Beyond the pass-backed primitives above, this registry recognizes EVERY
-//! remaining z3 4.15.4 tactic name (z3 `-tactics` lists 116; AY previously knew
-//! 25). Each of the 91 added names has one of four SOUND realizations — none
+//! remaining Z3 5.0.0 tactic name (`z3 -tactics` lists 118). Each name has one
+//! of four SOUND realizations — none
 //! adds a decide path, and none can ever change a verdict:
 //!
 //! - **CLASS S — solver-strategy tactics → identity (`Skip`)** (`qflia`, `qfbv`,
@@ -154,7 +153,6 @@ pub const SUPPORTED_TACTIC_NAMES: &[&str] = &[
     "qe",
     "nnf",
     "tseitin-cnf",
-    "cnf",
     "bit-blast",
     "split-clause",
     "ctx-solver-simplify",
@@ -531,7 +529,7 @@ pub enum ApplyTactic {
     /// top-level conjunction is split into separate goal formulas, matching Z3.
     /// NNF is equivalence-preserving (stronger than equisatisfiable).
     Nnf,
-    /// `tseitin-cnf` (alias `cnf`) — convert the goal to CNF via Tseitin
+    /// `tseitin-cnf` — convert the goal to CNF via Tseitin
     /// encoding. Introduces fresh auxiliary Boolean variables, so the result is
     /// **equisatisfiable** (NOT equivalent) to the input: with the aux variables
     /// treated as free, `check-sat(result) == check-sat(input)`.
@@ -700,7 +698,7 @@ impl ApplyTactic {
             "qe-light" => Ok(Self::QeLight),
             "qe" => Ok(Self::Qe),
             "nnf" => Ok(Self::Nnf),
-            "tseitin-cnf" | "cnf" => Ok(Self::TseitinCnf),
+            "tseitin-cnf" => Ok(Self::TseitinCnf),
             "bit-blast" => Ok(Self::BitBlast),
             "split-clause" => Ok(Self::SplitClause),
             "ctx-solver-simplify" => Ok(Self::CtxSolverSimplify),
@@ -714,9 +712,9 @@ impl ApplyTactic {
             "propagate-ineqs" => Ok(Self::PropagateIneqs),
             "elim-term-ite" => Ok(Self::ElimTermIte),
             // `cofactor-term-ite` reduces to the same Shannon ITE lift as
-            // `blast-term-ite` (same alias pattern as `tseitin-cnf`|`cnf`): an
-            // equivalent ite-tree, differently ordered/simplified than z3's
-            // cofactoring — documented in the tactic descr.
+            // `blast-term-ite`: an equivalent ite-tree, differently
+            // ordered/simplified than z3's cofactoring — documented in the
+            // tactic description.
             "blast-term-ite" | "cofactor-term-ite" => Ok(Self::BlastTermIte),
             "der" => Ok(Self::Der),
             "distribute-forall" => Ok(Self::DistributeForall),

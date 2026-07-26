@@ -721,6 +721,25 @@ fn contains_nonlinear_mul_treats_constant_factor_as_linear() {
 }
 
 #[test]
+fn and_all_deduplicates_exact_conjuncts_after_flattening() {
+    let x = ChcVar::new("x", ChcSort::Int);
+    let lower = ChcExpr::le(ChcExpr::Int(0), ChcExpr::var(x.clone()));
+    let upper = ChcExpr::le(ChcExpr::var(x), ChcExpr::Int(10));
+
+    let conjunction = ChcExpr::and_all([
+        lower.clone(),
+        ChcExpr::and_all([upper.clone(), lower.clone()]),
+        upper,
+    ]);
+
+    let ChcExpr::Op(ChcOp::And, ref args) = conjunction else {
+        panic!("expected two distinct flattened conjuncts");
+    };
+    assert_eq!(args.len(), 2);
+    assert_eq!(args[0].as_ref(), &lower);
+}
+
+#[test]
 fn test_or_all_dedup_preserves_distinct_disjuncts_9076() {
     // #9076: or_all must dedup by EXACT structural identity, not hash alone.
     // The soundness property: every structurally-DISTINCT disjunct survives

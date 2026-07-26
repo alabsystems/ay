@@ -57,6 +57,10 @@ pub enum LpError {
     #[error("iteration limit reached")]
     IterationLimit,
 
+    /// Solver produced an internally inconsistent answer.
+    #[error("numerical failure: {0}")]
+    NumericalFailure(String),
+
     /// I/O error while reading the instance.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

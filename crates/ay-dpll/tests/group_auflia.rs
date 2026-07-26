@@ -67,5 +67,7 @@ mod dt_uflia_array_free_routing_chc25;
 mod qf_ax_swap_np_soundness;
 #[path = "group_auflia/qf_ax_swap_sf_soundness.rs"]
 mod qf_ax_swap_sf_soundness;
+#[path = "group_auflia/recovered_array_false_unsat.rs"]
+mod recovered_array_false_unsat;
 #[path = "group_auflia/uflia_fd_rescue_04_06.rs"]
 mod uflia_fd_rescue_04_06;

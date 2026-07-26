@@ -1,0 +1,23 @@
+id: sat-satcomp-2026-main-corpus
+version: 1
+description: >
+  Exact ordered 400-row SAT Competition 2026 benchmark selection from the
+  organizer's pinned selected_benchmarks.csv. Duplicate selected payloads are
+  retained as distinct scored rows. AY and Z3 run on the same private input
+  snapshots; this is a same-host corpus replay, not an official-hardware score.
+owner: andrewyates.name@gmail.com
+competition: sat-comp
+scoring: sat-comp
+inputs:
+  benchmarks_dir: benchmarks/sat/satcomp2026-main/instances
+  reference_solver: z3
+  timeout_sec: 60
+  standard_timeout_sec: 5000
+  runs: 1
+metrics:
+  - solved
+  - total
+  - wrong
+  - par2_avg
+outputs:
+  results_dir: evals/results/sat-satcomp-2026-main-corpus/{run_id}

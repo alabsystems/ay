@@ -5,6 +5,7 @@
   with companion PB, MaxSAT, QBF, CP, and LP/MILP engines.</p>
   <p>
     <a href="#quick-start">Quick start</a> ·
+    <a href="#learn-ay-interactively">Tutorial</a> ·
     <a href="#check-ays-answers-without-trusting-ay">Check the answers</a> ·
     <a href="#use-ay">Use AY</a> ·
     <a href="#capability-grid">Capabilities</a> ·
@@ -80,8 +81,28 @@ SMT
 
 AY returns `sat` and a model, for example `x = 7, y = 0`.
 
-Unsat answers carry proof. Solve the included unsatisfiable example and
-re-check the emitted certificate with
+### Learn AY interactively
+
+`ay tutorial` is the front door to AY's complete feature set. The hub links to
+fundamentals, an engineer course with Sudoku/routing/Minesweeper programs, an
+expert course with worked proof and incremental examples, and a feature atlas:
+
+```bash
+ay tutorial
+ay tutorial engineers
+ay tutorial experts
+ay tutorial features
+ay tutorial play sudoku
+```
+
+For applications that look like search, scheduling, routing, configuration, or
+puzzle solving, see the typed Rust/Python/TypeScript
+[`AY Search` guide](AY_SEARCH.md). It lets the program declare finite
+choices, constraints, and an objective while AY supplies propagation,
+backtracking, enumeration, and optimization.
+
+This supported QF_LIA example carries an Alethe proof. Solve it and re-check
+the emitted certificate with
 [Carcara](https://github.com/ufmg-smite/carcara), the SMT community's
 independent Alethe proof checker
 (`cargo install --git https://github.com/ufmg-smite/carcara.git`):
@@ -375,7 +396,13 @@ underlying techniques began here.
   process, and records versions, hashes, timeouts, disagreements, unknowns,
   and crashes. It measures a named surface rather than turning one passing
   corpus into a universal claim. See
-  [`ay-z3-parity`](crates/ay-z3-parity/src/main.rs).
+  [`ay-z3-parity`](crates/ay-z3-parity/src/main.rs). Its
+  [`smtlib-conformance` gate](the development design notes) separately pins
+  SMT-LIB 2.7 and the exact Z3 5.0.0 overlay, then fails closed on any
+  unowned requirement, incomplete source inventory, skip, unknown, or
+  unvalidated SAT model/UNSAT proof. It currently serves as an executable
+  readiness contract: only target identity is implemented, so no build can
+  receive a full replacement pass yet.
 
 ## AY in ALab Systems
 
@@ -474,7 +501,10 @@ ay --features                     # 54 SMT logics, 4 proof formats, 12 proof the
 ay z3-audit --scope cli-subset --inventory-only --summary-json audit.json
 ay verifier-audit --consumer all --json surfaces.json   # 13 surfaces: 11 READY, 2 tracked gaps
 ay diagnose --reference z3 examples/quickstart_unsat.smt2
-ay corpus list                    # 27 corpora with pinned provenance
+ay corpus list                    # all managed corpora with provenance/status
+ay corpus plan --group competition-2025-2026 --json  # read-only download/tool/disk preflight
+ay corpus campaign-audit          # exact 2025/26 track-to-asset/profile join
+ay bench campaign plan --profile reviewer-full  # one disposition for every track
 ay tool list                      # external checkers/solvers registry + install state
 ay scripts list                   # every maintained script, indexed and grouped
 ay bench compare list             # the competition registry: specs, budgets, winners
@@ -489,6 +519,10 @@ Reproduce a comparison locally (requires Z3 plus `curl`, `tar`, and `zstd`):
 cargo build --release --locked -p ay --features bench --bin ay
 ./target/release/ay bench list
 ./target/release/ay corpus list
+# After the complete campaign acquisition recipe below:
+./target/release/ay bench campaign run --profile reviewer-full \
+  --require-installed \
+  --output evals/results/campaign/reviewer-full.json
 
 # Start with the small suite shipped in the checkout.
 ./target/release/ay bench run smt-local-suite \
@@ -554,6 +588,7 @@ AY is a Cargo workspace. The main boundaries are:
 | `crates/ay-chc` | CHC portfolio and certificate surfaces. |
 | `crates/ay-pb`, `ay-maxsat`, `ay-qbf`, `ay-count` | Discrete optimization and counting engines. |
 | `crates/ay-lp`, `ay-milp`, `ay-cp` | LP/MILP and constraint-programming paths. |
+| `crates/ay-search` | Typed finite-domain search, enumeration, optimization, and portable SearchSpec v1. |
 | `crates/ay-bindings`, `crates/ay-ffi` | Typed Rust API and native/Z3-shaped interfaces. |
 | `bindings/` | Python, C++, Java, JavaScript/WASM, and OCaml adapters. |
 | `benchmarks/`, `evals/` | Small fixtures, corpus metadata, and reproducible evaluation definitions. |
@@ -566,9 +601,22 @@ full. `ay corpus list` prints the catalog, defined in
 
 ```bash
 ay corpus list
+ay corpus campaign-audit
+ay corpus plan \
+  --group competition-2025-2026 \
+  --group competition-2025-2026-competitors \
+  --group competition-2025-2026-external
+ay corpus download \
+  --group competition-2025-2026 \
+  --group competition-2025-2026-competitors \
+  --group competition-2025-2026-external
+ay corpus verify \
+  --group competition-2025-2026 \
+  --group competition-2025-2026-competitors \
+  --group competition-2025-2026-external
+ay corpus campaign-audit --require-installed
 ay corpus download satcomp2024-sample
 ay corpus download chc-comp-2025-benchmarks
-ay corpus verify --all
 ```
 
 </details>

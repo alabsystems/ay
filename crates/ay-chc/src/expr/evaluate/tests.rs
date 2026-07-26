@@ -496,6 +496,64 @@ mod bigint_escape_value_ops {
             "non-integer model value must abstain, not coerce"
         );
     }
+
+    /// A concrete Int-valued array select must participate in the exact
+    /// comparison retry when the opposite operand is a beyond-i128 Horner
+    /// literal. This is the shape emitted by Solidity LIA-Array benchmarks.
+    #[test]
+    fn eval_int_big_array_select_against_horner_literal() {
+        let int_array = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+        let arr = ChcVar::new("arr", int_array);
+        let mut model: FxHashMap<String, SmtValue> = FxHashMap::default();
+        model.insert(
+            "arr".to_string(),
+            SmtValue::ArrayMap {
+                default: Box::new(SmtValue::Int(0)),
+                entries: vec![(SmtValue::Int(7), SmtValue::Int(42))],
+            },
+        );
+
+        let selected = ChcExpr::select(ChcExpr::var(arr), ChcExpr::int(7));
+        assert_eq!(eval_int_big(&selected, &model), Some(BigInt::from(42)));
+
+        let two_256_minus_one = (BigInt::from(1u8) << 256) - 1;
+        let lhs = ChcExpr::add(selected, ChcExpr::int(5));
+        let rhs = ChcExpr::from_bigint(two_256_minus_one);
+        let comparison = ChcExpr::le(lhs.clone(), rhs.clone());
+        assert_eq!(
+            evaluate_expr(&comparison, &model),
+            Some(SmtValue::Bool(true))
+        );
+        let false_control = ChcExpr::gt(lhs, rhs);
+        assert_eq!(
+            evaluate_expr(&false_control, &model),
+            Some(SmtValue::Bool(false))
+        );
+    }
+
+    /// BigInt array elements remain exact, while a non-integer selected value
+    /// must abstain rather than being coerced into the integer lane.
+    #[test]
+    fn eval_int_big_array_select_value_type_controls() {
+        let int_array = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+        let ints = ChcVar::new("ints", int_array);
+        let bool_array = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Bool));
+        let bools = ChcVar::new("bools", bool_array);
+        let mut model: FxHashMap<String, SmtValue> = FxHashMap::default();
+        model.insert(
+            "ints".to_string(),
+            SmtValue::ConstArray(Box::new(SmtValue::int_from_bigint(big_probe()))),
+        );
+        model.insert(
+            "bools".to_string(),
+            SmtValue::ConstArray(Box::new(SmtValue::Bool(true))),
+        );
+
+        let selected_int = ChcExpr::select(ChcExpr::var(ints), ChcExpr::int(0));
+        assert_eq!(eval_int_big(&selected_int, &model), Some(big_probe()));
+        let selected_bool = ChcExpr::select(ChcExpr::var(bools), ChcExpr::int(0));
+        assert_eq!(eval_int_big(&selected_bool, &model), None);
+    }
 }
 
 // --- Real (LRA) arithmetic evaluation (#LRA-Lin) -----------------------------

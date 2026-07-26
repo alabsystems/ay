@@ -211,7 +211,23 @@ impl Solver {
         self.cold.original_ledger.pop_scope();
         // Keep incremental_original_boundary in sync with ledger size so that
         // reset_search_state does not attempt to re-add already-present clauses.
-        self.cold.incremental_original_boundary = self.cold.original_ledger.num_clauses();
+        //
+        // CLAMP, do not assign (#unguarded-tvalid-lemmas fuzz find): under the
+        // IC3/inc-engine deferral (`add_clause_unscoped_inner` keeps the
+        // boundary put and leaves new clauses ledger-only until the next
+        // solve's `attach_new_clauses_incremental`), a pop() BEFORE the next
+        // solve must not advance the boundary past deferred clauses of the
+        // still-live outer scopes — assigning `num_clauses()` here marked them
+        // "already attached", leaving them permanently absent from the arena
+        // and invisible to BCP (wrong SAT on push;add;push;add;pop;solve —
+        // caught by fuzz_unguarded_tvalid_lemma_differential seed 16). When
+        // everything was attached (boundary == pre-pop ledger size, the
+        // non-deferral invariant), min() truncates exactly like the old
+        // assignment did.
+        self.cold.incremental_original_boundary = self
+            .cold
+            .incremental_original_boundary
+            .min(self.cold.original_ledger.num_clauses());
 
         // Invalidate JIT conflict processor on pop (#8489): the scope may have
         // added variables (scope selectors) that changed num_vars. The conflict
@@ -889,6 +905,23 @@ impl Solver {
     /// Leaves the CHC/PDR IC3 path (ic3_mode WITHOUT this flag) untouched.
     pub fn set_inc_engine_reset_mode(&mut self, on: bool) {
         self.cold.inc_engine_reset_mode = on;
+    }
+
+    /// #unguarded-tvalid-lemmas STAGE 1: retain THEORY-CONFLICT lemmas
+    /// permanently across `pop()` (OpenSMT-style).
+    ///
+    /// When on, `add_theory_conflict_lemma` stores its clause via the
+    /// unscoped `add_theory_lemma` path (`scope_lim = 0`, no `+selector`
+    /// guard) instead of `add_theory_lemma_scoped`. The caller contract: only
+    /// route T-VALID conflict lemmas (theory tautologies over term-semantic
+    /// atom literals, e.g. LRA Farkas cores) through that entry, and only
+    /// enable this on solvers whose atom var<->term binding is
+    /// session-stable. Set by the incremental QF_LRA engine lane
+    /// (`AY_LRA_INC_UNGUARDED_LEMMAS`, default-ON there, `=0` opts out);
+    /// that lane excludes proof sessions. Default off: behavior identical
+    /// to the scoped path.
+    pub fn set_unguarded_theory_conflict_lemmas(&mut self, on: bool) {
+        self.cold.unguarded_theory_conflict_lemmas = on;
     }
 
     /// Set the constraint activation variable for lightweight IC3 constraints (#8662).

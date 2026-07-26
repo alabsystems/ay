@@ -11,11 +11,11 @@ use super::LogicCategory;
 pub(crate) const FAIL_CLOSED_COMBINED: [&str; 4] =
     ["QF_BVLRA", "QF_AUFBVLIA", "QF_UFBVLIA", "QF_AUFBVLIRA"];
 
-/// Whether z3 4.15.4 silently ACCEPTS `s` as a `set-logic` token (solve, exit 0)
+/// Whether z3 5.0.0 silently ACCEPTS `s` as a `set-logic` token (solve, exit 0)
 /// rather than emitting `unsupported` + `; ignoring unsupported logic ...`.
 ///
 /// z3's recognizer is STRUCTURAL/substring, not a whitelist — reverse-engineered
-/// and pinned by a 45-token adversarial sweep against z3 4.15.4. It is
+/// and pinned by an adversarial sweep against z3 5.0.0. It is
 /// case-sensitive. Accept iff `s` is one of a small exact set, OR contains any
 /// recognized theory-fragment substring, OR starts with `A` / `QF_A`.
 ///
@@ -29,8 +29,8 @@ pub(crate) fn is_z3_recognized_logic(s: &str) -> bool {
     if EXACT.contains(&s) {
         return true;
     }
-    const SUBSTR: [&str; 11] = [
-        "UF", "BV", "DT", "LIA", "LRA", "LIRA", "NIA", "NRA", "NIRA", "IDL", "RDL",
+    const SUBSTR: [&str; 12] = [
+        "UF", "BV", "DT", "FP", "LIA", "LRA", "LIRA", "NIA", "NRA", "NIRA", "IDL", "RDL",
     ];
     if SUBSTR.iter().any(|needle| s.contains(needle)) {
         return true;

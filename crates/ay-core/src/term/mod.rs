@@ -296,7 +296,6 @@ impl From<BigRational> for RationalWrapper {
 // cloning also mints a distinct rollback identity so an opaque speculative
 // checkpoint can never be transplanted between the two otherwise-identical
 // stores.
-#[derive(Clone)]
 pub struct TermStore {
     /// All terms, indexed by TermId
     terms: Vec<TermEntry>,
@@ -411,6 +410,48 @@ pub struct TermStore {
     rollback_identity: RollbackIdentity,
     /// Invalidates every older checkpoint after one rollback is consumed.
     rollback_generation: u64,
+}
+
+impl Clone for TermStore {
+    fn clone(&self) -> Self {
+        let cloned = Self {
+            terms: self.terms.clone(),
+            hash_cons: self.hash_cons.clone(),
+            not_cache: self.not_cache.clone(),
+            var_counter: self.var_counter,
+            names: self.names.clone(),
+            true_term: self.true_term,
+            false_term: self.false_term,
+            to_real_shadowed: self.to_real_shadowed,
+            is_int_shadowed: self.is_int_shadowed,
+            // These are conservative allocation ledgers, not a fresh capacity
+            // census. A cloned Vec/HashMap may reserve less than its source,
+            // so copying can overcount, but never undercounts the source's
+            // tracked history and remains exactly balanced with this clone's
+            // later Drop.
+            instance_term_bytes: self.instance_term_bytes,
+            heap_data_bytes: self.heap_data_bytes,
+            bucket_capacity_bytes: self.bucket_capacity_bytes,
+            // Container clones are free to choose different capacities, so the
+            // source store's capacity-based cache is not valid for this copy.
+            true_memory_cache: std::cell::Cell::new(0),
+            true_memory_cache_at: std::cell::Cell::new(0),
+            no_mbqi: self.no_mbqi.clone(),
+            skolem_symbols: self.skolem_symbols.clone(),
+            synthesis_watermark: self.synthesis_watermark,
+            quantifier_id: self.quantifier_id.clone(),
+            skolem_id: self.skolem_id.clone(),
+            rollback_identity: self.rollback_identity.clone(),
+            rollback_generation: self.rollback_generation,
+        };
+
+        // A cloned store owns a second physical allocation and its Drop
+        // subtracts this exact per-instance counter. Credit the process-wide
+        // aggregate only after every field clone succeeded, keeping clone/drop
+        // accounting balanced even if an allocation above panics.
+        GLOBAL_TERM_BYTES.fetch_add(cloned.instance_term_bytes, Ordering::Relaxed);
+        cloned
+    }
 }
 
 /// Clone behavior for a store's rollback identity: a cloned `TermStore` owns

@@ -17,6 +17,10 @@ fn int(n: i64) -> BigRational {
     BigRational::from_integer(n.into())
 }
 
+fn rat(n: i64, d: i64) -> BigRational {
+    BigRational::new(n.into(), d.into())
+}
+
 /// A window-shaped LP: `x0, x1 in [0, 1]`, `y = x0 + x1` (free), plus a
 /// coupling row `x0 - x1 >= -1/2`. Returns the model and `y`.
 fn window_model() -> (Model, Col) {
@@ -178,5 +182,124 @@ fn verify_rejects_inconsistent_duplicate_column_row() {
     assert!(
         bad.verify(&m).is_err(),
         "an internally-inconsistent duplicate-column row must be rejected"
+    );
+}
+
+/// Regression for the >600-row harvest proof lane: the structural output is
+/// free, so neither direction can be certified from its box alone. The row
+/// duals must carry the bound through a tall affine chain, and the resulting
+/// exact fact combination must verify in both public senses.
+#[test]
+fn tall_affine_chain_harvests_verified_min_and_max_rows() {
+    let mut m = Model::new();
+    let input = m.add_col(0.0, 1.0);
+    let mut previous = input;
+    for _ in 0..601 {
+        let next = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        m.add_row(0.0, 0.0, &[(next, 1.0), (previous, -1.0)]);
+        previous = next;
+    }
+    let output = previous;
+    let mut s = LpSession::new(&m, &SolveOpts::new()).unwrap();
+
+    let lower = s
+        .harvest_cut(&[(output, 1.0)], Sense::Minimize)
+        .expect("tall-chain minimize should produce a certified weak row");
+    lower.verify(&m).unwrap();
+    assert_eq!(lower.coeffs, vec![(output.index() as u32, int(1))]);
+    assert_eq!(lower.lb, int(0));
+
+    let upper = s
+        .harvest_cut(&[(output, 1.0)], Sense::Maximize)
+        .expect("tall-chain maximize should produce a certified weak row");
+    upper.verify(&m).unwrap();
+    assert_eq!(upper.coeffs, vec![(output.index() as u32, int(-1))]);
+    assert_eq!(upper.lb, int(-1));
+}
+
+/// A >600-row model whose exact minimum is 1/3, but whose useful float row
+/// dual is 1/3 and therefore snaps slightly DOWN on the 2^-30 weak-proof grid.
+/// The 600 independent affine equalities put it on the large harvest lane
+/// without changing the objective.
+fn snapped_third_model() -> (Model, Col) {
+    let mut m = Model::new();
+    let x = m.add_col(1.0, 2.0);
+    let z = m.add_col(0.0, 1.0);
+    m.add_row(0.0, 0.0, &[(z, 3.0), (x, -1.0)]); // z = x/3
+    for _ in 0..600 {
+        let dummy = m.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        m.add_row(0.0, 0.0, &[(dummy, 1.0)]);
+    }
+    (m, z)
+}
+
+#[test]
+fn threshold_harvest_accepts_strictly_sufficient_weak_row() {
+    let (m, z) = snapped_third_model();
+    let mut s = LpSession::new(&m, &SolveOpts::new()).unwrap();
+    let row = s
+        .harvest_cut_stronger_than(&[(z, 1.0)], Sense::Minimize, &int(0))
+        .expect("the snapped weak bound is strictly positive");
+    row.verify(&m).unwrap();
+    assert!(row.lb > int(0));
+    assert!(
+        row.lb < rat(1, 3),
+        "this guard must exercise the weak row, not the exact optimum"
+    );
+}
+
+#[test]
+fn threshold_harvest_rejects_exact_equality() {
+    let (m, y) = window_model();
+    let mut s = LpSession::new(&m, &SolveOpts::new()).unwrap();
+    assert!(
+        s.harvest_cut_stronger_than(&[(y, 1.0)], Sense::Minimize, &int(0))
+            .is_none(),
+        "min y = 0 equals, but does not exceed, the exclusive threshold"
+    );
+}
+
+#[test]
+fn threshold_harvest_maximize_uses_returned_lower_form_coordinates() {
+    let (m, y) = window_model();
+    let mut s = LpSession::new(&m, &SolveOpts::new()).unwrap();
+    let row = s
+        .harvest_cut_stronger_than(&[(y, 1.0)], Sense::Maximize, &int(-3))
+        .expect("max y = 2 is returned as -y >= -2, which exceeds -3");
+    row.verify(&m).unwrap();
+    assert_eq!(row.coeffs, vec![(y.index() as u32, int(-1))]);
+    assert_eq!(row.lb, int(-2));
+
+    assert!(
+        s.harvest_cut_stronger_than(&[(y, 1.0)], Sense::Maximize, &int(-2))
+            .is_none(),
+        "the returned lower-form bound equals, but does not exceed, -2"
+    );
+}
+
+#[test]
+fn insufficient_weak_row_continues_to_stronger_exact_fallback() {
+    let (m, z) = snapped_third_model();
+    let mut s = LpSession::new(&m, &SolveOpts::new()).unwrap();
+    let weak = s
+        .harvest_cut(&[(z, 1.0)], Sense::Minimize)
+        .expect("large-model weak row");
+    weak.verify(&m).unwrap();
+    assert!(weak.lb < rat(1, 3));
+
+    // The next float solve deterministically proposes the same weak bound.
+    // Equality is insufficient, so both signs must be rejected and the exact
+    // rim must recover the genuinely stronger optimum z >= 1/3.
+    let exact = s
+        .harvest_cut_stronger_than(&[(z, 1.0)], Sense::Minimize, &weak.lb)
+        .expect("insufficient weak advice must continue to exact fallback");
+    exact.verify(&m).unwrap();
+    assert_eq!(exact.lb, rat(1, 3));
+    assert!(exact.lb > weak.lb);
+
+    assert!(
+        s.harvest_cut_stronger_than(&[(z, 1.0)], Sense::Minimize, &rat(1, 2))
+            .is_none(),
+        "even the exact optimum is insufficient for a threshold above 1/3"
     );
 }

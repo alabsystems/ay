@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ay-script: pre-push-hook
-# In-tree pre-push hook: run the SMT soundness-differential gate before every
-# push. This opt-in local coverage supplements the repository's GitHub Actions
-# checks.
+# In-tree pre-push hook: enforce zero active first-party Python test skips and
+# run the SMT soundness-differential gate before every push. This opt-in local
+# coverage supplements the repository's GitHub Actions checks.
 #
 # INSTALL (the owner installs it; it is never forced):
 #     git config core.hooksPath scripts/git-hooks
@@ -24,7 +24,18 @@ if command -v git-lfs >/dev/null 2>&1; then
     git lfs pre-push "$@" || exit $?
 fi
 
-# --- 2. Soundness-differential gate -----------------------------------------
+# --- 2. Python zero-skip gate -----------------------------------------------
+echo ""
+echo "pre-push: checking for active first-party Python test skips ..."
+if ! python3 "$REPO_ROOT/scripts/check_no_python_test_skips.py"; then
+    echo ""
+    echo "pre-push: BLOCKED — active Python test skip found."
+    echo "          Fix the root cause; first-party skips are not permitted."
+    exit 1
+fi
+echo "pre-push: Python zero-skip gate PASSED."
+
+# --- 3. Soundness-differential gate -----------------------------------------
 echo ""
 echo "pre-push: running SMT soundness-differential gate ..."
 if ! bash "$REPO_ROOT/scripts/ci/smt_soundness_gate.sh"; then

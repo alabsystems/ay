@@ -11,7 +11,7 @@
 use std::fs;
 use std::path::Path;
 
-use ay_lp::{parse_lp, parse_mps, solve, Problem, RowKind, Sense, Solution};
+use ay_lp::{parse_lp, parse_mps, solve, LpError, Problem, RowKind, Sense, Solution};
 
 fn fixture_path(name: &str) -> String {
     let dir = env!("CARGO_MANIFEST_DIR");
@@ -197,4 +197,19 @@ ENDATA
     );
     assert!((sol.values[0] + 2.0).abs() < 1e-3, "x = {}", sol.values[0]);
     check_feasible(&problem, &sol);
+}
+
+#[test]
+fn test_lp_binary_with_explicit_inconsistent_bound_is_infeasible() {
+    let input = "\
+Maximize
+ x
+Bounds
+ x >= 2
+Binary
+ x
+End
+";
+    let problem = parse_lp(input).expect("parse lp");
+    assert!(matches!(solve(&problem), Err(LpError::Infeasible)));
 }

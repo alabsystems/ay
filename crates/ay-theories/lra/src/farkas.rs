@@ -29,7 +29,20 @@ impl LraSolver {
         // Most rows are feasible, so pass 2 almost never executes.
 
         for row_idx in 0..self.rows.len() {
-            let lower_conflict_upper = {
+            // #8471: each pass-1 sweep is discarded unless the basic var carries the
+            // bound it would contradict (the lower sweep needs `basic.upper`, the upper
+            // sweep needs `basic.lower`). Testing that first is behaviour-identical —
+            // the sweeps only read state — and turns a full O(row) Rational sweep into
+            // one Option test on every row whose basic var is unbounded in that
+            // direction, which is common for rows whose slack carries only one asserted
+            // side.
+            let basic_has_upper = self.vars[self.rows[row_idx].basic_var as usize]
+                .upper
+                .is_some();
+
+            let lower_conflict_upper = if !basic_has_upper {
+                None
+            } else {
                 let row = &self.rows[row_idx];
                 let basic_info = &self.vars[row.basic_var as usize];
 
@@ -95,7 +108,18 @@ impl LraSolver {
                 }
             }
 
-            let upper_conflict_lower = {
+            // Re-read, deliberately NOT hoisted past the pass-2 call above:
+            // `build_lower_farkas_conflict` takes `&mut self`. It writes no bound slot
+            // today (its only `&mut` effect is `stats.stale_conflict_rejected_count`),
+            // but a hoisted flag would go stale in the one direction that loses a
+            // conflict — a `basic.lower` that APPEARS leaves the flag `false` and skips
+            // this sweep, i.e. SAT on an UNSAT row. Identical cost, no window.
+            let basic_has_lower = self.vars[self.rows[row_idx].basic_var as usize]
+                .lower
+                .is_some();
+            let upper_conflict_lower = if !basic_has_lower {
+                None
+            } else {
                 let row = &self.rows[row_idx];
                 let basic_info = &self.vars[row.basic_var as usize];
 

@@ -13,27 +13,31 @@
 //! For every division subdir under a corpus root, every `.smt2` file is run
 //! through AY (via the FFI dylib), z3 (via libz3), and `ay --self-check` (via
 //! a CLI binary proved to come from the same clean source revision as the FFI
-//! library). Each run is a fresh, timeboxed child process, reusing the exact
-//! isolation/timing plumbing of the `bench` subcommand, so no crashing or
-//! runaway solve can bias or abort the campaign.
+//! library). Each run is a stopped-exec, resource-enveloped child process,
+//! reusing the exact isolation/timing plumbing of the `bench` subcommand, so
+//! no crashing or runaway solve can bias or abort the campaign.
 //!
 //! Output is a compact per-division table plus a persisted JSON certificate
 //! carrying all raw per-division and per-file data. Given a prior certificate
-//! via `--baseline`, a DELTA column tracks solved% / selfcert% / strict changes
+//! via `--baseline`, a DELTA column tracks solved% / selfcert% / rating changes
 //! across runs. Any `sat`-vs-`unsat` DISAGREE (AY vs z3) — or any self-check
 //! answer that contradicts AY's own eval — is a wrong answer: it is surfaced
 //! as a prominent WARNING and forces a nonzero exit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use ay_bench::{PlannedResources, ResourcePlan};
+
 use crate::bench::{
-    self, categorize, geomean, host_info, median, ratio_of, run_one, run_selfcheck, sha256_of,
-    spawn_timeboxed, utc_now_iso, BenchOutcome, Category, SelfCheck, WIN_LOSS_MIN_SECS,
+    self, categorize, geomean, host_info, median, ratio_of, resource_evidence, run_one,
+    run_selfcheck, sha256_of, spawn_timeboxed, utc_now_iso, BenchOutcome, Category, OutcomeKind,
+    SelfCheck, WIN_LOSS_MIN_SECS,
 };
 use crate::diff::Verdict;
 use crate::loader;
@@ -66,6 +70,233 @@ pub(crate) struct ScoreboardConfig {
     pub json_out: PathBuf,
     pub baseline: Option<PathBuf>,
     pub divisions: Option<Vec<String>>,
+    /// Append-only per-file journal, written as each file completes. Defaults to
+    /// `<json_out>.checkpoint.jsonl`; the certificate is only written at the very
+    /// end, so without this a crash at hour 40 of a multi-day corpus run loses
+    /// everything.
+    pub checkpoint: Option<PathBuf>,
+    /// Reuse completed files from the checkpoint instead of re-running them.
+    /// Opt-in: silently reusing a stale journal would fabricate results.
+    pub resume: bool,
+    /// Files sampled PER DIVISION. `None` runs every file. A full SMT-LIB pass
+    /// is 438k files (~300h at 20s/file across three solvers), so a bounded
+    /// per-track sample is what makes this runnable on a schedule.
+    pub sample: Option<usize>,
+    /// Sampling seed. The selection is a pure function of (seed, division,
+    /// relative path), so the same seed always yields the same set and two runs
+    /// are comparable; a different seed is an independent sample of the track.
+    pub seed: u64,
+    /// Periodically-rewritten JSON status file: done/total, rate, ETA, and
+    /// per-division progress. This is how a long run is observed without
+    /// tailing a million-line stderr log.
+    pub progress: Option<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// Seeded per-division sampling
+// ---------------------------------------------------------------------------
+
+/// FNV-1a 64. Chosen over `DefaultHasher` because the sample must be stable
+/// across toolchain versions and machines — a benchmark selection that silently
+/// reshuffles when the compiler updates is not reproducible evidence.
+fn fnv1a64(seed: u64, bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325 ^ seed;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Take at most `n` files from EACH division, chosen by hashing (seed, path).
+///
+/// Hash-ranked rather than evenly-spaced-by-index because the corpus grows: an
+/// index rule reshuffles the whole sample when files are added, while the hash
+/// rule keeps previously-selected files selected, so a track's numbers stay
+/// comparable across corpus refreshes. Execution order is restored to sorted
+/// path order afterwards so the run itself stays deterministic.
+fn sample_per_division(
+    files: Vec<(String, PathBuf)>,
+    n: usize,
+    seed: u64,
+) -> (Vec<(String, PathBuf)>, BTreeMap<String, (usize, usize)>) {
+    let mut by_div: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for (div, f) in files {
+        by_div.entry(div).or_default().push(f);
+    }
+    let mut kept = Vec::new();
+    let mut census = BTreeMap::new();
+    for (div, mut paths) in by_div {
+        let available = paths.len();
+        paths.sort_by_cached_key(|p| (fnv1a64(seed, p.as_os_str().as_encoded_bytes()), p.clone()));
+        paths.truncate(n);
+        paths.sort();
+        census.insert(div.clone(), (paths.len(), available));
+        kept.extend(paths.into_iter().map(|p| (div.clone(), p)));
+    }
+    kept.sort();
+    (kept, census)
+}
+
+// ---------------------------------------------------------------------------
+// Checkpoint journal
+// ---------------------------------------------------------------------------
+//
+// One JSON object per line, flushed as each file completes, so a killed or
+// crashed run can resume instead of restarting. Only RAW per-solver outcomes are
+// persisted; `category` and `ratio` are DERIVED and are recomputed on resume, so
+// a journal can never disagree with the current classifier.
+//
+// Line 0 is a header fingerprinting the run (corpus root, timeout, and the
+// sha256 of every binary involved). `--resume` refuses a journal whose header
+// does not match the current run, because mixing results from two different
+// binaries or timeouts produces a certificate that describes neither.
+
+/// Reconstruct a verdict token written by `Verdict::as_str`.
+fn verdict_from_str(s: &str) -> Option<Verdict> {
+    match s {
+        "sat" => Some(Verdict::Sat),
+        "unsat" => Some(Verdict::Unsat),
+        "unknown" => Some(Verdict::Unknown),
+        _ => None,
+    }
+}
+
+fn outcome_to_json(o: &BenchOutcome) -> serde_json::Value {
+    let (kind, verdicts, detail) = match &o.kind {
+        OutcomeKind::Verdicts(v) => (
+            "verdicts",
+            Some(v.iter().map(|x| x.as_str()).collect::<Vec<_>>()),
+            None,
+        ),
+        OutcomeKind::Timeout => ("timeout", None, None),
+        OutcomeKind::MemoryLimit => ("memout", None, None),
+        OutcomeKind::Crash(d) => ("crash", None, Some(d.clone())),
+        OutcomeKind::InputError(d) => ("input-error", None, Some(d.clone())),
+    };
+    serde_json::json!({
+        "kind": kind,
+        "verdicts": verdicts,
+        "detail": detail,
+        "wall_ns": o.wall.as_nanos() as u64,
+        "peak_rss": o.peak_rss,
+    })
+}
+
+fn outcome_from_json(v: &serde_json::Value) -> Option<BenchOutcome> {
+    let detail = || v.get("detail")?.as_str().map(str::to_string);
+    let kind = match v.get("kind")?.as_str()? {
+        "verdicts" => OutcomeKind::Verdicts(
+            v.get("verdicts")?
+                .as_array()?
+                .iter()
+                .map(|x| x.as_str().and_then(verdict_from_str))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        "timeout" => OutcomeKind::Timeout,
+        "memout" => OutcomeKind::MemoryLimit,
+        "crash" => OutcomeKind::Crash(detail().unwrap_or_default()),
+        "input-error" => OutcomeKind::InputError(detail().unwrap_or_default()),
+        _ => return None,
+    };
+    Some(BenchOutcome {
+        kind,
+        wall: Duration::from_nanos(v.get("wall_ns")?.as_u64()?),
+        peak_rss: v.get("peak_rss").and_then(serde_json::Value::as_u64),
+    })
+}
+
+fn selfcheck_to_json(s: &SelfCheck) -> serde_json::Value {
+    let (kind, verdicts, detail) = match s {
+        SelfCheck::Verdicts(v) => (
+            "verdicts",
+            Some(v.iter().map(|x| x.as_str()).collect::<Vec<_>>()),
+            None,
+        ),
+        SelfCheck::Timeout => ("timeout", None, None),
+        SelfCheck::MemoryLimit => ("memout", None, None),
+        SelfCheck::Crash(d) => ("crash", None, Some(d.clone())),
+        SelfCheck::Error(d) => ("error", None, Some(d.clone())),
+    };
+    serde_json::json!({ "kind": kind, "verdicts": verdicts, "detail": detail })
+}
+
+fn selfcheck_from_json(v: &serde_json::Value) -> Option<SelfCheck> {
+    let detail = || {
+        v.get("detail")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(match v.get("kind")?.as_str()? {
+        "verdicts" => SelfCheck::Verdicts(
+            v.get("verdicts")?
+                .as_array()?
+                .iter()
+                .map(|x| x.as_str().and_then(verdict_from_str))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        "timeout" => SelfCheck::Timeout,
+        "memout" => SelfCheck::MemoryLimit,
+        "crash" => SelfCheck::Crash(detail()),
+        "error" => SelfCheck::Error(detail()),
+        _ => return None,
+    })
+}
+
+/// Identity of a run. A journal may only be resumed into an identical one.
+fn checkpoint_header(cfg: &ScoreboardConfig, ay_sha: &str, z3_sha: &str) -> serde_json::Value {
+    serde_json::json!({
+        "checkpoint_schema": 1,
+        "root": cfg.root.display().to_string(),
+        "timeout_secs": cfg.timeout_secs,
+        "divisions": cfg.divisions,
+        "ay_sha256": ay_sha,
+        "z3_sha256": z3_sha,
+    })
+}
+
+/// Completed per-file outcomes from a prior run, keyed by file path.
+type ResumeMap = HashMap<PathBuf, (BenchOutcome, Option<BenchOutcome>, SelfCheck)>;
+
+/// Load a journal, fail-closed. Returns `Err` when the header is absent or
+/// describes a different run; a truncated final line (the normal shape of a
+/// crash) is dropped and everything before it is kept.
+fn load_checkpoint(path: &Path, expected_header: &serde_json::Value) -> Result<ResumeMap, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read checkpoint {}: {e}", path.display()))?;
+    let mut lines = text.lines();
+    let header: serde_json::Value = lines
+        .next()
+        .ok_or_else(|| format!("checkpoint {} is empty", path.display()))
+        .and_then(|l| serde_json::from_str(l).map_err(|e| format!("bad checkpoint header: {e}")))?;
+    if &header != expected_header {
+        return Err(format!(
+            "checkpoint {} describes a different run and cannot be resumed.\n  \
+             journal: {header}\n  current: {expected_header}",
+            path.display()
+        ));
+    }
+    let mut out = ResumeMap::new();
+    for line in lines {
+        // A crash mid-write leaves a partial last line; skip anything unparsable
+        // rather than inventing a record for it.
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let (Some(file), Some(ay)) = (
+            v.get("file").and_then(serde_json::Value::as_str),
+            v.get("ay").and_then(outcome_from_json),
+        ) else {
+            continue;
+        };
+        let z3 = v.get("z3").and_then(outcome_from_json);
+        let Some(selfcheck) = v.get("self").and_then(selfcheck_from_json) else {
+            continue;
+        };
+        out.insert(PathBuf::from(file), (ay, z3, selfcheck));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -89,13 +320,30 @@ fn division_of(root: &Path, file: &Path) -> String {
 /// Recursively collect `.smt2` files under `root`, tagged with their division,
 /// optionally filtered to a set of division names.
 fn collect(root: &Path, only: Option<&[String]>) -> Result<Vec<(String, PathBuf)>, String> {
+    /// Hidden directories are never corpus content. `ay-z3-parity fetch` stages
+    /// each division through `.{div}.fetch-staging-*` and `.{div}.fetch-backup-*`
+    /// siblings inside the corpus root; if one leaks (APFS `remove_dir_all` can
+    /// fail with ENOTEMPTY), walking it silently DOUBLE-COUNTS that division's
+    /// files under a bogus division name. That happened on the 2026-07-24 full
+    /// fetch — the scoreboard started scoring `.AUFDTLIRA.fetch-backup-...` as a
+    /// division. Skipping dot-directories makes the scan immune to it.
+    fn is_hidden_dir(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'))
+    }
+
     fn walk(path: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
         let metadata = std::fs::symlink_metadata(path)?;
         if metadata.is_dir() {
             let mut entries = std::fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
             entries.sort_by_key(std::fs::DirEntry::path);
             for entry in entries {
-                walk(&entry.path(), out)?;
+                let child = entry.path();
+                if child.is_dir() && is_hidden_dir(&child) {
+                    continue;
+                }
+                walk(&child, out)?;
             }
         } else if (metadata.is_file()
             || (metadata.file_type().is_symlink() && std::fs::metadata(path)?.is_file()))
@@ -153,20 +401,20 @@ impl FileRecord {
     fn beyond_z3(&self) -> bool {
         self.z3.is_some() && self.ay_decided() && !self.z3_decided() && !self.disagree()
     }
-    /// A strict-superiority "loss": z3 decides this file but AY does not.
+    /// A PAR coverage loss: z3 decides this file but AY does not.
     fn loss(&self) -> bool {
         self.z3_decided() && !self.ay_decided()
     }
     /// Both solvers returned only decisive answers, but their verdict-list
     /// shapes differ (for example one answer versus two). This is not a proved
     /// sat-vs-unsat conflict, but it is not agreement and therefore blocks a
-    /// strict-superiority claim.
+    /// PAR coverage claim.
     fn verdict_shape_mismatch(&self) -> bool {
         self.z3_decided() && self.ay_decided() && self.category == Some(Category::Other)
     }
-    /// A strict-superiority "slower": decided by both, AY slower than z3 with
+    /// A PAR wall blocker: decided by both, AY slower than z3 with
     /// the (slower) AY side above the 10 ms noise floor.
-    fn slower(&self) -> bool {
+    fn wall_slower_than_z3(&self) -> bool {
         if !self.agree() {
             return false;
         }
@@ -227,7 +475,6 @@ struct DivStats {
     beyond: usize,
     losses: usize,
     verdict_shape_mismatches: usize,
-    slower: usize,
     self_cert: usize,
     self_conflict: usize,
     ratios: Vec<f64>,
@@ -249,14 +496,12 @@ struct DivStats {
     /// decided-by-both files whose larger peak clears [`RSS_FLOOR_BYTES`]
     /// (the only files a memory comparison is drawn on).
     rss_cmp: usize,
-    /// Decided-by-both files for which either peak-RSS measurement is missing.
-    /// Missing evidence must block SUPERIOR rather than satisfy its memory bar
-    /// vacuously (notably on non-Unix hosts).
-    rss_missing: usize,
-    /// Decided-by-both files that do not establish AY below 80% of z3's peak:
-    /// either an eligible measured pair with `ay_rss >= 0.8 * z3_rss`, or a
-    /// missing measurement. Breaks SUPERIOR's memory bar.
+    /// Among `rss_cmp`: AY not below 80% of z3's peak (`ay_rss >= 0.8 *
+    /// z3_rss`) — breaks SUPERIOR's memory bar.
     rss_not_80: usize,
+    /// Decided-by-both files lacking either peak-RSS measurement. Missing
+    /// evidence fails closed and prevents a SUPERIOR/PERFECT claim.
+    rss_missing: usize,
     /// `ay_rss / z3_rss` over `rss_cmp` files (the MEM geomean column).
     rss_ratios: Vec<f64>,
 }
@@ -284,9 +529,6 @@ impl DivStats {
         }
         if r.verdict_shape_mismatch() {
             self.verdict_shape_mismatches += 1;
-        }
-        if r.slower() {
-            self.slower += 1;
         }
         if r.self_certified() {
             self.self_cert += 1;
@@ -345,7 +587,6 @@ impl DivStats {
                         // Without both peaks we cannot know that the pair is
                         // below the floor or that AY satisfies the <80% bar.
                         self.rss_missing += 1;
-                        self.rss_not_80 += 1;
                     }
                 }
             }
@@ -361,7 +602,6 @@ impl DivStats {
         self.beyond += o.beyond;
         self.losses += o.losses;
         self.verdict_shape_mismatches += o.verdict_shape_mismatches;
-        self.slower += o.slower;
         self.self_cert += o.self_cert;
         self.self_conflict += o.self_conflict;
         self.ratios.extend_from_slice(&o.ratios);
@@ -372,8 +612,8 @@ impl DivStats {
         self.wall_losses += o.wall_losses;
         self.wall_not_2x += o.wall_not_2x;
         self.rss_cmp += o.rss_cmp;
-        self.rss_missing += o.rss_missing;
         self.rss_not_80 += o.rss_not_80;
+        self.rss_missing += o.rss_missing;
         self.rss_ratios.extend_from_slice(&o.rss_ratios);
     }
 
@@ -398,23 +638,6 @@ impl DivStats {
         median(&s)
     }
 
-    /// STRICT SUPERIORITY over z3 for this division: AY agrees on every file z3
-    /// decides (no undecided loss, verdict-shape mismatch, or disagreement), and
-    /// AY is at least as fast as z3 on every agreed file above the 10 ms floor.
-    /// Only meaningful when z3 actually decided something here.
-    fn strict(&self, z3_available: bool) -> Option<bool> {
-        if !z3_available {
-            return None;
-        }
-        Some(
-            self.z3_decided > 0
-                && self.losses == 0
-                && self.verdict_shape_mismatches == 0
-                && self.slower == 0
-                && self.disagree == 0,
-        )
-    }
-
     /// Files in this division AY does NOT solve (no decisive sat/unsat) — the
     /// gap between SUPERIOR and PERFECT.
     fn unsolved(&self) -> usize {
@@ -431,9 +654,9 @@ impl DivStats {
     ///   `ay_wall <= z3_wall` (0 wall losses).
     /// * **SUPERIOR** — all of PAR, AND on every decided-by-both file above
     ///   `WALL_FLOOR` `ay_wall <= 0.5*z3_wall` (>= 2x faster; 0 `wall_not_2x`),
-    ///   AND every decided-by-both file has both RSS measurements and, when
-    ///   above `RSS_FLOOR`, `ay_rss < 0.8*z3_rss` (< 80% peak memory;
-    ///   0 `rss_not_80`). Missing RSS is reject-only, never vacuous success.
+    ///   AND complete peak-RSS evidence, with every decided-by-both file above
+    ///   `RSS_FLOOR` satisfying `ay_rss < 0.8*z3_rss` (< 80% peak memory; 0
+    ///   `rss_not_80` and 0 `rss_missing`).
     /// * **PERFECT** — all of SUPERIOR, AND AY solves EVERY file in the
     ///   division (decisive on 100% of the track, not merely what z3 decides).
     ///
@@ -450,7 +673,7 @@ impl DivStats {
         if !par {
             return Rating::BelowPar;
         }
-        let superior = self.wall_not_2x == 0 && self.rss_not_80 == 0;
+        let superior = self.wall_not_2x == 0 && self.rss_not_80 == 0 && self.rss_missing == 0;
         if !superior {
             return Rating::Par;
         }
@@ -483,8 +706,11 @@ impl DivStats {
                 }
                 format!("below({})", parts.join(","))
             }
-            // xN files missing the 2x-speed bar, mN missing the <80%-mem bar.
-            Rating::Par => format!("PAR(x{},m{})", self.wall_not_2x, self.rss_not_80),
+            // xN miss 2x speed, mN miss <80% memory, rN lack RSS evidence.
+            Rating::Par => format!(
+                "PAR(x{},m{},r{})",
+                self.wall_not_2x, self.rss_not_80, self.rss_missing
+            ),
             // uN track files AY does not solve.
             Rating::Superior => format!("SUPERIOR(u{})", self.unsolved()),
             Rating::Perfect => "PERFECT".to_string(),
@@ -608,16 +834,28 @@ fn source_coherence_error(
     }
 }
 
-fn probe_ay_cli(path: PathBuf, ffi_build_stamp: Option<&str>) -> AyCliIdentity {
+fn probe_ay_cli(
+    resources: &PlannedResources,
+    path: PathBuf,
+    ffi_build_stamp: Option<&str>,
+) -> AyCliIdentity {
     const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
     let sha256 = sha256_of(&path);
-    let mut cmd = Command::new(&path);
-    cmd.arg("--version");
-    let raw = spawn_timeboxed(cmd, VERSION_TIMEOUT);
+    let raw = spawn_timeboxed(
+        resources,
+        &path,
+        &[OsString::from("--version")],
+        VERSION_TIMEOUT,
+        "ay-z3-parity version probe",
+    );
 
     let probe_error = if let Some(error) = raw.harness_error {
         Some(error)
+    } else if raw.output_truncated {
+        Some("`ay --version` exceeded the fixed stdout capture limit".to_string())
+    } else if raw.memout {
+        Some("`ay --version` exceeded its RSS envelope".to_string())
     } else if raw.killed || raw.observed > VERSION_TIMEOUT {
         Some("`ay --version` timed out".to_string())
     } else {
@@ -665,6 +903,22 @@ pub(crate) fn run(cfg: &ScoreboardConfig) -> i32 {
             eprintln!("error: {error}");
             return 2;
         }
+    };
+    let available_total = files.len();
+    let (files, sample_census) = match cfg.sample {
+        Some(n) if n > 0 => {
+            let (kept, census) = sample_per_division(files, n, cfg.seed);
+            eprintln!(
+                "scoreboard: SAMPLED {} of {} files — {} per division, seed {} \
+                 (reproducible: same seed + corpus = same set)",
+                kept.len(),
+                available_total,
+                n,
+                cfg.seed
+            );
+            (kept, Some(census))
+        }
+        _ => (files, None),
     };
     if files.is_empty() {
         eprintln!(
@@ -722,12 +976,32 @@ pub(crate) fn run(cfg: &ScoreboardConfig) -> i32 {
         ),
     }
 
+    let timeout = Duration::from_secs(cfg.timeout_secs);
+    let resources = match PlannedResources::plan(
+        &ay_bench::runner::repo_root_public(),
+        cfg.jobs,
+        "ay-z3-parity scoreboard",
+    ) {
+        Ok(resources) => resources,
+        Err(error) => {
+            eprintln!("error: resource planning failed: {error}");
+            return 2;
+        }
+    };
+    let ay_cli_path = resolve_ay_cli(cfg);
     let ay_cli_identity =
-        resolve_ay_cli(cfg).map(|path| probe_ay_cli(path, ay_build_stamp.as_deref()));
+        ay_cli_path.map(|path| probe_ay_cli(&resources, path, ay_build_stamp.as_deref()));
     let ay_cli = ay_cli_identity
         .as_ref()
         .filter(|identity| identity.source_coherent)
         .map(|identity| identity.path.clone());
+    let resource_evidence = match resource_evidence(&resources.plan, timeout, ay_cli.is_some()) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            eprintln!("error: resource envelope failed: {error}");
+            return 2;
+        }
+    };
     match &ay_cli_identity {
         None => eprintln!(
             "warning: no `ay` CLI binary found (pass --ay-cli, or build \
@@ -742,12 +1016,14 @@ pub(crate) fn run(cfg: &ScoreboardConfig) -> i32 {
         Some(_) => {}
     }
 
-    let timeout = Duration::from_secs(cfg.timeout_secs);
     let total = files.len();
     eprintln!(
-        "scoreboard: {total} files, timeout {}s, jobs {}, AY={} z3={} ay-cli={}",
+        "scoreboard: {total} files, timeout {}s, jobs requested/effective {}/{}, memory {}MiB/child, NBCORE {}, AY={} z3={} ay-cli={}",
         cfg.timeout_secs,
         cfg.jobs,
+        resources.plan.jobs,
+        resources.plan.memlimit_mb_per_child,
+        resources.plan.nbcore_per_child,
         cfg.ay.display(),
         if z3_available {
             cfg.z3.display().to_string()
@@ -760,24 +1036,215 @@ pub(crate) fn run(cfg: &ScoreboardConfig) -> i32 {
             .unwrap_or_else(|| "(none)".to_string()),
     );
 
+    // Checkpoint journal. Always on: the certificate is written only at the very
+    // end, so an unjournalled multi-day corpus run loses everything to a crash.
+    let checkpoint_path = cfg.checkpoint.clone().unwrap_or_else(|| {
+        let mut p = cfg.json_out.clone().into_os_string();
+        p.push(".checkpoint.jsonl");
+        PathBuf::from(p)
+    });
+    let header = checkpoint_header(
+        cfg,
+        sha256_of(&cfg.ay).as_deref().unwrap_or("(unhashed)"),
+        &if z3_available {
+            sha256_of(&cfg.z3).unwrap_or_else(|| "(unhashed)".to_string())
+        } else {
+            "(absent)".to_string()
+        },
+    );
+    let resumed: ResumeMap = if cfg.resume {
+        match load_checkpoint(&checkpoint_path, &header) {
+            Ok(map) => {
+                eprintln!(
+                    "scoreboard: resuming — {} file(s) reused from {}",
+                    map.len(),
+                    checkpoint_path.display()
+                );
+                map
+            }
+            Err(error) => {
+                eprintln!("error: --resume refused: {error}");
+                return 2;
+            }
+        }
+    } else {
+        ResumeMap::new()
+    };
+    let fresh_journal = resumed.is_empty();
+    let journal = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .truncate(false)
+        .open(&checkpoint_path)
+    {
+        Ok(mut f) => {
+            if fresh_journal {
+                // Overwrite any unusable prior journal with a header for THIS run.
+                if let Err(error) = std::fs::write(&checkpoint_path, format!("{header}\n")) {
+                    eprintln!(
+                        "error: cannot write checkpoint {}: {error}",
+                        checkpoint_path.display()
+                    );
+                    return 2;
+                }
+                f = match std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&checkpoint_path)
+                {
+                    Ok(f) => f,
+                    Err(error) => {
+                        eprintln!("error: cannot reopen checkpoint: {error}");
+                        return 2;
+                    }
+                };
+            }
+            Mutex::new(f)
+        }
+        Err(error) => {
+            eprintln!(
+                "error: cannot open checkpoint {}: {error}",
+                checkpoint_path.display()
+            );
+            return 2;
+        }
+    };
+    eprintln!(
+        "scoreboard: checkpoint {} ({} per completed file; rerun with --resume after a crash)",
+        checkpoint_path.display(),
+        if fresh_journal { "fresh" } else { "appending" }
+    );
+
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
+    let reused = AtomicUsize::new(0);
     let slots: Mutex<Vec<Option<FileRecord>>> = Mutex::new((0..total).map(|_| None).collect());
     let campaign_t0 = Instant::now();
 
+    // Progress file: rewritten atomically (tmp + rename) so a reader always sees
+    // a complete document, never a half-written one.
+    let progress_path = cfg.progress.clone();
+    let write_progress = |done_n: usize, reused_n: usize, elapsed: Duration, final_: bool| {
+        let Some(path) = progress_path.as_ref() else {
+            return;
+        };
+        let fresh = done_n.saturating_sub(reused_n);
+        let per_min = if elapsed.as_secs_f64() > 0.0 {
+            fresh as f64 / (elapsed.as_secs_f64() / 60.0)
+        } else {
+            0.0
+        };
+        let remaining = total.saturating_sub(done_n);
+        let eta_hours = if per_min > 0.0 {
+            remaining as f64 / per_min / 60.0
+        } else {
+            f64::NAN
+        };
+        let doc = serde_json::json!({
+            "generated_utc": utc_now_iso(),
+            "state": if final_ { "finished" } else { "running" },
+            "pid": std::process::id(),
+            "done": done_n,
+            "total": total,
+            "reused_from_checkpoint": reused_n,
+            "percent": (done_n as f64 * 100.0 / total.max(1) as f64 * 100.0).round() / 100.0,
+            "files_per_min": (per_min * 100.0).round() / 100.0,
+            "eta_hours": if eta_hours.is_finite() {
+                serde_json::json!((eta_hours * 100.0).round() / 100.0)
+            } else {
+                serde_json::Value::Null
+            },
+            "elapsed_secs": elapsed.as_secs(),
+            "corpus_root": cfg.root.display().to_string(),
+            "sample_per_division": cfg.sample,
+            "seed": cfg.seed,
+            "timeout_secs": cfg.timeout_secs,
+            "jobs": resources.plan.jobs,
+            "checkpoint": checkpoint_path.display().to_string(),
+        });
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, format!("{doc}\n")).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    };
+    if let Some(p) = progress_path.as_ref() {
+        eprintln!("scoreboard: progress {}", p.display());
+    }
+
     std::thread::scope(|scope| {
-        for _ in 0..cfg.jobs.max(1) {
+        // Ticker: keeps the status file fresh even while every worker is parked
+        // on a 20s solver timeout, so "is it alive?" is answerable at a glance.
+        // Self-terminating: `thread::scope` joins at the END of this closure, so
+        // a flag set here would fire before the workers ever run. The ticker
+        // instead exits once every file is accounted for.
+        scope.spawn(|| {
+            while done.load(Ordering::Relaxed) < total {
+                write_progress(
+                    done.load(Ordering::Relaxed),
+                    reused.load(Ordering::Relaxed),
+                    campaign_t0.elapsed(),
+                    false,
+                );
+                for _ in 0..50 {
+                    if done.load(Ordering::Relaxed) >= total {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
+        for _ in 0..resources.plan.jobs {
             scope.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= total {
                     break;
                 }
                 let (division, file) = &files[i];
-                let z3 = z3_available.then(|| run_one(&exe, &cfg.z3, file, timeout));
-                let ay = run_one(&exe, &cfg.ay, file, timeout);
-                let selfcheck = match &ay_cli {
-                    Some(cli) => run_selfcheck(cli, file, timeout),
-                    None => SelfCheck::Error("no ay CLI".to_string()),
+                // Reused files are NOT re-journalled: the line is already there,
+                // and appending it twice would inflate a later resume.
+                let from_journal = resumed.get(file).cloned();
+                let replayed = from_journal.is_some();
+                let (ay, z3, selfcheck) = match from_journal {
+                    Some((ay, z3, selfcheck)) => (ay, z3, selfcheck),
+                    None => {
+                        let z3 = z3_available.then(|| {
+                            run_one(
+                                &resources,
+                                &exe,
+                                &cfg.z3,
+                                file,
+                                timeout,
+                                "ay-z3-parity scoreboard z3",
+                            )
+                        });
+                        let ay = run_one(
+                            &resources,
+                            &exe,
+                            &cfg.ay,
+                            file,
+                            timeout,
+                            "ay-z3-parity scoreboard AY",
+                        );
+                        let selfcheck = match &ay_cli {
+                            Some(cli) => run_selfcheck(&resources, cli, file, timeout),
+                            None => SelfCheck::Error("no ay CLI".to_string()),
+                        };
+                        // Journal BEFORE the record is published, so anything the
+                        // certificate can report is already durable.
+                        let line = serde_json::json!({
+                            "file": file.display().to_string(),
+                            "division": division,
+                            "ay": outcome_to_json(&ay),
+                            "z3": z3.as_ref().map(outcome_to_json),
+                            "self": selfcheck_to_json(&selfcheck),
+                        });
+                        {
+                            let mut f = journal.lock().expect("journal poisoned");
+                            if let Err(error) = writeln!(f, "{line}").and_then(|()| f.flush()) {
+                                eprintln!("warning: checkpoint write failed: {error}");
+                            }
+                        }
+                        (ay, z3, selfcheck)
+                    }
                 };
                 let category = z3.as_ref().map(|z| categorize(&ay, z));
                 let ratio = matches!(
@@ -785,9 +1252,13 @@ pub(crate) fn run(cfg: &ScoreboardConfig) -> i32 {
                     Some(Category::AgreeSat | Category::AgreeUnsat | Category::AgreeMixed)
                 )
                 .then(|| ratio_of(&ay, z3.as_ref().expect("agree implies z3 present")));
+                if replayed {
+                    reused.fetch_add(1, Ordering::Relaxed);
+                }
                 let n_done = done.fetch_add(1, Ordering::Relaxed) + 1;
                 eprintln!(
-                    "[{n_done}/{total}] {division} {}: z3={} ay={} self={} {}",
+                    "[{n_done}/{total}]{} {division} {}: z3={} ay={} self={} {}",
+                    if replayed { " (resumed)" } else { "" },
                     file.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
                     z3.as_ref()
                         .map(BenchOutcome::label)
@@ -808,6 +1279,12 @@ pub(crate) fn run(cfg: &ScoreboardConfig) -> i32 {
             });
         }
     });
+    write_progress(
+        done.load(Ordering::Relaxed),
+        reused.load(Ordering::Relaxed),
+        campaign_t0.elapsed(),
+        true,
+    );
 
     let records: Vec<FileRecord> = slots
         .into_inner()
@@ -862,11 +1339,14 @@ pub(crate) fn run(cfg: &ScoreboardConfig) -> i32 {
         }
     );
     println!(
-        "  corpus root:      {}  ({} files, timeout {}s, jobs {}, wall {:.1}s)",
+        "  corpus root:      {}  ({} files, timeout {}s, jobs requested/effective {}/{}, memory {}MiB/child, NBCORE {}, wall {:.1}s)",
         cfg.root.display(),
         total,
         cfg.timeout_secs,
         cfg.jobs,
+        resources.plan.jobs,
+        resources.plan.memlimit_mb_per_child,
+        resources.plan.nbcore_per_child,
         campaign_wall.as_secs_f64()
     );
     if let Some(b) = &baseline {
@@ -891,6 +1371,10 @@ pub(crate) fn run(cfg: &ScoreboardConfig) -> i32 {
         z3_available,
         ay_cli_identity.as_ref(),
         campaign_wall,
+        &resources.plan,
+        &resource_evidence,
+        available_total,
+        sample_census.as_ref(),
     );
     let cert_text = serde_json::to_string_pretty(&cert).unwrap_or_default();
     if let Some(dir) = cfg.json_out.parent() {
@@ -1148,10 +1632,10 @@ fn render_table(
          MEM ay/z3 = geomean PEAK-RSS ratio over decided-by-both above 5MB (<1 = AY leaner)\n\
          RATING (per division; floors: WALL 10ms, RSS 5MB):\n\
          \x20 PAR      = DISAGREE 0, AY decides every z3 decision, ay_wall <= z3_wall on every decided-by-both file > 10ms\n\
-         \x20 SUPERIOR = PAR + ay_wall <= 0.5*z3_wall (>=2x) on every such file + measured ay_rss < 0.8*z3_rss on every decided-by-both file > 5MB; missing RSS blocks\n\
+         \x20 SUPERIOR = PAR + ay_wall <= 0.5*z3_wall (>=2x) on every such file + complete RSS evidence + ay_rss < 0.8*z3_rss on every decided-by-both file > 5MB; missing RSS blocks\n\
          \x20 PERFECT  = SUPERIOR + AY decides 100% of the track's files\n\
          \x20 below(uN,sM,dK,mJ) = N undecided losses, M slower-than-z3, K disagreements, J verdict-shape mismatches\n\
-         \x20 PAR(xN,mM) = N files miss the 2x-speed bar, M miss the <80%-mem bar | SUPERIOR(uN) = N track files AY doesn't solve\n",
+         \x20 PAR(xN,mM,rK) = N miss 2x speed, M miss <80% memory, K lack RSS evidence | SUPERIOR(uN) = N track files AY doesn't solve\n",
     );
     if baseline.is_some() {
         out.push_str(
@@ -1177,6 +1661,10 @@ fn build_certificate(
     z3_available: bool,
     ay_cli: Option<&AyCliIdentity>,
     campaign_wall: Duration,
+    resource_plan: &ResourcePlan,
+    resource_evidence: &serde_json::Value,
+    available_total: usize,
+    sample_census: Option<&BTreeMap<String, (usize, usize)>>,
 ) -> serde_json::Value {
     let div_json = |name: &str, s: &DivStats| {
         serde_json::json!({
@@ -1191,18 +1679,12 @@ fn build_certificate(
             "self_conflict": s.self_conflict,
             "solved_pct": s.solved_pct(),
             "selfcert_pct": s.selfcert_pct(),
-            "decided_by_both": s.ratios.len(),
+            "decided_by_both": s.both_decided,
+            "wall_ratio_sample_count": s.ratios.len(),
             "geomean_wall_ratio_ay_over_z3": s.geo_ratio(),
             "median_wall_ratio_ay_over_z3": s.median_ratio(),
             "ay_wins_2x": s.ay_wins_2x,
             "z3_wins_2x": s.z3_wins_2x,
-            "strict_superiority": s.strict(z3_available),
-            "strict_blockers": {
-                "undecided_losses": s.losses,
-                "verdict_shape_mismatches": s.verdict_shape_mismatches,
-                "slower": s.slower,
-                "disagree": s.disagree
-            },
             // --- rating ladder (PAR / SUPERIOR / PERFECT / below / n/a) ---
             "rating": s.rating(z3_available).word(),
             "mem_geomean_ay_over_z3": s.mem_geo(),
@@ -1218,7 +1700,7 @@ fn build_certificate(
                 "disagree": s.disagree,
                 // SUPERIOR blockers
                 "wall_below_2x": s.wall_not_2x,
-                "rss_below_80pct_not_established": s.rss_not_80,
+                "rss_at_or_above_80pct": s.rss_not_80,
                 // PERFECT blocker
                 "unsolved_files": s.unsolved(),
             },
@@ -1239,7 +1721,7 @@ fn build_certificate(
                 "beyond_z3": r.beyond_z3(),
                 "loss": r.loss(),
                 "verdict_shape_mismatch": r.verdict_shape_mismatch(),
-                "slower": r.slower(),
+                "wall_slower_than_z3": r.wall_slower_than_z3(),
                 "wall_ratio_ay_over_z3": r.ratio,
                 "rss_ratio_ay_over_z3": rss_ratio(&r.ay, r.z3.as_ref()),
             })
@@ -1270,7 +1752,7 @@ fn build_certificate(
         .collect();
     serde_json::json!({
         "kind": "ay-z3-scoreboard",
-        "format_version": 1,
+        "format_version": 2,
         "generated_utc": utc_now_iso(),
         "invocation": std::env::args().collect::<Vec<_>>().join(" "),
         "host": host_info(),
@@ -1297,17 +1779,32 @@ fn build_certificate(
         "z3_available": z3_available,
         "corpus_root": cfg.root.display().to_string(),
         "divisions_filter": cfg.divisions,
+        // A score is meaningless without what it was measured on (standing rule
+        // 12). `mode` is "all" or "seeded-per-division"; the census records, per
+        // track, how many files were selected out of how many exist, so a
+        // sampled number can never be read as a full-corpus one.
+        "sampling": {
+            "mode": if cfg.sample.is_some() { "seeded-per-division" } else { "all" },
+            "per_division": cfg.sample,
+            "seed": cfg.seed,
+            "selected_files": records.len(),
+            "available_files": available_total,
+            "census": sample_census.map(|c| c.iter()
+                .map(|(d, (sel, avail))| (d.clone(), serde_json::json!({"selected": sel, "available": avail})))
+                .collect::<serde_json::Map<_, _>>()),
+        },
         "timeout_secs": cfg.timeout_secs,
-        "jobs": cfg.jobs,
+        "jobs": resource_plan.jobs,
+        "requested_jobs": resource_plan.requested_jobs,
+        "resource": resource_evidence,
         "campaign_wall_secs": campaign_wall.as_secs_f64(),
         "baseline": cfg.baseline.as_ref().map(|p| p.display().to_string()),
         "methodology": {
             "z3_agreement": "solved% = ay-agree / z3-decided; DISAGREE = positional sat-vs-unsat (AY vs z3), must be 0",
             "self_certification": "selfcert% = files AY self-certifies (a source-coherent ay solve --self-check exits cleanly within the deadline and emits the same decisive verdict AY's eval gives) / files AY decides; the z3-independent metric",
-            "strict_superiority": "per division: AY agrees on every file z3 decides (0 undecided losses, verdict-shape mismatches, or disagreements) AND AY >= as fast as z3 on every agreed file with the AY side above 10ms (0 slower)",
-            "rating_ladder": "per division, highest tier reached. decided-by-both = files AY and z3 both decide. PAR = DISAGREE 0 AND AY returns a decisive verdict matching z3 on every file z3 decides (0 undecided losses + 0 verdict-shape mismatches) AND ay_wall <= z3_wall on every decided-by-both file above the WALL floor. SUPERIOR = PAR AND ay_wall <= 0.5*z3_wall on every such file (>=2x) AND both peak-RSS measurements are present for every decided-by-both file AND ay_rss < 0.8*z3_rss on every measured pair above the RSS floor (<80% peak). PERFECT = SUPERIOR AND AY decides 100% of the track's files. n/a when z3 is absent or decided nothing.",
-            "peak_rss": "per (file, solver) child peak resident set size in BYTES via wait4()/rusage.ru_maxrss; Darwin reports bytes, Linux kilobytes (normalized to bytes with cfg(target_os))",
-            "isolation": "each (file, solver) pair and each self-check runs in a fresh timeboxed child (reuses `bench` plumbing); a crash/timeout on one file cannot bias or abort the run",
+            "rating_ladder": "per division, highest tier reached. decided-by-both = files AY and z3 both decide. PAR = DISAGREE 0 AND AY returns a decisive verdict matching z3 on every file z3 decides (0 undecided losses + 0 verdict-shape mismatches) AND ay_wall <= z3_wall on every decided-by-both file above the WALL floor. SUPERIOR = PAR AND ay_wall <= 0.5*z3_wall on every such file (>=2x) AND complete peak-RSS evidence with ay_rss < 0.8*z3_rss on every decided-by-both file above the RSS floor (<80% peak). Missing RSS caps the rating at PAR. PERFECT = SUPERIOR AND AY decides 100% of the track's files. n/a when z3 is absent or decided nothing.",
+            "peak_rss": "each successful bench-one child self-reports getrusage(RUSAGE_SELF).ru_maxrss in BYTES after solver teardown; Darwin reports bytes, Linux kilobytes (normalized to bytes with cfg(target_os)); missing evidence fails closed for SUPERIOR/PERFECT",
+            "isolation": "each (file, solver) pair and each self-check runs in a stopped-exec process group with a pre-exec zero-grace RSS watchdog, bounded stdout, and residual-descendant teardown before leader reap",
             "win_loss_min_secs": WIN_LOSS_MIN_SECS,
             "wall_floor_secs": WALL_FLOOR_SECS,
             "rss_floor_bytes": RSS_FLOOR_BYTES,
@@ -1380,6 +1877,77 @@ mod tests {
     const MB: u64 = 1024 * 1024;
 
     #[test]
+    fn certificate_uses_true_decided_by_both_and_persists_resource_plan() {
+        use Verdict::*;
+        let record = rec(
+            v(&[Sat]),
+            20,
+            Some(v(&[Sat, Sat])),
+            30,
+            SelfCheck::Verdicts(vec![Sat]),
+        );
+        let mut stats = DivStats::default();
+        stats.add(&record);
+        assert_eq!(stats.both_decided, 1);
+        assert!(stats.ratios.is_empty());
+        let mut divisions = BTreeMap::new();
+        divisions.insert("D".to_string(), stats.clone());
+        let cfg = ScoreboardConfig {
+            ay: PathBuf::from("missing-ay-lib"),
+            ay_cli: None,
+            z3: PathBuf::from("missing-z3-lib"),
+            root: PathBuf::from("missing-corpus"),
+            timeout_secs: 20,
+            jobs: 8,
+            json_out: PathBuf::from("unused.json"),
+            baseline: None,
+            divisions: None,
+            checkpoint: None,
+            resume: false,
+            sample: None,
+            seed: 0,
+            progress: None,
+        };
+        let plan = ResourcePlan {
+            requested_jobs: 8,
+            jobs: 3,
+            memlimit_mb_per_child: 2048,
+            nbcore_per_child: 2,
+            headroom_mb: 16_384,
+            planner: "scripts/_oom_guard.py".to_string(),
+        };
+        let evidence =
+            resource_evidence(&plan, Duration::from_secs(20), true).expect("resource evidence");
+        let cert = build_certificate(
+            &cfg,
+            &[record],
+            &divisions,
+            &stats,
+            None,
+            None,
+            None,
+            true,
+            None,
+            Duration::from_secs(1),
+            &plan,
+            &evidence,
+            1,
+            None,
+        );
+        assert_eq!(cert["format_version"], 2);
+        assert_eq!(cert["totals"]["decided_by_both"], 1);
+        assert_eq!(cert["totals"]["wall_ratio_sample_count"], 0);
+        assert_eq!(cert["totals"]["rating_ladder"]["decided_by_both"], 1);
+        assert!(
+            cert["totals"].get("strict_superiority").is_none(),
+            "the certificate must expose the documented rating ladder, not the retired strict metric",
+        );
+        assert_eq!(cert["jobs"], 3);
+        assert_eq!(cert["requested_jobs"], 8);
+        assert_eq!(cert["resource"]["memlimit_mb_per_child"], 2048);
+    }
+
+    #[test]
     fn agree_counts_and_solved_pct() {
         use Verdict::*;
         let mut s = DivStats::default();
@@ -1407,7 +1975,7 @@ mod tests {
         assert_eq!(s.solved_pct(), Some(50.0));
         assert_eq!(s.self_cert, 1);
         assert_eq!(s.selfcert_pct(), Some(100.0));
-        assert_eq!(s.strict(true), Some(false)); // 1 loss
+        assert_eq!(s.rating(true), Rating::BelowPar); // 1 loss
     }
 
     #[test]
@@ -1428,7 +1996,7 @@ mod tests {
     }
 
     #[test]
-    fn disagree_is_flagged_and_breaks_strict() {
+    fn disagree_is_flagged_and_breaks_par() {
         use Verdict::*;
         let r = rec(
             v(&[Sat]),
@@ -1441,11 +2009,11 @@ mod tests {
         let mut s = DivStats::default();
         s.add(&r);
         assert_eq!(s.disagree, 1);
-        assert_eq!(s.strict(true), Some(false));
+        assert_eq!(s.rating(true), Rating::BelowPar);
     }
 
     #[test]
-    fn strict_true_when_all_decided_and_at_least_as_fast() {
+    fn matching_faster_run_reaches_par_without_rss_evidence() {
         use Verdict::*;
         let mut s = DivStats::default();
         // AY strictly faster on a meaningful (>10ms) file.
@@ -1456,12 +2024,12 @@ mod tests {
             50,
             SelfCheck::Verdicts(vec![Unsat]),
         ));
-        assert_eq!(s.strict(true), Some(true));
-        assert_eq!(s.strict(false), None); // z3 absent -> n/a
+        assert_eq!(s.rating(true), Rating::Par);
+        assert_eq!(s.rating(false), Rating::NotApplicable);
     }
 
     #[test]
-    fn decisive_verdict_count_mismatch_blocks_strict_superiority() {
+    fn decisive_verdict_count_mismatch_blocks_par() {
         use Verdict::*;
         let r = rec(
             v(&[Sat]),
@@ -1477,14 +2045,13 @@ mod tests {
         s.add(&r);
         assert_eq!(s.losses, 0);
         assert_eq!(s.verdict_shape_mismatches, 1);
-        assert_eq!(s.strict(true), Some(false));
         // A verdict-shape mismatch is a PAR coverage blocker: below par, shown m1.
         assert_eq!(s.rating(true), Rating::BelowPar);
         assert!(s.rating_cell(true).contains("m1"));
     }
 
     #[test]
-    fn slower_blocks_strict_only_above_floor() {
+    fn slower_blocks_par_only_above_floor() {
         use Verdict::*;
         // AY 50ms vs z3 20ms, both agree unsat: AY slower and above 10ms floor.
         let mut s = DivStats::default();
@@ -1495,8 +2062,8 @@ mod tests {
             20,
             SelfCheck::Verdicts(vec![Unsat]),
         ));
-        assert_eq!(s.slower, 1);
-        assert_eq!(s.strict(true), Some(false));
+        assert_eq!(s.wall_losses, 1);
+        assert_eq!(s.rating(true), Rating::BelowPar);
 
         // AY 3ms vs z3 1ms: slower but under the 10ms floor -> not a blocker.
         let mut s2 = DivStats::default();
@@ -1507,8 +2074,8 @@ mod tests {
             1,
             SelfCheck::Verdicts(vec![Unsat]),
         ));
-        assert_eq!(s2.slower, 0);
-        assert_eq!(s2.strict(true), Some(true));
+        assert_eq!(s2.wall_losses, 0);
+        assert_eq!(s2.rating(true), Rating::Par);
     }
 
     #[test]
@@ -1572,7 +2139,7 @@ mod tests {
         ));
         assert_eq!(s.solved_pct(), None); // z3_decided == 0
         assert_eq!(s.selfcert_pct(), Some(100.0));
-        assert_eq!(s.strict(false), None);
+        assert_eq!(s.rating(false), Rating::NotApplicable);
     }
 
     #[test]
@@ -1619,6 +2186,190 @@ mod tests {
             .contains("dirty"));
         assert!(source_coherence_error(None, Some(same_source)).is_some());
         assert!(source_coherence_error(Some(ffi), None).is_some());
+    }
+
+    /// `ay-z3-parity fetch` stages divisions through `.{div}.fetch-backup-*`
+    /// siblings inside the corpus root. One leaked on the 2026-07-24 full fetch
+    /// and the scoreboard scored `.AUFDTLIRA.fetch-backup-...` as a division,
+    /// double-counting 218 files. Hidden directories are never corpus content.
+    #[test]
+    fn corpus_collection_skips_hidden_staging_and_backup_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "ay-z3-scoreboard-hidden-{}-{}",
+            std::process::id(),
+            utc_now_iso().replace([':', '-', '.'], "")
+        ));
+        let real = root.join("QF_UF");
+        let leaked = root.join(".QF_UF.fetch-backup-1-2");
+        std::fs::create_dir_all(&real).expect("mkdir real");
+        std::fs::create_dir_all(&leaked).expect("mkdir leaked");
+        std::fs::write(real.join("a.smt2"), b"(check-sat)").expect("write real");
+        std::fs::write(leaked.join("a.smt2"), b"(check-sat)").expect("write leaked");
+
+        let found = collect(&root, None).expect("collect");
+        assert_eq!(
+            found.len(),
+            1,
+            "leaked backup must not be walked: {found:?}"
+        );
+        assert_eq!(found[0].0, "QF_UF");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn outcome(kind: OutcomeKind, ms: u64, rss: Option<u64>) -> BenchOutcome {
+        BenchOutcome {
+            kind,
+            wall: Duration::from_millis(ms),
+            peak_rss: rss,
+        }
+    }
+
+    /// Every outcome shape must survive the journal, including the timing and
+    /// RSS the certificate's geomean columns are computed from — a journal that
+    /// loses those would silently change the result on resume.
+    #[test]
+    fn checkpoint_round_trips_every_outcome_shape() {
+        let cases = vec![
+            outcome(
+                OutcomeKind::Verdicts(vec![Verdict::Sat, Verdict::Unsat]),
+                1234,
+                Some(9_000),
+            ),
+            outcome(OutcomeKind::Verdicts(vec![]), 1, None),
+            outcome(OutcomeKind::Timeout, 20_000, None),
+            outcome(OutcomeKind::MemoryLimit, 500, Some(1)),
+            outcome(OutcomeKind::Crash("SIGSEGV".into()), 7, None),
+            outcome(OutcomeKind::InputError("bad sort".into()), 3, Some(42)),
+        ];
+        for c in cases {
+            let back = outcome_from_json(&outcome_to_json(&c)).expect("round trip");
+            assert_eq!(back.label(), c.label());
+            assert_eq!(back.detail(), c.detail());
+            assert_eq!(back.wall, c.wall, "wall must survive: {}", c.label());
+            assert_eq!(back.peak_rss, c.peak_rss, "rss must survive: {}", c.label());
+        }
+        for s in [
+            SelfCheck::Verdicts(vec![Verdict::Unsat]),
+            SelfCheck::Timeout,
+            SelfCheck::MemoryLimit,
+            SelfCheck::Crash("SIGKILL".into()),
+            SelfCheck::Error("no ay CLI".into()),
+        ] {
+            let back = selfcheck_from_json(&selfcheck_to_json(&s)).expect("round trip");
+            assert_eq!(back.label(), s.label());
+            assert_eq!(back.detail(), s.detail());
+        }
+    }
+
+    /// Resuming across a different binary, timeout, or corpus would produce a
+    /// certificate describing neither run, so a header mismatch is fatal. A
+    /// truncated last line is the normal shape of a crash and must be tolerated.
+    #[test]
+    fn checkpoint_refuses_foreign_header_and_tolerates_a_torn_tail() {
+        let dir = std::env::temp_dir().join(format!(
+            "ay-z3-scoreboard-ckpt-{}-{}",
+            std::process::id(),
+            utc_now_iso().replace([':', '-', '.'], "")
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("c.jsonl");
+
+        let header = serde_json::json!({"checkpoint_schema": 1, "timeout_secs": 20});
+        let rec = serde_json::json!({
+            "file": "/corpus/QF_UF/a.smt2",
+            "division": "QF_UF",
+            "ay": outcome_to_json(&outcome(OutcomeKind::Verdicts(vec![Verdict::Unsat]), 5, None)),
+            "z3": serde_json::Value::Null,
+            "self": selfcheck_to_json(&SelfCheck::Verdicts(vec![Verdict::Unsat])),
+        });
+        // Third line is deliberately torn, as a SIGKILL mid-write leaves it.
+        std::fs::write(&path, format!("{header}\n{rec}\n{{\"file\": \"/corpus/QF")).expect("write");
+
+        let loaded = load_checkpoint(&path, &header).expect("matching header loads");
+        assert_eq!(loaded.len(), 1, "torn tail must be dropped, not invented");
+        assert!(loaded.contains_key(Path::new("/corpus/QF_UF/a.smt2")));
+
+        let foreign = serde_json::json!({"checkpoint_schema": 1, "timeout_secs": 10});
+        let err = load_checkpoint(&path, &foreign).expect_err("foreign header must be refused");
+        assert!(err.contains("different run"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn corpus(divs: &[(&str, usize)]) -> Vec<(String, PathBuf)> {
+        let mut v = Vec::new();
+        for (d, n) in divs {
+            for i in 0..*n {
+                v.push((
+                    (*d).to_string(),
+                    PathBuf::from(format!("/c/{d}/f{i:04}.smt2")),
+                ));
+            }
+        }
+        v
+    }
+
+    /// The sample is the unit of comparability for a continuously-run
+    /// benchmark, so it must be a pure function of (seed, path): same seed →
+    /// same set, every time, on every machine and toolchain.
+    #[test]
+    fn sampling_is_deterministic_per_seed_and_bounded_per_division() {
+        let c = corpus(&[("QF_UF", 100), ("QF_AX", 3), ("QF_BV", 100)]);
+        let (a, census) = sample_per_division(c.clone(), 10, 42);
+        let (b, _) = sample_per_division(c.clone(), 10, 42);
+        assert_eq!(a, b, "same seed must reproduce the same sample");
+
+        // Bounded PER DIVISION, and a small division is taken whole rather than
+        // padded — every track stays represented.
+        assert_eq!(census["QF_UF"], (10, 100));
+        assert_eq!(census["QF_BV"], (10, 100));
+        assert_eq!(census["QF_AX"], (3, 3));
+        assert_eq!(a.len(), 23);
+
+        // A different seed is an independent sample, not the same one.
+        let (d, _) = sample_per_division(c.clone(), 10, 43);
+        assert_ne!(a, d, "a different seed must select differently");
+
+        // Execution order is sorted, so the run itself is deterministic too.
+        let mut sorted = a.clone();
+        sorted.sort();
+        assert_eq!(a, sorted);
+    }
+
+    /// Hash-ranked, not index-spaced: a file's rank depends only on (seed,
+    /// path), never on how many other files exist. So growing the corpus can
+    /// only displace a selected file by out-ranking it — it cannot reshuffle the
+    /// selection wholesale, which is what an index rule (`i*total/n`) does. That
+    /// keeps a track's numbers comparable across corpus refreshes.
+    ///
+    /// Doubling the corpus is expected to retain ~N/2 of the sample; asserted
+    /// loosely because this is one draw, and the exact invariant (rank is
+    /// corpus-independent) is checked directly below it.
+    #[test]
+    fn sampling_is_stable_when_the_corpus_grows() {
+        let before = corpus(&[("QF_UF", 200)]);
+        let after = corpus(&[("QF_UF", 400)]);
+        let (a, _) = sample_per_division(before, 100, 7);
+        let (b, _) = sample_per_division(after, 100, 7);
+        let kept = a.iter().filter(|f| b.contains(f)).count();
+        assert!(
+            kept >= 30,
+            "doubling the corpus should retain ~half the sample, kept {kept}/100"
+        );
+
+        // The exact invariant: every survivor kept its rank key, and every
+        // dropped file was displaced by a strictly better-ranked newcomer.
+        let worst_kept = b
+            .iter()
+            .map(|(_, p)| fnv1a64(7, p.as_os_str().as_encoded_bytes()))
+            .max()
+            .expect("non-empty");
+        for (_, p) in a.iter().filter(|f| !b.contains(f)) {
+            assert!(
+                fnv1a64(7, p.as_os_str().as_encoded_bytes()) >= worst_kept,
+                "a dropped file must rank no better than the worst survivor"
+            );
+        }
     }
 
     #[test]
@@ -1699,14 +2450,14 @@ mod tests {
         // Agree unsat, AY 40ms vs z3 50ms: faster (PAR) but under 2x (not SUPERIOR).
         let mut s = DivStats::default();
         s.add(&rec_out(
-            ay_rss(v(&[Unsat]), 40, Some(MB)),
-            Some(ay_rss(v(&[Unsat]), 50, Some(2 * MB))),
+            ay_rss(v(&[Unsat]), 40, Some(8 * MB)),
+            Some(ay_rss(v(&[Unsat]), 50, Some(20 * MB))),
             SelfCheck::Verdicts(vec![Unsat]),
         ));
         assert_eq!(s.wall_losses, 0);
         assert_eq!(s.wall_not_2x, 1);
         assert_eq!(s.rating(true), Rating::Par);
-        assert_eq!(s.rating_cell(true), "PAR(x1,m0)");
+        assert_eq!(s.rating_cell(true), "PAR(x1,m0,r0)");
     }
 
     #[test]
@@ -1723,27 +2474,25 @@ mod tests {
         assert_eq!(s.rss_cmp, 1);
         assert_eq!(s.rss_not_80, 1);
         assert_eq!(s.rating(true), Rating::Par);
-        assert_eq!(s.rating_cell(true), "PAR(x0,m1)");
+        assert_eq!(s.rating_cell(true), "PAR(x0,m1,r0)");
     }
 
     #[test]
-    fn rating_par_when_rss_evidence_is_missing() {
+    fn rating_missing_rss_fails_closed_at_par() {
         use Verdict::*;
-        // The wall bar alone cannot establish SUPERIOR. This is the normal
-        // shape on non-Unix hosts and can also arise from a failed per-child
-        // rusage measurement: missing evidence must not become vacuous success.
         let mut s = DivStats::default();
-        s.add(&rec_out(
-            ay_rss(v(&[Unsat]), 20, None),
-            Some(ay_rss(v(&[Unsat]), 50, Some(20 * MB))),
+        s.add(&rec(
+            v(&[Unsat]),
+            20,
+            Some(v(&[Unsat])),
+            50,
             SelfCheck::Verdicts(vec![Unsat]),
         ));
         assert_eq!(s.wall_not_2x, 0);
         assert_eq!(s.rss_cmp, 0);
         assert_eq!(s.rss_missing, 1);
-        assert_eq!(s.rss_not_80, 1);
         assert_eq!(s.rating(true), Rating::Par);
-        assert_eq!(s.rating_cell(true), "PAR(x0,m1)");
+        assert_eq!(s.rating_cell(true), "PAR(x0,m0,r1)");
     }
 
     #[test]

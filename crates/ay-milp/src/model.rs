@@ -495,6 +495,28 @@ impl Model {
         exact(a).expect("validated row coefficient")
     }
 
+    /// [`Self::row_coeff_exact`], landing on the inline-small exact rational
+    /// representation used by verdict-critical matrix accumulators.
+    ///
+    /// The side-store lookup is load-bearing: `a` can be only a rounded proxy
+    /// for `v`, so the fast `f64` conversion is legal only when no override
+    /// exists for this entry.
+    pub(crate) fn row_coeff_exact_small(
+        &self,
+        row: usize,
+        c: u32,
+        a: f64,
+    ) -> ay_lra::rational::Rational {
+        if self.has_inexact_coeffs {
+            if let Some(er) = self.exact_rows.get(&(row as u32)) {
+                if let Some(v) = er.coeffs.get(&c) {
+                    return ay_lra::rational::Rational::from_big(v.clone());
+                }
+            }
+        }
+        exact_small(a).expect("validated row coefficient")
+    }
+
     /// The TRUE rational lower bound of row `row` (`None` = `-INFINITY`), given
     /// its stored `f64` `lb`. Consults the side-store first.
     pub(crate) fn row_lb_exact(&self, row: usize, lb: f64) -> Option<BigRational> {
@@ -508,6 +530,23 @@ impl Model {
         exact(lb)
     }
 
+    /// [`Self::row_lb_exact`], landing on the inline-small exact rational
+    /// representation without bypassing a true-rational side-store override.
+    pub(crate) fn row_lb_exact_small(
+        &self,
+        row: usize,
+        lb: f64,
+    ) -> Option<ay_lra::rational::Rational> {
+        if self.has_inexact_coeffs {
+            if let Some(er) = self.exact_rows.get(&(row as u32)) {
+                if let Some(v) = &er.lb {
+                    return Some(ay_lra::rational::Rational::from_big(v.clone()));
+                }
+            }
+        }
+        exact_small(lb)
+    }
+
     /// The TRUE rational upper bound of row `row` (`None` = `+INFINITY`).
     pub(crate) fn row_ub_exact(&self, row: usize, ub: f64) -> Option<BigRational> {
         if self.has_inexact_coeffs {
@@ -518,6 +557,23 @@ impl Model {
             }
         }
         exact(ub)
+    }
+
+    /// [`Self::row_ub_exact`], landing on the inline-small exact rational
+    /// representation without bypassing a true-rational side-store override.
+    pub(crate) fn row_ub_exact_small(
+        &self,
+        row: usize,
+        ub: f64,
+    ) -> Option<ay_lra::rational::Rational> {
+        if self.has_inexact_coeffs {
+            if let Some(er) = self.exact_rows.get(&(row as u32)) {
+                if let Some(v) = &er.ub {
+                    return Some(ay_lra::rational::Rational::from_big(v.clone()));
+                }
+            }
+        }
+        exact_small(ub)
     }
 
     /// The TRUE rational objective coefficient of column `c`, given its stored
@@ -940,7 +996,7 @@ pub(crate) fn exact(f: f64) -> Option<BigRational> {
 
 #[cfg(test)]
 mod exact_tests {
-    use super::exact;
+    use super::{exact, exact_small};
     use num_rational::BigRational;
 
     /// The dyadic fast path must be BYTE-IDENTICAL to `BigRational::from_float`
@@ -983,9 +1039,17 @@ mod exact_tests {
                 "mismatch on structured value {f:e} (bits {:#x})",
                 f.to_bits()
             );
+            assert_eq!(
+                exact_small(f).map(|value| value.to_big()),
+                exact(f),
+                "small exact mismatch on structured value {f:e} (bits {:#x})",
+                f.to_bits()
+            );
         }
         assert_eq!(exact(f64::INFINITY), None);
         assert_eq!(exact(f64::NEG_INFINITY), None);
+        assert_eq!(exact_small(f64::INFINITY), None);
+        assert_eq!(exact_small(f64::NEG_INFINITY), None);
 
         // Deterministic xorshift sweep over raw bit patterns: exercises random
         // mantissa/exponent combinations including subnormals.
@@ -1003,6 +1067,11 @@ mod exact_tests {
                 exact(f),
                 BigRational::from_float(f),
                 "mismatch on bits {s:#x} ({f:e})"
+            );
+            assert_eq!(
+                exact_small(f).map(|value| value.to_big()),
+                exact(f),
+                "small exact mismatch on bits {s:#x} ({f:e})"
             );
             tested += 1;
         }

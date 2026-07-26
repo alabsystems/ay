@@ -326,7 +326,7 @@ def test_rec_name_collision_with_plain_uf_fails_closed():
 # Differential vs real z3py (same probes, independent verdicts)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_differential_fact_vs_real_z3():
     # ayz3 side.
     fact = _fact_def()

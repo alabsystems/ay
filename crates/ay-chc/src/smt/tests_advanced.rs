@@ -651,12 +651,15 @@ fn test_incremental_sat_context_bg_conflict() {
     );
 }
 
-/// Build a deep nested expression tree: (and (and (and ... (> x 0))))
+/// Build a shared deep Boolean tree with exponentially many occurrences.
 fn make_deep_conjunction(depth: usize) -> ChcExpr {
     let x = ChcVar::new("x", ChcSort::Int);
     let mut expr = ChcExpr::gt(ChcExpr::var(x), ChcExpr::int(0));
     for _ in 0..depth {
-        expr = ChcExpr::and(expr.clone(), expr);
+        // Keep the branches structurally distinct so reflexive-equality
+        // simplification cannot collapse the stress graph before the
+        // conversion-budget guard counts occurrences.
+        expr = ChcExpr::eq(expr.clone(), ChcExpr::not(expr));
     }
     expr
 }

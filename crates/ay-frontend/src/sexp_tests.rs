@@ -393,13 +393,24 @@ fn test_round_trip_string() {
 #[test]
 fn test_round_trip_string_with_escapes() {
     // SMT-LIB 2.6: a backslash is a LITERAL character (only `\u…` are escapes).
-    // Legacy input `\"` is therefore parsed as backslash+quote, NOT as an
-    // escaped quote — decoding it away was a wrong-verdict soundness bug on
-    // str.len/membership (see ay-core::unescape_string_contents, commit
-    // 204a245f which updated the parallel smtlib_tests assertions).
-    let sexp = parse_sexp(r#""say \"hi\"""#).unwrap();
-    // Internal representation keeps the backslashes literal.
-    assert_eq!(sexp, SExpr::String(r#"say \"hi\""#.to_string()));
+    // It follows that a literal ENDS at the first unpaired `"` even when a
+    // backslash immediately precedes it — `\"` does not escape the quote.
+    //
+    // This assertion previously expected `"say \"hi\""` to parse as ONE string,
+    // which contradicted the very rule stated above. That was only reachable
+    // because the LEXER still carried a `\\.` alternative and swallowed the
+    // terminating quote; the decoder had already been corrected. z3 5.0.0
+    // adjudicates: `(str.len "say \")` is 5, and the longer form errors with
+    // "unknown constant hi" — i.e. the literal really does stop at that quote.
+    let sexp = parse_sexp(r#""say \""#).unwrap();
+    assert_eq!(sexp, SExpr::String(r"say \".to_string()));
+
+    // And the legacy form is now rejected rather than silently re-interpreted,
+    // matching z3, which also errors on it.
+    assert!(
+        parse_sexp(r#""say \"hi\"""#).is_err(),
+        "backslash must not escape the terminating quote"
+    );
 
     // The canonical SMT-LIB 2.6 way to embed a quote is `""`. A string that
     // mixes a literal backslash (not adjacent to a quote) with an embedded quote

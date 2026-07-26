@@ -8,13 +8,34 @@
 //! All methods are `impl Executor` — they share the same method namespace.
 
 // #8529: Use deterministic hash sets in all builds.
-use ay_core::kani_compat::DetHashSet as HashSet;
+use ay_core::kani_compat::{DetHashMap, DetHashSet as HashSet};
 use ay_core::term::TermData;
 use ay_core::{Sort, TermId};
 
 use super::{EvalValue, Model, NormalizedArray, EVAL_STACK_RED_ZONE, EVAL_STACK_SIZE};
 
 use super::Executor;
+
+/// Cached index behind [`Executor::array_def_candidates`]: every asserted
+/// binary `=` keyed by each side's `TermId`, in definitional-constraint order,
+/// together with the byte-exact `(assertions, assumptions)` snapshot it was
+/// built from (compared on every lookup; any difference forces a rebuild).
+pub(in crate::executor) struct ArrayDefIndexCache {
+    assertions_snapshot: Vec<TermId>,
+    assumptions_snapshot: Option<Vec<TermId>>,
+    /// Outermost `evaluate_term` frame (`eval_guard::top_frame_generation`)
+    /// that last validated the snapshot byte-exactly; lookups in the same
+    /// frame skip the O(constraints) re-compare (assertions are frozen for
+    /// the frame's lifetime by the live `&self` borrow — debug builds
+    /// re-verify on every hit).
+    validated_generation: Option<u64>,
+    /// Outermost `AssertionsFrozen` region that last validated the snapshot
+    /// byte-exactly (a stated no-assertion-mutation contract, oracle-defended
+    /// in debug builds); amortizes across the MANY top-level frames a repair /
+    /// completion pass creates.
+    validated_freeze_generation: Option<u64>,
+    by_side: DetHashMap<TermId, Vec<TermId>>,
+}
 
 /// Collapse authoritative/newest-first interpretation stores to one semantic
 /// entry per concrete index. Sorting before this step would make a shadowed
@@ -1917,6 +1938,153 @@ impl Executor {
             .chain(self.last_assumptions.iter().flatten().copied())
     }
 
+    /// The asserted binary equalities mentioning `var` as a side, in
+    /// definitional-constraint order — the shared candidate list behind
+    /// `array_variable_definition{,_excluding}` and
+    /// `unique_array_constructor_definition_excluding`.
+    ///
+    /// Served from `array_def_index`, an index over ALL binary `=` constraints
+    /// that is rebuilt whenever the `(assertions, assumptions)` snapshot is not
+    /// BYTE-IDENTICAL to the one it was built from. The exact-equality check
+    /// runs on every call, so the index can never serve a definition set that
+    /// differs from what a fresh scan would see (model validation is a
+    /// soundness gate — a stale definition here could accept a wrong model).
+    /// Identical id snapshots imply an identical index because the `TermStore`
+    /// is append-only: an existing `TermId`'s data never changes.
+    ///
+    /// Motivation: each of those lookups previously scanned every constraint,
+    /// making model evaluation O(selects × constraints); an n-ary `distinct`
+    /// over N selects expands to ~N²/2 constraints, so validation of a
+    /// trivially-SAT instance cost tens of seconds by N≈400 while its solve
+    /// took 0.1s. With the index a lookup is O(snapshot compare) + O(own
+    /// candidates).
+    fn array_def_candidates(&self, var: TermId) -> Vec<TermId> {
+        let mut cache = self.array_def_index.borrow_mut();
+        let frame_gen = super::eval_guard::top_frame_generation();
+        let freeze_gen = super::eval_guard::assertions_freeze_generation();
+        // Fast path: already validated within the CURRENT outermost
+        // `evaluate_term` frame. For that frame's whole lifetime the executor
+        // is under a live `&self` borrow and `ctx.assertions` /
+        // `last_assumptions` are plain fields, so the borrow checker itself
+        // guarantees the assertion set cannot change — one exact snapshot
+        // compare per frame is sufficient. Without this, the O(constraints)
+        // compare per lookup dominated the very validation cost this index
+        // removes (sample profile: 3288/3969 samples in the compare at
+        // N=400). NOT keyed on eval-memo sessions: those span `&mut self`
+        // regions that DO mutate assertions (refuted by the incremental
+        // push/pop suite via this very oracle). Debug builds re-run the full
+        // compare on every hit as a corpus-wide oracle for the borrow
+        // reasoning.
+        // Additionally honour an explicit assertions-freeze region
+        // (`AssertionsFrozen`): passes like read-pin repair interleave model
+        // mutation with MANY top-level eval frames, so the frame key alone
+        // re-compares once per pin. The freeze key is a stated (not
+        // borrow-enforced) contract — defended by the debug re-compare below.
+        let fast_valid = match cache.as_ref() {
+            Some(c) => {
+                (frame_gen.is_some() && c.validated_generation == frame_gen)
+                    || (freeze_gen.is_some() && c.validated_freeze_generation == freeze_gen)
+            }
+            None => false,
+        };
+        #[cfg(debug_assertions)]
+        if fast_valid {
+            let c = cache.as_ref().expect("fast_valid implies cache");
+            debug_assert!(
+                c.assertions_snapshot == self.ctx.assertions
+                    && c.assumptions_snapshot == self.last_assumptions,
+                "array_def_index: assertion set changed within a frame/freeze \
+                 fast-path region — an AssertionsFrozen guard wraps a region \
+                 that mutates assertions, or the &self frame reasoning broke"
+            );
+        }
+        let valid = fast_valid
+            || cache.as_ref().is_some_and(|c| {
+                c.assertions_snapshot == self.ctx.assertions
+                    && c.assumptions_snapshot == self.last_assumptions
+            });
+        if !valid {
+            let mut by_side: DetHashMap<TermId, Vec<TermId>> = DetHashMap::default();
+            for assertion in self.definitional_constraint_terms() {
+                let TermData::App(sym, args) = self.ctx.terms.get(assertion) else {
+                    continue;
+                };
+                if sym.name() != "=" || args.len() != 2 {
+                    continue;
+                }
+                by_side.entry(args[0]).or_default().push(assertion);
+                if args[1] != args[0] {
+                    by_side.entry(args[1]).or_default().push(assertion);
+                }
+            }
+            *cache = Some(ArrayDefIndexCache {
+                assertions_snapshot: self.ctx.assertions.clone(),
+                assumptions_snapshot: self.last_assumptions.clone(),
+                validated_generation: None,
+                validated_freeze_generation: None,
+                by_side,
+            });
+        }
+        // Stamp the outermost frame / freeze region that (re)validated this
+        // index so subsequent lookups in either scope take the fast path.
+        let c = cache.as_mut().expect("array_def_index populated above");
+        c.validated_generation = frame_gen;
+        c.validated_freeze_generation = freeze_gen;
+        c.by_side.get(&var).cloned().unwrap_or_default()
+    }
+
+    /// All `select(array_term, _)` terms in the store, ascending by id — the
+    /// candidate set behind `array_witness_base_interp`'s constrained-read
+    /// collection (which previously scanned the WHOLE term store per array:
+    /// O(arrays × terms) during model-output completion).
+    ///
+    /// Served from `select_by_array_index`, extended lazily over the
+    /// append-only term store (`[scanned, len)` suffix scans only). Exact by
+    /// construction: existing `TermId`s are immutable, ids never shrink except
+    /// on `reset()` (which clears the index) — a length shrink additionally
+    /// forces a from-scratch rebuild. Debug builds re-derive the list by full
+    /// scan on every lookup as the oracle.
+    pub(super) fn selects_of_array(&self, array_term: TermId) -> Vec<TermId> {
+        let mut ix = self.select_by_array_index.borrow_mut();
+        let (scanned, map) = &mut *ix;
+        let len = self.ctx.terms.len();
+        if *scanned > len {
+            // Term store shrank (ctx replaced outside reset()): rebuild.
+            *scanned = 0;
+            map.clear();
+        }
+        if *scanned < len {
+            for raw in *scanned..len {
+                let tid = TermId(raw as u32);
+                if let TermData::App(sym, args) = self.ctx.terms.get(tid) {
+                    if sym.name() == "select" && args.len() == 2 {
+                        map.entry(args[0]).or_default().push(tid);
+                    }
+                }
+            }
+            *scanned = len;
+        }
+        let result = map.get(&array_term).cloned().unwrap_or_default();
+        #[cfg(debug_assertions)]
+        {
+            let mut oracle = Vec::new();
+            for raw in 0..len {
+                let tid = TermId(raw as u32);
+                if let TermData::App(sym, args) = self.ctx.terms.get(tid) {
+                    if sym.name() == "select" && args.len() == 2 && args[0] == array_term {
+                        oracle.push(tid);
+                    }
+                }
+            }
+            debug_assert_eq!(
+                result, oracle,
+                "select_by_array_index diverged from a full term-store scan \
+                 (append-only assumption violated?)"
+            );
+        }
+        result
+    }
+
     /// Find a definitional equality `(= v rhs)` or `(= lhs v)` for the array
     /// variable `v` among the assertions (and active assumptions) and return
     /// the OTHER side.
@@ -1927,21 +2095,12 @@ impl Executor {
     /// first such definition; if a variable has several, any one is sound
     /// because all asserted equalities must hold simultaneously.
     pub(super) fn array_variable_definition(&self, var: TermId) -> Option<TermId> {
-        for assertion in self.definitional_constraint_terms() {
-            let TermData::App(sym, args) = self.ctx.terms.get(assertion) else {
+        for assertion in self.array_def_candidates(var) {
+            let TermData::App(_, args) = self.ctx.terms.get(assertion) else {
                 continue;
             };
-            if sym.name() != "=" || args.len() != 2 {
-                continue;
-            }
             let (lhs, rhs) = (args[0], args[1]);
-            let other = if lhs == var {
-                rhs
-            } else if rhs == var {
-                lhs
-            } else {
-                continue;
-            };
+            let other = if lhs == var { rhs } else { lhs };
             if self.is_array_definition_shape(other) {
                 return Some(other);
             }
@@ -1963,21 +2122,12 @@ impl Executor {
         var: TermId,
         def_visited: &HashSet<TermId>,
     ) -> Option<TermId> {
-        for assertion in self.definitional_constraint_terms() {
-            let TermData::App(sym, args) = self.ctx.terms.get(assertion) else {
+        for assertion in self.array_def_candidates(var) {
+            let TermData::App(_, args) = self.ctx.terms.get(assertion) else {
                 continue;
             };
-            if sym.name() != "=" || args.len() != 2 {
-                continue;
-            }
             let (lhs, rhs) = (args[0], args[1]);
-            let other = if lhs == var {
-                rhs
-            } else if rhs == var {
-                lhs
-            } else {
-                continue;
-            };
+            let other = if lhs == var { rhs } else { lhs };
             // Skip an array-variable definition we have already chased: that is
             // the back-edge of a definitional cycle.
             if matches!(self.ctx.terms.get(other), TermData::Var(_, _))
@@ -2006,21 +2156,12 @@ impl Executor {
         def_visited: &HashSet<TermId>,
     ) -> Option<TermId> {
         let mut unique = None;
-        for assertion in self.definitional_constraint_terms() {
-            let TermData::App(sym, args) = self.ctx.terms.get(assertion) else {
+        for assertion in self.array_def_candidates(var) {
+            let TermData::App(_, args) = self.ctx.terms.get(assertion) else {
                 continue;
             };
-            if sym.name() != "=" || args.len() != 2 {
-                continue;
-            }
             let (lhs, rhs) = (args[0], args[1]);
-            let other = if lhs == var {
-                rhs
-            } else if rhs == var {
-                lhs
-            } else {
-                continue;
-            };
+            let other = if lhs == var { rhs } else { lhs };
             if matches!(self.ctx.terms.get(other), TermData::Var(_, _)) {
                 if def_visited.contains(&other) {
                     continue;

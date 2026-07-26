@@ -1,10 +1,6 @@
-//! Root-LP bound probe: translate an OPT-LIN PB into a CONTINUOUS [0,1] model and
-//! solve the pure LP relaxation with ay-milp's exact LpSession. Prints the exact
-//! root LP optimum so we can compare it to a known integer incumbent and decide
-//! whether the integrality gap (LP*..IntOpt) is the bottleneck.
-//!
-//!   PROBE_FILES=a.opb,b.opb PROBE_SECS=60 \
-//!     cargo test -p ay-pb --release --test lp_root_probe -- --ignored --nocapture
+//! Root-LP translation regression: translate an OPT-LIN PB into a continuous
+//! `[0,1]` model and require ay-milp's exact `LpSession` to return the known
+//! fractional optimum.
 
 use ay_milp::{Col, LpSession, Model, Outcome, Sense, SolveOpts};
 use ay_pb::{parse_opb, PbInstance, PbRel, PbTerm};
@@ -59,47 +55,29 @@ fn pb_to_lp(inst: &PbInstance) -> Option<Model> {
     Some(model)
 }
 
-fn probe(path: &str, budget_secs: u64) {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        eprintln!("SKIP {path}: not found");
-        return;
-    };
-    let inst = parse_opb(&raw).expect("parse opb");
-    let name = path.rsplit('/').next().unwrap_or(path);
-    let Some(model) = pb_to_lp(&inst) else {
-        println!("{name}: DECLINE (non-linear)");
-        return;
-    };
-    let opts = SolveOpts::new().with_time_limit(Duration::from_secs(budget_secs));
-    let mut lp = LpSession::new(&model, &opts).expect("lp session");
-    let t0 = std::time::Instant::now();
-    let outcome = lp.optimize_model_objective().expect("optimize");
-    let dt = t0.elapsed().as_secs_f64();
-    use num_traits::ToPrimitive;
-    match &outcome {
-        Outcome::Optimal { value, .. } => println!(
-            "{name}: nvars={} ncons={} ROOT-LP* = {:.4} time={dt:.2}s",
-            inst.num_vars,
-            inst.constraints.len(),
-            value.to_f64().unwrap_or(f64::NAN)
-        ),
-        Outcome::Infeasible { .. } => println!("{name}: LP INFEASIBLE time={dt:.2}s"),
-        Outcome::Unbounded => println!("{name}: LP UNBOUNDED time={dt:.2}s"),
-        Outcome::Unknown { reason } => println!("{name}: LP UNKNOWN ({reason:?}) time={dt:.2}s"),
-        other => println!("{name}: LP OTHER {other:?} time={dt:.2}s"),
-    }
-}
-
 #[test]
-#[ignore = "manual root-LP probe; run with --ignored --nocapture"]
-fn lp_root_probe_instances() {
-    let budget: u64 = std::env::var("PROBE_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60);
-    for p in std::env::var("PROBE_FILES").unwrap_or_default().split(',') {
-        if !p.is_empty() {
-            probe(p, budget);
+fn root_lp_returns_exact_fractional_cover_bound() {
+    // min x1+x2 subject to 2*x1+2*x2 >= 3 has LP optimum 3/2 but
+    // integer optimum 2.  This pins both translation and the root relaxation,
+    // including the integrality gap that the former manual probe investigated.
+    let inst = parse_opb(
+        "* #variable= 2 #constraint= 1\n\
+         min: +1 x1 +1 x2 ;\n\
+         +2 x1 +2 x2 >= 3 ;\n",
+    )
+    .expect("parse fixture");
+    let model = pb_to_lp(&inst).expect("linear fixture");
+    let opts = SolveOpts::new().with_time_limit(Duration::from_secs(2));
+    let mut lp = LpSession::new(&model, &opts).expect("lp session");
+    let outcome = lp.optimize_model_objective().expect("optimize");
+    match outcome {
+        Outcome::Optimal { value, .. } => {
+            assert_eq!(
+                value,
+                num_rational::BigRational::new(3.into(), 2.into()),
+                "the continuous relaxation must preserve its fractional optimum"
+            );
         }
+        other => panic!("expected a proved LP optimum, got {other:?}"),
     }
 }

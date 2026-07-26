@@ -32,6 +32,7 @@ mod propagation;
 mod store_chain;
 mod union_find;
 mod weak_equiv;
+mod weak_lemmas;
 
 pub(crate) use bridge::SelectResolution;
 pub use bridge::UndecidedIndexPair;
@@ -302,12 +303,16 @@ impl ExactSelectModelEqObligation {
 /// another context. A thread-local (not a solver field) keeps `&self` query
 /// paths free of borrow conflicts with the `&mut self` scan loop.
 pub(crate) mod eq_paths_cache {
+    use super::SelectResolution;
     use ay_core::kani_compat::DetHashMap as HashMap;
     use ay_core::{TermId, TheoryLit};
     use std::cell::RefCell;
     use std::rc::Rc;
 
     type PathMap = HashMap<TermId, Vec<TheoryLit>>;
+    /// Memoized payload of `resolve_select_base_for_propagation_with_reasons`:
+    /// `(resolution, reasons)`.
+    pub(crate) type ResolveBaseMemo = (SelectResolution, Vec<TheoryLit>);
     type PairReason = Option<Vec<TheoryLit>>;
     type AssertedPredecessors = HashMap<TermId, (TermId, TermId)>;
     type SharedAssertedPredecessors = Rc<AssertedPredecessors>;
@@ -345,6 +350,18 @@ pub(crate) mod eq_paths_cache {
         /// O(pairs × chain × class) re-walk that `store_chain_reaches_asserted`
         /// / `collect_complete_effective_stores` drove per candidate pair.
         store_through: HashMap<(TermId, bool), Option<Rc<StoreThroughMemo>>>,
+        /// Per-`(array, index)` memo of
+        /// `resolve_select_base_for_propagation_with_reasons` (store-chain
+        /// resolution for N-O equality propagation). The resolution is a
+        /// deterministic pure function of `store_cache`, `eq_adj`, external
+        /// facts, `assigns`, `diseq_set` and the (immutable) affine structure —
+        /// all frozen for the lifetime of the window — so a hit is
+        /// byte-identical to a recomputation (its reasons are sorted+deduped
+        /// before return). This collapses the redundant re-resolution of the
+        /// same `(array, index)` across the many asserted-array-equality
+        /// (`lhs`/`rhs`) pairs in the cross-chain O(eq_pairs × indices) loop and
+        /// the main per-select scan within one propagation call.
+        resolve_base: HashMap<(TermId, TermId), Rc<ResolveBaseMemo>>,
         /// Whole-output memo of `select_alias_diseq_candidate_pairs()`
         /// (#7956): pure function of `diseq_set` / `select_cache` / `eq_adj` /
         /// `assigns` / shadow union-find, all frozen in the window; the
@@ -473,6 +490,23 @@ pub(crate) mod eq_paths_cache {
             if let Some(t) = c.borrow_mut().as_mut() {
                 t.store_through
                     .insert((term, skip_sentinels), found.clone());
+            }
+        });
+    }
+
+    /// Cached `resolve_select_base_for_propagation_with_reasons(array, index)`
+    /// payload, if warm. `None` when the window is inactive or cold for the key.
+    pub(crate) fn get_resolve_base(array: TermId, index: TermId) -> Option<Rc<ResolveBaseMemo>> {
+        CACHE.with(|c| {
+            c.borrow()
+                .as_ref()
+                .and_then(|t| t.resolve_base.get(&(array, index)).cloned())
+        })
+    }
+    pub(crate) fn put_resolve_base(array: TermId, index: TermId, payload: &Rc<ResolveBaseMemo>) {
+        CACHE.with(|c| {
+            if let Some(t) = c.borrow_mut().as_mut() {
+                t.resolve_base.insert((array, index), payload.clone());
             }
         });
     }

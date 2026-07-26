@@ -2480,10 +2480,22 @@ impl InliningBackTranslator {
                         ));
                         return None;
                     };
+                    let Some(ordered_premises) = Self::order_surviving_premises(
+                        &clause.body.predicates,
+                        &premise_targets,
+                        &steps,
+                        input_clauses,
+                    ) else {
+                        log_ground_translation_detail(format_args!(
+                            "clause-inliner: could not align premises for uncomposed input \
+                             clause {input_index} (output step {old_index})"
+                        ));
+                        return None;
+                    };
                     let mut env = step.env.clone();
                     crate::ground_derivation::complete::seed_env_from_premises(
                         clause,
-                        &premise_targets,
+                        &ordered_premises,
                         &steps,
                         input_clauses,
                         &mut env,
@@ -2499,7 +2511,7 @@ impl InliningBackTranslator {
                     steps.push(GroundDerivationStep {
                         clause_index: input_index,
                         env,
-                        premises: premise_targets,
+                        premises: ordered_premises,
                     });
                     emitted
                 }
@@ -2518,6 +2530,38 @@ impl InliningBackTranslator {
             log_ground_translation_detail(format_args!(
                 "clause-inliner: expanded derivation does not validate on the input problem ({err})"
             ));
+            if crate::ground_derivation::ground_backtranslation_debug() {
+                for (step_index, step) in translated.steps.iter().enumerate() {
+                    let Some(clause) = input_clauses.get(step.clause_index) else {
+                        continue;
+                    };
+                    let expected: Vec<String> = clause
+                        .body
+                        .predicates
+                        .iter()
+                        .map(|(pred, _)| format!("P{}", pred.0))
+                        .collect();
+                    let actual: Vec<String> = step
+                        .premises
+                        .iter()
+                        .map(|premise| {
+                            translated
+                                .steps
+                                .get(*premise)
+                                .and_then(|premise_step| {
+                                    input_clauses.get(premise_step.clause_index)
+                                })
+                                .and_then(|premise_clause| premise_clause.head.predicate_id())
+                                .map_or_else(|| "false".to_string(), |pred| format!("P{}", pred.0))
+                        })
+                        .collect();
+                    log_ground_translation_detail(format_args!(
+                        "clause-inliner: translated step {step_index} clause={} \
+                         expected={expected:?} premises={:?} actual={actual:?}",
+                        step.clause_index, step.premises
+                    ));
+                }
+            }
             return None;
         }
         Some(translated)
@@ -2643,7 +2687,6 @@ impl InliningBackTranslator {
         }
         let env = &env;
         let mut surviving = premise_targets.to_vec();
-        surviving.reverse(); // pop() consumes them in body order
 
         let mut scratch: Vec<GroundScratchStep> = Vec::new();
         let premises = Self::reconstruct_ground_body(
@@ -2651,6 +2694,7 @@ impl InliningBackTranslator {
             env,
             trace,
             input_clauses,
+            steps,
             &mut scratch,
             &mut surviving,
         )?;
@@ -2960,6 +3004,9 @@ impl InliningBackTranslator {
     ) {
         /// Wall-clock cap for the per-clause recovery solve.
         const RECOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        /// Per-polarity cap when completing a Boolean call argument omitted
+        /// from a partial SMT model.
+        const FORCED_BOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
         let mut conjuncts: Vec<ChcExpr> = Vec::new();
         if let Some(constraint) = &composite.body.constraint {
@@ -3019,15 +3066,146 @@ impl InliningBackTranslator {
                 env.insert(var.name, value.clone());
             }
         }
+
+        // The SMT layer is allowed to return a PARTIAL model.  In particular,
+        // a Boolean fixed only through a short implication chain may be absent
+        // even though the restored composite formula forces its value.  Such a
+        // variable can still occur in an inlined predicate's call arguments,
+        // where reconstruction must evaluate it to seed the original head.
+        //
+        // Complete only missing Boolean CALL variables, and only when the two
+        // polarities prove uniqueness: F /\ v SAT and F /\ !v UNSAT (or the
+        // converse).  If both are possible, either is Unknown, or the sort is
+        // not Boolean, leave the variable unbound so expansion fails closed.
+        // The proposed value is additionally checked by the full translated
+        // derivation validation below.
+        let mut call_vars: Vec<ChcVar> = Vec::new();
+        for step in trace.steps.values() {
+            for call_arg in &step.call_args {
+                for var in call_arg.vars() {
+                    if !call_vars.contains(&var) {
+                        call_vars.push(var);
+                    }
+                }
+            }
+        }
+        call_vars.sort();
+        for var in call_vars {
+            if env.contains_key(&var.name) || var.sort != ChcSort::Bool {
+                continue;
+            }
+            let Some(value) = Self::uniquely_forced_bool_value(&formula, &var, FORCED_BOOL_TIMEOUT)
+            else {
+                continue;
+            };
+            crate::ground_derivation::log_ground_translation_detail(format_args!(
+                "clause-inliner: recovered uniquely forced Boolean call argument {}={value:?}",
+                var.name
+            ));
+            env.insert(var.name, value);
+        }
+    }
+
+    /// Return a Boolean value only when `formula` permits exactly one polarity.
+    ///
+    /// This is deliberately not model completion by convention: an omitted
+    /// Boolean whose two polarities are both satisfiable remains absent.  Each
+    /// query is bounded, and any Unknown fails closed.
+    pub(super) fn uniquely_forced_bool_value(
+        formula: &ChcExpr,
+        var: &ChcVar,
+        timeout: std::time::Duration,
+    ) -> Option<SmtValue> {
+        if var.sort != ChcSort::Bool {
+            return None;
+        }
+        let atom = ChcExpr::var(var.clone());
+        let mut positive_smt = SmtContext::new();
+        let positive = positive_smt
+            .check_sat_with_timeout(&ChcExpr::and(formula.clone(), atom.clone()), timeout);
+        let mut negative_smt = SmtContext::new();
+        let negative = negative_smt
+            .check_sat_with_timeout(&ChcExpr::and(formula.clone(), ChcExpr::not(atom)), timeout);
+        match (positive, negative) {
+            (SmtResult::Sat(_), negative) if negative.is_unsat() => Some(SmtValue::Bool(true)),
+            (positive, SmtResult::Sat(_)) if positive.is_unsat() => Some(SmtValue::Bool(false)),
+            _ => None,
+        }
+    }
+
+    /// Remove the unique available premise whose translated input clause
+    /// derives `body_pred`.
+    ///
+    /// Predicate identity is only an ordering key. Multiple matches are
+    /// ambiguous (the calls may carry different arguments), so they fail
+    /// closed; the final full derivation validation checks all argument links.
+    fn take_surviving_premise(
+        body_pred: PredicateId,
+        surviving: &mut Vec<usize>,
+        emitted_steps: &[crate::ground_derivation::GroundDerivationStep],
+        input_clauses: &[HornClause],
+    ) -> Option<usize> {
+        let matching: Vec<usize> = surviving
+            .iter()
+            .enumerate()
+            .filter_map(|(position, premise)| {
+                let premise_head = emitted_steps
+                    .get(*premise)
+                    .and_then(|premise_step| input_clauses.get(premise_step.clause_index))
+                    .and_then(|premise_clause| premise_clause.head.predicate_id());
+                (premise_head == Some(body_pred)).then_some(position)
+            })
+            .collect();
+        if matching.len() != 1 {
+            crate::ground_derivation::log_ground_translation_detail(format_args!(
+                "clause-inliner: expected one surviving premise for body predicate \
+                 {body_pred:?}, found {}; fail closed",
+                matching.len()
+            ));
+            return None;
+        }
+        Some(surviving.remove(matching[0]))
+    }
+
+    /// Order translated premises exactly as an input clause's body.
+    fn order_surviving_premises(
+        body_preds: &[(PredicateId, Vec<ChcExpr>)],
+        premises: &[usize],
+        emitted_steps: &[crate::ground_derivation::GroundDerivationStep],
+        input_clauses: &[HornClause],
+    ) -> Option<Vec<usize>> {
+        let mut surviving = premises.to_vec();
+        let ordered = body_preds
+            .iter()
+            .map(|(body_pred, _)| {
+                Self::take_surviving_premise(
+                    *body_pred,
+                    &mut surviving,
+                    emitted_steps,
+                    input_clauses,
+                )
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if !surviving.is_empty() {
+            crate::ground_derivation::log_ground_translation_detail(format_args!(
+                "clause-inliner: {} translated premises were not consumed; fail closed",
+                surviving.len()
+            ));
+            return None;
+        }
+        Some(ordered)
     }
 
     /// Reconstruct premise references for a clause body, recursing into inlined
-    /// predicates and drawing surviving ones from `surviving` (in body order).
+    /// predicates and matching each surviving premise by its translated input
+    /// head. The inliner's stack may reorder output body predicates, so output
+    /// premise position is not an input-space correspondence.
     fn reconstruct_ground_body(
         body_preds: &[(PredicateId, Vec<ChcExpr>)],
         env: &FxHashMap<String, SmtValue>,
         trace: &ClauseTrace,
         input_clauses: &[HornClause],
+        emitted_steps: &[crate::ground_derivation::GroundDerivationStep],
         scratch: &mut Vec<GroundScratchStep>,
         surviving: &mut Vec<usize>,
     ) -> Option<Vec<Result<usize, usize>>> {
@@ -3039,17 +3217,17 @@ impl InliningBackTranslator {
                     env,
                     trace,
                     input_clauses,
+                    emitted_steps,
                     scratch,
                     surviving,
                 )?)),
                 None => {
-                    let Some(existing) = surviving.pop() else {
-                        crate::ground_derivation::log_ground_translation_detail(format_args!(
-                            "clause-inliner: ran out of surviving premises for body predicate \
-                             {body_pred:?}; fail closed"
-                        ));
-                        return None;
-                    };
+                    let existing = Self::take_surviving_premise(
+                        *body_pred,
+                        surviving,
+                        emitted_steps,
+                        input_clauses,
+                    )?;
                     refs.push(Ok(existing));
                 }
             }
@@ -3063,6 +3241,7 @@ impl InliningBackTranslator {
         env: &FxHashMap<String, SmtValue>,
         trace: &ClauseTrace,
         input_clauses: &[HornClause],
+        emitted_steps: &[crate::ground_derivation::GroundDerivationStep],
         scratch: &mut Vec<GroundScratchStep>,
         surviving: &mut Vec<usize>,
     ) -> Option<usize> {
@@ -3136,6 +3315,7 @@ impl InliningBackTranslator {
             env,
             trace,
             input_clauses,
+            emitted_steps,
             scratch,
             surviving,
         )?;

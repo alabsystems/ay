@@ -1180,6 +1180,21 @@ pub(crate) struct SolverStats {
     /// check-sat, or `can_use_incremental_reset` failed closed on a destructive
     /// arena op). Should stay small/constant, not scale with num_check_sats.
     pub ext_full_reset_hits: u64,
+    /// #unguarded-tvalid-lemmas STAGE 0 (replay counter): conflicts whose
+    /// CONFLICTING clause was born in a PRIOR incremental solve (its
+    /// birth-solve stamp < the current `incremental_solve_count`). This is
+    /// the direct measure of cross-solve learned/lemma-clause carryover: on
+    /// the .ind push/pop regime it should be near zero while T-valid theory
+    /// conflict lemmas are selector-guarded (the pool is deleted at every
+    /// pop) and grow once permanent retention is enabled.
+    pub conflicts_from_prior_solve_clauses: u64,
+    /// #unguarded-tvalid-lemmas STAGE 0 (replay counter): conflicts that
+    /// occur at a decision level within the assumption prefix
+    /// (`decision_level <= active_assumption_count`). Such conflicts resolve
+    /// against scope-selector/assumption decisions, so their learned clauses
+    /// carry the selector guard — the transitive-poisoning mechanism this
+    /// campaign quantifies.
+    pub assumption_level_conflicts: u64,
     /// IC3 lazy lemma removal (#8662 Gap 7): clauses marked as pending-garbage
     /// by the IC3 caller via `mark_clause_garbage_lazy()`.
     pub ic3_lazy_removed: u64,
@@ -2168,6 +2183,8 @@ impl SolverStats {
             assumption_cache_levels_reused: 0,
             ext_incremental_reset_hits: 0,
             ext_full_reset_hits: 0,
+            conflicts_from_prior_solve_clauses: 0,
+            assumption_level_conflicts: 0,
             ic3_lazy_removed: 0,
             leaked_learned_clauses_gc_removed: 0,
             ic3_domain_cache_hits: 0,

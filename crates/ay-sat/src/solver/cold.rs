@@ -380,6 +380,9 @@ pub(crate) struct ColdState {
     pub(super) ema_swapped: bool,
     /// Whether to use Glucose-style restarts (true) or Luby restarts (false)
     pub(super) glucose_restarts: bool,
+    /// #storm-poll-cadence: rolling count of theory-propagate rounds used to
+    /// amortize the deadline poll on `Continue` results (1/32 cadence).
+    pub(crate) theory_continue_polls: u64,
     /// Theory conflict ratio EMA (fraction of conflicts from theory/extension).
     /// Updated by `update_theory_conflict_ratio()` on every conflict. When this
     /// exceeds `THEORY_CONFLICT_RATIO_THRESHOLD` (0.8), the solver switches to
@@ -838,6 +841,20 @@ pub(crate) struct ColdState {
     pub(super) clause_ids: Vec<u64>,
     /// Learned-clause birth conflict count for default-off 19-63 identity profiling.
     pub(super) bcp_learned_clause_birth_conflicts: Vec<u64>,
+    /// #unguarded-tvalid-lemmas STAGE 0 (replay counter): per-clause
+    /// birth-solve stamp, indexed by arena offset like `clause_ids`.
+    ///
+    /// Records `incremental_solve_count` at clause creation so conflict
+    /// analysis can attribute conflicts to clauses born BEFORE the current
+    /// incremental solve (cross-solve learned-clause carryover measurement
+    /// for the .ind push/pop regime). The vec stays EMPTY until the session
+    /// becomes incremental (`incremental_solve_count > 0`): a missing entry
+    /// reads as birth epoch 0 ("born in/before the first solve"), so
+    /// single-shot solving allocates nothing. Remapped by arena GC and
+    /// cleared on the ledger arena rebuild exactly like `clause_ids`
+    /// (clauses re-added by the rebuild read as epoch 0 — acceptable for a
+    /// diagnostic counter).
+    pub(super) clause_birth_solve: Vec<u32>,
     /// Per-variable LRAT clause ID fallback for level-0 variables whose reason
     /// clause was deleted via `ReasonPolicy::ClearLevel0`. Without this, chain
     /// collectors skip such variables, producing incomplete LRAT hints (#4617).
@@ -998,6 +1015,20 @@ pub(crate) struct ColdState {
     /// query sequences. The cleanup fires every `INCREMENTAL_REDUCE_INTERVAL`
     /// solves when the learned clause count exceeds a threshold.
     pub(super) incremental_solve_count: u64,
+    /// #unguarded-tvalid-lemmas STAGE 0 (replay counter): number of
+    /// assumption literals (scope selectors + user assumptions) for the
+    /// CURRENT solve call.
+    ///
+    /// Set at `solve_with_assumptions_impl` entry; reset to 0 by the
+    /// no-assumption solve entry (`solve_no_assumptions`). Conflicts at
+    /// `decision_level <= active_assumption_count` occur inside the
+    /// assumption prefix — they resolve against scope-selector decisions and
+    /// their learned clauses carry the selector guard (the poisoning that
+    /// `conflicts_from_prior_solve_clauses` / `assumption_level_conflicts`
+    /// quantify). Resume-style re-entries (`resume_solving_with_extension`)
+    /// intentionally keep the previous solve's value: the assumption
+    /// decisions are still on the trail.
+    pub(super) active_assumption_count: u32,
     /// Conflict count at the last between-solve reduction (#8435).
     ///
     /// Tracks when the last `between_solve_reduce` ran (in lifetime_conflicts
@@ -1553,6 +1584,27 @@ pub(crate) struct ColdState {
     /// reset), so gating on this flag leaves the CHC IC3 path untouched. Set via
     /// `Solver::set_inc_engine_reset_mode(true)`.
     pub(crate) inc_engine_reset_mode: bool,
+    /// #unguarded-tvalid-lemmas STAGE 1: when true, THEORY-CONFLICT lemmas
+    /// routed through `add_theory_conflict_lemma` are stored UNSCOPED
+    /// (scope_lim = 0, no `+selector` guard) and therefore persist across
+    /// `pop()` — OpenSMT-style permanent retention of T-valid conflict
+    /// lemmas.
+    ///
+    /// SOUNDNESS CONTRACT (the caller must guarantee): every clause routed
+    /// through `add_theory_conflict_lemma` while this flag is set must be a
+    /// THEORY TAUTOLOGY over term-semantic atom literals — valid at every
+    /// scope forever (e.g. an LRA Farkas-core conflict lemma), possibly
+    /// weakened only by facts that are themselves session-permanent
+    /// (level-0 root facts). Atom var<->term bindings must be
+    /// session-stable, which holds because `pop()` never shrinks
+    /// `num_vars`/reuses variable indices and the inc-engine lane's
+    /// `local_term_to_var` map is session-persistent and append-only.
+    ///
+    /// Default false (behavior identical to `add_theory_lemma_scoped`).
+    /// Set via `Solver::set_unguarded_theory_conflict_lemmas(true)` by the
+    /// incremental QF_LRA engine lane (env `AY_LRA_INC_UNGUARDED_LEMMAS`,
+    /// default-ON there, `=0` opts out). That lane excludes proof sessions.
+    pub(crate) unguarded_theory_conflict_lemmas: bool,
     /// Minimum formula variable count before domain-restricted BCP is used.
     ///
     /// `None` means mode default: IC3 uses `IC3_DOMAIN_BCP_MIN_VARS_DEFAULT`,
@@ -1725,6 +1777,7 @@ impl ColdState {
             saved_lbd_ema_slow_exp: 1.0,
             ema_swapped: false,
             glucose_restarts: true,
+            theory_continue_polls: 0,
             theory_conflict_ratio: 0.0,
             ext_conflict_count: 0,
             theory_luby_idx: 1,
@@ -1863,6 +1916,7 @@ impl ColdState {
             // explicitly enabled.
             clause_ids: Vec::with_capacity(clauses_capacity),
             bcp_learned_clause_birth_conflicts: Vec::new(),
+            clause_birth_solve: Vec::new(),
             level0_proof_id: vec![0; num_vars],
             level0_proof_sign: vec![0; num_vars],
             lrat_level0_unit_materialize_cursor: 0,
@@ -1900,6 +1954,7 @@ impl ColdState {
             lifetime_propagations: 0,
             lifetime_restarts: 0,
             incremental_solve_count: 0,
+            active_assumption_count: 0,
             last_between_solve_reduce_conflicts: 0,
             lazy_theory_reasons: Vec::new(),
             lazy_theory_propagated: Vec::new(),
@@ -2015,6 +2070,7 @@ impl ColdState {
             ic3_new_clauses_pending: false,
             ic3_mode: false,
             inc_engine_reset_mode: false,
+            unguarded_theory_conflict_lemmas: false,
             domain_bcp_min_vars: None,
             ic3_constrain_act: None,
             ic3_constrained_offsets: Vec::new(),

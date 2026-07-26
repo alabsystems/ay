@@ -853,41 +853,21 @@ mod enum_probe {
     use super::*;
 
     #[test]
-    #[ignore = "manual; set BNN_ENUM_FILE"]
-    fn bnn_enum_file_probe() {
-        let path = std::env::var("BNN_ENUM_FILE").expect("set BNN_ENUM_FILE");
-        let raw = std::fs::read_to_string(&path).expect("read");
-        let inst = crate::parse_opb(&raw).expect("parse");
-        let obj = inst.objective.clone().expect("objective");
-        let net = match recognize(&inst, &obj) {
-            Some(n) => n,
-            None => {
-                eprintln!("NOT RECOGNIZED");
-                return;
-            }
+    fn bnn_enumerator_finds_exact_base_pattern_on_bounded_network() {
+        let (inst, obj) = tests::single_neuron_instance();
+        let net = recognize(&inst, &obj).expect("recognize fixture");
+        assert_eq!(net.neurons.len(), 1);
+        assert_eq!(net.free_inputs.len(), 2);
+
+        let mut improvements = Vec::new();
+        let mut stream = |value: i128, assignment: &[bool]| {
+            assert!(verify_all_constraints(&inst.constraints, assignment));
+            assert_eq!(crate::solver::eval_objective(&obj, assignment), value);
+            improvements.push(value);
         };
-        eprintln!(
-            "recognized: vars={} neurons={} gates={} logits={} pins={} free_inputs={}",
-            net.num_vars,
-            net.neurons.len(),
-            net.gates.len(),
-            net.logits.len(),
-            net.pins.len(),
-            net.free_inputs.len()
-        );
-        let t0 = std::time::Instant::now();
-        let mut count = 0u64;
-        let mut stream = |v: i128, _a: &[bool]| {
-            count += 1;
-            eprintln!("  improve -> {v} @ {:?}", t0.elapsed());
-        };
-        let deadline = t0 + std::time::Duration::from_mins(4);
-        let stop = || std::time::Instant::now() >= deadline;
-        let best = enumerate_adversarial_incumbents(&inst, &obj, None, &stop, &mut stream);
-        eprintln!(
-            "ENUM DONE: best={best:?} improvements={count} time={:?}",
-            t0.elapsed()
-        );
+        let best = enumerate_adversarial_incumbents(&inst, &obj, None, &|| false, &mut stream);
+        assert_eq!(best, Some(0));
+        assert_eq!(improvements, vec![0]);
     }
 }
 
@@ -922,7 +902,7 @@ mod tests {
     /// objective over the inputs. The two big-M rows encode `out = 1 iff
     /// x1 + x2 <= thr` with a dominant selector coefficient. We then check the
     /// recognizer extracts one neuron and the forward seed is feasible.
-    fn single_neuron_instance() -> (PbInstance, PbObjective) {
+    pub(super) fn single_neuron_instance() -> (PbInstance, PbObjective) {
         // Positive row:  +M x3 + x1 + x2 >= rhsP
         // Negative row:  -M x3 - x1 - x2 >= rhsN
         // Choose M = 100 (dominant), inputs coeff +1/-1, and pick rhsP/rhsN so the
@@ -1033,133 +1013,40 @@ mod tests {
 
 #[cfg(test)]
 mod real_instance_tests {
-    //! Opt-in tests over real benchmark files (debug build exercises the
-    //! adjacency `debug_assert`). Set `AY_BNN_GLOB` to a glob of `.opb` files and
-    //! run with `--ignored`. Not run by default (no benchmark files in CI).
     use super::*;
 
     #[test]
-    #[ignore = "requires AY_BNN_GLOB with local real benchmark files"]
-    fn seed_feasible_on_real_bnn_instances() {
-        let glob = match std::env::var("AY_BNN_GLOB") {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let mut any = false;
-        for path in glob_simple(&glob) {
-            any = true;
-            let text = std::fs::read_to_string(&path).expect("read instance");
-            let instance = crate::parser::parse_opb(&text).expect("parse opb");
-            let objective = instance.objective.clone().expect("has objective");
-            let net = recognize(&instance, &objective);
-            assert!(net.is_some(), "should recognize {path}");
-            let s = seed(&instance, &objective);
-            assert!(s.is_some(), "should seed {path}");
-            let s = s.unwrap();
-            assert!(
-                verify_all_constraints(&instance.constraints, &s),
-                "seed must be feasible for {path}"
-            );
-            eprintln!("OK {path}  feasible seed produced");
-        }
-        assert!(any, "no instances matched AY_BNN_GLOB");
-    }
-
-    /// Minimal glob over a directory pattern `dir/*.opb` (or a single file).
-    fn glob_simple(pattern: &str) -> Vec<String> {
-        if let Some(dir) = pattern.strip_suffix("/*.opb") {
-            let mut out = Vec::new();
-            if let Ok(rd) = std::fs::read_dir(dir) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if p.extension().and_then(|x| x.to_str()) == Some("opb") {
-                        out.push(p.to_string_lossy().into_owned());
-                    }
-                }
-            }
-            out.sort();
-            out
-        } else {
-            vec![pattern.to_string()]
-        }
+    fn recognized_bnn_seed_is_deterministic_feasible_and_exactly_valued() {
+        let (instance, objective) = tests::single_neuron_instance();
+        assert!(is_recognized(&instance, &objective));
+        let first = seed(&instance, &objective).expect("seed");
+        let second = seed(&instance, &objective).expect("repeat seed");
+        assert_eq!(first, second);
+        assert!(verify_all_constraints(&instance.constraints, &first));
+        let value = crate::solver::eval_objective(&objective, &first);
+        assert_eq!(value, first[0] as i128 + first[1] as i128);
+        assert!((0..=2).contains(&value));
     }
 }
 
 #[cfg(test)]
 mod timing_tests {
-    //! Opt-in: measures the wall-clock time for the SLS worker to reach its FIRST
-    //! feasible incumbent, all-false vs the BNN seed, on real instances. Set
-    //! `AY_BNN_GLOB` and run with `--ignored --nocapture`.
-    use crate::optimize::sls::search_with_options;
-    use ay_test_support::env::{lock_env, ScopedEnvVar};
+    use super::*;
 
     #[test]
-    #[ignore = "opt-in timing benchmark requires AY_BNN_GLOB"]
-    fn time_to_first_feasible_seed_vs_allfalse() {
-        let glob = match std::env::var("AY_BNN_GLOB") {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        // Serialized + restore-on-exit via the workspace env choke point; the
-        // per-iteration guards below scope the AY_PB_BNN_FEAS toggle.
-        let _env_lock = lock_env();
-        let paths: Vec<String> = if let Some(dir) = glob.strip_suffix("/*.opb") {
-            let mut out = Vec::new();
-            if let Ok(rd) = std::fs::read_dir(dir) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if p.extension().and_then(|x| x.to_str()) == Some("opb") {
-                        out.push(p.to_string_lossy().into_owned());
-                    }
-                }
-            }
-            out.sort();
-            out
-        } else {
-            vec![glob.clone()]
-        };
-        // Serialized for the whole run through the one workspace env choke point.
-        let _env_lock = lock_env();
-        for path in paths {
-            let text = std::fs::read_to_string(&path).expect("read");
-            let instance = crate::parser::parse_opb(&text).expect("parse");
-            let objective = instance.objective.clone().expect("obj");
-            let name = std::path::Path::new(&path)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("?")
-                .replace("normalized-bnn_mnist_", "");
-
-            for (label, env_on) in [("all-false", false), ("bnn-seed", true)] {
-                let _bnn_feas = if env_on {
-                    ScopedEnvVar::set("AY_PB_BNN_FEAS", "1")
-                } else {
-                    ScopedEnvVar::unset("AY_PB_BNN_FEAS")
-                };
-                let start = std::time::Instant::now();
-                let deadline = Some(start + std::time::Duration::from_secs(5));
-                let stop = || false;
-                let mut first_t: Option<f64> = None;
-                let mut first_obj: Option<i128> = None;
-                let mut on_improve = |obj: i128, _m: &[bool]| {
-                    if first_t.is_none() {
-                        first_t = Some(start.elapsed().as_secs_f64());
-                        first_obj = Some(obj);
-                    }
-                };
-                let _ = search_with_options(
-                    &instance,
-                    &objective,
-                    deadline,
-                    &stop,
-                    &mut on_improve,
-                    true,
-                );
-                let ft = first_t.map(|t| format!("{t:.4}s")).unwrap_or("none".into());
-                let fo = first_obj.map(|o| o.to_string()).unwrap_or("none".into());
-                eprintln!("TIMING {name:50} {label:10} first-feasible={ft:>10} obj={fo}");
-                // `_bnn` restores AY_PB_BNN_FEAS at the end of each iteration.
-            }
+    fn forward_evaluation_satisfies_neuron_for_every_input_pattern() {
+        let (instance, objective) = tests::single_neuron_instance();
+        let net = recognize(&instance, &objective).expect("recognize fixture");
+        for mask in 0u8..4 {
+            let mut assignment = vec![false; 3];
+            assignment[0] = mask & 1 != 0;
+            assignment[1] = mask & 2 != 0;
+            assert_eq!(forward_eval(&net, &mut assignment), 1);
+            assert_eq!(
+                assignment[2],
+                assignment[..2].iter().filter(|&&value| value).count() <= 1
+            );
+            assert!(verify_all_constraints(&instance.constraints, &assignment));
         }
     }
 }

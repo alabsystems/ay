@@ -159,8 +159,21 @@ impl LraSolver {
                 self.enqueue_lra_basis_region_request_at_safe_boundary();
                 self.drain_lra_basis_region_requests_at_safe_boundary();
                 self.save_feasible_snapshot();
+                // #warm-simplex: anchor the last-feasible value delta here.
+                self.warm_reanchor_delta();
             } else {
                 self.discard_lra_basis_region_candidate();
+                // #warm-simplex: on CONFLICT, restore the last-feasible
+                // assignment from the changed-vars delta (OpenSMT's conflict
+                // recovery). The conflict is already fully packaged (it
+                // depends on rows + bound reasons, not values), so this only
+                // repositions the warm start for the post-backtrack check.
+                if matches!(
+                    result,
+                    TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
+                ) {
+                    self.warm_restore_last_feasible();
+                }
             }
             result
         } else {
@@ -817,8 +830,14 @@ impl LraSolver {
                 self.enqueue_lra_basis_region_request_at_safe_boundary();
                 self.drain_lra_basis_region_requests_at_safe_boundary();
                 self.save_feasible_snapshot();
+                // #warm-simplex: anchor the last-feasible value delta here.
+                self.warm_reanchor_delta();
             } else {
                 self.discard_lra_basis_region_candidate();
+                // #warm-simplex conflict recovery (see check_impl).
+                if matches!(r, TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)) {
+                    self.warm_restore_last_feasible();
+                }
             }
             r
         } else {

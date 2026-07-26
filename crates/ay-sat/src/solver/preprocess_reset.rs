@@ -362,6 +362,11 @@ impl Solver {
     pub(super) fn reset_search_state(&mut self) {
         self.stats.clear_bcp_learned_1963_blocker_certs();
 
+        // #unguarded-tvalid-lemmas STAGE 0: per-solve assumption-prefix
+        // depth. `solve_with_assumptions_impl` re-sets this right after the
+        // reset; no-assumption solve entries leave it at 0.
+        self.cold.active_assumption_count = 0;
+
         // Default to full watch rebuild. Case (b) below may upgrade this to
         // an incremental attach if the arena is preserved (#8374).
         self.cold.incremental_watch_boundary = None;
@@ -538,6 +543,11 @@ impl Solver {
                 self.bump_reason_graph_epoch();
                 self.cold.clause_ids.clear();
                 self.cold.bcp_learned_clause_birth_conflicts.clear();
+                // #unguarded-tvalid-lemmas STAGE 0: stale arena offsets —
+                // clear with clause_ids. Rebuilt clauses read as birth
+                // epoch 0 ("pre-existing"), which is the honest attribution
+                // after a ledger rebuild.
+                self.cold.clause_birth_solve.clear();
                 for (ordinal, clause) in self.cold.original_ledger.iter_clauses().enumerate() {
                     let idx = self.arena.add(clause, false);
                     // Assign clause ID unconditionally (#8197, #8069 Phase 2a).
@@ -1035,6 +1045,11 @@ impl Solver {
     /// Using this when the arena has been destructively modified is unsound.
     pub(super) fn reset_search_state_incremental(&mut self) {
         self.stats.clear_bcp_learned_1963_blocker_certs();
+
+        // #unguarded-tvalid-lemmas STAGE 0: per-solve assumption-prefix
+        // depth. `solve_with_assumptions_impl` re-sets this right after the
+        // reset; no-assumption solve entries leave it at 0.
+        self.cold.active_assumption_count = 0;
 
         #[cfg(debug_assertions)]
         {

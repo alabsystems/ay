@@ -401,9 +401,9 @@ fn test_weq5_flip_keeps_common_base_singleton_witness() {
         "sibling stores off a common base must be weakly connected"
     );
 
+    #[cfg(debug_assertions)]
     crate::weak_equiv::weq5_shadow::reset();
     let result = solver.check_store_chain_select_difference_witness_singleton();
-    let snap = crate::weak_equiv::weq5_shadow::snapshot();
 
     // The witness fired (was NOT pruned by the flip): it demands the model
     // equality `i = 5` (the read index must be the single differing index).
@@ -411,23 +411,30 @@ fn test_weq5_flip_keeps_common_base_singleton_witness() {
         result.is_some(),
         "the singleton-support witness must still fire under the M5 flip"
     );
-    // Soundness gate: no base-eq pair was pruned as not-weakly-connected.
-    assert_eq!(
-        snap.disagree_base_eq_not_wc, 0,
-        "wrong-SAT gate: a base-eq witness pair must always be weakly connected"
-    );
-    assert!(
-        snap.base_eq_holds >= 1,
-        "the witness pair must have been recorded as a base-eq pair"
-    );
-    assert!(
-        snap.support_nonempty >= 1,
-        "the single differing index must produce a non-empty support"
-    );
-    assert_eq!(
-        snap.graph_pruned, 0,
-        "a weakly-connected witness pair must not be graph-pruned"
-    );
+    // The weq5 shadow counters are `#[cfg(debug_assertions)]`-gated instrumentation,
+    // so these gates only run in debug builds. The functional assertion above runs
+    // in every profile.
+    #[cfg(debug_assertions)]
+    {
+        let snap = crate::weak_equiv::weq5_shadow::snapshot();
+        // Soundness gate: no base-eq pair was pruned as not-weakly-connected.
+        assert_eq!(
+            snap.disagree_base_eq_not_wc, 0,
+            "wrong-SAT gate: a base-eq witness pair must always be weakly connected"
+        );
+        assert!(
+            snap.base_eq_holds >= 1,
+            "the witness pair must have been recorded as a base-eq pair"
+        );
+        assert!(
+            snap.support_nonempty >= 1,
+            "the single differing index must produce a non-empty support"
+        );
+        assert_eq!(
+            snap.graph_pruned, 0,
+            "a weakly-connected witness pair must not be graph-pruned"
+        );
+    }
 }
 
 /// The M5 flip must NOT prune when the common base is reached through a
@@ -465,20 +472,24 @@ fn test_weq5_flip_keeps_asserted_cross_base_witness() {
          weakly connected"
     );
 
+    #[cfg(debug_assertions)]
     crate::weak_equiv::weq5_shadow::reset();
     let result = solver.check_store_chain_select_difference_witness_singleton();
-    let snap = crate::weak_equiv::weq5_shadow::snapshot();
 
     assert!(
         result.is_some(),
         "the cross-base singleton witness must still fire under the M5 flip"
     );
-    assert_eq!(
-        snap.disagree_base_eq_not_wc, 0,
-        "wrong-SAT gate: asserted-cross-base pair must stay weakly connected"
-    );
-    assert!(snap.base_eq_holds >= 1);
-    assert_eq!(snap.graph_pruned, 0);
+    #[cfg(debug_assertions)]
+    {
+        let snap = crate::weak_equiv::weq5_shadow::snapshot();
+        assert_eq!(
+            snap.disagree_base_eq_not_wc, 0,
+            "wrong-SAT gate: asserted-cross-base pair must stay weakly connected"
+        );
+        assert!(snap.base_eq_holds >= 1);
+        assert_eq!(snap.graph_pruned, 0);
+    }
 }
 
 /// The M5 flip DOES prune a candidate pair whose select arrays are in different
@@ -512,22 +523,26 @@ fn test_weq5_flip_prunes_disconnected_pair() {
         "arrays in different components must not be weakly connected"
     );
 
+    #[cfg(debug_assertions)]
     crate::weak_equiv::weq5_shadow::reset();
     let result = solver.check_store_chain_select_difference_witness_singleton();
-    let snap = crate::weak_equiv::weq5_shadow::snapshot();
 
     assert!(
         result.is_none(),
         "no witness can fire on a disconnected (no common base) pair"
     );
-    assert!(
-        snap.graph_pruned >= 1,
-        "the disconnected pair must be graph-pruned by the M5 flip"
-    );
-    assert_eq!(
-        snap.disagree_base_eq_not_wc, 0,
-        "pruning a disconnected pair is sound: legacy base-eq also fails"
-    );
+    #[cfg(debug_assertions)]
+    {
+        let snap = crate::weak_equiv::weq5_shadow::snapshot();
+        assert!(
+            snap.graph_pruned >= 1,
+            "the disconnected pair must be graph-pruned by the M5 flip"
+        );
+        assert_eq!(
+            snap.disagree_base_eq_not_wc, 0,
+            "pruning a disconnected pair is sound: legacy base-eq also fails"
+        );
+    }
 }
 
 /// Disconnected components are never modulo-j equivalent.

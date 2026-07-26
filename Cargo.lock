@@ -116,6 +116,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
+dependencies = [
+ "derive_arbitrary",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -178,6 +187,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "signal-hook",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "toml 0.8.23",
@@ -185,6 +195,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "wait-timeout",
+ "zip",
 ]
 
 [[package]]
@@ -214,6 +225,7 @@ name = "ay-bench"
 version = "0.3.0"
 dependencies = [
  "ay-proof-complexity",
+ "ay-sys",
  "ay-test-support",
  "nix",
  "rayon",
@@ -223,6 +235,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "toml 0.8.23",
  "wait-timeout",
 ]
 
@@ -461,10 +474,12 @@ dependencies = [
  "ay-frontend",
  "ay-nra",
  "ay-sat",
+ "ay-search",
  "libc",
  "num-bigint",
  "num-rational",
  "num-traits",
+ "serde_json",
  "tempfile",
 ]
 
@@ -708,6 +723,7 @@ dependencies = [
  "ay-sys",
  "ay-test-support",
  "libc",
+ "nix",
  "num-bigint",
  "num-rational",
  "num-traits",
@@ -832,6 +848,16 @@ name = "ay-sat-congruence-core"
 version = "0.3.0"
 
 [[package]]
+name = "ay-search"
+version = "0.3.0"
+dependencies = [
+ "ay-cp",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ay-seq"
 version = "0.3.0"
 dependencies = [
@@ -910,12 +936,15 @@ dependencies = [
 name = "ay-z3-parity"
 version = "0.3.0"
 dependencies = [
+ "ay-bench",
  "ay-dpll",
  "ay-frontend",
  "libc",
  "libloading 0.8.9",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -1295,6 +1324,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "derive_arbitrary"
+version = "1.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1e567bd82dcff979e4b03460c307b3cdc9e96fde3d73bed1496d2bc75d9dd62a"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1356,6 +1396,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1375,6 +1425,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -2920,6 +2971,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+]
+
+[[package]]
 name = "target-triple"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3531,7 +3592,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3785,6 +3846,25 @@ dependencies = [
  "quote",
  "syn 2.0.118",
 ]
+
+[[package]]
+name = "zip"
+version = "4.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa8cd6af31c3b31c6631b8f483848b91589021b28fffe50adada48d4f4d2ed1"
+dependencies = [
+ "arbitrary",
+ "crc32fast",
+ "flate2",
+ "indexmap",
+ "memchr",
+]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b142a20ec14a91d5bc708c1dc21b080c550113d8aa77afa29635673a65dd02c5"
 
 [[package]]
 name = "zmij"

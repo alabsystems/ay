@@ -24,6 +24,30 @@ impl BackTranslator for ReplacingBackTranslator {
     }
 }
 
+struct CyclicGroundBackTranslator {
+    original_derivation: crate::ground_derivation::GroundDerivation,
+}
+
+impl BackTranslator for CyclicGroundBackTranslator {
+    fn translate_validity(&self, witness: ValidityWitness) -> ValidityWitness {
+        witness
+    }
+
+    fn translate_invalidity(&self, witness: InvalidityWitness) -> InvalidityWitness {
+        // Deliberately preserve the transformed attachment. This mirrors the
+        // legacy clone-based translators and pins the regression: the
+        // portfolio must replace it through translate_ground_derivation.
+        witness
+    }
+
+    fn translate_ground_derivation(
+        &self,
+        _derivation: &crate::ground_derivation::GroundDerivation,
+    ) -> Option<crate::ground_derivation::GroundDerivation> {
+        Some(self.original_derivation.clone())
+    }
+}
+
 fn make_query_only_but_not_inductive_model(problem: &ChcProblem) -> InvariantModel {
     let inv = problem.predicates()[0].id;
     let v0 = ChcVar::new("v0", ChcSort::Int);
@@ -1186,6 +1210,140 @@ fn test_accept_rejects_backtranslated_unsafe_invalid_on_original_problem() {
         matches!(result, AcceptDecision::Reject),
         "invalid original-domain Unsafe witness must be rejected so the portfolio can return Unknown"
     );
+}
+
+#[test]
+fn test_unsafe_validation_replaces_stale_ground_derivation_for_cyclic_original() {
+    use crate::ground_derivation::{
+        validate_ground_derivation, GroundDerivation, GroundDerivationStep,
+    };
+
+    // Original clause 0 is recursive. A transformed fact still carrying
+    // clause_index=0 therefore fails with exactly the noargs-0 symptom:
+    // "step 0 has 0 premises but its clause body has 1 predicates".
+    let mut original = ChcProblem::new();
+    let original_inv = original.declare_predicate("Inv", vec![ChcSort::Int]);
+    let x = ChcVar::new("x", ChcSort::Int);
+    original.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(original_inv, vec![ChcExpr::var(x.clone())])],
+            Some(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0))),
+        ),
+        ClauseHead::Predicate(
+            original_inv,
+            vec![ChcExpr::add(ChcExpr::var(x.clone()), ChcExpr::int(1))],
+        ),
+    ));
+    original.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0))),
+        ClauseHead::Predicate(original_inv, vec![ChcExpr::var(x.clone())]),
+    ));
+    original.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(original_inv, vec![ChcExpr::var(x.clone())])],
+            Some(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(1))),
+        ),
+        ClauseHead::False,
+    ));
+
+    let mut transformed = ChcProblem::new();
+    let transformed_inv = transformed.declare_predicate("Inv", vec![ChcSort::Int]);
+    transformed.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(1))),
+        ClauseHead::Predicate(transformed_inv, vec![ChcExpr::var(x.clone())]),
+    ));
+    transformed.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(transformed_inv, vec![ChcExpr::var(x.clone())])],
+            Some(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(1))),
+        ),
+        ClauseHead::False,
+    ));
+
+    let env = |value| {
+        let mut env = FxHashMap::default();
+        env.insert("x".to_string(), crate::smt::SmtValue::Int(value));
+        env
+    };
+    let transformed_derivation = GroundDerivation {
+        steps: vec![
+            GroundDerivationStep {
+                clause_index: 0,
+                env: env(1),
+                premises: vec![],
+            },
+            GroundDerivationStep {
+                clause_index: 1,
+                env: env(1),
+                premises: vec![0],
+            },
+        ],
+        query_step: 1,
+    };
+    validate_ground_derivation(&transformed, &transformed_derivation)
+        .expect("setup: transformed derivation must validate");
+    assert!(
+        validate_ground_derivation(&original, &transformed_derivation).is_err(),
+        "setup: transformed clause indices must not accidentally validate on the original"
+    );
+
+    let original_derivation = GroundDerivation {
+        steps: vec![
+            GroundDerivationStep {
+                clause_index: 1,
+                env: env(0),
+                premises: vec![],
+            },
+            GroundDerivationStep {
+                clause_index: 0,
+                env: env(0),
+                premises: vec![0],
+            },
+            GroundDerivationStep {
+                clause_index: 2,
+                env: env(1),
+                premises: vec![1],
+            },
+        ],
+        query_step: 2,
+    };
+    validate_ground_derivation(&original, &original_derivation)
+        .expect("setup: reconstructed cyclic derivation must validate on original clauses");
+
+    let transformed_cex =
+        Counterexample::new(vec![]).with_ground_derivation(transformed_derivation);
+    let solver = PortfolioSolver {
+        original_problem: original.clone(),
+        problem: transformed,
+        back_translator: Box::new(CyclicGroundBackTranslator {
+            original_derivation,
+        }),
+        config: PortfolioConfig {
+            external_cancellation: None,
+            engines: vec![],
+            parallel: false,
+            timeout: None,
+            parallel_timeout: None,
+            verbose: false,
+            enable_preprocessing: false,
+            engine_budgets: ay_core::kani_compat::DetHashMap::default(),
+            memory_budget: None,
+            strict_proofs: false,
+        },
+        bv_abstracted: false,
+        transform_memory: TransformMemoryReport::identity(),
+        cancellation_token: crate::CancellationToken::new(),
+    };
+
+    let translated = solver
+        .validate_unsafe_translating(&transformed_cex)
+        .expect("portfolio must validate the explicitly back-translated ground derivation");
+    let attached = translated
+        .ground_derivation
+        .as_ref()
+        .expect("validated counterexample must carry original-clause ground evidence");
+    validate_ground_derivation(&original, attached)
+        .expect("returned counterexample must replay on original clauses");
 }
 
 /// Strict proofs mode rejects BMC empty-model Safe (#8555).

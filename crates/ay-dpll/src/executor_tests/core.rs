@@ -684,19 +684,12 @@ fn test_executor_no_logic() {
 }
 
 #[test]
-fn executor_new_does_not_arm_process_global_memory_limit_under_test() {
-    // Root-cause guard for the full-suite mass-failure: `Executor::new()` arms
-    // the PROCESS-GLOBAL memory ceiling (`ay_sys::set_process_memory_limit`,
-    // embedded default ~phys/8) for production embedders. In the unit-test
-    // harness — one long-lived process running thousands of solver tests —
-    // that global ceiling is tripped by the harness's AGGREGATE footprint, not
-    // by the current solve: once the suite's cumulative allocator-retained
-    // footprint crossed 95% of the 3 GiB embedded default (24 GiB host), every
-    // subsequent solve in the process degraded to Unknown(MemoryLimit)
-    // (~1200+ load-dependent failures that all pass in isolation). The arm is
-    // therefore compiled out under cfg(test); tests that exercise memory-exit
-    // paths use the thread-local `force_process_memory_exceeded_for_testing`
-    // hook instead, which works with no limit armed.
+fn executor_new_does_not_arm_process_global_memory_limit() {
+    // Root-cause guard for cross-crate full-suite mass failures. A library
+    // constructor-side process ceiling couples every solver in a long-lived
+    // host through aggregate retained RSS, so host executables own that policy.
+    // The integration test in `tests/embedded_memory_policy.rs` proves the same
+    // contract with ay-dpll compiled as a normal downstream dependency.
     //
     // No ay-dpll lib test sets a process-wide limit, so this global read is
     // race-free within the suite.
@@ -704,9 +697,7 @@ fn executor_new_does_not_arm_process_global_memory_limit_under_test() {
     assert_eq!(
         ay_sys::get_process_memory_limit(),
         0,
-        "cfg(test) builds must not arm the process-global memory ceiling: \
-         a shared ceiling couples every test through total-harness footprint \
-         and mass-degrades solves to Unknown(MemoryLimit) under load"
+        "library construction must not arm a process-global memory ceiling"
     );
     assert!(
         !ay_sys::process_memory_exceeded(),

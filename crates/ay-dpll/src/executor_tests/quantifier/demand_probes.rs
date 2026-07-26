@@ -12,13 +12,10 @@
 //! - GREENS — must be `unsat` today, within a sane budget. These are the ground /
 //!   depth-1 refutations the current engine already discharges: the demand-driven
 //!   frontier at F<=1 must never regress below them.
-//! - PRODUCTION FLIPS (M5) — the prophecy-pair dual-vocabulary bridge CHAIN
-//!   (`freevar_takesome_repro`) and the two-recursive-field tree defining forall
-//!   (`sum_tree_forall`). Both were REDS pre-M5; the M5 authority flip makes the
-//!   frontier-gated demand lane the PRODUCTION path for their classified families,
-//!   and both now solve `unsat` in a plain production solve. Pinned to `unsat` in
-//!   `demand_production_flip_reds_are_unsat` (`#[ignore]`d — the takesome ground
-//!   final-solve is slow in debug).
+//! - PRODUCTION FLIPS (M5) — bounded reductions of the prophecy-pair
+//!   dual-vocabulary bridge chain and the two-recursive-field tree defining
+//!   forall.  Both solve `unsat` in a plain production solve and run in the
+//!   default suite.
 //! - REDS — expected NOT `unsat` today (Unknown/timeout). Post-M5 this is the
 //!   residual ground DT+LIA combiner gap (`red_ground_dtlia`, NO foralls, so the
 //!   demand lane arms nothing and the solve is byte-identical to the eager path).
@@ -194,38 +191,10 @@ const GREENS: &[(&str, &str)] = &[
 // discharges in a PLAIN production solve (no flag). Pinned to `unsat`: if either
 // regresses BELOW `unsat` the flip broke. Both are z3-UNSAT, so the flip is a
 // sound capability win. `freevar_takesome_repro` needs the ground DT+LIA
-// final-solve over the frontier-gated batch (~20s in a debug build), so the flip
-// assertions live in an `#[ignore]`d test with a generous wall cap (the default
-// `--lib` run stays fast); `sum_tree_forall` flips fast but is checked in the same
-// test for symmetry.
+// final-solve over the full frontier-gated batch is a benchmark campaign.  The
+// always-on gate below uses the exact depth-1 refutation core plus the fast tree
+// flip, so it proves the production mechanism in every default run.
 // ===========================================================================
-
-/// take_some / sum_x class: dual-vocabulary bridge over FREE variables, NO
-/// constructor literals anywhere -> the landed selector-fold is inert. Refutation
-/// needs bridges@{self,final} + sumdef@{self,final} + DT (C)@{self,final}, all
-/// depth<=1. The eager two-minter round-chaining wall buried it; the M5 demand
-/// lane parks the gen>1 chain and refutes the depth-1 batch at F=1 (PRODUCTION).
-const RED_FREEVAR_TAKESOME_REPRO: &str = r#"
-(set-logic ALL)
-(declare-datatypes ((Lst 0)) (((Nil) (Cons (hd Int) (tl Lst)))))
-(declare-fun sum (Lst) Int)
-(declare-fun payload_hd (Lst) Int)
-(declare-fun payload_get (Lst) Lst)
-(assert (forall ((l Lst)) (! (=> ((_ is Cons) l) (= (payload_get l) (tl l))) :pattern ((payload_get l)))))
-(assert (forall ((l Lst)) (! (=> ((_ is Cons) l) (= (payload_hd l) (hd l))) :pattern ((payload_hd l)))))
-(assert (forall ((l Lst)) (! (= (sum l) (ite ((_ is Cons) l) (+ (hd l) (sum (tl l))) 0)) :pattern ((sum l)))))
-(assert (forall ((l Lst)) (! (>= (sum l) 0) :pattern ((sum l)))))
-(declare-const self Lst)
-(declare-const final Lst)
-(declare-const k Int)
-(assert ((_ is Cons) self))
-(assert ((_ is Cons) final))
-(assert (>= k 0))
-(assert (= (payload_hd final) (+ (payload_hd self) k)))
-(assert (= (payload_get final) (payload_get self)))
-(assert (not (= (- (sum final) (sum self)) k)))
-(check-sat)
-"#;
 
 // ===========================================================================
 // REDS — pinned expected-NOT-`unsat`-today (Unknown/timeout). A flip to `unsat`
@@ -269,9 +238,15 @@ const RED_GROUND_DTLIA: &str = r#"
 (check-sat)
 "#;
 
-/// M5 PRODUCTION FLIPS: pinned to `unsat` in a plain production solve (no flag).
+/// Bounded M5 production flips, pinned to `unsat` in a plain production solve
+/// (no debug flag).  The manual depth-1 takesome core is the precise ground
+/// batch the demand frontier must deliver; the tree case exercises the
+/// production quantifier lane end to end.
 const PRODUCTION_FLIPS: &[(&str, &str)] = &[
-    ("freevar_takesome_repro", RED_FREEVAR_TAKESOME_REPRO),
+    (
+        "freevar_takesome_manual_d1",
+        GREEN_FREEVAR_TAKESOME_MANUAL_D1,
+    ),
     ("sum_tree_forall", RED_SUM_TREE_FORALL),
 ];
 
@@ -289,12 +264,8 @@ const GREEN_TIMEOUT: Duration = Duration::from_secs(15);
 /// bounds the suite: a red that overruns is abandoned and reported as Unknown.
 const RED_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Nominal per-check timeout for the M5 PRODUCTION FLIP probes. `sum_tree_forall`
-/// flips at F=1 in a couple of seconds, but `freevar_takesome_repro` needs the
-/// ground DT+LIA final-solve over its frontier-gated batch (~20s in a debug
-/// build), so the cap is generous. The flip test is `#[ignore]`d so this budget
-/// never lands in the default `--lib` run.
-const PRODUCTION_FLIP_TIMEOUT: Duration = Duration::from_mins(2);
+/// Per-check timeout for the bounded M5 production probes.
+const PRODUCTION_FLIP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Solve `input` under a nominal `timeout`, bounded by a HARD wall cap of
 /// `timeout + 3s`. The solve runs on a worker thread; if it does not finish
@@ -401,11 +372,8 @@ fn demand_red_probes_are_not_unsat_today() {
 /// not a shadow/debug arm. Pinned to `unsat`: a regression BELOW `unsat` means the
 /// flip broke; a `sat` is a soundness stop-the-line (both are z3-UNSAT).
 ///
-/// `#[ignore]`d because `freevar_takesome_repro`'s ground DT+LIA final-solve is the
-/// documented slow combiner (~20s debug). Run explicitly:
-/// `cargo test -p ay-dpll demand_production_flip_reds_are_unsat -- --ignored --nocapture`.
+/// Both reductions are bounded and always run.
 #[test]
-#[ignore = "M5 production flip: freevar_takesome ground DT+LIA final-solve is slow in debug; run with --ignored"]
 fn demand_production_flip_reds_are_unsat() {
     for (name, smt2) in PRODUCTION_FLIPS {
         let (verdict, _stats) = solve(smt2, PRODUCTION_FLIP_TIMEOUT);

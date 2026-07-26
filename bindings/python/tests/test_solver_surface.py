@@ -76,7 +76,7 @@ def test_parse_smtlib2_string_unsat():
     assert s.check() == z.unsat
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 @pytest.mark.parametrize("src,expected", [
     ("(declare-const x Int)(assert (> x 5))(assert (< x 10))", "sat"),
     ("(declare-const x Int)(assert (> x 5))(assert (< x 3))", "unsat"),
@@ -223,7 +223,7 @@ def test_assert_and_track_name_string():
     assert names  # non-empty
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_unsat_core_crosscheck_verdict_and_soundness():
     # Same tracked problem through ayz3 AND z3py: verdicts must agree, and BOTH
     # cores must be sound, deletion-minimal unsat subsets. We do NOT require
@@ -306,7 +306,7 @@ def test_check_assumptions_model_under_assumption():
     assert m[x].as_long() == 42
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 @pytest.mark.parametrize("theory", ["int", "bv"])
 def test_check_assumptions_crosscheck(theory):
     # ayz3
@@ -436,7 +436,7 @@ def test_simplify_returns_equivalent_expression():
     assert s.check() == z.unsat
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_simplify_value_matches_z3py_on_literals():
     # On a closed numeral expression, both AY and z3py reduce to the same value.
     se = z.simplify(z.IntVal(2) + z.IntVal(3))

@@ -447,10 +447,18 @@ fn required_value(tok: Option<&&str>, line: usize) -> Result<f64, LpError> {
 }
 
 fn parse_float(raw: &str, line: usize) -> Result<f64, LpError> {
-    raw.parse::<f64>().map_err(|_| LpError::InvalidNumber {
+    let value = raw.parse::<f64>().map_err(|_| LpError::InvalidNumber {
         line,
         raw: raw.to_string(),
-    })
+    })?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(LpError::InvalidNumber {
+            line,
+            raw: raw.to_string(),
+        })
+    }
 }
 
 fn strip_comment(line: &str) -> &str {

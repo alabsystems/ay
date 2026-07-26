@@ -345,6 +345,24 @@ pub(crate) fn solve_vec(smt: &str) -> Vec<String> {
         .unwrap_or_else(|err| panic!("execution failed: {err}\nSMT2:\n{smt}"))
 }
 
+/// Like [`solve_vec`], but with fail-closed self-certification (`--self-check`):
+/// `sat`/`unsat` are emitted ONLY when AY's own in-tree checker confirms them,
+/// and anything unverifiable degrades to `unknown`. Use this to pin behavior
+/// that is only sound in the authoritative self-check mode (default mode may
+/// still trust the solving machinery).
+pub(crate) fn solve_selfcheck_vec(smt: &str) -> Vec<String> {
+    let commands = parse(smt).unwrap_or_else(|err| panic!("parse failed: {err}\nSMT2:\n{smt}"));
+    let mut exec = Executor::new();
+    exec.set_self_check(true);
+    exec.execute_all(&commands)
+        .unwrap_or_else(|err| panic!("execution failed: {err}\nSMT2:\n{smt}"))
+}
+
+/// Convenience string form of [`solve_selfcheck_vec`].
+pub(crate) fn solve_selfcheck(smt: &str) -> String {
+    solve_selfcheck_vec(smt).join("\n")
+}
+
 /// Find the first sat/unsat/unknown line in solver output.
 pub(crate) fn sat_result(output: &str) -> Option<&str> {
     output

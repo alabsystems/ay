@@ -363,7 +363,7 @@ def test_concat_dispatches_bv_vs_string():
 # documented sound divergences.
 # ===========================================================================
 
-@pytest.mark.skipif(not HAVE_Z3, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_sexpr_matches_z3py_where_identical():
     with fresh():
         ax = A.BitVec("x", 8)
@@ -389,7 +389,7 @@ def test_sexpr_matches_z3py_where_identical():
         assert a_e.sexpr() == z_e.sexpr(), (a_e.sexpr(), z_e.sexpr())
 
 
-@pytest.mark.skipif(not HAVE_Z3, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_documented_sound_sexpr_divergences():
     # These print differently from z3py but denote the SAME term (verified by the
     # semantic solve tests above). They are AY's documented sound divergences.
@@ -426,7 +426,7 @@ def test_forall_accessors():
         assert f.body().sexpr() == "(< x 10)"
 
 
-@pytest.mark.skipif(not HAVE_Z3, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_forall_accessors_match_z3py():
     with fresh():
         x = A.Int("x")

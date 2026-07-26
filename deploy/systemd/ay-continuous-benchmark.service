@@ -11,15 +11,18 @@ Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=CC=ay-zig-cc
 Environment=CXX=ay-zig-cxx
 Environment=CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=ay-zig-cc
-# Host-local latest.json/latest.md and the isolated continuous/status branch
-# are updated at every checkpoint. Add --publish-issue after granting the
+# Host-local latest.json/latest.md and the non-branch refs/notes/continuous/status
+# publication ref are updated at every checkpoint. Add --publish-issue after granting the
 # service identity GitHub Issues read/write access.
-ExecStart=/usr/bin/python3 %h/.local/share/ay-continuous/repo/scripts/continuous_benchmark.py --repo %h/.local/share/ay-continuous/repo cycle --state-root %h/.local/state/ay-continuous --push --publish-status-branch
+ExecStart=/usr/bin/python3 %h/.local/share/ay-continuous/repo/scripts/continuous_benchmark.py --repo %h/.local/share/ay-continuous/repo cycle --state-root %h/.local/state/ay-continuous --push --publish-status-ref
 Nice=10
 IOSchedulingClass=idle
 OOMPolicy=stop
 MemoryHigh=40G
 MemoryMax=44G
+# Benchmark children must fail at their enforced envelope, not silently spill
+# into host swap and produce incomparable timings.
+MemorySwapMax=0
 LimitFSIZE=10G
 TasksMax=4096
 TimeoutStartSec=3h45min

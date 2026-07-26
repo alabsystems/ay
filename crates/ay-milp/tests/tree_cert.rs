@@ -131,6 +131,38 @@ fn live_binary_hint_breaks_the_root_score_tie_only() {
     }
 }
 
+#[test]
+fn root_probe_shortlist_breaks_a_zero_objective_root_tie() {
+    let mut m = Model::new();
+    let x0 = m.add_binary_col();
+    let x1 = m.add_binary_col();
+    let x2 = m.add_binary_col();
+    let y0 = m.add_binary_col();
+    let y1 = m.add_binary_col();
+    let y2 = m.add_binary_col();
+    m.add_row(1.5, 1.5, &[(x0, 1.0), (x1, 1.0), (x2, 1.0)]);
+    m.add_row(1.5, 1.5, &[(y0, 1.0), (y1, 1.0), (y2, 1.0)]);
+
+    let mut session = BabSession::new(m.clone(), &SolveOpts::new()).unwrap();
+    session.shortlist_root_strong_branch_candidates(&[x1]);
+    match session.check().unwrap() {
+        Outcome::Infeasible {
+            tree_cert: Some(cert),
+            ..
+        } => {
+            cert.verify(&m).unwrap();
+            let TreeNode::Split { col, .. } = cert.root else {
+                panic!("case-split-only model must have a split root");
+            };
+            assert_eq!(
+                col, x1,
+                "equal zero-objective probe scores must prefer the live shortlist"
+            );
+        }
+        other => panic!("expected certified Infeasible, got {other:?}"),
+    }
+}
+
 /// The certificate is evidence about ONE model: against a feasible variant
 /// (rhs 3/2 -> 1) it must refute. This is the live soundness probe — a tree
 /// certificate that verified here would prove a feasible model infeasible.

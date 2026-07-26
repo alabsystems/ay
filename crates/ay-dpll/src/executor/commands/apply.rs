@@ -1020,19 +1020,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_cnf_alias_maps_to_tseitin_cnf() {
-        // z3 accepts `cnf` as an alias for `tseitin-cnf`; both must reach the same
-        // pass and produce the identical goal on the same input.
-        let via_full = outputs(
-            "(declare-const a Bool)\n(declare-const b Bool)\n(assert (= a (not b)))\n(apply tseitin-cnf)\n",
-        );
-        let via_alias = outputs(
-            "(declare-const a Bool)\n(declare-const b Bool)\n(assert (= a (not b)))\n(apply cnf)\n",
-        );
-        assert_eq!(
-            via_full.last(),
-            via_alias.last(),
-            "`cnf` must be an alias for `tseitin-cnf`"
+    fn apply_non_z3_cnf_alias_is_rejected() {
+        // Z3 5.0.0 rejects `cnf`; AY's exact compatibility surface must too.
+        assert!(
+            parse("(apply cnf)").is_err(),
+            "`cnf` is not a Z3 5.0.0 tactic"
         );
     }
 

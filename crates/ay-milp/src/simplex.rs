@@ -79,6 +79,33 @@ pub(crate) enum SimplexStatus {
     Cutoff,
 }
 
+/// How a bounded solve should consume an adopted warm basis.
+///
+/// `PrimalAdvice` is deliberately narrower than the adaptive warm-dual policy:
+/// it is a typed, per-call request for locally capped setup work whose stopped
+/// candidate will only seed a later proof-bearing solve. It skips the
+/// transactional warm-dual attempt so the cap advances primal phase I instead
+/// of spending the whole slice on a dual walk that is then rolled back.
+///
+/// `PrimalProofContinuation` shares that direct-primal preamble, but is
+/// explicitly verdict-bearing: callers must apply their ordinary exact
+/// optimality/weak-row/Farkas gates to its result.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WarmSolveMode {
+    /// Historical bounded-solve behavior.
+    Normal,
+    /// Preserve the adopted warm basis but continue directly with primal work.
+    PrimalAdvice,
+    /// Continue a stopped primal prefix into one fully checked proof solve.
+    PrimalProofContinuation,
+}
+
+impl WarmSolveMode {
+    fn continues_primal(self) -> bool {
+        matches!(self, Self::PrimalAdvice | Self::PrimalProofContinuation)
+    }
+}
+
 /// The float lane's proposal: a basis, and where each non-basic column rests.
 /// `Clone` exists for the node-cut admission trial (`bab.rs`): the pre-trial
 /// candidate is saved so a rejected cut can restore the node's state exactly.
@@ -702,6 +729,38 @@ fn dual_anatomy_enabled() -> bool {
 /// (see `DUAL_ANAT_ZFLAT`).
 const DUAL_ANAT_ZTOL: f64 = 1e-7;
 
+/// Output of `FloatLp::factor_probe`: the FTRAN/BTRAN images a basis produces on
+/// one forced factorization lane, plus the lane's fill and singular-repair kick
+/// count. The differential harness (`diag_bump_lu_diff`, `tests/bump_lu_diff.rs`)
+/// runs it on requested lane pairs and asserts the images and repairs agree,
+/// including the opt-in block-triangular-factor (BTF) lane.
+pub(crate) struct FactorProbe {
+    /// One dense `B⁻¹·M_j` (length m) per requested FTRAN column, remapped to
+    /// CANONICAL basis-column order (pivot/scaled frame) — lane-invariant.
+    pub ftran: Vec<Vec<f64>>,
+    /// One dense row of `B⁻¹` (length m, constraint-row indexed, original frame)
+    /// per requested basis column — the dual functional of that column.
+    pub btran: Vec<Vec<f64>>,
+    /// `sx.etas.entries()` — the eta-file fill after the forced factorization.
+    pub fill: usize,
+    /// Whether the final successful rebuild actually used the bump-LU segment.
+    /// A requested lane is not proof of execution because the peel/floor gate
+    /// may decline it or the fill guard may retry in slot order.
+    pub bump_lu_used: bool,
+    /// Dependent columns kicked to their bounds during the factorization.
+    pub kicked: usize,
+    /// Exact original-basis columns kicked to their bounds. Comparing only the
+    /// count can hide two lanes repairing different singular columns.
+    pub kicked_columns: Vec<usize>,
+    /// The post-refactorize basis order (`sx.basis`): which basis column sits in
+    /// each row slot. The two lanes pivot the bump differently, so this DIFFERS
+    /// between them even though they invert the same operator — the evidence that
+    /// the column-keyed comparison is doing real work.
+    pub basis_order: Vec<usize>,
+    /// Wall time of the whole probe (warm_start + FTRAN + BTRAN).
+    pub secs: f64,
+}
+
 /// The LP in computational form. Columns `0..n` are structural, `n..n+m`
 /// logical (one per row).
 #[derive(Clone)]
@@ -755,8 +814,8 @@ pub(crate) struct FloatLp {
     /// weights for the next warm solve (a unit restart burns the first pivots of
     /// every child re-learning the same row norms). Cold solves reset to units.
     dse_cache: LuCacheCellDse,
-    /// Cross-probe LU reuse for the GUB strong-branch sweep (see `ProbeReuse`).
-    /// Armed only around `gub_strong_pick`'s probe loop; otherwise inert.
+    /// Cross-probe LU reuse for a bounded strong-branch sweep (see
+    /// `ProbeReuse`). Armed explicitly around one probe loop; otherwise inert.
     probe_reuse: ProbeReuseCell,
     /// TRUE once a cut-slot REWRITE has changed this LP's matrix in place
     /// (`reload_rows`) — i.e. warm bases stored elsewhere in the tree may predate
@@ -775,6 +834,21 @@ pub(crate) struct FloatLp {
     /// from iteration zero. The broad size class keeps its existing path;
     /// `AY_MILP_CHAIN_SHAPE=0` disables this structural gate.
     chain_shape: std::cell::Cell<u8>,
+    /// Typed per-instance override for the cold affine-chain distress-probe
+    /// iteration budget. `None` preserves the historical
+    /// `AY_MILP_CHAIN_PROBE`/20,000-iteration policy.
+    chain_distress_probe_iters: Option<u64>,
+    /// Per-instance advice to try the triangular equality crash immediately on
+    /// a cold solve, without changing the global size/shape policy.  The LP
+    /// harvest lane sets this for affine-chain relaxations; every other caller
+    /// leaves the default `false` and keeps its historical path.  The crash
+    /// still validates equality density, peel depth, pivots, and fill before it
+    /// installs anything, and falls back to the all-logical basis on a decline.
+    eager_affine_crash: bool,
+    /// Per-instance typed request to retain bounded-range rows' logicals in a
+    /// triangular-crash basis. The effective policy also honors the historical
+    /// exact `AY_MILP_RANGE_LOGICAL_CRASH=1` environment opt-in.
+    range_logical_triangular_crash: bool,
     /// COLD solves on this instance take the CLASSIC path: no cold dual-simplex
     /// start, no LU engine — the eta-file primal, bit-for-bit as before those
     /// existed. Set by branch-and-bound on ITS OWN `FloatLp` (and inherited by
@@ -976,6 +1050,23 @@ fn rt_masked_enabled() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *B.get_or_init(|| std::env::var_os("AY_MILP_RT_MASKED").is_some())
 }
+/// INCREMENTAL ELIGIBILITY BITMASK for the dual ratio-test build (`rt_kind`; kill
+/// switch `AY_MILP_NO_RT_KIND`). Default-ON: the bitmask scan reads one `u8` per
+/// column in place of the 16-byte `basic_row` `Option` load + the `at` load + the
+/// 5-arm eligibility match, and is byte-identical to the 4-stream build (same
+/// breakpoints, same first-minimal argmin, same pivot stream). See `rt_kind`.
+fn rt_kind_enabled() -> bool {
+    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_RT_KIND").is_none())
+}
+/// Correctness harness for `rt_kind` (`AY_MILP_RT_KIND_VERIFY`): recompute the
+/// eligibility bitmask from scratch before every ratio-test scan and assert it
+/// matches the incrementally-maintained one. O(cols) per pivot — testing only;
+/// proves the incremental maintenance never drifts from the ground truth.
+fn rt_kind_verify_enabled() -> bool {
+    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var_os("AY_MILP_RT_KIND_VERIFY").is_some())
+}
 /// Per-iteration ratio-test profiler (`AY_MILP_ITER_PROFILE`). See `rt_profile_line`.
 fn iter_profile_enabled() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1176,6 +1267,26 @@ fn force_tri_crash() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *B.get_or_init(|| std::env::var("AY_MILP_TRI_CRASH").as_deref() == Ok("1"))
 }
+/// Parse the historical range-logical crash environment opt-in.
+///
+/// Exact `"1"` only: malformed or merely truthy-looking values remain off.
+fn range_logical_crash_env_value(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// Admit a fully peeled equality block even when bounded-range rows are the
+/// majority. The range rows retain their own logicals in the crash basis.
+///
+/// Exact `"1"` only: this is a default-off measurement lever, not a new
+/// production policy.
+fn range_logical_crash_env_enabled() -> bool {
+    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        let value = std::env::var("AY_MILP_RANGE_LOGICAL_CRASH");
+        range_logical_crash_env_value(value.as_deref().ok())
+    })
+}
+
 /// Kill switch for the CHAIN-SHAPE class gate (`FloatLp::chain_shape`):
 /// `AY_MILP_CHAIN_SHAPE=0` restores the pure size gate byte-for-byte.
 fn chain_shape_enabled() -> bool {
@@ -1228,10 +1339,27 @@ fn chain_probe_iters() -> u64 {
             .unwrap_or(20_000)
     })
 }
+
+/// Resolve the typed LP-local chain-probe budget before consulting the
+/// historical process policy. Keeping the fallback lazy means a configured LP
+/// is independent of process-global environment.
+fn resolve_chain_distress_probe_iters(typed: Option<u64>, historical: impl FnOnce() -> u64) -> u64 {
+    typed.unwrap_or_else(historical)
+}
 /// Kill switch for the BUMP LU base factor inside `refactorize` (A/B lever).
 fn no_bump_lu() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *B.get_or_init(|| std::env::var_os("AY_MILP_NO_BUMP_LU").is_some())
+}
+/// `AY_MILP_BUMP_BTF=1`: route the bump base factor through the BLOCK-TRIANGULAR
+/// lane (lane 2) instead of the monolithic Markowitz LU (lane 1). Opt-in until
+/// proven: unset, `refactorize` is byte-identical to before. The bump decomposes
+/// near-triangularly (a few small SCC blocks + ~20k singletons), so factoring
+/// only the diagonal SCC blocks — off-diagonals riding as L content — drops fill
+/// from the monolithic ~47M toward O(bump nnz), the full-depth FTRAN-cost lever.
+fn bump_btf_env() -> bool {
+    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var_os("AY_MILP_BUMP_BTF").is_some())
 }
 /// Bump-size floor for the LU base factor in `refactorize`: below it the PFI
 /// segment stays (small bumps rebuild near-zero-fill anyway — the crash-walk
@@ -1553,7 +1681,9 @@ impl<'a> WarmSolver<'a> {
         self.sx.rebound(self.lp, lower, upper);
         self.sx.farkas = None;
         self.sx.farkas_verified = false;
-        let status = self.sx.run(self.lp, self.seeded, deadline);
+        let status = self
+            .sx
+            .run(self.lp, self.seeded, WarmSolveMode::Normal, deadline);
         if trace_lane {
             let eta_delta = (REFAC_COUNT.load(std::sync::atomic::Ordering::Relaxed) as u64)
                 .wrapping_sub(eta_before);
@@ -1889,6 +2019,9 @@ impl FloatLp {
             cut_slots_live: std::cell::Cell::new(false),
             dual_adapt: std::cell::Cell::new((0, 0, 0)),
             chain_shape: std::cell::Cell::new(0),
+            chain_distress_probe_iters: None,
+            eager_affine_crash: false,
+            range_logical_triangular_crash: false,
             plain_cold: false,
             eager_perturb: false,
             mat_scale,
@@ -1940,6 +2073,9 @@ impl FloatLp {
             return false;
         }
         fresh.plain_cold = self.plain_cold;
+        fresh.eager_affine_crash = self.eager_affine_crash;
+        fresh.range_logical_triangular_crash = self.range_logical_triangular_crash;
+        fresh.chain_distress_probe_iters = self.chain_distress_probe_iters;
         // A cut-slot rewrite does not change the model's class: keep the
         // chain-shape verdict (recomputing on the cut-laden matrix could only
         // flip it noisily; the verdict is a property of the model's identity).
@@ -2265,6 +2401,48 @@ impl FloatLp {
         self.chain_shape.get() == 1
     }
 
+    /// Request the self-validating affine-chain crash on this LP's next cold
+    /// solve.  This is local advice: it does not alter environment policy,
+    /// process defaults, warm solves, or any other [`FloatLp`].
+    pub(crate) fn request_eager_affine_crash(&mut self) {
+        self.eager_affine_crash = true;
+    }
+
+    /// Set the typed, per-instance range-logical triangular-crash request.
+    ///
+    /// The historical environment opt-in is resolved separately at the crash
+    /// attempt so an explicit request never mutates process-global policy.
+    pub(crate) fn request_range_logical_triangular_crash(&mut self) {
+        self.range_logical_triangular_crash = true;
+    }
+
+    /// Set the typed, per-instance cold affine-chain distress-probe budget.
+    ///
+    /// `None` retains the historical environment/default policy. The value
+    /// survives row reloads and ordinary `FloatLp` clones.
+    pub(crate) fn set_chain_distress_probe_iters(&mut self, iters: Option<u64>) {
+        self.chain_distress_probe_iters = iters;
+    }
+
+    /// Typed per-instance override, excluding the environment compatibility
+    /// fallback.
+    #[cfg(test)]
+    pub(crate) fn chain_distress_probe_iters_override(&self) -> Option<u64> {
+        self.chain_distress_probe_iters
+    }
+
+    /// Effective range-logical policy for this LP instance.
+    fn range_logical_triangular_crash_enabled(&self) -> bool {
+        self.range_logical_triangular_crash || range_logical_crash_env_enabled()
+    }
+
+    /// Typed per-instance request, excluding the environment compatibility
+    /// fallback. Test-only so production callers cannot confuse the two.
+    #[cfg(test)]
+    pub(crate) fn range_logical_triangular_crash_requested(&self) -> bool {
+        self.range_logical_triangular_crash
+    }
+
     /// TRUE once this LP has been CLASSIFIED as a layered-affine chain — whether
     /// merely ARMED (state 3) or promoted on distress (state 1). Distinct from
     /// `chain_lp` (distress ONLY): the k124 ACAS diff-leaf class has healthy cold
@@ -2274,6 +2452,21 @@ impl FloatLp {
     /// (classified NOT-chain, e.g. qiu) and state 0 (unclassified) are false.
     pub(crate) fn chain_class(&self) -> bool {
         matches!(self.chain_shape.get(), 1 | 3)
+    }
+
+    /// The bloom-cap RELAXATION predicate (see the tall_lu bloom arm in
+    /// `dual_simplex`). The divergence guard must be RELAXED only for a
+    /// POSITIVELY-classified non-chain LP (state 2, e.g. qiu, whose warm-dual
+    /// bloom genuinely converges). It must stay ARMED for the chain class
+    /// (states 1/3, which thrash) AND for the UNCLASSIFIED state 0 — which is
+    /// where the BIG size class (cifar100 NN windows/full-depth) sits, because
+    /// BIG skips classification entirely. The old predicate `!chain_class()`
+    /// was true for state 0 too, silently disabling the guard on exactly the
+    /// NN-thrash class it was built for; keying on state 2 positively fixes it.
+    /// Verdict-neutral: only the warm walk's length/bail changes (every exit is
+    /// post-checked primal_feasible+priced_out; bounds rigorous for any duals).
+    pub(crate) fn bloom_relax_class(&self) -> bool {
+        self.chain_shape.get() == 2
     }
 
     /// The EQUALITY-ROW TRIANGULAR PEEL census — `triangular_crash`'s own peel
@@ -2498,6 +2691,135 @@ impl FloatLp {
         Some(out)
     }
 
+    /// DIFFERENTIAL-CORRECTNESS PROBE (the BTF de-risking scaffold). Factor
+    /// `cand`'s basis through `refactorize` on a FORCED bump-LU lane (`lane` = 0
+    /// PFI slot-order, 1 Markowitz bump-LU, 2 block-triangular bump-LU), then
+    /// capture the `B⁻¹` images that let a differential caller confirm the
+    /// lanes represent the SAME inverse operator.
+    ///
+    /// PERMUTATION-INVARIANT INDEXING (the load-bearing subtlety). `refactorize`
+    /// finalizes `self.basis = rf_new_basis` (simplex.rs) — it PERMUTES the basis
+    /// into the factorization's pivot-order row slots, and the two lanes pivot the
+    /// bump in DIFFERENT orders, so lane 0 and lane 1 assign the same basis column
+    /// to DIFFERENT row slots. Comparing FTRAN/BTRAN vectors by raw row slot would
+    /// then compare permuted vectors and report a spurious O(1) disagreement even
+    /// though both operators are identical. So this probe keys everything off
+    /// COLUMN IDENTITY, which is lane-invariant:
+    ///   * FTRAN: `alpha = B⁻¹·M_j` is remapped from row-slot to canonical
+    ///     basis-column order via `basic_row` — `out[k]` is the coefficient of the
+    ///     basis column `cand.basis[k]` in `M_j`'s expansion, the UNIQUE (hence
+    ///     lane-invariant) solution of `B x = M_j`. Recorded in the pivot (scaled)
+    ///     frame; both lanes share the scaling, so the differential cancels it.
+    ///   * BTRAN: for each basis column `c` in `btran_cols`, the row of `B⁻¹` DUAL
+    ///     to `c` = `e_{slot(c)}ᵀ·B⁻¹` where `slot(c) = basic_row[c]`. Its output is
+    ///     indexed by CONSTRAINT ROW (already lane-invariant), and the scaled-frame
+    ///     fixup uses `c`'s own column scale.
+    ///
+    /// Returns `None` on a shape mismatch. This is measurement scaffolding: a bug
+    /// here can only mis-report, never touch a verdict (nothing on the solve path
+    /// calls it).
+    pub(crate) fn factor_probe(
+        &self,
+        cand: &Candidate,
+        ftran_cols: &[usize],
+        btran_cols: &[usize],
+        lane: u8,
+    ) -> Option<FactorProbe> {
+        if lane > 2 || cand.basis.len() != self.m || cand.at.len() != self.cols {
+            return None;
+        }
+        let mut seen_basis_columns = vec![false; self.cols];
+        for &column in &cand.basis {
+            if column >= self.cols || std::mem::replace(&mut seen_basis_columns[column], true) {
+                return None;
+            }
+        }
+        let t0 = std::time::Instant::now();
+        let mut sx = Simplex::new(self, &self.lower, &self.upper);
+        // Pin the lane BEFORE warm_start — warm_start triggers the refactorize
+        // that reads the gate. A fresh Simplex crashes to its own basis, so the
+        // warm hint is never `same` and the rebuild always runs on this lane.
+        sx.bump_lu_override = Some(lane);
+        sx.warm_start(self, &cand.basis, &cand.at, &self.lower, &self.upper);
+
+        // FTRAN: B⁻¹·(column j of M) into sx.alpha over sx.nz, then REMAP to the
+        // canonical basis-column order. `ftran` accumulates onto `alpha` and
+        // assumes it is zero at rest, so restore the support afterwards.
+        let mut ftran = Vec::with_capacity(ftran_cols.len());
+        for &j in ftran_cols {
+            if j >= self.cols {
+                return None;
+            }
+            sx.ftran(self, j);
+            // out[k] = coefficient of basis column cand.basis[k] = alpha[slot(c_k)].
+            // Slots absent from the support read 0.0 (that column's coefficient is
+            // zero). `basic_row[c]` is `Some` for every un-kicked basis column.
+            let mut col = vec![0.0f64; self.m];
+            for (k, &c) in cand.basis.iter().enumerate() {
+                if let Some(slot) = sx.basic_row[c] {
+                    col[k] = sx.alpha[slot];
+                }
+            }
+            let nz = std::mem::take(&mut sx.nz);
+            for &i in &nz {
+                sx.alpha[i] = 0.0; // restore rest state for the next ftran
+            }
+            sx.nz = nz;
+            sx.nz.clear();
+            ftran.push(col);
+        }
+
+        // BTRAN: the row of B⁻¹ dual to each requested basis column, indexed by
+        // constraint row (lane-invariant), with that column's own scaled fixup.
+        let mut btran = Vec::with_capacity(btran_cols.len());
+        for &c in btran_cols {
+            if c >= self.cols {
+                return None;
+            }
+            let Some(slot) = sx.basic_row[c] else {
+                // Column not basic in this factorization (kicked); record zeros so
+                // the two lanes stay index-aligned (a kick is itself a differential
+                // invariant the caller checks separately).
+                btran.push(vec![0.0f64; self.m]);
+                continue;
+            };
+            sx.y_is_duals = false;
+            sx.y.fill(0.0);
+            sx.y[slot] = 1.0;
+            sx.btran();
+            let mut row = sx.y.clone();
+            if self.scaled() {
+                let d_c = self.val_mul[c];
+                for (r, v) in row.iter_mut().enumerate() {
+                    *v *= d_c * self.bnd_mul[self.n + r];
+                }
+            }
+            btran.push(row);
+        }
+
+        let mut kicked_columns = cand
+            .basis
+            .iter()
+            .copied()
+            .filter(|&column| sx.basic_row[column].is_none())
+            .collect::<Vec<_>>();
+        kicked_columns.sort_unstable();
+        if kicked_columns.len() != sx.refactor_kicked {
+            return None;
+        }
+
+        Some(FactorProbe {
+            ftran,
+            btran,
+            fill: sx.etas.entries(),
+            bump_lu_used: sx.refactor_bump_lu_used,
+            kicked: sx.refactor_kicked,
+            kicked_columns,
+            basis_order: sx.basis.clone(),
+            secs: t0.elapsed().as_secs_f64(),
+        })
+    }
+
     pub(crate) fn solve_bounded(
         &self,
         lower: &[f64],
@@ -2505,6 +2827,27 @@ impl FloatLp {
         warm: Option<(&[usize], &[NbBound])>,
         deadline: Option<std::time::Instant>,
     ) -> Candidate {
+        self.solve_bounded_with_mode(lower, upper, warm, WarmSolveMode::Normal, deadline)
+    }
+
+    /// Solve under tightened bounds with an explicit warm-basis policy.
+    ///
+    /// [`WarmSolveMode::PrimalAdvice`] is bounded preparatory work only.
+    /// [`WarmSolveMode::PrimalProofContinuation`] takes the same direct-primal
+    /// path but returns a verdict candidate that its caller must exactify just
+    /// like a [`WarmSolveMode::Normal`] result.
+    pub(crate) fn solve_bounded_with_mode(
+        &self,
+        lower: &[f64],
+        upper: &[f64],
+        warm: Option<(&[usize], &[NbBound])>,
+        warm_mode: WarmSolveMode,
+        deadline: Option<std::time::Instant>,
+    ) -> Candidate {
+        debug_assert!(
+            warm.is_some() || warm_mode == WarmSolveMode::Normal,
+            "direct-primal warm modes require an adopted warm basis"
+        );
         stats::bump(&stats::SOLVES);
         let _t_solve = std::time::Instant::now();
         // Pooled solver state: reset-in-place is `Simplex::new` minus the ~25
@@ -2573,7 +2916,8 @@ impl FloatLp {
             && !lu_enabled()
             && ((self.cols >= BIG_LP_COLS && self.m >= BIG_LP_ROWS)
                 || force_tri_crash()
-                || self.chain_lp())
+                || self.chain_lp()
+                || self.eager_affine_crash)
             && {
                 // The crash runs on the fresh eta state and never composes
                 // with an LU operator: set any cached engine aside, and on
@@ -2581,7 +2925,7 @@ impl FloatLp {
                 // `plain_cold`, whose documented cold-solve semantics drop it)
                 // instead of losing it.
                 let cached = sx.lu.take();
-                let ok = sx.triangular_crash(self);
+                let ok = sx.triangular_crash(self, self.range_logical_triangular_crash_enabled());
                 if ok {
                     if !self.plain_cold {
                         *self.lu_cache.0.borrow_mut() = cached;
@@ -2741,13 +3085,16 @@ impl FloatLp {
         // certification outright (postchk 114 -> 410, rim 77.7s, unknown
         // @592s) and cold-only Devex keeps it but grows the tree 48,123 ->
         // 92,015 / 222 -> 319s.
-        let chain_probe = warm.is_none()
+        let chain_distress_probe_iters = (warm.is_none()
             && sx.lu.is_none()
             && self.chain_shape.get() == 3
-            && !no_tri_crash()
-            && chain_probe_iters() > 0;
-        if chain_probe {
-            sx.probe_iters_left = chain_probe_iters();
+            && !no_tri_crash())
+        .then(|| {
+            resolve_chain_distress_probe_iters(self.chain_distress_probe_iters, chain_probe_iters)
+        });
+        let chain_probe = chain_distress_probe_iters.is_some_and(|iters| iters > 0);
+        if let Some(iters) = chain_distress_probe_iters.filter(|&iters| iters > 0) {
+            sx.probe_iters_left = iters;
         }
         let primal_before = stats::get(&stats::PRIMAL_ITERS);
         // SBPROFILE: everything above (pool adopt + `reset` + LU-install +
@@ -2758,7 +3105,7 @@ impl FloatLp {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
-        let mut status = sx.run(self, warm_started, deadline);
+        let mut status = sx.run(self, warm_started, warm_mode, deadline);
         if chain_probe {
             sx.probe_iters_left = u64::MAX;
             if trace_enabled() {
@@ -2776,9 +3123,9 @@ impl FloatLp {
                 if deadline.is_none_or(|d| std::time::Instant::now() < d) {
                     sx.reset(self, lower, upper, false);
                     if !no_tri_crash() {
-                        sx.triangular_crash(self);
+                        sx.triangular_crash(self, self.range_logical_triangular_crash_enabled());
                     }
-                    status = sx.run(self, false, deadline);
+                    status = sx.run(self, false, WarmSolveMode::Normal, deadline);
                     if trace_enabled() {
                         eprintln!(
                             "AY_MILP_TRACE chain probe: bundle retry {:?} ({} primal iters total)",
@@ -2870,7 +3217,8 @@ impl FloatLp {
     /// already transactional per pivot, and the parent's basis would only make the
     /// duals STALER). The budget is a pure iteration COUNT — the probe's cost is the
     /// same on every run and every machine, which the tree's determinism requires.
-    /// Arm cross-probe LU reuse for a GUB strong-branching sweep (`ProbeReuse`).
+    /// Arm cross-probe LU reuse for a bounded strong-branching sweep
+    /// (`ProbeReuse`).
     /// The returned guard disarms and drops the snapshot on scope exit (RAII, so an
     /// early return in the caller still releases it). No-op unless this LP is on the
     /// wide/tall LU probe path and the kill switch is unset — the reuse is inert
@@ -2895,6 +3243,37 @@ impl FloatLp {
         max_iters: u64,
         deadline: Option<std::time::Instant>,
     ) -> Vec<f64> {
+        self.probe_duals_with_memory_status(lower, upper, warm, max_iters, deadline)
+            .0
+    }
+
+    /// [`Self::probe_duals`] with a fail-closed memory verdict.
+    ///
+    /// Ordinary branch-selection advice may keep a stale-but-rigorous dual
+    /// when an LU rebuild declines. The target-FSB harvest has an explicit
+    /// memory contract instead: it discards that probe and therefore the whole
+    /// fused selection attempt when the simplex memory guard fires.
+    pub(crate) fn probe_duals_fail_closed(
+        &self,
+        lower: &[f64],
+        upper: &[f64],
+        warm: Option<(&[usize], &[NbBound])>,
+        max_iters: u64,
+        deadline: Option<std::time::Instant>,
+    ) -> Option<Vec<f64>> {
+        let (duals, out_of_memory) =
+            self.probe_duals_with_memory_status(lower, upper, warm, max_iters, deadline);
+        (!out_of_memory).then_some(duals)
+    }
+
+    fn probe_duals_with_memory_status(
+        &self,
+        lower: &[f64],
+        upper: &[f64],
+        warm: Option<(&[usize], &[NbBound])>,
+        max_iters: u64,
+        deadline: Option<std::time::Instant>,
+    ) -> (Vec<f64>, bool) {
         stats::bump(&stats::SOLVES);
         let _t_solve = std::time::Instant::now();
         let mut sx: Box<Simplex> = match self.sx_cache.0.borrow_mut().take() {
@@ -2930,13 +3309,13 @@ impl FloatLp {
                 rep_basis: (self.n..self.n + self.m).collect(),
             });
         }
-        // CROSS-PROBE LU REUSE (see `ProbeReuse`): while a GUB strong-branch sweep
+        // CROSS-PROBE LU REUSE (see `ProbeReuse`): while a strong-branch sweep
         // is armed, restore the pristine parent factorization into the working
         // operator so this probe's `warm_start` takes the `rep_basis` match-skip
         // instead of re-factoring the basis the PREVIOUS probe's dual walk pivoted
         // away from. The snapshot is a fresh `factor()` output, so the restored
         // operator is bit-identical to the re-factor it replaces. `armed` is set
-        // only inside `gub_strong_pick`, so every other solve skips this entirely.
+        // only inside an explicit RAII guard, so every other solve skips this.
         let reuse_armed = self.probe_reuse.0.borrow().armed;
         if reuse_armed {
             if let Some(cache) = sx.lu.as_mut() {
@@ -3002,9 +3381,10 @@ impl FloatLp {
                 .wrapping_sub(eta_before);
             record_lane(lane_bucket, eta_delta);
         }
+        let out_of_memory = sx.oom;
         *self.lu_cache.0.borrow_mut() = sx.lu.take();
         *self.sx_cache.0.borrow_mut() = Some(sx);
-        duals
+        (duals, out_of_memory)
     }
 }
 
@@ -3047,7 +3427,7 @@ impl Clone for LuCacheCell {
     }
 }
 
-/// CROSS-PROBE LU REUSE for the GUB strong-branching sweep (`gub_strong_pick`).
+/// CROSS-PROBE LU REUSE for a bounded strong-branching sweep.
 ///
 /// A strong-branch node probes k candidate row-splits, two children each, and
 /// EVERY one of those 2k probes warm-starts the SAME parent basis. But each
@@ -3063,11 +3443,11 @@ impl Clone for LuCacheCell {
 /// `factor()` produces for that basis, and all fresh factors of one basis are
 /// bit-identical, so the restored operator equals the re-factor it replaces —
 /// the probe's duals, the ranked pick, and the resulting tree are unchanged;
-/// only the factor WORK is saved. Armed only around `gub_strong_pick`'s loop
-/// (`wide_tall`/`tall_lu` set-partition path), so every other solve — and every
-/// non-air05 corpus/ladder instance — is byte-identical and never consults it.
+/// only the factor WORK is saved. Armed only around an explicit caller probe
+/// loop (`wide_tall`/`tall_lu` path), so every other solve is byte-identical
+/// and never consults it.
 struct ProbeReuse {
-    /// Set by `gub_strong_pick` around its probe loop; probes reuse only while armed.
+    /// Set around one bounded probe loop; probes reuse only while armed.
     armed: bool,
     /// A fresh factorization of the parent basis, captured on the first probe that
     /// factors it (`updates() == 0`). `None` until then and after disarm.
@@ -3093,8 +3473,8 @@ fn probe_lu_reuse_enabled() -> bool {
     *B.get_or_init(|| std::env::var_os("AY_MILP_NO_PROBE_LU_REUSE").is_none())
 }
 
-/// RAII arm/disarm guard for the cross-probe LU reuse (`ProbeReuse`), so an early
-/// return or panic in `gub_strong_pick` still releases the snapshot.
+/// RAII arm/disarm guard for cross-probe LU reuse, so an early return or panic
+/// still releases the snapshot.
 pub(crate) struct ProbeReuseGuard<'a>(&'a FloatLp);
 impl Drop for ProbeReuseGuard<'_> {
     fn drop(&mut self) {
@@ -3191,6 +3571,216 @@ struct BumpFactor {
     /// Local column indexes with no admissible pivot (numerically dependent);
     /// the caller's logical repair covers their rows, as in the PFI path.
     kicked: Vec<u32>,
+}
+
+/// `AY_MILP_BUMP_SCC=1`: print the SCC-size histogram of the bump block on
+/// each rebuild. Diagnostic-only; gates the BTF block-factor program (many
+/// medium SCCs ⇒ block substitution wins, one giant SCC ⇒ it does not).
+fn bump_scc_enabled() -> bool {
+    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var_os("AY_MILP_BUMP_SCC").is_some())
+}
+
+/// The block-triangular structure of the bump `acols` (transformed bump
+/// columns): greedy bipartite matching (col → open row; augment the few misses
+/// with an iterative Kuhn DFS), then the directed dependency digraph (col `c` →
+/// col `c′` when `c` has a nonzero in `c′`'s matched row) whose SCCs are the
+/// Dulmage–Mendelsohn fine blocks — the irreducible cores the BTF block factor
+/// isolates. Iterative Tarjan (47k-safe).
+///
+/// Returns `(col_block, block_topo_order, col_row)`:
+/// - `col_block[c]` — SCC id of column `c`, numbered in Tarjan COMPLETION order
+///   (0 = the SCC Tarjan finalized first = a condensation SINK).
+/// - `block_topo_order` — the block ids in the order the BTF lane must emit them:
+///   a topological order of the condensation (SOURCES first). Tarjan finalizes
+///   SCCs in reverse-topological order, so this is simply the completion order
+///   reversed. Emitting sources first makes each block's spill into a LATER
+///   block's rows ride as sub-diagonal L content (the block-lower-triangular
+///   invariant the per-block factor relies on). Direction confirmed empirically
+///   by the lane-1-vs-2 differential.
+/// - `col_row[c]` — the open row matched to column `c` (`usize::MAX` if the
+///   augmenting search left it unmatched: structurally dependent, kicked).
+///
+/// The matching (and therefore the block structure and every `block_open` mask
+/// the BTF lane derives from `col_row`) is restricted to the `open` rows — the
+/// bump's own mid rows — exactly the pivot set `bump_eliminate` runs over. A
+/// column's entries in NON-open rows (already-pivoted head rows, reserved back
+/// rows) are spectators that ride along as L content; matching a bump column to
+/// one of those would let a per-block factor pivot on an already-owned row and
+/// strand the bump's real row uncovered.
+fn bump_scc_blocks(
+    m: usize,
+    acols: &[Vec<(u32, f64)>],
+    open: &[bool],
+) -> (Vec<u32>, Vec<u32>, Vec<usize>) {
+    let nb = acols.len();
+    // --- bipartite matching: col -> open row (greedy, then augment misses) ---
+    let mut col_row = vec![usize::MAX; nb];
+    let mut row_col = vec![usize::MAX; m];
+    for (c, col) in acols.iter().enumerate() {
+        for &(r, _) in col {
+            if open[r as usize] && row_col[r as usize] == usize::MAX {
+                col_row[c] = r as usize;
+                row_col[r as usize] = c;
+                break;
+            }
+        }
+    }
+    // Augment the columns greedy missed (iterative Kuhn DFS).
+    for c0 in 0..nb {
+        if col_row[c0] != usize::MAX {
+            continue;
+        }
+        let mut seen = vec![false; m];
+        // stack frames: (col, next entry index in acols[col])
+        let mut stack: Vec<(usize, usize)> = vec![(c0, 0)];
+        let mut augmented = false;
+        while let Some(&mut (c, ref mut ei)) = stack.last_mut() {
+            let col = &acols[c];
+            let mut advanced = false;
+            while *ei < col.len() {
+                let r = col[*ei].0 as usize;
+                *ei += 1;
+                if !open[r] || seen[r] {
+                    continue;
+                }
+                seen[r] = true;
+                let occ = row_col[r];
+                if occ == usize::MAX {
+                    // free row: unwind, flipping the alternating path
+                    let mut rr = r;
+                    for &(pc, pei) in stack.iter().rev() {
+                        let prev = col_row[pc];
+                        col_row[pc] = rr;
+                        row_col[rr] = pc;
+                        let _ = pei;
+                        rr = prev;
+                        if rr == usize::MAX {
+                            break;
+                        }
+                    }
+                    augmented = true;
+                    advanced = true;
+                    break;
+                } else {
+                    stack.push((occ, 0));
+                    advanced = true;
+                    break;
+                }
+            }
+            if augmented {
+                break;
+            }
+            if !advanced {
+                stack.pop();
+            }
+        }
+    }
+    // --- directed digraph on matched columns; iterative Tarjan SCC ---
+    // adjacency: c -> row_col[r] for each (r,_) in acols[c] with a matched owner.
+    let mut index = vec![u32::MAX; nb];
+    let mut low = vec![0u32; nb];
+    let mut onstk = vec![false; nb];
+    let mut stk: Vec<u32> = Vec::new();
+    let mut comp = vec![u32::MAX; nb];
+    let mut nblocks = 0u32;
+    let mut idx = 0u32;
+    // iterative Tarjan: frame (node, edge-cursor)
+    for s in 0..nb {
+        if index[s] != u32::MAX {
+            continue;
+        }
+        let mut call: Vec<(u32, usize)> = vec![(s as u32, 0)];
+        while let Some(&mut (v, ref mut ci)) = call.last_mut() {
+            let vu = v as usize;
+            if *ci == 0 {
+                index[vu] = idx;
+                low[vu] = idx;
+                idx += 1;
+                stk.push(v);
+                onstk[vu] = true;
+            }
+            let col = &acols[vu];
+            let mut recursed = false;
+            while *ci < col.len() {
+                let r = col[*ci].0 as usize;
+                *ci += 1;
+                let w = row_col[r];
+                if w == usize::MAX {
+                    continue;
+                }
+                if index[w] == u32::MAX {
+                    call.push((w as u32, 0));
+                    recursed = true;
+                    break;
+                } else if onstk[w] {
+                    if index[w] < low[vu] {
+                        low[vu] = index[w];
+                    }
+                }
+            }
+            if recursed {
+                continue;
+            }
+            if low[vu] == index[vu] {
+                let bid = nblocks;
+                loop {
+                    let w = stk.pop().unwrap();
+                    onstk[w as usize] = false;
+                    comp[w as usize] = bid;
+                    if w == v {
+                        break;
+                    }
+                }
+                nblocks += 1;
+            }
+            call.pop();
+            if let Some(&mut (p, _)) = call.last_mut() {
+                if low[vu] < low[p as usize] {
+                    low[p as usize] = low[vu];
+                }
+            }
+        }
+    }
+    // Tarjan completes SCCs in reverse-topological order; emit sources first.
+    let block_topo_order: Vec<u32> = (0..nblocks).rev().collect();
+    (comp, block_topo_order, col_row)
+}
+
+/// READ-ONLY diagnostic (no operator change): a one-line SCC-size histogram of
+/// the bump block, over the block structure `bump_scc_blocks` computes (matched
+/// over the `open` rows, the same set the factor pivots on).
+fn bump_scc_histogram(m: usize, acols: &[Vec<(u32, f64)>], open: &[bool]) -> String {
+    let nb = acols.len();
+    if nb == 0 {
+        return "BUMP_SCC empty".to_string();
+    }
+    let (comp, block_order, col_row) = bump_scc_blocks(m, acols, open);
+    let nblocks = block_order.len();
+    let unmatched = col_row.iter().filter(|&&r| r == usize::MAX).count();
+    let mut sizes = vec![0usize; nblocks];
+    for &b in &comp {
+        sizes[b as usize] += 1;
+    }
+    let mut buckets = [0usize; 7]; // 1, 2-9, 10-99, 100-999, 1k-5k, 5k-10k, 10k+
+    let mut largest = 0usize;
+    for &sz in &sizes {
+        largest = largest.max(sz);
+        let b = match sz {
+            1 => 0,
+            2..=9 => 1,
+            10..=99 => 2,
+            100..=999 => 3,
+            1000..=4999 => 4,
+            5000..=9999 => 5,
+            _ => 6,
+        };
+        buckets[b] += 1;
+    }
+    format!(
+        "BUMP_SCC nb={nb} unmatched={unmatched} sccs={nblocks} LARGEST={largest} | hist[1]={} [2-9]={} [10-99]={} [100-999]={} [1k-5k]={} [5k-10k]={} [10k+]={}",
+        buckets[0], buckets[1], buckets[2], buckets[3], buckets[4], buckets[5], buckets[6]
+    )
 }
 
 /// Right-looking Markowitz elimination of the bump block, threshold-pivoted
@@ -3554,6 +4144,22 @@ struct Simplex {
     /// per-column division vectorises, then read by the filtered push pass. Same
     /// IEEE division per column ⇒ byte-identical breakpoints. Default path unused.
     rt_ratio: Vec<f64>,
+    /// Incremental DUAL RATIO-TEST ELIGIBILITY bitmask (`AY_MILP_NO_RT_KIND` kills
+    /// it). The dual ratio-test build's per-column eligibility splits into a
+    /// BASIS-STABLE part (`basic_row[j].is_none() && at[j] != Zero`, plus which
+    /// bound the nonbasic column rests at) that changes ONLY on a basis change,
+    /// and a per-pivot sign test on `arow[j]`. `rt_kind[j]` caches the stable part
+    /// as `0` = ineligible (basic OR free-at-zero), `1` = nonbasic at LOWER, `2` =
+    /// nonbasic at UPPER, so the pivot-hot scan reads ONE `u8` stream instead of
+    /// the 16-byte `Option<usize>` `basic_row` load + the `at` load + the 5-arm
+    /// match. Rebuilt once per `dual_simplex` entry (`rebuild_rt_kind`, before the
+    /// pivot loop) and maintained incrementally at the two in-loop basis mutations
+    /// (the bound-flip commit and the pivot commit); every other basis mutation
+    /// (crash/warm-start/cold-dual/primal) precedes the next dual entry's rebuild.
+    /// The entering column — hence every exact verdict — is byte-identical: the
+    /// scan pushes the SAME `(d[j]/arow[j]).abs()` breakpoints, in the same
+    /// ascending-`j` order, with the same first-minimal argmin.
+    rt_kind: Vec<u8>,
     d: Vec<f64>,
     /// Partial-pricing cursor: the column where the next pricing sweep begins
     /// (cyclic). Persisting it across iterations is what makes sectional
@@ -3635,6 +4241,12 @@ struct Simplex {
     /// basis). Carried across solves by `reset(keep_factor=true)`, this is what
     /// licenses CROSS-SOLVE ETA REUSE — see `warm_start`.
     factor_live: bool,
+    /// This LP successfully installed the opt-in mixed
+    /// `[B_EE 0; B_RE -I]` crash basis at least once.  Only that successful,
+    /// instance-local event licenses the range-logical refactor preorder:
+    /// reading the process-wide experiment flag here would make a declined
+    /// crash perturb unrelated LPs and contaminate the A/B.
+    range_logical_crash_installed: bool,
     /// How many solve boundaries the current eta file has been reused across
     /// since its last true rebuild (rebuild -> 0, each `warm_start` skip -> +1).
     /// `AY_MILP_ETA_GEN` caps it (chains compound: a reused file carries its
@@ -3651,6 +4263,25 @@ struct Simplex {
     /// fill), so every guard reading it is a dead branch on the corpus —
     /// byte-identical.
     oom: bool,
+    /// DIFFERENTIAL-HARNESS SEAM (`factor_probe`): forces the `refactorize`
+    /// bump-LU base-factor lane for this solve, bypassing the `AY_MILP_NO_BUMP_LU`
+    /// env read. `None` = production (the env expression decides — BYTE-IDENTICAL
+    /// to the pre-seam gate); `Some(1)` = force the Markowitz bump-LU lane on
+    /// (still subject to the peel being active AND the bump above `bump_lu_min`);
+    /// `Some(0)` = force the PFI slot-order lane off. Never set on any shipping
+    /// path — only `FloatLp::factor_probe` writes it, so every production solve
+    /// reads `None` and the gate is unchanged.
+    bump_lu_override: Option<u8>,
+    /// The number of dependent columns the last `refactorize` KICKED to their
+    /// bounds (singular-basis repair). Surfaced so `factor_probe` can report it
+    /// per lane — a differential invariant (both lanes factor the SAME basis, so
+    /// they must kick the same count). Advisory diagnostic; nothing reads it on
+    /// the production path.
+    refactor_kicked: usize,
+    /// Whether the final successful `refactorize` attempt used the bump-LU
+    /// segment. Diagnostic provenance for `factor_probe`; production never
+    /// reads it.
+    refactor_bump_lu_used: bool,
 }
 
 /// Eta-file fill-cap multiplier (`AY_MILP_ETA_CAP_MULT`, default 4 = the
@@ -3743,6 +4374,7 @@ impl Simplex {
             rho: vec![0.0; lp.m],
             arow: vec![0.0; lp.cols],
             rt_ratio: Vec::new(),
+            rt_kind: vec![0u8; lp.cols],
             d: vec![0.0; lp.cols],
             pcost: vec![0.0; lp.cols],
             pcost_save: Vec::new(),
@@ -3770,8 +4402,12 @@ impl Simplex {
             anat_z0: 0.0,
             probe_iters_left: u64::MAX,
             factor_live: false,
+            range_logical_crash_installed: false,
             chain_gen: 0,
             oom: false,
+            bump_lu_override: None,
+            refactor_kicked: 0,
+            refactor_bump_lu_used: false,
         };
         s.reset(lp, lower, upper, false);
         s
@@ -4395,6 +5031,10 @@ impl Simplex {
     /// a stale but self-consistent inverse costs tightness, never soundness,
     /// because nothing this lane produces is trusted anyway.
     fn refactorize(&mut self, lp: &FloatLp) {
+        // Fail closed for diagnostic provenance even when an early return
+        // (OOM/cache hit) means no rebuild lane ran.
+        self.refactor_kicked = 0;
+        self.refactor_bump_lu_used = false;
         // Once the LU factor has DECLINED (fill over budget) this solve is
         // giving up: do NOT rebuild anything. The eta-file arm below is itself
         // an unbounded fill bomb, and re-attempting the LU factor would just
@@ -4708,6 +5348,7 @@ impl Simplex {
         let mut forced: Vec<usize> = Vec::new();
         if ((self.cols >= BIG_LP_COLS && self.m >= BIG_LP_ROWS)
             || force_tri_crash()
+            || self.range_logical_crash_installed
             || (lp.chain_lp() && chain_preorder()))
             && !no_tri_crash()
         {
@@ -4930,8 +5571,10 @@ impl Simplex {
             self.eta_nnz_cap.saturating_mul(2)
         };
         let mut kicked;
+        let mut bump_lu_used;
         'attempt: loop {
             kicked = 0;
+            bump_lu_used = false;
             let mut blew = false;
             // BUMP LU BASE FACTOR. The peel's head and tail rebuild
             // (near-)zero-fill, but the mid-walk bump is a genuine ~10k-column
@@ -4944,7 +5587,31 @@ impl Simplex {
             // (~160-column bumps, already near-zero-fill) keep the measured
             // PFI path; `AY_MILP_NO_BUMP_LU=1` kills it for A/B. Warm updates
             // stay PFI on top, exactly as before.
-            let bump_lu_now = !forced.is_empty() && peel_nb >= bump_lu_min() && !no_bump_lu();
+            // The `bump_lu_override` seam (default `None`) reproduces the env
+            // expression BYTE-FOR-BYTE in production; `factor_probe` sets it to
+            // force a specific lane for the differential harness. `bump_lane`:
+            // 0 = PFI product-form (no bump segment), 1 = monolithic Markowitz
+            // bump-LU (`bump_lu_segment`), 2 = block-triangular (`bump_btf_segment`).
+            // The default (override `None`, `AY_MILP_BUMP_BTF` unset) is lane 1
+            // exactly as before — BTF is opt-in until proven.
+            let bump_active = !forced.is_empty() && peel_nb >= bump_lu_min();
+            let bump_lane: u8 = match self.bump_lu_override {
+                Some(1) if bump_active => 1,
+                Some(2) if bump_active => 2,
+                Some(_) => 0,
+                None => {
+                    if !bump_active {
+                        0
+                    } else if bump_btf_env() {
+                        2
+                    } else if !no_bump_lu() {
+                        1
+                    } else {
+                        0
+                    }
+                }
+            };
+            let bump_lu_now = bump_lane != 0;
             let diag = bump_diag_enabled() && !forced.is_empty();
             let seg_t0 = std::time::Instant::now();
             let (mut seg_ef, mut seg_eb) = (usize::MAX, usize::MAX);
@@ -4960,15 +5627,28 @@ impl Simplex {
                 }
                 if bump_lu_now && di >= peel_nf && di < peel_nf + peel_nb {
                     if di == peel_nf {
-                        let ok = self.bump_lu_segment(
-                            lp,
-                            peel_nf,
-                            peel_nb,
-                            &deferred,
-                            tol,
-                            fill_cap,
-                            &mut kicked,
-                        );
+                        let ok = if bump_lane == 2 {
+                            self.bump_btf_segment(
+                                lp,
+                                peel_nf,
+                                peel_nb,
+                                &deferred,
+                                tol,
+                                fill_cap,
+                                &mut kicked,
+                            )
+                        } else {
+                            self.bump_lu_segment(
+                                lp,
+                                peel_nf,
+                                peel_nb,
+                                &deferred,
+                                tol,
+                                fill_cap,
+                                &mut kicked,
+                            )
+                        };
+                        bump_lu_used = ok;
                         if !ok || self.etas.entries() > fill_cap {
                             blew = true;
                             break;
@@ -5109,6 +5789,11 @@ impl Simplex {
         }
         self.rf_cols = cols_list;
         self.rf_deferred = deferred;
+        // Surface the singular-repair kick count for the differential harness
+        // (`factor_probe`). Both lanes factor the SAME basis, so the count is a
+        // lane-invariant. Advisory only — no production path reads it.
+        self.refactor_kicked = kicked;
+        self.refactor_bump_lu_used = bump_lu_used;
 
         // BASIS REPAIR: fill every uncovered row with a LOGICAL. An uncovered
         // row `r` implies logical `n + r` is NOT in the basis (had it been,
@@ -5263,6 +5948,12 @@ impl Simplex {
             acols.push(col);
         }
         let open: Vec<bool> = self.rf_row_used.iter().map(|&u| !u).collect();
+        if bump_scc_enabled() {
+            eprintln!(
+                "AY_MILP_TRACE {}",
+                bump_scc_histogram(self.m, &acols, &open)
+            );
+        }
         let Some(f) = bump_eliminate(self.m, acols, &open, tol, entry_cap) else {
             return false;
         };
@@ -5296,6 +5987,141 @@ impl Simplex {
                 "AY_MILP_TRACE refactorize bump LU: {nb} cols ({gathered} gathered nnz) -> {} pivots, L {lnnz} + U {unnz} entries, {} kicked, {:.2}s",
                 f.stages.len(),
                 f.kicked.len(),
+                _t.elapsed().as_secs_f64()
+            );
+        }
+        true
+    }
+
+    /// The BLOCK-TRIANGULAR (BTF) segment of the peel-ordered rebuild — lane 2.
+    /// Same role and signature as `bump_lu_segment`, but instead of one
+    /// monolithic Markowitz core it factors the bump SCC-BLOCK by SCC-block.
+    ///
+    /// `bump_scc_blocks` decomposes the transformed bump columns into their
+    /// Dulmage–Mendelsohn fine blocks (the strongly-connected cores of the
+    /// column-dependency digraph) and hands back a topological emission order.
+    /// Each block is factored by `bump_eliminate` with ONLY that block's matched
+    /// rows open — so every entry landing in another block's row (or in a head /
+    /// back row) rides along as pure L content, exactly as the monolithic lane
+    /// lets non-open rows ride. Because the blocks are emitted SOURCES-first,
+    /// each block's spill lands only in rows pivoted LATER: sub-diagonal L, so
+    /// the composed eta file is the same operator as lane 1's — at
+    /// `Σ nnz(L_block)+nnz(U_block)` entries, which for a near-triangular bump
+    /// (a few small SCCs + thousands of singletons) is O(bump nnz) rather than
+    /// the monolithic core's dense fill. Kicked columns accumulate exactly as in
+    /// lane 1; returns `false` on any block's (or the accumulated file's)
+    /// fill-cap breach, and the caller retries in slot order.
+    fn bump_btf_segment(
+        &mut self,
+        lp: &FloatLp,
+        nf: usize,
+        nb: usize,
+        deferred: &[usize],
+        tol: f64,
+        entry_cap: usize,
+        kicked: &mut usize,
+    ) -> bool {
+        let _t = std::time::Instant::now();
+        // Gather the transformed sparse bump columns — identical to lane 1.
+        let mut acols: Vec<Vec<(u32, f64)>> = Vec::with_capacity(nb);
+        let mut gathered = 0usize;
+        for &j in &deferred[nf..nf + nb] {
+            self.ftran(lp, j);
+            let mut col: Vec<(u32, f64)> = Vec::with_capacity(self.nz.len());
+            for &i in &self.nz {
+                col.push((i as u32, self.alpha[i]));
+                self.alpha[i] = 0.0;
+            }
+            gathered += col.len();
+            acols.push(col);
+        }
+        // OPEN rows = the bump's own mid rows (head/back already own theirs in
+        // `rf_row_used`), the exact pivot set — matched here and per block below.
+        let open: Vec<bool> = self.rf_row_used.iter().map(|&u| !u).collect();
+        if bump_scc_enabled() {
+            eprintln!(
+                "AY_MILP_TRACE {}",
+                bump_scc_histogram(self.m, &acols, &open)
+            );
+        }
+        // Block-triangular decomposition + topological (sources-first) order.
+        let (col_block, block_order, col_row) = bump_scc_blocks(self.m, &acols, &open);
+        let nblocks = block_order.len();
+        let mut cols_by_block: Vec<Vec<usize>> = vec![Vec::new(); nblocks];
+        for (c, &b) in col_block.iter().enumerate() {
+            cols_by_block[b as usize].push(c);
+        }
+        let mut total_l = 0usize;
+        let mut total_u = 0usize;
+        let mut largest_block = 0usize;
+        let mut nk = 0usize;
+        // One reusable open mask (blocks' matched rows are disjoint, so each
+        // iteration sets only its own rows and resets exactly those — no
+        // per-block `vec![false; m]` over thousands of tiny blocks).
+        let mut block_open = vec![false; self.m];
+        for &blk in &block_order {
+            let members = &cols_by_block[blk as usize];
+            if members.is_empty() {
+                continue;
+            }
+            largest_block = largest_block.max(members.len());
+            // This block's columns, and an open mask holding ONLY its matched
+            // rows: everything else (earlier/closed blocks, head, back) rides as
+            // L content. The matching is a bijection, so a block's matched rows
+            // are disjoint from every other block's — no open-mask overlap.
+            let mut block_acols: Vec<Vec<(u32, f64)>> = Vec::with_capacity(members.len());
+            for &c in members {
+                if col_row[c] != usize::MAX {
+                    block_open[col_row[c]] = true;
+                }
+                block_acols.push(std::mem::take(&mut acols[c]));
+            }
+            let f = bump_eliminate(self.m, block_acols, &block_open, tol, entry_cap);
+            // Reset only this block's rows before any early return / next block.
+            for &c in members {
+                if col_row[c] != usize::MAX {
+                    block_open[col_row[c]] = false;
+                }
+            }
+            let Some(f) = f else {
+                return false;
+            };
+            // Emit L-etas (stage order) then U-etas (reversed) — exactly as
+            // `bump_lu_segment`, remapping block-local column indices back to the
+            // global `deferred[nf + ..]` slot via this block's `members`.
+            for (k, &(pr, lc, _)) in f.stages.iter().enumerate() {
+                if !f.lcols[k].is_empty() {
+                    for &(r, lm) in &f.lcols[k] {
+                        self.etas.push_entry(r as usize, -lm);
+                    }
+                    total_l += f.lcols[k].len();
+                    self.etas.finish_eta(pr as usize, 1.0);
+                }
+                self.rf_new_basis[pr as usize] = deferred[nf + members[lc as usize]];
+                self.rf_row_used[pr as usize] = true;
+            }
+            for &(pr, lc, piv) in f.stages.iter().rev() {
+                let inv = 1.0 / piv;
+                for &(si, u) in &f.uhist[lc as usize] {
+                    self.etas
+                        .push_entry(f.stages[si as usize].0 as usize, -u * inv);
+                }
+                total_u += f.uhist[lc as usize].len();
+                self.etas.finish_eta(pr as usize, inv);
+            }
+            *kicked += f.kicked.len();
+            nk += f.kicked.len();
+            // The per-block `bump_eliminate` caps its OWN L+U; the file across
+            // blocks can still overrun the peel-order guard — bail to the
+            // slot-order retry, same contract as lane 1.
+            if self.etas.entries() > entry_cap {
+                return false;
+            }
+        }
+        if trace_enabled() {
+            eprintln!(
+                "AY_MILP_TRACE refactorize bump BTF: {nb} cols ({gathered} gathered nnz) -> {nblocks} blocks (largest {largest_block}), L {total_l} + U {total_u} = {} fill, {nk} kicked, {:.2}s",
+                total_l + total_u,
                 _t.elapsed().as_secs_f64()
             );
         }
@@ -5556,11 +6382,16 @@ impl Simplex {
     /// future model) abandons the build and falls back to the all-logical
     /// crash. Gated to `cols >= BIG_LP_COLS && m >= BIG_LP_ROWS` cold solves on the eta path
     /// (`AY_MILP_TRI_CRASH=1` forces it on small LPs for tests;
-    /// `AY_MILP_NO_TRI_CRASH` kills it) — the ladder/corpus band never sees
-    /// it, keeping their float paths and pace byte-identical.
+    /// `AY_MILP_NO_TRI_CRASH` kills it). The typed
+    /// `SolveOpts::with_range_logical_triangular_crash()` request, or the
+    /// historical exact `AY_MILP_RANGE_LOGICAL_CRASH=1` compatibility opt-in,
+    /// additionally admits a fully peeled equality block when bounded-range
+    /// rows are the majority, retaining those rows' logicals as the `-I`
+    /// lower-right block. The ladder/corpus band never sees either opt-in,
+    /// keeping their default float paths and pace byte-identical.
     ///
     /// Returns `true` if the crash basis was installed.
-    fn triangular_crash(&mut self, lp: &FloatLp) -> bool {
+    fn triangular_crash(&mut self, lp: &FloatLp, retain_range_logicals: bool) -> bool {
         /// Entries below this are not trusted as structure (denormal noise).
         const TINY: f64 = 1e-11;
         /// Forced diagonal pivots below this abort the build (fail-closed).
@@ -5579,7 +6410,7 @@ impl Simplex {
         }
         // Not an equality-chain model: peeling would place too little of the
         // basis to change the phase-1 regime; keep the all-logical start.
-        if neq * 2 < m {
+        if neq * 2 < m && !retain_range_logicals {
             if trace_enabled() {
                 eprintln!("AY_MILP_TRACE triangular crash declined: {neq}/{m} equality rows");
             }
@@ -5640,7 +6471,8 @@ impl Simplex {
                 }
             }
         }
-        if peel.len() * 2 < m {
+        let full_equality_peel = neq > 0 && peel.len() == neq;
+        if peel.len() * 2 < m && !(retain_range_logicals && full_equality_peel) {
             // Peel too shallow to be worth a heavier inverse. The depth is the
             // diagnostic: a conv/DAG block whose columns all touch several
             // equality rows never seeds the singleton queue, and the peel
@@ -5709,8 +6541,20 @@ impl Simplex {
         self.eta_nnz = self.etas.entries();
         self.since_refactor = 0;
         self.factor_live = true;
+        if retain_range_logicals {
+            self.range_logical_crash_installed = true;
+        }
         self.chain_gen = 0;
-        if trace_enabled() {
+        if trace_enabled() && retain_range_logicals {
+            eprintln!(
+                "AY_MILP_TRACE range-logical triangular crash: equality_rows={neq} \
+                 range_rows={} peeled={} retained_range_logicals={} eta_entries={}",
+                m - neq,
+                peel.len(),
+                m - neq,
+                self.etas.entries()
+            );
+        } else if trace_enabled() {
             eprintln!(
                 "AY_MILP_TRACE triangular crash: peeled {}/{neq} equality rows ({} eta entries)",
                 peel.len(),
@@ -5830,6 +6674,32 @@ impl Simplex {
             self.dual_perturb_active = false;
         }
         r
+    }
+
+    /// Recompute the dual ratio-test eligibility bitmask `rt_kind` from scratch
+    /// over every column: `0` = ineligible (basic OR nonbasic-free-at-zero), `1` =
+    /// nonbasic at lower bound, `2` = nonbasic at upper bound. Called once at the
+    /// top of `dual_simplex_inner` (before the pivot loop) so the incremental
+    /// maintenance at the flip/pivot commits starts from a correct snapshot; every
+    /// OTHER basis mutation (crash, warm-start, cold-dual, primal phase, refactor)
+    /// precedes the next dual entry and is therefore captured here. Pure function
+    /// of `basic_row` + `at`, so it exactly reproduces the 4-stream scan's filter.
+    fn rebuild_rt_kind(&mut self) {
+        let cols = self.cols;
+        if self.rt_kind.len() < cols {
+            self.rt_kind.resize(cols, 0);
+        }
+        for j in 0..cols {
+            self.rt_kind[j] = if self.basic_row[j].is_some() {
+                0
+            } else {
+                match self.at[j] {
+                    NbBound::Zero => 0,
+                    NbBound::Lower => 1,
+                    NbBound::Upper => 2,
+                }
+            };
+        }
     }
 
     /// Shape gate for the dual cost perturbation. TIGHT to the qiu class — the
@@ -5956,7 +6826,7 @@ impl Simplex {
             // speed changes; the chain exclusion is about not LOSING a proof to a
             // slowdown, not about soundness — every exit is post-checked either way).
             None if lp.tall_lu()
-                && !lp.chain_class()
+                && lp.bloom_relax_class()
                 && !no_bloom_relax()
                 && caller_tag() != CALLER_FLIP_LNS =>
             {
@@ -6097,6 +6967,19 @@ impl Simplex {
         let cutoff_on = self.cutoff.is_finite() && !no_cutoff();
         if anat {
             self.anat_z0 = self.dual_anat_z(lp);
+        }
+        // Seed the dual ratio-test eligibility bitmask from the fully-settled entry
+        // basis (all warm-start/crash/cold-dual/primal/entry-flip/perturbation
+        // mutations are behind us). The pivot loop maintains it incrementally at the
+        // flip and pivot commits, so this is the ONLY full recompute per dual entry.
+        let rt_kind_on = rt_kind_enabled();
+        let rt_kind_verify = rt_kind_verify_enabled();
+        // Maintain the bitmask whenever it is read (ON) or checked (VERIFY); when
+        // both are off the incremental writes are skipped so the kill-switch path
+        // is a true byte-for-byte baseline.
+        let rt_kind_maint = rt_kind_on || rt_kind_verify;
+        if rt_kind_maint {
+            self.rebuild_rt_kind();
         }
         for iter in 0..budget {
             // No pivot iteration may run once the factor has declined (fill over
@@ -6532,6 +7415,27 @@ impl Simplex {
                 // `kmin` — and the entering column — is identical: byte-identical stream.
                 let mut kmin = 0usize;
                 let mut rmin_track = f64::INFINITY;
+                if rt_kind_verify {
+                    // Ground-truth check: the incrementally-maintained bitmask must
+                    // equal a from-scratch recompute at every scan. O(cols)/pivot,
+                    // testing only — proves the flip/pivot commit updates never drift.
+                    let cols = self.cols;
+                    for j in 0..cols {
+                        let want = if self.basic_row[j].is_some() {
+                            0u8
+                        } else {
+                            match self.at[j] {
+                                NbBound::Zero => 0,
+                                NbBound::Lower => 1,
+                                NbBound::Upper => 2,
+                            }
+                        };
+                        assert_eq!(
+                            self.rt_kind[j], want,
+                            "rt_kind drift at col {j} (dual iter {iter})"
+                        );
+                    }
+                }
                 if rt_masked && !bland {
                     // MASKED / BRANCHLESS BUILD (A/B experiment). Pass 1 divides
                     // over ALL columns branch-free (vectorisable); pass 2 applies
@@ -6572,6 +7476,54 @@ impl Simplex {
                             continue;
                         }
                         let ratio = rt_ratio[j];
+                        if fused_rt && ratio < rmin_track {
+                            kmin = self.bp.len();
+                            rmin_track = ratio;
+                        }
+                        self.bp.push((ratio, j as u32));
+                    }
+                } else if rt_kind_on && !bland {
+                    // INCREMENTAL BITMASK BUILD (default). The basis-stable part of
+                    // the eligibility test — `basic_row[j].is_none() && at[j] != Zero`
+                    // and which bound the nonbasic column rests at — is pre-folded into
+                    // `rt_kind[j]` (`0` ineligible, `1` lower, `2` upper) and maintained
+                    // on basis change, so this pivot-hot scan reads ONE `u8` in place of
+                    // the 16-byte `basic_row` `Option` load + the `at` load + the 5-arm
+                    // match. The surviving per-column work — the `arow` magnitude gate,
+                    // the sign test, the `(d[j]/arow[j]).abs()` breakpoint, and the
+                    // first-minimal `kmin` fold — is BIT-IDENTICAL to the 4-stream build
+                    // below (same push set, same ascending-`j` order, same argmin), so
+                    // the pivot stream and every exact verdict are unchanged.
+                    let cols = self.cols;
+                    let arow = &self.arow[..cols];
+                    let d = &self.d[..cols];
+                    let rt_kind = &self.rt_kind[..cols];
+                    for j in 0..cols {
+                        let kind = rt_kind[j];
+                        if kind == 0 {
+                            continue;
+                        }
+                        let a = arow[j];
+                        if a.abs() <= pivot_tol {
+                            continue;
+                        }
+                        // kind==1 (lower): eligible iff (below ? a<0 : a>0);
+                        // kind==2 (upper): eligible iff (below ? a>0 : a<0).
+                        let eligible = if kind == 1 {
+                            if below {
+                                a < 0.0
+                            } else {
+                                a > 0.0
+                            }
+                        } else if below {
+                            a > 0.0
+                        } else {
+                            a < 0.0
+                        };
+                        if !eligible {
+                            continue;
+                        }
+                        let ratio = (d[j] / a).abs();
                         if fused_rt && ratio < rmin_track {
                             kmin = self.bp.len();
                             rmin_track = ratio;
@@ -7033,11 +7985,21 @@ impl Simplex {
                 }
                 for &ju in &self.flips {
                     let j = ju as usize;
-                    self.at[j] = match self.at[j] {
+                    let nb = match self.at[j] {
                         NbBound::Lower => NbBound::Upper,
                         NbBound::Upper => NbBound::Lower,
                         NbBound::Zero => NbBound::Zero,
                     };
+                    self.at[j] = nb;
+                    // A flipped column stays NONBASIC — mirror its new resting bound
+                    // into the eligibility bitmask (Lower->1, Upper->2, Zero->0).
+                    if rt_kind_maint {
+                        self.rt_kind[j] = match nb {
+                            NbBound::Lower => 1,
+                            NbBound::Upper => 2,
+                            NbBound::Zero => 0,
+                        };
+                    }
                 }
             }
             if let Some(t) = flipc_t0 {
@@ -7148,6 +8110,15 @@ impl Simplex {
             };
             self.basis[row] = col;
             self.basic_row[col] = Some(row);
+            // Incrementally track the ratio-test eligibility bitmask across the pivot:
+            // the LEAVER goes nonbasic at its violated bound (below -> Lower=1, else
+            // Upper=2), the ENTERING column becomes basic (=0). Every other column's
+            // eligibility is basis-invariant, so these two writes keep `rt_kind` a
+            // byte-exact mirror of `basic_row`/`at` for the next iteration's scan.
+            if rt_kind_maint {
+                self.rt_kind[leaving] = if below { 1 } else { 2 };
+                self.rt_kind[col] = 0;
+            }
             self.xb[row] = entering_value;
 
             // Forrest–Goldfarb: the leaving row's norm shrinks by the pivot square;
@@ -7480,8 +8451,13 @@ impl Simplex {
         &mut self,
         lp: &FloatLp,
         warm_started: bool,
+        warm_mode: WarmSolveMode,
         deadline: Option<std::time::Instant>,
     ) -> SimplexStatus {
+        debug_assert!(
+            warm_started || warm_mode == WarmSolveMode::Normal,
+            "direct-primal warm modes require an adopted warm basis"
+        );
         self.warm_run = warm_started;
         // Phase I, phase II, and then CHECK — because an optimum over an
         // infeasible point is not an optimum. On drift, refactorize (which
@@ -7496,7 +8472,16 @@ impl Simplex {
         // A warm basis is dual feasible, so try the dual simplex first. Its answer is
         // put through the SAME checks the primal's is — primal feasible AND priced out
         // — so a dual bug costs a slow node, never a wrong one.
-        if warm_started && !lp.warm_dual_should_attempt() {
+        if warm_started && warm_mode.continues_primal() {
+            // DIRECT PRIMAL: `warm_start` has already adopted and refactorized
+            // the prior basis under this narrower box. Continue its primal
+            // feasibility work directly. In particular, do not spend time on
+            // a transactional dual walk whose failure restores the very basis
+            // it started from. `PrimalAdvice` is setup-only;
+            // `PrimalProofContinuation` is admitted only where the caller
+            // applies the normal exact verdict gates.
+            self.recompute_xb(lp);
+        } else if warm_started && !lp.warm_dual_should_attempt() {
             // ADAPTIVE BYPASS (see `warm_dual_should_attempt`): the warm dual
             // keeps losing on this LP, so skip the doomed walk and hand the
             // warm basis straight to the primal — exactly the state the
@@ -8673,6 +9658,532 @@ impl Simplex {
             );
         }
         SimplexStatus::Stopped
+    }
+}
+
+#[cfg(test)]
+mod chain_distress_probe_tests {
+    use super::resolve_chain_distress_probe_iters;
+
+    #[test]
+    fn typed_chain_probe_budget_preempts_historical_policy() {
+        assert_eq!(
+            resolve_chain_distress_probe_iters(Some(321), || {
+                panic!("typed override must not consult the historical fallback")
+            }),
+            321
+        );
+    }
+
+    #[test]
+    fn typed_zero_disables_chain_probe_without_consulting_fallback() {
+        assert_eq!(
+            resolve_chain_distress_probe_iters(Some(0), || {
+                panic!("typed zero must not consult the historical fallback")
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn absent_chain_probe_override_preserves_historical_policy() {
+        assert_eq!(resolve_chain_distress_probe_iters(None, || 20_000), 20_000);
+    }
+}
+
+#[cfg(test)]
+mod warm_solve_mode_tests {
+    use super::*;
+    use num_rational::BigRational;
+
+    fn independent_warm_repairs(rows: usize) -> (Model, FloatLp, Vec<Col>, Vec<Col>) {
+        let mut model = Model::new();
+        let mut fixed = Vec::with_capacity(rows);
+        let mut objective_cols = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            let x = model.add_col(0.0, 1.0);
+            let z = model.add_col(0.0, 2.0);
+            model.add_row(0.0, f64::INFINITY, &[(z, 1.0), (x, -1.0)]);
+            fixed.push(x);
+            objective_cols.push(z);
+        }
+        let objective: Vec<_> = objective_cols.iter().map(|col| (col.0, 1.0)).collect();
+        let lp = FloatLp::from_model(&model, &objective, Sense::Minimize)
+            .expect("independent repair LP");
+        (model, lp, fixed, objective_cols)
+    }
+
+    fn fixed_box(lp: &FloatLp, fixed: &[Col]) -> (Vec<f64>, Vec<f64>) {
+        prefix_box(lp, fixed, fixed.len())
+    }
+
+    fn prefix_box(lp: &FloatLp, fixed: &[Col], fixed_count: usize) -> (Vec<f64>, Vec<f64>) {
+        let mut lower = lp.lower.clone();
+        let mut upper = lp.upper.clone();
+        for col in &fixed[..fixed_count] {
+            lower[col.index()] = 1.0;
+            upper[col.index()] = 1.0;
+        }
+        (lower, upper)
+    }
+
+    fn changed_basis_slots(before: &Candidate, after: &Candidate) -> usize {
+        before
+            .basis
+            .iter()
+            .zip(&after.basis)
+            .filter(|(left, right)| left != right)
+            .count()
+    }
+
+    fn assert_same_candidate(left: &Candidate, right: &Candidate) {
+        assert_eq!(left.status, right.status);
+        assert_eq!(left.basis, right.basis);
+        assert_eq!(left.at, right.at);
+        assert_eq!(
+            left.values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            right
+                .values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            left.duals
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            right
+                .duals
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            left.farkas
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            right
+                .farkas
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(left.farkas_verified, right.farkas_verified);
+    }
+
+    #[test]
+    fn capped_primal_advice_advances_and_reuses_a_stopped_basis() {
+        let (_, lp, fixed, objective_cols) = independent_warm_repairs(8);
+        let root = lp.solve(None);
+        assert_eq!(root.status, SimplexStatus::Optimal);
+        let (lower, upper) = fixed_box(&lp, &fixed);
+
+        let first = {
+            let _cap = IterCap::set(2);
+            lp.solve_bounded_with_mode(
+                &lower,
+                &upper,
+                Some((&root.basis, &root.at)),
+                WarmSolveMode::PrimalAdvice,
+                None,
+            )
+        };
+        assert_eq!(first.status, SimplexStatus::Stopped);
+        let first_progress = changed_basis_slots(&root, &first);
+        assert!(
+            first_progress > 0,
+            "the capped prefix must retain completed primal pivots"
+        );
+        assert_eq!(
+            lp.dual_adapt.get().0,
+            0,
+            "PrimalAdvice must not enter or score the warm-dual lane"
+        );
+
+        let second = {
+            let _cap = IterCap::set(2);
+            lp.solve_bounded_with_mode(
+                &lower,
+                &upper,
+                Some((&first.basis, &first.at)),
+                WarmSolveMode::PrimalAdvice,
+                None,
+            )
+        };
+        assert_eq!(second.status, SimplexStatus::Stopped);
+        assert!(
+            changed_basis_slots(&root, &second) > first_progress,
+            "the next cap must continue from, not replay, the first stopped basis"
+        );
+
+        let completed = lp.solve_bounded(&lower, &upper, Some((&second.basis, &second.at)), None);
+        assert_eq!(completed.status, SimplexStatus::Optimal);
+        for col in objective_cols {
+            assert!(
+                completed.values[col.index()] >= 1.0 - 1e-9,
+                "the proof-bearing normal solve must validate the carried basis"
+            );
+        }
+    }
+
+    #[test]
+    fn stopped_nested_prefix_continues_to_exact_verified_optimum_without_warm_dual() {
+        let (model, lp, fixed, _) = independent_warm_repairs(8);
+        let root = lp.solve(None);
+        assert_eq!(root.status, SimplexStatus::Optimal);
+
+        let (prefix_lower, prefix_upper) = prefix_box(&lp, &fixed, 4);
+        let prefix = {
+            let _cap = IterCap::set(2);
+            lp.solve_bounded_with_mode(
+                &prefix_lower,
+                &prefix_upper,
+                Some((&root.basis, &root.at)),
+                WarmSolveMode::PrimalAdvice,
+                None,
+            )
+        };
+        assert_eq!(prefix.status, SimplexStatus::Stopped);
+
+        let (lower, upper) = fixed_box(&lp, &fixed);
+        let completed = lp.solve_bounded_with_mode(
+            &lower,
+            &upper,
+            Some((&prefix.basis, &prefix.at)),
+            WarmSolveMode::PrimalProofContinuation,
+            None,
+        );
+        assert_eq!(completed.status, SimplexStatus::Optimal);
+        assert_eq!(
+            lp.dual_adapt.get().0,
+            0,
+            "advice plus proof continuation must make zero warm-dual entries"
+        );
+
+        let mut leaf_model = model;
+        for col in fixed {
+            leaf_model.fix_col(col, 1.0);
+        }
+        let certified =
+            crate::certify::certify_bounded(&leaf_model, &lp, &completed, &lower, &upper)
+                .expect("the continuation basis must be exactly optimal");
+        assert_eq!(
+            certified.value,
+            BigRational::from_integer(8.into()),
+            "all eight epigraph variables are exactly one"
+        );
+        certified
+            .cert
+            .verify(&leaf_model)
+            .expect("the exact optimality certificate must independently verify");
+    }
+
+    #[test]
+    fn stopped_nested_prefix_continues_to_exact_verified_infeasibility_without_warm_dual() {
+        let (mut model, _, fixed, objective_cols) = independent_warm_repairs(8);
+        let assignment_terms: Vec<_> = fixed.iter().map(|col| (*col, 1.0)).collect();
+        model.add_row(f64::NEG_INFINITY, 7.0, &assignment_terms);
+        let objective: Vec<_> = objective_cols.iter().map(|col| (col.0, 1.0)).collect();
+        let lp =
+            FloatLp::from_model(&model, &objective, Sense::Minimize).expect("infeasible leaf LP");
+        let root = lp.solve(None);
+        assert_eq!(root.status, SimplexStatus::Optimal);
+
+        let (prefix_lower, prefix_upper) = prefix_box(&lp, &fixed, 4);
+        let prefix = {
+            let _cap = IterCap::set(2);
+            lp.solve_bounded_with_mode(
+                &prefix_lower,
+                &prefix_upper,
+                Some((&root.basis, &root.at)),
+                WarmSolveMode::PrimalAdvice,
+                None,
+            )
+        };
+        assert_eq!(prefix.status, SimplexStatus::Stopped);
+
+        let (lower, upper) = fixed_box(&lp, &fixed);
+        let completed = lp.solve_bounded_with_mode(
+            &lower,
+            &upper,
+            Some((&prefix.basis, &prefix.at)),
+            WarmSolveMode::PrimalProofContinuation,
+            None,
+        );
+        assert_eq!(completed.status, SimplexStatus::PrimalInfeasible);
+        assert_eq!(
+            lp.dual_adapt.get().0,
+            0,
+            "infeasible proof continuation must also skip warm dual"
+        );
+
+        let mut leaf_model = model;
+        for col in fixed {
+            leaf_model.fix_col(col, 1.0);
+        }
+        let farkas = crate::tree_cert::exact_farkas_from_float_ray(&leaf_model, &completed.farkas)
+            .expect("the continuation ray must exactify");
+        farkas
+            .verify(&leaf_model)
+            .expect("the exact Farkas certificate must independently verify");
+    }
+
+    #[test]
+    fn default_wrapper_is_identical_to_explicit_normal_mode() {
+        let (_, default_lp, default_fixed, _) = independent_warm_repairs(8);
+        let (_, explicit_lp, explicit_fixed, _) = independent_warm_repairs(8);
+        let default_root = default_lp.solve(None);
+        let explicit_root = explicit_lp.solve(None);
+        assert_same_candidate(&default_root, &explicit_root);
+        let (default_lower, default_upper) = fixed_box(&default_lp, &default_fixed);
+        let (explicit_lower, explicit_upper) = fixed_box(&explicit_lp, &explicit_fixed);
+
+        let default = {
+            let _cap = IterCap::set(2);
+            default_lp.solve_bounded(
+                &default_lower,
+                &default_upper,
+                Some((&default_root.basis, &default_root.at)),
+                None,
+            )
+        };
+        let explicit = {
+            let _cap = IterCap::set(2);
+            explicit_lp.solve_bounded_with_mode(
+                &explicit_lower,
+                &explicit_upper,
+                Some((&explicit_root.basis, &explicit_root.at)),
+                WarmSolveMode::Normal,
+                None,
+            )
+        };
+        assert_same_candidate(&default, &explicit);
+        assert_eq!(default.status, SimplexStatus::Stopped);
+        assert_eq!(
+            default.basis, default_root.basis,
+            "the historical capped warm-dual failure remains transactional"
+        );
+        assert!(
+            default_lp.dual_adapt.get().0 > 0 && explicit_lp.dual_adapt.get().0 > 0,
+            "Normal mode must retain the historical warm-dual routing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod eager_affine_crash_tests {
+    use super::*;
+
+    #[test]
+    fn range_logical_crash_policy_defaults_off_and_explicit_request_turns_it_on() {
+        let (mut explicit, _, _) = range_row_model(1.0, 1.0);
+        let (default, _, _) = range_row_model(1.0, 1.0);
+
+        assert!(!default.range_logical_triangular_crash);
+        explicit.request_range_logical_triangular_crash();
+        assert!(explicit.range_logical_triangular_crash);
+    }
+
+    #[test]
+    fn range_logical_crash_env_exact_one_turns_it_on() {
+        assert!(range_logical_crash_env_value(Some("1")));
+    }
+
+    #[test]
+    fn range_logical_crash_malformed_env_values_stay_off() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("01"),
+            Some("true"),
+            Some("on"),
+        ] {
+            assert!(
+                !range_logical_crash_env_value(value),
+                "unexpected opt-in for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_range_logical_crash_request_does_not_bleed_between_lps() {
+        let (mut explicit, _, _) = range_row_model(1.0, 1.0);
+        let (plain, _, _) = range_row_model(1.0, 1.0);
+
+        explicit.request_range_logical_triangular_crash();
+
+        assert!(explicit.range_logical_triangular_crash);
+        assert!(
+            !plain.range_logical_triangular_crash,
+            "typed policy leaked to a separately lowered LP"
+        );
+
+        let mut sx = Simplex::new(&explicit, &explicit.lower, &explicit.upper);
+        assert!(sx.triangular_crash(&explicit, explicit.range_logical_triangular_crash));
+        assert!(sx.range_logical_crash_installed);
+    }
+
+    #[test]
+    fn advisory_is_instance_local_and_installs_a_small_chain_basis() {
+        // This two-column affine chain is deliberately far below the global
+        // big-LP gate.  Only the explicit per-instance advice licenses the
+        // immediate crash attempt.
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 1.0);
+        let z = model.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        model.add_row(0.0, 0.0, &[(z, 1.0), (x, -1.0)]);
+
+        let plain = FloatLp::from_model(&model, &[(z.0, 1.0)], Sense::Minimize).expect("plain LP");
+        assert!(plain.cols < BIG_LP_COLS && plain.m < BIG_LP_ROWS);
+        assert!(!plain.eager_affine_crash);
+
+        let mut advised =
+            FloatLp::from_model(&model, &[(z.0, 1.0)], Sense::Minimize).expect("advised LP");
+        advised.request_eager_affine_crash();
+        assert!(advised.eager_affine_crash);
+        assert!(!plain.eager_affine_crash, "advice leaked to another LP");
+
+        let mut sx = Simplex::new(&advised, &advised.lower, &advised.upper);
+        assert!(sx.triangular_crash(&advised, false));
+        assert_eq!(sx.basis, vec![x.index()]);
+    }
+
+    fn range_row_model(first_pivot: f64, second_pivot: f64) -> (FloatLp, Col, Col) {
+        let mut model = Model::new();
+        let z0 = model.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        let z1 = model.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        model.add_row(0.0, 0.0, &[(z0, first_pivot)]);
+        model.add_row(0.0, 0.0, &[(z1, second_pivot), (z0, -1.0)]);
+        // Every non-equality row sees both peeled outputs, so the installed
+        // block has a genuine nonzero B_RE below its equality triangle.
+        model.add_row(-2.0, 2.0, &[(z0, 1.0), (z1, 1.0)]);
+        model.add_row(-3.0, 3.0, &[(z0, 2.0), (z1, -1.0)]);
+        model.add_row(-4.0, 4.0, &[(z0, -1.0), (z1, 2.0)]);
+        let lp =
+            FloatLp::from_model(&model, &[(z1.0, 1.0)], Sense::Minimize).expect("range-row LP");
+        (lp, z0, z1)
+    }
+
+    #[test]
+    fn range_logical_policy_installs_the_block_basis_only_after_full_equality_peel() {
+        let (lp, z0, z1) = range_row_model(1.0, 1.0);
+        assert_eq!(lp.m, 5);
+
+        let mut ordinary = Simplex::new(&lp, &lp.lower, &lp.upper);
+        assert!(
+            !ordinary.triangular_crash(&lp, false),
+            "two equality rows remain below the historical half-row gate"
+        );
+        assert_eq!(ordinary.basis, (lp.n..lp.n + lp.m).collect::<Vec<_>>());
+        assert_eq!(ordinary.etas.entries(), 0);
+
+        let mut range = Simplex::new(&lp, &lp.lower, &lp.upper);
+        assert!(range.triangular_crash(&lp, true));
+        assert_eq!(
+            range.basis,
+            vec![z0.index(), z1.index(), lp.n + 2, lp.n + 3, lp.n + 4]
+        );
+        assert!(
+            range.etas.entries() > 0,
+            "range-row spill must materialize the nonzero B_RE block"
+        );
+        for row in 2..lp.m {
+            let logical = lp.n + row;
+            assert_eq!(range.basic_row[logical], Some(row));
+            assert_eq!(range.basis[row], logical);
+        }
+
+        // The installed eta operator must map every basis column to the unit
+        // vector of its assigned row, including all retained range logicals.
+        for row in 0..lp.m {
+            let col = range.basis[row];
+            range.ftran(&lp, col);
+            for (i, &value) in range.alpha.iter().enumerate() {
+                let expected = if i == row { 1.0 } else { 0.0 };
+                assert!(
+                    (value - expected).abs() <= 1e-12,
+                    "basis col {col} row {i}: {value}, expected {expected}"
+                );
+            }
+            for &i in &range.nz {
+                range.alpha[i] = 0.0;
+            }
+            range.nz.clear();
+        }
+
+        // The sticky per-LP policy must also make the first later rebuild use
+        // a valid operator for the same block basis.
+        assert!(range.range_logical_crash_installed);
+        range.refactorize(&lp);
+        for row in 2..lp.m {
+            let logical = lp.n + row;
+            assert_eq!(range.basic_row[logical], Some(row));
+            assert_eq!(range.basis[row], logical);
+        }
+        for row in 0..lp.m {
+            let col = range.basis[row];
+            range.ftran(&lp, col);
+            for (i, &value) in range.alpha.iter().enumerate() {
+                let expected = if i == row { 1.0 } else { 0.0 };
+                assert!(
+                    (value - expected).abs() <= 1e-12,
+                    "post-refactor basis col {col} row {i}: {value}, expected {expected}"
+                );
+            }
+            for &i in &range.nz {
+                range.alpha[i] = 0.0;
+            }
+            range.nz.clear();
+        }
+    }
+
+    #[test]
+    fn range_logical_policy_declines_an_incomplete_equality_peel_untouched() {
+        let mut model = Model::new();
+        let z = model.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        model.add_row(0.0, 0.0, &[(z, 1.0)]);
+        // A redundant empty equality has no admissible structural pivot.  The
+        // first equality peels, but the full-equality guard must reject the
+        // proposed mixed block basis.
+        model.add_row(0.0, 0.0, &[]);
+        model.add_row(-2.0, 2.0, &[(z, 1.0)]);
+        model.add_row(-3.0, 3.0, &[(z, -1.0)]);
+        model.add_row(-4.0, 4.0, &[(z, 2.0)]);
+        let lp =
+            FloatLp::from_model(&model, &[(z.0, 1.0)], Sense::Minimize).expect("partial-peel LP");
+        assert_eq!(lp.m, 5);
+
+        let mut sx = Simplex::new(&lp, &lp.lower, &lp.upper);
+        assert!(!sx.triangular_crash(&lp, true));
+        assert!(!sx.range_logical_crash_installed);
+        assert_eq!(sx.basis, (lp.n..lp.n + lp.m).collect::<Vec<_>>());
+        assert_eq!(sx.etas.entries(), 0);
+        assert_eq!(sx.eta_nnz, 0);
+        for row in 0..lp.m {
+            assert_eq!(sx.basic_row[lp.n + row], Some(row));
+        }
+    }
+
+    #[test]
+    fn range_logical_policy_rolls_back_a_tiny_equality_pivot() {
+        // Reversed peel order installs z0 first, then encounters z1's tiny
+        // pivot. Rollback must therefore undo an already-installed structural
+        // basis column and eta, not merely reject before the first mutation.
+        let (lp, _, _) = range_row_model(1.0, 1e-8);
+        let mut sx = Simplex::new(&lp, &lp.lower, &lp.upper);
+        assert!(!sx.triangular_crash(&lp, true));
+        assert_eq!(sx.basis, (lp.n..lp.n + lp.m).collect::<Vec<_>>());
+        assert_eq!(sx.etas.entries(), 0);
+        assert_eq!(sx.eta_nnz, 0);
+        for row in 0..lp.m {
+            assert_eq!(sx.basic_row[lp.n + row], Some(row));
+        }
     }
 }
 

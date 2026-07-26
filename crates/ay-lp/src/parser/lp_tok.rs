@@ -225,7 +225,14 @@ fn read_number(bytes: &[u8], line: usize) -> Result<(f64, usize), LpError> {
         line,
         raw: raw.to_string(),
     })?;
-    Ok((parsed, j))
+    if parsed.is_finite() {
+        Ok((parsed, j))
+    } else {
+        Err(LpError::InvalidNumber {
+            line,
+            raw: raw.to_string(),
+        })
+    }
 }
 
 fn is_name_start(c: u8) -> bool {

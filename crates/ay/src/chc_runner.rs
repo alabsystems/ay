@@ -1624,7 +1624,7 @@ pub(crate) fn run_chc_from_content(
     validate: bool,
     stats_cfg: stats_output::StatsConfig,
     proof_config: Option<&ProofConfig>,
-) {
+) -> Option<String> {
     use ay::chc::{AdaptiveConfig, AdaptivePortfolio, ChcParser, VerifiedChcResult};
 
     validate_chc_proof_request(proof_config);
@@ -1639,11 +1639,11 @@ pub(crate) fn run_chc_from_content(
                 format_args!("parse error: {error}"),
                 "chc parse error",
             );
-            return;
+            return None;
         }
         Err(error) => {
             emit_chc_fail_closed_unknown(stats_cfg, false, error, "chc parser panic");
-            return;
+            return None;
         }
     };
 
@@ -1717,7 +1717,7 @@ pub(crate) fn run_chc_from_content(
                     num_clauses,
                 );
             }
-            return;
+            return None;
         }
     }
 
@@ -1732,7 +1732,7 @@ pub(crate) fn run_chc_from_content(
                 error,
                 "chc portfolio initialization panic",
             );
-            return;
+            return None;
         }
     };
 
@@ -1755,7 +1755,7 @@ pub(crate) fn run_chc_from_content(
                 error,
                 "chc solver panic",
             );
-            return;
+            return None;
         }
     };
     let proof_run = ChcPdrProofRun::new(solver.problem(), result.clone(), "portfolio");
@@ -1769,6 +1769,7 @@ pub(crate) fn run_chc_from_content(
 
     let mut replay_artifacts = ChcCliReplayArtifacts::default();
     let mut settled_stats_evidence = None;
+    let mut emitted_spacer_model = None;
     let result_str = match catch_chc_boundary("emit CHC result", || match &result {
         // SOUNDNESS discharge gate: demote an unverified SAFE to unknown rather
         // than print a false-SAFE (the portfolio occasionally returns a Safe
@@ -1840,6 +1841,7 @@ pub(crate) fn run_chc_from_content(
                         ChcStatsSettlement::Ready(evidence) => {
                             settled_stats_evidence = evidence;
                             let spacer_model = inv.model().to_spacer_format(solver.problem());
+                            emitted_spacer_model = Some(spacer_model.clone());
                             emit_safe_chc_stdout(
                                 safe_str,
                                 &cert,
@@ -1932,7 +1934,7 @@ pub(crate) fn run_chc_from_content(
                 error,
                 "chc result emission panic",
             );
-            return;
+            return None;
         }
     };
     // Evidence was fully constructed and revalidated before any definitive
@@ -1957,6 +1959,7 @@ pub(crate) fn run_chc_from_content(
             num_clauses,
         );
     }
+    emitted_spacer_model
 }
 
 /// Run portfolio CHC solver on a file

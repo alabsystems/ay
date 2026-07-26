@@ -225,7 +225,10 @@ fn make_deep_conjunction(depth: usize) -> ChcExpr {
     let x = ChcVar::new("x", ChcSort::Int);
     let mut expr = ChcExpr::gt(ChcExpr::var(x), ChcExpr::int(0));
     for _ in 0..depth {
-        expr = ChcExpr::and(expr.clone(), expr);
+        // Keep an exponentially large occurrence graph without routing it
+        // through canonical conjunction deduplication or the simplifier's
+        // reflexive-equality fold.
+        expr = ChcExpr::eq(expr.clone(), ChcExpr::not(expr));
     }
     expr
 }

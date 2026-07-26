@@ -2,30 +2,39 @@
 // Author: Andrew Yates
 // Licensed under the Apache License, Version 2.0
 
-//! Regression: nested array-of-array read-over-write wrong-SAT (QF_AUFNIA).
+//! Regression + capability: nested array-of-array read-over-write (QF_AUFNIA).
 //!
 //! Minimized from the SV-COMP `s3_srvr.blast.07/10` UltimateAutomizer scripts
-//! (`benchmarks/smtlib-all/QF_AUFNIA/...`) which AY certified `sat` — in DEFAULT
-//! mode AND under `ay solve --self-check` — while z3 4.16 and each file's own
-//! `(set-info :status unsat)` say UNSAT. THE CARDINAL FAILURE: a wrong `sat`
-//! passing AY's own fail-closed self-check gate.
+//! (`benchmarks/smtlib-all/QF_AUFNIA/...`) which AY once certified `sat` — in
+//! DEFAULT mode AND under `ay solve --self-check` — while z3 4.16 and each
+//! file's own `(set-info :status unsat)` say UNSAT (the original wrong-SAT).
 //!
-//! Mechanism: the model evaluator's `evaluate_select` could not reduce a
-//! NESTED array-valued select — `(select (select m b) o)` over a two-level
-//! memory `(Array Int (Array Int Int))`. It treated the inner `(select m b)`
-//! as an opaque base, returned `Unknown`, and the caller's LIA-model fallback
-//! (mod.rs, "in AUFLIA the LIA solver treats select terms as opaque variables")
-//! then laundered the arithmetic solver's UNCONSTRAINED value for a read that
-//! the store structure actually FORCES. The strict oracle never observed the
-//! contradiction, so the internally-inconsistent model escaped as a wrong SAT.
+//! Two layers protect this family, exercised here:
 //!
-//! Fix: `evaluate_select` now resolves an array-valued nested select to the
-//! concrete inner-array term it denotes (exact ROW1/ROW2 peeling through
-//! store chains and array-variable definitions), so the forced value is
-//! recomputed and the inconsistent candidate model is rejected (verdict
-//! degrades to a sound `unknown`).
+//!  1. SOUNDNESS FLOOR (unchanged, commit 0fd51aa7dd + the
+//!     `quarantine_unverified_nested_array_unsat` boundary): the lazy array +
+//!     arithmetic combination cannot be trusted on `(Array Int (Array Int Int))`,
+//!     so a nested read must NEVER be certified `sat` when the store structure
+//!     forces a contradicting value, and an UNVERIFIED nested-array UNSAT is
+//!     fail-closed to `unknown`.
 //!
-//! These must NEVER return `sat` again.
+//!  2. CAPABILITY (this change, `try_ufnia_store_flat_row_refutation` in
+//!     `combined/mod.rs`): `solve_uf_nia` (QF_AUFNIA) has no dedicated array
+//!     theory, so read-over-write through a NAMED array variable
+//!     (`(= M1 (store M0 …))`) was never propagated and a determined UNSAT came
+//!     back `unknown`. The rescue inlines each single-definition `var = store(…)`
+//!     (equisatisfiable) and lets exact `select(store(a,i,v),i)=v` rewriting fold
+//!     the nested read-over-write chains to their forced values. When EVERY array
+//!     term folds away, the sound NIA solver refutes the pure-arithmetic residue
+//!     — an authoritative, array-combination-free UNSAT that is exempt from the
+//!     quarantine. Shapes whose reads collapse only under a case split on
+//!     symbolic index equalities stay a sound `unknown`.
+//!
+//! DEFAULT-mode `unsat` is the bar for the fully-collapsing shapes; `--self-check`
+//! may still report `unknown` until the proof lane certifies the residue.
+//!
+//! No shape here may EVER return `sat` (soundness), and no SAT-direction shape
+//! may EVER return `unsat` (no over-refutation).
 
 fn assert_not_sat(label: &str, smt: &str) {
     let output = crate::common::solve(smt);
@@ -41,11 +50,42 @@ fn assert_not_sat(label: &str, smt: &str) {
     );
 }
 
-/// The smallest fragment that still wrong-SATs: one nested store, one nested
-/// read. `m1[b][o] = 8448`, then `x <= m1[b][o]` with `x >= 8640` is UNSAT
-/// because the read is forced to 8448 < 8640.
+/// The fully-collapsing shapes MUST now be refuted: the read-over-write chain
+/// folds to a concrete value (no case split needed), so `unknown` is no longer
+/// acceptable — DEFAULT-mode `unsat` is required.
+fn assert_unsat(label: &str, smt: &str) {
+    let output = crate::common::solve(smt);
+    let verdict = crate::common::sat_result(&output).unwrap_or("<none>");
+    assert_eq!(
+        verdict, "unsat",
+        "{label}: read-over-write forces the nested read to a value the bound \
+         rules out — AY must derive unsat via the store-flat ROW reduction; \
+         got {verdict:?}\n{output}"
+    );
+}
+
+/// THE minimized wrong-SAT reproducer, verbatim (`.claude/wrongsat_min.smt2`):
+/// constant outer/inner keys `0`, so `select(select(M1,0),0)` folds by exact
+/// ROW1 to `8448`, contradicting `>= 8640`. This is the shape that MUST become
+/// `unsat` in default mode.
 #[test]
-fn nested_array_row_single_store_is_not_sat() {
+fn nested_array_row_minimized_repro_is_unsat() {
+    let smt = r#"
+        (set-logic QF_AUFNIA)
+        (declare-fun M0 () (Array Int (Array Int Int)))
+        (declare-fun M1 () (Array Int (Array Int Int)))
+        (assert (= M1 (store M0 0 (store (select M0 0) 0 8448))))
+        (assert (>= (select (select M1 0) 0) 8640))
+        (check-sat)
+    "#;
+    assert_unsat("minimized nested ROW repro", smt);
+}
+
+/// The smallest symbolic fragment: one nested store, one nested read at the
+/// SAME (symbolic) keys. `m1[b][o] = 8448`, then `x <= m1[b][o]` with
+/// `x >= 8640` is UNSAT because the read folds (ROW1, key-identical) to 8448.
+#[test]
+fn nested_array_row_single_store_is_unsat() {
     let smt = r#"
         (set-logic QF_AUFNIA)
         (declare-fun m0 () (Array Int (Array Int Int)))
@@ -58,7 +98,7 @@ fn nested_array_row_single_store_is_not_sat() {
         (assert (>= x 8640))
         (check-sat)
     "#;
-    assert_not_sat("single-store nested ROW", smt);
+    assert_unsat("single-store nested ROW", smt);
 }
 
 /// Two nested stores at the same base with a shadowing overwrite at a

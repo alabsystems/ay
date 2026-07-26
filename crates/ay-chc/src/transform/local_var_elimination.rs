@@ -11,6 +11,7 @@
 
 use crate::{ChcExpr, ChcOp, ChcProblem, ChcVar, ClauseBody, HornClause};
 use ay_core::kani_compat::DetHashSet as FxHashSet;
+use num_bigint::BigInt;
 
 use super::{
     MemoryBackTranslator, TransformMemoryReport, TransformObligation, TransformationResult,
@@ -38,11 +39,16 @@ impl LocalVarEliminator {
     }
 
     pub(crate) fn eliminate(&self, problem: &ChcProblem) -> ChcProblem {
+        self.eliminate_with_index_map(problem).0
+    }
+
+    fn eliminate_with_index_map(&self, problem: &ChcProblem) -> (ChcProblem, Vec<usize>) {
         let mut total_eliminated = 0;
         let mut clauses_modified = 0;
         let mut new_clauses = Vec::with_capacity(problem.clauses().len());
+        let mut output_to_input = Vec::with_capacity(problem.clauses().len());
 
-        for clause in problem.clauses() {
+        for (input_index, clause) in problem.clauses().iter().enumerate() {
             let (new_clause, eliminated) = self.eliminate_in_clause(clause);
             if eliminated > 0 {
                 total_eliminated += eliminated;
@@ -50,6 +56,7 @@ impl LocalVarEliminator {
             }
             if !is_trivially_false(&new_clause) {
                 new_clauses.push(new_clause);
+                output_to_input.push(input_index);
             }
         }
 
@@ -68,7 +75,7 @@ impl LocalVarEliminator {
         for clause in new_clauses {
             new_problem.add_clause(clause);
         }
-        new_problem
+        (new_problem, output_to_input)
     }
 
     fn eliminate_in_clause(&self, clause: &HornClause) -> (HornClause, usize) {
@@ -112,6 +119,9 @@ impl LocalVarEliminator {
         if let Some(result) = self.try_equality_substitution(constraint, var) {
             return Some(result);
         }
+        if let Some(result) = self.try_constant_interval_elimination(constraint, var) {
+            return Some(result);
+        }
         self.try_one_sided_bound_elimination(constraint, var)
     }
 
@@ -134,6 +144,59 @@ impl LocalVarEliminator {
             }
         }
         None
+    }
+
+    fn try_constant_interval_elimination(
+        &self,
+        constraint: &ChcExpr,
+        var: &ChcVar,
+    ) -> Option<ChcExpr> {
+        if !matches!(&var.sort, crate::ChcSort::Int) {
+            return None;
+        }
+
+        let conjuncts = {
+            let mut c = constraint.collect_conjuncts();
+            c.retain(|x| !matches!(x, ChcExpr::Bool(true)));
+            c
+        };
+        let mut lower: Option<BigInt> = None;
+        let mut upper: Option<BigInt> = None;
+        let mut found_bound = false;
+
+        for conj in &conjuncts {
+            if !conjunct_mentions_var(conj, var) {
+                continue;
+            }
+            found_bound = true;
+            match classify_constant_int_bound(conj, var)? {
+                ConstantIntBound::Lower(value) => {
+                    lower = Some(match lower.take() {
+                        Some(current) => current.max(value),
+                        None => value,
+                    });
+                }
+                ConstantIntBound::Upper(value) => {
+                    upper = Some(match upper.take() {
+                        Some(current) => current.min(value),
+                        None => value,
+                    });
+                }
+            }
+        }
+
+        if !found_bound {
+            return None;
+        }
+        if matches!((lower, upper), (Some(lower), Some(upper)) if lower > upper) {
+            return Some(ChcExpr::Bool(false));
+        }
+
+        Some(ChcExpr::and_all(
+            conjuncts
+                .into_iter()
+                .filter(|conj| !conjunct_mentions_var(conj, var)),
+        ))
     }
 
     fn try_one_sided_bound_elimination(
@@ -176,8 +239,9 @@ impl LocalVarEliminator {
 
 impl Transformer for LocalVarEliminator {
     fn transform(self: Box<Self>, problem: ChcProblem) -> TransformationResult {
+        let (transformed, output_to_input) = self.eliminate_with_index_map(&problem);
         TransformationResult {
-            problem: self.eliminate(&problem),
+            problem: transformed,
             back_translator: Box::new(
                 MemoryBackTranslator::new(
                     TransformMemoryReport::with_original_validation_obligations(
@@ -189,7 +253,11 @@ impl Transformer for LocalVarEliminator {
                         ],
                     ),
                 )
-                .with_ground_input("local-var-elimination", &problem),
+                .with_ground_index_map(
+                    "local-var-elimination",
+                    &problem,
+                    output_to_input,
+                ),
             ),
         }
     }
@@ -230,6 +298,72 @@ fn extract_equality_for_var(conj: &ChcExpr, var: &ChcVar) -> Option<ChcExpr> {
 
 fn conjunct_mentions_var(conj: &ChcExpr, var: &ChcVar) -> bool {
     conj.vars().contains(var)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConstantIntBound {
+    Lower(BigInt),
+    Upper(BigInt),
+}
+
+fn classify_constant_int_bound(conj: &ChcExpr, var: &ChcVar) -> Option<ConstantIntBound> {
+    let ChcExpr::Op(op @ (ChcOp::Le | ChcOp::Lt | ChcOp::Ge | ChcOp::Gt), args) = conj else {
+        return None;
+    };
+    if args.len() != 2 {
+        return None;
+    }
+
+    let (var_on_lhs, constant_expr) = match (args[0].as_ref(), args[1].as_ref()) {
+        (ChcExpr::Var(candidate), constant) if candidate == var => (true, constant),
+        (constant, ChcExpr::Var(candidate)) if candidate == var => (false, constant),
+        _ => return None,
+    };
+    let mut constant = eval_ground_int_constant(constant_expr)?;
+    let strict = matches!(*op, ChcOp::Gt | ChcOp::Lt);
+    let lower = matches!(
+        (*op, var_on_lhs),
+        (ChcOp::Ge | ChcOp::Gt, true) | (ChcOp::Le | ChcOp::Lt, false)
+    );
+    if strict {
+        if lower {
+            constant += 1;
+        } else {
+            constant -= 1;
+        }
+    }
+
+    Some(if lower {
+        ConstantIntBound::Lower(constant)
+    } else {
+        ConstantIntBound::Upper(constant)
+    })
+}
+
+fn eval_ground_int_constant(expr: &ChcExpr) -> Option<BigInt> {
+    crate::expr::maybe_grow_expr_stack(|| match expr {
+        ChcExpr::Int(value) => Some(BigInt::from(*value)),
+        ChcExpr::Op(ChcOp::Neg, args) if args.len() == 1 => {
+            Some(-eval_ground_int_constant(&args[0])?)
+        }
+        ChcExpr::Op(ChcOp::Add, args) if !args.is_empty() => {
+            let mut args = args.iter();
+            let mut value = eval_ground_int_constant(args.next()?)?;
+            for arg in args {
+                value += eval_ground_int_constant(arg)?;
+            }
+            Some(value)
+        }
+        ChcExpr::Op(ChcOp::Mul, args) if !args.is_empty() => {
+            let mut args = args.iter();
+            let mut value = eval_ground_int_constant(args.next()?)?;
+            for arg in args {
+                value *= eval_ground_int_constant(arg)?;
+            }
+            Some(value)
+        }
+        _ => None,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

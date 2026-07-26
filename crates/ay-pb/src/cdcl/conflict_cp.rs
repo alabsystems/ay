@@ -9,6 +9,7 @@
 
 use super::*;
 use crate::cutting_planes::{add_coeff, gcd_i64, lcm_i64, negate_lit, CpConstraint};
+#[cfg(debug_assertions)]
 use crate::types::PbConstraint;
 
 impl PbCdclSolver {

@@ -78,11 +78,28 @@ const WIDENING_THRESHOLD: u32 = 5;
 /// convergence in practice).
 const MAX_FIXPOINT_ROUNDS: usize = 64;
 
+/// Standard post-widening narrowing rounds.
+///
+/// Widening deliberately forgets a moving bound after a few iterations. A
+/// guarded bounded loop can therefore lose its final finite upper bound just
+/// before convergence (for example `x = 0; x < 6; x++`). Narrowing intersects
+/// the widened post-fixpoint with its abstract one-step image and recovers
+/// bounds implied by stable guards. Every recovered candidate still passes
+/// the existing per-clause inductiveness check before it is used.
+const MAX_NARROWING_ROUNDS: usize = 8;
+
 /// Per-SMT-query timeout for invariant verification / mod discharge.
 const QUERY_TIMEOUT: Duration = Duration::from_millis(600);
 
 /// Total wall budget for the whole pass (analysis + SMT checks).
 const PASS_BUDGET: Duration = Duration::from_secs(8);
+
+/// Deterministic work cap in addition to the wall-clock deadline.
+///
+/// Deadline checks happen at every abstract-expression, atom, argument, and
+/// clause step. The fuel cap is a second fail-closed guard for clocks with
+/// coarse resolution and makes exhaustion behavior deterministic in tests.
+const PASS_WORK_BUDGET: usize = 1_000_000;
 
 /// Skip the pass on systems larger than this (SMT cost scales with clauses).
 const MAX_CLAUSES: usize = 300;
@@ -90,6 +107,37 @@ const MAX_CLAUSES: usize = 300;
 /// Iterations of the collect-check-rewrite loop per clause (nested mods
 /// become dischargeable only after their inner casts are discharged).
 const MAX_REWRITE_ROUNDS: usize = 3;
+
+/// Shared, monotonically decreasing budget for every phase of one pass.
+struct PassBudget {
+    deadline: Instant,
+    work_remaining: usize,
+}
+
+impl PassBudget {
+    fn new(deadline: Instant, work_remaining: usize) -> Self {
+        Self {
+            deadline,
+            work_remaining,
+        }
+    }
+
+    /// Charge one bounded unit and reject work once either limit is spent.
+    fn checkpoint(&mut self) -> Option<()> {
+        if self.work_remaining == 0 || Instant::now() >= self.deadline {
+            return None;
+        }
+        self.work_remaining -= 1;
+        Some(())
+    }
+
+    /// Remaining timeout for one external solver call.
+    fn timeout(&mut self, cap: Duration) -> Option<Duration> {
+        self.checkpoint()?;
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        (!remaining.is_zero()).then_some(cap.min(remaining))
+    }
+}
 
 // ── Interval domain ────────────────────────────────────────────────────────
 
@@ -223,23 +271,57 @@ fn opt_sub(a: &Option<BigInt>, b: &Option<BigInt>) -> Option<BigInt> {
 
 /// Fold a constant integer expression (including the `2^32 * 2^(w-32)` pow2
 /// trees that `bv_to_int::ops::int_pow2` emits) into a `BigInt`.
-fn const_bigint(expr: &ChcExpr) -> Option<BigInt> {
-    match expr {
+///
+/// The outer `Option` is budget exhaustion; the inner one is "not constant".
+fn const_bigint_budgeted(expr: &ChcExpr, budget: &mut PassBudget) -> Option<Option<BigInt>> {
+    budget.checkpoint()?;
+    let value = match expr {
         ChcExpr::Int(v) => Some(BigInt::from(*v)),
-        ChcExpr::Op(ChcOp::Add, args) => args
-            .iter()
-            .try_fold(BigInt::zero(), |acc, a| Some(acc + const_bigint(a)?)),
+        ChcExpr::Op(ChcOp::Add, args) => {
+            let mut result = BigInt::zero();
+            for arg in args {
+                let Some(value) = const_bigint_budgeted(arg, budget)? else {
+                    return Some(None);
+                };
+                result += value;
+            }
+            Some(result)
+        }
         ChcExpr::Op(ChcOp::Sub, args) if !args.is_empty() => {
             let mut it = args.iter();
-            let first = const_bigint(it.next()?)?;
-            it.try_fold(first, |acc, a| Some(acc - const_bigint(a)?))
+            let Some(mut result) = const_bigint_budgeted(it.next()?, budget)? else {
+                return Some(None);
+            };
+            for arg in it {
+                let Some(value) = const_bigint_budgeted(arg, budget)? else {
+                    return Some(None);
+                };
+                result -= value;
+            }
+            Some(result)
         }
-        ChcExpr::Op(ChcOp::Mul, args) => args
-            .iter()
-            .try_fold(BigInt::one(), |acc, a| Some(acc * const_bigint(a)?)),
-        ChcExpr::Op(ChcOp::Neg, args) if args.len() == 1 => Some(-const_bigint(&args[0])?),
+        ChcExpr::Op(ChcOp::Mul, args) => {
+            let mut result = BigInt::one();
+            for arg in args {
+                let Some(value) = const_bigint_budgeted(arg, budget)? else {
+                    return Some(None);
+                };
+                result *= value;
+            }
+            Some(result)
+        }
+        ChcExpr::Op(ChcOp::Neg, args) if args.len() == 1 => {
+            const_bigint_budgeted(&args[0], budget)?.map(|value| -value)
+        }
         _ => None,
-    }
+    };
+    Some(value)
+}
+
+#[cfg(test)]
+fn const_bigint(expr: &ChcExpr) -> Option<BigInt> {
+    let mut budget = PassBudget::new(Instant::now() + Duration::from_secs(1), PASS_WORK_BUDGET);
+    const_bigint_budgeted(expr, &mut budget).flatten()
 }
 
 // ── Per-clause environment ─────────────────────────────────────────────────
@@ -252,50 +334,67 @@ fn env_interval(env: &VarEnv, v: &ChcVar) -> Interval {
 }
 
 /// Evaluate an integer expression to an interval under `env`.
-fn eval_interval(expr: &ChcExpr, env: &VarEnv) -> Interval {
-    if let Some(c) = const_bigint(expr) {
-        return Interval::constant(c);
+fn eval_interval(expr: &ChcExpr, env: &VarEnv, budget: &mut PassBudget) -> Option<Interval> {
+    budget.checkpoint()?;
+    if let Some(c) = const_bigint_budgeted(expr, budget)? {
+        return Some(Interval::constant(c));
     }
-    match expr {
+    let interval = match expr {
         ChcExpr::Var(v) => env_interval(env, v),
         ChcExpr::Op(op, args) => match op {
-            ChcOp::Add => args
-                .iter()
-                .map(|a| eval_interval(a, env))
-                .reduce(|a, b| a.add(&b))
-                .unwrap_or_else(Interval::top),
-            ChcOp::Sub if !args.is_empty() => {
-                let mut it = args.iter().map(|a| eval_interval(a, env));
-                let first = it.next().expect("non-empty");
-                it.fold(first, |acc, b| acc.sub(&b))
+            ChcOp::Add => {
+                let mut result: Option<Interval> = None;
+                for arg in args {
+                    let incoming = eval_interval(arg, env, budget)?;
+                    result = Some(match result {
+                        Some(current) => current.add(&incoming),
+                        None => incoming,
+                    });
+                }
+                result.unwrap_or_else(Interval::top)
             }
-            ChcOp::Neg if args.len() == 1 => eval_interval(&args[0], env).neg(),
-            ChcOp::Mul => args
-                .iter()
-                .map(|a| eval_interval(a, env))
-                .reduce(|a, b| a.mul(&b))
-                .unwrap_or_else(Interval::top),
-            ChcOp::Mod if args.len() == 2 => match const_bigint(&args[1]) {
+            ChcOp::Sub if !args.is_empty() => {
+                let mut it = args.iter();
+                let mut result = eval_interval(it.next().expect("non-empty"), env, budget)?;
+                for arg in it {
+                    result = result.sub(&eval_interval(arg, env, budget)?);
+                }
+                result
+            }
+            ChcOp::Neg if args.len() == 1 => eval_interval(&args[0], env, budget)?.neg(),
+            ChcOp::Mul => {
+                let mut result: Option<Interval> = None;
+                for arg in args {
+                    let incoming = eval_interval(arg, env, budget)?;
+                    result = Some(match result {
+                        Some(current) => current.mul(&incoming),
+                        None => incoming,
+                    });
+                }
+                result.unwrap_or_else(Interval::top)
+            }
+            ChcOp::Mod if args.len() == 2 => match const_bigint_budgeted(&args[1], budget)? {
                 Some(m) if m.sign() == num_bigint::Sign::Plus => {
-                    eval_interval(&args[0], env).mod_const(&m)
+                    eval_interval(&args[0], env, budget)?.mod_const(&m)
                 }
                 _ => Interval::top(),
             },
-            ChcOp::Div if args.len() == 2 => match const_bigint(&args[1]) {
+            ChcOp::Div if args.len() == 2 => match const_bigint_budgeted(&args[1], budget)? {
                 Some(d) if d.sign() == num_bigint::Sign::Plus => {
-                    eval_interval(&args[0], env).div_const(&d)
+                    eval_interval(&args[0], env, budget)?.div_const(&d)
                 }
                 _ => Interval::top(),
             },
             ChcOp::Ite if args.len() == 3 => {
-                let t = eval_interval(&args[1], env);
-                let e = eval_interval(&args[2], env);
+                let t = eval_interval(&args[1], env, budget)?;
+                let e = eval_interval(&args[2], env, budget)?;
                 t.join(&e)
             }
             _ => Interval::top(),
         },
         _ => Interval::top(),
-    }
+    };
+    Some(interval)
 }
 
 /// Meet `v`'s environment interval with `itv` (Int-sorted vars only).
@@ -309,15 +408,18 @@ fn bound_var(env: &mut VarEnv, v: &ChcVar, itv: Interval) {
 
 /// Refine `env` with a single comparison atom `var ⋈ expr` / `expr ⋈ var`
 /// (the backward/local direction of the propagation).
-fn apply_atom(atom: &ChcExpr, env: &mut VarEnv) {
-    let ChcExpr::Op(op, args) = atom else { return };
+fn apply_atom(atom: &ChcExpr, env: &mut VarEnv, budget: &mut PassBudget) -> Option<()> {
+    budget.checkpoint()?;
+    let ChcExpr::Op(op, args) = atom else {
+        return Some(());
+    };
     if args.len() != 2 {
-        return;
+        return Some(());
     }
 
     match (args[0].as_ref(), args[1].as_ref()) {
         (ChcExpr::Var(v), rhs) => {
-            let r = eval_interval(rhs, env);
+            let r = eval_interval(rhs, env, budget)?;
             let itv = match op {
                 ChcOp::Eq => r,
                 ChcOp::Le => Interval { lo: None, hi: r.hi },
@@ -330,12 +432,12 @@ fn apply_atom(atom: &ChcExpr, env: &mut VarEnv) {
                     lo: r.lo.map(|l| l + BigInt::one()),
                     hi: None,
                 },
-                _ => return,
+                _ => return Some(()),
             };
             bound_var(env, v, itv);
         }
         (lhs, ChcExpr::Var(v)) => {
-            let l = eval_interval(lhs, env);
+            let l = eval_interval(lhs, env, budget)?;
             let itv = match op {
                 ChcOp::Eq => l,
                 // c <= v  ⇒  v >= c
@@ -349,21 +451,41 @@ fn apply_atom(atom: &ChcExpr, env: &mut VarEnv) {
                     lo: None,
                     hi: l.hi.map(|h| h - BigInt::one()),
                 },
-                _ => return,
+                _ => return Some(()),
             };
             bound_var(env, v, itv);
         }
         _ => {}
     }
+    Some(())
+}
+
+/// Apply top-level conjunction atoms without first flattening the entire
+/// expression into an unbudgeted temporary vector.
+fn apply_constraint_atoms(expr: &ChcExpr, env: &mut VarEnv, budget: &mut PassBudget) -> Option<()> {
+    budget.checkpoint()?;
+    crate::expr::maybe_grow_expr_stack(|| {
+        if let ChcExpr::Op(ChcOp::And, args) = expr {
+            for arg in args {
+                apply_constraint_atoms(arg, env, budget)?;
+            }
+            Some(())
+        } else {
+            apply_atom(expr, env, budget)
+        }
+    })
 }
 
 /// Build the per-clause variable environment: body-predicate argument bounds
 /// (forward direction) meet constraint-atom bounds (backward direction).
-fn clause_env(clause: &HornClause, state: &PredState) -> VarEnv {
+fn clause_env(clause: &HornClause, state: &PredState, budget: &mut PassBudget) -> Option<VarEnv> {
+    budget.checkpoint()?;
     let mut env = VarEnv::default();
     for (pid, args) in &clause.body.predicates {
+        budget.checkpoint()?;
         if let Some(intervals) = state.get(pid) {
             for (arg, itv) in args.iter().zip(intervals.iter()) {
+                budget.checkpoint()?;
                 if let ChcExpr::Var(v) = arg {
                     if v.sort == ChcSort::Int && !itv.is_top() {
                         let cur = env_interval(&env, v);
@@ -376,12 +498,10 @@ fn clause_env(clause: &HornClause, state: &PredState) -> VarEnv {
     if let Some(constraint) = &clause.body.constraint {
         // Two passes so bounds derived late feed atoms seen early.
         for _ in 0..2 {
-            for atom in constraint.conjuncts() {
-                apply_atom(atom, &mut env);
-            }
+            apply_constraint_atoms(constraint, &mut env, budget)?;
         }
     }
-    env
+    Some(env)
 }
 
 // ── The transformer ────────────────────────────────────────────────────────
@@ -394,6 +514,8 @@ fn clause_env(clause: &HornClause, state: &PredState) -> VarEnv {
 /// can be proven.
 pub(crate) struct IntervalPropagator {
     verbose: bool,
+    pass_budget: Duration,
+    work_budget: usize,
     /// Test-only override for the `AY_CHC_DISABLE_WORD_BV` kill-switch so
     /// behavioral tests stay deterministic under parallel test execution.
     enabled_override: Option<bool>,
@@ -403,6 +525,8 @@ impl IntervalPropagator {
     pub(crate) fn new() -> Self {
         Self {
             verbose: false,
+            pass_budget: PASS_BUDGET,
+            work_budget: PASS_WORK_BUDGET,
             enabled_override: None,
         }
     }
@@ -412,9 +536,24 @@ impl IntervalPropagator {
         self
     }
 
+    /// Bound this pass by the caller's local route budget.
+    ///
+    /// The global default remains [`PASS_BUDGET`]; specialized candidate
+    /// routes can only reduce it. A zero budget makes the transform a no-op.
+    pub(crate) fn with_pass_budget(mut self, budget: Duration) -> Self {
+        self.pass_budget = budget.min(PASS_BUDGET);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_enabled_for_test(mut self, enabled: bool) -> Self {
         self.enabled_override = Some(enabled);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_work_budget_for_test(mut self, work_budget: usize) -> Self {
+        self.work_budget = work_budget;
         self
     }
 }
@@ -424,22 +563,44 @@ impl Transformer for IntervalPropagator {
         let enabled = self
             .enabled_override
             .unwrap_or_else(|| !super::word_bv_hardening_disabled());
-        if !enabled || problem.clauses().is_empty() || problem.clauses().len() > MAX_CLAUSES {
+        if !enabled
+            || self.pass_budget.is_zero()
+            || problem.clauses().is_empty()
+            || problem.clauses().len() > MAX_CLAUSES
+        {
             return identity(problem);
         }
-        let deadline = Instant::now() + PASS_BUDGET;
+        let deadline = Instant::now() + self.pass_budget;
+        let mut budget = PassBudget::new(deadline, self.work_budget);
+        if budget.checkpoint().is_none() {
+            return identity(problem);
+        }
 
         // Phase 1: forward interval fixpoint with widening (candidates only —
         // correctness comes from the SMT verification in phase 2).
-        let candidates = forward_fixpoint(&problem);
+        let Some(mut candidates) = forward_fixpoint_budgeted(&problem, &mut budget) else {
+            return identity(problem);
+        };
+        if narrow_fixpoint(&problem, &mut candidates, &mut budget).is_none() {
+            return identity(problem);
+        }
 
         // Phase 2: verify the candidate invariant inductively; fail-closed.
-        let verified = verify_invariant(&problem, candidates, deadline, self.verbose);
+        let Some(verified) = verify_invariant(&problem, candidates, &mut budget, self.verbose)
+        else {
+            return identity(problem);
+        };
 
         // Phase 3: strengthen clauses with verified body bounds and discharge
         // mod casts whose no-wraparound condition is SMT-implied.
-        let (transformed, rewrites, strengthened) =
-            strengthen_and_discharge(&problem, &verified, deadline, self.verbose);
+        let Some((transformed, rewrites, strengthened)) =
+            strengthen_and_discharge(&problem, &verified, &mut budget, self.verbose)
+        else {
+            return identity(problem);
+        };
+        if budget.checkpoint().is_none() {
+            return identity(problem);
+        }
 
         if rewrites == 0 && !strengthened {
             return identity(problem);
@@ -469,39 +630,44 @@ fn identity(problem: ChcProblem) -> TransformationResult {
 }
 
 /// Forward interval analysis: per-predicate-argument `[lo, hi]` candidates.
-fn forward_fixpoint(problem: &ChcProblem) -> PredState {
+fn forward_fixpoint_budgeted(problem: &ChcProblem, budget: &mut PassBudget) -> Option<PredState> {
+    budget.checkpoint()?;
     let mut state = PredState::default();
     // Per (pred, arg): how often each bound moved (for widening).
     let mut lo_moves: FxHashMap<(PredicateId, usize), u32> = FxHashMap::default();
     let mut hi_moves: FxHashMap<(PredicateId, usize), u32> = FxHashMap::default();
 
     for _round in 0..MAX_FIXPOINT_ROUNDS {
+        budget.checkpoint()?;
         let mut changed = false;
         for clause in problem.clauses() {
+            budget.checkpoint()?;
             let ClauseHead::Predicate(pid, head_args) = &clause.head else {
                 continue;
             };
             // Bottom semantics: a clause only fires once all its body
             // predicates have been reached.
-            if clause
-                .body
-                .predicates
-                .iter()
-                .any(|(bpid, _)| !state.contains_key(bpid))
-            {
+            let mut body_reached = true;
+            for (body_pid, _) in &clause.body.predicates {
+                budget.checkpoint()?;
+                if !state.contains_key(body_pid) {
+                    body_reached = false;
+                    break;
+                }
+            }
+            if !body_reached {
                 continue;
             }
-            let env = clause_env(clause, &state);
-            let new_intervals: Vec<Interval> = head_args
-                .iter()
-                .map(|arg| {
-                    if arg.sort() == ChcSort::Int {
-                        eval_interval(arg, &env)
-                    } else {
-                        Interval::top()
-                    }
-                })
-                .collect();
+            let env = clause_env(clause, &state, budget)?;
+            let mut new_intervals = Vec::with_capacity(head_args.len());
+            for arg in head_args {
+                budget.checkpoint()?;
+                new_intervals.push(if arg.sort() == ChcSort::Int {
+                    eval_interval(arg, &env, budget)?
+                } else {
+                    Interval::top()
+                });
+            }
 
             match state.get_mut(pid) {
                 None => {
@@ -511,6 +677,7 @@ fn forward_fixpoint(problem: &ChcProblem) -> PredState {
                 Some(current) => {
                     for (i, (cur, new)) in current.iter_mut().zip(new_intervals.iter()).enumerate()
                     {
+                        budget.checkpoint()?;
                         let joined = cur.join(new);
                         if joined != *cur {
                             // Widen the moving side past the threshold.
@@ -544,8 +711,102 @@ fn forward_fixpoint(problem: &ChcProblem) -> PredState {
     }
 
     // Keep only informative entries.
-    state.retain(|_, intervals| intervals.iter().any(|i| !i.is_top()));
-    state
+    let mut informative = PredState::default();
+    for (pid, intervals) in state {
+        budget.checkpoint()?;
+        let mut keep = false;
+        for interval in &intervals {
+            budget.checkpoint()?;
+            keep |= !interval.is_top();
+        }
+        if keep {
+            informative.insert(pid, intervals);
+        }
+    }
+    Some(informative)
+}
+
+#[cfg(test)]
+fn forward_fixpoint(problem: &ChcProblem) -> PredState {
+    let mut budget = PassBudget::new(Instant::now() + Duration::from_secs(1), PASS_WORK_BUDGET);
+    forward_fixpoint_budgeted(problem, &mut budget).unwrap_or_default()
+}
+
+/// Refine a widened interval post-fixpoint by standard abstract narrowing.
+///
+/// `state` is the post-fixpoint produced by [`forward_fixpoint_budgeted`]. For each
+/// round we compute the abstract image `F(state)` from a stable snapshot and
+/// intersect it with `state`. This can recover a finite bound lost to
+/// widening, while never being trusted directly: [`verify_invariant`] checks
+/// the complete narrowed candidate against every defining clause and drops a
+/// predicate on SAT, Unknown, or timeout.
+fn narrow_fixpoint(
+    problem: &ChcProblem,
+    state: &mut PredState,
+    budget: &mut PassBudget,
+) -> Option<()> {
+    for _round in 0..MAX_NARROWING_ROUNDS {
+        budget.checkpoint()?;
+        let mut image = PredState::default();
+        for clause in problem.clauses() {
+            budget.checkpoint()?;
+            let ClauseHead::Predicate(pid, head_args) = &clause.head else {
+                continue;
+            };
+            let mut body_reached = true;
+            for (body_pid, _) in &clause.body.predicates {
+                budget.checkpoint()?;
+                if !state.contains_key(body_pid) {
+                    body_reached = false;
+                    break;
+                }
+            }
+            if !body_reached {
+                continue;
+            }
+            let env = clause_env(clause, state, budget)?;
+            let mut head_intervals = Vec::with_capacity(head_args.len());
+            for arg in head_args {
+                budget.checkpoint()?;
+                head_intervals.push(if arg.sort() == ChcSort::Int {
+                    eval_interval(arg, &env, budget)?
+                } else {
+                    Interval::top()
+                });
+            }
+            match image.get_mut(pid) {
+                None => {
+                    image.insert(*pid, head_intervals);
+                }
+                Some(current) => {
+                    for (slot, incoming) in current.iter_mut().zip(head_intervals) {
+                        budget.checkpoint()?;
+                        *slot = slot.join(&incoming);
+                    }
+                }
+            }
+        }
+
+        let mut changed = false;
+        for (pid, current) in state.iter_mut() {
+            budget.checkpoint()?;
+            let Some(incoming) = image.get(pid) else {
+                continue;
+            };
+            for (slot, next) in current.iter_mut().zip(incoming) {
+                budget.checkpoint()?;
+                let narrowed = slot.meet(next);
+                if narrowed != *slot {
+                    *slot = narrowed;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Some(())
 }
 
 /// Bound atoms `lo <= e ∧ e <= hi` for one expression.
@@ -561,15 +822,24 @@ fn interval_atoms(expr: &ChcExpr, itv: &Interval) -> Vec<ChcExpr> {
 }
 
 /// All bound atoms for one predicate application under `state`.
-fn pred_app_atoms(pid: &PredicateId, args: &[ChcExpr], state: &PredState) -> Vec<ChcExpr> {
+fn pred_app_atoms(
+    pid: &PredicateId,
+    args: &[ChcExpr],
+    state: &PredState,
+    budget: &mut PassBudget,
+) -> Option<Vec<ChcExpr>> {
+    budget.checkpoint()?;
     let Some(intervals) = state.get(pid) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
-    args.iter()
-        .zip(intervals.iter())
-        .filter(|(arg, itv)| !itv.is_top() && arg.sort() == ChcSort::Int)
-        .flat_map(|(arg, itv)| interval_atoms(arg, itv))
-        .collect()
+    let mut atoms = Vec::new();
+    for (arg, interval) in args.iter().zip(intervals) {
+        budget.checkpoint()?;
+        if !interval.is_top() && arg.sort() == ChcSort::Int {
+            atoms.extend(interval_atoms(arg, interval));
+        }
+    }
+    Some(atoms)
 }
 
 /// SMT-verify the candidate invariant inductively, per clause. Any predicate
@@ -579,36 +849,35 @@ fn pred_app_atoms(pid: &PredicateId, args: &[ChcExpr], state: &PredState) -> Vec
 fn verify_invariant(
     problem: &ChcProblem,
     mut candidates: PredState,
-    deadline: Instant,
+    budget: &mut PassBudget,
     verbose: bool,
-) -> PredState {
+) -> Option<PredState> {
+    budget.checkpoint()?;
     let mut smt = SmtContext::new();
     'restart: while !candidates.is_empty() {
+        budget.checkpoint()?;
         for clause in problem.clauses() {
+            budget.checkpoint()?;
             let ClauseHead::Predicate(pid, head_args) = &clause.head else {
                 continue;
             };
-            let head_atoms = pred_app_atoms(pid, head_args, &candidates);
+            let head_atoms = pred_app_atoms(pid, head_args, &candidates, budget)?;
             if head_atoms.is_empty() {
                 continue;
             }
-            if Instant::now() >= deadline {
-                // Fail-closed: partially verified bounds are not trusted.
-                if verbose {
-                    safe_eprintln!("IntervalPropagator: verification budget exhausted — dropping all interval candidates");
-                }
-                return PredState::default();
-            }
             let mut premise: Vec<ChcExpr> = Vec::new();
             if let Some(c) = &clause.body.constraint {
+                budget.checkpoint()?;
                 premise.push(c.clone());
             }
             for (bpid, bargs) in &clause.body.predicates {
-                premise.extend(pred_app_atoms(bpid, bargs, &candidates));
+                budget.checkpoint()?;
+                premise.extend(pred_app_atoms(bpid, bargs, &candidates, budget)?);
             }
             premise.push(ChcExpr::not(ChcExpr::and_all(head_atoms)));
-            let query = ChcExpr::and_all(premise).simplify_constants();
-            match smt.check_sat_with_executor_fallback_timeout(&query, QUERY_TIMEOUT) {
+            let query = ChcExpr::and_all(premise);
+            let timeout = budget.timeout(QUERY_TIMEOUT)?;
+            match smt.check_sat_with_executor_fallback_timeout(&query, timeout) {
                 SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_) => {}
                 _ => {
                     if verbose {
@@ -623,69 +892,105 @@ fn verify_invariant(
             }
         }
         // All clauses verified against the current candidate set.
-        return candidates;
+        return Some(candidates);
     }
-    candidates
+    Some(candidates)
 }
 
 /// Collect all distinct `Mod(t, m)` subterms with a positive constant modulus.
-fn collect_mod_terms(expr: &ChcExpr, out: &mut Vec<(ChcExpr, ChcExpr, BigInt)>) {
+fn collect_mod_terms(
+    expr: &ChcExpr,
+    out: &mut Vec<(ChcExpr, ChcExpr, BigInt)>,
+    budget: &mut PassBudget,
+) -> Option<()> {
+    budget.checkpoint()?;
     crate::expr::maybe_grow_expr_stack(|| {
         if let ChcExpr::Op(op, args) = expr {
             if *op == ChcOp::Mod && args.len() == 2 {
-                if let Some(m) = const_bigint(&args[1]) {
-                    if m.sign() == num_bigint::Sign::Plus && !out.iter().any(|(t, _, _)| t == expr)
-                    {
+                if let Some(m) = const_bigint_budgeted(&args[1], budget)? {
+                    let mut duplicate = false;
+                    for (term, _, _) in out.iter() {
+                        budget.checkpoint()?;
+                        if term == expr {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if m.sign() == num_bigint::Sign::Plus && !duplicate {
                         out.push((expr.clone(), args[0].as_ref().clone(), m));
                     }
                 }
             }
             for a in args {
-                collect_mod_terms(a, out);
+                collect_mod_terms(a, out, budget)?;
             }
         } else if let ChcExpr::PredicateApp(_, _, args) | ChcExpr::FuncApp(_, _, args) = expr {
             for a in args {
-                collect_mod_terms(a, out);
+                collect_mod_terms(a, out, budget)?;
             }
         } else if let ChcExpr::ConstArray(_, val) = expr {
-            collect_mod_terms(val, out);
+            collect_mod_terms(val, out, budget)?;
         }
+        Some(())
     })
 }
 
 /// Replace every occurrence of `target` (an exact subterm) with `replacement`.
-fn replace_subterm(expr: &ChcExpr, target: &ChcExpr, replacement: &ChcExpr) -> ChcExpr {
+fn replace_subterm(
+    expr: &ChcExpr,
+    target: &ChcExpr,
+    replacement: &ChcExpr,
+    budget: &mut PassBudget,
+) -> Option<ChcExpr> {
+    budget.checkpoint()?;
     crate::expr::maybe_grow_expr_stack(|| {
         if expr == target {
-            return replacement.clone();
+            return Some(replacement.clone());
         }
-        match expr {
-            ChcExpr::Op(op, args) => ChcExpr::Op(
-                *op,
-                args.iter()
-                    .map(|a| std::sync::Arc::new(replace_subterm(a, target, replacement)))
-                    .collect(),
-            ),
-            ChcExpr::PredicateApp(name, pid, args) => ChcExpr::PredicateApp(
-                name.clone(),
-                *pid,
-                args.iter()
-                    .map(|a| std::sync::Arc::new(replace_subterm(a, target, replacement)))
-                    .collect(),
-            ),
-            ChcExpr::FuncApp(name, sort, args) => ChcExpr::FuncApp(
-                name.clone(),
-                sort.clone(),
-                args.iter()
-                    .map(|a| std::sync::Arc::new(replace_subterm(a, target, replacement)))
-                    .collect(),
-            ),
+        let rebuilt = match expr {
+            ChcExpr::Op(op, args) => {
+                let mut rebuilt = Vec::with_capacity(args.len());
+                for arg in args {
+                    rebuilt.push(std::sync::Arc::new(replace_subterm(
+                        arg,
+                        target,
+                        replacement,
+                        budget,
+                    )?));
+                }
+                ChcExpr::Op(*op, rebuilt)
+            }
+            ChcExpr::PredicateApp(name, pid, args) => {
+                let mut rebuilt = Vec::with_capacity(args.len());
+                for arg in args {
+                    rebuilt.push(std::sync::Arc::new(replace_subterm(
+                        arg,
+                        target,
+                        replacement,
+                        budget,
+                    )?));
+                }
+                ChcExpr::PredicateApp(name.clone(), *pid, rebuilt)
+            }
+            ChcExpr::FuncApp(name, sort, args) => {
+                let mut rebuilt = Vec::with_capacity(args.len());
+                for arg in args {
+                    rebuilt.push(std::sync::Arc::new(replace_subterm(
+                        arg,
+                        target,
+                        replacement,
+                        budget,
+                    )?));
+                }
+                ChcExpr::FuncApp(name.clone(), sort.clone(), rebuilt)
+            }
             ChcExpr::ConstArray(sort, val) => ChcExpr::ConstArray(
                 sort.clone(),
-                std::sync::Arc::new(replace_subterm(val, target, replacement)),
+                std::sync::Arc::new(replace_subterm(val, target, replacement, budget)?),
             ),
             _ => expr.clone(),
-        }
+        };
+        Some(rebuilt)
     })
 }
 
@@ -695,12 +1000,14 @@ fn replace_subterm(expr: &ChcExpr, target: &ChcExpr, replacement: &ChcExpr) -> C
 fn strengthen_and_discharge(
     problem: &ChcProblem,
     verified: &PredState,
-    deadline: Instant,
+    budget: &mut PassBudget,
     verbose: bool,
-) -> (ChcProblem, usize, bool) {
+) -> Option<(ChcProblem, usize, bool)> {
+    budget.checkpoint()?;
     let mut smt = SmtContext::new();
     let mut result = ChcProblem::new();
     for pred in problem.predicates() {
+        budget.checkpoint()?;
         result.declare_predicate(&pred.name, pred.arg_sorts.clone());
     }
 
@@ -708,39 +1015,40 @@ fn strengthen_and_discharge(
     let mut strengthened = false;
 
     for clause in problem.clauses() {
+        budget.checkpoint()?;
         // Verified bounds of body-predicate arguments (Eldarica-style clause
         // strengthening; sound because the invariant is conjoined onto every
         // model at back-translation).
         let mut body_atoms: Vec<ChcExpr> = Vec::new();
         for (bpid, bargs) in &clause.body.predicates {
-            body_atoms.extend(pred_app_atoms(bpid, bargs, verified));
+            budget.checkpoint()?;
+            body_atoms.extend(pred_app_atoms(bpid, bargs, verified, budget)?);
         }
 
         let mut constraint = clause.body.constraint.clone();
         let mut head = clause.head.clone();
-        let env = clause_env(clause, verified);
+        let env = clause_env(clause, verified, budget)?;
 
         // Discharge loop: proven bound atoms accumulate into the context so
         // nested casts can be discharged in later rounds.
         let mut proven_bounds: Vec<ChcExpr> = Vec::new();
         for _round in 0..MAX_REWRITE_ROUNDS {
+            budget.checkpoint()?;
             let mut mods: Vec<(ChcExpr, ChcExpr, BigInt)> = Vec::new();
             if let Some(c) = &constraint {
-                collect_mod_terms(c, &mut mods);
+                collect_mod_terms(c, &mut mods, budget)?;
             }
             if let ClauseHead::Predicate(_, head_args) = &head {
                 for arg in head_args {
-                    collect_mod_terms(arg, &mut mods);
+                    collect_mod_terms(arg, &mut mods, budget)?;
                 }
             }
             let mut round_rewrites = 0usize;
             for (mod_term, operand, modulus) in mods {
-                if Instant::now() >= deadline {
-                    break;
-                }
+                budget.checkpoint()?;
                 // Cheap interval pre-filter: only pay for SMT when the
                 // abstract interpretation already suggests no wraparound.
-                let itv = eval_interval(&operand, &env);
+                let itv = eval_interval(&operand, &env, budget)?;
                 let in_range_hint = matches!(
                     (&itv.lo, &itv.hi),
                     (Some(lo), Some(hi))
@@ -759,8 +1067,9 @@ fn strengthen_and_discharge(
                 ctx.extend(body_atoms.iter().cloned());
                 ctx.extend(proven_bounds.iter().cloned());
                 ctx.push(ChcExpr::not(ChcExpr::and(lo_atom.clone(), hi_atom.clone())));
-                let query = ChcExpr::and_all(ctx).simplify_constants();
-                match smt.check_sat_with_executor_fallback_timeout(&query, QUERY_TIMEOUT) {
+                let query = ChcExpr::and_all(ctx);
+                let timeout = budget.timeout(QUERY_TIMEOUT)?;
+                match smt.check_sat_with_executor_fallback_timeout(&query, timeout) {
                     SmtResult::Unsat
                     | SmtResult::UnsatWithCore(_)
                     | SmtResult::UnsatWithFarkas(_) => {
@@ -772,12 +1081,15 @@ fn strengthen_and_discharge(
                         }
                         // Rewrite everywhere in the clause and keep the proven
                         // bounds so the rewrite is an equivalence.
-                        constraint = constraint.map(|c| replace_subterm(&c, &mod_term, &operand));
+                        constraint = match constraint {
+                            Some(c) => Some(replace_subterm(&c, &mod_term, &operand, budget)?),
+                            None => None,
+                        };
                         if let ClauseHead::Predicate(pid, head_args) = &head {
-                            let new_args = head_args
-                                .iter()
-                                .map(|a| replace_subterm(a, &mod_term, &operand))
-                                .collect();
+                            let mut new_args = Vec::with_capacity(head_args.len());
+                            for arg in head_args {
+                                new_args.push(replace_subterm(arg, &mod_term, &operand, budget)?);
+                            }
                             head = ClauseHead::Predicate(*pid, new_args);
                         }
                         proven_bounds.push(lo_atom);
@@ -809,7 +1121,7 @@ fn strengthen_and_discharge(
         ));
     }
 
-    (result, total_rewrites, strengthened)
+    Some((result, total_rewrites, strengthened))
 }
 
 // ── Back-translation ───────────────────────────────────────────────────────

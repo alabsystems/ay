@@ -647,7 +647,16 @@ pub(in crate::executor) fn map_conflict_to_blocking_clause(
         return BlockingClauseResult::Unsat;
     }
 
-    solver.add_theory_lemma_scoped(clause);
+    // #unguarded-tvalid-lemmas STAGE 1: this is the split-loop Farkas/theory
+    // conflict lemma — a THEORY TAUTOLOGY over term-semantic atom literals.
+    // T-validity provenance: `map_conflict_lits` above maps ONLY TermId-keyed
+    // atoms (partial map => `Unmapped` => no clause is ever added), so the
+    // clause is the negation of a theory-inconsistent atom conjunction, valid
+    // at every scope forever. Routed through the conflict-lemma gate: scoped
+    // (old behavior) unless the solver's `unguarded_theory_conflict_lemmas`
+    // flag is set (the inc-engine QF_LRA lane), in which case it persists
+    // across pop() in the deletable learned tier.
+    solver.add_theory_conflict_lemma(clause);
 
     // Add blocking clauses for remaining batch-collected bound conflicts (#5117).
     // Skip any extra clause where a conflict term fails to map — a partial
@@ -1131,7 +1140,13 @@ pub(in crate::executor) fn add_extra_blocking_clauses(
     for extra in extra_conflicts {
         if let Ok(extra_clause) = map_conflict_lits(&extra.literals, local_term_to_var) {
             if !extra_clause.is_empty() {
-                solver.add_theory_lemma_scoped(extra_clause);
+                // #unguarded-tvalid-lemmas STAGE 1: batch bound conflicts are
+                // theory tautologies over term-semantic atoms (same
+                // `map_conflict_lits` full-mapping guarantee as the primary
+                // conflict) — route through the conflict-lemma gate so the
+                // inc-engine lane retains them across pop(). Scoped (old
+                // behavior) whenever the solver flag is off.
+                solver.add_theory_conflict_lemma(extra_clause);
             }
         }
         // Err = some terms unmapped → skip this clause (partial mapping is unsound)

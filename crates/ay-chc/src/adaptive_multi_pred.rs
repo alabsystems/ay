@@ -1097,6 +1097,20 @@ impl AdaptivePortfolio {
         let probe_start = Instant::now();
         let result = bmc.solve();
         if let Some(hit) = self.acyclic_bmc_probe_result(result, features, depth) {
+            // This is the raw, untransformed `self.problem` probe. Cache an
+            // empty-model scalar proof only here, after the exact exhaustive
+            // BMC run itself returned Safe. Do not record from the generic
+            // finalizer: `ValidationEvidence` is metadata and a fabricated
+            // label must never manufacture a reusable proof.
+            if matches!(
+                &hit,
+                (
+                    PortfolioResult::Safe(model),
+                    ValidationEvidence::ScalarAcyclicBmcExhaustive { .. }
+                ) if model.is_empty()
+            ) {
+                crate::acyclic_cert_cache::record_acyclic_bmc_safe(&self.problem, depth);
+            }
             return Some(hit);
         }
 

@@ -297,7 +297,6 @@ pub(super) fn accept_reparsed_sat_model(
     let verify_result =
         verify_sat_model_conjunction_strict_with_mod_retry(exprs.iter().copied(), &model);
     let requires_strict = needs_strict_reparsed_validation(exprs);
-
     match verify_result {
         ModelVerifyResult::Invalid => {
             tracing::warn!(
@@ -616,7 +615,10 @@ impl SmtContext {
             // text of timeout-class checks for offline differential analysis.
             if let Ok(dir) = std::env::var("AY_CHECKSAT_DUMP") {
                 let dt = t_build.elapsed();
-                if result_str == "unknown" || dt.as_millis() > 500 {
+                if result_str == "unknown"
+                    || matches!(result, SmtResult::Unknown)
+                    || dt.as_millis() > 500
+                {
                     use std::sync::atomic::{AtomicUsize, Ordering};
                     static DUMP_SEQ: AtomicUsize = AtomicUsize::new(0);
                     let n = DUMP_SEQ.fetch_add(1, Ordering::Relaxed);

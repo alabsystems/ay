@@ -26,7 +26,10 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 from _oom_guard import plan_solver_resources, run_captured, warn_concurrent_build  # noqa: E402
 
-DATA = os.environ.get("MZN_CH_DATA", f"{REPO}/benchmarks/minizinc/challenge-2025/data")
+DATA = os.environ.get(
+    "MZN_CH_DATA",
+    f"{REPO}/benchmarks/minizinc/challenge-2025/mznc2025_probs",
+)
 RESULTS = os.environ.get("MZN_CH_RESULTS", f"{REPO}/benchmarks/minizinc/challenge-2025/results-2025.json")
 MZN = os.environ.get("MINIZINC", "minizinc")
 TIMEOUT_BIN = os.environ.get("GTIMEOUT", "gtimeout")

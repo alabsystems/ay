@@ -2,8 +2,8 @@
 # `ay bench compare` (design: the development design notes §3.1; run
 # classes: official / replay / laptop — see the development design notes).
 #
-# Every fact below was researched from the official competition sites on
-# 2026-07-20 with citations; "unknown" means the official record did not state
+# Every fact below was researched from the official competition sites through
+# 2026-07-24 with citations; "unknown" means the official record did not state
 # it — never a guess. Entries are data for `ay bench compare`; nothing here is
 # an AY result claim.
 #
@@ -49,6 +49,7 @@ competition = "satcomp"
 edition     = 2025
 track       = "Main track (sequential)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "satcomp-2025-main"
 official_hosts = "BenchCloud instance of SoSy-Lab, LMU Munich (first year off StarExec): nodes with Intel Xeon E3-1230 v5 @ 3.40 GHz, 8 cores, 30 GB RAM. Slides note StarExec previously gave 128 GB; several 2025 runs crashed at the 20 GB allocation used in practice."
 budgets     = "5000 s per job (CPU time), 30 GB memory; separate proof-checking budget: 45000 s for the checker toolchain. UNSAT certificates mandatory; instance counted unsolved if proof checking times out."
 scoring     = "PAR-2: sum of runtimes of solved instances plus 2x timeout (10000 s) per unsolved instance; lower is better. Certified UNSAT via verified checkers chosen per participant: cake_lpr (LRAT/LPR), GRAT, or VeriPB+CakePB; proof written to proof.out; incorrect proof => disqualification."
@@ -85,6 +86,7 @@ competition = "satcomp"
 edition     = 2025
 track       = "Parallel track"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "satcomp-2025-main"
 official_hosts = "AWS EC2 m6i.16xlarge: 64 vCPUs, 256 GiB RAM (3rd-gen Intel Xeon Scalable 'Ice Lake', all-core turbo 3.5 GHz per AWS). Ran on beta of AWS's new Docker-based competition infrastructure (single Docker image, submission via GitHub repo; https://github.com/aws-samples/aws-batch-comp-infrastructure-sample). Cloud track was skipped in 2025."
 budgets     = "1000 s wall-clock per job (reduced from 5000 s in prior years); node memory 256 GiB (no separate per-job cap found). No UNSAT proofs required; model required in SAT case."
 scoring     = "PAR-2 on wall-clock time: sum of runtimes of solved instances plus 2x timeout per unsolved instance; lower is better."
@@ -115,7 +117,120 @@ citations = [
   os        = ""
   arch      = "x86_64"
 
-# unconfirmed (sat): 1) Exact competition-submitted source packages for the three parallel-track winners: the official downloads page publishes only the 25 Main-track solver tarballs; parallel solvers were submitted as Docker builds via private GitHub repos to the AWS infrastructure, and I found no official archive of the exact submitted versions (upstream framework repos cited instead). 2) Per-job memory cap on the p
+# unconfirmed (sat): 1) Exact competition-submitted source packages for the three parallel-track winners: the official downloads page publishes only the 25 Main-track solver tarballs; parallel solvers were submitted as Docker builds via private GitHub repos to the AWS infrastructure, and I found no official archive of the exact submitted versions (upstream framework repos cited instead). 2) No separate per-job memory cap was published beyond the parallel node's RAM.
+
+[[comparison]]
+id          = "satcomp-2026-main"
+competition = "satcomp"
+edition     = 2026
+track       = "Main track (sequential)"
+status      = "ready"
+corpus_name = "satcomp-2026-main"
+notes       = "The competition identifies a HoreKa Blue node but not its memory subtype (the linked NHR hardware table lists 256, 512, and 4096 GiB Blue variants). official.memory_gb is therefore deliberately 0: compare check fails closed instead of treating the 32 GB per-job limit as node RAM. Seven simultaneous jobs are part of the official execution envelope and are not modeled by schema 1."
+official_hosts = "NHR@KIT HoreKa Blue compute node: two Intel Xeon Platinum 8368 sockets, 76 physical cores / 152 threads per node; the competition ran seven benchmarks concurrently. HoreKa Blue node memory depends on subtype (256, 512, or 4096 GiB), and the competition page does not identify the subtype."
+budgets     = "5000 s time limit and 32 GB memory per solver/benchmark job. Main submissions must provide a model for SAT and a proof certificate for UNSAT; a benchmark is unsolved if proof checking times out, and an incorrect model or proof disqualifies the solver."
+scoring     = "PAR-2, lower is better: runtime for a solved instance and twice the timeout for an unsolved instance. Official results report Main PAR-2 and solved count over 400 selected instances."
+corpus      = "The exact ordered 400-row selected_benchmarks.csv from the organizer's deterministic benchmark-compilation repository commit 6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c, materialized through the pinned GBD response manifest."
+winners = [
+  "satsuma-iter+kissat, Markus Anders and Cayden Codel (PAR-2 3647.02, 276/400 solved; sequential author source bundle anders.tar.xz)",
+  "Kissat-MAB-HyPre, Jiongzhi Zheng et al. (PAR-2 3996.29, 255/400 solved; sequential author source bundle zheng.tar.xz)",
+  "EDA-Kissat-v2, Yalun Cai and Qiang Xu (PAR-2 4469.34, 240/400 solved; sequential author source bundle yalun.tar.xz)",
+]
+citations = [
+  "https://satcompetition.github.io/2026/tracks.html",
+  "https://satcompetition.github.io/2026/downloads/satcomp26slides.pdf",
+  "https://satcompetition.github.io/2026/downloads/scores.csv",
+  "https://satcompetition.github.io/2026/downloads.html",
+  "https://www.nhr.kit.edu/userdocs/horeka/hardware/",
+  "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/benchmark-compilation-script/selected_benchmarks.csv",
+  "https://satcompetition.github.io/2026/downloads/solvers/anders.tar.xz",
+  "https://satcompetition.github.io/2026/downloads/solvers/zheng.tar.xz",
+  "https://satcompetition.github.io/2026/downloads/solvers/yalun.tar.xz",
+]
+
+  # Node memory is intentionally unknown; see notes. This makes host matching
+  # fail closed instead of confusing the 32 GB per-job limit with node RAM.
+  [comparison.official]
+  cpu_model = "Intel Xeon Platinum 8368"
+  cores     = 76
+  memory_gb = 0
+  os        = "linux"
+  arch      = "x86_64"
+
+[[comparison]]
+id          = "satcomp-2026-parallel"
+competition = "satcomp"
+edition     = 2026
+track       = "Parallel track"
+status      = "ready"
+corpus_name = "satcomp-2026-main"
+notes       = "The official Downloads page currently publishes sequential author bundles only. The exact submitted parallel containers are therefore not claimed as reproducible references; compare check reports their winner references unresolved until pinned public artifacts exist."
+official_hosts = "One AWS EC2 m6i.16xlarge instance per solver: 64 vCPUs (32 physical cores), 256 GiB RAM, 3rd Generation Intel Xeon Scalable (Ice Lake)."
+budgets     = "1000 s wall-clock per solver/benchmark job on one m6i.16xlarge instance. Parallel submissions must provide a model in the SAT case."
+scoring     = "PAR-2 on wall-clock time, lower is better: runtime for a solved instance and twice the 1000 s timeout for an unsolved instance. Official results report Parallel PAR-2 and solved count over the 400 selected instances."
+corpus      = "The same exact ordered 400-row SAT Competition 2026 selected benchmark set as Main, pinned from organizer commit 6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c."
+winners = [
+  "mallob-quick, Dominik Schreiber et al. (PAR-2 346.504, 300/400 solved; exact submitted container not publicly archived)",
+  "prs-mergesat, Zhenwei Yang et al. (PAR-2 401.118, 282/400 solved; exact submitted container not publicly archived)",
+  "prs-sc26, Zhihan Chen et al. (PAR-2 453.758, 263/400 solved; exact submitted container not publicly archived)",
+]
+citations = [
+  "https://satcompetition.github.io/2026/tracks.html",
+  "https://satcompetition.github.io/2026/downloads/satcomp26slides.pdf",
+  "https://satcompetition.github.io/2026/downloads.html",
+  "https://aws.amazon.com/ec2/instance-types/m6i/",
+  "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/benchmark-compilation-script/selected_benchmarks.csv",
+]
+
+  [comparison.official]
+  cpu_model = "Intel Xeon Scalable (Ice Lake)"
+  cores     = 64
+  memory_gb = 256
+  os        = ""
+  arch      = "x86_64"
+
+[[comparison]]
+id          = "satcomp-2026-cloud"
+competition = "satcomp"
+edition     = 2026
+track       = "Cloud track (distributed)"
+status      = "unsupported"
+corpus_name = "satcomp-2026-main"
+notes       = "Schema 1 describes one local host and cannot encode or verify the required 100-node topology, network, MPI/SSH setup, or aggregate resource envelope. No [comparison.official] block is provided, so compare check deliberately returns specs-pending rather than misclassifying one m6i.4xlarge node as an official replay. AY also has no distributed multi-node SAT engine. The final presentation reports two Cloud submissions, one disqualification, and one participant, but publishes only a plot; no numeric table or defensible winner score is recorded here."
+official_hosts = "100 AWS EC2 m6i.4xlarge instances in parallel per solver; each node has 16 vCPUs (8 physical cores) and 64 GiB RAM. Inter-node communication is available through MPI and SSH."
+budgets     = "200 s wall-clock on 100 m6i.4xlarge nodes per solver/benchmark job."
+scoring     = "PAR-2 on wall-clock time, lower is better. The final presentation contains a Cloud solved-over-time plot but no numeric leaderboard table."
+corpus      = "The same exact ordered 400-row SAT Competition 2026 selected benchmark set as Main and Parallel."
+winners     = []
+citations = [
+  "https://satcompetition.github.io/2026/tracks.html",
+  "https://satcompetition.github.io/2026/downloads/satcomp26slides.pdf",
+  "https://aws.amazon.com/ec2/instance-types/m6i/",
+  "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/benchmark-compilation-script/selected_benchmarks.csv",
+]
+
+[[comparison]]
+id          = "smtcomp-2025-published-score-view-inventory"
+competition = "smtcomp"
+edition     = 2025
+track       = "All 280 published division/scoring tables and 57 competition-wide recognition/scoring views"
+status      = "specs-pending"
+notes       = "Crosswalk-only comparison record spanning five tracks and two different official machine envelopes. The catalog and official-field ledger contain one identity for each of the 337 result surfaces, up to three eligible published entries per surface, official score components, and a labeled solve rate. Division/scoring rows are not medal tracks. Best Overall runner-up scores are sums of the complete published six-decimal contribution rows, with the official winner display retained separately; the maximum observed rounding difference is 0.000002. Incremental uses correct check-sats divided by exact selected check-sats because its generated Solved column is always zero. A single [comparison.official] machine block would be false because the Parallel track used the separate large shared-memory host."
+official_hosts = "Single Query, Incremental, Unsat-Core, and Model-Validation used the 168-node apollon BenchCloud cluster; Parallel used one separate 256-processor, 2 TB RAM machine."
+budgets     = "Standard tracks: 1200 s wall-clock and four solver cores per job, with approximately 30 GB memory. Parallel: 120 s wall-clock on the separate shared-memory machine."
+scoring     = "Every published score mode is a distinct view. Division tables rank lexicographically by errors, correctness, and the mode-specific time score. Competition-wide Best Overall, Largest Contribution, and Biggest Lead are separate recognitions."
+corpus      = "Five exact Zenodo 10.5281/zenodo.16887742 track archives, plus organizer-processed result and benchmark-metadata artifacts pinned at archive commit 401302678311593efcef8a79b614b33a3b853eac."
+winners = [
+  "cvc5 — Best Overall winner in every published Single Query, Incremental, Unsat-Core, and Model-Validation scoring view",
+  "Z3-Parti-Z3pp — Parallel-track Best Overall winner for parallel, SAT, and 24-second scoring",
+  "Bitwuzla — Parallel-track Best Overall UNSAT winner",
+]
+citations = [
+  "https://smt-comp.github.io/2025/results/",
+  "https://github.com/SMT-COMP/smt-comp.github.io/commit/401302678311593efcef8a79b614b33a3b853eac",
+  "https://smt-comp.github.io/2025/rules.pdf",
+  "https://zenodo.org/records/16887742",
+]
 
 [[comparison]]
 id          = "smtcomp-2025-single-query-best-overall"
@@ -123,6 +238,7 @@ competition = "smtcomp"
 edition     = 2025
 track       = "Single Query — competition-wide recognitions (Best Overall / Biggest Lead / Largest Contribution)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "smtcomp-2025-single-query"
 official_hosts = "BenchCloud (BenchExec) cluster of LMU Munich SoSy-Lab: 168 'apollon' nodes, Intel Xeon E3-1230 v5 @ 3.40 GHz, 4 cores available to the solver, 33 GB RAM per node (StarExec no longer used; Cloud track cancelled for lack of infrastructure)"
 budgets     = "20 min wall-clock per solver/benchmark pair; memory limit 'on the order of 30 GB' (RAM-disk writes count against it); 4 cores per job"
 scoring     = "Best Overall Ranking = sum over divisions of normalized score (n_D/N_D)^2, or -2 for a division with any wrong answer; underlying division scores are lexicographic (fewest errors > most solved > least wall time > least CPU time), with a 'sequential' variant capping CPU time at the 20-min wall limit; unknown-status benchmarks on which sound solvers disagree are removed"
@@ -155,6 +271,7 @@ competition = "smtcomp"
 edition     = 2025
 track       = "Single Query — QF_LinearIntArith division (logics QF_LIA, QF_IDL, QF_LIRA)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "smtcomp-2025-single-query"
 official_hosts = "Same for all 2025 non-parallel tracks: 168 apollon nodes (Intel Xeon E3-1230 v5 @ 3.40 GHz, 4 cores per job, 33 GB RAM) of the LMU SoSy-Lab BenchCloud/BenchExec cluster"
 budgets     = "20 min wall-clock per job; memory ~30 GB; 4 cores"
 scoring     = "Sequential score (fewest wrong answers > most solved > least CPU time, CPU capped at wall limit); parallel/sat/unsat/24s winners also recognized"
@@ -184,6 +301,7 @@ competition = "smtcomp"
 edition     = 2025
 track       = "Single Query — QF_LinearRealArith division (logics QF_LRA, QF_RDL)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "smtcomp-2025-single-query"
 official_hosts = "168 apollon nodes, Intel Xeon E3-1230 v5 @ 3.40 GHz, 4 cores per job, 33 GB RAM (LMU SoSy-Lab BenchCloud)"
 budgets     = "20 min wall-clock per job; memory ~30 GB; 4 cores"
 scoring     = "Sequential score (errors > solved > CPU time, capped at wall limit)"
@@ -213,6 +331,7 @@ competition = "smtcomp"
 edition     = 2025
 track       = "Single Query — QF_Bitvec division (logic QF_BV)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "smtcomp-2025-single-query"
 official_hosts = "168 apollon nodes, Intel Xeon E3-1230 v5 @ 3.40 GHz, 4 cores per job, 33 GB RAM (LMU SoSy-Lab BenchCloud)"
 budgets     = "20 min wall-clock per job; memory ~30 GB; 4 cores"
 scoring     = "Sequential score (errors > solved > CPU time, capped at wall limit); SAT-performance winner was Bitwuzla"
@@ -242,6 +361,7 @@ competition = "smtcomp"
 edition     = 2025
 track       = "Single Query — QF_Strings division (logics QF_S, QF_SLIA, QF_SNIA)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "smtcomp-2025-single-query"
 official_hosts = "168 apollon nodes, Intel Xeon E3-1230 v5 @ 3.40 GHz, 4 cores per job, 33 GB RAM (LMU SoSy-Lab BenchCloud)"
 budgets     = "20 min wall-clock per job; memory ~30 GB; 4 cores"
 scoring     = "Sequential score (errors > solved > CPU time, capped at wall limit); Z3-Noodler-Mocha swept all five scoring schemes"
@@ -271,6 +391,7 @@ competition = "smtcomp"
 edition     = 2025
 track       = "Single Query — Equality division (quantified; logics UF, UFDT)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "smtcomp-2025-single-query"
 official_hosts = "168 apollon nodes, Intel Xeon E3-1230 v5 @ 3.40 GHz, 4 cores per job, 33 GB RAM (LMU SoSy-Lab BenchCloud)"
 budgets     = "20 min wall-clock per job; memory ~30 GB; 4 cores"
 scoring     = "Sequential score (errors > solved > CPU time, capped at wall limit); cvc5 won all five scoring schemes"
@@ -300,6 +421,7 @@ competition = "smtcomp"
 edition     = 2025
 track       = "Single Query — Arith division (quantified; logics LIA, LRA, NIA, NRA)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "smtcomp-2025-single-query"
 official_hosts = "168 apollon nodes, Intel Xeon E3-1230 v5 @ 3.40 GHz, 4 cores per job, 33 GB RAM (LMU SoSy-Lab BenchCloud)"
 budgets     = "20 min wall-clock per job; memory ~30 GB; 4 cores"
 scoring     = "Sequential score (errors > solved > CPU time, capped at wall limit); YicesQS beats cvc5 on the CPU-time tiebreak at equal solved count"
@@ -329,6 +451,7 @@ competition = "smtcomp"
 edition     = 2025
 track       = "Model Validation — QF_LinearIntArith division (sat benchmarks; produce-models)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "smtcomp-2025-model-validation"
 official_hosts = "168 apollon nodes, Intel Xeon E3-1230 v5 @ 3.40 GHz, 4 cores per job, 33 GB RAM (LMU SoSy-Lab BenchCloud)"
 budgets     = "20 min wall-clock per job for solving; model checked afterwards by the organizers' validator (rules anticipated ~15 min wall-clock for validation); memory ~30 GB"
 scoring     = "n=1 per model the official validator confirms VALID, e=1 per INVALID model; same lexicographic sequential/parallel ranking as other tracks (track best-overall winner: cvc5, 31.577255)"
@@ -359,6 +482,7 @@ competition = "smtcomp"
 edition     = 2025
 track       = "Model Validation — QF_LinearRealArith division"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "smtcomp-2025-model-validation"
 official_hosts = "168 apollon nodes, Intel Xeon E3-1230 v5 @ 3.40 GHz, 4 cores per job, 33 GB RAM (LMU SoSy-Lab BenchCloud)"
 budgets     = "20 min wall-clock solving + organizer-side model validation (~15 min anticipated); memory ~30 GB"
 scoring     = "Validated-model count with error penalty for invalid models; lexicographic sequential/parallel ranking"
@@ -387,6 +511,7 @@ competition = "smtcomp"
 edition     = 2025
 track       = "Model Validation — QF_Bitvec division"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "smtcomp-2025-model-validation"
 official_hosts = "168 apollon nodes, Intel Xeon E3-1230 v5 @ 3.40 GHz, 4 cores per job, 33 GB RAM (LMU SoSy-Lab BenchCloud)"
 budgets     = "20 min wall-clock solving + organizer-side model validation (~15 min anticipated); memory ~30 GB"
 scoring     = "Validated-model count with error penalty for invalid models; lexicographic sequential/parallel ranking"
@@ -426,6 +551,108 @@ citations = [
   "https://smt-comp.github.io/2025/rules.pdf",
 ]
 
+[[comparison]]
+id          = "smtcomp-2026-standard-tracks"
+competition = "smtcomp"
+edition     = 2026
+track       = "Single Query, Incremental, Unsat-Core, and Model-Validation — aggregate infrastructure and provisional Best Overall leaders"
+status      = "ready"
+notes       = "Machine and resource fields are final organizer configuration facts. Results are explicitly provisional: these rankings are reproduced from the raw result artifacts committed on the organizer's 2026_results branch at 9e86f266ecd80fadb3d41272a75b46c5a8497bb1 with that commit's scoring implementation; generated result pages are gitignored and the results were not yet merged into the primary site at retrieval time. The aggregate score view follows the organizer's 2025 convention: sequential Best Overall for Single Query, Unsat-Core, and Model-Validation, and parallel Best Overall for Incremental. This aggregate is not a replacement for per-track/per-division scoreboards."
+official_hosts = "The four standard tracks ran on the 168 'apollon' nodes of LMU SoSy-Lab's BenchCloud cluster. Each node has an Intel Xeon E3-1230 v5 @ 3.40 GHz CPU, 4 solver-available cores, and 33 GB RAM."
+budgets     = "Per solver/benchmark job: 1200 s wall-clock, 4 CPU cores (4800 s aggregate CPU limit), and 30720 MB memory. Unsat-core validation separately uses 1200 s, 4 cores, and 15360 MB. The writable overlay is a RAM disk and counts against the memory limit."
+scoring     = "Division scores are lexicographic: fewer errors, then more correct results (or greater unsat-core reduction), then lower wall/CPU time according to the score view; PAR-2 is also reported. Best Overall sums ((n_D/N_D)^2, or -2 for a division with an error) * log10(N_D) over entered competitive divisions, with CPU-time or wall-time tie breaking."
+corpus      = "Selection is from the 2025 SMT-LIB release under the published 2026 selection policy. The pinned provisional artifacts record exact executed identities: 45,905 distinct Single Query benchmarks (45,821 scored after excluding 84 disagreement files), 10,725 Incremental, 27,728 Unsat-Core, and 19,094 Model-Validation. No final frozen 2026 benchmark archive had been published at retrieval time."
+winners = [
+  "cvc5 — provisional Single Query sequential Best Overall rank 1, score 40.373142; 34,860 correct/solved of 45,821 scored",
+  "cvc5-cvc5-xyz — provisional Single Query sequential Best Overall rank 2, score 40.284829; 34,753 correct/solved of 45,821; globally eligible under the organizer code's across-division eligibility rule",
+  "Z3-GEX — provisional Single Query sequential Best Overall rank 3, score 15.991403; 14,018 correct and 14,242 solved of 45,821 (entered 18,036)",
+  "cvc5 — provisional Incremental parallel Best Overall rank 1, score 40.380757; 9,035/10,725 traces completed and 10,810,942/31,433,146 checks correct",
+  "SMTInterpol — provisional Incremental parallel Best Overall rank 2, score 37.773362; 6,063 traces completed, 23,813,201 checks correct, 7,931 traces entered",
+  "Yices2 — provisional Incremental parallel Best Overall rank 3, score 24.966193; 5,104 traces completed, 18,913,589 checks correct, 5,368 traces entered",
+  "cvc5 — provisional Unsat-Core sequential Best Overall rank 1, score 26.303383; 25,026/27,728 valid cores, reduction 7,009,279/18,749,354 assertions",
+  "SMTInterpol — provisional Unsat-Core sequential Best Overall rank 2, score 11.067936; 14,747 valid cores of 21,491 entered, reduction 4,069,920",
+  "OpenSMT — provisional Unsat-Core sequential Best Overall rank 3, score 8.112414; 2,324 valid cores of 2,474 entered, reduction 3,137,816",
+  "cvc5 — provisional Model-Validation sequential Best Overall rank 1, score 28.262747; 17,007 correct/valid models of 19,094",
+  "SMTInterpol — provisional Model-Validation sequential Best Overall rank 2, score 17.549562; 7,207 correct and 7,216 valid of 12,845 entered",
+  "Bitwuzla — provisional Model-Validation sequential Best Overall rank 3, score 12.575312; 10,009 correct/valid models of 10,037 entered",
+]
+citations = [
+  "https://smt-comp.github.io/2026/specs/",
+  "https://smt-comp.github.io/2026/rules.pdf",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/web/content/specs/index.md",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/web/static/rules.pdf",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/smtcomp/defs.py",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/smtcomp/benchexec.py",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/smtcomp/scoring.py",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/smtcomp/generate_website_page.py",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/data/results-sq-2026.json.gz",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/data/results-inc-2026.json.gz",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/data/results-uc-2026.json.gz",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/data/results-mv-2026.json.gz",
+]
+
+  [comparison.official]
+  cpu_model = "Intel Xeon E3-1230 v5"
+  cores     = 4
+  memory_gb = 33
+  os        = ""
+  arch      = "x86_64"
+
+[[comparison]]
+id          = "smtcomp-2026-parallel"
+competition = "smtcomp"
+edition     = 2026
+track       = "Parallel Track — provisional Best Overall"
+status      = "ready"
+notes       = "The track page describes the underlying node as 256 virtual cores and 2 TB RAM. The pinned organizer execution code and rules define the enforced per-job envelope as 128 CPU cores and 1,024,000 MB; the provisional artifact corroborates that envelope with CPU/wall ratios near 128 and memory observations near 1,024,000 MB. The CPU model, OS, and architecture are not published, so compare check deliberately cannot classify any machine as an official-equivalent replay. Rankings are reproduced with the pinned organizer scoring implementation from provisional 2026_results-branch data; generated result pages are gitignored and this is not a final-site claim."
+official_hosts = "One machine per solver, advertised with 256 virtual cores and 2 TB RAM; the official BenchExec configuration allocates 128 CPU cores and 1,024,000 MB to each solver/benchmark job. CPU model, OS, and architecture are not stated."
+budgets     = "1200 s wall-clock, 128 CPU cores (153600 s aggregate CPU limit), and 1,024,000 MB memory per solver/benchmark job."
+scoring     = "Parallel division score is lexicographic: fewer errors, more correct results, lower wall time, then lower CPU time; no sequential score is recognized for this track. Best Overall sums ((n_D/N_D)^2, or -2 for a division with an error) * log10(N_D) across entered competitive divisions."
+corpus      = "Exactly 400 distinct SMT-LIB benchmark identities are present in the pinned provisional result artifact (1,151 solver-run records). The benchmarks were selected from Single Query logics under the official policy; no final frozen materialized 2026 archive had been published at retrieval time."
+winners = [
+  "z3-parallel — provisional Best Overall rank 1, score 0.358031, 63/400 solved (37 SAT, 26 UNSAT; entered on 348 benchmarks)",
+  "Yices2 — provisional Best Overall rank 2, score 0.231060, 26/400 solved (15 SAT, 11 UNSAT; entered on 100 benchmarks)",
+  "Bitwuzla-BV_Parti — provisional Best Overall rank 3, score 0.205616, 18/400 solved (7 SAT, 11 UNSAT; entered on 52 benchmarks)",
+]
+citations = [
+  "https://smt-comp.github.io/2026/parallel_track/",
+  "https://smt-comp.github.io/2026/rules.pdf",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/web/content/parallel_track/index.md",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/web/static/rules.pdf",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/smtcomp/defs.py",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/smtcomp/benchexec.py",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/smtcomp/scoring.py",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/smtcomp/generate_website_page.py",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/data/results-parallel-2026.json.gz",
+]
+
+  # CPU identity is intentionally unknown. Even a >=128-core, >=1 TB host
+  # remains laptop-only because the official machine cannot be identified.
+  [comparison.official]
+  cpu_model = ""
+  cores     = 128
+  memory_gb = 1024
+  os        = ""
+  arch      = ""
+
+[[comparison]]
+id          = "smtcomp-2026-cloud"
+competition = "smtcomp"
+edition     = 2026
+track       = "Cloud Track — separately scheduled post-workshop event"
+status      = "unsupported"
+notes       = "Fail-closed entry. The dedicated 2026 page schedules preliminary and final calls for August 8 and August 22 and names the AWS competition harness, but it gives only a 2024 hardware reference (100 m4.4xlarge nodes), not the actual 2026 node count or instance type. The Cloud instructions were added in July after the Parallel page's March statement that Cloud was not part of the main event, so the dedicated page is treated as the later source for this separately scheduled event. No [comparison.official] block is provided, and AY has no distributed multi-node SMT engine."
+official_hosts = "unknown"
+budgets     = "The page recommends a 200 s Cloud timeout, mirroring SAT-COMP; it does not state a final enforced 2026 resource envelope."
+scoring     = "pending publication for the separately scheduled event"
+corpus      = "pending publication; the harness page says benchmark inputs are uploaded to S3"
+winners     = []
+citations = [
+  "https://smt-comp.github.io/2026/cloud_track/",
+  "https://github.com/SMT-COMP/smt-comp.github.io/commit/7a4510815287b2a9690485d9838eeea85f1ec385",
+  "https://github.com/SMT-COMP/smt-comp.github.io/blob/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/web/content/cloud_track/index.md",
+]
+
 # unconfirmed (smt): 1) Exact enforced per-job memory limit: rules only say 'on the order of 30 GB' (nodes have 33 GB); the precise BenchExec memlimit value was not published anywhere I could find. 2) Exact submitted version numbers for Yices2, Bitwuzla, Bitwuzla-MachBV, Z3-alpha, Z3-Noodler, Z3-Noodler-Mocha and YicesQS are not stated on the competition site or their Zenodo records; the authoritative identifier is th
 
 [[comparison]]
@@ -434,6 +661,7 @@ competition = "chccomp"
 edition     = 2026
 track       = "LIA-Lin (Solver Track, check-sat)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "chc-comp-2026-benchmarks"
 official_hosts = "SoSy-Lab VCloud (LMU Munich; hosts 'cloud-*'): Intel Xeon (Skylake) @ 2000 MHz, 32 cores and 131894 MB RAM per node; Linux 6.8.0-60-generic; harness BenchExec 3.35-dev via vcloud-benchmark.py"
 budgets     = "Per job: 1800 s time limit, 30000 MB memory, 8 CPU cores (from BenchExec run metadata in official result tables)"
 scoring     = "Score = number of correctly solved benchmarks; official results page shows toggle 'Ignore wrong results' (default) / 'Punish wrong results' / 'Assume all correct'; hors-concours solvers (Spacer/Z3) excluded from medals; ranking methodology per CHC-COMP 2022 report (DOI 10.4204/EPTCS.373.5)"
@@ -465,6 +693,7 @@ competition = "chccomp"
 edition     = 2026
 track       = "LIA-Nonlin (labelled 'LIA' in official 2026 result tables / LIA.set)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "chc-comp-2026-benchmarks"
 official_hosts = "Same as LIA-Lin: SoSy-Lab VCloud, Intel Xeon (Skylake) @ 2000 MHz, 32 cores / 131894 MB RAM per node, BenchExec 3.35-dev"
 budgets     = "1800 s, 30000 MB, 8 CPU cores per job"
 scoring     = "Score = correctly solved count (default 'ignore wrong results' view); hors-concours excluded from medals"
@@ -494,6 +723,7 @@ competition = "chccomp"
 edition     = 2026
 track       = "LIA-Lin-Arrays (Solver Track)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "chc-comp-2026-benchmarks"
 official_hosts = "Same VCloud environment as above"
 budgets     = "1800 s, 30000 MB, 8 CPU cores per job"
 scoring     = "Score = correctly solved count (default view); hors-concours excluded"
@@ -522,6 +752,7 @@ competition = "chccomp"
 edition     = 2026
 track       = "LIA-Nonlin-Arrays (labelled 'LIA-Arrays' in official 2026 result tables)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "chc-comp-2026-benchmarks"
 official_hosts = "Same VCloud environment as above"
 budgets     = "1800 s, 30000 MB, 8 CPU cores per job"
 scoring     = "Score = correctly solved count (default view); hors-concours excluded"
@@ -550,6 +781,7 @@ competition = "chccomp"
 edition     = 2026
 track       = "ADT-LIA (Solver Track)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "chc-comp-2026-benchmarks"
 official_hosts = "Same VCloud environment as above"
 budgets     = "1800 s, 30000 MB, 8 CPU cores per job"
 scoring     = "Score = correctly solved count (default view); hors-concours excluded"
@@ -579,6 +811,7 @@ competition = "chccomp"
 edition     = 2026
 track       = "ADT-LIA-Arrays (Solver Track)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "chc-comp-2026-benchmarks"
 official_hosts = "Same VCloud environment as above"
 budgets     = "1800 s, 30000 MB, 8 CPU cores per job"
 scoring     = "Score = correctly solved count (default view); hors-concours excluded. (Model Track ran in parallel with model validation by Z3 4.16.0/cvc5 1.3.3/Princess 2025-11-17; Eldarica won Model Track overall)"
@@ -833,6 +1066,7 @@ competition = "mcc"
 edition     = 2025
 track       = "mc — Track 1: Model Counting, Ranking A (exact, arbitrary precision)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "mcc-2025-track1-public"
 notes       = "Edition label: MC 2025"
 official_hosts = "Evaluation platform hosted by SoSy-Lab, LMU Munich; (pre-)evaluation run at Swedish National Supercomputer Centre (NSC) Tetralith cluster — nodes: 2x Intel Xeon Gold 6130 (32 cores/node), 96 GiB standard nodes (384 GiB fat), 100 Gbps Omni-Path"
 budgets     = "3600 s runtime, 32 GB memory per job; temp disk allowed for preprocessing; per-job core allocation not stated on the official page"
@@ -865,6 +1099,7 @@ competition = "mcc"
 edition     = 2025
 track       = "wmc — Track 2 (weighted MC) was OMITTED in 2025 (2024 results too similar to Track 4); nearest track: Track 4 Projected Weighted Model Counting, Rankings A/B (exact)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "mcc-2025-track4-public"
 notes       = "Edition label: MC 2025"
 official_hosts = "Same as Track 1: SoSy-Lab (LMU Munich) hosted platform; NSC Tetralith cluster (2x Intel Xeon Gold 6130, 32 cores, 96 GiB/node)"
 budgets     = "3600 s runtime, 32 GB memory per job"
@@ -894,6 +1129,7 @@ competition = "mcc"
 edition     = 2025
 track       = "pmc — Track 3: Projected Model Counting, Ranking A (exact)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "mcc-2025-track3-public"
 notes       = "Edition label: MC 2025"
 official_hosts = "Same as Track 1: SoSy-Lab (LMU Munich) hosted platform; NSC Tetralith cluster (2x Intel Xeon Gold 6130, 32 cores, 96 GiB/node)"
 budgets     = "3600 s runtime, 32 GB memory per job"
@@ -923,6 +1159,7 @@ competition = "mznc"
 edition     = 2025
 track       = "Fixed (FD search)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "minizinc-challenge-2025"
 official_hosts = "Intel Xeon Platinum 8260; Ubuntu 24.04 LTS Docker containers; FD/FREE config: 1 core, 16 GiB; cloud/instance type not published"
 budgets     = "20 min wall clock per instance (includes MiniZinc-to-FlatZinc compilation); 16 GiB memory (FD class); MiniZinc 2.9.3; 100 instances"
 scoring     = "Complete scoring (Borda-style pairwise): per instance, 1 point vs each solver strictly beaten (better solution/optimality proof/solved vs unsolved); quality ties split the point by time ratio. 2026-01-14 amendment fixed undetected incorrect optimality claims"
@@ -952,6 +1189,7 @@ competition = "mznc"
 edition     = 2025
 track       = "Free search"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "minizinc-challenge-2025"
 official_hosts = "Intel Xeon Platinum 8260; Ubuntu 24.04 LTS; 1 core, 16 GiB (FREE class)"
 budgets     = "20 min wall clock per instance incl. compilation; 16 GiB"
 scoring     = "Complete scoring (Borda-style pairwise, time-split ties)"
@@ -980,6 +1218,7 @@ competition = "mznc"
 edition     = 2025
 track       = "Parallel search"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "minizinc-challenge-2025"
 official_hosts = "Intel Xeon Platinum 8260; Ubuntu 24.04 LTS; PAR/OPEN config: 8 cores, 64 GiB"
 budgets     = "20 min wall clock per instance incl. compilation; 8 cores, 64 GiB"
 scoring     = "Complete scoring (Borda-style pairwise, time-split ties)"
@@ -1008,6 +1247,7 @@ competition = "mznc"
 edition     = 2025
 track       = "Open class — NO MEDAL AWARDED (no portfolio-solver entrants at deadline); Local Search medals instead: Gold OR-Tools CP-SAT LS (https://github.com/google/or-tools, Apache-2.0), Silver Yuck (https://github.com/informarte/yuck), Bronze Atlantis (https://github.com/astra-uu-se/atlantis)"
 status      = "ready"  # runner lands post-0.1.0; entry is citable data
+corpus_name = "minizinc-challenge-2025"
 official_hosts = "Intel Xeon Platinum 8260; Ubuntu 24.04 LTS; 8 cores, 64 GiB (OPEN/LS multi-core config)"
 budgets     = "20 min wall clock per instance incl. compilation; 8 cores, 64 GiB"
 scoring     = "Complete scoring (Borda-style pairwise, time-split ties)"
@@ -1059,6 +1299,7 @@ id          = "xcsp3-2025-main"
 competition = "xcsp3"
 edition     = 2025
 track       = "CSP / COP over XCSP3-core (integer variables)"
+corpus_name = "xcsp3-2025-instances"
 official_hosts = "unknown (proceedings arXiv:2511.06918; specs not yet extracted)"
 budgets     = "unknown"
 scoring     = "per-track rankings; CoSoCo among the 2025 medalists; ACE off-competition"
@@ -1077,6 +1318,7 @@ id          = "casc-2025-fof"
 competition = "casc"
 edition     = 2025
 track       = "First-order divisions (TPTP syntax)"
+corpus_name = "casc-2025-problems"
 official_hosts = "unknown (CASC 2025 at CADE-30; specs not yet extracted)"
 budgets     = "unknown"
 scoring     = "problems solved per division, CASC rules"

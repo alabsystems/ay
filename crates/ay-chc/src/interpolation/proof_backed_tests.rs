@@ -273,31 +273,11 @@ fn test_proof_derived_interpolant_eq_diffvar_guarded_network() {
     }
 }
 
-/// Manual repro harness (inc-17): replays a dumped proof-solve script
-/// (`AY_PROOF_ITP_DUMP` format) through `try_proof_derived_interpolant`.
-///
-/// Env: `AY_REPRO_SCRIPT=<path>` (assert split read from the `_a<N>_b<M>`
-/// filename suffix or `AY_REPRO_A_COUNT`), `AY_REPRO_BUDGET_MS` (default
-/// 20000). Prints wall time + outcome; run with `--ignored --nocapture`.
-#[test]
-#[ignore = "manual repro harness; set AY_REPRO_SCRIPT"]
-fn repro_proof_itp_replay() {
-    let path = std::env::var("AY_REPRO_SCRIPT").expect("set AY_REPRO_SCRIPT");
-    let text = std::fs::read_to_string(&path).expect("readable script");
-    let a_count: usize = std::env::var("AY_REPRO_A_COUNT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .or_else(|| {
-            let stem = std::path::Path::new(&path).file_stem()?.to_str()?;
-            let a_part = stem.split("_a").nth(1)?;
-            a_part.split("_b").next()?.parse().ok()
-        })
-        .expect("a-count from filename or AY_REPRO_A_COUNT");
-    let budget_ms: u64 = std::env::var("AY_REPRO_BUDGET_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20_000);
-
+fn replay_proof_script(
+    text: &str,
+    a_count: usize,
+    budget: Duration,
+) -> Option<(ChcExpr, Vec<ChcExpr>, Vec<ChcExpr>, FxHashSet<String>)> {
     // Variable sorts from the (machine-generated) declare-const lines.
     let mut var_sorts: FxHashMap<String, ChcSort> = FxHashMap::default();
     for line in text.lines() {
@@ -319,7 +299,7 @@ fn repro_proof_itp_replay() {
     // Parse asserts via the ay-dpll frontend, convert back to ChcExpr with
     // the production converter.
     let mut solver = Solver::try_new(Logic::QfLia).expect("solver");
-    let asserts = solver.parse_smtlib2(&text).expect("parseable dump");
+    let asserts = solver.parse_smtlib2(text).expect("parseable dump");
     assert!(a_count < asserts.len(), "split must leave a non-empty B");
     let mut exprs: Vec<ChcExpr> = Vec::with_capacity(asserts.len());
     for &t in &asserts {
@@ -342,30 +322,43 @@ fn repro_proof_itp_replay() {
         .filter(|n| a_vars.contains(n))
         .collect();
 
-    let t0 = Instant::now();
-    let result = try_proof_derived_interpolant(
-        a_constraints,
-        b_constraints,
-        &shared_vars,
-        Duration::from_millis(budget_ms),
+    let result = try_proof_derived_interpolant(a_constraints, b_constraints, &shared_vars, budget);
+    result.map(|itp| {
+        (
+            itp,
+            a_constraints.to_vec(),
+            b_constraints.to_vec(),
+            shared_vars,
+        )
+    })
+}
+
+/// Replays a small proof-solve dump through the production parser, converter,
+/// proof traversal, and Craig validator. Captured production dumps are handled
+/// by the bounded `proof_interpolant_replay` example rather than ambient test
+/// configuration.
+#[test]
+fn repro_proof_itp_replay() {
+    const BUILTIN: &str = r#"
+(set-logic QF_LIA)
+(declare-const g Bool)
+(declare-const b Bool)
+(declare-const h Bool)
+(assert g)
+(assert (or (not g) b))
+(assert (or (not b) h))
+(assert (not h))
+"#;
+
+    let (itp, a_constraints, b_constraints, shared_vars) =
+        replay_proof_script(BUILTIN, 2, Duration::from_secs(10))
+            .expect("built-in proof replay must serve an interpolant");
+    assert!(
+        !itp.vars().iter().any(|v| v.name.starts_with("ay_eqdv_p")),
+        "definitional variables must not survive: {itp:?}"
     );
-    let dt = t0.elapsed();
-    match result {
-        Some(itp) => {
-            assert!(
-                !itp.vars().iter().any(|v| v.name.starts_with("ay_eqdv_p")),
-                "definitional variables must not survive: {itp:?}"
-            );
-            println!(
-                "REPRO: served VERIFIED proof interpolant in {:.3}s ({} a / {} b): {itp:?}",
-                dt.as_secs_f64(),
-                a_constraints.len(),
-                b_constraints.len()
-            );
-        }
-        None => println!(
-            "REPRO: fallback (no proof interpolant) after {:.3}s",
-            dt.as_secs_f64()
-        ),
-    }
+    assert!(
+        is_valid_interpolant(&a_constraints, &b_constraints, &itp, &shared_vars),
+        "replayed interpolant must satisfy the Craig properties: {itp:?}"
+    );
 }

@@ -764,6 +764,47 @@ impl ArraySolver<'_> {
             };
         }
 
+        // M2/M3: model-based read-over-weak-path lemmas (Christ/Hoenicke weak
+        // equivalence) — the LAST-RESORT completeness net. Every store-chain
+        // ROW2 pass, the specialized store-difference / permutation / nested-
+        // select / disjunctive-store-target / array-equality checks, and the
+        // N-O interface-equality generation above have all passed, so the
+        // solver is about to declare this model SAT. The weak graph gives it a
+        // final read-over-weak-eq audit across arbitrary weak paths (through
+        // strong array equalities and multi-store chains) that direct store-
+        // chain resolution can miss; a surviving violation is a genuine
+        // conflict, not a SAT model. Running only here (not per round) keeps it
+        // near-zero overhead, and it composes with the #6546 snapshot: the
+        // snapshot is saved below ONLY if this audit also finds nothing.
+        // BUDGETED so a firing round can never flood.
+        //
+        // Empirical note: AY's eager store-chain + equality-merge resolution
+        // already decides these conflicts earlier on the current corpus, so
+        // this net rarely fires there (its firing is covered by the
+        // `tests/weak_lemmas.rs` unit witnesses). It is kept live as the sound
+        // completeness backstop and the lazy-weak-eq parity with z3/SMTInterpol;
+        // it is NOT promoted to primary because ROW2 is the better search driver
+        // (a primary-position trial regressed `pointer-safe-5` into a timeout).
+        if self.interrupted_or_deadline() {
+            return TheoryResult::Unknown;
+        }
+        let weak_path_lemmas = {
+            let _eq_paths_cache_guard = eq_paths_cache::activate();
+            self.read_over_weak_path_conflict_lemmas()
+        };
+        if self.interrupted_or_deadline() {
+            return TheoryResult::Unknown;
+        }
+        let weak_path_lemmas = self.filter_unapplied_final_check_lemmas(weak_path_lemmas);
+        if !weak_path_lemmas.is_empty() {
+            tracing::debug!(
+                count = weak_path_lemmas.len(),
+                "arrays final_check: read-over-weak-path lemma batch"
+            );
+            self.conflict_count += 1;
+            return TheoryResult::NeedLemmas(weak_path_lemmas);
+        }
+
         // All sub-checks passed — save snapshot for short-circuit (#6546).
         self.final_check_snapshot = Some(fc_snapshot);
         TheoryResult::Sat
@@ -815,6 +856,26 @@ impl ArraySolver<'_> {
             return None;
         }
 
+        // Precompute the reads (index, select) per active-array class for the
+        // shared-read distinctness prune in the loop below. `select(a, i) ≠
+        // select(b, i)` provable at a shared index FORCES `a ≠ b` by
+        // extensionality, so such a pair can never be equal and needs no
+        // interface-equality split. Without this, N arrays pairwise-
+        // distinguished only by their reads spawn O(N²) interface equalities
+        // (MAX_INTERFACE_EQS_PER_CALL/round) that never converge — turning a
+        // trivially-SAT problem into `unknown` past ~20 arrays.
+        // Both the shared-read prune and the free-array skip below read this
+        // map. The free-array test must see every direct read; otherwise a
+        // read-carrying array could be misclassified as free and lose a
+        // genuinely needed split.
+        let mut reads_by_array: HashMap<TermId, Vec<(TermId, TermId)>> = HashMap::default();
+        for (&sel_term, &(arr, idx)) in &self.select_cache {
+            reads_by_array
+                .entry(self.equiv_class_representative(arr))
+                .or_default()
+                .push((idx, sel_term));
+        }
+
         let mut requests = Vec::new();
 
         // O(n^2) pairwise comparison, budgeted.
@@ -845,6 +906,42 @@ impl ArraySolver<'_> {
 
                 // Already known disequal — no need to split (Z3: `!ctx.is_diseq`).
                 if self.known_distinct(a, b) {
+                    continue;
+                }
+
+                // Provably distinct by a shared read (extensionality
+                // contrapositive): if `a` and `b` are read at a common index
+                // with provably-distinct values, they cannot be equal — the
+                // split is useless. Sound: only fires when the select
+                // disequality is PROVABLE, so a genuinely-undecided pair (which
+                // N-O still needs to split) is never suppressed. This is the
+                // array-level `known_distinct` that the raw diseq_set misses
+                // when only the reads, not the arrays, were asserted distinct.
+                if self.arrays_distinct_by_shared_read(&reads_by_array, a, b) {
+                    continue;
+                }
+
+                // Free-array lazy skip: a FREE array variable — a plain array
+                // `Var` with no DIRECT reads and no equality edges — has no
+                // behaviour that can FORCE its equality with anything, and any
+                // model can keep it distinct (its stores read as fresh
+                // `select(base, k)` values), so an interface-equality split
+                // involving it can never change satisfiability and is pure
+                // wasted search. This is Z3's own discipline: `mk_interface_eqs`
+                // splits only SHARED arrays (`collect_shared_vars`), never
+                // theory-internal free store bases. AY previously split every
+                // select/store base: N independent `select (store bₖ iₖ vₖ) j`
+                // terms spawned O(N²) useless `bₖ = bₘ` splits — 1018 interface
+                // eqs / 192k decisions at N=105 and a solid timeout by N=200,
+                // where this skip yields 0 interface eqs / 205 decisions / ~2s
+                // (verdicts unchanged, matching z3). Soundness: pairs that are
+                // equal, provably distinct, or related through ANY equality
+                // edge / read are all excluded by the guards above and the
+                // free-array test below, so only genuinely unconstrained
+                // arrays are skipped.
+                if self.array_is_interface_free(&reads_by_array, a)
+                    || self.array_is_interface_free(&reads_by_array, b)
+                {
                     continue;
                 }
 
@@ -920,6 +1017,60 @@ impl ArraySolver<'_> {
         } else {
             Some(requests)
         }
+    }
+
+    /// Whether `a` is a FREE array for interface-equality purposes: a plain
+    /// array `Var` with no DIRECT reads (`reads_by_array` has no entry for its
+    /// class) and no equality edges (`eq_adj`, which includes external
+    /// cross-theory equalities after `rebuild_assign_indices`). Such an array
+    /// is observed only through stores over it; nothing can force its equality
+    /// with another array, and a model can always keep it distinct — so an
+    /// interface split with it is useless. Conservative: restricted to `Var`
+    /// (excludes stores / const-arrays / maps, whose structure can force
+    /// equalities the split loop must still surface).
+    fn array_is_interface_free(
+        &self,
+        reads_by_array: &HashMap<TermId, Vec<(TermId, TermId)>>,
+        a: TermId,
+    ) -> bool {
+        matches!(self.terms.get(a), TermData::Var(..))
+            && reads_by_array.get(&a).is_none_or(|reads| reads.is_empty())
+            && !self.eq_adj.contains_key(&a)
+    }
+
+    /// Whether array classes `a` and `b` are provably distinct because they are
+    /// read at a common (known-equal) index with provably-distinct values — the
+    /// extensionality contrapositive `select(a, i) ≠ select(b, i) ⟹ a ≠ b`.
+    ///
+    /// Used to suppress useless Nelson-Oppen interface-equality splits between
+    /// arrays that cannot be equal. Sound: it returns `true` only when the
+    /// select disequality is *provable* (`explain_distinct_if_provable`, from
+    /// asserted facts — not the model), so a pair that could still be equal is
+    /// never suppressed and no needed split is dropped.
+    ///
+    /// `reads_by_array` maps each active array class to its `(index, select)`
+    /// reads. Cost is `O(reads(a) × reads(b))`, negligible when arrays have few
+    /// reads (the common case) and paid at most once per interface-eq pair.
+    fn arrays_distinct_by_shared_read(
+        &self,
+        reads_by_array: &HashMap<TermId, Vec<(TermId, TermId)>>,
+        a: TermId,
+        b: TermId,
+    ) -> bool {
+        let (Some(reads_a), Some(reads_b)) = (reads_by_array.get(&a), reads_by_array.get(&b))
+        else {
+            return false;
+        };
+        for &(idx_a, sel_a) in reads_a {
+            for &(idx_b, sel_b) in reads_b {
+                if self.known_equal(idx_a, idx_b)
+                    && self.explain_distinct_if_provable(sel_a, sel_b).is_some()
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Check if `(= a b)` is a self-store pattern that mk_eq will simplify.

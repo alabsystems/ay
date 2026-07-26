@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 serde_json.workspace = true
 serde.workspace = true
+toml.workspace = true
 rusqlite.workspace = true
 rayon.workspace = true
 sha2.workspace = true
@@ -21,7 +22,10 @@ wait-timeout.workspace = true
 ay-proof-complexity.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["fs", "time"] }
+nix = { workspace = true, features = ["fs", "time", "user"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ay-sys.workspace = true
 
 [dev-dependencies]
 ay-test-support.workspace = true

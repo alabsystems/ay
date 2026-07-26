@@ -779,17 +779,31 @@ fn float_leaf_farkas(
         fstats::FLOAT_STATUS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return None;
     }
+    if let Some(cert) = exact_farkas_from_float_ray(work, &cand.farkas) {
+        fstats::FLOAT_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Some(cert);
+    }
+    fstats::FLOAT_VERIFY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    None
+}
+
+/// Exactify a phase-I row ray and verify the resulting contradiction against
+/// `work`. The float solver's ray is advice only: both possible sign
+/// conventions are tried, and only an independently exact-verified Farkas
+/// certificate is returned.
+pub(crate) fn exact_farkas_from_float_ray(work: &Model, ray: &[f64]) -> Option<FarkasCertificate> {
+    if ray.len() != work.num_rows() {
+        return None;
+    }
     // The phase-I sign convention is not pinned down (see
     // `safe_farkas_proves_empty`); try the ray both ways.
     for sign in [1.0f64, -1.0] {
-        if let Some(cert) = ray_to_farkas(work, &cand.farkas, sign) {
+        if let Some(cert) = ray_to_farkas(work, ray, sign) {
             if cert.verify(work).is_ok() {
-                fstats::FLOAT_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(cert);
             }
         }
     }
-    fstats::FLOAT_VERIFY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     None
 }
 

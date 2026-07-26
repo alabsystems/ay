@@ -1805,11 +1805,22 @@ fn test_lia_reset_timings_clears_and_reaccumulates() {
     assert_eq!(t.hnf, std::time::Duration::ZERO);
     assert_eq!(t.dioph, std::time::Duration::ZERO);
 
-    // Re-accumulates on the next check.
-    let _ = solver.check();
+    // Re-accumulates on subsequent checks. A single check on a one-constraint
+    // problem can complete inside the clock's resolution and record exactly
+    // ZERO, which made the single-shot form flaky in release (~1 in 20). Retry a
+    // bounded number of times: re-accumulation is the property under test, and
+    // any working accumulator crosses a nonzero duration well before the cap.
+    let mut accumulated = std::time::Duration::ZERO;
+    for _ in 0..100 {
+        let _ = solver.check();
+        accumulated = solver.timings().simplex;
+        if accumulated > std::time::Duration::ZERO {
+            break;
+        }
+    }
     assert!(
-        solver.timings().simplex > std::time::Duration::ZERO,
-        "timings must re-accumulate after reset+check"
+        accumulated > std::time::Duration::ZERO,
+        "timings must re-accumulate after reset+check (100 checks still totalled zero)"
     );
 }
 

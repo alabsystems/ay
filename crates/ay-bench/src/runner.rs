@@ -6,7 +6,9 @@
 //! natively in Rust, and applies competition-standard scoring.
 
 use crate::error::{BenchError, Result, WithContext};
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -52,23 +54,209 @@ fn repo_root() -> PathBuf {
     repo_root_public()
 }
 
+const BENCH_CORPUS_ROOT_ENV: &str = "AY_BENCH_CORPUS_ROOT";
+
 /// Public wrapper: walk parents looking for the repo root (contains both
 /// `Cargo.toml` and an `evals/` directory). Shared with the harvester module.
 #[must_use]
 pub fn repo_root_public() -> PathBuf {
-    let mut dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    loop {
-        if dir.join("Cargo.toml").exists() && dir.join("evals").exists() {
-            return dir;
-        }
-        if !dir.pop() {
-            return std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut starts = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        starts.push(cwd);
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            starts.push(parent.to_path_buf());
         }
     }
+    for start in starts {
+        for ancestor in start.ancestors() {
+            if ancestor.join("Cargo.toml").is_file() && ancestor.join("evals").is_dir() {
+                return ancestor.to_path_buf();
+            }
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn registry_dir() -> PathBuf {
     repo_root().join("evals").join("registry")
+}
+
+/// Resolve the optional supervisor-owned corpus repository.
+///
+/// This environment variable is deliberately narrower than a general alternate
+/// repository root: eval registry YAML and selection/control manifests continue
+/// to come from the candidate worktree. Only normalized `benchmarks/...`
+/// payload paths are remapped below this root.
+fn shared_corpus_root_from(configured: Option<&OsStr>) -> Result<Option<PathBuf>> {
+    let Some(configured) = configured else {
+        return Ok(None);
+    };
+    if configured.is_empty() {
+        return Err(BenchError::InvalidArgs {
+            reason: format!("{BENCH_CORPUS_ROOT_ENV} must not be empty"),
+        });
+    }
+    let path = PathBuf::from(configured);
+    if !path.is_absolute() {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "{BENCH_CORPUS_ROOT_ENV} must be an absolute repository root, got {}",
+                path.display()
+            ),
+        });
+    }
+    let metadata = std::fs::symlink_metadata(&path).with_bench_context(|| {
+        format!(
+            "inspecting {BENCH_CORPUS_ROOT_ENV} repository root {}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_dir() {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "{BENCH_CORPUS_ROOT_ENV} must name a non-symlink directory: {}",
+                path.display()
+            ),
+        });
+    }
+    let canonical = std::fs::canonicalize(&path).with_bench_context(|| {
+        format!(
+            "canonicalizing {BENCH_CORPUS_ROOT_ENV} repository root {}",
+            path.display()
+        )
+    })?;
+    if canonical != path {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "{BENCH_CORPUS_ROOT_ENV} must already be canonical: {} resolves to {}",
+                path.display(),
+                canonical.display()
+            ),
+        });
+    }
+    let cargo = path.join("Cargo.toml");
+    let benchmarks = path.join("benchmarks");
+    let cargo_metadata = std::fs::symlink_metadata(&cargo).with_bench_context(|| {
+        format!(
+            "inspecting {BENCH_CORPUS_ROOT_ENV} repository marker {}",
+            cargo.display()
+        )
+    })?;
+    let benchmarks_metadata = std::fs::symlink_metadata(&benchmarks).with_bench_context(|| {
+        format!(
+            "inspecting {BENCH_CORPUS_ROOT_ENV} benchmark root {}",
+            benchmarks.display()
+        )
+    })?;
+    if !cargo_metadata.file_type().is_file() || !benchmarks_metadata.file_type().is_dir() {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "{BENCH_CORPUS_ROOT_ENV} must contain a regular Cargo.toml and non-symlink benchmarks directory: {}",
+                path.display()
+            ),
+        });
+    }
+    Ok(Some(path))
+}
+
+fn shared_corpus_root() -> Result<Option<PathBuf>> {
+    shared_corpus_root_from(std::env::var_os(BENCH_CORPUS_ROOT_ENV).as_deref())
+}
+
+fn normalized_repo_relative_path<'a>(value: &'a str, label: &str) -> Result<&'a Path> {
+    let path = Path::new(value);
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        let std::path::Component::Normal(segment) = component else {
+            return Err(BenchError::InvalidArgs {
+                reason: format!("{label} must be a normalized repo-relative path: {value:?}"),
+            });
+        };
+        let Some(segment) = segment.to_str() else {
+            return Err(BenchError::InvalidArgs {
+                reason: format!("{label} is not valid UTF-8: {value:?}"),
+            });
+        };
+        if segment.chars().any(char::is_control) {
+            return Err(BenchError::InvalidArgs {
+                reason: format!("{label} contains control characters: {value:?}"),
+            });
+        }
+        normalized.push(segment);
+    }
+    if normalized.as_os_str().is_empty() || normalized.as_os_str() != path.as_os_str() {
+        return Err(BenchError::InvalidArgs {
+            reason: format!("{label} must be a normalized repo-relative path: {value:?}"),
+        });
+    }
+    Ok(path)
+}
+
+fn normalized_benchmark_relative_path<'a>(value: &'a str, label: &str) -> Result<&'a Path> {
+    let path = normalized_repo_relative_path(value, label)?;
+    if path
+        .components()
+        .next()
+        .and_then(|component| match component {
+            std::path::Component::Normal(segment) => segment.to_str(),
+            _ => None,
+        })
+        != Some("benchmarks")
+    {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "{label} must remain below benchmarks/ when {BENCH_CORPUS_ROOT_ENV} is set: {value:?}"
+            ),
+        });
+    }
+    Ok(path)
+}
+
+fn remap_benchmark_input(
+    candidate_root: &Path,
+    shared_root: Option<&Path>,
+    value: &str,
+    label: &str,
+) -> Result<PathBuf> {
+    let Some(shared_root) = shared_root else {
+        return Ok(candidate_root.join(value));
+    };
+    let relative = normalized_benchmark_relative_path(value, label)?;
+    Ok(shared_root.join(relative))
+}
+
+fn eval_benchmark_directories(
+    spec: &EvalSpec,
+    candidate_root: &Path,
+    domain: &str,
+    shared_root: Option<&Path>,
+) -> Result<(PathBuf, PathBuf)> {
+    let configured = spec
+        .inputs
+        .as_ref()
+        .and_then(|inputs| inputs.benchmarks_dir.as_deref());
+    let relative_default = format!("benchmarks/{domain}");
+    let candidate = configured
+        .map(|directory| expand_tilde(directory, candidate_root))
+        .unwrap_or_else(|| candidate_root.join(&relative_default));
+    let source = match (configured, shared_root) {
+        (Some(directory), Some(_)) => remap_benchmark_input(
+            candidate_root,
+            shared_root,
+            directory,
+            "eval benchmarks_dir",
+        )?,
+        (Some(directory), None) => expand_tilde(directory, candidate_root),
+        (None, _) => remap_benchmark_input(
+            candidate_root,
+            shared_root,
+            &relative_default,
+            "inferred eval benchmarks_dir",
+        )?,
+    };
+    Ok((source, candidate))
 }
 
 fn discover_evals() -> Result<Vec<(String, EvalSpec)>> {
@@ -652,15 +840,19 @@ fn parse_eval_spec_minimal(text: &str, path: &Path) -> Result<EvalSpec> {
 }
 
 fn find_solver(name_or_path: &str) -> Option<PathBuf> {
+    let resolve = |candidate: &Path| {
+        if !is_executable_file(candidate) {
+            return None;
+        }
+        let canonical = std::fs::canonicalize(candidate).ok()?;
+        is_executable_file(&canonical).then_some(canonical)
+    };
     let requested = Path::new(name_or_path);
     if requested.is_absolute() || name_or_path.contains(std::path::MAIN_SEPARATOR) {
-        return is_executable_file(requested).then(|| requested.to_path_buf());
+        return resolve(requested);
     }
     let search_path = std::env::var_os("PATH")?;
-    std::env::split_paths(&search_path).find_map(|directory| {
-        let candidate = directory.join(name_or_path);
-        is_executable_file(&candidate).then_some(candidate)
-    })
+    std::env::split_paths(&search_path).find_map(|directory| resolve(&directory.join(name_or_path)))
 }
 
 fn resolve_configured_reference_solver(name_or_path: &str) -> Result<(String, PathBuf)> {
@@ -757,10 +949,24 @@ fn infer_division(eval_id: &str) -> String {
 fn infer_track(eval_id: &str) -> String {
     if eval_id.contains("extra-small-lia") {
         "LIA-extra-small".to_string()
+    } else if eval_id.contains("adt-lia-arrays") {
+        "ADT-LIA-Arrays".to_string()
+    } else if eval_id.contains("adt-lia") {
+        "ADT-LIA".to_string()
+    } else if eval_id.contains("lia-lin-arrays") {
+        "LIA-Lin-Arrays".to_string()
+    } else if eval_id.contains("lia-nonlin-arrays") {
+        "LIA-Arrays".to_string()
     } else if eval_id.contains("lia-lin") {
         "LIA-Lin".to_string()
-    } else if eval_id.contains("lia") {
+    } else if eval_id.contains("lia-nonlin") || eval_id.ends_with("-lia") {
         "LIA".to_string()
+    } else if eval_id.contains("lra-lin") || eval_id.ends_with("-lra") {
+        "LRA-Lin".to_string()
+    } else if eval_id.contains("bv-lin") {
+        "BV-Lin".to_string()
+    } else if eval_id.contains("bv-nonlin") || eval_id.ends_with("-bv") {
+        "BV".to_string()
     } else {
         "unknown".to_string()
     }
@@ -806,6 +1012,35 @@ fn competition_timeout(eval_id: &str) -> f64 {
     infer_competition(eval_id).standard_timeout()
 }
 
+fn eval_timeout(eval_id: &str, inputs: Option<&EvalInputs>, args: &RunArgs) -> Result<f64> {
+    let standard_timeout = competition_timeout(eval_id);
+    if args.competition
+        && args
+            .timeout
+            .is_some_and(|timeout| timeout != standard_timeout)
+    {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "--competition timeout override for eval {eval_id} must equal the standard \
+                 competition timeout ({standard_timeout}s)"
+            ),
+        });
+    }
+    let timeout = if let Some(timeout) = args.timeout {
+        timeout
+    } else if args.competition {
+        standard_timeout
+    } else {
+        inputs.and_then(|input| input.timeout_sec).unwrap_or(60.0)
+    };
+    if !timeout.is_finite() || timeout <= 0.0 {
+        return Err(BenchError::InvalidArgs {
+            reason: format!("timeout for eval {eval_id} must be finite and positive"),
+        });
+    }
+    Ok(timeout)
+}
+
 // ===================================================================
 // Eval execution
 // ===================================================================
@@ -844,6 +1079,12 @@ pub struct RunArgs {
     pub sat_ai_class: Option<String>,
     /// SAT solver variant passed to ay as `--sat-variant` for SAT runs.
     pub sat_variant: Option<String>,
+    /// Internal campaign-profile cap applied after `_oom_guard.py` admission.
+    /// This can only reduce the admitted memory envelope.
+    pub resource_memory_cap_mib: Option<usize>,
+    /// Internal campaign-profile cap applied after `_oom_guard.py` admission.
+    /// This can only reduce the exported `NBCORE` budget.
+    pub resource_core_cap: Option<usize>,
 }
 
 /// Score an existing results file and print the result.
@@ -897,22 +1138,14 @@ fn run_single_eval(
     ay_path: &Path,
     pinned_ay: &crate::environment::PinnedSolver,
     environment: &crate::environment::Environment,
-) -> Result<(serde_json::Value, Option<serde_json::Value>)> {
+) -> Result<(
+    serde_json::Value,
+    Option<serde_json::Value>,
+    serde_json::Value,
+)> {
     let inputs = spec.inputs.as_ref();
 
-    // Determine timeout
-    let timeout = if let Some(t) = args.timeout {
-        t
-    } else if args.competition {
-        competition_timeout(eval_id)
-    } else {
-        inputs.and_then(|i| i.timeout_sec).unwrap_or(60.0)
-    };
-    if !timeout.is_finite() || timeout <= 0.0 {
-        return Err(BenchError::InvalidArgs {
-            reason: format!("timeout for eval {eval_id} must be finite and positive"),
-        });
-    }
+    let timeout = eval_timeout(eval_id, inputs, args)?;
 
     let mode_label = if args.competition {
         "COMPETITION"
@@ -929,6 +1162,7 @@ fn run_single_eval(
 
     let root = repo_root();
     let domain = infer_domain(eval_id);
+    let shared_corpus_root = shared_corpus_root()?;
     // Native eval execution is intentionally sequential, but the job-1 case
     // still needs an explicit envelope: the main ay binary otherwise claims
     // 85% of machine RAM.  Keep `_oom_guard.py` as the admission-policy source
@@ -943,18 +1177,23 @@ fn run_single_eval(
         );
     }
 
-    // Determine benchmarks_dir from spec or infer from domain
-    let benchmarks_dir = spec
-        .inputs
-        .as_ref()
-        .and_then(|i| i.benchmarks_dir.as_deref())
-        .map(|d| expand_tilde(d, &root))
-        .unwrap_or_else(|| root.join("benchmarks").join(domain));
+    // Registry and selection controls stay in the candidate worktree. The
+    // trusted supervisor may read payloads from a persistent corpus checkout.
+    let (benchmarks_dir, candidate_benchmarks_dir) =
+        eval_benchmark_directories(spec, &root, domain, shared_corpus_root.as_deref())?;
 
     // Build explicit file list from list_file, set_file, or suite_dirs
-    let file_list = match build_file_list(spec, &root, &benchmarks_dir)? {
+    let file_list = match build_file_list(
+        spec,
+        &root,
+        &benchmarks_dir,
+        &candidate_benchmarks_dir,
+        shared_corpus_root.as_deref(),
+    )? {
         Some(file_list) => Some(file_list),
-        None => build_suite_dirs_list(spec, &benchmarks_dir, domain)?,
+        None => {
+            build_suite_dirs_list(spec, &benchmarks_dir, domain, shared_corpus_root.as_deref())?
+        }
     };
 
     let runs = effective_runs(args, inputs)?;
@@ -969,17 +1208,40 @@ fn run_single_eval(
             None => Vec::new(),
         }
     } else {
-        args.reference_solvers.clone()
+        args.reference_solvers
+            .iter()
+            .map(|(name, path)| {
+                let requested = path.to_str().ok_or_else(|| BenchError::InvalidArgs {
+                    reason: format!(
+                        "reference solver path is not valid UTF-8: {}",
+                        path.display()
+                    ),
+                })?;
+                let resolved =
+                    find_solver(requested).ok_or_else(|| BenchError::SolverNotFound {
+                        name: requested.to_string(),
+                    })?;
+                Ok((name.clone(), resolved))
+            })
+            .collect::<Result<Vec<_>>>()?
     };
 
     let run_id = environment.timestamp.replace(':', "-");
     let eval_output_root = bench_results_root(&root).join(eval_id);
     std::fs::create_dir_all(&eval_output_root)?;
-    let run_dir = tempfile::Builder::new()
-        .prefix(&format!("{run_id}-"))
+    let run_dir_prefix = format!("{run_id}-");
+    let mut run_dir_builder = tempfile::Builder::new();
+    run_dir_builder.prefix(&run_dir_prefix);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        run_dir_builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let run_dir = run_dir_builder
         .tempdir_in(&eval_output_root)
         .with_bench_context(|| format!("reserving unique run directory for {eval_id}"))?;
     let output_dir = run_dir.path().to_path_buf();
+    let private_input_dir = crate::native::reserve_private_input_directory(&output_dir)?;
     let artifact_output_dir = if domain == "sat" {
         Some(output_dir.join("artifacts"))
     } else {
@@ -988,10 +1250,11 @@ fn run_single_eval(
 
     // Native execution owns the authoritative --memory flag. Passing it via
     // solver_args would either duplicate or override the admitted envelope.
-    let solver_args = solver_args_for_eval(domain, args);
+    let solver_args = solver_args_for_eval(domain, args, timeout);
     let native_args = crate::native::NativeRunArgs {
         ay: ay_path,
         benchmarks_dir: &benchmarks_dir,
+        private_input_dir: private_input_dir.path(),
         timeout_sec: timeout,
         domain,
         quiet: args.quiet,
@@ -1082,7 +1345,16 @@ fn run_single_eval(
             published_dir.display()
         );
     }
-    Ok((score, shard))
+    let verification = verification_summary(&results);
+    let evidence = serde_json::json!({
+        "results_path": results_path,
+        "verified": verification.verified,
+        "wrong": verification.wrong,
+        "unverified_definitive": verification.unverified_definitive,
+        "non_definitive": verification.non_definitive,
+        "total": verification.total,
+    });
+    Ok((score, shard, evidence))
 }
 
 fn bench_results_root(repo_root: &Path) -> PathBuf {
@@ -1198,13 +1470,20 @@ fn shard_selection(args: &RunArgs) -> Result<Option<crate::native::NativeShardSe
     }
 }
 
-fn solver_args_for_eval(domain: &str, args: &RunArgs) -> Vec<String> {
+fn solver_args_for_eval(domain: &str, args: &RunArgs, timeout_sec: f64) -> Vec<String> {
     let mut solver_args = Vec::new();
     if domain == "sat" {
         if let Some(variant) = args.sat_variant.as_deref() {
             solver_args.push("--sat-variant".to_string());
             solver_args.push(variant.to_string());
         }
+    } else if domain == "chc" && args.competition {
+        // Competition mode suppresses optional validation/proof overhead in
+        // the timed child. AY also receives the parent watchdog boundary so
+        // it can reserve a small amount for graceful teardown.
+        solver_args.push("--competition".to_string());
+        solver_args.push("--timeout".to_string());
+        solver_args.push(((timeout_sec * 1000.0).round() as u64).max(1).to_string());
     }
     solver_args
 }
@@ -1259,28 +1538,7 @@ fn build_rows(
     results: &crate::native::NativeResults,
     with_features: bool,
 ) -> Result<Vec<ResultRow>> {
-    // Index comparison items (if present) by file path so we can look up
-    // agreement quickly.
-    let mut comp_index: BTreeMap<&str, Vec<&'static str>> = BTreeMap::new();
-    if let Some(reference_comparisons) = results.reference_comparisons.as_deref() {
-        for reference in reference_comparisons {
-            for comparison in &reference.items {
-                comp_index
-                    .entry(comparison.file.as_str())
-                    .or_default()
-                    .push(comparison.agreement);
-            }
-        }
-    } else {
-        // Backward compatibility for in-memory/legacy results that only carry
-        // the first reference's rows.
-        for comparison in results.comparisons.as_deref().unwrap_or(&[]) {
-            comp_index
-                .entry(comparison.file.as_str())
-                .or_default()
-                .push(comparison.agreement);
-        }
-    }
+    let comp_index = comparison_index(results);
 
     let timestamp = results.environment.timestamp.clone();
     let resource_plan = results
@@ -1387,6 +1645,63 @@ fn build_rows(
         .collect()
 }
 
+fn comparison_index(results: &crate::native::NativeResults) -> BTreeMap<&str, Vec<&'static str>> {
+    // Index comparison items (if present) by file path so we can look up
+    // agreement quickly.
+    let mut comp_index: BTreeMap<&str, Vec<&'static str>> = BTreeMap::new();
+    if let Some(reference_comparisons) = results.reference_comparisons.as_deref() {
+        for reference in reference_comparisons {
+            for comparison in &reference.items {
+                comp_index
+                    .entry(comparison.file.as_str())
+                    .or_default()
+                    .push(comparison.agreement);
+            }
+        }
+    } else {
+        // Backward compatibility for in-memory/legacy results that only carry
+        // the first reference's rows.
+        for comparison in results.comparisons.as_deref().unwrap_or(&[]) {
+            comp_index
+                .entry(comparison.file.as_str())
+                .or_default()
+                .push(comparison.agreement);
+        }
+    }
+    comp_index
+}
+
+#[derive(Debug)]
+struct VerificationSummary {
+    verified: usize,
+    wrong: usize,
+    unverified_definitive: usize,
+    non_definitive: usize,
+    total: usize,
+}
+
+fn verification_summary(results: &crate::native::NativeResults) -> VerificationSummary {
+    let comp_index = comparison_index(results);
+    let mut summary = VerificationSummary {
+        verified: 0,
+        wrong: 0,
+        unverified_definitive: 0,
+        non_definitive: 0,
+        total: results.items.len(),
+    };
+    for item in &results.items {
+        match classify_verifier(item, &comp_index) {
+            1 => summary.verified += 1,
+            0 => summary.wrong += 1,
+            _ if matches!(item.result.to_ascii_lowercase().as_str(), "sat" | "unsat") => {
+                summary.unverified_definitive += 1;
+            }
+            _ => summary.non_definitive += 1,
+        }
+    }
+    summary
+}
+
 /// Classify a `NativeResultItem` against the comparison index and expected
 /// label to produce `verifier_ok` (-1 / 0 / 1).
 fn classify_verifier(
@@ -1466,7 +1781,8 @@ pub fn cmd_run(args: RunArgs) -> Result<()> {
     // Selected evals execute sequentially, so one job-1 admission plan is the
     // effective envelope for the complete command and its scorecard probe.
     let root = repo_root();
-    let resources = crate::resource::PlannedResources::plan(&root, 1, "ay bench run")?;
+    let mut resources = crate::resource::PlannedResources::plan(&root, 1, "ay bench run")?;
+    resources.apply_per_child_caps(args.resource_memory_cap_mib, args.resource_core_cap)?;
     let pinned_ay = crate::environment::PinnedSolver::capture(
         &ay_path,
         &resources,
@@ -1490,11 +1806,12 @@ pub fn cmd_run(args: RunArgs) -> Result<()> {
             &pinned_ay,
             &environment,
         ) {
-            Ok((score, shard)) => {
+            Ok((score, shard, evidence)) => {
                 let mut row = serde_json::json!({
                     "eval_id": eval_id,
                     "competition": infer_competition(eval_id).name(),
                     "score": score,
+                    "evidence": evidence,
                 });
                 if let Some(shard) = shard {
                     row["shard"] = shard;
@@ -1742,7 +2059,8 @@ fn eval_list_rows(evals: &[(String, EvalSpec)]) -> Vec<EvalListRow> {
 ///   Lines starting with `#` or empty are skipped. Optional second column
 ///   is ignored (used for expected result in some formats).
 /// - `set_file`: manifest relative to benchmarks_dir, listing paths relative
-///   to benchmarks_dir. Lines ending in `.yml` are converted to `.smt2`.
+///   to benchmarks_dir. CHC-COMP task-definition YAML entries are resolved
+///   through their declared `input_files` scalar.
 ///
 /// Returns `None` if neither is specified (caller uses directory discovery).
 const MAX_MANIFEST_BENCHMARKS: usize = 1_000_000;
@@ -1752,6 +2070,8 @@ fn build_file_list(
     spec: &EvalSpec,
     root: &Path,
     benchmarks_dir: &Path,
+    candidate_benchmarks_dir: &Path,
+    shared_corpus_root: Option<&Path>,
 ) -> Result<Option<Vec<PathBuf>>> {
     let inputs = match spec.inputs.as_ref() {
         Some(i) => i,
@@ -1759,7 +2079,10 @@ fn build_file_list(
     };
 
     if let Some(ref list_path) = inputs.list_file {
-        let path = root.join(list_path);
+        // A list file is a candidate-controlled selection manifest, even when
+        // its benchmark payload rows are served from the shared corpus root.
+        let list_relative = normalized_repo_relative_path(list_path, "list_file")?;
+        let path = root.join(list_relative);
         let text = crate::resource::read_bounded_text(
             &path,
             crate::resource::MAX_METADATA_BYTES,
@@ -1790,8 +2113,13 @@ fn build_file_list(
             let Some(file_path) = trimmed.split_whitespace().next() else {
                 continue;
             };
-            let full = root.join(file_path);
-            if full.exists() {
+            let full = remap_benchmark_input(
+                root,
+                shared_corpus_root,
+                file_path,
+                "list_file benchmark entry",
+            )?;
+            if full.is_file() && !full.is_symlink() {
                 files.push(full);
             } else {
                 missing_count += 1;
@@ -1816,7 +2144,16 @@ fn build_file_list(
     }
 
     if let Some(ref set_name) = inputs.set_file {
-        let set_path = benchmarks_dir.join(set_name);
+        let set_relative = normalized_repo_relative_path(set_name, "set_file")?;
+        // Prefer a tracked candidate-worktree set manifest. Downloaded
+        // competition set files are absent from a fresh worktree and fall back
+        // to the trusted shared corpus checkout.
+        let candidate_set_path = candidate_benchmarks_dir.join(set_relative);
+        let set_path = if candidate_set_path.is_file() && !candidate_set_path.is_symlink() {
+            candidate_set_path
+        } else {
+            benchmarks_dir.join(set_relative)
+        };
         let text = crate::resource::read_bounded_text(
             &set_path,
             crate::resource::MAX_METADATA_BYTES,
@@ -1843,14 +2180,8 @@ fn build_file_list(
                     ),
                 });
             }
-            // CHC-COMP set files list .yml paths; convert to .smt2
-            let smt2_name = if let Some(stem) = trimmed.strip_suffix(".yml") {
-                format!("{stem}.smt2")
-            } else {
-                trimmed.to_string()
-            };
-            let full = benchmarks_dir.join(&smt2_name);
-            if full.exists() {
+            let full = resolve_set_benchmark_entry(benchmarks_dir, trimmed)?;
+            if full.is_file() && !full.is_symlink() {
                 files.push(full);
             } else {
                 missing_count += 1;
@@ -1877,6 +2208,88 @@ fn build_file_list(
     Ok(None)
 }
 
+fn resolve_set_benchmark_entry(benchmarks_dir: &Path, entry: &str) -> Result<PathBuf> {
+    // Current organizer-generated CHC-COMP sets use a single harmless "./"
+    // prefix. Normalize only that exact prefix; parent traversal and repeated
+    // non-normal components remain rejected below.
+    let entry = entry.strip_prefix("./").unwrap_or(entry);
+    let relative = normalized_repo_relative_path(entry, "set_file benchmark entry")?;
+    let declared = benchmarks_dir.join(relative);
+    if !matches!(
+        declared
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("yml" | "yaml")
+    ) {
+        return Ok(declared);
+    }
+
+    let metadata =
+        std::fs::symlink_metadata(&declared).map_err(|error| BenchError::InvalidArgs {
+            reason: format!(
+                "set_file task definition {} cannot be inspected: {error}",
+                declared.display()
+            ),
+        })?;
+    if !metadata.file_type().is_file() {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "set_file task definition must be a regular non-symlink file: {}",
+                declared.display()
+            ),
+        });
+    }
+    let text = crate::resource::read_bounded_text(
+        &declared,
+        crate::resource::MAX_METADATA_BYTES,
+        "set_file task definition",
+    )?;
+    let mut input_file = None;
+    for (line_index, raw_line) in text.lines().enumerate() {
+        let Some((raw_key, raw_value)) = raw_line.trim_start().split_once(':') else {
+            continue;
+        };
+        if raw_key.trim() != "input_files" {
+            continue;
+        }
+        if input_file.is_some() {
+            return Err(BenchError::InvalidArgs {
+                reason: format!(
+                    "set_file task definition {} repeats input_files",
+                    declared.display()
+                ),
+            });
+        }
+        let value = eval_string_value(
+            raw_value,
+            "input_files",
+            &declared,
+            line_index.saturating_add(1),
+        )?;
+        if value.is_empty() || value.starts_with('[') || value.starts_with('{') {
+            return Err(BenchError::InvalidArgs {
+                reason: format!(
+                    "set_file task definition {} must declare exactly one scalar input_files path",
+                    declared.display()
+                ),
+            });
+        }
+        input_file = Some(value);
+    }
+    let input_file = input_file.ok_or_else(|| BenchError::InvalidArgs {
+        reason: format!(
+            "set_file task definition {} has no scalar input_files path",
+            declared.display()
+        ),
+    })?;
+    let input_relative =
+        normalized_repo_relative_path(&input_file, "task-definition input_files path")?;
+    Ok(declared
+        .parent()
+        .unwrap_or(benchmarks_dir)
+        .join(input_relative))
+}
+
 fn summarize_missing_paths(paths: &[PathBuf], total_missing: usize) -> String {
     let examples = paths
         .iter()
@@ -1896,6 +2309,7 @@ fn build_suite_dirs_list(
     spec: &EvalSpec,
     benchmarks_dir: &Path,
     domain: &str,
+    shared_corpus_root: Option<&Path>,
 ) -> Result<Option<Vec<PathBuf>>> {
     let Some(dirs) = spec
         .inputs
@@ -1911,7 +2325,12 @@ fn build_suite_dirs_list(
     }
     let mut files = Vec::new();
     for subdir in dirs {
-        let path = benchmarks_dir.join(subdir);
+        let relative = if shared_corpus_root.is_some() {
+            normalized_repo_relative_path(subdir, "suite_dirs entry")?
+        } else {
+            Path::new(subdir)
+        };
+        let path = benchmarks_dir.join(relative);
         if !path.is_dir() {
             return Err(BenchError::InvalidArgs {
                 reason: format!(
@@ -1925,6 +2344,129 @@ fn build_suite_dirs_list(
     files.sort();
     ensure_unique_benchmark_paths(&files, "suite_dirs")?;
     Ok(Some(files))
+}
+
+fn preflight_eval_benchmark_paths(
+    eval_id: &str,
+) -> Result<(String, PathBuf, PathBuf, Vec<PathBuf>)> {
+    let evals = discover_evals()?;
+    let spec = evals
+        .iter()
+        .find_map(|(id, spec)| (id == eval_id).then_some(spec))
+        .ok_or_else(|| BenchError::EvalNotFound {
+            ids: eval_id.to_string(),
+        })?;
+    let root = repo_root();
+    let domain = infer_domain(eval_id);
+    let shared_corpus_root = shared_corpus_root()?;
+    let (benchmarks_dir, candidate_benchmarks_dir) =
+        eval_benchmark_directories(spec, &root, domain, shared_corpus_root.as_deref())?;
+    let file_list = match build_file_list(
+        spec,
+        &root,
+        &benchmarks_dir,
+        &candidate_benchmarks_dir,
+        shared_corpus_root.as_deref(),
+    )? {
+        Some(files) => Some(files),
+        None => {
+            build_suite_dirs_list(spec, &benchmarks_dir, domain, shared_corpus_root.as_deref())?
+        }
+    };
+    let (canonical_benchmarks_dir, files) =
+        crate::native::preflight_benchmark_paths(&benchmarks_dir, domain, file_list.as_deref())?;
+    Ok((
+        domain.to_string(),
+        benchmarks_dir,
+        canonical_benchmarks_dir,
+        files,
+    ))
+}
+
+/// Validate an eval's configured corpus and return its complete benchmark
+/// count without launching a solver.
+///
+/// Campaign orchestration uses this before classifying a lane as runnable so
+/// a placeholder directory cannot satisfy a declared minimum-corpus gate.
+pub fn preflight_eval_benchmark_count(eval_id: &str) -> Result<usize> {
+    preflight_eval_benchmark_paths(eval_id).map(|(_, _, _, files)| files.len())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalBenchmarkIdentity {
+    pub benchmark_id: String,
+    pub canonical_path: String,
+    pub source_sha256: String,
+    pub source_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalBenchmarkInventory {
+    pub benchmarks_dir: String,
+    pub canonical_benchmarks_dir: String,
+    pub domain: String,
+    pub competition: String,
+    pub score_scope: Option<String>,
+    pub content_inventory_sha256: String,
+    pub items: Vec<EvalBenchmarkIdentity>,
+}
+
+fn update_inventory_field(hasher: &mut Sha256, bytes: &[u8]) -> Result<()> {
+    let length = u64::try_from(bytes.len()).map_err(|_| {
+        BenchError::msg("benchmark inventory field length exceeds the portable u64 format")
+    })?;
+    hasher.update(length.to_be_bytes());
+    hasher.update(bytes);
+    Ok(())
+}
+
+/// Resolve and authenticate the exact current source selection for one eval.
+///
+/// The digest is path-portable: it binds normalized corpus-relative IDs,
+/// source byte lengths, and source SHA-256 identities, but not host-specific
+/// absolute paths. `canonical_path` remains available for strict local
+/// reconciliation with the native runner's evidence.
+pub fn preflight_eval_benchmark_inventory(eval_id: &str) -> Result<EvalBenchmarkInventory> {
+    let (domain, benchmarks_dir, canonical_benchmarks_dir, files) =
+        preflight_eval_benchmark_paths(eval_id)?;
+    let competition = infer_competition(eval_id);
+    let score_scope = match competition {
+        Competition::SatComp => None,
+        Competition::SmtComp => Some(infer_division(eval_id)),
+        Competition::ChcComp => Some(infer_track(eval_id)),
+        Competition::HwmccComp => Some(infer_hwmcc_track(eval_id)),
+    };
+    let mut items = Vec::with_capacity(files.len());
+    let mut inventory = Sha256::new();
+    inventory.update(b"ay-eval-benchmark-content-inventory-v1\0");
+    update_inventory_field(&mut inventory, domain.as_bytes())?;
+    let count = u64::try_from(files.len())
+        .map_err(|_| BenchError::msg("benchmark inventory count exceeds u64"))?;
+    inventory.update(count.to_be_bytes());
+    for path in files {
+        let benchmark_id =
+            crate::resource::normalized_relative_id(&path, &canonical_benchmarks_dir)?;
+        let (source_sha256, source_size_bytes) =
+            crate::native::current_benchmark_source_identity(&path)?;
+        update_inventory_field(&mut inventory, benchmark_id.as_bytes())?;
+        update_inventory_field(&mut inventory, source_sha256.as_bytes())?;
+        inventory.update(source_size_bytes.to_be_bytes());
+        items.push(EvalBenchmarkIdentity {
+            benchmark_id,
+            canonical_path: path.display().to_string(),
+            source_sha256,
+            source_size_bytes,
+        });
+    }
+    Ok(EvalBenchmarkInventory {
+        benchmarks_dir: benchmarks_dir.display().to_string(),
+        canonical_benchmarks_dir: canonical_benchmarks_dir.display().to_string(),
+        domain,
+        competition: competition.name().to_string(),
+        score_scope,
+        content_inventory_sha256: format!("sha256:{:x}", inventory.finalize()),
+        items,
+    })
 }
 
 fn ensure_unique_benchmark_paths(files: &[PathBuf], source: &str) -> Result<()> {
@@ -2044,6 +2586,8 @@ mod tests {
             sat_track: None,
             sat_ai_class: None,
             sat_variant: None,
+            resource_memory_cap_mib: None,
+            resource_core_cap: None,
         }
     }
 
@@ -2076,6 +2620,189 @@ mod tests {
     }
 
     #[test]
+    fn shared_corpus_root_is_absolute_canonical_and_repo_shaped() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("Cargo.toml"), b"[workspace]\n").unwrap();
+        std::fs::create_dir(directory.path().join("benchmarks")).unwrap();
+        let root = directory.path().canonicalize().unwrap();
+
+        assert_eq!(
+            shared_corpus_root_from(Some(root.as_os_str())).unwrap(),
+            Some(root.clone())
+        );
+        assert!(shared_corpus_root_from(Some(OsStr::new("relative/repo"))).is_err());
+        assert!(shared_corpus_root_from(Some(OsStr::new(""))).is_err());
+
+        let noncanonical = root.join("..").join(root.file_name().unwrap());
+        assert!(shared_corpus_root_from(Some(noncanonical.as_os_str())).is_err());
+        std::fs::remove_file(root.join("Cargo.toml")).unwrap();
+        assert!(shared_corpus_root_from(Some(root.as_os_str())).is_err());
+    }
+
+    #[test]
+    fn shared_corpus_remaps_payloads_but_not_candidate_list_control() {
+        let candidate = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(candidate.path().join("benchmarks/sat/fixture")).unwrap();
+        std::fs::create_dir_all(shared.path().join("benchmarks/sat/fixture")).unwrap();
+        std::fs::write(
+            candidate.path().join("benchmarks/sat/control.txt"),
+            b"benchmarks/sat/fixture/shared.cnf sat\n",
+        )
+        .unwrap();
+        // A different shared copy of the control file must never select rows.
+        std::fs::write(
+            shared.path().join("benchmarks/sat/control.txt"),
+            b"benchmarks/sat/fixture/not-selected.cnf sat\n",
+        )
+        .unwrap();
+        std::fs::write(
+            shared.path().join("benchmarks/sat/fixture/shared.cnf"),
+            b"p cnf 0 0\n",
+        )
+        .unwrap();
+        let spec = parse_eval_spec_minimal(
+            "id: sat-fixture\ninputs:\n  benchmarks_dir: benchmarks/sat/fixture\n  list_file: benchmarks/sat/control.txt\n",
+            Path::new("fixture.yaml"),
+        )
+        .unwrap();
+        let shared_root = shared.path().canonicalize().unwrap();
+        let (benchmarks_dir, candidate_benchmarks_dir) =
+            eval_benchmark_directories(&spec, candidate.path(), "sat", Some(&shared_root)).unwrap();
+        assert_eq!(benchmarks_dir, shared_root.join("benchmarks/sat/fixture"));
+        assert_eq!(
+            candidate_benchmarks_dir,
+            candidate.path().join("benchmarks/sat/fixture")
+        );
+        let files = build_file_list(
+            &spec,
+            candidate.path(),
+            &benchmarks_dir,
+            &candidate_benchmarks_dir,
+            Some(&shared_root),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            files,
+            vec![shared_root.join("benchmarks/sat/fixture/shared.cnf")]
+        );
+    }
+
+    #[test]
+    fn shared_corpus_rejects_non_benchmark_or_non_normal_payload_paths() {
+        let root = Path::new("/candidate");
+        let shared = Path::new("/trusted");
+        for value in [
+            "../benchmarks/sat/case.cnf",
+            "benchmarks/sat/../case.cnf",
+            "/benchmarks/sat/case.cnf",
+            "evals/registry/case.yaml",
+        ] {
+            assert!(
+                remap_benchmark_input(root, Some(shared), value, "fixture").is_err(),
+                "shared corpus accepted {value:?}"
+            );
+        }
+        assert_eq!(
+            remap_benchmark_input(root, Some(shared), "benchmarks/sat/case.cnf", "fixture")
+                .unwrap(),
+            PathBuf::from("/trusted/benchmarks/sat/case.cnf")
+        );
+    }
+
+    #[test]
+    fn shared_corpus_set_manifest_cannot_escape_benchmark_root() {
+        let candidate = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let candidate_benchmarks = candidate.path().join("benchmarks/chc/fixture");
+        let shared_benchmarks = shared.path().join("benchmarks/chc/fixture");
+        std::fs::create_dir_all(&candidate_benchmarks).unwrap();
+        std::fs::create_dir_all(&shared_benchmarks).unwrap();
+        std::fs::write(candidate_benchmarks.join("track.set"), b"../escape.smt2\n").unwrap();
+        let spec = parse_eval_spec_minimal(
+            "id: chc-fixture\ninputs:\n  benchmarks_dir: benchmarks/chc/fixture\n  set_file: track.set\n",
+            Path::new("fixture.yaml"),
+        )
+        .unwrap();
+
+        let error = build_file_list(
+            &spec,
+            candidate.path(),
+            &shared_benchmarks,
+            &candidate_benchmarks,
+            Some(shared.path()),
+        )
+        .expect_err("parent traversal in shared set manifest must fail")
+        .to_string();
+        assert!(error.contains("normalized repo-relative"), "got: {error}");
+    }
+
+    #[test]
+    fn set_manifest_resolves_task_definition_input_files() {
+        let candidate = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let candidate_benchmarks = candidate.path().join("benchmarks/chc/fixture");
+        let shared_benchmarks = shared.path().join("benchmarks/chc/fixture");
+        std::fs::create_dir_all(&candidate_benchmarks).unwrap();
+        std::fs::create_dir_all(shared_benchmarks.join("family")).unwrap();
+        std::fs::write(
+            candidate_benchmarks.join("track.set"),
+            b"./family/task-name-does-not-match-input.yml\n",
+        )
+        .unwrap();
+        std::fs::write(
+            shared_benchmarks.join("family/task-name-does-not-match-input.yml"),
+            b"format_version: '2.0'\ninput_files: actual.smt2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            shared_benchmarks.join("family/actual.smt2"),
+            b"(set-logic HORN)\n",
+        )
+        .unwrap();
+        let spec = parse_eval_spec_minimal(
+            "id: chc-fixture\ninputs:\n  benchmarks_dir: benchmarks/chc/fixture\n  set_file: track.set\n",
+            Path::new("fixture.yaml"),
+        )
+        .unwrap();
+
+        let files = build_file_list(
+            &spec,
+            candidate.path(),
+            &shared_benchmarks,
+            &candidate_benchmarks,
+            Some(shared.path()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(files, vec![shared_benchmarks.join("family/actual.smt2")]);
+    }
+
+    #[test]
+    fn set_manifest_rejects_task_definition_input_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let benchmarks = root.path().join("benchmarks/chc/fixture");
+        std::fs::create_dir_all(benchmarks.join("family")).unwrap();
+        std::fs::write(benchmarks.join("track.set"), b"family/task.yml\n").unwrap();
+        std::fs::write(
+            benchmarks.join("family/task.yml"),
+            b"input_files: ../escape.smt2\n",
+        )
+        .unwrap();
+        let spec = parse_eval_spec_minimal(
+            "id: chc-fixture\ninputs:\n  benchmarks_dir: benchmarks/chc/fixture\n  set_file: track.set\n",
+            Path::new("fixture.yaml"),
+        )
+        .unwrap();
+
+        let error = build_file_list(&spec, root.path(), &benchmarks, &benchmarks, None)
+            .expect_err("task-definition input must not escape its directory")
+            .to_string();
+        assert!(error.contains("normalized repo-relative"), "got: {error}");
+    }
+
+    #[test]
     fn missing_path_diagnostics_are_bounded() {
         let paths = (0..100)
             .map(|index| PathBuf::from(format!("missing-{index}.smt2")))
@@ -2089,8 +2816,46 @@ mod tests {
     #[test]
     fn solver_args_leave_planned_memory_to_native_execution() {
         let args = test_run_args();
-        let solver_args = solver_args_for_eval("smt", &args);
+        let solver_args = solver_args_for_eval("smt", &args, 60.0);
         assert!(!solver_args.iter().any(|arg| arg.starts_with("--memory")));
+    }
+
+    #[test]
+    fn competition_chc_solver_args_are_explicit_and_persistable() {
+        let mut args = test_run_args();
+        args.competition = true;
+        assert_eq!(
+            solver_args_for_eval("chc", &args, 12.3456),
+            ["--competition", "--timeout", "12346"]
+        );
+
+        args.competition = false;
+        assert!(solver_args_for_eval("chc", &args, 12.3456).is_empty());
+    }
+
+    #[test]
+    fn competition_timeout_override_must_match_the_standard() {
+        let mut args = test_run_args();
+        args.competition = true;
+        args.timeout = Some(30.0);
+        let error = eval_timeout("chccomp-2025-lia-lin-arrays", None, &args)
+            .expect_err("a nonstandard competition timeout must be rejected")
+            .to_string();
+        assert!(error.contains("standard competition timeout"), "{error}");
+        assert!(error.contains("1800"), "{error}");
+
+        args.timeout = Some(competition_timeout("chccomp-2025-lia-lin-arrays"));
+        assert_eq!(
+            eval_timeout("chccomp-2025-lia-lin-arrays", None, &args).unwrap(),
+            1800.0
+        );
+
+        args.competition = false;
+        args.timeout = Some(30.0);
+        assert_eq!(
+            eval_timeout("chccomp-2025-lia-lin-arrays", None, &args).unwrap(),
+            30.0
+        );
     }
 
     #[test]
@@ -2154,6 +2919,17 @@ mod tests {
         );
         assert_eq!(infer_track("chccomp-2025-lia-lin"), "LIA-Lin");
         assert_eq!(infer_track("chccomp-2025-lia"), "LIA");
+        assert_eq!(
+            infer_track("chccomp-2026-solver-adt-lia-arrays"),
+            "ADT-LIA-Arrays"
+        );
+        assert_eq!(
+            infer_track("chccomp-2026-solver-lia-nonlin-arrays"),
+            "LIA-Arrays"
+        );
+        assert_eq!(infer_track("chccomp-2026-solver-lra-lin"), "LRA-Lin");
+        assert_eq!(infer_track("chccomp-2026-solver-bv-lin"), "BV-Lin");
+        assert_eq!(infer_track("chccomp-2026-solver-bv-nonlin"), "BV");
         assert_eq!(infer_track("sat-par2-dev"), "unknown");
     }
 
@@ -2260,8 +3036,33 @@ outputs:
 
         permissions.set_mode(0o700);
         std::fs::set_permissions(&solver, permissions).unwrap();
-        assert_eq!(find_solver(solver.to_str().unwrap()), Some(solver));
+        // `find_solver` deliberately canonicalizes (see
+        // `configured_solver_symlink_is_resolved_to_its_regular_target`), so the
+        // expectation must be canonical too. On macOS the temp dir lives behind
+        // the `/var` -> `/private/var` symlink, so comparing against the raw
+        // `tempdir()` path fails there while passing on Linux.
+        let expected = std::fs::canonicalize(&solver).unwrap();
+        assert_eq!(find_solver(solver.to_str().unwrap()), Some(expected));
         assert!(!is_executable_file(directory.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_solver_symlink_is_resolved_to_its_regular_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("solver-real");
+        std::fs::write(&target, b"#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&target).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&target, permissions).unwrap();
+        let link = directory.path().join("solver");
+        symlink(&target, &link).unwrap();
+
+        let (_, resolved) = resolve_configured_reference_solver(link.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, target.canonicalize().unwrap());
+        assert!(std::fs::symlink_metadata(resolved).unwrap().is_file());
     }
 
     #[test]
@@ -2336,6 +3137,29 @@ inputs:
         assert_eq!(inputs.standard_timeout_sec, Some(5000.0));
         assert_eq!(scoring_label("sat-par2-dev", &spec), "sat-comp");
         assert_eq!(standard_timeout_sec("sat-par2-dev", &spec), 5000.0);
+    }
+
+    #[test]
+    fn eval_inventory_binds_sorted_paths_and_source_hashes() {
+        let first = preflight_eval_benchmark_inventory("sat-continuous-canary")
+            .expect("preflight SAT canary inventory");
+        let second = preflight_eval_benchmark_inventory("sat-continuous-canary")
+            .expect("repeat SAT canary inventory");
+        assert_eq!(first, second);
+        assert_eq!(first.domain, "sat");
+        assert_eq!(first.competition, "SAT-COMP");
+        assert_eq!(first.score_scope, None);
+        assert!(!first.items.is_empty());
+        assert!(first.content_inventory_sha256.starts_with("sha256:"));
+        assert!(first
+            .items
+            .windows(2)
+            .all(|pair| pair[0].benchmark_id < pair[1].benchmark_id));
+        assert!(first.items.iter().all(|item| {
+            Path::new(&item.canonical_path).is_absolute()
+                && item.source_size_bytes > 0
+                && item.source_sha256.starts_with("sha256:")
+        }));
     }
 
     #[test]
@@ -2507,6 +3331,8 @@ inputs:
             sat_track: None,
             sat_ai_class: None,
             sat_variant: None,
+            resource_memory_cap_mib: None,
+            resource_core_cap: None,
         };
 
         let selected = select_evals_for_run(evals, &args).unwrap();

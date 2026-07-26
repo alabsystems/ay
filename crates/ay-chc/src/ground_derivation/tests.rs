@@ -553,6 +553,211 @@ fn ground_derivation_len_and_is_empty_track_the_step_list() {
 }
 
 // ==========================================================================
+// Projected integer-bound completion
+//
+// An opaque fallback entry deliberately excludes the named variable from the
+// bounded per-clause witness solve, then gets ignored as non-concrete by final
+// completion. This isolates the final bound/default decision without a global
+// test-only switch that would race other SMT tests.
+// ==========================================================================
+
+fn complete_after_skipping_witness_solve(
+    clause: &HornClause,
+    env: &mut FxHashMap<String, SmtValue>,
+    names: &[&str],
+) -> bool {
+    let fallback = names
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_string(),
+                SmtValue::Opaque("test-skip-witness".to_string()),
+            )
+        })
+        .collect();
+    complete::complete_env_for_clause_with_fallback(clause, env, &fallback)
+}
+
+#[test]
+fn ground_bound_completion_recovers_projected_p1_lower_bound() {
+    // Exact local-var-elimination replay blocker from the packed-string shard:
+    // P1 survives in the original clause only as `P1 >= 4`. Zero is not a
+    // witness; the least satisfying integer is four.
+    let p1 = ChcVar::new("P1__inline_1168__inline_1226", ChcSort::Int);
+    let constraint = ChcExpr::ge(ChcExpr::var(p1.clone()), ChcExpr::Int(4));
+    let clause = HornClause::query(ClauseBody::constraint(constraint.clone()));
+    let mut completed = FxHashMap::default();
+
+    assert!(complete_after_skipping_witness_solve(
+        &clause,
+        &mut completed,
+        &[&p1.name],
+    ));
+    assert_eq!(completed.get(&p1.name), Some(&SmtValue::Int(4)));
+    assert_eq!(
+        eval_ground_pub(&constraint, &completed),
+        Some(SmtValue::Bool(true))
+    );
+}
+
+#[test]
+fn ground_bound_completion_uses_extrema_and_strict_integer_offsets() {
+    let lower = ChcVar::new("lower", ChcSort::Int);
+    let upper = ChcVar::new("upper", ChcSort::Int);
+    let constraint = ChcExpr::and_all(vec![
+        ChcExpr::ge(ChcExpr::var(lower.clone()), ChcExpr::Int(4)),
+        // Reversed strict lower bound: 7 < lower, hence lower >= 8.
+        ChcExpr::lt(ChcExpr::Int(7), ChcExpr::var(lower.clone())),
+        ChcExpr::le(ChcExpr::var(upper.clone()), ChcExpr::Int(10)),
+        // Reversed strict upper bound: 6 > upper, hence upper <= 5.
+        ChcExpr::gt(ChcExpr::Int(6), ChcExpr::var(upper.clone())),
+    ]);
+    let clause = HornClause::query(ClauseBody::constraint(constraint.clone()));
+    let mut completed = FxHashMap::default();
+
+    assert!(complete_after_skipping_witness_solve(
+        &clause,
+        &mut completed,
+        &[&lower.name, &upper.name],
+    ));
+    assert_eq!(completed.get(&lower.name), Some(&SmtValue::Int(8)));
+    assert_eq!(completed.get(&upper.name), Some(&SmtValue::Int(5)));
+    assert_eq!(
+        eval_ground_pub(&constraint, &completed),
+        Some(SmtValue::Bool(true))
+    );
+}
+
+#[test]
+fn ground_bound_completion_solves_affine_nested_array_bound_exactly() {
+    let table_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let table = ChcVar::new("table", table_sort);
+    let local = ChcVar::new("local", ChcSort::Int);
+    // 0 <= table[0] + 2*local, with table[0] = 3:
+    // local >= ceil(-3/2) = -1.
+    let constraint = ChcExpr::le(
+        ChcExpr::int(0),
+        ChcExpr::add(
+            ChcExpr::select(ChcExpr::var(table.clone()), ChcExpr::int(0)),
+            ChcExpr::mul(ChcExpr::int(2), ChcExpr::var(local.clone())),
+        ),
+    );
+    let clause = HornClause::query(ClauseBody::constraint(constraint.clone()));
+    let mut completed = FxHashMap::default();
+    completed.insert(
+        table.name.clone(),
+        SmtValue::ConstArray(Box::new(SmtValue::Int(3))),
+    );
+
+    assert!(complete_after_skipping_witness_solve(
+        &clause,
+        &mut completed,
+        &[&local.name],
+    ));
+    assert_eq!(completed.get(&local.name), Some(&SmtValue::Int(-1)));
+    assert_eq!(
+        eval_ground_pub(&constraint, &completed),
+        Some(SmtValue::Bool(true))
+    );
+}
+
+#[test]
+fn ground_bound_completion_handles_negative_affine_strict_coefficient() {
+    let local = ChcVar::new("local", ChcSort::Int);
+    // -3*local + 1 > 8  <=>  local <= -3.
+    let constraint = ChcExpr::gt(
+        ChcExpr::add(
+            ChcExpr::mul(ChcExpr::int(-3), ChcExpr::var(local.clone())),
+            ChcExpr::int(1),
+        ),
+        ChcExpr::int(8),
+    );
+    let clause = HornClause::query(ClauseBody::constraint(constraint.clone()));
+    let mut completed = FxHashMap::default();
+
+    assert!(complete_after_skipping_witness_solve(
+        &clause,
+        &mut completed,
+        &[&local.name],
+    ));
+    assert_eq!(completed.get(&local.name), Some(&SmtValue::Int(-3)));
+    assert_eq!(
+        eval_ground_pub(&constraint, &completed),
+        Some(SmtValue::Bool(true))
+    );
+}
+
+#[test]
+fn ground_bound_completion_strict_offset_is_arbitrary_precision() {
+    let x = ChcVar::new("x", ChcSort::Int);
+    let constraint = ChcExpr::gt(ChcExpr::var(x.clone()), ChcExpr::Int(i128::MAX));
+    let clause = HornClause::query(ClauseBody::constraint(constraint.clone()));
+    let mut completed = FxHashMap::default();
+
+    assert!(complete_after_skipping_witness_solve(
+        &clause,
+        &mut completed,
+        &[&x.name],
+    ));
+    assert_eq!(
+        completed.get(&x.name),
+        Some(&SmtValue::int_from_bigint(
+            num_bigint::BigInt::from(i128::MAX) + 1
+        ))
+    );
+    assert_eq!(
+        eval_ground_pub(&constraint, &completed),
+        Some(SmtValue::Bool(true))
+    );
+}
+
+#[test]
+fn ground_bound_completion_rejects_conflicting_bounds() {
+    let x = ChcVar::new("x", ChcSort::Int);
+    let constraint = ChcExpr::and(
+        ChcExpr::ge(ChcExpr::var(x.clone()), ChcExpr::Int(4)),
+        ChcExpr::le(ChcExpr::var(x.clone()), ChcExpr::Int(3)),
+    );
+    let clause = HornClause::query(ClauseBody::constraint(constraint));
+    let mut completed = FxHashMap::default();
+
+    assert!(!complete_after_skipping_witness_solve(
+        &clause,
+        &mut completed,
+        &[&x.name],
+    ));
+    assert!(!completed.contains_key(&x.name));
+}
+
+#[test]
+fn ground_bound_completion_rejects_symbolic_or_ambiguous_bounds() {
+    let x = ChcVar::new("x", ChcSort::Int);
+    let y = ChcVar::new("y", ChcSort::Int);
+    let symbolic = HornClause::query(ClauseBody::constraint(ChcExpr::ge(
+        ChcExpr::var(x.clone()),
+        ChcExpr::var(y.clone()),
+    )));
+    assert!(!complete_after_skipping_witness_solve(
+        &symbolic,
+        &mut FxHashMap::default(),
+        &[&x.name, &y.name],
+    ));
+
+    // The lower bound alone suggests four, but the disequality is another
+    // occurrence the extremal rule does not account for. Reject rather than
+    // claiming that a bounds-only completion applies.
+    let ambiguous = HornClause::query(ClauseBody::constraint(ChcExpr::and(
+        ChcExpr::ge(ChcExpr::var(x.clone()), ChcExpr::Int(4)),
+        ChcExpr::ne(ChcExpr::var(x.clone()), ChcExpr::Int(4)),
+    )));
+    assert!(!complete_after_skipping_witness_solve(
+        &ambiguous,
+        &mut FxHashMap::default(),
+        &[&x.name],
+    ));
+}
+
+// ==========================================================================
 // Witness carrying and ground completion (#item4-ground-witness-backtranslation)
 //
 // These pin the SOUNDNESS claim that makes carrying a transformed-search model
@@ -1027,4 +1232,39 @@ fn ground_pins_refine_a_stale_carried_table() {
     kept.insert("T".to_string(), agreeing.clone());
     assert!(complete::complete_env_for_clause(&clause, &mut kept));
     assert_eq!(kept.get("T"), Some(&agreeing));
+}
+
+#[test]
+fn completion_propagates_known_array_alias_before_defaulting() {
+    // The inliner recovery shape: E carries the transformed model's concrete
+    // byte table and the original clause says E = Y. Y is otherwise unread.
+    // Eagerly defaulting every unread array before the second propagation pass
+    // made that equality false instead of copying E exactly.
+    let arr_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let e = ChcVar::new("E", arr_sort.clone());
+    let y = ChcVar::new("Y", arr_sort);
+    let equality = ChcExpr::eq(ChcExpr::var(e.clone()), ChcExpr::var(y.clone()));
+    let clause = HornClause::query(ClauseBody::constraint(equality.clone()));
+    let table = SmtValue::ArrayMap {
+        default: Box::new(SmtValue::Int(0)),
+        entries: vec![
+            (SmtValue::Int(0), SmtValue::Int(38)),
+            (SmtValue::Int(1), SmtValue::Int(18)),
+            (SmtValue::Int(2), SmtValue::Int(31)),
+            (SmtValue::Int(3), SmtValue::Int(240)),
+        ],
+    };
+    let mut completed = FxHashMap::default();
+    completed.insert(e.name, table.clone());
+
+    assert!(complete::complete_env_for_clause(&clause, &mut completed));
+    assert_eq!(
+        completed.get(&y.name),
+        Some(&table),
+        "array equality must determine the alias before arbitrary defaults run"
+    );
+    assert_eq!(
+        eval_ground_pub(&equality, &completed),
+        Some(SmtValue::Bool(true))
+    );
 }

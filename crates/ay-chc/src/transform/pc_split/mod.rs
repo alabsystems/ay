@@ -444,6 +444,8 @@ fn build_split_problem(
             reverse,
             new_to_orig_clause,
             original_sorts,
+            input_problem: crate::ground_derivation::ground_backtranslation_enabled()
+                .then(|| std::sync::Arc::new(problem.clone())),
             report,
         }),
     ))
@@ -459,6 +461,15 @@ struct PcSplitBackTranslator {
     new_to_orig_clause: Vec<usize>,
     /// Original argument sorts per original predicate.
     original_sorts: FxHashMap<PredicateId, Vec<ChcSort>>,
+    /// INPUT problem retained for exact ground-derivation reconstruction.
+    ///
+    /// Pc splitting keeps a 1:1 clause correspondence but removes each split
+    /// predicate's pinned pc argument and folds its defining equality out of
+    /// the output constraint.  Mapping the recorded clause index back and
+    /// completing the richer input clause restores that pc value.  The shared
+    /// clause-map translator validates the completed derivation on this input
+    /// problem before returning it.
+    input_problem: Option<std::sync::Arc<ChcProblem>>,
     report: TransformMemoryReport,
 }
 
@@ -536,6 +547,23 @@ impl PcSplitBackTranslator {
 }
 
 impl BackTranslator for PcSplitBackTranslator {
+    fn translate_ground_derivation(
+        &self,
+        derivation: &crate::ground_derivation::GroundDerivation,
+    ) -> Option<crate::ground_derivation::GroundDerivation> {
+        let input_problem = self.input_problem.clone()?;
+        crate::ground_derivation::clause_map::ClauseMapGroundTranslator::from_index_map(
+            "pc-split",
+            input_problem,
+            &self.new_to_orig_clause,
+        )
+        .translate(derivation)
+    }
+
+    fn ground_translation_name(&self) -> &'static str {
+        "pc-split"
+    }
+
     /// Disjunctive model reassembly: for each split predicate `P` with
     /// values `{v}` and clone interpretations `I_v`,
     /// `P(a0, a...) := \/_v (a0 = v /\ I_v(a...))`. Clones the model omits

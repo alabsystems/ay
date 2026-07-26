@@ -2869,6 +2869,16 @@ impl Executor {
                 return; // no EUF model: nothing the repair could fix anyway
             }
         }
+        // Freeze marker for the def-index fast path: the repair rounds below
+        // interleave MODEL mutations with thousands of top-level evaluate_term
+        // calls (one frame each), so the frame-generation key alone re-runs
+        // the O(constraints) def-index snapshot compare once per pin — the
+        // dominant remaining cost on the pairwise-expanded `distinct` family.
+        // Repair mutates ONLY the model (lia/euf views, sat slots), never
+        // `ctx.assertions` / `last_assumptions`; that stated contract is
+        // oracle-defended in debug builds (`array_def_candidates` re-compares
+        // the full snapshot on every freeze-keyed hit and panics on drift).
+        let _assertions_frozen = crate::executor::model::AssertionsFrozen::new();
         self.repair_cross_base_chain_equalities();
         self.repair_negated_same_base_chain();
         // #uflia-witness-complete (1a-ii): asserted range/disequality index for

@@ -253,10 +253,42 @@ impl LraSolver {
         // #inc-cib-nodelta: conservative — force one full sweep per pop epoch
         // (rows whose generations were stamped above re-derive regardless).
         self.ib_overlay_complete = false;
-        self.infeasible_heap.clear();
-        // #inc-heap-epoch: O(1) logical clear of heap membership.
-        self.bump_heap_epoch();
-        self.heap_stale = true;
+        if self.warm.enabled {
+            // #warm-simplex: REPAIR the infeasible-candidate structures instead
+            // of clearing them. Pop never rewrites variable VALUES (only the
+            // bound slots restored by the trail replay above), so a var's
+            // violation status can change only if its OWN bound slot changed —
+            // exactly the `changed_vars` list. Re-validate those (basic vars
+            // re-enter/leave the heap via `track_var_feasibility`; non-basic
+            // vars join the persistent dirty set for the targeted SAT-exit
+            // scan). Note this does NOT rely on pop being loosen-only: a
+            // retraction trail entry (`retract_unjustified_var_bounds`) can
+            // restore a TIGHTER bound than the pre-pop state, and the
+            // re-validation handles both directions. Stale heap entries for
+            // vars that became feasible are lazily dropped by
+            // `pop_greatest_error`, which re-validates on extraction.
+            // `heap_stale` is left untouched: if it was already true (e.g. a
+            // row was added in the popped scope) the next simplex still does
+            // the full rebuild.
+            for &var in &changed_vars {
+                if (var as usize) >= self.vars.len() {
+                    continue;
+                }
+                if !self.heap_stale {
+                    self.track_var_feasibility(var);
+                }
+                if matches!(self.vars[var as usize].status, Some(VarStatus::NonBasic))
+                    && self.violates_bounds(var).is_some()
+                {
+                    self.warm_mark_nonbasic_dirty(var);
+                }
+            }
+        } else {
+            self.infeasible_heap.clear();
+            // #inc-heap-epoch: O(1) logical clear of heap membership.
+            self.bump_heap_epoch();
+            self.heap_stale = true;
+        }
         self.trivial_conflict = None;
         self.injected_to_int_axioms.clear();
         self.last_check_trail_pos = self.asserted_trail.len();
@@ -478,6 +510,11 @@ impl LraSolver {
         self.in_infeasible_heap.clear();
         self.heap_epoch = 1;
         self.heap_stale = true;
+        // #warm-simplex: vars are dropped wholesale — reset the warm
+        // structures alongside the heap membership vec.
+        self.warm_invalidate();
+        self.warm.nonbasic_stamp.clear();
+        self.warm.delta_stamp.clear();
         self.disequality_trail.clear();
         self.disequality_trail_scopes.clear();
         self.shared_disequality_trail.clear();
@@ -608,6 +645,9 @@ impl LraSolver {
         // #inc-heap-epoch: O(1) logical clear of heap membership.
         self.bump_heap_epoch();
         self.heap_stale = true;
+        // #warm-simplex: values/bounds rewritten wholesale above — all warm
+        // tracking is stale.
+        self.warm_invalidate();
         self.disequality_trail.clear();
         self.disequality_trail_scopes.clear();
         self.shared_disequality_trail.clear();
@@ -729,6 +769,9 @@ impl LraSolver {
         self.implied_bounds_fresh = false;
         self.in_infeasible_heap.resize(self.vars.len(), 0);
         self.heap_stale = true;
+        // #warm-simplex: imported snapshot replaced vars/values — all warm
+        // tracking is stale.
+        self.warm_invalidate();
         self.propagation_dirty_vars
             .extend(self.atom_index.keys().copied());
         self.propagation_dirty_vars

@@ -21,6 +21,7 @@ mod fetch;
 mod inprocess;
 mod loader;
 mod scoreboard;
+mod smtlib_conformance;
 mod symbols;
 
 use std::path::PathBuf;
@@ -45,15 +46,19 @@ USAGE:
 
   ay-z3-parity fetch <dest-dir> [--sample N | --all] [--max-mb M]
                      [--divisions d1,d2,...] [--record ID] [--list]
-      Re-download & DETERMINISTICALLY sample the SMT-LIB corpus from Zenodo
-      (record 11061097 by default) into <dest-dir>/<DIVISION>/. Queries the API
-      for every <DIV>.tar.zst archive, downloads each, verifies its published
-      md5 (a mismatch skips just that division), extracts the zstd tarball, and
-      writes N evenly-spaced .smt2 files (indices floor(i*total/N), '/'->'__').
-      --all samples every file; --max-mb (default 60) skips giant archives
-      (QF_BV/QF_LIA/QF_IDL/AUFBV) unless raised; --divisions is an allowlist;
-      --list prints the available divisions + sizes and downloads nothing.
-      In-tree equivalent of benchmarks/smtlib-sample/fetch-all.sh.
+      Materialize the SMT-LIB corpus from Zenodo (record 11061097 by default)
+      into <dest-dir>/<DIVISION>/. Queries the API for every <DIV>.tar.zst
+      archive, downloads each, verifies its published md5 (a mismatch skips just
+      that division), extracts the zstd tarball, and writes its .smt2 files flat
+      ('/'->'__').
+      COMPLETE BY DEFAULT: every division, every file, NO size cap (84 divisions
+      / ~4.8 GB for SMT-LIB 2024 non-incremental). Narrowing is opt-in and always
+      reported: --sample N takes an evenly-spaced subset (indices
+      floor(i*total/N)), --divisions is an allowlist, --max-mb M skips archives
+      over M MB. Any of those prints an `!! INCOMPLETE COVERAGE` block naming
+      every exclusion, so a partial corpus can never read as a complete one.
+      --list is a dry run: shows what the current options would include or
+      exclude and downloads nothing. See `fetch --help` for details.
 
   ay-z3-parity diff <corpus-dir-or-file>... [--ay <path>] [--z3 <path>]
                      [--timeout <secs>] [--json] [--oracle declared]
@@ -85,12 +90,14 @@ USAGE:
       timing and a hard-kill timebox. Emits a per-division table, a JSON
       certificate (--json-out) and a markdown report (--report) with an
       auto-populated \"where z3 wins\" section. Exit non-zero iff any
-      sat-vs-unsat DISAGREE.
+      sat-vs-unsat DISAGREE. Requested jobs are capped by `_oom_guard.py`;
+      the exact enforced memory/core/timeout envelope is persisted.
 
   ay-z3-parity scoreboard <corpus-root> --ay <path> [--ay-cli <path>]
                      [--z3 <path>] [--jobs <n>] [--timeout <secs>]
                      [--json-out <path>] [--baseline <path>]
-                     [--divisions <d1,d2,...>]
+                     [--divisions <d1,d2,...>] [--checkpoint <path>] [--resume]
+                     [--sample-per-division <n>] [--seed <u64>] [--progress <path>]
       PROGRESS SCOREBOARD across every division subdir under <corpus-root>, on
       TWO metrics at once: the z3-AGREEMENT metric and AY's OWN fail-closed
       SELF-CERTIFICATION metric. Each .smt2 is run through AY (the FFI dylib),
@@ -103,20 +110,20 @@ USAGE:
         BEYOND    = files AY decides where z3 does not
         GEO ay/z3 = geomean WALL ratio over decided-by-both (<1 = AY faster)
         MEM ay/z3 = geomean PEAK-RSS ratio over decided-by-both above 5MB
-                    (<1 = AY leaner); each child's peak RSS is captured via
-                    wait4()/rusage (Darwin bytes, Linux kilobytes, normalized)
+                    (<1 = AY leaner); each successful bench child self-reports
+                    getrusage(RUSAGE_SELF) (Darwin bytes, Linux KiB normalized)
         RATING    = highest tier reached (floors: WALL 10ms, RSS 5MB):
                     PAR      = DISAGREE 0, AY decides every z3 decision, and
                                ay_wall <= z3_wall on every decided-by-both file
                     SUPERIOR = PAR + ay_wall <= 0.5*z3_wall (>=2x) on every such
-                               file + measured ay_rss < 0.8*z3_rss on every one
-                               over 5MB; missing RSS evidence blocks this tier
+                               file + complete RSS evidence + ay_rss < 0.8*z3_rss
+                               on every one over 5MB; missing RSS blocks this tier
                     PERFECT  = SUPERIOR + AY decides 100% of the track's files
-                    below(uN,sM,dK,mJ) / PAR(xN,mM) / SUPERIOR(uN) show blockers
+                    below(uN,sM,dK,mJ) / PAR(xN,mM,rK) / SUPERIOR(uN) show blockers
         DISAGREE  = sat-vs-unsat conflicts (AY vs z3) — MUST be 0
       Emits a compact per-division table (+ TOTAL) and a JSON certificate
       (--json-out) with all raw per-division/per-file data. With --baseline
-      <prior scoreboard json>, adds a DELTA column (solved/selfcert/strict vs
+      <prior scoreboard json>, adds a DELTA column (solved/selfcert/rating vs
       the baseline) so progress is trackable across runs. Works with z3 absent
       (z3 columns become n/a; AY still reports decided + self-cert). The `ay`
       CLI is found via --ay-cli, else a sibling `ay` next to the FFI dylib,
@@ -124,6 +131,8 @@ USAGE:
       and FFI build identities prove the same source revision. Exit non-zero
       (with a prominent WARNING) iff any DISAGREE or any self-check-vs-eval
       contradiction.
+      Requested jobs are capped by `_oom_guard.py`; the exact enforced
+      memory/core/timeout envelope is persisted in the certificate.
 
   ay-z3-parity behavior [--ay <path>] [--z3 <path>] [--json]
       Audit behavior on the honest-divergence surface: drive the same
@@ -133,18 +142,55 @@ USAGE:
       verdict). Prints the honest residue where libz3 is more capable.
       Exit non-zero iff any pair of produced values/verdicts CONFLICTS.
 
+  ay-z3-parity smtlib-conformance <profile|init|run|check|receipt-check> ...
+      Maintain the fail-closed SMT-LIB 2.7 + exact Z3 5.0.0 conformance
+      contract. The contract has closed dimensions for grammar, commands,
+      theories, logics, typing/scope, command state, SAT models, UNSAT proofs,
+      unknown policy, the Z3 overlay, corpus closure, and gate integrity.
+      `check` is completion-gated by default and exits 0 only when every source
+      inventory is closed and every requirement has exhaustive, hash-bound
+      passing evidence. `--audit-only` is the explicit weaker status mode.
+      See `smtlib-conformance --help` for the evidence protocol.
+
 DEFAULTS:
   --ay        target/debug/libay_ffi.dylib
   --ay-cli    sibling `ay` next to --ay, else target/release/ay (scoreboard)
   --z3        /opt/homebrew/lib/libz3.dylib
   --timeout   10 (diff) / 20 (bench, scoreboard)  per-(file,solver) wall seconds
-  --jobs      1    (bench/scoreboard; parallel worker count)
+  --jobs      1    (bench/scoreboard; requested workers, host planner may cap)
   --json-out  ay-z3-bench.json (bench) / ay-z3-scoreboard.json (scoreboard)
   --report    ay-z3-bench.md   (bench only)
   --baseline  (none; scoreboard DELTA column vs a prior scoreboard json)
   --divisions (all; scoreboard/fetch: comma-separated divisions to include)
-  --sample    500      (fetch; files sampled per division; --all = every file)
-  --max-mb    60       (fetch; skip archives larger than this many MB)
+  --sample-per-division (all; scoreboard: run at most N files from EACH
+              division, chosen by hashing (seed, path). A full SMT-LIB pass is
+              438k files / ~300h; a per-track sample is what makes this runnable
+              on a schedule. Small divisions are taken whole, so every track
+              stays represented, and the certificate records selected/available
+              per track so a sampled number can never read as a full one)
+  --seed      0 (scoreboard: sampling seed. Selection is a pure function of
+              (seed, path) — same seed and corpus give the same set on any
+              machine, so two runs are comparable; a new seed is an independent
+              sample. Ranking is hash-based, not index-based, so growing the
+              corpus does not reshuffle the existing selection)
+  --progress  (none; scoreboard: path to a JSON status file rewritten every ~5s
+              with done/total, files/min, ETA, pid and the run's parameters.
+              Written atomically, so a reader never sees a partial document)
+  --checkpoint <json-out>.checkpoint.jsonl (scoreboard; ALWAYS written, one
+              line per completed file, flushed immediately. The certificate is
+              only written at the end, so this is what a multi-day corpus run
+              survives a crash with)
+  --resume    (off; scoreboard: reuse completed files from the checkpoint
+              instead of re-running them. Opt-in, and refused outright if the
+              journal's header does not match this run's corpus, timeout and
+              binary hashes — resuming across a rebuild would produce a
+              certificate describing neither run)
+  --sample    (unset)  (fetch; EVERY file per division by default. --sample N
+                        narrows to N evenly-spaced files and is reported as
+                        incomplete coverage)
+  --max-mb    (unset)  (fetch; NO size cap by default, so every division is
+                        fetched. --max-mb M skips larger archives and is
+                        reported as incomplete coverage)
   --record    11061097 (fetch; Zenodo record id)
 "
 }
@@ -162,6 +208,11 @@ struct Parsed {
     oracle: Option<String>,
     baseline: Option<PathBuf>,
     divisions: Option<Vec<String>>,
+    checkpoint: Option<PathBuf>,
+    resume: bool,
+    sample: Option<usize>,
+    seed: u64,
+    progress: Option<PathBuf>,
     positionals: Vec<PathBuf>,
 }
 
@@ -178,6 +229,11 @@ fn parse(rest: &[String]) -> Result<Parsed, String> {
     let mut oracle = None;
     let mut baseline = None;
     let mut divisions = None;
+    let mut checkpoint = None;
+    let mut resume = false;
+    let mut sample = None;
+    let mut seed = 0u64;
+    let mut progress = None;
     let mut positionals = Vec::new();
 
     let mut it = rest.iter();
@@ -194,6 +250,28 @@ fn parse(rest: &[String]) -> Result<Parsed, String> {
             "--report" => report = PathBuf::from(it.next().ok_or("--report needs a path")?),
             "--baseline" => {
                 baseline = Some(PathBuf::from(it.next().ok_or("--baseline needs a path")?));
+            }
+            "--checkpoint" => {
+                checkpoint = Some(PathBuf::from(it.next().ok_or("--checkpoint needs a path")?));
+            }
+            "--resume" => resume = true,
+            "--sample-per-division" => {
+                sample = Some(
+                    it.next()
+                        .ok_or("--sample-per-division needs a count")?
+                        .parse()
+                        .map_err(|_| "--sample-per-division must be a positive integer")?,
+                );
+            }
+            "--seed" => {
+                seed = it
+                    .next()
+                    .ok_or("--seed needs an integer")?
+                    .parse()
+                    .map_err(|_| "--seed must be a u64")?;
+            }
+            "--progress" => {
+                progress = Some(PathBuf::from(it.next().ok_or("--progress needs a path")?));
             }
             "--divisions" => {
                 let list = it
@@ -239,6 +317,11 @@ fn parse(rest: &[String]) -> Result<Parsed, String> {
     Ok(Parsed {
         ay,
         ay_cli,
+        checkpoint,
+        resume,
+        sample,
+        seed,
+        progress,
         z3,
         json,
         timeout,
@@ -272,6 +355,9 @@ fn main() -> ExitCode {
     // and needs no dylibs, so it parses its own args ahead of the shared parser.
     if cmd == "fetch" {
         return ExitCode::from(fetch::run(rest) as u8);
+    }
+    if matches!(cmd, "smtlib-conformance" | "smtlib") {
+        return ExitCode::from(smtlib_conformance::run(rest) as u8);
     }
 
     let parsed = match parse(rest) {
@@ -376,11 +462,16 @@ fn main() -> ExitCode {
                     json_out,
                     baseline: parsed.baseline,
                     divisions: parsed.divisions,
+                    checkpoint: parsed.checkpoint,
+                    resume: parsed.resume,
+                    sample: parsed.sample,
+                    seed: parsed.seed,
+                    progress: parsed.progress,
                 })
             }
         }
         // Hidden child mode used by `bench`: evaluate ONE file in ONE library
-        // and print `AYZ3_WALL_NS <ns>` followed by the raw solver output.
+        // and print strict wall/RSS headers followed by the raw solver output.
         "bench-one" => {
             if parsed.positionals.len() != 2 {
                 eprintln!("error: `bench-one` needs exactly <lib> <file>");

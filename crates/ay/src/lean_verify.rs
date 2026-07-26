@@ -97,7 +97,7 @@ impl LeanVerifier {
     /// descriptor bytes against the published digest before and after this
     /// call, so the private stage pathname is never the trust root for the
     /// verified-content claim.
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     pub(crate) fn verify_snapshot_path(
         &self,
         snapshot_path: &std::path::Path,

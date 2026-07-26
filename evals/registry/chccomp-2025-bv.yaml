@@ -1,0 +1,23 @@
+# Andrew Yates <andrewyates.name@gmail.com>
+# Eval spec for the CHC-COMP 2025 BV benchmark suite
+id: chccomp-2025-bv
+version: 1
+description: CHC-COMP 2025 official BV benchmark suite
+owner: andrewyates.name@gmail.com
+inputs:
+  benchmarks_dir: benchmarks/chc/chc-comp25-benchmarks
+  set_file: BV.set
+  timeout_sec: 30
+  runs: 3
+  reference_solver: z3
+metrics:
+  - passed
+  - total
+  - sat
+  - unsat
+  - wrong
+  - timeout
+  - unknown
+  - error
+outputs:
+  results_dir: evals/results/chccomp-2025-bv/{run_id}

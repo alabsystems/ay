@@ -1014,140 +1014,63 @@ mod tests {
     use super::*;
     use crate::types::PbLit;
 
-    /// Probe: does `certified_objective_floor` produce a floor for a real `.opb`,
-    /// and does it meet the incumbent? Gates whether a DIRECT floor-cert emitter
-    /// would add VeriPB coverage. Ignored; drive with:
-    ///   FLOOR_PROBE_FILE=/abs/path.opb FLOOR_PROBE_OPT=<incumbent> \
-    ///     cargo test -p ay-pb --release --lib proof::optimum_check::tests::floor_probe -- --ignored --nocapture
     #[test]
-    #[ignore = "manual floor-cert probe; set FLOOR_PROBE_FILE"]
-    fn floor_probe() {
-        let path = std::env::var("FLOOR_PROBE_FILE").expect("set FLOOR_PROBE_FILE");
-        let raw = std::fs::read_to_string(&path).expect("read opb");
-        let inst = crate::parse_opb(&raw).expect("parse opb");
-        let obj = inst.objective.clone().expect("optimization instance");
-        let floor = certified_objective_floor(&inst.constraints, &obj);
-        let lp = crate::optimize::lp_bound::lp_lower_bound(
-            &obj,
-            &inst.constraints,
-            inst.num_vars,
-            &|| false,
-        );
-        eprintln!("  lp_lower_bound = {lp:?}");
-        if let Ok(dump) = std::env::var("DUAL_DUMP") {
-            if let Some(raw) = crate::optimize::lp_bound::lp_dual_raw(
-                &obj,
+    fn checked_floor_matches_lp_and_integer_optimum() {
+        let inst = crate::parse_opb(
+            "* #variable= 2 #constraint= 1\n\
+             min: +1 x1 +1 x2 ;\n\
+             +2 x1 +2 x2 >= 3 ;\n",
+        )
+        .expect("parse fixture");
+        let obj = inst.objective.as_ref().expect("objective");
+        let cert = build_aggregation_floor_cert(&inst.constraints, obj).expect("floor certificate");
+        assert_eq!(cert.check_floor(), Ok(2), "checker verdict");
+        assert_eq!(cert.certify_optimum(2), Ok(2));
+        assert_eq!(certified_objective_floor(&inst.constraints, obj), Some(2));
+        assert_eq!(
+            crate::optimize::lp_bound::lp_lower_bound(
+                obj,
                 &inst.constraints,
                 inst.num_vars,
                 &|| false,
-            ) {
-                use std::fmt::Write as _;
-                let mut s = String::new();
-                let _ = writeln!(s, "bound {}", raw.bound);
-                let _ = writeln!(s, "num_constraint_rows {}", raw.num_constraint_rows);
-                let _ = write!(s, "complement");
-                for (v, b) in raw.complement.iter().enumerate() {
-                    if *b {
-                        let _ = write!(s, " {}", v + 1);
-                    }
-                }
-                let _ = writeln!(s);
-                let _ = write!(s, "duals");
-                for d in &raw.duals {
-                    let _ = write!(s, " {d}");
-                }
-                let _ = writeln!(s);
-                std::fs::write(&dump, s).expect("write dual dump");
-                eprintln!("  DUAL_DUMP written to {dump}");
-            }
-        }
-        let opt: Option<i128> = std::env::var("FLOOR_PROBE_OPT")
-            .ok()
-            .and_then(|s| s.parse().ok());
-        let meets = match (floor, opt) {
-            (Some(f), Some(o)) => format!("meets_incumbent={}", f == o),
-            _ => "meets_incumbent=?".to_string(),
-        };
-        let name = path.rsplit('/').next().unwrap_or(&path);
-        println!("FLOOR_PROBE {name}: floor={floor:?} incumbent={opt:?} {meets}");
+            ),
+            Some(2)
+        );
+        assert_eq!(brute_optimum(&inst), Some(2));
     }
 
-    /// Probe: convert a WBO instance to its PBO relaxation and write it as OPB text
-    /// (`WBO_PROBE_FILE` -> `WBO_PROBE_OUT`), so the OPB `--proof` cert path can be
-    /// run on the projection. Gates the WBO-CERT capability.
     #[test]
-    #[ignore = "manual WBO->OPB probe; set WBO_PROBE_FILE + WBO_PROBE_OUT"]
-    fn wbo_to_opb_probe() {
-        let path = std::env::var("WBO_PROBE_FILE").expect("set WBO_PROBE_FILE");
-        let out = std::env::var("WBO_PROBE_OUT").expect("set WBO_PROBE_OUT");
-        let raw = std::fs::read_to_string(&path).expect("read wbo");
-        let wbo = crate::parse_wbo(&raw).expect("parse wbo");
+    fn wbo_projection_round_trips_and_preserves_optimum() {
+        let wbo = crate::parse_wbo(
+            "soft: 10 ;\n\
+             +1 x1 >= 1 ;\n\
+             [5] +1 x2 >= 1 ;\n\
+             [2] +1 ~x2 >= 1 ;\n",
+        )
+        .expect("parse WBO fixture");
         let pbo = crate::optimize::wbo::wbo_to_pbo(&wbo);
-        use std::fmt::Write as _;
-        let mut s = String::new();
-        let _ = writeln!(
-            s,
-            "* #variable= {} #constraint= {}",
-            pbo.num_vars,
-            pbo.constraints.len()
-        );
-        let fmt_terms = |terms: &[PbTerm], s: &mut String| {
-            for t in terms {
-                let lit = t.lits[0];
-                let name = if lit.negated {
-                    format!("~x{}", lit.var)
-                } else {
-                    format!("x{}", lit.var)
-                };
-                let _ = write!(
-                    s,
-                    "{}{} {} ",
-                    if t.coeff >= 0 { "+" } else { "" },
-                    t.coeff,
-                    name
-                );
-            }
-        };
-        if let Some(obj) = &pbo.objective {
-            let _ = write!(s, "min: ");
-            fmt_terms(&obj.terms, &mut s);
-            let _ = writeln!(s, ";");
-        }
-        for con in &pbo.constraints {
-            fmt_terms(&con.terms, &mut s);
-            let rel = match con.rel {
-                PbRel::Ge => ">=",
-                PbRel::Eq => "=",
-            };
-            let _ = writeln!(s, "{} {} ;", rel, con.rhs);
-        }
-        std::fs::write(&out, s).expect("write opb");
-        println!(
-            "WBO_TO_OPB {}: pbo_vars={} pbo_cons={} -> {out}",
-            path.rsplit('/').next().unwrap_or(&path),
-            pbo.num_vars,
-            pbo.constraints.len()
-        );
+        let encoded = crate::instance_to_opb(&pbo);
+        let round_trip = crate::parse_opb(&encoded).expect("parse projected OPB");
+        assert_eq!(round_trip, pbo);
+        assert_eq!(brute_optimum(&round_trip), Some(2));
     }
 
-    /// Probe: linearize an OPT-NLC OPB (products -> AND-aux vars) and write the linear
-    /// OPB (`NLC_PROBE_FILE` -> `NLC_PROBE_OUT`), so the linear cert path can run on it.
     #[test]
-    #[ignore = "manual NLC->linear probe; set NLC_PROBE_FILE + NLC_PROBE_OUT"]
-    fn nlc_linearize_probe() {
-        let path = std::env::var("NLC_PROBE_FILE").expect("set NLC_PROBE_FILE");
-        let out = std::env::var("NLC_PROBE_OUT").expect("set NLC_PROBE_OUT");
-        let raw = std::fs::read_to_string(&path).expect("read opb");
-        let inst = crate::parse_opb(&raw).expect("parse opb");
+    fn nlc_linearization_round_trips_and_preserves_optimum() {
+        let inst = crate::parse_opb(
+            "* #variable= 2 #constraint= 1\n\
+             min: +3 x1 x2 +1 x1 +1 x2 ;\n\
+             +1 x1 +1 x2 >= 1 ;\n",
+        )
+        .expect("parse nonlinear fixture");
         let lin = crate::linearize::linearize(&inst);
-        std::fs::write(&out, crate::instance_to_opb(&lin)).expect("write opb");
-        println!(
-            "NLC_LINEARIZE {}: {}v/{}c -> {}v/{}c linear -> {out}",
-            path.rsplit('/').next().unwrap_or(&path),
-            inst.num_vars,
-            inst.constraints.len(),
-            lin.num_vars,
-            lin.constraints.len()
+        assert!(crate::linearize::is_linear(&lin));
+        assert!(lin.num_vars > inst.num_vars);
+        assert_eq!(brute_optimum(&inst), Some(1));
+        assert_eq!(brute_optimum(&lin), Some(1));
+        assert_eq!(
+            crate::parse_opb(&crate::instance_to_opb(&lin)).expect("parse linear OPB"),
+            lin
         );
     }
 
@@ -1167,6 +1090,39 @@ mod tests {
             rel: PbRel::Ge,
             rhs,
         }
+    }
+
+    fn brute_optimum(instance: &crate::types::PbInstance) -> Option<i128> {
+        assert!(instance.num_vars <= 20, "bounded test fixture");
+        let objective = instance.objective.as_ref()?;
+        let eval_terms = |terms: &[PbTerm], mask: u64| {
+            terms
+                .iter()
+                .map(|term| {
+                    let active = term.lits.iter().all(|lit| {
+                        let value = mask & (1u64 << (lit.var - 1)) != 0;
+                        value != lit.negated
+                    });
+                    if active {
+                        term.coeff
+                    } else {
+                        0
+                    }
+                })
+                .sum::<i128>()
+        };
+        (0..(1u64 << instance.num_vars))
+            .filter(|&mask| {
+                instance.constraints.iter().all(|constraint| {
+                    let lhs = eval_terms(&constraint.terms, mask);
+                    match constraint.rel {
+                        PbRel::Ge => lhs >= constraint.rhs,
+                        PbRel::Eq => lhs == constraint.rhs,
+                    }
+                })
+            })
+            .map(|mask| eval_terms(&objective.terms, mask))
+            .min()
     }
 
     #[test]

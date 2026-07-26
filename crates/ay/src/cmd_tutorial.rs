@@ -27,6 +27,8 @@ use ay_dpll::Executor;
 use ay_frontend::sexp::parse_sexps;
 use ay_frontend::{parse, SExpr};
 
+mod guides;
+
 // ---------------------------------------------------------------------------
 // CLI definition
 // ---------------------------------------------------------------------------
@@ -38,7 +40,7 @@ pub(crate) struct TutorialArgs {
     #[command(subcommand)]
     command: Option<TutorialCommand>,
 
-    /// Run the interactive 5-level tutorial
+    /// Run the interactive beginner tutorial (legacy alias for `basics`)
     #[arg(long, conflicts_with = "challenge")]
     interactive: bool,
 
@@ -49,6 +51,46 @@ pub(crate) struct TutorialArgs {
 
 #[derive(Subcommand)]
 enum TutorialCommand {
+    /// Learn constraint-solving fundamentals in five interactive lessons
+    Basics,
+
+    /// Browse every major AY solver, integration, and tool family
+    Features {
+        /// Show one atlas section (omit for the complete atlas)
+        #[arg(value_enum)]
+        section: Option<guides::FeatureSection>,
+
+        /// Pause between sections
+        #[arg(long)]
+        interactive: bool,
+    },
+
+    /// Build solver-backed applications and production integrations
+    Engineers {
+        /// Show one chapter (omit for the complete course)
+        #[arg(value_enum)]
+        chapter: Option<guides::EngineerChapter>,
+
+        /// Pause between chapters
+        #[arg(long)]
+        interactive: bool,
+    },
+
+    /// Explore AY's proof, theory, optimization, and research surfaces
+    Experts {
+        /// Show one chapter (omit for the complete course)
+        #[arg(value_enum)]
+        chapter: Option<guides::ExpertChapter>,
+
+        /// Pause between chapters
+        #[arg(long)]
+        interactive: bool,
+    },
+
+    /// Play solver-backed games and inspect their generated constraints
+    #[command(subcommand)]
+    Play(guides::PlayCommand),
+
     /// Solve an SMT-LIB2 file with educational output
     Solve {
         /// Path to .smt2 file
@@ -77,6 +119,20 @@ pub(crate) fn run(args: &TutorialArgs) -> Result<()> {
         return run_challenge(level);
     }
     match &args.command {
+        Some(TutorialCommand::Basics) => run_tutorial(),
+        Some(TutorialCommand::Features {
+            section,
+            interactive,
+        }) => guides::run_feature_atlas(*section, *interactive),
+        Some(TutorialCommand::Engineers {
+            chapter,
+            interactive,
+        }) => guides::run_engineer_course(*chapter, *interactive),
+        Some(TutorialCommand::Experts {
+            chapter,
+            interactive,
+        }) => guides::run_expert_course(*chapter, *interactive),
+        Some(TutorialCommand::Play(command)) => guides::run_game(command),
         Some(TutorialCommand::Solve { file }) => run_solve(file),
         None => {
             print_welcome();
@@ -93,7 +149,24 @@ fn print_welcome() {
     println!(
         r#"
 AY tutorial
-Educational SMT solving
+Learn AY by solving real problems
+
+Choose a path:
+  ay tutorial basics             Five interactive lessons from first principles
+  ay tutorial engineers          Build Sudoku, automation, and production integrations
+  ay tutorial experts            Worked examples for solver researchers and Z3 experts
+  ay tutorial features           Browse the complete AY feature atlas
+  ay tutorial play sudoku        Play in a live solver-backed Sudoku lab
+  ay tutorial solve FILE.smt2    Explain one of your own models
+  ay tutorial --challenge easy   Try a short constraint puzzle
+
+AY at a glance:
+  Solve       SMT-LIB, DIMACS SAT, and CHC safety problems
+  Optimize    OMT, pseudo-Boolean, MaxSAT, LP/MILP, and FlatZinc models
+  Explore     Models, AllSAT, exact model counting, simplification, visualization
+  Trust       Alethe, DRAT, LRAT, VeriPB, self-checking, and external replay
+  Integrate   Rust, Python, JavaScript/TypeScript, C/C++, Java, OCaml, and Z3-shaped APIs
+  Evaluate    Reproducible benchmarks, corpora, diagnostics, statistics, and provenance
 
 An SMT solver figures out whether a set of rules can all be true
 at the same time -- and if so, finds values that make them work.
@@ -133,10 +206,12 @@ Quick example:
         }
     }
 
-    println!("Try these next:");
-    println!("  ay tutorial --interactive    Step-by-step lessons");
-    println!("  ay tutorial --challenge easy  A puzzle to solve");
-    println!("  ay tutorial solve FILE.smt2  Solve your own file");
+    println!("Continue from here:");
+    println!("  ay tutorial basics             Learn the core ideas interactively");
+    println!("  ay tutorial engineers build    Build three real solver-backed programs");
+    println!("  ay tutorial experts proofs      Produce and inspect proof artifacts");
+    println!("  ay tutorial features            See every major AY feature");
+    println!("  ay tutorial --interactive       Legacy alias for the basics course");
     println!();
 }
 
@@ -732,8 +807,9 @@ fn level_4_mini_sudoku() -> Result<bool> {
     println!("    | 2 | 1 |");
     println!("    +---+---+");
     println!();
-    println!("  Real Sudoku (9x9) uses the same idea with 81 variables and");
-    println!("  hundreds of constraints. SMT solvers handle that easily.");
+    println!("  A 9x9 Sudoku uses the same model shape with 81 variables and");
+    println!("  hundreds of constraints, but encoding and solver choice matter:");
+    println!("  AY's validated tutorial path is 4x4; benchmark your exact 9x9 model.");
 
     println!();
     prompt_continue()

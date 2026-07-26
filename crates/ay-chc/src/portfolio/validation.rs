@@ -10,9 +10,10 @@
 use super::preprocess::sort_contains_recursive_bv;
 use super::{EngineResult, PortfolioResult, PortfolioSolver};
 use crate::pdr::{
-    CexVerificationResult, InvariantModel, PdrConfig, PdrSolver, PredicateInterpretation,
+    CexVerificationResult, Counterexample, InvariantModel, PdrConfig, PdrSolver,
+    PredicateInterpretation,
 };
-use crate::transform::accept_profile_enabled;
+use crate::transform::{accept_profile_enabled, BackTranslator};
 use crate::{ChcExpr, ChcProblem, ChcSort, ChcVar, PredicateId};
 use ay_core::kani_compat::DetHashMap as FxHashMap;
 use std::time::Duration;
@@ -27,6 +28,45 @@ use std::time::Duration;
 /// This is a safety cap; the cooperative cancellation token (from the
 /// portfolio) normally stops them earlier.
 const VALIDATION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Back-translate a counterexample and replace transformed ground evidence.
+///
+/// `BackTranslator::translate_invalidity` predates `GroundDerivation` and
+/// remaps only the legacy step/witness representation. Clone-based
+/// translators therefore leave a transformed clause-indexed ground proof
+/// attached. This helper runs the proof through its separate fallible
+/// translator, validates it against `original_problem`, and replaces (or
+/// clears) the stale attachment.
+///
+/// The returned ground derivation is still only candidate evidence: every
+/// acceptance site re-validates it on the clauses it owns.
+pub(crate) fn backtranslate_counterexample_with_ground_evidence(
+    back_translator: &dyn BackTranslator,
+    original_problem: &ChcProblem,
+    cex: &Counterexample,
+) -> Counterexample {
+    let mut translated = back_translator.translate_invalidity(cex.clone());
+    let Some(transformed_derivation) = &cex.ground_derivation else {
+        return translated;
+    };
+
+    let _witness_budget = crate::ground_derivation::witness::ScopedWitnessChainBudget::new();
+    translated.ground_derivation = back_translator
+        .translate_ground_derivation(transformed_derivation)
+        .and_then(|candidate| {
+            match crate::ground_derivation::validate_ground_derivation(original_problem, &candidate)
+            {
+                Ok(()) => Some(candidate),
+                Err(err) => {
+                    crate::ground_derivation::log_ground_translation_detail(format_args!(
+                        "portfolio ground back-translation rejected on original clauses: {err}"
+                    ));
+                    None
+                }
+            }
+        });
+    translated
+}
 
 /// Validation result
 #[derive(Debug, Clone)]
@@ -553,7 +593,11 @@ impl PortfolioSolver {
                 self.transform_memory_diagnostic()
             ));
         }
-        let translated_cex = self.back_translator.translate_invalidity(cex.clone());
+        let translated_cex = backtranslate_counterexample_with_ground_evidence(
+            self.back_translator.as_ref(),
+            &self.original_problem,
+            cex,
+        );
 
         // Defense in depth for #6047/#6293: after back-translation, witness instances for
         // BV/Array predicates must already use original-domain values. If Int-domain values

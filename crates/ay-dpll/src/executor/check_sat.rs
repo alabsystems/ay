@@ -742,6 +742,32 @@ impl Executor {
                 }
                 return sat;
             }
+            // The scoped DT certificate probe runs the same singleton-sort
+            // closure as ordinary dispatch. If that closure hit a full resource
+            // checkpoint, the probe restored its swapped assertion window while
+            // deliberately preserving the stop reason. Do not continue into
+            // quantifier preprocessing with a closure prefix.
+            if matches!(
+                self.last_unknown_reason,
+                Some(UnknownReason::Interrupted)
+                    | Some(UnknownReason::Timeout)
+                    | Some(UnknownReason::MemoryLimit)
+            ) && self
+                .last_result
+                .as_ref()
+                .is_some_and(SolveResult::is_unknown)
+            {
+                self.ctx.assertions = scope_tracked_assertions;
+                if let Some((incr_theory_state, incr_bv_state, quantifier_manager)) =
+                    saved_quantified_incremental_state.take()
+                {
+                    self.incr_theory_state = incr_theory_state;
+                    self.incr_bv_state = incr_bv_state;
+                    self.quantifier_manager = quantifier_manager;
+                }
+                self.defer_model_validation = false;
+                return Ok(SolveResult::Unknown);
+            }
         }
 
         let mut qr = self.process_quantifiers();
@@ -852,18 +878,28 @@ impl Executor {
             return mapped;
         }
 
-        // Soundness pass (card-1 element-sort arrays): if an array's element
-        // sort has cardinality one, all arrays of that sort are equal, so any
-        // asserted array disequality is UNSAT. Datatype cardinality is only
-        // resolvable here (the array theory sees the element sort as an opaque
-        // `Uninterpreted` name). Runs once before dispatch; a no-op unless a
-        // card-1-element array disequality is present.
-        self.add_singleton_array_sort_equalities();
-        // Companion soundness pass: fold ANY equality atom over a singleton sort
-        // (datatype or array) to `true`, including positive / nested uses such
-        // as `(= v (store v i c))` over a singleton element sort that the
-        // disequality-only pass above does not reach. (#bug05 wrong-sat)
-        self.fold_singleton_sort_equalities();
+        // Soundness pass: every ground term of a provably-singleton sort denotes
+        // the same value. Assert a linear equality spanning set before dispatch
+        // so EUF congruence sees the fact even when those terms occur only as UF
+        // arguments (not in source equality syntax).
+        let singleton_roots = self.ctx.assertions.clone();
+        if !self
+            .add_ground_singleton_sort_equalities(&singleton_roots)
+            .is_complete()
+        {
+            // The asserted prefix is sound but not complete enough to authorize
+            // dispatch. Restore the authored scope and fail closed immediately.
+            self.ctx.assertions = scope_tracked_assertions;
+            if let Some((incr_theory_state, incr_bv_state, quantifier_manager)) =
+                saved_quantified_incremental_state.take()
+            {
+                self.incr_theory_state = incr_theory_state;
+                self.incr_bv_state = incr_bv_state;
+                self.quantifier_manager = quantifier_manager;
+            }
+            self.defer_model_validation = false;
+            return Ok(SolveResult::Unknown);
+        }
         // Companion soundness pass (finite-enum CARDINALITY / pigeonhole): an
         // all-nullary datatype sort has exactly `k` inhabitants; forcing more
         // than `k` pairwise-distinct values of that sort is UNSAT. Generalizes
@@ -1039,8 +1075,20 @@ impl Executor {
         let (category, features) = self.detect_logic_category(&ground);
         // The soundness passes the top-level dispatch runs before `route_to_solver`
         // (over the swapped-in ground core; discarded with it on restore).
-        self.add_singleton_array_sort_equalities();
-        self.fold_singleton_sort_equalities();
+        let singleton_roots = self.ctx.assertions.clone();
+        if !self
+            .add_ground_singleton_sort_equalities(&singleton_roots)
+            .is_complete()
+        {
+            // Preserve the resource reason installed by the full checkpoint so
+            // the outer solve can distinguish this decline from an ordinary
+            // certificate miss.
+            self.ctx.assertions = saved_assertions;
+            self.incr_theory_state = saved_incr;
+            self.defer_model_validation = saved_defer;
+            self.last_model = None;
+            return None;
+        }
         let pigeonhole_unsat = self.add_finite_enum_pigeonhole_conflict();
         if features.has_arrays {
             self.add_distinct_const_array_disequalities();
@@ -1770,8 +1818,25 @@ impl Executor {
         roots: &[TermId],
         result: SolveResult,
     ) -> SolveResult {
+        // Consume-once: this marker authorizes EXACTLY the result it
+        // accompanies. `take` clears it here so a trusted refutation from an
+        // earlier query can never leak authorization into a later untrusted
+        // one (every public UNSAT funnels through this boundary).
+        let trusted_row_reduction = std::mem::take(&mut self.nested_array_row_reduction_unsat);
+
         if !result.is_unsat() || !StaticFeatures::collect(&self.ctx.terms, roots).has_nested_arrays
         {
+            return result;
+        }
+
+        // Exempt a trust-free store-flat read-over-write refutation
+        // (`try_ufnia_store_flat_row_refutation`). That reduction inlined every
+        // single-definition `var = store(…)` (equisatisfiable) and exact ROW1
+        // rewriting folded ALL array structure away, so the retained UNSAT was
+        // proven by the sound arithmetic solver over an ARRAY-FREE residue — it
+        // never used the fail-closed lazy array+arith combination this gate
+        // guards. Authoritative; not quarantined.
+        if trusted_row_reduction {
             return result;
         }
 
@@ -1850,6 +1915,9 @@ impl Executor {
         self.model_validation_delegated_assertions.clear();
         self.skip_model_eval = false;
         self.read_pin_repair_done = false;
+        // Reset the trust-free nested-array store-flat reduction marker; it is
+        // re-established only when that exact reduction fires this solve.
+        self.nested_array_row_reduction_unsat = false;
         // Fail-closed default, re-enabled at ENTRY (original assertion shapes,
         // before preprocessing erases array structure) only via the
         // route-independent observational-completeness argument; the
@@ -3197,6 +3265,15 @@ impl Executor {
             // `is_int`/division decider, so it is a sound superset for these
             // QF_LRA problems (#9139).
             LogicCategory::QfLra if features.has_is_int_real => self.solve_nra(),
+            // #rdl-engine: `QF_RDL` is (in the SMT-LIB corpus, 100% of it) pure
+            // difference logic — every atom is `x − y ⋈ c`, `x ⋈ c` or `x ⋈ y`.
+            // `solve_rdl` decides such instances with the incremental
+            // difference-graph engine instead of the general simplex. It is
+            // FAIL-CLOSED: unless every reachable theory atom is a pure Real
+            // difference atom it immediately delegates to `solve_lra()`, and any
+            // non-definite verdict from the DL lane is re-solved by `solve_lra()`
+            // too. `AY_RDL_ENGINE=0` disables the lane without a rebuild.
+            LogicCategory::QfLra if self.ctx.logic() == Some("QF_RDL") => self.solve_rdl(),
             LogicCategory::QfLra => self.solve_lra(),
             LogicCategory::QfLia => {
                 if features.has_bv_int_conversion {

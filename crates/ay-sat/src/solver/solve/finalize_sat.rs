@@ -555,10 +555,7 @@ impl Solver {
                                 let w: Vec<i32> =
                                     wc.witness.iter().map(|l| l.to_dimacs()).collect();
                                 let c: Vec<i32> = wc.clause.iter().map(|l| l.to_dimacs()).collect();
-                                entries.push(format!(
-                                    "  stack[{si}]: witness={w:?} clause={c:?} suppressed={} preserve={}",
-                                    wc.suppressed, wc.preserve
-                                ));
+                                entries.push(format!("  stack[{si}]: witness={w:?} clause={c:?}"));
                             }
                         }
                     }
@@ -567,9 +564,6 @@ impl Solver {
                     for (rev_idx, step) in steps.iter().rev().enumerate() {
                         let fwd_idx = steps.len() - 1 - rev_idx;
                         if let crate::reconstruct::ReconstructionStep::Witness(wc) = step {
-                            if wc.suppressed {
-                                continue;
-                            }
                             let pre: Vec<(usize, bool)> = broken_vars
                                 .iter()
                                 .filter(|&&vi| vi < replay.len())

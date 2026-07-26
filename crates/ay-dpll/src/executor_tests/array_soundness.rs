@@ -1003,3 +1003,42 @@ fn test_nested_array_unsat_assumption_is_quarantined() {
     "#;
     assert_eq!(solve_one(input), "unknown");
 }
+
+/// #arr2lia-inflate: the speculative arrays-to-LIA rescue reduction must not
+/// inflate the SHARED term store out of proportion to the input.
+///
+/// Saturation gives each distinct array base one read per index, so its
+/// read-over-read (Ackermann) cost is QUADRATIC in the index count, while the
+/// pre-saturation congruence guard is only linear in it. A chain of array
+/// aliases plus any arithmetic atom therefore passed that guard and interned
+/// tens of thousands of terms; the `ack_pairs` budget downstream is consulted
+/// only AFTER those terms exist, so bailing there could not undo the growth.
+/// Downstream AUFLIA passes scan the whole term store, so the "rescue" cost far
+/// more than the search it was meant to rescue: 32 aliased arrays + `(>= p 0)`
+/// interned 66,595 terms and took 7.5s; at 40 arrays it timed out entirely.
+///
+/// The formula is trivially satisfiable (make every array equal), so any
+/// non-`sat` answer — or a slow one — is the regression.
+#[test]
+#[timeout(60_000)]
+fn arrays_to_lia_alias_chain_with_arithmetic_does_not_blow_up_term_store() {
+    let n = 60;
+    let mut src = String::from("(set-logic ALL)\n");
+    for k in 0..n {
+        src.push_str(&format!("(declare-const x{k} (Array Int Int))\n"));
+    }
+    src.push_str("(declare-const i Int)\n(declare-const p Int)\n");
+    // The arithmetic atom is what routes this through the AUFLIA/arrays-to-LIA
+    // path at all; `p` shares nothing with the arrays.
+    src.push_str("(assert (>= p 0))\n");
+    for k in 0..n - 1 {
+        src.push_str(&format!("(assert (= x{k} x{}))\n", k + 1));
+    }
+    src.push_str("(assert (= (select x0 i) 7))\n(check-sat)\n");
+    assert_eq!(
+        solve_one(&src),
+        "sat",
+        "aliased array chain + arithmetic must stay solvable, not drown in \
+         read-over-read axioms"
+    );
+}

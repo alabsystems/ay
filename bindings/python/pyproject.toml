@@ -19,12 +19,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ayz3"
 version = "0.1.0"
-description = "z3py-shaped core subset backed by the AY solver"
+description = "Z3-shaped and declarative finite-domain Python APIs backed by AY"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.8"
 authors = [{ name = "Andrew Yates" }]
-keywords = ["smt", "solver", "z3", "z3py", "satisfiability", "ay"]
+keywords = ["smt", "solver", "z3", "z3py", "satisfiability", "search", "optimization", "ay"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -41,18 +41,19 @@ dependencies = []
 [project.optional-dependencies]
 # Match the recorded reference version named in this repository's differential
 # tests. The ordinary ayz3 wheel remains dependency-free.
-dev = ["pytest>=8", "z3-solver==4.15.4.0"]
+dev = ["pytest>=8", "z3-solver==5.0.0.0"]
 
 [project.urls]
 Homepage = "https://github.com/alabsystems/ay"
 Repository = "https://github.com/alabsystems/ay"
 
 [tool.setuptools]
-# Only the ayz3 package ships; tests/conftest are dev-only.
-packages = ["ayz3"]
+# Ship the Z3-shaped and declarative-search APIs; tests/examples are dev-only.
+packages = ["ayz3", "aysearch"]
 
 [tool.setuptools.package-data]
 # Include the bundled cdylib (staged into ayz3/ by setup.py's build step).
 # Listed for every platform basename so the manifest is platform-agnostic; the
 # build step only ever produces the one for the current platform.
 ayz3 = ["libay_ffi.dylib", "libay_ffi.so", "ay_ffi.dll"]
+aysearch = ["py.typed"]

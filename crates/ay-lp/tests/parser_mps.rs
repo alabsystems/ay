@@ -107,3 +107,38 @@ ENDATA
     let p = parse_mps(input).expect("parse");
     assert_eq!(p.sense, Sense::Max);
 }
+
+#[test]
+fn test_parse_mps_rejects_non_finite_numeric_fields() {
+    let input = "\
+NAME INF
+ROWS
+ N OBJ
+ L C1
+COLUMNS
+    X1 OBJ 1e999 C1 1.0
+RHS
+    RHS C1 1.0
+ENDATA
+";
+    assert!(matches!(
+        parse_mps(input),
+        Err(LpError::InvalidNumber { .. })
+    ));
+
+    let input = "\
+NAME INF
+ROWS
+ N OBJ
+ L C1
+COLUMNS
+    X1 OBJ 1.0 C1 1.0
+RHS
+    RHS C1 1e999
+ENDATA
+";
+    assert!(matches!(
+        parse_mps(input),
+        Err(LpError::InvalidNumber { .. })
+    ));
+}

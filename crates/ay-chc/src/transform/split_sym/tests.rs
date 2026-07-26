@@ -312,6 +312,62 @@ fn split_sym_backtranslates_populated_witness_mechanics() {
     );
 }
 
+/// Ground proof back-translation must reinsert the split control argument and
+/// replay the complete clone chain on the original cyclic clauses.
+#[test]
+fn split_sym_backtranslates_ground_derivation_to_original() {
+    use crate::ground_derivation::{
+        validate_ground_derivation, GroundDerivation, GroundDerivationStep,
+    };
+    use crate::smt::SmtValue;
+
+    let original = fsm_unsafe_problem();
+    let result = split(original.clone());
+    let env = |pairs: &[(&str, i128)]| {
+        pairs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), SmtValue::Int(*value)))
+            .collect()
+    };
+
+    // P_0(0) -> P_1(1) -> P_2(2) -> false. Clause specialization preserves
+    // source variable names and exact output→input clause correspondence.
+    let transformed = GroundDerivation {
+        steps: vec![
+            GroundDerivationStep {
+                clause_index: 0,
+                env: env(&[("s", 0), ("x", 0)]),
+                premises: vec![],
+            },
+            GroundDerivationStep {
+                clause_index: 1,
+                env: env(&[("s", 0), ("t", 1), ("x", 0), ("y", 1)]),
+                premises: vec![0],
+            },
+            GroundDerivationStep {
+                clause_index: 2,
+                env: env(&[("s", 1), ("t", 2), ("x", 1), ("y", 2)]),
+                premises: vec![1],
+            },
+            GroundDerivationStep {
+                clause_index: 3,
+                env: env(&[("s", 2), ("x", 2)]),
+                premises: vec![2],
+            },
+        ],
+        query_step: 3,
+    };
+    validate_ground_derivation(&result.problem, &transformed)
+        .expect("setup: clone-space derivation must validate");
+
+    let translated = result
+        .back_translator
+        .translate_ground_derivation(&transformed)
+        .expect("split-symbol must translate concrete derivations");
+    validate_ground_derivation(&original, &translated)
+        .expect("back-translated clone chain must replay on original cyclic clauses");
+}
+
 /// Value-cap bail: a predicate whose pinned argument takes more than
 /// MAX_SPLIT_VALUES distinct values must not be split (identity transform).
 #[test]

@@ -170,6 +170,7 @@ impl ChcExpr {
     /// This is the canonical version used throughout CHC solving.
     pub fn and_all(conjuncts: impl IntoIterator<Item = Self>) -> Self {
         let mut out: Vec<Arc<Self>> = Vec::new();
+        let mut seen: FxHashSet<Arc<Self>> = FxHashSet::default();
         let mut pending: VecDeque<Self> = conjuncts.into_iter().collect();
 
         while let Some(expr) = pending.pop_front() {
@@ -182,7 +183,16 @@ impl ChcExpr {
                         pending.push_front(arg.as_ref().clone());
                     }
                 }
-                other => out.push(mk_arc(other)),
+                other => {
+                    // Exact duplicate conjuncts are idempotent. Compiler-
+                    // generated CHCs often repeat identical array bounds many
+                    // times after inlining; retaining one copy avoids sending
+                    // a much larger but equivalent formula to every engine.
+                    let arc = mk_arc(other);
+                    if seen.insert(arc.clone()) {
+                        out.push(arc);
+                    }
+                }
             }
         }
 

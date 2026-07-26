@@ -124,7 +124,7 @@ def test_statistics_get_missing_key():
         st.get_key_value("definitely-not-a-key")
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_statistics_shape_crosscheck():
     # Same problem through ayz3 AND z3py: the STRUCTURAL shape must match. We do
     # NOT compare key sets — AY's counter set differs from z3's (documented).
@@ -184,7 +184,7 @@ def test_to_smt2_has_check_sat_and_reparses():
     assert reparsed.check() == s.check() == z.sat
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_sexpr_verdict_agrees_with_z3py():
     # Build the same constraints, dump ayz3.sexpr(), and confirm both AY (on
     # reparse) and z3py agree on the verdict.

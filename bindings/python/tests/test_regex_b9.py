@@ -26,7 +26,7 @@ except Exception:  # pragma: no cover - depends on environment
     _z3 = None
     HAVE_Z3PY = False
 
-requires_z3py = pytest.mark.skipif(not HAVE_Z3PY, reason="z3py not importable")
+requires_z3py = pytest.mark.usefixtures("required_reference_z3")
 
 
 def fresh_solver():

@@ -24,11 +24,10 @@ fn bare_primitive_names_parse() {
 }
 
 #[test]
-fn tseitin_cnf_and_its_cnf_alias_parse_to_the_same_tactic() {
-    // z3 accepts both `tseitin-cnf` and the short `cnf` spelling; both must map
-    // to the one Tseitin CNF tactic (depth 1, a single primitive).
+fn tseitin_cnf_parses_and_non_z3_cnf_alias_is_rejected() {
+    // Z3 5.0.0 exposes `tseitin-cnf` and rejects the short `cnf` spelling.
     assert_eq!(parse("tseitin-cnf"), Ok(ApplyTactic::TseitinCnf));
-    assert_eq!(parse("cnf"), Ok(ApplyTactic::TseitinCnf));
+    assert!(parse("cnf").is_err());
     assert_eq!(ApplyTactic::TseitinCnf.depth(), 1);
 }
 
@@ -44,8 +43,8 @@ fn propagate_ineqs_parses_to_its_own_tactic_not_an_alias() {
 #[test]
 fn transform_tactic_batch_names_parse() {
     // The z3-compatible transform batch: each bare name maps to its own tactic
-    // (depth 1), and `cofactor-term-ite` is an ALIAS of `blast-term-ite` (same
-    // Shannon ITE lift), mirroring the `tseitin-cnf`|`cnf` alias precedent.
+    // (depth 1), and `cofactor-term-ite` is an ALIAS of `blast-term-ite` (the
+    // same Shannon ITE lift).
     assert_eq!(parse("elim-term-ite"), Ok(ApplyTactic::ElimTermIte));
     assert_eq!(parse("blast-term-ite"), Ok(ApplyTactic::BlastTermIte));
     assert_eq!(parse("cofactor-term-ite"), Ok(ApplyTactic::BlastTermIte));
@@ -68,7 +67,7 @@ fn transform_tactic_batch_names_parse() {
 
 #[test]
 fn lift_if_is_not_a_z3_tactic_and_is_rejected() {
-    // z3 4.15.4 rejects `(apply lift-if)` with "unknown tactic"; AY must too —
+    // Z3 5.0.0 rejects `(apply lift-if)` with "unknown tactic"; AY must too —
     // real-z3-names-only policy (a near-neighbor of the batch's ite tactics).
     assert!(
         parse("lift-if").is_err(),
@@ -444,7 +443,7 @@ fn the_batch_registers_exactly_91_names_and_all_parse() {
     for name in BATCH_NAMES {
         assert!(
             parse(name).is_ok(),
-            "z3-4.15.4 tactic name {name:?} must parse (registered by this batch)"
+            "pinned Z3 tactic name {name:?} must parse (registered by this batch)"
         );
         assert!(
             crate::command::SUPPORTED_TACTIC_NAMES.contains(name),

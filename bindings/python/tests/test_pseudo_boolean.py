@@ -120,7 +120,7 @@ def test_pb_requires_pairs():
 # Differential vs real z3py on random cardinality/PB instances.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_pb_differential_vs_z3py():
     def build(mod, seed):
         random.seed(seed)

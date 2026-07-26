@@ -2241,6 +2241,27 @@ impl<'a> BvLiaBitblastTranslator<'a> {
                 "bvsub" => self
                     .translate_bv_args(&args)
                     .and_then(|args| self.fold_bvsub(args)),
+                // SMT-LIB shifts are width-preserving binary operations. Lift
+                // both operands through the same exact residue translation as
+                // the surrounding BV expression, then reconstruct the
+                // identical operator in the pure-BV term consumed by the
+                // existing bit-blast/enumeration gate. Requiring exact binary
+                // arity keeps malformed internal terms fail-closed.
+                "bvshl" if args.len() == 2 => {
+                    let lhs = self.translate_bv(args[0])?;
+                    let rhs = self.translate_bv(args[1])?;
+                    Some(self.terms.mk_bvshl(vec![lhs, rhs]))
+                }
+                "bvlshr" if args.len() == 2 => {
+                    let lhs = self.translate_bv(args[0])?;
+                    let rhs = self.translate_bv(args[1])?;
+                    Some(self.terms.mk_bvlshr(vec![lhs, rhs]))
+                }
+                "bvashr" if args.len() == 2 => {
+                    let lhs = self.translate_bv(args[0])?;
+                    let rhs = self.translate_bv(args[1])?;
+                    Some(self.terms.mk_bvashr(vec![lhs, rhs]))
+                }
                 "bvnot" if args.len() == 1 => {
                     let arg = self.translate_bv(args[0])?;
                     Some(self.terms.mk_bvnot(arg))
@@ -5342,7 +5363,7 @@ impl Executor {
     /// The incremental macro creates the solver internally, so we pre-seed
     /// the IncrementalTheoryState with a configured solver that the macro
     /// will detect and reuse via `pipeline_incremental_setup!`.
-    fn configure_sat_search_tuning(
+    pub(in crate::executor) fn configure_sat_search_tuning(
         &mut self,
         geometric_initial: f64,
         geometric_factor: f64,
@@ -6377,6 +6398,15 @@ impl Executor {
         if self.should_abort_theory_loop() {
             return Ok(SolveResult::Unknown);
         }
+        // #nested-array-row: the EUF+NIA combination has no dedicated array
+        // theory, so a determined UNSAT that requires read-over-write through a
+        // named array variable (the SV-COMP UltimateAutomizer nested-memory
+        // family) is missed. Attempt a sound, UNSAT-only store-flat refutation
+        // BEFORE the main solve; it falls through (None) on anything but a
+        // definitive UNSAT, so SAT instances are never perturbed.
+        if let Some(result) = self.try_ufnia_store_flat_row_refutation()? {
+            return Ok(result);
+        }
         let (preprocessed_assertions, proof_provenance) =
             self.preprocess_ufnia_assertions_with_proof_provenance();
         let solve_interrupt = self.solve_interrupt.clone();
@@ -6420,6 +6450,266 @@ impl Executor {
         })
     }
 
+    /// UNSAT-only read-over-write rescue for the array-of-array nested-memory
+    /// family (`#nested-array-row`).
+    ///
+    /// `solve_uf_nia` has NO dedicated array theory: arrays are handled by EUF
+    /// congruence plus the term rewriter's syntactic `select(store(a,i,v),i)→v`
+    /// fold, which only fires when the store is SYNTACTICALLY the select's base.
+    /// SV-COMP UltimateAutomizer memory scripts instead bind each SSA memory to
+    /// a named array variable (`(= M1 (store M0 …))`, element sort itself an
+    /// array) and read through the variable, so the fold never triggers and a
+    /// determined UNSAT — a nested read forced by read-over-write to a value
+    /// that a later arithmetic bound rules out — is returned as `unknown`.
+    ///
+    /// This inlines those single-definition `var = store(…)` equalities
+    /// (`substitute_store_flat_equalities`; equisatisfiable, because a variable
+    /// constrained by exactly one array-store definition and nothing else is
+    /// purely definitional), which lets `mk_select`/`mk_store` collapse the
+    /// nested read-over-write chains to their forced values as the assertions
+    /// are rebuilt. When the fold eliminates EVERY array term, the residue is a
+    /// pure Int problem the NIA solver decides directly.
+    ///
+    /// Soundness: only a definitive UNSAT of the equisatisfiable residue is
+    /// promoted, and it is derived by exact ROW rewriting (not a validation
+    /// gate). Any other outcome — including a genuinely-SAT nested read whose
+    /// residue is satisfiable — returns `None` and the untouched normal solve
+    /// runs, so this can never manufacture a wrong `unsat` nor perturb a `sat`.
+    /// Runs on a PRIVATE copy of the assertion window with full executor-state
+    /// save/restore (mirrors `try_unsat_via_arrays_to_lia_ackermann`), and bails
+    /// in O(scan) when no store-flat definition inlines away every array term
+    /// (e.g. the hundreds of partially-resolved reads in the full scripts).
+    fn try_ufnia_store_flat_row_refutation(&mut self) -> Result<Option<SolveResult>> {
+        if self.incremental_mode
+            || self.original_problem_had_quantifiers
+            || self.mod_div_or_branch_rescue_depth > 0
+        {
+            return Ok(None);
+        }
+        // Cheap gate: only array-carrying windows can benefit.
+        if !self
+            .ctx
+            .assertions
+            .iter()
+            .any(|&a| assertion_contains_array_ops(&self.ctx.terms, a))
+        {
+            return Ok(None);
+        }
+
+        // Inline `var = store(…)` definitions on a PRIVATE copy so the rewriter
+        // folds read-over-write through the nested store chains. ctx.assertions
+        // is left untouched for the normal solve / model recovery.
+        let mut folded = self.ctx.assertions.clone();
+        super::solve_harness_helpers::substitute_store_flat_equalities(
+            &mut self.ctx.terms,
+            &mut folded,
+        );
+        if folded == self.ctx.assertions {
+            return Ok(None); // no single-definition store-flat equality to inline
+        }
+
+        // Only proceed when the fold eliminated EVERY array term. A residue that
+        // still mentions arrays is left to the normal pipeline (fail-open:
+        // returns None), keeping this rescue O(scan) on the large scripts whose
+        // hundreds of reads do not fully collapse.
+        let reachable = crate::executor::theories::reachable_term_set(&self.ctx.terms, &folded);
+        if reachable
+            .iter()
+            .any(|&t| matches!(self.ctx.terms.sort(t), Sort::Array(_)))
+        {
+            return Ok(None);
+        }
+
+        // ---- Solve the array-free residue, accept ONLY unsat ----------------
+        // Equisatisfiable to the original window, so a residue UNSAT is a sound
+        // UNSAT for the original. Full state save/restore; a non-unsat outcome
+        // is discarded and the caller's normal solve runs unchanged.
+        let proof_export_scope = self.proof_export_scope_assertions();
+        let saved_assertions = std::mem::replace(&mut self.ctx.assertions, folded);
+        let saved_model = self.last_model.clone();
+        let saved_model_validated = self.last_model_validated;
+        let saved_unknown_reason = self.last_unknown_reason;
+        let saved_result = self.last_result.clone();
+        let saved_skip_model_eval = self.skip_model_eval;
+        let saved_read_pin_repair_done = self.read_pin_repair_done;
+        let saved_branch_validation = self.sat_validated_by_mod_div_or_branch;
+        let saved_proof_provenance = self.proof_problem_assertion_provenance.clone();
+        let saved_statistics = std::mem::take(&mut self.last_statistics);
+
+        // The private solve owns a fresh proof tracker and artifact set. A
+        // discarded probe must not drain or overwrite proof state accumulated
+        // by its caller, while an accepted proof must not inherit unrelated
+        // outer steps.
+        let proof_was_enabled = self.proof_tracker.is_enabled();
+        let mut auxiliary_tracker = crate::proof_tracker::ProofTracker::new();
+        if proof_was_enabled {
+            auxiliary_tracker.enable();
+        }
+        let saved_proof_tracker = std::mem::replace(&mut self.proof_tracker, auxiliary_tracker);
+        let saved_last_proof = self.last_proof.take();
+        let saved_last_lrat_certificate = self.last_lrat_certificate.take();
+        let saved_last_proof_term_overrides = self.last_proof_term_overrides.take();
+        let saved_last_proof_quality = self.last_proof_quality.take();
+        let saved_last_clause_trace = self.last_clause_trace.take();
+        let saved_last_var_to_term = self.last_var_to_term.take();
+        let saved_last_trail_provenance = self.last_trail_provenance.take();
+        let saved_last_negations = self.last_negations.take();
+        let saved_last_clausification_proofs = self.last_clausification_proofs.take();
+        let saved_last_original_clause_theory_proofs =
+            self.last_original_clause_theory_proofs.take();
+        let saved_proof_check_result = self.proof_check_result.take();
+        let saved_proof_check_ok = self.proof_check_ok;
+        let saved_last_proof_rebuild_originals =
+            std::mem::take(&mut self.last_proof_rebuild_originals);
+        let saved_quant_expansion_records = std::mem::take(&mut self.quant_expansion_records);
+
+        // Give solve_nia the folded window without ever promoting folded terms
+        // to authored premises. Unchanged originals retain their identity;
+        // reduced-only assumptions remain derived and are demoted on export.
+        let folded_proof_provenance =
+            ProofProblemAssertionProvenance::passthrough(&saved_assertions, &self.ctx.assertions)
+                .preserving_authority_from(saved_proof_provenance.as_ref());
+        self.proof_problem_assertion_provenance = Some(folded_proof_provenance);
+        self.mod_div_or_branch_rescue_depth += 1;
+
+        self.last_model = None;
+        self.last_model_validated = false;
+        self.last_unknown_reason = None;
+        self.last_result = None;
+        self.skip_model_eval = false;
+        self.read_pin_repair_done = false;
+        self.sat_validated_by_mod_div_or_branch = false;
+
+        let result = self.solve_nia();
+
+        self.mod_div_or_branch_rescue_depth -= 1;
+        self.ctx.assertions = saved_assertions;
+        self.last_statistics = saved_statistics;
+        self.skip_model_eval = saved_skip_model_eval;
+        self.read_pin_repair_done = saved_read_pin_repair_done;
+        self.sat_validated_by_mod_div_or_branch = saved_branch_validation;
+        self.proof_tracker = saved_proof_tracker;
+
+        match result {
+            Ok(r) if r.is_unsat() => {
+                self.last_unknown_reason = None;
+                // The retained proof was built over the folded residue. Keep
+                // only genuine outer-scope assumptions and render every
+                // reduced-only/trust leaf as an attributed Hole. The reduced
+                // SAT trace and LRAT bytes certify a different CNF, so they
+                // cannot accompany the original problem artifact.
+                self.rescope_store_flat_row_proof_to_problem(&proof_export_scope);
+                self.last_lrat_certificate = None;
+                self.last_proof_quality = None;
+                self.last_clause_trace = None;
+                self.last_var_to_term = None;
+                self.last_trail_provenance = None;
+                self.last_negations = None;
+                self.last_clausification_proofs = None;
+                self.last_original_clause_theory_proofs = None;
+                self.proof_check_result = None;
+                self.proof_check_ok = false;
+                self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
+                self.quant_expansion_records = saved_quant_expansion_records;
+                self.proof_problem_assertion_provenance = saved_proof_provenance;
+                // Mark this UNSAT as the trust-free array-free-residue reduction
+                // so the nested-array quarantine boundary accepts it.
+                self.nested_array_row_reduction_unsat = true;
+                Ok(Some(r))
+            }
+            Ok(_) => {
+                // Restore caller-visible state; fall through to normal solve.
+                self.last_model = saved_model;
+                self.last_model_validated = saved_model_validated;
+                self.last_unknown_reason = saved_unknown_reason;
+                self.last_result = saved_result;
+                self.proof_problem_assertion_provenance = saved_proof_provenance;
+                self.last_proof = saved_last_proof;
+                self.last_lrat_certificate = saved_last_lrat_certificate;
+                self.last_proof_term_overrides = saved_last_proof_term_overrides;
+                self.last_proof_quality = saved_last_proof_quality;
+                self.last_clause_trace = saved_last_clause_trace;
+                self.last_var_to_term = saved_last_var_to_term;
+                self.last_trail_provenance = saved_last_trail_provenance;
+                self.last_negations = saved_last_negations;
+                self.last_clausification_proofs = saved_last_clausification_proofs;
+                self.last_original_clause_theory_proofs = saved_last_original_clause_theory_proofs;
+                self.proof_check_result = saved_proof_check_result;
+                self.proof_check_ok = saved_proof_check_ok;
+                self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
+                self.quant_expansion_records = saved_quant_expansion_records;
+                Ok(None)
+            }
+            Err(err) => {
+                self.last_model = saved_model;
+                self.last_model_validated = saved_model_validated;
+                self.last_unknown_reason = saved_unknown_reason;
+                self.last_result = saved_result;
+                self.proof_problem_assertion_provenance = saved_proof_provenance;
+                self.last_proof = saved_last_proof;
+                self.last_lrat_certificate = saved_last_lrat_certificate;
+                self.last_proof_term_overrides = saved_last_proof_term_overrides;
+                self.last_proof_quality = saved_last_proof_quality;
+                self.last_clause_trace = saved_last_clause_trace;
+                self.last_var_to_term = saved_last_var_to_term;
+                self.last_trail_provenance = saved_last_trail_provenance;
+                self.last_negations = saved_last_negations;
+                self.last_clausification_proofs = saved_last_clausification_proofs;
+                self.last_original_clause_theory_proofs = saved_last_original_clause_theory_proofs;
+                self.proof_check_result = saved_proof_check_result;
+                self.proof_check_ok = saved_proof_check_ok;
+                self.last_proof_rebuild_originals = saved_last_proof_rebuild_originals;
+                self.quant_expansion_records = saved_quant_expansion_records;
+                Err(err)
+            }
+        }
+    }
+
+    /// Re-scope a store-flat auxiliary refutation to the caller's authored
+    /// assertion window.
+    ///
+    /// Store-flat folding introduces no fresh symbols, so unlike arrays-to-LIA
+    /// this needs no term substitution. It only prevents the folded residue
+    /// from escaping as free `Assume`/`trust` authority.
+    fn rescope_store_flat_row_proof_to_problem(&mut self, problem_assertions: &[TermId]) {
+        use ay_core::{AletheRule, ProofStep, TheoryLemmaKind};
+
+        let Some(mut proof) = self.last_proof.take() else {
+            return;
+        };
+        let problem_set: HashSet<TermId> = problem_assertions.iter().copied().collect();
+
+        for step in &mut proof.steps {
+            match step {
+                ProofStep::Assume(term) if !problem_set.contains(term) => {
+                    *step = ProofStep::Step {
+                        rule: AletheRule::Hole,
+                        clause: vec![*term],
+                        premises: Vec::new(),
+                        args: Vec::new(),
+                    };
+                }
+                ProofStep::TheoryLemma {
+                    clause,
+                    kind: TheoryLemmaKind::Generic,
+                    ..
+                } => {
+                    *step = ProofStep::Step {
+                        rule: AletheRule::Hole,
+                        clause: std::mem::take(clause),
+                        premises: Vec::new(),
+                        args: Vec::new(),
+                    };
+                }
+                ProofStep::Step { rule, .. } if matches!(rule, AletheRule::Trust) => {
+                    *rule = AletheRule::Hole;
+                }
+                _ => {}
+            }
+        }
+
+        self.last_proof = Some(proof);
+    }
     /// Solve using combined Arrays + EUF + LIA theory
     ///
     /// This handles both integer branch-and-bound splits (NeedSplit) and
@@ -7516,6 +7806,70 @@ impl Executor {
         // A mutated witness invalidates prior validation evidence; the
         // finalize pass re-validates it fail-closed.
         self.last_model_validated = bv_model_validated && !grafted;
+    }
+}
+
+#[cfg(test)]
+mod nested_row_refutation_state_tests {
+    use super::*;
+    use ay_core::{ProofStep, TheoryLemmaKind};
+
+    #[test]
+    fn discarded_auxiliary_solve_cannot_authorize_outer_sat() {
+        let mut exec = Executor::new();
+        let array_sort = Sort::array(Sort::Int, Sort::Int);
+        let a0 = exec.ctx.terms.mk_var("a0", array_sort.clone());
+        let a1 = exec.ctx.terms.mk_var("a1", array_sort);
+        let zero = exec.ctx.terms.mk_int(BigInt::from(0));
+        let one = exec.ctx.terms.mk_int(BigInt::from(1));
+        let stored = exec.ctx.terms.mk_store(a0, zero, one);
+        let store_definition = exec.ctx.terms.mk_eq(a1, stored);
+
+        // Symbolic division arms the NIA path's SAT-only validation bypass
+        // before the auxiliary outcome is known. This residue is satisfiable,
+        // so the probe must discard that authorization with its result.
+        let x = exec.ctx.terms.mk_var("x", Sort::Int);
+        let y = exec.ctx.terms.mk_var("y", Sort::Int);
+        let z = exec.ctx.terms.mk_var("z", Sort::Int);
+        let quotient = exec.ctx.terms.mk_intdiv(x, z);
+        let div_equality = exec.ctx.terms.mk_eq(quotient, y);
+        exec.ctx.assertions = vec![store_definition, div_equality];
+        let original_assertions = exec.ctx.assertions.clone();
+
+        exec.proof_tracker.enable();
+        let outer_lemma = exec.ctx.terms.mk_var("outer_nested_row_lemma", Sort::Bool);
+        exec.proof_tracker
+            .add_theory_lemma_with_kind(
+                vec![outer_lemma],
+                TheoryLemmaKind::ArraySelectStore { index_eq: true },
+            )
+            .expect("proof tracking is enabled");
+
+        assert!(!exec.sat_validated_by_mod_div_or_branch);
+        let result = exec
+            .try_ufnia_store_flat_row_refutation()
+            .expect("the auxiliary NIA solve should not fail");
+
+        assert!(result.is_none(), "a satisfiable residue must be discarded");
+        assert_eq!(exec.ctx.assertions, original_assertions);
+        assert!(
+            !exec.sat_validated_by_mod_div_or_branch,
+            "a discarded private solve must not authorize the outer SAT path"
+        );
+        assert_eq!(
+            exec.proof_tracker.num_steps(),
+            1,
+            "a discarded private solve must not drain or extend the outer proof tracker"
+        );
+        let proof = exec.proof_tracker.take_proof();
+        assert!(matches!(
+            proof.steps.as_slice(),
+            [ProofStep::TheoryLemma {
+                clause,
+                kind: TheoryLemmaKind::ArraySelectStore { index_eq: true },
+                ..
+            }] if clause == &[outer_lemma]
+        ));
     }
 }
 

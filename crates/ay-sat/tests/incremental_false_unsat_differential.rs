@@ -279,18 +279,13 @@ fn dump_repro(
 // Campaign driver.
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 struct CampaignStats {
     guaranteed_sat_rounds: usize,
     adversarial_rounds: usize,
     observed_unsat: usize,
     observed_sat: usize,
     differential_agree: usize,
-    /// Provably-SAT queries the solver downgraded to Unknown (never a wrong
-    /// verdict — the finalize_sat gate fails safe). Tracked, not fatal: a nonzero
-    /// count on the `PreprocessHeavy` config is the KNOWN, CONTAINED vivify×subsume
-    /// completeness defect (root-caused; a real fix is a separate solver change).
-    /// Only a false-UNSAT (a definite wrong verdict) fails this SOUNDNESS soak.
-    contained_unknown_downgrades: usize,
 }
 
 /// Drive one incremental solver instance IC3-style over `rounds` rounds.
@@ -353,6 +348,24 @@ fn run_seed(
             None => {}
         }
 
+        if incr.is_none() {
+            let repro = dump_repro(
+                "UNEXPECTED UNKNOWN",
+                config,
+                seed,
+                round,
+                num_vars,
+                &sol,
+                &db,
+                &assumptions,
+            );
+            panic!(
+                "{repro}\nunknown reason = {:?}\n\
+                 BUG: this uninterrupted finite query must complete with SAT or UNSAT",
+                solver.last_unknown_reason(),
+            );
+        }
+
         // Whenever a SAT model escapes to the caller, it MUST satisfy every
         // accumulated original clause. Catches false-SAT (bad model
         // reconstruction) regardless of SAT/adversarial round kind.
@@ -409,49 +422,54 @@ fn run_seed(
                          incrementally-driven solver returned UNSAT (a wrong verdict)."
                     );
                 }
-                // FAILS SAFE: Unknown/downgrade on a provably-SAT query is a
-                // COMPLETENESS defect, never a wrong verdict (the finalize_sat gate
-                // (#8819) refuses to emit an unsatisfied model). Track it (surfaced
-                // in the campaign report) but do NOT fail the soundness soak — a
-                // nonzero count on PreprocessHeavy is the known, contained
-                // vivify×subsume defect, not a regression of the IC3/incremental path.
-                None => stats.contained_unknown_downgrades += 1,
+                None => unreachable!("Unknown rejected above"),
                 Some(true) => {}
             }
         } else {
             // ORACLE 2: incremental vs fresh differential (+ brute adjudication).
             stats.adversarial_rounds += 1;
-            let fresh = fresh_verdict(num_vars, &db, &assumptions);
-            if let (Some(i), Some(f)) = (incr, fresh) {
-                if i == f {
-                    stats.differential_agree += 1;
+            let i = incr.expect("Unknown rejected above");
+            let f = fresh_verdict(num_vars, &db, &assumptions).unwrap_or_else(|| {
+                let repro = dump_repro(
+                    "FRESH SOLVER RETURNED UNKNOWN",
+                    config,
+                    seed,
+                    round,
+                    num_vars,
+                    &sol,
+                    &db,
+                    &assumptions,
+                );
+                panic!("{repro}\nBUG: uninterrupted fresh solve must return SAT or UNSAT");
+            });
+            if i == f {
+                stats.differential_agree += 1;
+            } else {
+                // Disagreement — adjudicate with brute force if feasible.
+                let truth = if brute_ok {
+                    Some(brute_force_sat(num_vars, &db, &assumptions))
                 } else {
-                    // Disagreement — adjudicate with brute force if feasible.
-                    let truth = if brute_ok {
-                        Some(brute_force_sat(num_vars, &db, &assumptions))
-                    } else {
-                        None
-                    };
-                    let repro = dump_repro(
-                        "INCREMENTAL vs FRESH DISAGREEMENT",
-                        config,
-                        seed,
-                        round,
-                        num_vars,
-                        &sol,
-                        &db,
-                        &assumptions,
-                    );
-                    panic!(
-                        "{repro}\nincremental={} fresh={} brute_force_truth={:?}\n\
-                         BUG: incremental and from-scratch solves of the SAME clause set + \
-                         assumptions disagree. If incremental=UNSAT this is the target \
-                         false-UNSAT.",
-                        if i { "SAT" } else { "UNSAT" },
-                        if f { "SAT" } else { "UNSAT" },
-                        truth.map(|t| if t { "SAT" } else { "UNSAT" }),
-                    );
-                }
+                    None
+                };
+                let repro = dump_repro(
+                    "INCREMENTAL vs FRESH DISAGREEMENT",
+                    config,
+                    seed,
+                    round,
+                    num_vars,
+                    &sol,
+                    &db,
+                    &assumptions,
+                );
+                panic!(
+                    "{repro}\nincremental={} fresh={} brute_force_truth={:?}\n\
+                     BUG: incremental and from-scratch solves of the SAME clause set + \
+                     assumptions disagree. If incremental=UNSAT this is the target \
+                     false-UNSAT.",
+                    if i { "SAT" } else { "UNSAT" },
+                    if f { "SAT" } else { "UNSAT" },
+                    truth.map(|t| if t { "SAT" } else { "UNSAT" }),
+                );
             }
         }
 
@@ -489,14 +507,7 @@ fn run_campaign(
 ) {
     let seeds = base_seeds * env_mul("AY_FUZZ_SEED_MUL");
     let rounds = base_rounds * (env_mul("AY_FUZZ_ROUND_MUL") as usize);
-    let mut stats = CampaignStats {
-        guaranteed_sat_rounds: 0,
-        adversarial_rounds: 0,
-        observed_unsat: 0,
-        observed_sat: 0,
-        differential_agree: 0,
-        contained_unknown_downgrades: 0,
-    };
+    let mut stats = CampaignStats::default();
     for &config in configs {
         for seed in 0..seeds {
             run_seed(
@@ -515,12 +526,11 @@ fn run_campaign(
         "[{label}] PASS: no false-UNSAT / disagreement.\n  \
          configs={} seeds={seeds} num_vars={num_vars} rounds={rounds} \
          init_clauses={init_clauses} add/round={add_per_round} adversarial={adversarial_pct}%\n  \
-         guaranteed-SAT rounds verified = {} (no false-UNSAT; {} fails-safe Unknown-downgrades)\n  \
+         guaranteed-SAT rounds verified = {} (no false-UNSAT or Unknown)\n  \
          adversarial rounds = {} (incr-vs-fresh differential; agreements = {})\n  \
          observed verdicts: SAT = {}, UNSAT = {}",
         configs.len(),
         stats.guaranteed_sat_rounds,
-        stats.contained_unknown_downgrades,
         stats.adversarial_rounds,
         stats.differential_agree,
         stats.observed_sat,
@@ -536,7 +546,7 @@ fn run_campaign(
 }
 
 // ---------------------------------------------------------------------------
-// Focused reproducer for a CONTAINED incremental completeness defect.
+// Focused regression for an incremental vivify × subsumption defect.
 //
 // ROOT CAUSE (root-caused with a concrete witness num_vars=12 seed=2483 round=1;
 // NOT the BVE model-reconstruction it was originally suspected to be —
@@ -556,16 +566,9 @@ fn run_campaign(
 // Bisection is decisive: the trigger needs BOTH vivify AND subsume; disabling
 // either kills it; BVE/BCE/probe are irrelevant.
 //
-// CONTAINED: the always-on `finalize_sat` gate (#8819) detects "internal model
-// does not satisfy the clause DB", returns Unknown/`InvalidSatModel`, and #8754
-// poisons the solver — so NO unsound verdict escapes (asserted per-round). The
-// cost is completeness (Unknown on a decidable query). Production IC3 uses
-// `set_ic3_mode()` and does not hit this PreprocessHeavy path.
-//
-// A correct fix lives in the vivify/BCP propagation-repair (re-propagate from
-// qhead=0 / re-watch strengthened clauses whose watches were falsified at level
-// 0 after an inprocessing pass), and needs SAT-corpus perf validation — left for
-// a focused, solver-expert change; this repro pins the exact trigger.
+// The always-on `finalize_sat` gate (#8819) contained the historical failure by
+// returning Unknown/`InvalidSatModel`. The regression below requires the
+// production watch repair to prevent that downgrade altogether.
 // ---------------------------------------------------------------------------
 
 /// Drive one PreprocessHeavy solver and return the round index at which the
@@ -573,7 +576,7 @@ fn run_campaign(
 /// accumulated clause DB + assumptions + planted solution at that point.
 /// Also asserts, at every round, that NO unsound verdict escapes.
 #[allow(clippy::type_complexity)]
-fn probe_reconstruction_corruption(
+fn probe_vivify_subsume_corruption(
     num_vars: usize,
     seed: u64,
     rounds: usize,
@@ -639,67 +642,70 @@ fn probe_reconstruction_corruption(
     None
 }
 
-/// Deterministic, self-contained reproduction of the incremental-BVE
-/// reconstruction corruption. Marked `#[ignore]` because it documents a
-/// *contained* latent defect (the guard holds — no unsound verdict escapes),
-/// not a pass/fail soundness gate. Run explicitly:
-///   cargo test -p ay-sat --test incremental_false_unsat_differential \
-///     repro_incremental_bve_reconstruction_corruption -- --ignored --nocapture
+/// Bounded regression for the incremental vivify × subsumption 2WL defect.
+///
+/// The former ignored test searched 36,000 `(num_vars, seed)` pairs even though
+/// the minimal deterministic witness is known. Exercise only that witness and
+/// its first two rounds. [`probe_vivify_subsume_corruption`] asserts on every
+/// round that no false SAT or false UNSAT verdict escapes. The historical
+/// failure returned `InvalidSatModel` at round 1; the root fix must prevent any
+/// such trigger.
 #[test]
-#[ignore = "documents a contained latent defect (finalize_sat gate holds); run explicitly"]
-#[timeout(300_000)]
-fn repro_incremental_bve_reconstruction_corruption() {
-    // Scan for the smallest (num_vars, seed) that trips the finalize_sat gate.
-    let (rounds, init, add, adv) = (30usize, 60usize, 2usize, 60u64);
-    let mut found = None;
-    'scan: for &nv in &[10usize, 12, 14, 16, 18, 20, 24, 30, 40] {
-        for seed in 0..4000u64 {
-            if let Some((round, sol, db, assumptions)) =
-                probe_reconstruction_corruption(nv, seed, rounds, init, add, adv)
-            {
-                eprintln!(
-                    "TRIGGER: num_vars={nv} seed={seed} round={round} clauses={} \
-                     assumptions={}",
-                    db.len(),
-                    assumptions.len()
-                );
-                eprintln!(
-                    "{}",
-                    dump_repro(
-                        "INCREMENTAL-BVE RECONSTRUCTION CORRUPTION (contained: guard -> Unknown)",
-                        Config::PreprocessHeavy,
-                        seed,
-                        round,
-                        nv,
-                        &sol,
-                        &db,
-                        &assumptions,
-                    )
-                );
-                found = Some((nv, seed, round));
-                break 'scan;
-            }
-        }
-    }
-    match found {
-        Some((nv, seed, round)) => eprintln!(
-            "REPRO OK: contained incremental-BVE reconstruction corruption at \
-             num_vars={nv} seed={seed} round={round}. The finalize_sat gate (#8819) \
-             returned InvalidSatModel and #8754 poisoned the solver (UNSAT->Unknown), \
-             so NO unsound verdict escaped (asserted per-round). This is the latent \
-             defect underlying the reported false-UNSAT symptom; production IC3 \
-             (set_ic3_mode, BVE off) does not hit it."
-        ),
-        None => eprintln!(
-            "NO TRIGGER found in scan window — reconstruction corruption not \
-             reproduced under these parameters."
-        ),
-    }
+#[timeout(30_000)]
+fn incremental_vivify_subsume_soundness_regression() {
+    let trigger = probe_vivify_subsume_corruption(
+        /* num_vars */ 12, /* seed */ 2483, /* rounds */ 2,
+        /* init_clauses */ 60, /* add_per_round */ 2, /* adversarial_pct */ 60,
+    )
+    .map(|(round, _, _, _)| round);
+
+    assert_eq!(
+        trigger, None,
+        "vivification left a clause stranded on level-0-false watches"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
+
+/// Sweep rewrites an original clause, BCE removes the rewritten clause, and
+/// BVE later eliminates its blocking variable. The BCE witness must remain on
+/// the reconstruction stack so the original clause is restored.
+#[test]
+#[timeout(30_000)]
+fn preprocess_heavy_seed_15_reconstruction_regression() {
+    let mut stats = CampaignStats::default();
+    run_seed(
+        Config::PreprocessHeavy,
+        /* seed */ 15,
+        /* num_vars */ 16,
+        /* rounds */ 1,
+        /* init_clauses */ 64,
+        /* add_per_round */ 0,
+        /* adversarial_pct */ 70,
+        &mut stats,
+    );
+}
+
+/// Vivification shortens an original clause before BCE removes it and BVE
+/// later eliminates the same blocking variable. Retaining the earlier BCE
+/// witness prevents a model-reconstruction downgrade to `InvalidSatModel`.
+#[test]
+#[timeout(30_000)]
+fn preprocess_heavy_seed_18_reconstruction_regression() {
+    let mut stats = CampaignStats::default();
+    run_seed(
+        Config::PreprocessHeavy,
+        /* seed */ 18,
+        /* num_vars */ 40,
+        /* rounds */ 1,
+        /* init_clauses */ 120,
+        /* add_per_round */ 0,
+        /* adversarial_pct */ 55,
+        &mut stats,
+    );
+}
 
 /// Large-variable planted campaign across all three configs. The planted
 /// oracle makes every non-adversarial round a provable SAT, so any incremental

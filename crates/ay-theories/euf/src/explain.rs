@@ -70,11 +70,25 @@ impl ExplainMemo {
     }
     /// Store the reason set for `(a, b)` (idempotent: the forest is immutable
     /// within the cache lifetime, so a re-store would be identical).
+    ///
+    /// We store the deduped reason SET (by `(term.0, value)` — the full identity
+    /// of a `TheoryLit`), not the raw appended buffer. The raw buffer re-contains
+    /// a shared sub-proof's reasons once per parent in a congruence DAG, so a
+    /// deep diamond-shaped proof makes a stored entry — and every later cache HIT
+    /// that re-appends it whole in `explain_into` — blow up combinatorially
+    /// (observed: 20 GB RSS + timeout on QF_ALIA/cs_fib-2). Every consumer
+    /// sort+dedups its final reason buffer by the same key, and the union of the
+    /// deduped sub-sets equals the union of the raw sub-sets AS A SET, so this is
+    /// byte-identical to storing the raw buffer while collapsing the blowup to
+    /// polynomial. No distinct literal is ever dropped: same key ⟹ identical lit.
     #[inline]
     fn insert(&mut self, a: u32, b: u32, reasons: &[TheoryLit]) {
-        self.cache
-            .entry(Self::key(a, b))
-            .or_insert_with(|| reasons.to_vec());
+        self.cache.entry(Self::key(a, b)).or_insert_with(|| {
+            let mut v = reasons.to_vec();
+            v.sort_unstable_by_key(|l| (l.term.0, l.value));
+            v.dedup_by_key(|l| (l.term.0, l.value));
+            v
+        });
     }
 }
 

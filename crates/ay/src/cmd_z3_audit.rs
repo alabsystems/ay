@@ -34,6 +34,7 @@ const BASIC_SMT_TRANSCRIPT_INPUT: &str = "(set-option :produce-models true)\n\
                                           (check-sat)\n\
                                           (get-value (x))\n";
 const CHC_CANARY_PROBLEM: &str = "benchmarks/chc/counter_safe_chccomp.smt2";
+const CHC_CERTIFICATE_FILENAME: &str = "chc-certificate.chccert";
 const LAUNCH_GATED_HEADING: &str = "## Release-Gated Compatibility Surface";
 const BROADER_LEDGER_HEADING: &str = "## Broader Z3 Compatibility Honesty Ledger";
 const C_API_FFI_SMOKE_ID: &str = "c_api_ffi_smoke";
@@ -2304,7 +2305,7 @@ fn chc_certificate_replay_row(
     run: bool,
 ) -> ProofInventoryRow {
     let command = format!(
-        "{} solve --chc --stats-json --proof <work-dir>/chc-certificate.smt2 {CHC_CANARY_PROBLEM} && ay z3-audit --reference-cache {}",
+        "{} solve --chc --stats-json --proof <work-dir>/{CHC_CERTIFICATE_FILENAME} {CHC_CANARY_PROBLEM} && ay z3-audit --reference-cache {}",
         ay.display(),
         reference_cache_path.display()
     );
@@ -2332,7 +2333,7 @@ fn chc_certificate_replay_row(
     }
 
     let problem = repo_root.join(CHC_CANARY_PROBLEM);
-    let certificate = work_dir.join("chc-certificate.smt2");
+    let certificate = work_dir.join(CHC_CERTIFICATE_FILENAME);
     let certificate_arg = certificate.to_string_lossy().into_owned();
     let problem_arg = problem.to_string_lossy().into_owned();
     let emit = match run_command_capture(
@@ -2696,8 +2697,13 @@ fn unique_chc_stats_json(stdout: &[u8], stderr: &[u8]) -> Result<Value> {
             let (_, _, value) = candidates
                 .pop()
                 .context("same-run CHC stats candidate disappeared during parsing")?;
-            if value.get("mode").and_then(Value::as_str) != Some("chc") {
-                anyhow::bail!("same-run stats JSON carrying CHC evidence has mode other than chc");
+            if !matches!(
+                value.get("mode").and_then(Value::as_str),
+                Some("chc" | "portfolio")
+            ) {
+                anyhow::bail!(
+                    "same-run stats JSON carrying CHC evidence has mode other than chc/portfolio"
+                );
             }
             Ok(value)
         }
@@ -2935,7 +2941,7 @@ fn generate_reference_cache(repo_root: &Path, ay: &Path, z3: &str) -> Result<Val
     let problem = repo_root.join(CHC_CANARY_PROBLEM);
     let problem_sha256 =
         sha256_file(&problem).with_context(|| format!("hash CHC canary {}", problem.display()))?;
-    let certificate = work_dir.join("chc-certificate.smt2");
+    let certificate = work_dir.join(CHC_CERTIFICATE_FILENAME);
     let certificate_arg = certificate.to_string_lossy().into_owned();
     let problem_arg = problem.to_string_lossy().into_owned();
     let emit = run_command_capture(
@@ -3001,7 +3007,20 @@ fn generate_reference_cache(repo_root: &Path, ay: &Path, z3: &str) -> Result<Val
         "generator": {
             "z3_command": z3,
             "z3_version": z3_version,
-            "ay": ay,
+            // Repo-relative, never absolute. This value is committed to
+            // tests/z3-audit/reference-cache.json, and an absolute path here is
+            // machine-specific (/Users/<name>/ay/target/debug/ay), which the
+            // publication guard rejects — one refreshed oracle would block the
+            // entire public export. Normalising at the producer means a
+            // regenerated cache cannot reintroduce the leak.
+            "ay": ay
+                .strip_prefix(repo_root)
+                .map(|rel| rel.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| {
+                    ay.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "ay".to_string())
+                }),
             "ay_version": ay_version,
         },
         "basic_smt_transcript": {
@@ -4201,7 +4220,12 @@ fn split_current_eval_packets(
         } else {
             stale.push(format!(
                 "{}@{}",
-                path.display(),
+                // Repo-relative, matching the sibling scoreboard path above.
+                // This string is embedded in the `missing` diagnostic that gets
+                // committed to tests/z3-audit/reference-cache.json, so an
+                // absolute path here (/Users/<name>/ay/evals/...) fails the
+                // publication forbidden-content guard and blocks the export.
+                relative_path_string(repo_root, &path),
                 eval_result_commit(&value).unwrap_or_else(|| "unknown".to_string())
             ));
         }

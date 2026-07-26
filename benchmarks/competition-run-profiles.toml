@@ -1,0 +1,112 @@
+# Resource and subset profiles for the 2025/2026 continuous campaign.
+#
+# These are evidence classes, not user-tunable solver defaults. Every process
+# launcher must obtain its actual jobs/per-child plan from scripts/_oom_guard.py
+# and persist that enforced plan in the result packet.
+
+schema_version = 1
+
+[[profile]]
+id = "reviewer-full"
+run_class = "proxy"
+purpose = "Run every currently executable registered campaign lane over its full configured corpus and emit explicit dispositions for all 832 tracks."
+timeout_sec = 60
+shard_size = 0
+max_jobs = 1
+per_child_memory_mib = 8192
+per_child_cores = 1
+cpu_policy = "planner-budget-no-affinity-claim"
+oom_guard_required = true
+same_host_competitors = 0
+score_comparable = false
+notes = "This is an exhaustive operational audit, not an official replay. Unsupported tracks are emitted as blocked rows and proxy scores are never admitted as retroactive competition scores."
+
+[[profile]]
+id = "canary-proxy"
+run_class = "proxy"
+purpose = "Fast build/soundness regression signal on committed canaries."
+timeout_sec = 10
+shard_size = 16
+max_jobs = 2
+per_child_memory_mib = 2048
+cpu_policy = "physical-cores-no-smt-overlap"
+oom_guard_required = true
+same_host_competitors = 0
+score_comparable = false
+
+[[profile]]
+id = "targeted-proxy"
+run_class = "proxy"
+purpose = "Rolling deterministic shards for development and bug localization."
+timeout_sec = 300
+shard_size = 64
+max_jobs = 4
+per_child_memory_mib = 8192
+cpu_policy = "physical-cores-no-smt-overlap"
+oom_guard_required = true
+same_host_competitors = 0
+score_comparable = false
+
+[[profile]]
+id = "same-host-calibrated"
+run_class = "same-host-calibrated"
+purpose = "Full available corpus with AY and up to three pinned leading competitors under one enforced envelope."
+timeout_sec = 0
+shard_size = 0
+max_jobs = 0
+per_child_memory_mib = 0
+cpu_policy = "one-pinned-physical-core-set-per-child"
+oom_guard_required = true
+same_host_competitors = 3
+score_comparable = true
+notes = "Zero numeric values mean take the track's published limit, then let _oom_guard.py reduce concurrency to the effective cgroup/host envelope. This is never called official."
+
+[[profile]]
+id = "official-replay"
+run_class = "official-replay"
+purpose = "Exact corpus, toolchain, checker, limits, and cited official hardware."
+timeout_sec = 0
+shard_size = 0
+max_jobs = 0
+per_child_memory_mib = 0
+cpu_policy = "exact-published-topology-and-affinity"
+oom_guard_required = true
+same_host_competitors = 3
+score_comparable = true
+requires_exact_hardware = true
+notes = "Fail closed on any unknown or mismatched CPU, physical/logical core topology, RAM/cgroup/swap envelope, OS, checker, or corpus pin. No current local run qualifies."
+
+[[profile]]
+id = "high-memory-same-host"
+run_class = "same-host-calibrated"
+purpose = "CASC, CoCo, HWMCC, VNN, MiniZinc PAR/OPEN, and other lanes exceeding this host."
+timeout_sec = 0
+shard_size = 0
+max_jobs = 0
+per_child_memory_mib = 0
+minimum_host_memory_gib = 128
+cpu_policy = "competition-specific"
+oom_guard_required = true
+same_host_competitors = 3
+score_comparable = true
+
+[[subset]]
+id = "committed-canary"
+kind = "explicit-versioned-list"
+size = 0
+scoring = "directional-only"
+notes = "Size is lane-specific. The committed list and its SHA-256 are persisted with each packet."
+
+[[subset]]
+id = "rolling-shard-64"
+kind = "deterministic-sorted-path-shard"
+size = 64
+scoring = "directional-only"
+notes = "Uses ay bench run --shard-index/--shard-size. Packets retain the full corpus-path inventory SHA-256; scores never mix across shards."
+
+[[subset]]
+id = "full-corpus"
+kind = "all-pinned-instances"
+size = 0
+scoring = "eligible-if-all-other-gates-pass"
+notes = "Zero means every instance in the pinned competition selection."

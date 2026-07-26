@@ -1534,31 +1534,29 @@ fn test_interpolation_spike_mini_conservation() {
     );
 }
 
-/// Standalone replay of a captured proof-interpolation query (rank-4 inc-6
-/// diagnostic). Env-gated and `#[ignore]`d: set `AY_ITP_REPRO_FILE` to an
-/// SMT-LIB script (e.g. an `AY_PROOF_ITP_DUMP` capture) and
-/// `AY_ITP_REPRO_ACOUNT` to the A-partition assert count, then run with
-/// `--ignored`. Prints the per-strength Craig verification verdicts
-/// (A&!I / I&B / shared-vars) for the PRODUCTION `get_interpolant_with_strength`.
+/// Always-on replay of the minimized interpolation capture through every
+/// production strength.  Each returned candidate is independently checked for
+/// A=>I, I∧B unsatisfiability, and shared-symbol purity.
+///
+/// This replaces the former env/file-only diagnostic: the regression now
+/// exercises real interpolation behavior in every test run.
 #[test]
-#[ignore = "manual diagnostic: requires AY_ITP_REPRO_FILE + AY_ITP_REPRO_ACOUNT"]
-fn test_interpolation_repro_replay() {
-    let path = std::env::var("AY_ITP_REPRO_FILE").expect("AY_ITP_REPRO_FILE not set");
-    let a_count: usize = std::env::var("AY_ITP_REPRO_ACOUNT")
-        .expect("AY_ITP_REPRO_ACOUNT not set")
-        .parse()
-        .expect("AY_ITP_REPRO_ACOUNT must be a number");
-    let src = std::fs::read_to_string(&path).expect("repro file readable");
+fn test_interpolation_builtin_repro_all_strengths_verify() {
+    let src = MINI;
+    let a_count = assert_lines(src)
+        .len()
+        .checked_sub(1)
+        .expect("mini repro must contain an A and B partition");
 
     let mut solver = Solver::try_new(Logic::QfLia).expect("QF_LIA supported");
     solver.set_produce_proofs(true);
     solver.set_option(":ay-proof-no-varsubst", "true");
-    let asserts: Vec<Term> = solver.parse_smtlib2(&src).expect("repro parses");
+    let asserts: Vec<Term> = solver.parse_smtlib2(src).expect("repro parses");
     assert!(a_count > 0 && a_count < asserts.len(), "split degenerate");
     let result = solver.check_sat();
     assert!(result.is_unsat(), "repro must be UNSAT, got {result:?}");
 
-    let part = Partition::new(&solver, &src, &asserts, a_count);
+    let part = Partition::new(&solver, src, &asserts, a_count);
     let a_terms: Vec<Term> = asserts[..a_count].to_vec();
     let b_terms: Vec<Term> = asserts[a_count..].to_vec();
 
@@ -1584,20 +1582,6 @@ fn test_interpolation_repro_replay() {
                 collect_var_ids(&solver, tid, &mut vars);
                 let non_shared = vars.difference(&part.shared_vars).count();
                 let i_text = solver.format_term(Term(tid));
-                // Diagnostic escape hatch (inc-19): giant roots can wedge the
-                // internal verification solve; skip it to reach later
-                // strengths' traces. Never affects production (test-only).
-                let skip_chars: usize = std::env::var("AY_ITP_REPRO_VERIFY_MAX_CHARS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(usize::MAX);
-                if i_text.len() > skip_chars {
-                    eprintln!(
-                        "[repro:{name}] SKIPPED verification (itp_chars={} > {skip_chars})",
-                        i_text.len()
-                    );
-                    continue;
-                }
                 let ra = check_script(&build_script(
                     &part.decls,
                     &part.a_lines,
@@ -1610,6 +1594,11 @@ fn test_interpolation_repro_replay() {
                 ));
                 let ok = non_shared == 0 && ra == "unsat" && rb == "unsat";
                 verified_any |= ok;
+                assert!(
+                    ok,
+                    "{name} returned a non-Craig candidate: A&!I={ra}, I&B={rb}, \
+                     non_shared_vars={non_shared}, I={i_text}"
+                );
                 eprintln!(
                     "[repro:{name}] A&!I={ra} I&B={rb} non_shared_vars={non_shared} \
                      verified={ok} cert(attempted={} verified={} served={}) itp_chars={}",
@@ -1618,9 +1607,6 @@ fn test_interpolation_repro_replay() {
                     cert_stats.served,
                     i_text.len()
                 );
-                if std::env::var("AY_ITP_REPRO_PRINT").is_ok() {
-                    eprintln!("[repro:{name}] I = {i_text}");
-                }
             }
         }
     }

@@ -41,11 +41,12 @@
 //! multiplier ever references an infinite bound. The identity `cert.verify`
 //! re-checks is therefore not an extra construction — it is LP duality itself.
 
+use ay_lra::rational::Rational as FastRational;
 use num_rational::BigRational;
 use num_traits::{Signed, ToPrimitive, Zero};
 
-use crate::cert::{BoundSide, FactRef, Multiplier, OptimalityCertificate};
-use crate::model::{exact, Col, Model, Row, Sense};
+use crate::cert::{BoundSide, CertifiedRow, FactRef, Multiplier, OptimalityCertificate};
+use crate::model::{exact, exact_small, Col, Model, Row, Sense};
 use crate::simplex::{Candidate, FloatLp, NbBound};
 
 /// A basis proven optimal in exact arithmetic.
@@ -62,6 +63,198 @@ pub(crate) struct CertifiedOptimum {
 /// worth doing only while the basis is small enough for that to beat re-solving
 /// from scratch on the exact rim. Above this the caller takes the rim directly.
 pub(crate) const MAX_EXACT_BASIS_ROWS: usize = 600;
+
+/// Turn an arbitrary finite float row-dual vector into an exact, independently
+/// checked weak-duality row for the minimize-form objective `q`.
+///
+/// No optimality, feasibility, or sign property of `row_duals` is trusted.
+/// Each finite component is first snapped to an exact `2^-30` dyadic (the
+/// established [`crate::bab`] weak-bound grid), and
+///
+/// ```text
+/// d = q - Aᵀy
+/// beta = Σ_r y_r b_r + Σ_j d_j B_j
+/// ```
+///
+/// is recomputed over the model's TRUE rational matrix/row-bound side-store.
+/// A positive coefficient selects a lower bound and a negative coefficient an
+/// upper bound. A row-dual component whose selected row side is infinite is
+/// safely replaced by zero (any `y` is legal for weak duality); a structural
+/// residual whose selected column side is infinite makes this particular
+/// proposal unusable. The resulting positive fact multipliers must convince
+/// [`CertifiedRow::verify`] before the row can leave this function.
+///
+/// Thus bad, stale, sign-reversed, or merely inaccurate float duals can only
+/// weaken the returned bound or make this function decline. They cannot mint
+/// an invalid inequality. `deadline` is advisory work control: expiry declines
+/// rather than returning a partially constructed proof.
+pub(crate) fn certified_weak_dual_row(
+    model: &Model,
+    q: &[f64],
+    row_duals: &[f64],
+    deadline: Option<std::time::Instant>,
+) -> Option<CertifiedRow> {
+    let row = weak_dual_row_proposal(model, q, row_duals, deadline)?;
+    // This is the authority. The construction is only a proposal; the public
+    // certificate checker independently recombines true model facts.
+    row.verify(model).ok()?;
+    (!deadline.is_some_and(|limit| std::time::Instant::now() >= limit)).then_some(row)
+}
+
+/// Build the weak-duality proposal without independently recombining it.
+///
+/// Keeping construction separate from verification lets the ignored
+/// performance characterization time the two exact-arithmetic phases
+/// independently. All production callers still go through
+/// [`certified_weak_dual_row`] and therefore cannot bypass verification.
+fn weak_dual_row_proposal(
+    model: &Model,
+    q: &[f64],
+    row_duals: &[f64],
+    deadline: Option<std::time::Instant>,
+) -> Option<CertifiedRow> {
+    const ROW_DEADLINE_STRIDE: usize = 64;
+    const NNZ_DEADLINE_STRIDE: usize = 1024;
+    const COL_DEADLINE_STRIDE: usize = 256;
+
+    let expired = || deadline.is_some_and(|limit| std::time::Instant::now() >= limit);
+    let n = model.num_cols();
+    let m = model.num_rows();
+    if q.len() != n
+        || row_duals.len() != m
+        || q.iter().chain(row_duals).any(|v| !v.is_finite())
+        || expired()
+    {
+        return None;
+    }
+
+    // Dense and canonical: every residual sign decision below is exact, with
+    // no epsilon dropping and no duplicate-column ambiguity.
+    let objective: Option<Vec<FastRational>> = q.iter().map(|&v| exact_small(v)).collect();
+    let objective = objective?;
+    let mut residual = objective.clone();
+    let mut beta = FastRational::zero();
+    let mut multipliers = Vec::with_capacity(m + n);
+    let mut visited_nnz = 0usize;
+    // Weak duality is valid for ANY y, so retaining all 53 bits of a noisy
+    // float dual is needless and expensive: tiny values can carry 2^110
+    // denominators into every later gcd. This is intentionally the same grid
+    // and overflow guard as `bab::exact_bound`.
+    const DUAL_GRID: i64 = 1 << 30;
+    let snap_dual = |v: f64| -> Option<FastRational> {
+        let scaled = (v * DUAL_GRID as f64).round();
+        if !scaled.is_finite() || scaled.abs() > 9.0e18 {
+            return None;
+        }
+        Some(FastRational::new(scaled as i64, DUAL_GRID))
+    };
+
+    for r in 0..m {
+        if r % ROW_DEADLINE_STRIDE == 0 && expired() {
+            return None;
+        }
+        let (coeffs, lb, ub) = model.row(Row(r as u32));
+        let y = snap_dual(row_duals[r])?;
+        if y.is_zero() {
+            continue;
+        }
+
+        // An unavailable side does not poison the whole proposal: replacing
+        // just this arbitrary dual component by exact zero remains a valid
+        // weak-duality choice and may still leave a useful certified row.
+        let (fact, selected_bound, magnitude) = if y.is_positive() {
+            let Some(bound) = model.row_lb_exact_small(r, lb) else {
+                continue;
+            };
+            (
+                FactRef::RowBound {
+                    row: Row(r as u32),
+                    side: BoundSide::Lower,
+                },
+                bound,
+                y.to_big(),
+            )
+        } else {
+            let Some(bound) = model.row_ub_exact_small(r, ub) else {
+                continue;
+            };
+            (
+                FactRef::RowBound {
+                    row: Row(r as u32),
+                    side: BoundSide::Upper,
+                },
+                bound,
+                (-&y).to_big(),
+            )
+        };
+
+        beta.mul_add_assign(&y, &selected_bound);
+        multipliers.push(Multiplier {
+            fact,
+            coeff: magnitude,
+        });
+        let neg_y = -&y;
+        for &(c, a) in coeffs {
+            visited_nnz += 1;
+            if visited_nnz.is_multiple_of(NNZ_DEADLINE_STRIDE) && expired() {
+                return None;
+            }
+            let a = model.row_coeff_exact_small(r, c, a);
+            residual[c as usize].mul_add_assign(&a, &neg_y);
+        }
+    }
+
+    for (j, d) in residual.iter().enumerate() {
+        if j % COL_DEADLINE_STRIDE == 0 && expired() {
+            return None;
+        }
+        if d.is_zero() {
+            continue;
+        }
+        let col = Col(j as u32);
+        let (lb, ub) = model.col_bounds(col);
+        let (fact, selected_bound, magnitude) = if d.is_positive() {
+            (
+                FactRef::ColBound {
+                    col,
+                    side: BoundSide::Lower,
+                },
+                exact_small(lb)?,
+                d.to_big(),
+            )
+        } else {
+            (
+                FactRef::ColBound {
+                    col,
+                    side: BoundSide::Upper,
+                },
+                exact_small(ub)?,
+                (-d).to_big(),
+            )
+        };
+        beta.mul_add_assign(d, &selected_bound);
+        multipliers.push(Multiplier {
+            fact,
+            coeff: magnitude,
+        });
+    }
+
+    if expired() {
+        return None;
+    }
+    let cert = OptimalityCertificate {
+        sense: Sense::Minimize,
+        objective: objective
+            .into_iter()
+            .enumerate()
+            .filter(|(_, coeff)| !coeff.is_zero())
+            .map(|(j, coeff)| (j as u32, coeff.to_big()))
+            .collect(),
+        bound: beta.to_big(),
+        multipliers,
+    };
+    Some(cert.into_certified_row())
+}
 
 /// Overridable for measurement.
 pub(crate) fn max_exact_basis_rows() -> usize {
@@ -749,7 +942,9 @@ pub(crate) fn certify_bounded(
                 if z[j] < lo {
                     if trace {
                         let d = (&lo - &z[j]).to_f64().unwrap_or(f64::NAN);
-                        eprintln!("AY_MILP_TRACE !! exact_point: basic col {j} below its lower bound by {d:.3e}");
+                        eprintln!(
+                            "AY_MILP_TRACE !! exact_point: basic col {j} below its lower bound by {d:.3e}"
+                        );
                     }
                     return None;
                 }
@@ -758,7 +953,9 @@ pub(crate) fn certify_bounded(
                 if z[j] > hi {
                     if trace {
                         let d = (&z[j] - &hi).to_f64().unwrap_or(f64::NAN);
-                        eprintln!("AY_MILP_TRACE !! exact_point: basic col {j} above its upper bound by {d:.3e}");
+                        eprintln!(
+                            "AY_MILP_TRACE !! exact_point: basic col {j} above its upper bound by {d:.3e}"
+                        );
                     }
                     return None;
                 }
@@ -1015,6 +1212,660 @@ impl ExactLu {
             z[i] = &acc / &self.lu[i][i];
         }
         z
+    }
+}
+
+#[cfg(test)]
+mod weak_dual_row_tests {
+    use super::*;
+    use crate::cert::tests::{combine_bounded_big_reference, combine_bounded_fast_for_benchmark};
+    use num_bigint::BigInt;
+    use num_traits::One;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::time::Duration;
+
+    fn rat(n: i64, d: i64) -> BigRational {
+        BigRational::new(n.into(), d.into())
+    }
+
+    /// The pre-fast-path implementation, retained only as a differential
+    /// oracle. It deliberately performs every accumulation with
+    /// `BigRational`; production uses `FastRational` and must return the exact
+    /// same proof object or decline for the same mathematical reason.
+    fn certified_weak_dual_row_big_reference(
+        model: &Model,
+        q: &[f64],
+        row_duals: &[f64],
+        deadline: Option<std::time::Instant>,
+    ) -> Option<CertifiedRow> {
+        let row = certified_weak_dual_row_big_reference_proposal(model, q, row_duals, deadline)?;
+        row.verify(model).ok()?;
+        (!deadline.is_some_and(|limit| std::time::Instant::now() >= limit)).then_some(row)
+    }
+
+    fn certified_weak_dual_row_big_reference_proposal(
+        model: &Model,
+        q: &[f64],
+        row_duals: &[f64],
+        deadline: Option<std::time::Instant>,
+    ) -> Option<CertifiedRow> {
+        const ROW_DEADLINE_STRIDE: usize = 64;
+        const NNZ_DEADLINE_STRIDE: usize = 1024;
+        const COL_DEADLINE_STRIDE: usize = 256;
+
+        let expired = || deadline.is_some_and(|limit| std::time::Instant::now() >= limit);
+        let n = model.num_cols();
+        let m = model.num_rows();
+        if q.len() != n
+            || row_duals.len() != m
+            || q.iter().chain(row_duals).any(|v| !v.is_finite())
+            || expired()
+        {
+            return None;
+        }
+
+        let objective: Option<Vec<BigRational>> = q.iter().map(|&v| exact(v)).collect();
+        let objective = objective?;
+        let mut residual = objective.clone();
+        let mut beta = BigRational::zero();
+        let mut multipliers = Vec::with_capacity(m + n);
+        let mut visited_nnz = 0usize;
+        const DUAL_GRID: i64 = 1 << 30;
+        let snap_dual = |v: f64| -> Option<BigRational> {
+            let scaled = (v * DUAL_GRID as f64).round();
+            if !scaled.is_finite() || scaled.abs() > 9.0e18 {
+                return None;
+            }
+            Some(BigRational::new((scaled as i64).into(), DUAL_GRID.into()))
+        };
+
+        for r in 0..m {
+            if r % ROW_DEADLINE_STRIDE == 0 && expired() {
+                return None;
+            }
+            let (coeffs, lb, ub) = model.row(Row(r as u32));
+            let y = snap_dual(row_duals[r])?;
+            if y.is_zero() {
+                continue;
+            }
+            let (fact, selected_bound, magnitude) = if y.is_positive() {
+                let Some(bound) = model.row_lb_exact(r, lb) else {
+                    continue;
+                };
+                (
+                    FactRef::RowBound {
+                        row: Row(r as u32),
+                        side: BoundSide::Lower,
+                    },
+                    bound,
+                    y.clone(),
+                )
+            } else {
+                let Some(bound) = model.row_ub_exact(r, ub) else {
+                    continue;
+                };
+                (
+                    FactRef::RowBound {
+                        row: Row(r as u32),
+                        side: BoundSide::Upper,
+                    },
+                    bound,
+                    -y.clone(),
+                )
+            };
+
+            beta += &y * selected_bound;
+            multipliers.push(Multiplier {
+                fact,
+                coeff: magnitude,
+            });
+            for &(c, a) in coeffs {
+                visited_nnz += 1;
+                if visited_nnz.is_multiple_of(NNZ_DEADLINE_STRIDE) && expired() {
+                    return None;
+                }
+                residual[c as usize] -= model.row_coeff_exact(r, c, a) * &y;
+            }
+        }
+
+        for (j, d) in residual.iter().enumerate() {
+            if j % COL_DEADLINE_STRIDE == 0 && expired() {
+                return None;
+            }
+            if d.is_zero() {
+                continue;
+            }
+            let col = Col(j as u32);
+            let (lb, ub) = model.col_bounds(col);
+            let (fact, selected_bound, magnitude) = if d.is_positive() {
+                (
+                    FactRef::ColBound {
+                        col,
+                        side: BoundSide::Lower,
+                    },
+                    exact(lb)?,
+                    d.clone(),
+                )
+            } else {
+                (
+                    FactRef::ColBound {
+                        col,
+                        side: BoundSide::Upper,
+                    },
+                    exact(ub)?,
+                    -d.clone(),
+                )
+            };
+            beta += d * selected_bound;
+            multipliers.push(Multiplier {
+                fact,
+                coeff: magnitude,
+            });
+        }
+
+        if expired() {
+            return None;
+        }
+        Some(
+            OptimalityCertificate {
+                sense: Sense::Minimize,
+                objective: objective
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(_, coeff)| !coeff.is_zero())
+                    .map(|(j, coeff)| (j as u32, coeff))
+                    .collect(),
+                bound: beta,
+                multipliers,
+            }
+            .into_certified_row(),
+        )
+    }
+
+    fn assert_matches_big_reference(model: &Model, q: &[f64], row_duals: &[f64]) -> CertifiedRow {
+        let fast = certified_weak_dual_row(model, q, row_duals, None);
+        let reference = certified_weak_dual_row_big_reference(model, q, row_duals, None);
+        assert_eq!(fast, reference, "inline and BigRational builders diverged");
+        fast.expect("finite boxed differential case must construct")
+    }
+
+    #[test]
+    fn exact_row_dual_proves_fractional_equality_bound() {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 10.0);
+        model.add_row(3.0, 3.0, &[(x, 2.0)]);
+
+        let row = assert_matches_big_reference(&model, &[1.0], &[0.5]);
+        row.verify(&model).expect("proof must independently verify");
+        assert_eq!(row.coeffs, vec![(x.0, BigRational::one())]);
+        assert_eq!(row.lb, rat(3, 2));
+
+        let mut tampered = row;
+        tampered.lb += BigRational::one();
+        assert!(
+            tampered.verify(&model).is_err(),
+            "changing the proved bound must invalidate the exact identity"
+        );
+    }
+
+    #[test]
+    fn unavailable_row_side_is_zeroed_without_weakening_soundness() {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 1.0);
+        model.add_row(f64::NEG_INFINITY, 0.5, &[(x, 1.0)]);
+
+        // Positive y asks for the absent lower row side. The constructor is
+        // allowed to replace arbitrary y by zero, leaving the valid box proof
+        // x >= 0.
+        let row = certified_weak_dual_row(&model, &[1.0], &[4.0], None)
+            .expect("bounded structural residual still proves a row");
+        row.verify(&model).unwrap();
+        assert_eq!(row.lb, BigRational::zero());
+    }
+
+    #[test]
+    fn infinity_nonfinite_and_expired_inputs_decline() {
+        let mut free_model = Model::new();
+        free_model.add_col(f64::NEG_INFINITY, f64::INFINITY);
+        assert!(
+            certified_weak_dual_row(&free_model, &[1.0], &[], None).is_none(),
+            "positive residual cannot cite a missing structural lower bound"
+        );
+
+        let mut model = Model::new();
+        let x = model.add_col(-1.0, 1.0);
+        model.add_row(0.0, 0.0, &[(x, 1.0)]);
+        assert!(certified_weak_dual_row(&model, &[f64::NAN], &[0.0], None).is_none());
+        assert!(certified_weak_dual_row(&model, &[1.0], &[f64::INFINITY], None).is_none());
+        assert!(
+            certified_weak_dual_row(&model, &[1.0], &[f64::MAX], None).is_none(),
+            "a finite but unsnappable corrupted dual must fail closed"
+        );
+        assert!(
+            certified_weak_dual_row(&model, &[1.0], &[0.0], Some(std::time::Instant::now()))
+                .is_none()
+        );
+        assert!(
+            certified_weak_dual_row_big_reference(
+                &model,
+                &[1.0],
+                &[0.0],
+                Some(std::time::Instant::now())
+            )
+            .is_none(),
+            "the fast path preserves the reference deadline decline"
+        );
+    }
+
+    #[test]
+    fn maximize_lower_form_reorients_exactly() {
+        let mut model = Model::new();
+        let x = model.add_col(0.0, 2.0);
+        // max x is represented by q=-x. The lower-form row -x >= -2 is
+        // exactly the public upper bound x <= 2.
+        let row = certified_weak_dual_row(&model, &[-1.0], &[], None).unwrap();
+        row.verify(&model).unwrap();
+        assert_eq!(row.coeffs, vec![(x.0, -BigRational::one())]);
+        assert_eq!(row.lb, rat(-2, 1));
+    }
+
+    #[test]
+    fn uses_true_rational_side_store_not_float_proxies() {
+        let mut model = Model::new();
+        let x = model.add_col(-10.0, 10.0);
+        let row_handle = model.add_row(2.0 / 3.0, 2.0 / 3.0, &[(x, 1.0 / 3.0)]);
+        model.record_inexact_row_coeff(row_handle, x.0, rat(1, 3));
+        model.record_inexact_row_bound(row_handle, true, rat(2, 3));
+        model.record_inexact_row_bound(row_handle, false, rat(2, 3));
+
+        // Over the TRUE row (1/3)x = 2/3, y=3 has zero residual and proves
+        // x >= 2. Replaying rounded proxies would not close this identity.
+        let row = assert_matches_big_reference(&model, &[1.0], &[3.0]);
+        row.verify(&model).unwrap();
+        assert_eq!(row.coeffs, vec![(x.0, BigRational::one())]);
+        assert_eq!(row.lb, rat(2, 1));
+    }
+
+    #[test]
+    fn promotion_extremes_and_large_side_store_match_big_reference() {
+        let mut dyadic = Model::new();
+        let cols: Vec<Col> = (0..4).map(|_| dyadic.add_col(-1.0, 1.0)).collect();
+        let coeffs = [
+            f64::from_bits(1),
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            -f64::from_bits((1022_u64 << 52) | 1),
+        ];
+        for (&col, &coeff) in cols.iter().zip(&coeffs) {
+            dyadic.add_row(0.0, 0.0, &[(col, coeff)]);
+        }
+        let row = assert_matches_big_reference(
+            &dyadic,
+            &[1.0, -1.0, f64::MIN_POSITIVE, f64::from_bits(1)],
+            &[1.0, -0.5, 0.75, -1.25],
+        );
+        row.verify(&dyadic).unwrap();
+
+        let mut side_store = Model::new();
+        let x = side_store.add_col(-3.0, 5.0);
+        let proxy = side_store.add_row(2.0, 2.0, &[(x, 1.0)]);
+        let numerator = (BigInt::from(1_u8) << 180) + BigInt::from(17_u8);
+        let denominator = (BigInt::from(1_u8) << 100) + BigInt::from(3_u8);
+        let exact_coeff = BigRational::new(numerator, denominator);
+        let exact_bound = &exact_coeff + &exact_coeff;
+        side_store.record_inexact_row_coeff(proxy, x.0, exact_coeff.clone());
+        side_store.record_inexact_row_bound(proxy, true, exact_bound.clone());
+        side_store.record_inexact_row_bound(proxy, false, exact_bound);
+
+        let row = assert_matches_big_reference(&side_store, &[0.0], &[1.0]);
+        row.verify(&side_store).unwrap();
+        assert_eq!(row.lb, -(&exact_coeff + &exact_coeff + exact_coeff));
+    }
+
+    fn sealed_mix(mut value: u64) -> u64 {
+        value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn timed<T>(f: impl FnOnce() -> T) -> (Duration, T) {
+        let start = std::time::Instant::now();
+        let value = f();
+        (start.elapsed(), value)
+    }
+
+    fn median(mut samples: Vec<Duration>) -> Duration {
+        samples.sort_unstable();
+        samples[samples.len() / 2]
+    }
+
+    fn certified_row_hash(row: &CertifiedRow) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        row.coeffs.hash(&mut hasher);
+        row.lb.hash(&mut hasher);
+        row.multipliers.len().hash(&mut hasher);
+        for multiplier in &row.multipliers {
+            multiplier.fact.hash(&mut hasher);
+            multiplier.coeff.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    fn combination_hash(coeffs: &[BigRational], constant: &BigRational) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        coeffs.hash(&mut hasher);
+        constant.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// One-process characterization at the sealed VNN-COMP instance's exact
+    /// sparse dimensions. This deliberately excludes model construction and
+    /// solver setup: both implementations see the same warm, immutable model,
+    /// objective, snapped duals, multiplier list, and rational side-store.
+    ///
+    /// The shape is representative, but the synthetic adjacency, coefficient
+    /// distribution, and one-hot objective are not a replay of the confidential
+    /// network. Alternating order and medians reduce (but cannot eliminate)
+    /// shared-host frequency and scheduling noise.
+    #[test]
+    #[ignore = "sealed-scale exact-arithmetic performance characterization"]
+    fn sealed_scale_rational_weak_row_benchmark() {
+        const NUM_COLS: usize = 7_593;
+        const NUM_ROWS: usize = 4_846;
+        const NUM_NNZ: usize = 502_260;
+        const EXTRA_NNZ_ROWS: usize = NUM_NNZ - NUM_ROWS * 103;
+        const SIDE_STORE_COEFFS: usize = 8;
+        const SIDE_STORE_BOUNDS: usize = 8;
+        const ROUNDS: usize = 5;
+
+        let mut model = Model::new();
+        let cols: Vec<Col> = (0..NUM_COLS)
+            .map(|j| {
+                let lb = -7.0 - (j % 3) as f64;
+                let ub = 11.0 + (j % 5) as f64;
+                model.add_col(lb, ub)
+            })
+            .collect();
+        let mut duals = Vec::with_capacity(NUM_ROWS);
+        let mut actual_nnz = 0usize;
+
+        for r in 0..NUM_ROWS {
+            let degree = 103 + usize::from(r < EXTRA_NNZ_ROWS);
+            let mut coeffs = Vec::with_capacity(degree);
+            for k in 0..degree {
+                // gcd(67, 7593) == 1, so every row is duplicate-free.
+                let col = cols[(r * 131 + k * 67) % NUM_COLS];
+                let bits = sealed_mix(((r as u64) << 32) | k as u64);
+                let numerator = ((bits >> 8) % 2_047 + 1) as f64;
+                let denominator = (1_u64 << (8 + (bits as u32 % 5))) as f64;
+                let sign = if bits & 1 == 0 { 1.0 } else { -1.0 };
+                coeffs.push((col, sign * numerator / denominator));
+            }
+            actual_nnz += coeffs.len();
+
+            let row = model.add_row(-3.0, 4.0, &coeffs);
+            if r < SIDE_STORE_BOUNDS {
+                let exact_lb = if r == 0 {
+                    let numerator = -((BigInt::from(1_u8) << 115_usize) + BigInt::from(17_u8));
+                    let denominator = (BigInt::from(1_u8) << 75_usize) + BigInt::from(3_u8);
+                    BigRational::new(numerator, denominator)
+                } else {
+                    rat(-((2 * r + 1) as i64), 3)
+                };
+                model.record_inexact_row_bound(row, true, exact_lb);
+            }
+            if (SIDE_STORE_BOUNDS..SIDE_STORE_BOUNDS + SIDE_STORE_COEFFS).contains(&r) {
+                let exact_coeff = if r == SIDE_STORE_BOUNDS {
+                    let numerator = (BigInt::from(1_u8) << 113_usize) + BigInt::from(29_u8);
+                    let denominator = (BigInt::from(1_u8) << 73_usize) + BigInt::from(5_u8);
+                    BigRational::new(numerator, denominator)
+                } else {
+                    rat((2 * r + 1) as i64, 3)
+                };
+                let overridden_col = coeffs[0].0;
+                model.record_inexact_row_coeff(row, overridden_col.0, exact_coeff);
+            }
+
+            let bits = sealed_mix(0xd1b5_4a32_d192_ed03 ^ r as u64);
+            let numerator = ((bits >> 12) % ((1_u64 << 29) - 1) + 1) as f64;
+            let sign = if r < SIDE_STORE_BOUNDS + SIDE_STORE_COEFFS || bits & 1 == 0 {
+                1.0
+            } else {
+                -1.0
+            };
+            duals.push(sign * numerator / (1_u64 << 30) as f64);
+        }
+        assert_eq!(actual_nnz, NUM_NNZ);
+
+        let mut q = vec![0.0; NUM_COLS];
+        q[NUM_COLS - 1] = 1.0;
+
+        // Untimed warm-up also establishes the shared proof and Combination
+        // input before collecting any samples.
+        let fast_warm =
+            weak_dual_row_proposal(&model, &q, &duals, None).expect("finite box must build");
+        let big_warm = certified_weak_dual_row_big_reference_proposal(&model, &q, &duals, None)
+            .expect("BigRational oracle must build");
+        assert_eq!(fast_warm, big_warm);
+        fast_warm
+            .verify(&model)
+            .expect("warm proposal must independently verify");
+        let multipliers = fast_warm.multipliers.clone();
+
+        combine_bounded_big_reference(&multipliers, &model, None)
+            .expect("BigRational Combination warm-up must succeed");
+        let (fast_coeffs, fast_constant) =
+            combine_bounded_fast_for_benchmark(&multipliers, &model, None)
+                .expect("production Combination must succeed");
+        let (big_coeffs, big_constant) = combine_bounded_big_reference(&multipliers, &model, None)
+            .expect("BigRational Combination oracle must succeed");
+        assert_eq!(
+            fast_coeffs
+                .iter()
+                .map(FastRational::to_big)
+                .collect::<Vec<_>>(),
+            big_coeffs
+        );
+        assert_eq!(fast_constant.to_big(), big_constant);
+        let expected_row_hash = certified_row_hash(&fast_warm);
+        let expected_combination_hash = combination_hash(&big_coeffs, &big_constant);
+
+        let mut builder_fast = Vec::with_capacity(ROUNDS);
+        let mut builder_big = Vec::with_capacity(ROUNDS);
+        let mut combination_fast = Vec::with_capacity(ROUNDS);
+        let mut combination_big = Vec::with_capacity(ROUNDS);
+        let mut final_big_slots = None;
+
+        for round in 0..ROUNDS {
+            let (fast_time, fast_row, big_time, big_row) = if round % 2 == 0 {
+                let (fast_time, fast_row) = timed(|| {
+                    weak_dual_row_proposal(&model, &q, &duals, None)
+                        .expect("production proposal must build")
+                });
+                let (big_time, big_row) = timed(|| {
+                    certified_weak_dual_row_big_reference_proposal(&model, &q, &duals, None)
+                        .expect("BigRational proposal must build")
+                });
+                (fast_time, fast_row, big_time, big_row)
+            } else {
+                let (big_time, big_row) = timed(|| {
+                    certified_weak_dual_row_big_reference_proposal(&model, &q, &duals, None)
+                        .expect("BigRational proposal must build")
+                });
+                let (fast_time, fast_row) = timed(|| {
+                    weak_dual_row_proposal(&model, &q, &duals, None)
+                        .expect("production proposal must build")
+                });
+                (fast_time, fast_row, big_time, big_row)
+            };
+            assert_eq!(fast_row, big_row);
+            assert_eq!(certified_row_hash(&fast_row), expected_row_hash);
+            assert_eq!(certified_row_hash(&big_row), expected_row_hash);
+            builder_fast.push(fast_time);
+            builder_big.push(big_time);
+            drop(fast_row);
+            drop(big_row);
+
+            let (fast_time, fast_combination, big_time, big_combination) = if round % 2 == 0 {
+                let (fast_time, fast_combination) = timed(|| {
+                    combine_bounded_fast_for_benchmark(&multipliers, &model, None)
+                        .expect("production Combination must succeed")
+                });
+                let (big_time, big_combination) = timed(|| {
+                    combine_bounded_big_reference(&multipliers, &model, None)
+                        .expect("BigRational Combination oracle must succeed")
+                });
+                (fast_time, fast_combination, big_time, big_combination)
+            } else {
+                let (big_time, big_combination) = timed(|| {
+                    combine_bounded_big_reference(&multipliers, &model, None)
+                        .expect("BigRational Combination oracle must succeed")
+                });
+                let (fast_time, fast_combination) = timed(|| {
+                    combine_bounded_fast_for_benchmark(&multipliers, &model, None)
+                        .expect("production Combination must succeed")
+                });
+                (fast_time, fast_combination, big_time, big_combination)
+            };
+
+            // Conversion and final storage-state inspection are deliberately
+            // outside the Combination timer.
+            let (fast_coeffs, fast_constant) = fast_combination;
+            let round_big_slots = fast_coeffs.iter().filter(|value| !value.is_small()).count()
+                + usize::from(!fast_constant.is_small());
+            assert_eq!(
+                *final_big_slots.get_or_insert(round_big_slots),
+                round_big_slots
+            );
+            let fast_big_coeffs = fast_coeffs
+                .iter()
+                .map(FastRational::to_big)
+                .collect::<Vec<_>>();
+            let fast_big_constant = fast_constant.to_big();
+            let (big_coeffs, big_constant) = big_combination;
+            assert_eq!(fast_big_coeffs, big_coeffs);
+            assert_eq!(fast_big_constant, big_constant);
+            assert_eq!(
+                combination_hash(&fast_big_coeffs, &fast_big_constant),
+                expected_combination_hash
+            );
+            assert_eq!(
+                combination_hash(&big_coeffs, &big_constant),
+                expected_combination_hash
+            );
+            combination_fast.push(fast_time);
+            combination_big.push(big_time);
+        }
+
+        let combined_fast = builder_fast
+            .iter()
+            .zip(&combination_fast)
+            .map(|(builder, combination)| *builder + *combination)
+            .collect::<Vec<_>>();
+        let combined_big = builder_big
+            .iter()
+            .zip(&combination_big)
+            .map(|(builder, combination)| *builder + *combination)
+            .collect::<Vec<_>>();
+        let builder_fast_median = median(builder_fast);
+        let builder_big_median = median(builder_big);
+        let combination_fast_median = median(combination_fast);
+        let combination_big_median = median(combination_big);
+        let combined_fast_median = median(combined_fast);
+        let combined_big_median = median(combined_big);
+        let millis = |duration: Duration| duration.as_secs_f64() * 1_000.0;
+        let speedup = |old: Duration, new: Duration| old.as_secs_f64() / new.as_secs_f64();
+
+        println!(
+            "sealed_scale_rational_weak_row_benchmark \
+             cols={NUM_COLS} rows={NUM_ROWS} nnz={NUM_NNZ} rounds={ROUNDS} \
+             objective_nnz=1 multipliers={} side_store_entries={} forced_big_inputs=2 \
+             builder_fast_median_ms={:.3} builder_big_median_ms={:.3} \
+             builder_speedup={:.3}x \
+             combination_fast_median_ms={:.3} combination_big_median_ms={:.3} \
+             combination_speedup={:.3}x \
+             combined_fast_median_ms={:.3} combined_big_median_ms={:.3} \
+             combined_speedup={:.3}x final_big_slots={} \
+             row_hash={expected_row_hash:016x} combination_hash={expected_combination_hash:016x}",
+            multipliers.len(),
+            SIDE_STORE_COEFFS + SIDE_STORE_BOUNDS,
+            millis(builder_fast_median),
+            millis(builder_big_median),
+            speedup(builder_big_median, builder_fast_median),
+            millis(combination_fast_median),
+            millis(combination_big_median),
+            speedup(combination_big_median, combination_fast_median),
+            millis(combined_fast_median),
+            millis(combined_big_median),
+            speedup(combined_big_median, combined_fast_median),
+            final_big_slots.expect("at least one round"),
+        );
+    }
+
+    /// Deterministic LCG: arbitrary and often wrong-signed dual advice must
+    /// still either decline or emit a row accepted by the independent checker.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+
+        fn int(&mut self, lo: i64, hi: i64) -> i64 {
+            lo + self.below((hi - lo + 1) as u64) as i64
+        }
+    }
+
+    #[test]
+    fn random_adversarial_duals_always_verify() {
+        let mut rng = Lcg(0x6a09_e667_f3bc_c909);
+        for case in 0..200 {
+            let n = (rng.below(6) + 1) as usize;
+            let m = rng.below(9) as usize;
+            let mut model = Model::new();
+            let cols: Vec<Col> = (0..n).map(|_| model.add_col(-5.0, 5.0)).collect();
+            for _ in 0..m {
+                let mut coeffs = Vec::new();
+                for &col in &cols {
+                    let a = rng.int(-3, 3);
+                    if a != 0 {
+                        coeffs.push((col, a as f64));
+                    }
+                }
+                if coeffs.is_empty() {
+                    coeffs.push((cols[rng.below(n as u64) as usize], 1.0));
+                }
+                let base = rng.int(-4, 4) as f64;
+                let (lb, ub) = match rng.below(4) {
+                    0 => (base, base),
+                    1 => (base, base + (rng.below(4) + 1) as f64),
+                    2 => (base, f64::INFINITY),
+                    _ => (f64::NEG_INFINITY, base),
+                };
+                model.add_row(lb, ub, &coeffs);
+            }
+            let q: Vec<f64> = (0..n).map(|_| rng.int(-3, 3) as f64).collect();
+            let y: Vec<f64> = (0..m).map(|_| rng.int(-16, 16) as f64 / 4.0).collect();
+            let row = assert_matches_big_reference(&model, &q, &y);
+            row.verify(&model)
+                .unwrap_or_else(|err| panic!("case {case} failed verification: {err}"));
+            let expected: Vec<(u32, BigRational)> = q
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| **a != 0.0)
+                .map(|(j, &a)| (j as u32, exact(a).unwrap()))
+                .collect();
+            assert_eq!(row.coeffs, expected, "case {case} objective drift");
+        }
     }
 }
 

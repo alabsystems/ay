@@ -9,6 +9,7 @@
 //! This crate provides the benchmarking runner and scoring engines.
 //! The binary entry point has moved to the unified ay CLI (`ay bench`).
 
+pub mod campaign;
 pub mod chc_gate;
 pub mod cross_verify;
 pub mod db;
@@ -26,3 +27,8 @@ pub mod sat_mirror_manifest;
 pub mod scoring;
 
 pub use error::{BenchError, Result, WithContext};
+pub use resource::{
+    effective_execution_envelope, GuardedCapturedOutput, GuardedTranscriptOutput, PlannedResources,
+    ResourcePlan, ENFORCEMENT_AY_MEMORY_RSS_V1, ENFORCEMENT_RSS_WATCHDOG_V1,
+    GUARDED_TRANSCRIPT_INPUT_LIMIT, GUARDED_TRANSCRIPT_STREAM_LIMIT,
+};

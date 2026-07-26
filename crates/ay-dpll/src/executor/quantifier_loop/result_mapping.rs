@@ -15,7 +15,7 @@ use super::collect_and_conjuncts;
 use super::QuantifierProcessingResult;
 use crate::cegqi::CegqiInstantiator;
 use crate::ematching::contains_quantifier;
-use crate::executor::mbqi::SkippedQuantifierMbqiGate;
+use crate::executor::mbqi::{is_pure_arith_bool_symbol, SkippedQuantifierMbqiGate};
 use crate::executor::model::{EvalValue, Model};
 use crate::executor_types::{Result, SolveResult, UnknownReason};
 
@@ -4167,6 +4167,17 @@ impl Executor {
             return None;
         }
 
+        // Premise-forced refutation for the multi-binder / BitVec `fixpoint`
+        // shape (`∀xs. premise(xs) ⟹ conclusion(xs)` with a UF-free
+        // binder-pinning premise): the Int value-window loop below only covers
+        // single-`Int`-binder foralls, so these fell through and the UF-
+        // completion certificate granted a wrong `sat`. Sound; only ever UNSAT.
+        if let Some(r @ Ok(SolveResult::Unsat(_))) =
+            self.premise_forced_binder_refutation(&foralls, snapshot)
+        {
+            return Some(r);
+        }
+
         // Eager bounded instantiation: for each single-`Int`-binder `forall`
         // with a quantifier-free body, add the ground instances `body[c]` for a
         // small window of concrete `c`. The Skolem function `sk` is SHARED across
@@ -4437,6 +4448,248 @@ impl Executor {
                 None
             }
         }
+    }
+
+    /// Refute a conjunctive `∀xs. (premise(xs) ⟹ conclusion(xs))` in the
+    /// multi-binder BitVector `fixpoint` family that the Int value-window path
+    /// cannot reach.
+    ///
+    /// The recovered premise is ONLY a candidate generator. A disposable
+    /// executor solves it at fresh BitVector constants and supplies concrete
+    /// binder values `k`. We then substitute those literals into the WHOLE
+    /// universal body and independently ground-solve `body(k)`. The premise is
+    /// never asserted into the proof problem.
+    ///
+    /// SOUNDNESS. [`Self::forall_ids_in_conjunctive_position`] establishes that
+    /// the original problem entails this universal, hence it entails every
+    /// concrete instance `body(k)`. Therefore a definitive standalone UNSAT for
+    /// `body(k)` proves the original problem UNSAT. Candidate quality is not a
+    /// soundness surface: a mistaken De Morgan partition, a shadowed
+    /// builtin-looking symbol, or an underspecified operation can at worst
+    /// produce an unhelpful `k` whose whole-body verification is SAT/Unknown.
+    /// Restricting binders to fixed-width BitVectors makes every candidate value
+    /// exactly materializable as a model-independent literal.
+    ///
+    /// Both solves use fresh executors over cloned contexts. This is
+    /// load-bearing: the old in-place probe changed quantified/QF routing state,
+    /// invalidated proof/core provenance while registering constants, and leaked
+    /// those registrations into later checks.
+    fn premise_forced_binder_refutation(
+        &mut self,
+        foralls: &[TermId],
+        snapshot: &[TermId],
+    ) -> Option<Result<SolveResult>> {
+        const MAX_QPF_CONTEXT_TERMS: usize = 100_000;
+        if self.ctx.terms.len() > MAX_QPF_CONTEXT_TERMS || !self.qpf_probe_preflight() {
+            return None;
+        }
+        let _export_suppression = Self::suppress_bv_cnf_export_for_internal_checks();
+        let conjunctive = self.forall_ids_in_conjunctive_position(snapshot);
+        'quantifier: for &q in foralls {
+            if !conjunctive.contains(&q) {
+                continue;
+            }
+            let TermData::Forall(vars, body, _) = self.ctx.terms.get(q).clone() else {
+                continue;
+            };
+            if vars.is_empty()
+                || vars
+                    .iter()
+                    .any(|(_, sort)| !matches!(sort, ay_core::Sort::BitVec(_)))
+                || contains_quantifier(&self.ctx.terms, body)
+            {
+                continue;
+            }
+            let Some(premise) = self.forall_premise_candidate(body) else {
+                continue;
+            };
+            if contains_quantifier(&self.ctx.terms, premise) {
+                continue;
+            }
+            if !self.qpf_probe_preflight() {
+                return None;
+            }
+
+            let candidate_ctx = self.ctx.clone();
+            let mut candidate = self.qpf_probe_executor(candidate_ctx, 1000);
+            if candidate
+                .ctx
+                .process_command(&ay_frontend::Command::ResetAssertions)
+                .is_err()
+            {
+                continue;
+            }
+            let mut subst: HashMap<String, TermId> = HashMap::default();
+            let mut fresh_terms = Vec::with_capacity(vars.len());
+            let mut fresh_names = Vec::with_capacity(vars.len());
+            let mut fresh_ok = true;
+            for (name, sort) in &vars {
+                let c = candidate.ctx.terms.mk_fresh_var("__ay_qpf", sort.clone());
+                let cname = match candidate.ctx.terms.get(c) {
+                    TermData::Var(n, _) => n.clone(),
+                    _ => {
+                        fresh_ok = false;
+                        break;
+                    }
+                };
+                candidate
+                    .ctx
+                    .register_native_global_symbol(cname.clone(), c, sort.clone());
+                subst.insert(name.clone(), c);
+                fresh_terms.push(c);
+                fresh_names.push(cname);
+            }
+            if !fresh_ok || subst.len() != vars.len() {
+                continue;
+            }
+
+            let premise_c = crate::ematching::subst_vars(&mut candidate.ctx.terms, premise, &subst);
+            candidate.ctx.assertions.push(premise_c);
+            if !matches!(candidate.check_sat(), Ok(SolveResult::Sat)) {
+                continue;
+            }
+            let Some(model) = candidate.last_model.as_ref() else {
+                continue;
+            };
+            let witness_values = {
+                fresh_terms
+                    .iter()
+                    .map(|&term| candidate.evaluate_term(model, term))
+                    .collect::<Vec<_>>()
+            };
+
+            let mut literal_subst: HashMap<String, TermId> = HashMap::default();
+            for ((name, sort), value) in vars.iter().zip(&witness_values) {
+                let Some(literal) = pin_eval_const_for_sort(&mut candidate.ctx.terms, sort, value)
+                else {
+                    continue 'quantifier;
+                };
+                literal_subst.insert(name.clone(), literal);
+            }
+            if literal_subst.len() != vars.len() {
+                continue;
+            }
+            let body_k =
+                crate::ematching::subst_vars(&mut candidate.ctx.terms, body, &literal_subst);
+            if contains_quantifier(&candidate.ctx.terms, body_k) {
+                continue;
+            }
+
+            if candidate
+                .ctx
+                .process_command(&ay_frontend::Command::ResetAssertions)
+                .is_err()
+            {
+                continue;
+            }
+            candidate.ctx.remove_symbols(&fresh_names);
+            let verifier_ctx = std::mem::take(&mut candidate.ctx);
+            drop(candidate);
+            if !self.qpf_probe_preflight() {
+                return None;
+            }
+            let mut verifier = self.qpf_probe_executor(verifier_ctx, 2000);
+            verifier.ctx.assertions.push(body_k);
+            if matches!(verifier.check_sat(), Ok(SolveResult::Unsat(_))) {
+                return Some(Ok(SolveResult::unsat()));
+            }
+        }
+        None
+    }
+
+    /// Decline a disposable deep-context probe before it can breach the
+    /// caller's deadline, interrupt, or memory envelope.
+    ///
+    /// The 50% checks are predictive: cloning the context roughly doubles its
+    /// term/parser footprint. A term-count cap alone does not bound parsed AST,
+    /// symbol, or string storage, so waiting until after `Context::clone` can
+    /// already have crossed the process ceiling.
+    fn qpf_probe_preflight(&self) -> bool {
+        if self.external_stop_reason().is_some()
+            || ay_core::TermStore::global_memory_exceeded()
+            || ay_sys::process_memory_exceeded_at_percent(50)
+            || crate::memory::memory_exceeded(self.memory_limit())
+        {
+            return false;
+        }
+        if let Some(limit) = self.memory_limit() {
+            let current = crate::memory::current_memory_bytes();
+            if current > 0 && current > limit / 2 {
+                return false;
+            }
+        }
+        self.ctx.terms.true_memory_bytes() <= ay_core::TermStore::per_engine_budget() / 2
+    }
+
+    /// Heuristically recover a premise candidate from a universal body.
+    ///
+    /// `(=> premise _)` yields `premise` directly. A body normalized to De
+    /// Morgan disjunctive form `(=> (and p₁ … pₖ) C)` = `(or C (not p₁) … (not
+    /// pₖ))` yields the FULL premise `(and p₁ … pₖ)` — every negated disjunct is
+    /// a premise conjunct. (Grabbing only the first `(not p₁)` under-pins the
+    /// binders — the SSA chain leaves later binders free and the instance is
+    /// vacuously SAT.)
+    ///
+    /// `term_mentions_completable_uf` is deliberately an operational,
+    /// name-oriented completion classifier, not a semantic partition oracle.
+    /// Mispartitioning is harmless here because this term only proposes concrete
+    /// binder values; [`Self::premise_forced_binder_refutation`] verifies the
+    /// whole universal instance and never treats this candidate as an asserted
+    /// fact.
+    fn forall_premise_candidate(&mut self, body: TermId) -> Option<TermId> {
+        match self.ctx.terms.get(body).clone() {
+            TermData::App(sym, args) if sym.name() == "=>" && args.len() == 2 => Some(args[0]),
+            TermData::App(sym, args) if sym.name() == "or" && args.len() >= 2 => {
+                // `(or C (not p₁) … (not pₖ))` = `(=> (and p₁ … pₖ) C)` where the
+                // conclusion `C` carries the UF applications and each premise
+                // conjunct `pᵢ` is UF-FREE (a binder equality). Collect the
+                // apparently UF-free disjuncts (robust to how preprocessing renders each
+                // `(not pᵢ)` — `Not`, `distinct`, a folded comparison, …) and
+                // NEGATE each to recover `pᵢ`.
+                let mut conjs: Vec<TermId> = Vec::new();
+                let mut has_uf_disjunct = false;
+                for &d in &args {
+                    if self.term_mentions_completable_uf(d) {
+                        has_uf_disjunct = true;
+                    } else {
+                        conjs.push(self.ctx.terms.mk_not(d));
+                    }
+                }
+                // Require a UF-bearing conclusion disjunct (else this is a pure
+                // universal handled elsewhere) and at least one premise conjunct.
+                if !has_uf_disjunct || conjs.is_empty() {
+                    return None;
+                }
+                match conjs.len() {
+                    1 => Some(conjs[0]),
+                    _ => Some(self.ctx.terms.mk_and(conjs)),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Build an isolated probe executor over `ctx` under the caller's resource
+    /// envelope. The caller owns the cloned context, so solving may mutate every
+    /// executor/context bookkeeping field without touching the outer query.
+    fn qpf_probe_executor(&self, ctx: ay_frontend::Context, budget_ms: u64) -> Executor {
+        let mut probe = Executor::new();
+        probe.ctx = ctx;
+        probe.set_verification_level(self.verification_level());
+        probe.set_self_check(self.self_check());
+        probe.set_learned_clause_limit(self.learned_clause_limit());
+        probe.set_clause_db_bytes_limit(self.clause_db_bytes_limit());
+        probe.set_resource_limit(self.resource_limit());
+        probe.set_decision_limit(self.decision_limit());
+        probe.set_ground_budget_enabled(self.ground_budget_enabled());
+        probe.set_memory_limit(self.memory_limit());
+        let tight = ay_core::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+        let bounded = match self.solve_deadline.get() {
+            Some(d) if d < tight => Some(d),
+            _ => Some(tight),
+        };
+        probe.set_solve_controls(self.solve_interrupt.clone(), bounded);
+        probe
     }
 
     /// Over-approximate each alternation `forall` to a NECESSARY condition on the
@@ -6572,7 +6825,7 @@ impl Executor {
             }
             if let TermData::App(sym, args) = self.ctx.terms.get(t).clone() {
                 if args.len() == 1
-                    && !crate::executor::mbqi::is_pure_arith_bool_symbol(sym.name())
+                    && !is_pure_arith_bool_symbol(sym.name())
                     && !self.term_mentions_bound_var(args[0], &bound_set)
                 {
                     ground_uf.push((sym.name().to_string(), args[0]));
@@ -6597,7 +6850,7 @@ impl Executor {
             match self.ctx.terms.get(t).clone() {
                 TermData::App(sym, args) => {
                     if args.len() == 1
-                        && !crate::executor::mbqi::is_pure_arith_bool_symbol(sym.name())
+                        && !is_pure_arith_bool_symbol(sym.name())
                         && self.term_mentions_bound_var(args[0], &bound_set)
                     {
                         for (gname, garg) in &ground_uf {
@@ -6923,7 +7176,7 @@ impl Executor {
                 continue;
             }
             if let TermData::App(sym, args) = self.ctx.terms.get(t).clone() {
-                let is_uf = !crate::executor::mbqi::is_pure_arith_bool_symbol(sym.name());
+                let is_uf = !is_pure_arith_bool_symbol(sym.name());
                 if is_uf
                     && matches!(self.ctx.terms.sort(t), ay_core::Sort::Int)
                     && !self.term_mentions_bound_var(t, &bound_set)
@@ -7081,7 +7334,7 @@ impl Executor {
             }
             match self.ctx.terms.get(term) {
                 TermData::App(sym, args) => {
-                    if !crate::executor::mbqi::is_pure_arith_bool_symbol(sym.name())
+                    if !is_pure_arith_bool_symbol(sym.name())
                         && !self.ctx.terms.is_skolem_symbol(sym.name())
                         && args
                             .iter()
@@ -7128,7 +7381,7 @@ impl Executor {
             }
             match self.ctx.terms.get(term) {
                 TermData::App(sym, args) => {
-                    if !crate::executor::mbqi::is_pure_arith_bool_symbol(sym.name())
+                    if !is_pure_arith_bool_symbol(sym.name())
                         && self.term_mentions_bound_var(term, bound)
                     {
                         return true;
@@ -7374,6 +7627,190 @@ mod rebuild_tests {
     use ay_core::term::Symbol;
     use ay_core::{Sort, TermStore};
     use num_rational::BigRational;
+
+    fn load_assertions(smt: &str) -> Executor {
+        let commands = ay_frontend::parse(smt).expect("parse qpf fixture");
+        let mut exec = Executor::new();
+        for command in &commands {
+            let output = exec.execute(command).expect("execute qpf fixture");
+            assert!(output.is_none(), "fixture must not contain a query command");
+        }
+        exec
+    }
+
+    fn run_premise_probe(exec: &mut Executor) -> Option<Result<SolveResult>> {
+        let snapshot = exec.ctx.assertions.clone();
+        let mut quantifiers = Vec::new();
+        for &assertion in &snapshot {
+            crate::ematching::collect_quantifiers(&mut exec.ctx.terms, assertion, &mut quantifiers);
+        }
+        let foralls = quantifiers
+            .into_iter()
+            .filter(|&q| matches!(exec.ctx.terms.get(q), TermData::Forall(..)))
+            .collect::<Vec<_>>();
+        exec.premise_forced_binder_refutation(&foralls, &snapshot)
+    }
+
+    fn symbol_identities(exec: &Executor) -> Vec<String> {
+        let mut names = exec
+            .ctx
+            .symbol_iter()
+            .map(|(name, info)| exec.ctx.symbol_identity_name(name, info).to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn qpf_probe_refutes_only_a_verified_concrete_instance_and_preserves_outer_state() {
+        let mut exec = load_assertions(
+            r#"
+                (set-logic UFBV)
+                (declare-fun f ((_ BitVec 1)) (_ BitVec 1))
+                (assert (forall ((x (_ BitVec 1)))
+                  (=> (= x #b0)
+                      (and (= (f x) #b0) (= (f x) #b1)))))
+            "#,
+        );
+        exec.original_problem_had_quantifiers = true;
+        exec.last_result = Some(SolveResult::Sat);
+        exec.last_unknown_reason = Some(UnknownReason::Incomplete);
+        let symbols_before = symbol_identities(&exec);
+        let assertions_before = exec.ctx.assertions.clone();
+        let parsed_before = exec.ctx.assertions_parsed().to_vec();
+        let proof_enabled_before = exec.proof_tracker.is_enabled();
+        let proof_steps_before = exec.proof_tracker.num_steps();
+        let core_before = exec.last_assumption_core.clone();
+        let core_names_before = exec.last_core_term_to_name.clone();
+
+        let result = run_premise_probe(&mut exec);
+
+        assert!(
+            matches!(result, Some(Ok(SolveResult::Unsat(_)))),
+            "the x=#b0 instance is ground-UNSAT"
+        );
+        assert!(
+            exec.original_problem_had_quantifiers,
+            "a disposable ground probe must not enable QF-only outer routes"
+        );
+        assert!(
+            matches!(exec.last_result, Some(SolveResult::Sat)),
+            "a probe must preserve the outer verdict bookkeeping"
+        );
+        assert_eq!(
+            exec.last_unknown_reason,
+            Some(UnknownReason::Incomplete),
+            "a probe must preserve the outer diagnostic"
+        );
+        assert_eq!(
+            symbol_identities(&exec),
+            symbols_before,
+            "fresh qpf constants must stay inside the disposable context"
+        );
+        assert_eq!(exec.ctx.assertions, assertions_before);
+        assert_eq!(exec.ctx.assertions_parsed(), parsed_before);
+        assert_eq!(exec.proof_tracker.is_enabled(), proof_enabled_before);
+        assert_eq!(exec.proof_tracker.num_steps(), proof_steps_before);
+        assert_eq!(exec.last_assumption_core, core_before);
+        assert_eq!(exec.last_core_term_to_name, core_names_before);
+
+        let repeated = run_premise_probe(&mut exec);
+        assert!(matches!(repeated, Some(Ok(SolveResult::Unsat(_)))));
+        assert_eq!(symbol_identities(&exec), symbols_before);
+        assert_eq!(exec.ctx.assertions, assertions_before);
+        assert_eq!(exec.ctx.assertions_parsed(), parsed_before);
+    }
+
+    #[test]
+    fn qpf_probe_rejects_nonconjunctive_and_non_bv_carrier_adversaries() {
+        for (label, smt) in [
+            (
+                "nonconjunctive",
+                r#"
+                    (set-logic UFBV)
+                    (declare-const g Bool)
+                    (declare-fun p ((_ BitVec 1)) Bool)
+                    (assert (or g
+                      (forall ((x (_ BitVec 1)))
+                        (=> (= x x) (and (p x) (not (p x)))))))
+                "#,
+            ),
+            (
+                "model-varying carrier",
+                r#"
+                    (set-logic UF)
+                    (declare-sort U 0)
+                    (declare-const a U)
+                    (declare-fun p (U U) Bool)
+                    (assert (forall ((z U)) (= z a)))
+                    (assert (forall ((x U) (y U))
+                      (=> (distinct x y) (and (p x y) (not (p x y))))))
+                "#,
+            ),
+            (
+                "underspecified division",
+                r#"
+                    (set-logic UFNIA)
+                    (declare-fun p (Int) Bool)
+                    (assert (distinct (div 0 0) 0))
+                    (assert (forall ((x Int))
+                      (=> (and (= x 0) (= (div x 0) 0)) (p x))))
+                "#,
+            ),
+            (
+                "user bv-prefix direct",
+                r#"
+                    (set-logic UFBV)
+                    (declare-fun bvtrap ((_ BitVec 1)) Bool)
+                    (declare-fun p ((_ BitVec 1)) Bool)
+                    (assert (not (bvtrap #b0)))
+                    (assert (not (bvtrap #b1)))
+                    (assert (forall ((x (_ BitVec 1)))
+                      (=> (bvtrap x) (p x))))
+                "#,
+            ),
+            (
+                "user bv-prefix De Morgan",
+                r#"
+                    (set-logic UFBV)
+                    (declare-fun bvtrap ((_ BitVec 1)) Bool)
+                    (declare-fun p ((_ BitVec 1)) Bool)
+                    (assert (not (bvtrap #b0)))
+                    (assert (not (bvtrap #b1)))
+                    (assert (forall ((x (_ BitVec 1)))
+                      (or (not (bvtrap x)) (p x))))
+                "#,
+            ),
+        ] {
+            let mut exec = load_assertions(smt);
+            assert!(
+                run_premise_probe(&mut exec).is_none(),
+                "{label} must stay outside the concrete-BV-instance refutation"
+            );
+        }
+    }
+
+    #[test]
+    fn qpf_probe_skips_an_ineligible_first_forall_and_reaches_a_later_refutation() {
+        let mut exec = load_assertions(
+            r#"
+                (set-logic UFBV)
+                (declare-fun f ((_ BitVec 1)) (_ BitVec 1))
+                (assert (forall ((unused (_ BitVec 1))) (=> true true)))
+                (assert (forall ((x (_ BitVec 1)))
+                  (=> (= x #b0)
+                      (and (= (f x) #b0) (= (f x) #b1)))))
+            "#,
+        );
+
+        assert!(
+            matches!(
+                run_premise_probe(&mut exec),
+                Some(Ok(SolveResult::Unsat(_)))
+            ),
+            "an ineligible first forall must not abort the remaining forall scan"
+        );
+    }
 
     /// Build `forall x. B` where `B = psi0[y := sk_y(x)]` the way the
     /// Skolemizer does (registered internal symbol), plus its instantiator.

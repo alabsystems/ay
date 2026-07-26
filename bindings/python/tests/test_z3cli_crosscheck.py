@@ -20,8 +20,8 @@
 #
 # SOUNDNESS: every cross-checked case asserts ayz3's verdict EQUALS z3's. A
 # disagreement (sat-vs-unsat) is a hard failure. Cases where ayz3 honestly
-# returns `unknown` are surfaced (skipped, not failed) -- ayz3 must never report
-# a verdict that contradicts z3.
+# returns `unknown` are asserted as accepted incompleteness -- ayz3 must never
+# report a verdict that contradicts z3.
 #
 # Run:  cargo build -p ay-ffi  &&  pytest bindings/python/tests/test_z3cli_crosscheck.py -v
 
@@ -39,7 +39,11 @@ import ayz3 as z
 # ---------------------------------------------------------------------------
 
 _Z3_BIN = shutil.which("z3")
-HAVE_Z3_CLI = _Z3_BIN is not None
+if _Z3_BIN is None:
+    raise RuntimeError(
+        "the z3 CLI is a required oracle for test_z3cli_crosscheck.py; "
+        "install z3 and ensure it is on PATH"
+    )
 
 
 def _z3_cli_verdict(smt2: str) -> str:
@@ -76,16 +80,20 @@ def _crosscheck(ayz3_res, smt2: str, label: str):
     """Assert ayz3's verdict does not contradict the z3 CLI on `smt2`.
 
     Agreement (both sat / both unsat) passes. If EITHER side is `unknown`, that
-    is sound incompleteness, not a bug -> skip. A genuine sat-vs-unsat clash is
-    a hard failure.
+    is asserted as sound incompleteness. A genuine sat-vs-unsat clash is a hard
+    failure.
     """
-    if not HAVE_Z3_CLI:
-        pytest.skip("z3 CLI not on PATH")
     ay = _ayz3_verdict_token(ayz3_res)
     zz = _z3_cli_verdict(smt2)
-    if ay == "unknown" or zz == "unknown":
-        pytest.skip(f"{label}: incomplete (ayz3={ay}, z3={zz}) -- not a soundness bug")
-    assert ay == zz, f"{label}: VERDICT CLASH ayz3={ay} z3={zz}\nSMT-LIB:\n{smt2}"
+    if ay != "unknown" and zz != "unknown":
+        assert ay == zz, (
+            f"{label}: VERDICT CLASH ayz3={ay} z3={zz}\nSMT-LIB:\n{smt2}"
+        )
+    else:
+        assert "unknown" in (ay, zz), (
+            f"{label}: expected an explicit unknown for an incomplete result, "
+            f"got ayz3={ay} z3={zz}"
+        )
 
 
 # ===========================================================================
@@ -508,8 +516,6 @@ def test_mixed_bool_int_problem():
 # ===========================================================================
 
 def test_z3_cli_available_and_self_consistent():
-    if not HAVE_Z3_CLI:
-        pytest.skip("z3 CLI not on PATH")
     assert _z3_cli_verdict("(declare-const x Int)(assert (> x 0))(check-sat)") == "sat"
     assert _z3_cli_verdict(
         "(declare-const x Int)(assert (> x 0))(assert (< x 0))(check-sat)"

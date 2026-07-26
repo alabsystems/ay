@@ -102,7 +102,7 @@ def test_eval_array_selects_match_z3_semantics():
         assert m.eval(a[i], model_completion=False).as_long() == 1
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_eval_array_values_z3_pinned():
     """z3-pin the snapshot's claims: a[3]=7 and a[4]=1 must be consistent
     with the asserted formula in REAL z3 (never trust our own reduction)."""

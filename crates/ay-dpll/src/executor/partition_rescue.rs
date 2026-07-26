@@ -224,6 +224,23 @@ impl Executor {
                     return None;
                 }
             };
+            if matches!(
+                self.last_unknown_reason,
+                Some(UnknownReason::Interrupted)
+                    | Some(UnknownReason::Timeout)
+                    | Some(UnknownReason::MemoryLimit)
+            ) {
+                // In particular, singleton closure can abort after emitting a
+                // sound but incomplete prefix in its isolated component window.
+                // Preserve the full checkpoint's reason while unwinding all
+                // other rescue-local verdict state, and do not visit another
+                // component.
+                let stop_reason = self.last_unknown_reason;
+                self.restore_after_rescue(&guard);
+                self.last_unknown_reason = stop_reason;
+                self.last_result = Some(SolveResult::Unknown);
+                return Some(Ok(SolveResult::Unknown));
+            }
             match result {
                 SolveResult::Unsat(cert) => {
                     // Subset monotonicity: an UNSAT subset of the asserted
@@ -299,8 +316,15 @@ impl Executor {
         // any component whose SAT these passes would have to correct is merge-
         // ineligible anyway — but we replicate the passes rather than rely on
         // that argument.)
-        self.add_singleton_array_sort_equalities();
-        self.fold_singleton_sort_equalities();
+        let singleton_roots = self.ctx.assertions.clone();
+        if !self
+            .add_ground_singleton_sort_equalities(&singleton_roots)
+            .is_complete()
+        {
+            self.ctx.assertions = saved_assertions;
+            self.incr_theory_state = saved_incr;
+            return Ok(SolveResult::Unknown);
+        }
         let pigeonhole_unsat = self.add_finite_enum_pigeonhole_conflict();
         if features.has_arrays {
             self.add_distinct_const_array_disequalities();

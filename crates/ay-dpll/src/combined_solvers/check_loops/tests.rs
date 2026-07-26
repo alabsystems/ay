@@ -721,7 +721,8 @@ fn test_affine_nonlinear_returns_false() {
     assert!(!distinct_by_affine_offset(&store, prod, c));
 }
 
-/// Unknown function f(x) is not parseable — must return false.
+/// An opaque function application is a valid affine atom, but a bare atom is
+/// not provably distinct from a constant.
 #[test]
 fn test_affine_unknown_function_returns_false() {
     let mut store = TermStore::new();
@@ -729,6 +730,134 @@ fn test_affine_unknown_function_returns_false() {
     let f_x = store.mk_app(Symbol::Named("f".into()), vec![x], Sort::Int);
     let c = store.mk_int(BigInt::from(1));
     assert!(!distinct_by_affine_offset(&store, f_x, c));
+}
+
+/// #7956: EUF equality of opaque Int applications must lift through a shared
+/// affine context, with the asserted equality retained as the explanation.
+#[test]
+fn test_affine_euf_equality_lifts_opaque_app_through_offset_7956() {
+    let mut store = TermStore::new();
+    let carrier = Sort::Uninterpreted("Carrier".into());
+    let a = store.mk_var("a", carrier.clone());
+    let b = store.mk_var("b", carrier);
+    let f_a = store.mk_app(Symbol::Named("f".into()), vec![a], Sort::Int);
+    let f_b = store.mk_app(Symbol::Named("f".into()), vec![b], Sort::Int);
+    let one = store.mk_int(BigInt::from(1));
+    let lhs = make_add(&mut store, vec![f_a, one]);
+    let rhs = make_add(&mut store, vec![f_b, one]);
+    let equality = store.mk_eq(f_a, f_b);
+
+    let mut euf = EufSolver::new(&store);
+    euf.assert_literal(equality, true);
+    assert!(matches!(euf.check(), TheoryResult::Sat));
+
+    assert_eq!(
+        affine_euf_equality_reasons(&store, &mut euf, lhs, rhs),
+        Some(vec![TheoryLit::new(equality, true)]),
+        "the affine bridge must retain the SAT equality that justifies replacing f(a) by f(b)"
+    );
+}
+
+/// Coincidentally similar affine contexts must not be identified when EUF has
+/// no proof that their opaque leaves are equal.
+#[test]
+fn test_affine_euf_equality_rejects_unrelated_opaque_apps_7956() {
+    let mut store = TermStore::new();
+    let carrier = Sort::Uninterpreted("Carrier".into());
+    let a = store.mk_var("a", carrier.clone());
+    let b = store.mk_var("b", carrier);
+    let f_a = store.mk_app(Symbol::Named("f".into()), vec![a], Sort::Int);
+    let f_b = store.mk_app(Symbol::Named("f".into()), vec![b], Sort::Int);
+    let one = store.mk_int(BigInt::from(1));
+    let lhs = make_add(&mut store, vec![f_a, one]);
+    let rhs = make_add(&mut store, vec![f_b, one]);
+    let mut euf = EufSolver::new(&store);
+
+    assert_eq!(
+        affine_euf_equality_reasons(&store, &mut euf, lhs, rhs),
+        None,
+        "same-shaped indices with unrelated UF leaves are not proved equal"
+    );
+}
+
+/// Every independent EUF substitution in an affine identity must remain in
+/// the array edge's SAT explanation.
+#[test]
+fn test_affine_euf_equality_retains_two_independent_reasons_7956() {
+    let mut store = TermStore::new();
+    let a = store.mk_var("a", Sort::Int);
+    let b = store.mk_var("b", Sort::Int);
+    let c = store.mk_var("c", Sort::Int);
+    let d = store.mk_var("d", Sort::Int);
+    let lhs = make_add(&mut store, vec![a, c]);
+    let rhs = make_add(&mut store, vec![b, d]);
+    let equality_ab = store.mk_eq(a, b);
+    let equality_cd = store.mk_eq(c, d);
+
+    let mut euf = EufSolver::new(&store);
+    euf.assert_literal(equality_ab, true);
+    euf.assert_literal(equality_cd, true);
+    assert!(matches!(euf.check(), TheoryResult::Sat));
+
+    let mut expected = vec![
+        TheoryLit::new(equality_ab, true),
+        TheoryLit::new(equality_cd, true),
+    ];
+    expected.sort_unstable_by_key(|lit| (lit.term.0, lit.value));
+    assert_eq!(
+        affine_euf_equality_reasons(&store, &mut euf, lhs, rhs),
+        Some(expected),
+        "both class substitutions are necessary to prove a+c = b+d"
+    );
+}
+
+/// Coefficients may cancel only after EUF identifies their atoms; the
+/// identifying equality is therefore a required premise, even though the
+/// canonical coefficient map is empty.
+#[test]
+fn test_affine_euf_equality_retains_reason_for_class_cancellation_7956() {
+    let mut store = TermStore::new();
+    let x = store.mk_var("x", Sort::Int);
+    let y = store.mk_var("y", Sort::Int);
+    let lhs = make_sub(&mut store, vec![x, y]);
+    let zero = store.mk_int(BigInt::from(0));
+    let equality = store.mk_eq(x, y);
+
+    let mut euf = EufSolver::new(&store);
+    euf.assert_literal(equality, true);
+    assert!(matches!(euf.check(), TheoryResult::Sat));
+
+    assert_eq!(
+        affine_euf_equality_reasons(&store, &mut euf, lhs, zero),
+        Some(vec![TheoryLit::new(equality, true)]),
+        "cancelling x-y to zero depends on the asserted x=y literal"
+    );
+}
+
+/// A shared EUF merge without SAT-visible premises must not become an
+/// unconditional array-index equality.  Returning `None` leaves the pair for
+/// the ordinary equality/disequality split.
+#[test]
+fn test_affine_euf_equality_fails_closed_without_sat_reason_7956() {
+    let mut store = TermStore::new();
+    let x = store.mk_var("x", Sort::Int);
+    let y = store.mk_var("y", Sort::Int);
+    let c = store.mk_var("c", Sort::Int);
+    let d = store.mk_var("d", Sort::Int);
+    let lhs = make_add(&mut store, vec![x, c]);
+    let rhs = make_add(&mut store, vec![y, d]);
+    let explained_equality = store.mk_eq(c, d);
+
+    let mut euf = EufSolver::new(&store);
+    euf.assert_shared_equality(x, y, &[]);
+    euf.assert_literal(explained_equality, true);
+    assert!(matches!(euf.check(), TheoryResult::Sat));
+
+    assert_eq!(
+        affine_euf_equality_reasons(&store, &mut euf, lhs, rhs),
+        None,
+        "one explained substitution must not hide another substitution with no SAT explanation"
+    );
 }
 
 /// Multi-variable: (x + y + 3) vs (x + y + 5) — same coefficients, different offset.

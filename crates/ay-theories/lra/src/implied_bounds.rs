@@ -200,7 +200,9 @@ impl LraSolver {
                 // #8003: Full scan — bump generation and stamp all vars.
                 self.bound_generation += 1;
                 let cur_gen = self.bound_generation;
-                let mut fixed_vars = Vec::with_capacity(num_vars);
+                let mut fixed_vars = std::mem::take(&mut self.ib_fixed_vars_scratch);
+                fixed_vars.clear();
+                fixed_vars.reserve(num_vars);
                 let mut any_big = false;
                 for (i, info) in self.vars.iter().enumerate() {
                     any_big |= Self::var_has_big_direct_bound(info);
@@ -211,9 +213,10 @@ impl LraSolver {
                     }
                 }
                 self.big_bound_seen |= any_big;
-                for var_idx in fixed_vars {
+                for var_idx in fixed_vars.drain(..) {
                     self.register_fixed_term_var(var_idx);
                 }
+                self.ib_fixed_vars_scratch = fixed_vars;
             }
         }
 
@@ -249,11 +252,14 @@ impl LraSolver {
         // Z3's bound_analyzer_on_row doesn't store per-variable contributions;
         // it recomputes `total / a_j + bound_j` on demand. Removing the contrib
         // Rational eliminates ~70 BigRational allocations per row on dense LPs.
-        let mut lb_contribs: Vec<(usize, Rational, bool)> = Vec::new();
-        let mut ub_contribs: Vec<(usize, Rational, bool)> = Vec::new();
+        // #cib-alloc: reuse persistent scratch (mem::take + restore at exit)
+        // instead of per-call Vec::new(). Cleared before each row's use below,
+        // so reuse is byte-identical.
+        let mut lb_contribs = std::mem::take(&mut self.ib_lb_contribs_scratch);
+        let mut ub_contribs = std::mem::take(&mut self.ib_ub_contribs_scratch);
         // #8200: f64 shadow accumulators for floating-point pre-screening.
-        let mut lb_contribs_f64: Vec<f64> = Vec::new();
-        let mut ub_contribs_f64: Vec<f64> = Vec::new();
+        let mut lb_contribs_f64 = std::mem::take(&mut self.ib_lb_contribs_f64_scratch);
+        let mut ub_contribs_f64 = std::mem::take(&mut self.ib_ub_contribs_f64_scratch);
 
         // Approach G diagnostic (#4919): count per-row unbounded-variable
         // distribution to understand bound starvation.
@@ -299,20 +305,26 @@ impl LraSolver {
             );
         }
 
-        let mut updates: Vec<(usize, Option<ImpliedBound>, Option<ImpliedBound>)> = Vec::new();
+        // #cib-alloc: reuse persistent scratch; cleared at each cascade round
+        // start (below) and drained empty, so reuse is byte-identical.
+        let mut updates = std::mem::take(&mut self.ib_updates_scratch);
+        updates.clear();
 
         // #7973: When touched-row filtering is active, iterate only the
         // touched rows instead of scanning all rows. This converts O(total_rows)
         // to O(touched_rows), significant on LP benchmarks with 100+ rows
         // but only 5-10 touched per BCP callback.
-        let mut row_indices: Vec<usize> = match &iter_rows {
+        // #cib-alloc: reuse persistent scratch instead of collecting a fresh
+        // Vec per call. Same contents/order as the former collect+sort.
+        let mut row_indices = std::mem::take(&mut self.ib_row_indices_scratch);
+        row_indices.clear();
+        match &iter_rows {
             Some(touched) => {
-                let mut v: Vec<usize> = touched.iter().copied().collect();
-                v.sort_unstable();
-                v
+                row_indices.extend(touched.iter().copied());
+                row_indices.sort_unstable();
             }
-            None => (0..self.rows.len()).collect(),
-        };
+            None => row_indices.extend(0..self.rows.len()),
+        }
         // #8008: Cascade bound propagation through containing rows.
         //
         // Z3's architecture cascades bound derivations through the SAT-theory
@@ -404,6 +416,11 @@ impl LraSolver {
         let mut cascade_round = 0u32;
         let mut cascade_converged = true; // Set to false if we hit depth limit
         let mut deep_cascade_productive = false;
+        // #cib-alloc: hoist the former per-round `Vec::new()` allocations to
+        // persistent scratch, taken once and cleared per round below.
+        let mut round_newly_bounded = std::mem::take(&mut self.ib_round_newly_bounded_scratch);
+        let mut cross_neg_updates = std::mem::take(&mut self.ib_cross_neg_updates_scratch);
+        let mut cascade_rows = std::mem::take(&mut self.ib_cascade_rows_scratch);
         loop {
             updates.clear();
             // #8008: Removed coefficient budget (#8257). Z3's
@@ -1281,7 +1298,7 @@ impl LraSolver {
 
             // Apply deferred updates (only tighten, with strict-aware comparison).
             // Track which variables got tighter bounds THIS round for cascade.
-            let mut round_newly_bounded: Vec<u32> = Vec::new();
+            round_newly_bounded.clear();
             for (vi, new_lb, new_ub) in updates.drain(..) {
                 let mut any_tighter = false;
                 if let Some(new_ib) = new_lb {
@@ -1376,11 +1393,7 @@ impl LraSolver {
             //   UB(S1) tightened => LB(S2) = K - UB(S1)
             //   LB(S1) tightened => UB(S2) = K - LB(S1)
             {
-                let mut cross_neg_updates: Vec<(
-                    usize,
-                    Option<ImpliedBound>,
-                    Option<ImpliedBound>,
-                )> = Vec::new();
+                cross_neg_updates.clear();
                 for &vi in &newly_bounded {
                     let vi_usize = vi as usize;
                     if vi_usize >= self.negation_partners.len() {
@@ -1414,7 +1427,7 @@ impl LraSolver {
                         cross_neg_updates.push((partner_usize, None, Some(partner_ub)));
                     }
                 }
-                for (vi, new_lb, new_ub) in cross_neg_updates {
+                for (vi, new_lb, new_ub) in cross_neg_updates.drain(..) {
                     if let Some(new_ib) = new_lb {
                         let cur = &self.implied_bounds[vi].0;
                         let tighter = match cur {
@@ -1501,7 +1514,7 @@ impl LraSolver {
                 break;
             }
 
-            let mut cascade_rows: Vec<usize> = Vec::new();
+            cascade_rows.clear();
             for &vi in &round_newly_bounded {
                 let vi_usize = vi as usize;
                 if vi_usize < self.col_index.len() {
@@ -1520,7 +1533,7 @@ impl LraSolver {
             }
 
             row_indices.clear();
-            row_indices.extend(cascade_rows);
+            row_indices.extend(cascade_rows.iter().copied());
 
             if self.debug_lra {
                 safe_eprintln!(
@@ -1531,6 +1544,19 @@ impl LraSolver {
                 );
             }
         } // end cascade loop
+
+        // #cib-alloc: restore the scratch buffers for the next call. Contents
+        // are irrelevant (every use clears before writing); only the heap
+        // allocations are retained, which is the point.
+        self.ib_lb_contribs_scratch = lb_contribs;
+        self.ib_ub_contribs_scratch = ub_contribs;
+        self.ib_lb_contribs_f64_scratch = lb_contribs_f64;
+        self.ib_ub_contribs_f64_scratch = ub_contribs_f64;
+        self.ib_updates_scratch = updates;
+        self.ib_row_indices_scratch = row_indices;
+        self.ib_round_newly_bounded_scratch = round_newly_bounded;
+        self.ib_cross_neg_updates_scratch = cross_neg_updates;
+        self.ib_cascade_rows_scratch = cascade_rows;
 
         // #inc-cib-nodelta: this call swept every row, so the persistent
         // overlay is now complete for the current row set — repeat calls with

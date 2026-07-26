@@ -1768,8 +1768,8 @@ pub(crate) mod mixed_string_verify_stats {
     pub(crate) static REJECTED_SAT: AtomicU64 = AtomicU64::new(0);
     /// Rejected fail-closed because the conflict exceeded the size cap.
     pub(crate) static REJECTED_OVER_CAP: AtomicU64 = AtomicU64::new(0);
-    /// Skipped: conflict spans Int AND Real (or an int<->real bridge), which
-    /// the LIA-only SLIA adapter cannot faithfully re-solve.
+    /// Skipped: the context contains Real arithmetic or an int<->real bridge,
+    /// which the LIA-only SLIA adapter cannot faithfully re-solve.
     pub(crate) static SKIPPED_INT_REAL: AtomicU64 = AtomicU64::new(0);
     /// Skipped: a BitVec or truly-unknown literal — no fresh solver reproduces
     /// this conflict (the residual, still-unverified population).
@@ -1897,10 +1897,10 @@ pub(crate) fn mixed_string_verify_counts() -> mixed_string_verify_stats::Counts 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SliaSatTrust {
     /// No string->int bridge term is left dangling, so the `Sat` verdict is a
-    /// genuine satisfiability proof for the conflict's literal conjunction.
+    /// sound basis for rejecting the context as satisfiable.
     Trustworthy,
-    /// The conflict's OWN ground content refutes one of its literals: the
-    /// conflict is genuinely unsatisfiable and the `Sat` is an artifact of the
+    /// The context's ground content refutes one of its literals: the context is
+    /// genuinely unsatisfiable and the `Sat` is an artifact of the
     /// dropped length coupling. Accept.
     GroundRefuted,
     /// A string->int bridge term is unpinned (or is a function this check does
@@ -1989,10 +1989,11 @@ fn eval_arith_atom_with_pins(
     }
 }
 
-/// Decide whether the fresh QF_SLIA `Sat` verdict for `conflict` is trustworthy
+/// Decide whether the fresh QF_SLIA `Sat` verdict for the complete asserted
+/// verification context is trustworthy
 /// (see [`SliaSatTrust`]).
 ///
-/// 1. Build the `var -> const` string substitution the conflict itself pins
+/// 1. Build the `var -> const` string substitution the context itself pins
 ///    (positive `(= v "…")` literals), exactly like
 ///    [`string_conflict_has_ground_contradiction`].
 /// 2. Find every string->int bridge subterm. If there are none, the fresh solve
@@ -2002,16 +2003,16 @@ fn eval_arith_atom_with_pins(
 ///    a ground-foldable `str.len` leaves an unconstrained Int behind:
 ///    `Unfaithful`.
 /// 4. With every bridge pinned, each literal that MENTIONS a bridge term must
-///    ground-evaluate. One that evaluates AGAINST its asserted polarity proves
-///    the conflict genuine (`GroundRefuted`). One that cannot be evaluated
+///    ground-evaluate. One that evaluates AGAINST its asserted polarity shows
+///    the context inconsistent (`GroundRefuted`). One that cannot be evaluated
 ///    (e.g. `(<= (+ (str.len x) n) 1)` with `n` free) means LIA's choice of the
 ///    length still drives the verdict: `Unfaithful`. Only when all of them
 ///    check out is the `Sat` verdict `Trustworthy`.
-fn assess_slia_sat_trust(terms: &TermStore, conflict: &[TheoryLit]) -> SliaSatTrust {
+fn assess_slia_sat_trust(terms: &TermStore, context: &[TheoryLit]) -> SliaSatTrust {
     use ay_core::kani_compat::{DetHashMap, DetHashSet};
 
     let mut subst: DetHashMap<TermId, String> = DetHashMap::default();
-    for l in conflict {
+    for l in context {
         if !l.value {
             continue;
         }
@@ -2035,7 +2036,7 @@ fn assess_slia_sat_trust(terms: &TermStore, conflict: &[TheoryLit]) -> SliaSatTr
     let mut any_bridge = false;
     let mut unfaithful = false;
     let mut visited: DetHashSet<TermId> = DetHashSet::default();
-    let mut stack: Vec<TermId> = conflict.iter().map(|l| l.term).collect();
+    let mut stack: Vec<TermId> = context.iter().map(|l| l.term).collect();
     while let Some(t) = stack.pop() {
         if !visited.insert(t) {
             continue;
@@ -2079,7 +2080,7 @@ fn assess_slia_sat_trust(terms: &TermStore, conflict: &[TheoryLit]) -> SliaSatTr
         return SliaSatTrust::Unfaithful;
     }
 
-    for l in conflict {
+    for l in context {
         let mut atom = l.term;
         let mut polarity = l.value;
         while let TermData::Not(inner) = terms.get(atom) {
@@ -2165,18 +2166,19 @@ const MAX_MIXED_STRING_CONFLICT_LITS: usize = 64;
 ///
 /// REJECT only on a definitive `Sat` — the fresh combined solve reached its
 /// Nelson-Oppen fixpoint with the string theory complete and LIA decided, which
-/// PROVES the conflict's literal conjunction satisfiable, i.e. the conflict is
-/// spurious. Every other outcome (`Unsat` / `Unknown` / `NeedStringLemma` /
+/// establishes the conflict's literal conjunction satisfiable, i.e. the
+/// conflict is spurious. Every other outcome (`Unsat` / `Unknown` / `NeedStringLemma` /
 /// `NeedLemmas` / any split request) keeps the pre-fix accept. This is
 /// completeness-neutral by construction: it only ever adds a rejection where a
-/// fresh combined solve proves satisfiability, so it can turn a would-be wrong
-/// UNSAT into a sound Unknown, never the reverse.
+/// fresh combined solve establishes satisfiability, so it can turn a would-be
+/// wrong UNSAT into a sound Unknown, never the reverse.
 ///
 /// Three fragments are OUTSIDE the adapter and are skipped (observably, via
 /// their own counters) rather than judged: `Seq`-sorted content (no Seq theory
-/// in the adapter), Int/Real mixes (the adapter carries one LIA solver), and —
-/// checked only once a `Sat` actually comes back — conflicts whose `str.len`
-/// coupling the isolated solve could not reproduce (see [`SliaSatTrust`]).
+/// in the adapter), Array or Real content (the adapter carries neither theory),
+/// and — checked only once a `Sat` actually comes back — contexts whose
+/// `str.len` coupling the isolated solve could not reproduce (see
+/// [`SliaSatTrust`]).
 ///
 /// # Boundedness
 ///
@@ -2190,7 +2192,7 @@ const MAX_MIXED_STRING_CONFLICT_LITS: usize = 64;
 fn verify_strings_mixed_conflict_semantic(
     conflict: &[TheoryLit],
     terms: &TermStore,
-    support_axioms: &[TheoryLit],
+    verification_context: &[TheoryLit],
 ) -> Result<(), VerificationError> {
     use ay_core::{TheoryResult, TheorySolver};
 
@@ -2215,7 +2217,7 @@ fn verify_strings_mixed_conflict_semantic(
     // `verify_seq_conflict_semantic` exists to avoid). A conflict mixing Seq
     // with arithmetic reaches neither that verifier (it is not pure-String
     // domain) nor a faithful re-solve here — so skip it, observably.
-    if conflict_involves_seq_sort(terms, conflict) {
+    if conflict_involves_seq_sort(terms, verification_context) {
         observe_mixed_string_event(
             &mixed_string_verify_stats::SKIPPED_SEQ,
             "skipped-seq-sort",
@@ -2224,16 +2226,41 @@ fn verify_strings_mixed_conflict_semantic(
         return Ok(());
     }
 
-    // Int/Real mix (or an explicit `to_real`/`to_int`/`is_int` bridge) is
-    // OUTSIDE the SLIA fragment: the adapter carries a single LIA solver, so
-    // Real-sorted atoms and the int<->real coupling are dropped and a `Sat`
-    // verdict would NOT prove spuriousness. Mirror the #6853 skip — but
-    // observably, so this residual is counted rather than invisible.
-    if conflict_involves_int_real_mix(terms, conflict) {
+    // Any Real arithmetic (including an explicit
+    // `to_real`/`to_int`/`is_int` bridge) is OUTSIDE the SLIA fragment: the
+    // adapter carries a single LIA solver, so Real-sorted atoms and the
+    // int<->real coupling are dropped and a `Sat` verdict would not establish
+    // spuriousness. Mirror the #6853 skip — observably.
+    let has_real = verification_context
+        .iter()
+        .any(|lit| conflict_involves_real_sort(terms, lit.term));
+    if has_real || conflict_involves_int_real_mix(terms, verification_context) {
         observe_mixed_string_event(
             &mixed_string_verify_stats::SKIPPED_INT_REAL,
-            "skipped-int-real-mix",
+            "skipped-real-or-int-real",
             conflict.len(),
+        );
+        return Ok(());
+    }
+    // `StringsLiaSolver` has no ArraySolver. A context that combines native
+    // string content with select/store semantics therefore cannot use its
+    // `Sat` as a rejection verdict.
+    if verification_context
+        .iter()
+        .any(|lit| term_has_array_context(terms, lit.term))
+    {
+        observe_mixed_string_event(
+            &mixed_string_verify_stats::SKIPPED_UNVERIFIABLE,
+            "skipped-string-array-mix",
+            conflict.len(),
+        );
+        return Ok(());
+    }
+    if conflict_involves_nonlinear(terms, verification_context) {
+        tracing::debug!(
+            lit_count = conflict.len(),
+            "mixed string+nonlinear conflict skipped semantic re-verification: \
+             the QF_SLIA adapter carries only linear integer arithmetic"
         );
         return Ok(());
     }
@@ -2270,10 +2297,10 @@ fn verify_strings_mixed_conflict_semantic(
     // Support axioms hold in every model of the problem, so asserting them
     // alongside the conflict can only CONFIRM a genuine conflict (turning a
     // spurious-looking `Sat` into `Unsat`) — never manufacture a rejection.
-    for lit in conflict.iter().chain(support_axioms.iter()) {
+    for lit in verification_context {
         fresh.register_atom(lit.term);
     }
-    for lit in conflict.iter().chain(support_axioms.iter()) {
+    for lit in verification_context {
         fresh.assert_literal(lit.term, lit.value);
     }
 
@@ -2287,12 +2314,12 @@ fn verify_strings_mixed_conflict_semantic(
     if matches!(result, TheoryResult::Sat) {
         // The isolated adapter has no `str.len` axioms (the executor injects
         // those as assertions; a `&TermStore` verifier cannot mint terms), so a
-        // bare `Sat` is only a spuriousness PROOF when no string->int bridge
+        // bare `Sat` is only a sound rejection basis when no string->int bridge
         // term was left unconstrained. Check before rejecting — otherwise a
         // VALID conflict such as `{(= x "ab"), (>= (str.len x) 3)}` would be
         // thrown away, which is precisely the completeness failure this design
         // set out to avoid.
-        match assess_slia_sat_trust(terms, conflict) {
+        match assess_slia_sat_trust(terms, verification_context) {
             SliaSatTrust::Trustworthy => {}
             SliaSatTrust::GroundRefuted => {
                 observe_mixed_string_event(
@@ -2332,6 +2359,78 @@ fn verify_strings_mixed_conflict_semantic(
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LemmaTrailClosure {
+    /// A valid theory clause is fully falsified by the fixed verification trail.
+    Contradiction,
+    /// Every clause is satisfied after asserting these unit-implied literals.
+    Complete(Vec<TheoryLit>),
+    /// At least one clause still has multiple unassigned literals.
+    Inconclusive,
+}
+
+/// Close a batch of valid theory clauses under the fixed verification trail.
+///
+/// This is deliberately only unit propagation, not a SAT branch chooser.
+/// `NeedLemmas` clauses are permanent theory-valid clauses, but choosing one
+/// disjunct from a multi-live clause would strengthen the context without
+/// justification and could make a satisfiable conflict look unsatisfiable.
+pub(super) fn close_valid_lemma_clauses(
+    clauses: &[Vec<TheoryLit>],
+    trail: &mut ay_core::kani_compat::DetHashMap<TermId, bool>,
+) -> LemmaTrailClosure {
+    let mut units = Vec::new();
+
+    loop {
+        let mut changed = false;
+        let mut unresolved = false;
+
+        for clause in clauses {
+            // A syntactic `p OR NOT p` is satisfied independently of the
+            // trail. Clauses are canonicalized by the caller, so opposite
+            // polarities for one term are adjacent.
+            if clause
+                .windows(2)
+                .any(|pair| pair[0].term == pair[1].term && pair[0].value != pair[1].value)
+            {
+                continue;
+            }
+            if clause
+                .iter()
+                .any(|lit| trail.get(&lit.term) == Some(&lit.value))
+            {
+                continue;
+            }
+
+            let mut live = clause
+                .iter()
+                .copied()
+                .filter(|lit| !trail.contains_key(&lit.term));
+            let Some(unit) = live.next() else {
+                // An empty clause, or a clause whose every literal has the
+                // opposite trail polarity, refutes the fixed context.
+                return LemmaTrailClosure::Contradiction;
+            };
+            if live.next().is_some() {
+                unresolved = true;
+                continue;
+            }
+
+            trail.insert(unit.term, unit.value);
+            units.push(unit);
+            changed = true;
+        }
+
+        if !changed {
+            return if unresolved {
+                LemmaTrailClosure::Inconclusive
+            } else {
+                LemmaTrailClosure::Complete(units)
+            };
+        }
+    }
+}
+
 pub(super) fn verify_mixed_conflict_semantic(
     conflict: &[TheoryLit],
     terms: &TermStore,
@@ -2339,14 +2438,40 @@ pub(super) fn verify_mixed_conflict_semantic(
 ) -> Result<(), VerificationError> {
     use ay_core::{TheoryResult, TheorySolver};
 
+    // Every fragment choice and every definitive `Sat` verdict must describe
+    // the complete context asserted into the fresh solver. In particular, a
+    // support-only String/Seq or Int<->Real bridge cannot be ignored merely
+    // because it is absent from the conflict explanation.
+    let verification_context: Vec<_> = conflict
+        .iter()
+        .chain(support_axioms.iter())
+        .copied()
+        .collect();
+
+    // Keep a complete fixed-context trail. In particular, support axioms must
+    // participate in lemma cardinality: they may falsify all but one disjunct
+    // (or the entire clause) even when that atom is absent from the conflict.
+    let mut trail =
+        ay_core::kani_compat::det_hash_map_with_capacity(conflict.len() + support_axioms.len());
+    for lit in &verification_context {
+        if trail
+            .insert(lit.term, lit.value)
+            .is_some_and(|old| old != lit.value)
+        {
+            // The conflict plus unconditional support is already
+            // contradictory, so accepting the conflict is sound.
+            return Ok(());
+        }
+    }
+
     // Route by which fresh solver (if any) can reproduce this conflict.
     // Arithmetic/EUF/Array -> Nelson-Oppen combiner (below). String literals
     // mixed with those -> fresh QF_SLIA adapter. BitVec / truly-unknown ->
     // still unverifiable, but now COUNTED rather than silently accepted.
-    match classify_mixed_verifiability(terms, conflict.iter().map(|l| l.term)) {
+    match classify_mixed_verifiability(terms, verification_context.iter().map(|l| l.term)) {
         MixedVerifiability::Combined => {}
         MixedVerifiability::StringsCombined => {
-            return verify_strings_mixed_conflict_semantic(conflict, terms, support_axioms);
+            return verify_strings_mixed_conflict_semantic(conflict, terms, &verification_context);
         }
         MixedVerifiability::Unverifiable => {
             observe_mixed_string_event(
@@ -2370,12 +2495,20 @@ pub(super) fn verify_mixed_conflict_semantic(
     // `ConflictIsSat -> Unknown` gate then degrades a decidable linear
     // mixed-int/real query to `unknown` (archimedean_nat regression).
     // Mirror the nonlinear skip (#7978): accept optimistically.
-    if conflict_involves_int_real_mix(terms, conflict) {
+    if conflict_involves_int_real_mix(terms, &verification_context) {
         tracing::debug!(
             lit_count = conflict.len(),
             "mixed int/real (LIRA-bridged) conflict skipped semantic re-verification: \
              fresh combiners interpret a single numeric sort, so their SAT verdicts \
              are not trustworthy here (#6853 completeness)"
+        );
+        return Ok(());
+    }
+    if conflict_involves_nonlinear(terms, &verification_context) {
+        tracing::debug!(
+            lit_count = conflict.len(),
+            "mixed nonlinear conflict skipped semantic re-verification: the \
+             verification combiner carries only linear arithmetic solvers"
         );
         return Ok(());
     }
@@ -2385,15 +2518,13 @@ pub(super) fn verify_mixed_conflict_semantic(
     // Seq-length axiom instance beside an EUF-only conflict) still steers the
     // UF+LIA / UF+LRA / Array combiner choice (the factory scans only its
     // `atoms` argument).
-    let mut combiner = make_verification_combiner(
-        terms,
-        conflict
-            .iter()
-            .chain(support_axioms.iter())
-            .map(|lit| lit.term),
-    );
+    let selected_combiner_kind =
+        verification_combiner_kind(terms, verification_context.iter().map(|lit| lit.term));
+    let mut combiner =
+        make_verification_combiner(terms, verification_context.iter().map(|lit| lit.term));
+    let mut verified_combiner_context = verification_context.clone();
 
-    for lit in conflict {
+    for lit in &verification_context {
         combiner.register_atom(lit.term);
     }
     // Register and assert the support axioms (#8123 datatype tautologies AND
@@ -2402,22 +2533,98 @@ pub(super) fn verify_mixed_conflict_semantic(
     // otherwise call spuriously-Sat. Every support literal is true in every
     // model of the problem, so it can only CONFIRM a genuine conflict, never
     // manufacture one.
-    for lit in support_axioms {
-        combiner.register_atom(lit.term);
-    }
-    for lit in conflict {
-        combiner.assert_literal(lit.term, lit.value);
-    }
-    for lit in support_axioms {
+    for lit in &verification_context {
         combiner.assert_literal(lit.term, lit.value);
     }
 
-    match combiner.check() {
-        TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_) => Ok(()),
-        TheoryResult::Sat => Err(VerificationError::ConflictIsSat),
-        // Unknown / split: the combined solver may not be complete for all
-        // fragments. Accept optimistically rather than rejecting valid conflicts.
-        _ => Ok(()),
+    // Array and datatype solvers DRAIN a NeedLemmas batch after returning it:
+    // the production DPLL(T) layer normally installs those clauses in SAT.
+    // A bare second check therefore does not retain the emitted disjunction.
+    // Materialize only consequences justified by this fixed trail:
+    //   * zero live literals refutes the context immediately;
+    //   * one live literal is unit-implied and may be asserted;
+    //   * multiple live literals require a SAT split, so remain inconclusive.
+    // Rechecking is sound only when every emitted clause is satisfied after
+    // this closure. Speculative model equalities and arithmetic split requests
+    // are never asserted here.
+    const MAX_VERIFY_LEMMA_BATCHES: usize = 16;
+    let mut remaining_batches = MAX_VERIFY_LEMMA_BATCHES;
+    let mut seen_clauses: ay_core::kani_compat::DetHashSet<Vec<TheoryLit>> = Default::default();
+    let mut result = combiner.check();
+
+    loop {
+        match result {
+            TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_) => return Ok(()),
+            TheoryResult::Sat => return Err(VerificationError::ConflictIsSat),
+            TheoryResult::NeedLemmas(lemmas) => {
+                if remaining_batches == 0 || lemmas.is_empty() {
+                    return Ok(());
+                }
+                remaining_batches -= 1;
+
+                let mut clauses = Vec::with_capacity(lemmas.len());
+                let mut has_new_clause = false;
+                for lemma in lemmas {
+                    let mut clause = lemma.clause;
+                    clause.sort_unstable();
+                    clause.dedup();
+                    has_new_clause |= seen_clauses.insert(clause.clone());
+                    clauses.push(clause);
+                }
+
+                match close_valid_lemma_clauses(&clauses, &mut trail) {
+                    LemmaTrailClosure::Contradiction => return Ok(()),
+                    LemmaTrailClosure::Inconclusive => return Ok(()),
+                    LemmaTrailClosure::Complete(units) => {
+                        // A repeated, already-satisfied batch cannot change
+                        // this single-path verifier. Stop instead of spinning.
+                        if units.is_empty() && !has_new_clause {
+                            return Ok(());
+                        }
+
+                        // Lemma atoms were not part of the original combiner
+                        // selection. Before a later `Sat` can reject the
+                        // conflict, check that all materialized units remain in
+                        // the same supported fragment and require the same
+                        // concrete combiner. A support/lemma-only String,
+                        // BitVec, nonlinear, or Int<->Real bridge is therefore
+                        // inconclusive rather than a false definitive `Sat`.
+                        verified_combiner_context.extend(units.iter().copied());
+                        let still_combined = matches!(
+                            classify_mixed_verifiability(
+                                terms,
+                                verified_combiner_context.iter().map(|lit| lit.term),
+                            ),
+                            MixedVerifiability::Combined
+                        );
+                        let same_combiner = verification_combiner_kind(
+                            terms,
+                            verified_combiner_context.iter().map(|lit| lit.term),
+                        ) == selected_combiner_kind;
+                        if !still_combined
+                            || !same_combiner
+                            || conflict_involves_int_real_mix(terms, &verified_combiner_context)
+                            || conflict_involves_nonlinear(terms, &verified_combiner_context)
+                        {
+                            return Ok(());
+                        }
+
+                        for unit in units {
+                            combiner.register_atom(unit.term);
+                            combiner.assert_literal(unit.term, unit.value);
+                        }
+                        result = combiner.check();
+                    }
+                }
+            }
+            // NeedModelEquality/NeedModelEqualities are retractable model
+            // guidance, while NeedSplit/NeedDisequalitySplit/
+            // NeedExpressionSplit(s) require genuine SAT case splits. An
+            // immutable, single-path verifier cannot resolve them without
+            // choosing an unjustified branch. Unknown and string requests are
+            // likewise inconclusive. Preserve the existing optimistic policy.
+            _ => return Ok(()),
+        }
     }
 }
 
@@ -2738,10 +2945,9 @@ enum MixedVerifiability {
     /// and at least one is recognizable: the Nelson-Oppen verification combiner
     /// can re-solve it.
     Combined,
-    /// At least one String-domain literal, every other literal Arithmetic /
-    /// EUF / Array: the production QF_SLIA adapter (`Strings` + `EUF` + `LIA`)
-    /// reads exactly this fragment and can re-solve it
-    /// (#mixed-string-verify-gap).
+    /// At least one native String-domain term and no immediately-unverifiable
+    /// literal. The downstream QF_SLIA gate performs the final no-Array,
+    /// no-Real, linear-fragment checks before treating `Sat` as definitive.
     StringsCombined,
     /// A BitVec or truly-unknown literal is present — no fresh solver in this
     /// module reproduces the conflict. Still accepted, but COUNTED.
@@ -2764,6 +2970,13 @@ fn classify_mixed_verifiability(
     let mut has_recognizable = false;
     let mut has_string = false;
     for term in lits {
+        // Arithmetic atoms and UF-arithmetic equalities can hide a native
+        // String->Int operation below their top-level operator. Treat that as
+        // String content even when `classify_term_domain` returns Arithmetic
+        // or Unknown; otherwise a support-only `str.len` bridge can be sent to
+        // UF+LIA and its unconstrained value can make a `Sat` verdict look
+        // definitive.
+        has_string |= term_mentions_native_string_content(terms, term);
         match classify_term_domain(terms, term) {
             TheoryDomain::Arithmetic | TheoryDomain::Euf | TheoryDomain::Array => {
                 has_recognizable = true;
@@ -2944,12 +3157,19 @@ pub(super) fn classify_conflict_domain(terms: &TermStore, conflict: &[TheoryLit]
     result
 }
 
-pub(crate) fn make_verification_combiner(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerificationCombinerKind {
+    UfLia,
+    UfLra,
+    AufLia,
+    AufLra,
+    ArrayEuf,
+}
+
+fn verification_combiner_kind(
     terms: &TermStore,
     atoms: impl Iterator<Item = TermId>,
-) -> crate::combined_solvers::combiner::TheoryCombiner<'_> {
-    use crate::combined_solvers::combiner::TheoryCombiner;
-
+) -> VerificationCombinerKind {
     let mut has_int = false;
     let mut has_real = false;
     let mut has_array = false;
@@ -2960,23 +3180,38 @@ pub(crate) fn make_verification_combiner(
         has_array |= term_has_array_context(terms, term);
     }
 
-    let mut combiner = if has_int {
+    if has_int {
         if has_array {
-            TheoryCombiner::auf_lia(terms)
+            VerificationCombinerKind::AufLia
         } else {
-            TheoryCombiner::uf_lia(terms)
+            VerificationCombinerKind::UfLia
         }
     } else if has_real {
         if has_array {
-            TheoryCombiner::auf_lra(terms)
+            VerificationCombinerKind::AufLra
         } else {
-            TheoryCombiner::uf_lra(terms)
+            VerificationCombinerKind::UfLra
         }
     } else if has_array {
-        TheoryCombiner::array_euf(terms)
+        VerificationCombinerKind::ArrayEuf
     } else {
         // Default to UF+LIA for mixed uninterpreted/other domains.
-        TheoryCombiner::uf_lia(terms)
+        VerificationCombinerKind::UfLia
+    }
+}
+
+pub(crate) fn make_verification_combiner(
+    terms: &TermStore,
+    atoms: impl Iterator<Item = TermId>,
+) -> crate::combined_solvers::combiner::TheoryCombiner<'_> {
+    use crate::combined_solvers::combiner::TheoryCombiner;
+
+    let mut combiner = match verification_combiner_kind(terms, atoms) {
+        VerificationCombinerKind::UfLia => TheoryCombiner::uf_lia(terms),
+        VerificationCombinerKind::UfLra => TheoryCombiner::uf_lra(terms),
+        VerificationCombinerKind::AufLia => TheoryCombiner::auf_lia(terms),
+        VerificationCombinerKind::AufLra => TheoryCombiner::auf_lra(terms),
+        VerificationCombinerKind::ArrayEuf => TheoryCombiner::array_euf(terms),
     };
     // #uflia-verify-only: every caller of this factory is a fail-closed
     // verification re-check that pattern-matches only the `TheoryResult`

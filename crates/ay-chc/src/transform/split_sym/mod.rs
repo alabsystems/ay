@@ -286,6 +286,8 @@ impl Transformer for SymbolSplitter {
                 back_translator: Box::new(IdentityBackTranslator),
             };
         }
+        let input_problem = crate::ground_derivation::ground_backtranslation_enabled()
+            .then(|| std::sync::Arc::new(problem.clone()));
 
         // Declare original predicates first (identical ids), clones after.
         let mut new_problem = ChcProblem::new();
@@ -458,6 +460,7 @@ impl Transformer for SymbolSplitter {
                 clone_to_orig,
                 original_sorts,
                 index_map,
+                input_problem,
             }),
         }
     }
@@ -470,6 +473,8 @@ struct SplitSymBackTranslator {
     clone_to_orig: FxHashMap<PredicateId, (PredicateId, usize, ChcExpr)>,
     original_sorts: FxHashMap<PredicateId, Vec<ChcSort>>,
     index_map: ClauseIndexMap,
+    /// INPUT problem retained only for exact ground-derivation replay.
+    input_problem: Option<std::sync::Arc<ChcProblem>>,
 }
 
 impl SplitSymBackTranslator {
@@ -648,6 +653,19 @@ impl BackTranslator for SplitSymBackTranslator {
         }
 
         self.index_map.translate_invalidity(witness)
+    }
+
+    fn translate_ground_derivation(
+        &self,
+        derivation: &crate::ground_derivation::GroundDerivation,
+    ) -> Option<crate::ground_derivation::GroundDerivation> {
+        self.index_map
+            .ground_translator("split-symbol", self.input_problem.clone()?)
+            .translate(derivation)
+    }
+
+    fn ground_translation_name(&self) -> &'static str {
+        "split-symbol"
     }
 
     fn transform_memory(&self) -> TransformMemoryReport {

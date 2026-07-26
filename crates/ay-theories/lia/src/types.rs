@@ -317,6 +317,14 @@ pub struct LiaSolver<'a> {
     /// when Gaussian elimination derives f(1) = 0, this map provides the
     /// TermId for constant 0 so that the equality f(1) = 0 can be propagated.
     pub(crate) int_constant_terms: HashMap<BigInt, TermId>,
+    /// Reusable scratch DAG-visited set for `collect_integer_vars`. The term
+    /// DAG is hash-consed, so a shared subterm reachable via many parent paths
+    /// would otherwise be re-walked once per path (exponential on deep diamond
+    /// structures — observed as the dominant cost on QF_ALIA/cs_fib-2). Kept on
+    /// `self` (via `mem::take` + `clear`) so each top-level collect pays no
+    /// allocation. Every effect of `collect_integer_vars` is idempotent per
+    /// term, so pruning re-visits is byte-identical to the naive full walk.
+    pub(crate) collect_int_vars_visited: HashSet<TermId>,
     /// Asserted atoms for conflict generation
     pub(crate) asserted: Vec<(TermId, bool)>,
     /// #C3: Asserted literals whose atom is a Boolean constant asserted with the

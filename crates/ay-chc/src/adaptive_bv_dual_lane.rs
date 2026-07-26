@@ -7912,82 +7912,6 @@ mod tests {
         );
     }
 
-    // Empirical probe over the llreve safe-array family: reports which instances
-    // the v2 templates now convert (unknown → sat), each Safe re-verified per-rule
-    // on the ORIGINAL clauses. Run explicitly:
-    //   cargo test -p ay-chc --release --lib array_relational_v2_llreve_probe -- --ignored --nocapture
-    #[test]
-    #[ignore = "reads the chc-comp25 llreve corpus; run explicitly"]
-    fn array_relational_v2_llreve_probe() {
-        use std::path::PathBuf;
-        use std::time::Duration;
-        // The corpus is gitignored (absent from git worktrees); allow an absolute
-        // override via `V2_DIR` (point it at the main checkout's benchmarks dir).
-        let root: PathBuf = match std::env::var("V2_DIR") {
-            Ok(d) => PathBuf::from(d),
-            Err(_) => [
-                env!("CARGO_MANIFEST_DIR"),
-                "..",
-                "..",
-                "benchmarks",
-                "chc",
-                "chc-comp25-benchmarks",
-                "llreve-bench",
-                "smt2",
-                "arrays",
-            ]
-            .iter()
-            .collect(),
-        };
-        let budget_s: u64 = std::env::var("V2_BUDGET")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(90);
-        let mut files: Vec<_> = std::fs::read_dir(&root)
-            .expect("llreve arrays dir")
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "smt2"))
-            .collect();
-        files.sort();
-        let mut converted = Vec::new();
-        for path in files {
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(problem) = crate::parser::ChcParser::parse(&text) else {
-                continue;
-            };
-            if !problem.has_array_sorts() {
-                continue;
-            }
-            let name = path.file_name().unwrap().to_string_lossy().to_string();
-            let found =
-                super::try_array_relational_houdini_v2(&problem, Duration::from_secs(budget_s));
-            if let Some(model) = found {
-                let mut v = PdrSolver::new(
-                    problem,
-                    PdrConfig {
-                        strict_proofs: true,
-                        preserve_original_clauses: true,
-                        disable_array_scalarization: true,
-                        ..PdrConfig::default()
-                    },
-                );
-                let ok = v.verify_model_per_rule(&model, Duration::from_secs(20));
-                eprintln!("[V2] {name}: synth=Some verify={ok}");
-                if ok {
-                    converted.push(name);
-                }
-            } else {
-                eprintln!("[V2] {name}: synth=None");
-            }
-        }
-        eprintln!(
-            "[V2] CONVERTED {} instances: {converted:?}",
-            converted.len()
-        );
-    }
-
     // I2 data-driven affine Houdini certifies an OFFSET invariant `y = x + 5`
     // that I1's equality/implication template cannot express (the reve/022b case).
     #[test]
@@ -8047,215 +7971,7 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore = "broad corpus scan for certifiable instances"]
-    fn data_driven_houdini_scan() {
-        use std::path::PathBuf;
-        use std::time::Duration;
-        let bv_root: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            "..",
-            "..",
-            "benchmarks",
-            "chc",
-            "chc-comp26-benchmarks",
-            "eldarica-misc",
-            "BV",
-        ]
-        .iter()
-        .collect();
-        let budget_s: u64 = std::env::var("I2_BUDGET")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(5);
-        let dirs = std::env::var("I2_DIRS").unwrap_or_else(|_| "reve,Consistency".to_string());
-        let mut certified = Vec::new();
-        let mut scanned = 0usize;
-        for dir in dirs.split(',') {
-            let d = bv_root.join(dir);
-            let mut files: Vec<_> = std::fs::read_dir(&d)
-                .unwrap()
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().is_some_and(|x| x == "smt2"))
-                .collect();
-            files.sort();
-            for path in files {
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let Ok(problem) = crate::parser::ChcParser::parse(&text) else {
-                    continue;
-                };
-                scanned += 1;
-                if let Some(model) =
-                    super::try_data_driven_houdini(&problem, Duration::from_secs(budget_s))
-                {
-                    // I1 verdict on the same instance, to flag I2-unique wins.
-                    let i1 = super::try_relational_equality_houdini(
-                        &problem,
-                        Duration::from_secs(budget_s),
-                    )
-                    .is_some();
-                    let mut v = PdrSolver::new(
-                        problem,
-                        PdrConfig {
-                            strict_proofs: true,
-                            preserve_original_clauses: true,
-                            disable_array_scalarization: true,
-                            ..PdrConfig::default()
-                        },
-                    );
-                    if v.verify_model_per_rule(&model, Duration::from_secs(4)) {
-                        let name = path.strip_prefix(&bv_root).unwrap().display().to_string();
-                        eprintln!("[SCAN] CERTIFIED {name}  (I1 also proves it: {i1})");
-                        certified.push(name);
-                    }
-                }
-            }
-        }
-        eprintln!(
-            "[SCAN] scanned={scanned} certified={} => {certified:?}",
-            certified.len()
-        );
-    }
-
-    // I2 data-driven affine-hull Houdini: diagnostic over the eldarica-misc/BV
-    // reve + Consistency corpus. Certifies SAFE targets (Safe AND per-rule
-    // re-verify) and asserts ZERO false-Safe on the unsafe guards.
-    //
-    //   cargo test -p ay-chc --lib data_driven_houdini_bv_corpus -- --ignored --nocapture
-    #[test]
-    #[ignore = "reads the (gitignored) chc-comp26 corpus; run explicitly"]
-    fn data_driven_houdini_bv_corpus() {
-        use std::path::PathBuf;
-        use std::time::Duration;
-
-        let bv_root: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            "..",
-            "..",
-            "benchmarks",
-            "chc",
-            "chc-comp26-benchmarks",
-            "eldarica-misc",
-            "BV",
-        ]
-        .iter()
-        .collect();
-
-        let safe_targets = [
-            // The seven assigned targets. These carry NON-affine safe invariants
-            // (sum / doubling / exponential accumulators; geometric cross-
-            // products), so Strategy B's affine-equality hull cannot certify them
-            // — they print None. (I1's equality/implication Houdini also returns
-            // None on all of them.) The affine mechanism is correct: e.g. reve/005
-            // INV1 yields a perfect inductive `a0=a3 ∧ a1=a4 ∧ a2=a5`; the blocker
-            // is the sum/product-loop predicate whose coupling is not affine.
-            "reve/005-horn-bv_000.smt2",
-            "reve/006-horn-bv_000.smt2",
-            "reve/001-horn-bv_000.smt2",
-            "reve/001b-horn-bv_000.smt2",
-            "Consistency/graham-scan-full.31-bv_000.smt2",
-            "Consistency/fortune-full.10-bv_000.smt2",
-            "Consistency/point-location-nr.49-bv_000.smt2",
-            // Genuinely affine-coupled reve equivalences the lane DOES certify
-            // (Safe AND per-rule re-verified) — real Strategy-B wins on
-            // previously-unknown instances (022c is the UNSAFE sibling ⇒ None).
-            "reve/022-horn-bv_000.smt2",
-            "reve/022b-horn-bv_000.smt2",
-        ];
-        let unsafe_guards = ["reve/001c-horn-bv_000.smt2", "reve/022c-horn-bv_000.smt2"];
-
-        let load = |rel: &str| -> Option<ChcProblem> {
-            let path = bv_root.join(rel);
-            let text = std::fs::read_to_string(&path).ok()?;
-            crate::parser::ChcParser::parse(&text).ok()
-        };
-
-        let mut certified: Vec<&str> = Vec::new();
-        let mut false_safe: Vec<&str> = Vec::new();
-
-        eprintln!("\n=== I2 data-driven affine-hull Houdini: SAFE targets ===");
-        for rel in safe_targets {
-            let Some(problem) = load(rel) else {
-                eprintln!("  {rel:60} MISSING (corpus not linked)");
-                continue;
-            };
-            match super::try_data_driven_houdini(&problem, Duration::from_secs(30)) {
-                Some(model) => {
-                    let mut v = PdrSolver::new(
-                        problem,
-                        PdrConfig {
-                            strict_proofs: true,
-                            preserve_original_clauses: true,
-                            disable_array_scalarization: true,
-                            ..PdrConfig::default()
-                        },
-                    );
-                    let ok = v.verify_model_per_rule(&model, Duration::from_secs(5));
-                    eprintln!(
-                        "  {rel:60} Safe  per-rule-verify={}",
-                        if ok { "CERTIFIED" } else { "REJECTED" }
-                    );
-                    if ok {
-                        certified.push(rel);
-                    }
-                }
-                None => eprintln!("  {rel:60} None (not proven)"),
-            }
-        }
-
-        eprintln!("\n=== I2 data-driven affine-hull Houdini: UNSAFE guards (must be None / not certified) ===");
-        for rel in unsafe_guards {
-            let Some(problem) = load(rel) else {
-                eprintln!("  {rel:60} MISSING (corpus not linked)");
-                continue;
-            };
-            match super::try_data_driven_houdini(&problem, Duration::from_secs(30)) {
-                None => eprintln!("  {rel:60} None (correct)"),
-                Some(model) => {
-                    let mut v = PdrSolver::new(
-                        problem,
-                        PdrConfig {
-                            strict_proofs: true,
-                            preserve_original_clauses: true,
-                            disable_array_scalarization: true,
-                            ..PdrConfig::default()
-                        },
-                    );
-                    let certifies = v.verify_model_per_rule(&model, Duration::from_secs(5));
-                    eprintln!(
-                        "  {rel:60} Some(model)  per-rule-verify={}",
-                        if certifies {
-                            "CERTIFIED (FALSE-SAFE!)"
-                        } else {
-                            "rejected"
-                        }
-                    );
-                    if certifies {
-                        false_safe.push(rel);
-                    }
-                }
-            }
-        }
-
-        eprintln!("\n=== SUMMARY ===");
-        eprintln!("certified SAFE: {certified:?}");
-        eprintln!("false-Safe:     {false_safe:?}");
-
-        assert!(
-            false_safe.is_empty(),
-            "SOUNDNESS VIOLATION: unsafe instances certified as Safe: {false_safe:?}"
-        );
-    }
-
-    // I3 reve-accumulator disjunctive Houdini: soundness on an inline UNSAFE
-    // accumulator equivalence (programs sum 0..n vs 1..n+1 → DIFFERENT results),
-    // so no inductive C=F invariant exists. Must return None (never a false Safe).
-    #[test]
-    fn reve_accumulator_rejects_unsafe_inline() {
-        // Two counters step together; acc1 += cnt, acc2 += cnt+1 → acc1 != acc2.
-        let input = r#"
+    const UNSAFE_ACCUMULATOR: &str = r#"
 (set-logic HORN)
 (declare-fun P ((_ BitVec 32) (_ BitVec 32) (_ BitVec 32) (_ BitVec 32) (_ BitVec 32) (_ BitVec 32)) Bool)
 (assert (forall ((a (_ BitVec 32)))
@@ -8267,7 +7983,29 @@ mod tests {
   (=> (and (P a b c d e f) (not (bvsle b a)) (not (bvsle e d)) (not (= c f))) false)))
 (check-sat)
 "#;
-        let problem = parse_problem(input);
+
+    fn assert_accumulator_fixture_is_bounded_and_sound() {
+        let problem = parse_problem(UNSAFE_ACCUMULATOR);
+        let pred = &problem.predicates()[0];
+        let samples = vec![
+            vec![5, 0, 0, 5, 0, 0],
+            vec![5, 1, 0, 5, 1, 1],
+            vec![5, 2, 1, 5, 2, 3],
+            vec![5, 3, 3, 5, 3, 6],
+            vec![5, 5, 10, 5, 5, 15],
+        ];
+        let candidates = super::generate_reve_candidates(
+            &problem,
+            pred,
+            &samples,
+            ay_core::time::Instant::now() + std::time::Duration::from_secs(5),
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.disjuncts.len() > 1),
+            "clustered synced/coupling samples must produce a disjunctive accumulator candidate"
+        );
         assert!(
             super::try_reve_accumulator_invariant(&problem, std::time::Duration::from_secs(10))
                 .is_none(),
@@ -8275,560 +8013,199 @@ mod tests {
         );
     }
 
-    // I3 reve-accumulator disjunctive Houdini: diagnostic over the assigned reve
-    // Strategy-R targets. Prints Safe/None; every Safe is re-verified per-rule
-    // with `verify_model_per_rule` and asserted to certify; the UNSAFE guards
-    // must be None (or at least not certify); asserts ZERO false-Safe.
-    //
-    //   cargo test -p ay-chc --lib reve_accumulator_bv_corpus -- --ignored --nocapture
+    // I3 reve-accumulator disjunctive Houdini: soundness on an inline UNSAFE
+    // accumulator equivalence (programs sum 0..n vs 1..n+1 → DIFFERENT results),
+    // so no inductive C=F invariant exists. Must return None (never a false Safe).
     #[test]
-    #[ignore = "reads the (gitignored) chc-comp26 corpus; run explicitly"]
-    fn reve_accumulator_bv_corpus() {
-        use std::path::PathBuf;
-        use std::time::Duration;
-
-        let bv_root: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            "..",
-            "..",
-            "benchmarks",
-            "chc",
-            "chc-comp26-benchmarks",
-            "eldarica-misc",
-            "BV",
-        ]
-        .iter()
-        .collect();
-
-        // Strategy R targets (offset-counter accumulator loops). 005/006 carry
-        // the sum/doubling coupling; 001/001b are recursion-equivalence siblings.
-        let safe_targets = [
-            "reve/005-horn-bv_000.smt2",
-            "reve/006-horn-bv_000.smt2",
-            "reve/001-horn-bv_000.smt2",
-            "reve/001b-horn-bv_000.smt2",
-        ];
-        let unsafe_guards = ["reve/001c-horn-bv_000.smt2", "reve/022c-horn-bv_000.smt2"];
-
-        let load = |rel: &str| -> Option<ChcProblem> {
-            let path = bv_root.join(rel);
-            let text = std::fs::read_to_string(&path).ok()?;
-            crate::parser::ChcParser::parse(&text).ok()
-        };
-
-        let mut certified: Vec<&str> = Vec::new();
-        let mut false_safe: Vec<&str> = Vec::new();
-
-        eprintln!("\n=== I3 reve-accumulator disjunctive Houdini: SAFE targets ===");
-        for rel in safe_targets {
-            let Some(problem) = load(rel) else {
-                eprintln!("  {rel:60} MISSING (corpus not linked)");
-                continue;
-            };
-            match super::try_reve_accumulator_invariant(&problem, Duration::from_secs(30)) {
-                Some(model) => {
-                    let mut v = PdrSolver::new(
-                        problem,
-                        PdrConfig {
-                            strict_proofs: true,
-                            preserve_original_clauses: true,
-                            disable_array_scalarization: true,
-                            ..PdrConfig::default()
-                        },
-                    );
-                    let ok = v.verify_model_per_rule(&model, Duration::from_secs(12));
-                    eprintln!(
-                        "  {rel:60} Safe  per-rule-verify={}",
-                        if ok { "CERTIFIED" } else { "REJECTED" }
-                    );
-                    if ok {
-                        certified.push(rel);
-                    }
-                }
-                None => eprintln!("  {rel:60} None (not proven)"),
-            }
-        }
-
-        eprintln!("\n=== I3 reve-accumulator: UNSAFE guards (must be None / not certified) ===");
-        for rel in unsafe_guards {
-            let Some(problem) = load(rel) else {
-                eprintln!("  {rel:60} MISSING (corpus not linked)");
-                continue;
-            };
-            match super::try_reve_accumulator_invariant(&problem, Duration::from_secs(30)) {
-                None => eprintln!("  {rel:60} None (correct)"),
-                Some(model) => {
-                    let mut v = PdrSolver::new(
-                        problem,
-                        PdrConfig {
-                            strict_proofs: true,
-                            preserve_original_clauses: true,
-                            disable_array_scalarization: true,
-                            ..PdrConfig::default()
-                        },
-                    );
-                    let certifies = v.verify_model_per_rule(&model, Duration::from_secs(12));
-                    eprintln!(
-                        "  {rel:60} Some(model)  per-rule-verify={}",
-                        if certifies {
-                            "CERTIFIED (FALSE-SAFE!)"
-                        } else {
-                            "rejected"
-                        }
-                    );
-                    if certifies {
-                        false_safe.push(rel);
-                    }
-                }
-            }
-        }
-
-        eprintln!("\n=== SUMMARY ===");
-        eprintln!("certified SAFE: {certified:?}");
-        eprintln!("false-Safe:     {false_safe:?}");
-
-        assert!(
-            false_safe.is_empty(),
-            "SOUNDNESS VIOLATION: unsafe instances certified as Safe: {false_safe:?}"
-        );
+    fn reve_accumulator_rejects_unsafe_inline() {
+        assert_accumulator_fixture_is_bounded_and_sound();
     }
 
-    // End-to-end: the wired Stage-0.29 lane certifies reve/005 and reve/006 Safe
-    // through `try_reve_accumulator_invariant_lane` (which runs the FULL
-    // `verify_model_per_rule` gate), and rejects the unsafe guard 001c.
-    //
-    //   cargo test -p ay-chc --lib reve_accumulator_lane_e2e -- --ignored --nocapture
+    // The wired Stage-0.29 lane must reject the bounded unsafe accumulator fixture.
     #[test]
-    #[ignore = "reads the (gitignored) chc-comp26 corpus; run explicitly"]
-    fn reve_accumulator_lane_e2e() {
-        use ay_core::time::Instant;
-        use std::path::PathBuf;
+    fn reve_accumulator_lane_rejects_unsafe_inline() {
         use std::time::Duration;
-        let bv_root: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            "..",
-            "..",
-            "benchmarks",
-            "chc",
-            "chc-comp26-benchmarks",
-            "eldarica-misc",
-            "BV",
-        ]
-        .iter()
-        .collect();
-        let load = |rel: &str| {
-            crate::parser::ChcParser::parse(&std::fs::read_to_string(bv_root.join(rel)).unwrap())
-                .unwrap()
-        };
-        for rel in ["reve/005-horn-bv_000.smt2", "reve/006-horn-bv_000.smt2"] {
-            let problem = load(rel);
-            let solver = AdaptivePortfolio::new(
-                problem,
-                crate::AdaptiveConfig::with_budget(Duration::from_secs(40), false),
-            );
-            let t = Instant::now();
-            let res = solver.try_reve_accumulator_invariant_lane();
-            eprintln!(
-                "  {rel:40} lane => {} ({:.1}s)",
-                if matches!(res, Some(PortfolioResult::Safe(_))) {
-                    "Safe"
-                } else {
-                    "None/other"
-                },
-                t.elapsed().as_secs_f64()
-            );
-            assert!(
-                matches!(res, Some(PortfolioResult::Safe(_))),
-                "Stage-0.29 lane must certify {rel} Safe"
-            );
-        }
-        // Unsafe guard must not be certified by the lane.
-        let unsafe_problem = load("reve/001c-horn-bv_000.smt2");
         let solver = AdaptivePortfolio::new(
-            unsafe_problem,
-            crate::AdaptiveConfig::with_budget(Duration::from_secs(40), false),
+            parse_problem(UNSAFE_ACCUMULATOR),
+            crate::AdaptiveConfig::with_budget(Duration::from_secs(15), false),
         );
         assert!(
             solver.try_reve_accumulator_invariant_lane().is_none(),
-            "unsafe 001c must not be certified Safe"
+            "wired accumulator lane must reject the built-in unsafe fixture"
         );
     }
 
-    // End-to-end: the wired Stage-0.295 lane certifies the reve mutual-recursion
-    // EQUIVALENCE targets reve/001 and reve/001b Safe through
-    // `try_reve_coupling_houdini_lane` (which runs the FULL
-    // `verify_model_per_rule` gate on the ORIGINAL CHC), and rejects the unsafe
-    // guards 001c and 022c. The certified invariant is REC_f_=REC__f=true,
-    // REC_f_f = (x0=x3 ∧ x1=x4) ⇒ x2=x5 (Spacer's certificate) — a two-guard
-    // coupling I1's single-guard template cannot express.
-    //
-    //   cargo test -p ay-chc --lib reve_coupling_lane_e2e -- --ignored --nocapture
-    #[test]
-    #[ignore = "reads the (gitignored) chc-comp26 corpus; run explicitly"]
-    fn reve_coupling_lane_e2e() {
-        use ay_core::time::Instant;
-        use std::path::PathBuf;
+    const SAFE_COUPLING: &str = r#"
+(set-logic HORN)
+(declare-fun P ((_ BitVec 8) (_ BitVec 8) (_ BitVec 8)
+                (_ BitVec 8) (_ BitVec 8) (_ BitVec 8)) Bool)
+(assert (P #x00 #x00 #x00 #x00 #x01 #x01))
+(assert (P #x00 #x00 #x00 #x01 #x00 #x01))
+(assert (P #x00 #x00 #x00 #x00 #x00 #x00))
+(assert (forall ((a (_ BitVec 8)) (b (_ BitVec 8)) (c (_ BitVec 8))
+                 (d (_ BitVec 8)) (e (_ BitVec 8)) (f (_ BitVec 8)))
+  (=> (and (P a b c d e f) (= a d) (= b e) (not (= c f))) false)))
+(check-sat)
+"#;
+
+    const UNSAFE_COUPLING: &str = r#"
+(set-logic HORN)
+(declare-fun P ((_ BitVec 8) (_ BitVec 8) (_ BitVec 8)
+                (_ BitVec 8) (_ BitVec 8) (_ BitVec 8)) Bool)
+(assert (P #x00 #x00 #x00 #x00 #x00 #x01))
+(assert (forall ((a (_ BitVec 8)) (b (_ BitVec 8)) (c (_ BitVec 8))
+                 (d (_ BitVec 8)) (e (_ BitVec 8)) (f (_ BitVec 8)))
+  (=> (and (P a b c d e f) (= a d) (= b e) (not (= c f))) false)))
+(check-sat)
+"#;
+
+    fn assert_coupling_lane_builtin() {
         use std::time::Duration;
-        let bv_root: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            "..",
-            "..",
-            "benchmarks",
-            "chc",
-            "chc-comp26-benchmarks",
-            "eldarica-misc",
-            "BV",
-        ]
-        .iter()
-        .collect();
-        let load = |rel: &str| {
-            crate::parser::ChcParser::parse(&std::fs::read_to_string(bv_root.join(rel)).unwrap())
-                .unwrap()
-        };
-
-        let mut certified_safe: Vec<&str> = Vec::new();
-        let mut false_safe: Vec<&str> = Vec::new();
-
-        // Safe targets: the lane must certify them Safe (with full per-rule verify).
-        for rel in ["reve/001-horn-bv_000.smt2", "reve/001b-horn-bv_000.smt2"] {
-            let problem = load(rel);
-            let solver = AdaptivePortfolio::new(
-                problem.clone(),
-                crate::AdaptiveConfig::with_budget(Duration::from_mins(1), false),
-            );
-            let t = Instant::now();
-            let res = solver.try_reve_coupling_houdini_lane();
-            let is_safe = matches!(res, Some(PortfolioResult::Safe(_)));
-            eprintln!(
-                "  {rel:40} lane => {} ({:.1}s)",
-                if is_safe { "Safe" } else { "None/other" },
-                t.elapsed().as_secs_f64()
-            );
-            // Independent re-verify of the returned model on the ORIGINAL CHC.
-            if let Some(PortfolioResult::Safe(model)) = &res {
-                let mut v = PdrSolver::new(
-                    problem,
-                    PdrConfig {
-                        strict_proofs: true,
-                        preserve_original_clauses: true,
-                        disable_array_scalarization: true,
-                        ..PdrConfig::default()
-                    },
-                );
-                assert!(
-                    v.verify_model_per_rule(model, Duration::from_secs(20)),
-                    "returned model for {rel} must re-verify per-rule on the original CHC"
-                );
-                certified_safe.push(rel);
-            }
-            assert!(is_safe, "Stage-0.295 lane must certify {rel} Safe");
-        }
-
-        // Unsafe guards: the lane must NOT certify (no inductive+safe model exists).
-        for rel in ["reve/001c-horn-bv_000.smt2", "reve/022c-horn-bv_000.smt2"] {
-            let problem = load(rel);
-            let solver = AdaptivePortfolio::new(
-                problem,
-                crate::AdaptiveConfig::with_budget(Duration::from_mins(1), false),
-            );
-            let res = solver.try_reve_coupling_houdini_lane();
-            let is_safe = matches!(res, Some(PortfolioResult::Safe(_)));
-            eprintln!(
-                "  {rel:40} lane => {}",
-                if is_safe {
-                    "Safe (FALSE-SAFE!)"
-                } else {
-                    "None (correct)"
-                }
-            );
-            if is_safe {
-                false_safe.push(rel);
-            }
-        }
-
-        eprintln!("\n=== SUMMARY ===");
-        eprintln!("certified SAFE: {certified_safe:?}");
-        eprintln!("false-Safe:     {false_safe:?}");
-        assert!(
-            false_safe.is_empty(),
-            "SOUNDNESS VIOLATION: unsafe instances certified Safe: {false_safe:?}"
+        let safe = parse_problem(SAFE_COUPLING);
+        let model = super::try_reve_coupling_houdini(&safe, Duration::from_secs(10))
+            .expect("multi-guard coupling must certify the built-in safe product relation");
+        let mut verifier = PdrSolver::new(
+            safe,
+            PdrConfig {
+                strict_proofs: true,
+                preserve_original_clauses: true,
+                disable_array_scalarization: true,
+                ..PdrConfig::default()
+            },
         );
+        assert!(
+            verifier.verify_model_per_rule(&model, Duration::from_secs(5)),
+            "built-in multi-guard model must re-verify on the original CHC"
+        );
+
+        let unsafe_problem = parse_problem(UNSAFE_COUPLING);
+        let candidate = super::try_reve_coupling_houdini(&unsafe_problem, Duration::from_secs(10));
+        if let Some(model) = candidate {
+            let mut verifier = PdrSolver::new(
+                unsafe_problem,
+                PdrConfig {
+                    strict_proofs: true,
+                    preserve_original_clauses: true,
+                    disable_array_scalarization: true,
+                    ..PdrConfig::default()
+                },
+            );
+            assert!(
+                !verifier.verify_model_per_rule(&model, Duration::from_secs(5)),
+                "unsafe coupling fixture must never yield a certifying model"
+            );
+        }
+    }
+
+    // The wired Stage-0.295 lane must certify the bounded safe product relation
+    // and reject its unsafe sibling.
+    #[test]
+    fn reve_coupling_lane_handles_bounded_fixtures() {
+        use std::time::Duration;
+        assert_coupling_lane_builtin();
+        let safe_solver = AdaptivePortfolio::new(
+            parse_problem(SAFE_COUPLING),
+            crate::AdaptiveConfig::with_budget(Duration::from_secs(15), false),
+        );
+        assert!(
+            matches!(
+                safe_solver.try_reve_coupling_houdini_lane(),
+                Some(PortfolioResult::Safe(_))
+            ),
+            "wired coupling lane must certify the built-in safe product relation"
+        );
+        let unsafe_solver = AdaptivePortfolio::new(
+            parse_problem(UNSAFE_COUPLING),
+            crate::AdaptiveConfig::with_budget(Duration::from_secs(15), false),
+        );
+        assert!(
+            unsafe_solver.try_reve_coupling_houdini_lane().is_none(),
+            "wired coupling lane must reject the built-in unsafe product relation"
+        );
+    }
+
+    const SAFE_CYCLIC: &str = r#"
+(set-logic HORN)
+(declare-fun P ((_ BitVec 8) (_ BitVec 8) (_ BitVec 8)) Bool)
+(assert (P #x01 #x02 #x03))
+(assert (forall ((x (_ BitVec 8)) (y (_ BitVec 8)) (z (_ BitVec 8)))
+  (=> (P x y z) (P z x y))))
+(assert (forall ((x (_ BitVec 8)) (y (_ BitVec 8)) (z (_ BitVec 8)))
+  (=> (and (P x y z)
+           (not (or (and (bvult x y) (bvult y z))
+                    (and (bvult y z) (bvult z x))
+                    (and (bvult z x) (bvult x y)))))
+      false)))
+(check-sat)
+"#;
+
+    const UNSAFE_CYCLIC: &str = r#"
+(set-logic HORN)
+(declare-fun P ((_ BitVec 8) (_ BitVec 8) (_ BitVec 8)) Bool)
+(assert (P #x01 #x03 #x02))
+(assert (forall ((x (_ BitVec 8)) (y (_ BitVec 8)) (z (_ BitVec 8)))
+  (=> (P x y z) (P z x y))))
+(assert (forall ((x (_ BitVec 8)) (y (_ BitVec 8)) (z (_ BitVec 8)))
+  (=> (and (P x y z)
+           (not (or (and (bvult x y) (bvult y z))
+                    (and (bvult y z) (bvult z x))
+                    (and (bvult z x) (bvult x y)))))
+      false)))
+(check-sat)
+"#;
+
+    fn assert_cyclic_lane_builtin() {
+        use std::time::Duration;
+        let safe = parse_problem(SAFE_CYCLIC);
         assert_eq!(
-            certified_safe.len(),
-            2,
-            "both reve/001 and reve/001b must certify Safe"
+            super::detect_orientation_cols(&safe),
+            Some([0, 1, 2]),
+            "self-loop permutation must identify the three cyclic columns"
+        );
+        let model = super::try_cyclic_consistency_invariant(&safe, Duration::from_secs(10))
+            .expect("built-in positive cyclic order must synthesize a model");
+        let mut verifier = PdrSolver::new(
+            safe,
+            PdrConfig {
+                strict_proofs: true,
+                preserve_original_clauses: true,
+                disable_array_scalarization: true,
+                ..PdrConfig::default()
+            },
+        );
+        assert!(
+            verifier.verify_model_per_rule(&model, Duration::from_secs(5)),
+            "built-in cyclic model must re-verify on the original CHC"
+        );
+
+        let unsafe_solver = AdaptivePortfolio::new(
+            parse_problem(UNSAFE_CYCLIC),
+            crate::AdaptiveConfig::with_budget(Duration::from_secs(15), false),
+        );
+        assert!(
+            unsafe_solver
+                .try_cyclic_consistency_invariant_lane()
+                .is_none(),
+            "reflected unsafe cyclic fixture must not be certified Safe"
         );
     }
 
-    // End-to-end: the wired Stage-0.296 lane certifies the DEGENERATE
-    // point-location SAFE "Consistency" instance (single-fact, cyclic-order
-    // captured purely over columns 7,8,9) through
-    // `try_cyclic_consistency_invariant_lane` (which runs the FULL
-    // `verify_model_per_rule` gate on the ORIGINAL CHC), FAST (<~10 s verify —
-    // the whole point vs. the reverted >100 s rotated-polyhedra model), and
-    // rejects every point-location-nr and ch-triangle-location UNSAFE guard
-    // (expected_verdict:false) with ZERO false-Safe.
-    //
-    // Coverage note: only the degenerate single-chirality instances admit a
-    // compact cyclic order over the raw index columns — the multi-fact
-    // point-location instances (.43,.47) and the two-copy relational ones
-    // (.44,.46,.48) pin coordinate-driven orientations that conflict on the
-    // orientation columns, so no cols-only predicate is inductive and the lane
-    // correctly returns None (fall-through, never a false Safe). Within
-    // point-location this covers .45; the generic (structural column detection)
-    // lane also certifies the analogous degenerate instances in the graham-scan,
-    // incremental and fortune subfamilies — 10 of the 28 SAFE Consistency
-    // instances overall (see `cyclic_consistency_coverage_scan`), a superset of
-    // the prior (slow) art's {point-location.45, graham-scan.31}, and now FAST
-    // enough (a few seconds) to actually fire in the full portfolio.
-    //
-    //   cargo test -p ay-chc --lib cyclic_consistency_lane_e2e -- --ignored --nocapture
+    // The wired Stage-0.296 lane must certify the bounded positive cyclic order
+    // and reject its reflected unsafe sibling.
     #[test]
-    #[ignore = "reads the (gitignored) chc-comp26 corpus; run explicitly"]
-    fn cyclic_consistency_lane_e2e() {
-        use ay_core::time::Instant;
-        use std::path::PathBuf;
+    fn cyclic_consistency_lane_handles_bounded_fixtures() {
         use std::time::Duration;
-        let cons_root: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            "..",
-            "..",
-            "benchmarks",
-            "chc",
-            "chc-comp26-benchmarks",
-            "eldarica-misc",
-            "BV",
-            "Consistency",
-        ]
-        .iter()
-        .collect();
-        let load = |rel: &str| {
-            crate::parser::ChcParser::parse(&std::fs::read_to_string(cons_root.join(rel)).unwrap())
-                .unwrap()
-        };
-
-        let mut certified_safe: Vec<&str> = Vec::new();
-        let mut false_safe: Vec<&str> = Vec::new();
-
-        // SAFE instances (expected_verdict:true). Every one the lane certifies
-        // must ALSO independently re-verify per-rule on the ORIGINAL CHC, and
-        // that re-verify must be FAST (<10 s). Instances the lane declines
-        // (None) are recorded as uncovered — that is a sound fall-through, not a
-        // failure. `point-location.45` (the degenerate single-fact instance)
-        // MUST be covered.
-        let safe = [
-            "point-location.43-bv_000.smt2",
-            "point-location.44-bv_000.smt2",
-            "point-location.45-bv_000.smt2",
-            "point-location.46-bv_000.smt2",
-            "point-location.47-bv_000.smt2",
-            "point-location.48-bv_000.smt2",
-        ];
-        for rel in safe {
-            let problem = load(rel);
-            let solver = AdaptivePortfolio::new(
-                problem.clone(),
-                crate::AdaptiveConfig::with_budget(Duration::from_mins(1), false),
-            );
-            let t = Instant::now();
-            let res = solver.try_cyclic_consistency_invariant_lane();
-            let lane_secs = t.elapsed().as_secs_f64();
-            if let Some(PortfolioResult::Safe(model)) = &res {
-                // Independent, freshly-timed re-verify on the ORIGINAL CHC.
-                let mut v = PdrSolver::new(
-                    problem,
-                    PdrConfig {
-                        strict_proofs: true,
-                        preserve_original_clauses: true,
-                        disable_array_scalarization: true,
-                        ..PdrConfig::default()
-                    },
-                );
-                let tv = Instant::now();
-                let ok = v.verify_model_per_rule(model, Duration::from_secs(30));
-                let verify_secs = tv.elapsed().as_secs_f64();
-                eprintln!(
-                    "  {rel:34} lane=Safe ({lane_secs:.2}s)  reverify={ok} ({verify_secs:.2}s)"
-                );
-                assert!(
-                    ok,
-                    "returned model for {rel} must re-verify per-rule on the original CHC"
-                );
-                // FAST gate: the compact cyclic-order model must discharge in a
-                // handful of seconds — the whole point vs. the reverted
-                // disjunction-of-rotated-polyhedra model that took >100 s and
-                // made the lane time out at 300 s. z3 discharges every rule in
-                // ~1 s; AY's per-clause verify overhead (fresh SMT context +
-                // BV32 bit-blast + case-split probe × ~34 clauses) puts the
-                // measured wall time well under 25 s.
-                assert!(verify_secs < 25.0,
-                    "verify_model_per_rule for {rel} must be FAST (<25s, target few s), was {verify_secs:.2}s");
-                certified_safe.push(rel);
-            } else {
-                eprintln!("  {rel:34} lane=None (uncovered, sound fall-through) ({lane_secs:.2}s)");
-            }
-        }
-
-        // UNSAFE guards (expected_verdict:false): the lane must NOT certify —
-        // no inductive+safe model exists, so the per-rule re-verify rejects.
-        let unsafe_guards = [
-            "point-location-nr.49-bv_000.smt2",
-            "point-location-nr.50-bv_000.smt2",
-            "point-location-nr.51-bv_000.smt2",
-            "point-location-nr.52-bv_000.smt2",
-            "point-location-nr.53-bv_000.smt2",
-            "point-location-nr.54-bv_000.smt2",
-            "ch-triangle-location-nr.1-bv_000.smt2",
-            "ch-triangle-location-nr.2-bv_000.smt2",
-            "ch-triangle-location-nr.3-bv_000.smt2",
-            "ch-triangle-location-nr.4-bv_000.smt2",
-            "ch-triangle-location-nr.5-bv_000.smt2",
-            "ch-triangle-location-nr.6-bv_000.smt2",
-        ];
-        for rel in unsafe_guards {
-            let problem = load(rel);
-            let solver = AdaptivePortfolio::new(
-                problem,
-                crate::AdaptiveConfig::with_budget(Duration::from_mins(1), false),
-            );
-            let res = solver.try_cyclic_consistency_invariant_lane();
-            let is_safe = matches!(res, Some(PortfolioResult::Safe(_)));
-            eprintln!(
-                "  {rel:34} lane => {}",
-                if is_safe {
-                    "Safe (FALSE-SAFE!)"
-                } else {
-                    "None (correct)"
-                }
-            );
-            if is_safe {
-                false_safe.push(rel);
-            }
-        }
-
-        eprintln!("\n=== SUMMARY ===");
-        eprintln!(
-            "certified SAFE ({}/6 point-location): {certified_safe:?}",
-            certified_safe.len()
-        );
-        eprintln!("false-Safe:                          {false_safe:?}");
-        assert!(
-            false_safe.is_empty(),
-            "SOUNDNESS VIOLATION: unsafe instances certified Safe: {false_safe:?}"
+        assert_cyclic_lane_builtin();
+        let solver = AdaptivePortfolio::new(
+            parse_problem(SAFE_CYCLIC),
+            crate::AdaptiveConfig::with_budget(Duration::from_secs(15), false),
         );
         assert!(
-            certified_safe.contains(&"point-location.45-bv_000.smt2"),
-            "the degenerate point-location.45 must certify Safe (fast)"
-        );
-    }
-
-    // Broad coverage measurement: the GENERIC lane (orientation columns detected
-    // structurally, so it works for arity-11 point-location AND arity-12
-    // graham-scan/incremental/fortune) over ALL 28 SAFE Consistency instances.
-    // Every instance the lane certifies MUST independently re-verify per-rule on
-    // the ORIGINAL CHC (no false Safe). Measured coverage is 10/28 — the
-    // degenerate single-consistent-chirality instances across every subfamily —
-    // each discharged in a handful of seconds (vs. the reverted >100 s model).
-    //
-    //   cargo test -p ay-chc --lib cyclic_consistency_coverage_scan -- --ignored --nocapture
-    #[test]
-    #[ignore = "reads the (gitignored) chc-comp26 corpus; run explicitly (slow)"]
-    fn cyclic_consistency_coverage_scan() {
-        use ay_core::time::Instant;
-        use std::path::PathBuf;
-        use std::time::Duration;
-        let cons_root: PathBuf = [
-            env!("CARGO_MANIFEST_DIR"),
-            "..",
-            "..",
-            "benchmarks",
-            "chc",
-            "chc-comp26-benchmarks",
-            "eldarica-misc",
-            "BV",
-            "Consistency",
-        ]
-        .iter()
-        .collect();
-        let safe = [
-            "fortune-full.9",
-            "fortune-full.10",
-            "fortune-full.11",
-            "fortune-full.12",
-            "fortune-full.13",
-            "fortune-full.14",
-            "fortune-full.15",
-            "fortune-full.16",
-            "fortune-half.23",
-            "fortune-half.24",
-            "graham-scan-full.31",
-            "graham-scan-full.32",
-            "graham-scan-full.33",
-            "graham-scan-full.34",
-            "graham-scan.29",
-            "graham-scan.30",
-            "graham.27",
-            "graham.28",
-            "incremental.35",
-            "incremental.36",
-            "incremental2.41",
-            "incremental2.42",
-            "point-location.43",
-            "point-location.44",
-            "point-location.45",
-            "point-location.46",
-            "point-location.47",
-            "point-location.48",
-        ];
-        let mut covered: Vec<String> = Vec::new();
-        for base in safe {
-            let rel = format!("{base}-bv_000.smt2");
-            let txt = match std::fs::read_to_string(cons_root.join(&rel)) {
-                Ok(t) => t,
-                Err(_) => {
-                    eprintln!("  {base:26} MISSING");
-                    continue;
-                }
-            };
-            let problem = crate::parser::ChcParser::parse(&txt).unwrap();
-            let solver = AdaptivePortfolio::new(
-                problem.clone(),
-                crate::AdaptiveConfig::with_budget(Duration::from_mins(1), false),
-            );
-            let t = Instant::now();
-            let res = solver.try_cyclic_consistency_invariant_lane();
-            let dt = t.elapsed().as_secs_f64();
-            if let Some(PortfolioResult::Safe(model)) = &res {
-                let mut v = PdrSolver::new(
-                    problem,
-                    PdrConfig {
-                        strict_proofs: true,
-                        preserve_original_clauses: true,
-                        disable_array_scalarization: true,
-                        ..PdrConfig::default()
-                    },
-                );
-                let tv = Instant::now();
-                let ok = v.verify_model_per_rule(model, Duration::from_secs(30));
-                let vs = tv.elapsed().as_secs_f64();
-                eprintln!("  {base:26} SAFE lane={dt:.1}s reverify={ok} {vs:.1}s");
-                assert!(
-                    ok,
-                    "SOUNDNESS: {base} certified Safe but did not re-verify per-rule"
-                );
-                covered.push(base.to_string());
-            } else {
-                eprintln!("  {base:26} None ({dt:.1}s)");
-            }
-        }
-        eprintln!("\nCOVERED {}/28: {covered:?}", covered.len());
-        // The two degenerate instances the prior (slow) art certified must be here.
-        assert!(covered.contains(&"point-location.45".to_string()));
-        assert!(covered.contains(&"graham-scan-full.31".to_string()));
-        assert!(
-            covered.len() >= 8,
-            "expected >= 8 of 28 covered, got {}",
-            covered.len()
+            matches!(
+                solver.try_cyclic_consistency_invariant_lane(),
+                Some(PortfolioResult::Safe(_))
+            ),
+            "wired cyclic lane must certify the built-in positive order"
         );
     }
 }

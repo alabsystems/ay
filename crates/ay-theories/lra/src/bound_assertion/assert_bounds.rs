@@ -412,6 +412,16 @@ impl LraSolver {
                     }
                 }
             }
+            // #warm-simplex: a bound activation that makes a NON-basic var
+            // violate is invisible to the basic-var heap above; enqueue it in
+            // the persistent candidate set so the simplex's no-violated-row
+            // exit can scan O(dirty) instead of O(vars).
+            if self.warm.enabled
+                && matches!(self.vars[var as usize].status, Some(VarStatus::NonBasic))
+                && self.violates_bounds(var).is_some()
+            {
+                self.warm_mark_nonbasic_dirty(var);
+            }
         }
         self.dirty = true;
         tightened
@@ -546,6 +556,16 @@ impl LraSolver {
                         self.track_var_feasibility(bv);
                     }
                 }
+            }
+            // #warm-simplex: a bound activation that makes a NON-basic var
+            // violate is invisible to the basic-var heap above; enqueue it in
+            // the persistent candidate set so the simplex's no-violated-row
+            // exit can scan O(dirty) instead of O(vars).
+            if self.warm.enabled
+                && matches!(self.vars[var as usize].status, Some(VarStatus::NonBasic))
+                && self.violates_bounds(var).is_some()
+            {
+                self.warm_mark_nonbasic_dirty(var);
             }
         }
         self.dirty = true;

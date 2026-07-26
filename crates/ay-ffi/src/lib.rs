@@ -430,6 +430,135 @@ pub unsafe extern "C" fn ay_string_free(s: *mut c_char) {
     }
 }
 
+// ============================================================================
+// High-level finite-domain search (one-shot JSON API)
+// ============================================================================
+
+/// Maximum accepted size of a search JSON document, excluding its terminating
+/// NUL byte. This fixed boundary prevents unbounded parser input through the C
+/// ABI; it is mirrored by `AY_SEARCH_MAX_JSON_BYTES` in `include/ay.h`.
+const AY_SEARCH_MAX_JSON_BYTES: usize = 16 * 1024 * 1024;
+
+fn search_error_json(message: &str) -> String {
+    match serde_json::to_string(&serde_json::json!({
+        "status": "error",
+        "error": message,
+    })) {
+        Ok(json) => json,
+        // Serializing two string fields is infallible in practice, but FFI
+        // must still return a valid document if serde ever reports an error.
+        Err(_) => r#"{"status":"error","error":"could not serialize AY search error"}"#.to_string(),
+    }
+}
+
+fn owned_c_string(value: String) -> *mut c_char {
+    match CString::new(value) {
+        Ok(value) => value.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+fn search_json_input(bytes: &CStr) -> Result<&str, String> {
+    let bytes = bytes.to_bytes();
+    if bytes.len() > AY_SEARCH_MAX_JSON_BYTES {
+        return Err(format!(
+            "search specification exceeds {AY_SEARCH_MAX_JSON_BYTES}-byte input limit"
+        ));
+    }
+    std::str::from_utf8(bytes).map_err(|_| "search specification is not valid UTF-8".to_string())
+}
+
+/// Solve a versioned ay-search JSON specification in one call.
+///
+/// Every ordinary outcome is an owned JSON object. Solver `unknown` and a
+/// feasible-but-unproven optimization incumbent are preserved as distinct
+/// statuses; malformed specifications use `{"status":"error", ...}`.
+///
+/// # Safety
+/// `spec_json` must either be null or point to a valid null-terminated byte
+/// string for the duration of this call. A non-null return value must be freed
+/// exactly once with [`ay_string_free`].
+#[no_mangle]
+pub unsafe extern "C" fn ay_search_solve_json(spec_json: *const c_char) -> *mut c_char {
+    if spec_json.is_null() {
+        return owned_c_string(search_error_json("search specification pointer is null"));
+    }
+
+    let response = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: The pointer was null-checked above. The remaining validity
+        // and NUL-termination requirements are the caller's safety contract.
+        let bytes = unsafe { CStr::from_ptr(spec_json) };
+        let input = match search_json_input(bytes) {
+            Ok(input) => input,
+            Err(error) => return search_error_json(&error),
+        };
+        let result = (|| ay_search::SearchSpec::from_json(input)?.build()?.run())();
+        match result {
+            Ok(result) => match serde_json::to_string(&result) {
+                Ok(json) => json,
+                Err(error) => {
+                    search_error_json(&format!("could not serialize AY search result: {error}"))
+                }
+            },
+            Err(error) => search_error_json(&error.to_string()),
+        }
+    }));
+
+    match response {
+        Ok(json) => owned_c_string(json),
+        Err(panic) => owned_c_string(search_error_json(&format!(
+            "panic in ay_search_solve_json: {}",
+            z3_compat::panic_payload_to_string(&*panic)
+        ))),
+    }
+}
+
+/// Render a versioned ay-search JSON specification as SMT-LIB in one call.
+///
+/// The returned JSON object contains `{"status":"ok","smt2":"..."}` or an
+/// error envelope. Rendering does not execute the model.
+///
+/// # Safety
+/// `spec_json` must either be null or point to a valid null-terminated byte
+/// string for the duration of this call. A non-null return value must be freed
+/// exactly once with [`ay_string_free`].
+#[no_mangle]
+pub unsafe extern "C" fn ay_search_compile_json(spec_json: *const c_char) -> *mut c_char {
+    if spec_json.is_null() {
+        return owned_c_string(search_error_json("search specification pointer is null"));
+    }
+
+    let response = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: The pointer was null-checked above. The remaining validity
+        // and NUL-termination requirements are the caller's safety contract.
+        let bytes = unsafe { CStr::from_ptr(spec_json) };
+        let input = match search_json_input(bytes) {
+            Ok(input) => input,
+            Err(error) => return search_error_json(&error),
+        };
+        match ay_search::SearchSpec::from_json(input).and_then(|spec| spec.to_smt2()) {
+            Ok(smt2) => match serde_json::to_string(&serde_json::json!({
+                "status": "ok",
+                "smt2": smt2,
+            })) {
+                Ok(json) => json,
+                Err(error) => {
+                    search_error_json(&format!("could not serialize AY search rendering: {error}"))
+                }
+            },
+            Err(error) => search_error_json(&error.to_string()),
+        }
+    }));
+
+    match response {
+        Ok(json) => owned_c_string(json),
+        Err(panic) => owned_c_string(search_error_json(&format!(
+            "panic in ay_search_compile_json: {}",
+            z3_compat::panic_payload_to_string(&*panic)
+        ))),
+    }
+}
+
 /// Reset the solver state
 ///
 /// Clears all assertions and declarations, returning the solver to

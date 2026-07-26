@@ -62,7 +62,18 @@ impl<T: TheorySolver> TheoryExtension<'_, T> {
         // 512 cheap level-0 re-assertions is sub-millisecond, so the deadline
         // overshoot on the divergence is negligible.
         if let Some(deadline) = self.solve_deadline {
-            const DEADLINE_POLL_INTERVAL: u64 = 512;
+            // #storm-poll-cadence: 512 -> 16. On propagate-time pivot storms
+            // (bmwlin.bmc check 79 under warm-simplex) per-round cost inflates
+            // to the point where 512 rounds exceed the whole remaining budget,
+            // starving the safety-deadline poll for hundreds of seconds past
+            // expiry (measured: >294s overshoot; injected early-storm deadlines
+            // fire with ~0.6s overshoot, proving the plumbing works and only
+            // the cadence starves). At /16 the poll is one Instant::now() per
+            // 16 rounds — only when a deadline is installed — which is noise
+            // (the recorded 5% concern was PER-CALL timestamping). Liveness
+            // only: a hit degrades the solve to Unknown (fail-closed), never a
+            // wrong verdict; the per-check safety deadline re-arms next check.
+            const DEADLINE_POLL_INTERVAL: u64 = 16;
             if self
                 .eager_stats
                 .propagate_calls

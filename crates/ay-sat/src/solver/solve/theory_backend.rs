@@ -601,7 +601,21 @@ impl Solver {
                 // When it IS Continue, the periodic checks on conflict (every 100)
                 // and decision (every 1000) paths are sufficient for timeout
                 // responsiveness.
-                if !matches!(theory_result, TheoryPropResult::Continue) && should_stop() {
+                // #storm-poll-cadence companion: ALSO poll on Continue results
+                // at an amortized 1/32 cadence. A propagate-time pivot storm is
+                // a run of expensive-but-derivation-free theory rounds — the
+                // budget-exhausted propagate simplex maps Unknown->Sat ("no
+                // conflict found"), so every storm round returns Continue and
+                // the #8465 gate skipped the only per-round poll, starving the
+                // wall-clock deadline exactly when rounds are slowest. One
+                // should_stop() per 32 Continue rounds is noise; a hit only
+                // produces an earlier legal Unknown (fail-closed liveness).
+                self.cold.theory_continue_polls = self.cold.theory_continue_polls.wrapping_add(1);
+                let continue_poll = matches!(theory_result, TheoryPropResult::Continue)
+                    && self.cold.theory_continue_polls.is_multiple_of(32);
+                if (!matches!(theory_result, TheoryPropResult::Continue) || continue_poll)
+                    && should_stop()
+                {
                     return self.declare_unknown_with_reason(SatUnknownReason::Interrupted);
                 }
                 match theory_result {

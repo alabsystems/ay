@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover - depends on environment
     _z3 = None
     HAVE_Z3PY = False
 
-requires_z3 = pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+requires_z3 = pytest.mark.usefixtures("required_reference_z3")
 
 
 # ---------------------------------------------------------------------------

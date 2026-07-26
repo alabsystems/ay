@@ -80,6 +80,17 @@ use ay_core::{Sort, TermData, TermId, TermStore};
 /// stays exactly today's lazy loop.
 const ARRAYS_TO_LIA_AXIOM_BUDGET: usize = 20_000;
 
+/// Terms interned per generated read-over-read (Ackermann) axiom:
+/// `(= i1 i2)`, its negation, `(= s1 s2)`, and the enclosing `or`.
+const ARRAYS_TO_LIA_TERMS_PER_ACK_PAIR: usize = 4;
+
+/// How far this speculative reduction may inflate the SHARED term store,
+/// as a multiple of the original reachable problem size (#arr2lia-inflate).
+const ARRAYS_TO_LIA_MAX_TERM_INFLATION: usize = 20;
+
+/// Floor for the inflation allowance, so tiny inputs can still be rescued.
+const ARRAYS_TO_LIA_MIN_TERM_ALLOWANCE: usize = 5_000;
+
 fn is_store(terms: &TermStore, t: TermId) -> bool {
     matches!(terms.get(t), TermData::App(sym, args) if sym.name() == "store" && args.len() == 3)
 }
@@ -466,6 +477,51 @@ impl Executor {
                 tracing::debug!("arr2lia bail: over-budget-congruence");
                 return Ok(None);
             }
+        }
+
+        // Project the READ-OVER-READ cost too, and do it HERE (#arr2lia-inflate).
+        //
+        // The `ack_pairs` budget further down is only consulted AFTER saturation
+        // has already interned every read it counts, so bailing there cannot undo
+        // the growth it exists to prevent — and this is a speculative rescue whose
+        // terms outlive it in the SHARED store. Saturation gives each of the
+        // distinct array bases one read per index, so Ackermann is quadratic in
+        // `n_idx` per base while the congruence check above is only linear in it.
+        // A chain of `(= a b)` array equalities plus any arithmetic atom therefore
+        // sails through the check above and still interns tens of thousands of
+        // terms; downstream AUFLIA passes that scan the WHOLE term store then cost
+        // far more than the search this reduction was meant to rescue (measured:
+        // 32 aliased `(Array Int Int)` vars + `(>= p 0)` → 66,595 terms, 7.5s,
+        // versus 0.10s once this bails).
+        //
+        // Keep the allowance proportional to the original problem so genuinely
+        // large inputs can still be rescued; only disproportionate inflation bails.
+        let distinct_bases = {
+            let mut bases: Vec<TermId> = eq_atoms
+                .iter()
+                .flat_map(|&(_, lhs, rhs)| [lhs, rhs])
+                .collect();
+            bases.sort_unstable_by_key(|t| t.0);
+            bases.dedup();
+            bases.len()
+        };
+        let projected_ack_pairs =
+            distinct_bases.saturating_mul(n_idx.saturating_mul(n_idx.saturating_sub(1)) / 2);
+        let projected_terms = projected_ack_pairs.saturating_mul(ARRAYS_TO_LIA_TERMS_PER_ACK_PAIR);
+        let inflation_cap = reachable
+            .len()
+            .saturating_mul(ARRAYS_TO_LIA_MAX_TERM_INFLATION)
+            .max(ARRAYS_TO_LIA_MIN_TERM_ALLOWANCE);
+        if projected_ack_pairs > ARRAYS_TO_LIA_AXIOM_BUDGET || projected_terms > inflation_cap {
+            tracing::debug!(
+                distinct_bases,
+                n_idx,
+                projected_ack_pairs,
+                projected_terms,
+                inflation_cap,
+                "arr2lia bail: over-budget-ack-projected"
+            );
+            return Ok(None);
         }
 
         // ---- Saturation ----------------------------------------------------

@@ -128,6 +128,7 @@ impl<'a> LiaSolver<'a> {
             // always scans every integer variable.
             int_bounds_all_dirty: true,
             int_constant_terms: HashMap::default(),
+            collect_int_vars_visited: HashSet::default(),
             asserted: Vec::new(),
             const_bool_conflicts: Vec::new(),
             in_search_phase: false,
@@ -628,7 +629,26 @@ impl<'a> LiaSolver<'a> {
 
     /// Extract integer variables from a term and its subterms.
     /// Also collects integer constant terms for N-O propagation (#3581).
+    ///
+    /// Delegates to `collect_integer_vars_rec` with a reusable DAG-visited set
+    /// so each hash-consed subterm is processed at most once per top-level
+    /// call. Byte-identical to the naive recursion: every effect below is
+    /// idempotent per term (set inserts / `or_insert` / dirty-marking), and the
+    /// pre-order first-visit sequence — hence `integer_vars`/`sorted_integer_vars`
+    /// insertion order and the `var_index_epoch` count — is unchanged; only the
+    /// redundant re-descent into already-processed shared subterms is skipped.
     fn collect_integer_vars(&mut self, term: TermId) {
+        let mut visited = std::mem::take(&mut self.collect_int_vars_visited);
+        visited.clear();
+        self.collect_integer_vars_rec(term, &mut visited);
+        self.collect_int_vars_visited = visited;
+    }
+
+    fn collect_integer_vars_rec(&mut self, term: TermId, visited: &mut HashSet<TermId>) {
+        // Hash-consed DAG: a subterm shared by many parents is walked once.
+        if !visited.insert(term) {
+            return;
+        }
         match self.terms.get(term) {
             TermData::Const(Constant::Int(n)) => {
                 // Track integer constants for Nelson-Oppen propagation (#3581).
@@ -689,19 +709,19 @@ impl<'a> LiaSolver<'a> {
                     }
                 }
                 for &arg in args {
-                    self.collect_integer_vars(arg);
+                    self.collect_integer_vars_rec(arg, visited);
                 }
             }
             TermData::Let(_, body) => {
-                self.collect_integer_vars(*body);
+                self.collect_integer_vars_rec(*body, visited);
             }
             TermData::Not(inner) => {
-                self.collect_integer_vars(*inner);
+                self.collect_integer_vars_rec(*inner, visited);
             }
             TermData::Ite(cond, then_branch, else_branch) => {
-                self.collect_integer_vars(*cond);
-                self.collect_integer_vars(*then_branch);
-                self.collect_integer_vars(*else_branch);
+                self.collect_integer_vars_rec(*cond, visited);
+                self.collect_integer_vars_rec(*then_branch, visited);
+                self.collect_integer_vars_rec(*else_branch, visited);
             }
             _ => {}
         }

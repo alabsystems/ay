@@ -377,6 +377,20 @@ fn main() {
         return;
     }
 
+    if mode == "bumpdiff" {
+        // DIFFERENTIAL-CORRECTNESS HARNESS: reload a dumped basis (AY_BASIS_FILE)
+        // and factor it on BOTH trusted lanes (PFI slot-order vs Markowitz
+        // bump-LU), reporting the max FTRAN/BTRAN diff. Near-zero (~1e-9..1e-6) =
+        // the harness self-validates (the two lanes produce the same B⁻¹), so it
+        // is trustworthy for the future block-triangular-factor (BTF) lane. Set
+        // AY_MILP_BUMP_LU_MIN=1 so lane 1 takes the bump-LU path on a modest bump.
+        let (model, _nc, _nr, _bins, _obj) = build_model(&text, false);
+        let path =
+            std::env::var("AY_BASIS_FILE").unwrap_or_else(|_| "/tmp/ay_root_basis.txt".into());
+        println!("{}", ay_milp::diag_bump_lu_diff(&model, &path));
+        return;
+    }
+
     if mode == "presolve" {
         // MEASUREMENT: root presolve alone (tighten_bounds -> tighten_coefficients)
         // with `secs` as its whole deadline. AY_MILP_TRACE=1 for per-round lines.

@@ -151,6 +151,7 @@ pub(crate) fn debug_algebraic_enabled() -> bool {
     ay_core::debug_channel_active(ay_core::DebugChannel::Algebraic)
 }
 
+pub(crate) mod acyclic_cert_cache;
 mod adaptive;
 mod adaptive_bv_dual_lane;
 mod adaptive_bv_strategy;
@@ -796,6 +797,31 @@ pub mod engines {
         problem: &ChcProblem,
         config: &PdrConfig,
     ) -> Option<(bool, usize)> {
+        // Dead-end-cycle parity (ay#8578): the SOLVE lane
+        // (`AdaptivePortfolio::new`) strips provably-dead-end cycle predicates
+        // (a self-loop with no path to any query) so an acyclic-modulo-dead-end
+        // CHC routes to the fast bounded-BMC lane, and then ships an EMPTY
+        // acyclic-BMC certificate for the now-acyclic DAG. The CLI discharges
+        // that certificate against `solver.problem()` (already stripped), but an
+        // out-of-crate re-validation caller (e.g. model-checker-consumer's native CHC path)
+        // hands us the ORIGINAL, un-stripped problem, whose lone dead-end
+        // self-loop makes `has_cycles()` true and would spuriously reject the
+        // honest empty certificate below — demoting a genuinely-proved Safe to
+        // UNKNOWN. Apply the SAME verdict-preserving strip here so validation
+        // classifies and re-checks the identical acyclic-modulo-dead-end problem
+        // the solve lane proved. `strip_dead_end_cycle_predicates` is a strict
+        // no-op (byte-identical) for every problem outside that class, so this
+        // only recovers the lost decision and cannot change any other verdict.
+        let stripped_owned;
+        let problem = if problem.has_cycles() {
+            let mut p = problem.clone();
+            p.strip_dead_end_cycle_predicates();
+            stripped_owned = p;
+            &stripped_owned
+        } else {
+            problem
+        };
+
         // Accept scalar acyclic DAGs over any combination of Bool/Int/BV — NOT just BV.
         // The production path emits these acyclic-BMC Safe certificates for pure Bool/Int
         // scalar DAGs (source_exact_bool_int_dag, adaptive_multi_pred.rs:397), but this
@@ -825,8 +851,34 @@ pub mod engines {
 
         let depth = features.dag_depth.max(features.num_predicates).max(1);
         let budget = config.solve_timeout.or(Some(PDR_PROOF_VALIDATION_TIMEOUT));
-        if budget.is_some_and(|budget| budget.is_zero()) {
+        if budget.is_some_and(|budget| budget.is_zero())
+            || config
+                .cancellation_token
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        {
             return Some((false, depth));
+        }
+
+        // Reuse the solve lane's already-computed acyclic-BMC safety proof
+        // instead of recomputing the identical exhaustive BMC (the whole point
+        // of this optimization; count_zero/loop_with_old: ~8.5 s proved twice →
+        // once). This is reached ONLY after the eligibility, zero-budget, and
+        // pre-cancellation gates above, so a hit can only ever stand in for the
+        // `BmcSolver::solve()` run below — never bypass a gate. The memo records
+        // `problem` (the same dead-end-stripped problem classified here) ONLY
+        // immediately after complete acyclic BMC genuinely proved it safe.
+        // The key is the full structural identity, and the cached bound must
+        // cover the freshly recomputed exhaustive depth, so a hit is exactly
+        // equivalent to re-running: it yields `Some((true, depth))`, the same
+        // Safe verdict the re-run would establish. On any miss (the problem
+        // was not proved this session, is not structurally identical, or was
+        // proved only to a shallower bound) we fall through to the
+        // correct-but-slower re-run. See `crate::acyclic_cert_cache`.
+        if crate::acyclic_cert_cache::lookup_acyclic_bmc_safe(problem)
+            .is_some_and(|cached_depth| cached_depth >= depth)
+        {
+            return Some((true, depth));
         }
 
         let bmc_config = BmcConfig {

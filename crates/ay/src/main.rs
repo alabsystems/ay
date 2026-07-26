@@ -52,6 +52,8 @@ mod build_info;
 mod chc_runner;
 mod cmd_allsat;
 mod cmd_bench;
+#[cfg(feature = "bench")]
+mod cmd_bench_campaign;
 mod cmd_bench_compare;
 mod cmd_bisect;
 mod cmd_check;
@@ -698,7 +700,7 @@ enum Command {
     /// Run and score reproducible benchmark evaluations
     #[command(subcommand, hide = true)]
     Bench(cmd_bench::BenchCommand),
-    /// Manage benchmark corpora published as GitHub release assets
+    /// Plan, acquire, and verify benchmark corpora from pinned internet sources
     #[command(subcommand, hide = true)]
     Corpus(cmd_corpus::CorpusCommand),
     /// Build, verify, and locate external tools from pinned recipes

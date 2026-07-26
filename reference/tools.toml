@@ -55,6 +55,12 @@ tag    = "3.0.2"
 bin    = "veripb"                   # lands in ~/.cargo/bin
 verify = ["veripb", "--help"]
 
+# A `cargo install`ed binary carries NO provenance on disk — nothing under
+# ~/.cargo/bin records which revision produced it — so a commit-pinned cargo
+# tool is only drift-detectable through its own version banner. `verify_expect`
+# is therefore MANDATORY for source=cargo + commit (enforced in cmd_tool.rs),
+# and must be a prefix of `commit`: carcara prints
+# `carcara 1.1.0 [git master 9a352ee]`, so the short hash pins the probe.
 [[tool]]
 name   = "carcara"
 kind   = "checker"
@@ -64,3 +70,4 @@ url    = "https://github.com/ufmg-smite/carcara"
 commit = "9a352eea6c935ad35cb8ec22e521a7620ec5d474"  # upstream main, 2026-07-22; checked array rules
 bin    = "carcara"                  # lands in ~/.cargo/bin
 verify = ["carcara", "--version"]
+verify_expect = "9a352ee"           # MUST stay a prefix of `commit` (load-validated)

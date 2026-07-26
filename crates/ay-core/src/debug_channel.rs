@@ -596,6 +596,20 @@ pub fn theory_disable_flags() -> &'static TheoryDisableFlags {
     GLOBAL_THEORY_DISABLE_FLAGS.get_or_init(TheoryDisableFlags::default)
 }
 
+/// Cached env flag: `AY_UFLIA_ARITH_DECISIONS=1` forwards the arithmetic
+/// solver's LP-model-guided `suggest_decision_atom` through `LiaSolver` and
+/// `TheoryCombiner` to the SAT extension's theory-suggested-decision rank
+/// (eager-theory-propagation design 2026-07-20 §2 Inc2). Default OFF: LRA has
+/// implemented the suggestion since #8445 but neither adapter ever forwarded
+/// it (git-verified never-wired, not deliberate), so unset preserves the
+/// historical byte-identical trajectory on every lane. Single cached env read
+/// (`OnceLock`); both forwarding sites gate on this one function.
+#[inline]
+pub fn uflia_arith_decisions_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AY_UFLIA_ARITH_DECISIONS").ok().as_deref() == Some("1"))
+}
+
 // ---------------------------------------------------------------------------
 // Global singleton: SAT debug env flags (#8506)
 // ---------------------------------------------------------------------------

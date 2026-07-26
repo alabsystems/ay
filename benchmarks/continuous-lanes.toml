@@ -16,13 +16,9 @@ max_runs = 720
 [git]
 remote = "origin"
 base_branch = "main"
-# Only the service's own publication namespaces are excluded.  Every other
-# remote head is classified as ancestor, patch-equivalent, unique, or
-# conflicted on every cycle.
-exclude = [
-  "continuous/*",
-  "benchmark-results/*",
-]
+# Operational progress is published outside refs/heads. No branch is exempt:
+# every remote head is classified and integrated or rejected on every cycle.
+exclude = []
 
 [build]
 timeout_sec = 3600
@@ -37,7 +33,10 @@ commands = [
   ["{cargo}", "test", "-p", "ay-dpll"],
   ["{cargo}", "test", "-p", "ay-chc"],
   ["{cargo}", "test", "-p", "ay-milp"],
+  ["{cargo}", "test", "-p", "ay", "--bin", "ay", "cmd_corpus", "--features", "bench"],
   ["{cargo}", "build", "--release", "-p", "ay", "--features", "bench"],
+  ["{ay}", "bench", "compare", "campaign-check"],
+  ["{ay}", "corpus", "campaign-audit"],
   ["bash", "scripts/ci/sat_soundness_gate.sh", "{ay}", "drat", "10"],
   ["bash", "scripts/ci/smt_soundness_gate.sh", "{target}/release/libay_ffi.so", "{target}/release/ay-z3-parity", "5"],
 ]
@@ -78,11 +77,222 @@ timeout_sec = 30
 runs = 1
 official = false
 shard_size = 64
-min_benchmarks = 100
+min_benchmarks = 1312
+requires_tools = ["z3"]
 requires_paths = [
   "benchmarks/chc/chc-comp25-benchmarks/LIA-Lin.set",
 ]
 competition_refs = ["chccomp-2025-lia-lin"]
+
+[[lane]]
+id = "chccomp-2025-lia-nonlin"
+kind = "rolling"
+eval_id = "chccomp-2025-lia-nonlin"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 1283
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp25-benchmarks/LIA.set"]
+competition_refs = ["chccomp-2025-lia-nonlin"]
+
+[[lane]]
+id = "chccomp-2025-lia-lin-arrays"
+kind = "rolling"
+eval_id = "chccomp-2025-lia-lin-arrays"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 139
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp25-benchmarks/LIA-Lin-Arrays.set"]
+competition_refs = ["chccomp-2025-lia-lin-arrays"]
+
+[[lane]]
+id = "chccomp-2025-lia-nonlin-arrays"
+kind = "rolling"
+eval_id = "chccomp-2025-lia-nonlin-arrays"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 1738
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp25-benchmarks/LIA-Arrays.set"]
+competition_refs = ["chccomp-2025-lia-nonlin-arrays"]
+
+[[lane]]
+id = "chccomp-2025-adt-lia"
+kind = "rolling"
+eval_id = "chccomp-2025-adt-lia"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 1132
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp25-benchmarks/ADT-LIA.set"]
+competition_refs = ["chccomp-2025-adt-lia"]
+
+[[lane]]
+id = "chccomp-2025-adt-lia-arrays"
+kind = "rolling"
+eval_id = "chccomp-2025-adt-lia-arrays"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 3609
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp25-benchmarks/ADT-LIA-Arrays.set"]
+competition_refs = ["chccomp-2025-adt-lia-arrays"]
+
+[[lane]]
+id = "chccomp-2025-lra"
+kind = "rolling"
+eval_id = "chccomp-2025-lra"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 278
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp25-benchmarks/LRA-Lin.set"]
+competition_refs = ["chccomp-2025-lra"]
+
+[[lane]]
+id = "chccomp-2025-bv"
+kind = "rolling"
+eval_id = "chccomp-2025-bv"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 625
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp25-benchmarks/BV.set"]
+competition_refs = ["chccomp-2025-bv"]
+
+[[lane]]
+id = "chccomp-2026-solver-lia-lin"
+kind = "rolling"
+eval_id = "chccomp-2026-solver-lia-lin"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 1406
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp26-benchmarks/LIA-Lin.set"]
+competition_refs = ["chccomp-2026-solver-lia-lin"]
+
+[[lane]]
+id = "chccomp-2026-solver-lia-nonlin"
+kind = "rolling"
+eval_id = "chccomp-2026-solver-lia-nonlin"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 1287
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp26-benchmarks/LIA.set"]
+competition_refs = ["chccomp-2026-solver-lia-nonlin"]
+
+[[lane]]
+id = "chccomp-2026-solver-lia-lin-arrays"
+kind = "rolling"
+eval_id = "chccomp-2026-solver-lia-lin-arrays"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 139
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp26-benchmarks/LIA-Lin-Arrays.set"]
+competition_refs = ["chccomp-2026-solver-lia-lin-arrays"]
+
+[[lane]]
+id = "chccomp-2026-solver-lia-nonlin-arrays"
+kind = "rolling"
+eval_id = "chccomp-2026-solver-lia-nonlin-arrays"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 1738
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp26-benchmarks/LIA-Arrays.set"]
+competition_refs = ["chccomp-2026-solver-lia-nonlin-arrays"]
+
+[[lane]]
+id = "chccomp-2026-solver-adt-lia"
+kind = "rolling"
+eval_id = "chccomp-2026-solver-adt-lia"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 1131
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp26-benchmarks/ADT-LIA.set"]
+competition_refs = ["chccomp-2026-solver-adt-lia"]
+
+[[lane]]
+id = "chccomp-2026-solver-adt-lia-arrays"
+kind = "rolling"
+eval_id = "chccomp-2026-solver-adt-lia-arrays"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 3607
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp26-benchmarks/ADT-LIA-Arrays.set"]
+competition_refs = ["chccomp-2026-solver-adt-lia-arrays"]
+
+[[lane]]
+id = "chccomp-2026-solver-lra-lin"
+kind = "rolling"
+eval_id = "chccomp-2026-solver-lra-lin"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 277
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp26-benchmarks/LRA-Lin.set"]
+competition_refs = ["chccomp-2026-solver-lra-lin"]
+
+[[lane]]
+id = "chccomp-2026-solver-bv-lin"
+kind = "rolling"
+eval_id = "chccomp-2026-solver-bv-lin"
+enabled = false
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 2478
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp26-benchmarks/BV-Lin.set"]
+blocked_reason = "The organizer-pinned BV-Lin.set has 1,966 stale flattened task paths that do not exist in its own repository; no path reconstruction is accepted as official corpus identity."
+competition_refs = ["chccomp-2026-solver-bv-lin"]
+
+[[lane]]
+id = "chccomp-2026-solver-bv-nonlin"
+kind = "rolling"
+eval_id = "chccomp-2026-solver-bv-nonlin"
+timeout_sec = 30
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 96
+requires_tools = ["z3"]
+requires_paths = ["benchmarks/chc/chc-comp26-benchmarks/BV.set"]
+competition_refs = ["chccomp-2026-solver-bv-nonlin"]
 
 [[lane]]
 id = "smtcomp-qf-lra"
@@ -94,7 +304,7 @@ official = false
 shard_size = 64
 min_benchmarks = 100
 requires_tools = ["z3"]
-requires_paths = ["benchmarks/smtcomp/QF_LRA"]
+requires_paths = ["benchmarks/smtcomp/2025/single-query/single_query/QF_LRA"]
 competition_refs = ["smtcomp-2025-single-query"]
 
 [[lane]]
@@ -123,7 +333,7 @@ official = false
 shard_size = 64
 min_benchmarks = 100
 requires_tools = ["z3"]
-requires_paths = ["benchmarks/smtcomp/QF_LIA"]
+requires_paths = ["benchmarks/smtcomp/2025/single-query/single_query/QF_LIA"]
 competition_refs = ["smtcomp-2025-single-query"]
 
 [[lane]]
@@ -136,7 +346,7 @@ official = false
 shard_size = 64
 min_benchmarks = 100
 requires_tools = ["z3"]
-requires_paths = ["benchmarks/smtcomp/QF_BV"]
+requires_paths = ["benchmarks/smtcomp/2025/single-query/single_query/QF_BV"]
 competition_refs = ["smtcomp-2025-single-query"]
 
 [[lane]]
@@ -149,7 +359,7 @@ official = false
 shard_size = 64
 min_benchmarks = 100
 requires_tools = ["z3"]
-requires_paths = ["benchmarks/smtcomp/QF_ABV"]
+requires_paths = ["benchmarks/smtcomp/2025/single-query/single_query/QF_ABV"]
 competition_refs = ["smtcomp-2025-single-query"]
 
 [[lane]]
@@ -162,7 +372,7 @@ official = false
 shard_size = 64
 min_benchmarks = 100
 requires_tools = ["z3"]
-requires_paths = ["benchmarks/smtcomp/QF_ALIA"]
+requires_paths = ["benchmarks/smtcomp/2025/single-query/single_query/QF_ALIA"]
 competition_refs = ["smtcomp-2025-single-query"]
 
 [[lane]]
@@ -175,7 +385,7 @@ official = false
 shard_size = 64
 min_benchmarks = 100
 requires_tools = ["z3"]
-requires_paths = ["benchmarks/smtcomp/QF_AUFLIA"]
+requires_paths = ["benchmarks/smtcomp/2025/single-query/single_query/QF_AUFLIA"]
 competition_refs = ["smtcomp-2025-single-query"]
 
 [[lane]]
@@ -188,13 +398,15 @@ official = false
 shard_size = 64
 min_benchmarks = 100
 requires_tools = ["z3"]
-requires_paths = ["benchmarks/smtcomp/QF_UF"]
+requires_paths = ["benchmarks/smtcomp/2025/single-query/single_query/QF_UF"]
 competition_refs = ["smtcomp-2025-single-query"]
 
 [[lane]]
 id = "sat-par2-heldout"
 kind = "rolling"
 eval_id = "sat-par2-heldout"
+enabled = false
+blocked_reason = "Legacy heldout inputs have no public provenance or integrity pins; use the exact SAT Competition 2025/2026 selection lanes below."
 timeout_sec = 20
 runs = 1
 official = false
@@ -206,21 +418,62 @@ requires_paths = [
 ]
 competition_refs = ["satcomp-2025-main", "satcomp-2026-main"]
 
+[[lane]]
+id = "satcomp-2025-main-corpus"
+kind = "rolling"
+eval_id = "sat-satcomp-2025-main-corpus"
+timeout_sec = 60
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 400
+requires_tools = ["z3"]
+requires_paths = [
+  "benchmarks/sat/satcomp2025-main/SC2025.uri",
+  "benchmarks/sat/satcomp2025-main/instances",
+]
+competition_refs = [
+  "satcomp-2025-main",
+  "satcomp-2025-main-sat",
+  "satcomp-2025-main-unsat",
+]
+
+[[lane]]
+id = "satcomp-2026-main-corpus"
+kind = "rolling"
+eval_id = "sat-satcomp-2026-main-corpus"
+timeout_sec = 60
+runs = 1
+official = false
+shard_size = 64
+min_benchmarks = 400
+requires_tools = ["z3"]
+requires_paths = [
+  "benchmarks/sat/satcomp2026-main/selected_benchmarks.csv",
+  "benchmarks/sat/satcomp2026-main/SC2026.pinned.csv",
+  "benchmarks/sat/satcomp2026-main/instances",
+]
+competition_refs = [
+  "satcomp-2026-main",
+  "satcomp-2026-main-sat",
+  "satcomp-2026-main-unsat",
+]
+
 # Competition-time lanes are deliberately separate from the four-hour proxy
 # rotation.  Enable them explicitly after the exact corpus and checker packet
 # are frozen; different timeout/proof/resource envelopes are not comparable.
 [[lane]]
 id = "satcomp-2025-main-official"
 kind = "official"
-eval_id = "sat-par2-heldout"
+eval_id = "sat-satcomp-2025-main-corpus"
 runs = 1
 official = true
 enabled = false
 requires_paths = [
-  "benchmarks/sat/par2/heldout.txt",
-  "benchmarks/sat/par2/heldout",
+  "benchmarks/sat/satcomp2025-main/SC2025.uri",
+  "benchmarks/sat/satcomp2025-main/instances",
 ]
-blocked_reason = "Exact 400-instance SAT-COMP 2025 packet is not mapped to this eval yet."
+blocked_reason = "The exact corpus is mapped, but official hardware, checker, timeout, and submitted-tool replay gates remain unsatisfied."
 competition_refs = ["satcomp-2025-main"]
 
 [[lane]]
@@ -235,3 +488,27 @@ requires_paths = [
 ]
 blocked_reason = "Enable only with the full pinned corpus and checker/reference packet."
 competition_refs = ["chccomp-2025-lia-lin"]
+
+# Fixed shard-0 competition-mode evidence for the nonlinear LIA+arrays focus.
+# `official = true` selects AY's canonical 1800s CHC-COMP child contract; this
+# lane deliberately has no timeout_sec override. The trusted native runner
+# persists its oom-guard resource plan and enforcement tag with every result.
+# The 12,000s command cap protects the 4h controller and can abort this lane
+# incomplete; it is not a claim that 64 sequential AY+Z3 official-time runs
+# fit inside one cycle. This lane is selected only by `cycle --official`.
+[[lane]]
+id = "chccomp-2025-lia-nonlin-arrays-official-shard-0"
+kind = "official"
+eval_id = "chccomp-2025-lia-nonlin-arrays"
+runs = 1
+official = true
+enabled = true
+shard_index = 0
+shard_size = 64
+command_timeout_sec = 12000
+min_benchmarks = 1738
+requires_tools = ["z3"]
+requires_paths = [
+  "benchmarks/chc/chc-comp25-benchmarks/LIA-Arrays.set",
+]
+competition_refs = ["chccomp-2025-lia-nonlin-arrays"]

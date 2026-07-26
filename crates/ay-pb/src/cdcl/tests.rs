@@ -7460,3 +7460,65 @@ fn eq_knapsack_dp_huge_coefficient_pair() {
     assert_eq!(solver.solve(), PbCdclResult::Unsatisfiable);
     assert_eq!(solver.stats().eq_knapsack_dp, 1);
 }
+
+#[test]
+fn test_undecidable_lower_bound_opt_proof_defers_without_conclusion() {
+    // Triangle vertex cover: optimum 2, but `obj >= 2` needs a divide-by-2
+    // ROUNDING cut (`2*(x1+x2+x3) >= 3` -> `>= ceil(3/2)`), which no positive
+    // combination of the three edge rows can express — the direct planner
+    // stalls at a proven floor of 1 and the cardinality planner finds no single
+    // row of degree >= 2. This is a DIFFERENT inexpressibility cause than the
+    // coefficient-cancellation case covered by
+    // tests/proof_certified_track.rs::test_le_source_optimization_proof_*, so
+    // keep both.
+    //
+    // The native OPT proof must fail closed: no fabricated `rup >= 1 ;`, no
+    // `conclusion BOUNDS`, and `conclude_proof` refuses. The OptimumFound
+    // verdict itself still STANDS (the optimum and its model are correct) and
+    // the deferral is signalled through `opt_lower_bound_deferred`, which is
+    // what routes the CLI to the certified OPT-LIN fallback.
+    let objective = objective((1..=3).map(|var| linear_term(1, lit(var))).collect());
+    let instance = PbInstance {
+        num_vars: 3,
+        num_constraints: 3,
+        constraints: vec![
+            ge_constraint(vec![linear_term(1, lit(1)), linear_term(1, lit(2))], 1),
+            ge_constraint(vec![linear_term(1, lit(2)), linear_term(1, lit(3))], 1),
+            ge_constraint(vec![linear_term(1, lit(1)), linear_term(1, lit(3))], 1),
+        ],
+        objective: Some(objective.clone()),
+    };
+    let buf = SharedBuf::new();
+    let mut solver = PbCdclSolver::with_proof_writer(&instance, buf.clone())
+        .expect("proof writer creation must succeed");
+
+    let result = solver.solve_optimize(&objective, None);
+    assert!(
+        matches!(result, PbCdclResult::Optimal(_, 2)),
+        "triangle vertex cover should solve to optimum 2, got {result:?}"
+    );
+    assert!(
+        solver.opt_lower_bound_deferred(),
+        "an inexpressible structural floor must defer, not fabricate a bound"
+    );
+
+    let error = solver
+        .conclude_proof()
+        .expect_err("an unjustifiable optimality proof must not conclude");
+    assert!(
+        matches!(error, ProofError::UnprovableOptimizationLowerBound),
+        "unexpected proof error: {error:?}"
+    );
+
+    let proof = buf.as_string();
+    assert!(
+        !proof.lines().any(|line| line == "rup >= 1 ;"),
+        "no unjustified empty-clause RUP may be emitted: {proof}"
+    );
+    assert!(
+        !proof
+            .lines()
+            .any(|line| line.starts_with("conclusion BOUNDS")),
+        "no conclusion may be claimed for an underivable lower bound: {proof}"
+    );
+}

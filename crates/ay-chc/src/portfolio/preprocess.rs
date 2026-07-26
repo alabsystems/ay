@@ -7,6 +7,7 @@
 //! Builds a [`PreprocessSummary`] capturing the transformed problem and metadata
 //! needed by the adaptive routing layer and portfolio engine dispatch.
 
+use crate::transform::condense::UnreachableClauseEliminator;
 use crate::transform::{
     condense_enabled, split_sym_enabled, ArrayStoreForwarder, BackTranslator, BvToBoolBitBlaster,
     BvToIntAbstractor, ClauseInliner, CompositeBackTranslator, CondenseSuperpass,
@@ -206,6 +207,17 @@ impl BackTranslator for SharedCondenseBackTranslator {
 
     fn translate_invalidity(&self, witness: InvalidityWitness) -> InvalidityWitness {
         self.inner().translate_invalidity(witness)
+    }
+
+    fn translate_ground_derivation(
+        &self,
+        derivation: &crate::ground_derivation::GroundDerivation,
+    ) -> Option<crate::ground_derivation::GroundDerivation> {
+        self.inner().translate_ground_derivation(derivation)
+    }
+
+    fn ground_translation_name(&self) -> &'static str {
+        self.inner().ground_translation_name()
     }
 
     fn had_bitwise_uf_fallback(&self) -> bool {
@@ -476,9 +488,19 @@ impl PreprocessSummary {
             (result.problem, None)
         };
 
-        // Compose back-translators: graph collapse (when enabled) then cleanup
-        // then bvtobool then dt-flatten then pre-elim (outermost).
-        let mut inner: Vec<Box<dyn BackTranslator>> = Vec::new();
+        // Symbol splitting runs after the condense fixpoint, and later
+        // inlining/graph collapse can leave a split clone in a query body with
+        // no defining head. Re-run exact syntactic reachability at the very
+        // end so those newly exposed unreachable query arms become queryless.
+        let reachability_result = TransformationPipeline::new()
+            .with(UnreachableClauseEliminator::new().with_verbose(verbose))
+            .transform(transformed_problem);
+        let transformed_problem = reachability_result.problem;
+
+        // Compose back-translators in reverse transform order: final
+        // reachability first, graph collapse (when enabled), then cleanup,
+        // bvtobool, dt-flatten, pre-elim, and condense.
+        let mut inner: Vec<Box<dyn BackTranslator>> = vec![reachability_result.back_translator];
         if let Some(collapse_bt) = collapse_back_translator {
             inner.push(collapse_bt);
         }
@@ -966,6 +988,20 @@ mod tests {
     use super::*;
     use crate::transform::TransformObligation;
 
+    #[test]
+    fn shared_condense_translator_delegates_ground_translation() {
+        let translator =
+            SharedCondenseBackTranslator(Arc::new(Mutex::new(Box::new(IdentityBackTranslator))));
+        let derivation = crate::ground_derivation::GroundDerivation::default();
+
+        let translated = translator
+            .translate_ground_derivation(&derivation)
+            .expect("identity delegate must preserve the derivation");
+
+        assert!(translated.is_empty());
+        assert_eq!(translator.ground_translation_name(), "identity");
+    }
+
     /// #8419: sort_contains_recursive_bv must detect BV inside DT constructors.
     #[test]
     fn test_sort_contains_recursive_bv_inside_dt() {
@@ -1310,6 +1346,92 @@ mod tests {
         assert!(on.transform_memory.validates_original());
         assert!(on.transform_memory.safe_requires_original_validation());
         assert!(on.transform_memory.unsafe_backtranslation_complete());
+    }
+
+    /// SPLIT-SYM runs after the condense reachability fixpoint. A control
+    /// value used only by the query therefore creates a headless split clone
+    /// late in preprocessing; the final reachability pass must remove that
+    /// query and reconstruct the clone as false in the original model.
+    #[test]
+    fn final_reachability_prunes_late_headless_split_query() {
+        use crate::pdr::{InvariantModel, PdrConfig, PredicateInterpretation};
+        use crate::{ChcVar, ClauseBody, HornClause};
+
+        let array_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+        let mut problem = ChcProblem::new();
+        // Keep the split control value away from argument zero so PC-SPLIT
+        // cannot expose the unreachable clone before the condense fixpoint.
+        let summary_pred =
+            problem.declare_predicate("Summary", vec![array_sort.clone(), ChcSort::Int]);
+        let array = ChcVar::new("a", array_sort);
+        let args = |tag| vec![ChcExpr::var(array.clone()), ChcExpr::Int(tag)];
+
+        problem.add_clause(HornClause::new(
+            ClauseBody::empty(),
+            ClauseHead::Predicate(summary_pred, args(0)),
+        ));
+        problem.add_clause(HornClause::new(
+            ClauseBody::predicates_only(vec![(summary_pred, args(0))]),
+            ClauseHead::Predicate(summary_pred, args(1)),
+        ));
+        problem.add_clause(HornClause::new(
+            ClauseBody::predicates_only(vec![(summary_pred, args(1))]),
+            ClauseHead::Predicate(summary_pred, args(1)),
+        ));
+        problem.add_clause(HornClause::query(ClauseBody::predicates_only(vec![(
+            summary_pred,
+            args(2),
+        )])));
+
+        let original = problem.clone();
+        let summary = PreprocessSummary::build_with_graph_collapse(problem, false, false);
+        assert!(
+            summary
+                .transformed_problem
+                .predicates()
+                .iter()
+                .any(|predicate| predicate.name.contains("__ssym")),
+            "the regression must exercise the late SPLIT-SYM clone path"
+        );
+        assert!(
+            summary.transformed_problem.queries().next().is_none(),
+            "the headless split-summary query must be removed"
+        );
+        assert!(
+            summary.transformed_problem.has_query_evidence(),
+            "queryless preprocessing must retain pruned-query evidence"
+        );
+
+        let mut transformed_model = InvariantModel::new();
+        for predicate in summary.transformed_problem.predicates() {
+            let vars = predicate
+                .arg_sorts
+                .iter()
+                .enumerate()
+                .map(|(index, sort)| {
+                    ChcVar::new(
+                        format!("__p{}_a{index}", predicate.id.index()),
+                        sort.clone(),
+                    )
+                })
+                .collect();
+            transformed_model.set(
+                predicate.id,
+                PredicateInterpretation::new(vars, ChcExpr::Bool(true)),
+            );
+        }
+        let translated = summary
+            .back_translator
+            .translate_validity(transformed_model);
+        assert!(
+            crate::engines::validate_external_invariant_model(
+                &original,
+                &translated,
+                &PdrConfig::default(),
+            )
+            .expect("exact original-model validation must complete"),
+            "the backtranslated queryless model must prove the original Safe problem"
+        );
     }
 
     #[test]

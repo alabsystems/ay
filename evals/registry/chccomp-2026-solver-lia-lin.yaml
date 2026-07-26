@@ -1,0 +1,23 @@
+# Andrew Yates <andrewyates.name@gmail.com>
+# Eval spec for the CHC-COMP 2026 solver LIA-Lin benchmark suite
+id: chccomp-2026-solver-lia-lin
+version: 1
+description: CHC-COMP 2026 official solver LIA-Lin benchmark suite
+owner: andrewyates.name@gmail.com
+inputs:
+  benchmarks_dir: benchmarks/chc/chc-comp26-benchmarks
+  set_file: LIA-Lin.set
+  timeout_sec: 30
+  runs: 3
+  reference_solver: z3
+metrics:
+  - passed
+  - total
+  - sat
+  - unsat
+  - wrong
+  - timeout
+  - unknown
+  - error
+outputs:
+  results_dir: evals/results/chccomp-2026-solver-lia-lin/{run_id}

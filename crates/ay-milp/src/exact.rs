@@ -117,8 +117,8 @@ impl ExactLp {
     /// 1.85M-nnz NN model it is SECONDS of gcd-reducing multiplies, and it used to
     /// run un-deadlined before `make_feasible`'s per-iteration checks could fire
     /// (a profiler sample of a deadline overshoot landed 53% of its hits here).
-    /// [`Self::new_within`] bounds it; `new` remains for construction-time callers
-    /// (sessions, tests) whose cost the caller owns.
+    /// [`Self::new_within`] bounds it; `new` remains for callers with no
+    /// construction deadline whose cost the caller owns.
     pub(crate) fn new(model: &Model) -> Self {
         Self::new_within(model, None).expect("no deadline to miss")
     }

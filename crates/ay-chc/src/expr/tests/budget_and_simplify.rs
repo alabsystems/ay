@@ -10,7 +10,13 @@ fn build_deep_tree(depth: u32) -> ChcExpr {
     let x = ChcVar::new("x", ChcSort::Int);
     let mut expr = ChcExpr::le(ChcExpr::var(x), ChcExpr::int(0));
     for _ in 0..depth {
-        expr = ChcExpr::and(expr.clone(), expr);
+        // Build the pathological tree directly. The canonical `and`
+        // constructor now removes exact duplicates, which is production
+        // behavior this traversal-budget fixture intentionally bypasses.
+        expr = ChcExpr::Op(
+            crate::ChcOp::And,
+            vec![std::sync::Arc::new(expr.clone()), std::sync::Arc::new(expr)],
+        );
     }
     expr
 }
@@ -18,9 +24,11 @@ fn build_deep_tree(depth: u32) -> ChcExpr {
 #[test]
 fn test_node_count_small() {
     let x = ChcVar::new("x", ChcSort::Int);
-    let expr = ChcExpr::and(
-        ChcExpr::le(ChcExpr::var(x.clone()), ChcExpr::int(0)),
-        ChcExpr::le(ChcExpr::var(x), ChcExpr::int(0)),
+    let left = ChcExpr::le(ChcExpr::var(x.clone()), ChcExpr::int(0));
+    let right = ChcExpr::le(ChcExpr::var(x), ChcExpr::int(1));
+    let expr = ChcExpr::Op(
+        crate::ChcOp::And,
+        vec![std::sync::Arc::new(left), std::sync::Arc::new(right)],
     );
     assert_eq!(expr.node_count(100), 7);
 }

@@ -25,7 +25,10 @@ serde_json = { workspace = true }
 # lane in this tool that deliberately links ay instead of dlopening it.
 ay-dpll = { workspace = true }
 ay-frontend = { workspace = true }
+ay-bench = { workspace = true }
 serde = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

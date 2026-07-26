@@ -279,10 +279,19 @@ def load_manifest(track: str, division: str) -> list[Instance]:
         if not line:
             continue
         rec = json.loads(line)
+        # `family` is declared `str`, but some selection generators emit it as a
+        # LIST (e.g. SingleQuery/QF_Equality_NonLinearArith, where every row is
+        # `["20190429-UltimateAutomizerSvcomp2019"]`). An unnormalized list is
+        # unhashable and crashed `stratified_sample`'s dict key with
+        # `TypeError: unhashable type: 'list'`, so `--sample` was unusable on
+        # those divisions. Normalize here so every downstream use sees a str.
+        family = rec.get("family", "")
+        if isinstance(family, (list, tuple)):
+            family = "/".join(str(part) for part in family)
         inst = Instance(
             relpath=rec["relpath"],
             logic=rec.get("logic", ""),
-            family=rec.get("family", ""),
+            family=family,
             name=rec.get("name", ""),
             expected=rec.get("expected"),
         )

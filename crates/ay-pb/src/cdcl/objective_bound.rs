@@ -63,6 +63,19 @@ impl PbCdclSolver {
         }
     }
 
+    /// Emits the cutting-planes derivation of `objective >= optimum` into the
+    /// proof stream.
+    ///
+    /// Returns [`ObjectiveFloorCutOutcome::Derived`] ONLY when every step of the
+    /// plan was written, carrying the id of the closing contradiction row that
+    /// the `conclusion BOUNDS` footer hints at. Any failure is reported
+    /// distinctly so the caller fails closed instead of asserting a conclusion
+    /// it cannot back up: [`ObjectiveFloorCutOutcome::Inexpressible`] when the
+    /// planner declined (no positive combination of input rows proves the
+    /// floor), [`ObjectiveFloorCutOutcome::EmissionFailed`] when a `pol` step or
+    /// the closing addition against the incumbent bound could not be logged.
+    /// Reporting success after a failed step is exactly the defect this guards
+    /// against.
     pub(super) fn try_log_objective_lower_bound_cut_proof(
         &mut self,
         objective: &PbObjective,

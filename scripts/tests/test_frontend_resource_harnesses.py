@@ -21,6 +21,11 @@ import _oom_guard as oom_guard  # noqa: E402
 import pb_sweep  # noqa: E402
 import rewrite_oracle_check  # noqa: E402
 
+if not hasattr(os, "killpg"):
+    raise RuntimeError(
+        "frontend resource-harness tests require POSIX process-group support"
+    )
+
 
 def load_script(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -134,7 +139,6 @@ class CgroupDiscoveryTest(unittest.TestCase):
         self.assertEqual(found, 1)
 
 
-@unittest.skipUnless(hasattr(os, "killpg"), "needs POSIX process groups")
 class GuardCancellationTest(unittest.TestCase):
     def test_ancestor_walk_reaches_direct_parent(self):
         self.assertIn(os.getppid(), oom_guard._ancestor_pids())
@@ -183,7 +187,6 @@ class GuardCancellationTest(unittest.TestCase):
             self.assertTrue(zombie, "guarded child survived wrapper cancellation")
 
 
-@unittest.skipUnless(hasattr(os, "killpg"), "needs POSIX process groups")
 class DirectRunnerEnvelopeTest(unittest.TestCase):
     def _solver(self, directory, body):
         path = Path(directory, "solver")

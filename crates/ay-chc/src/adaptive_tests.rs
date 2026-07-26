@@ -117,6 +117,155 @@ fn create_const_key_array_cegar_safe_problem() -> ChcProblem {
     problem
 }
 
+fn create_reducible_lia_array_chain() -> ChcProblem {
+    let mut problem = ChcProblem::new();
+    let array_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let predicates: Vec<_> = (0..REDUCED_LIA_ARRAY_ROUTE_MIN_ORIGINAL_PREDICATES)
+        .map(|index| problem.declare_predicate(format!("P{index}"), vec![array_sort.clone()]))
+        .collect();
+    let array = ChcVar::new("a", array_sort);
+
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(true)),
+        ClauseHead::Predicate(predicates[0], vec![ChcExpr::var(array.clone())]),
+    ));
+    for pair in predicates.windows(2) {
+        problem.add_clause(HornClause::new(
+            ClauseBody::predicates_only(vec![(pair[0], vec![ChcExpr::var(array.clone())])]),
+            ClauseHead::Predicate(pair[1], vec![ChcExpr::var(array.clone())]),
+        ));
+    }
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(
+                *predicates.last().expect("nonempty predicate chain"),
+                vec![ChcExpr::var(array.clone())],
+            )],
+            Some(ChcExpr::eq(
+                ChcExpr::select(ChcExpr::var(array.clone()), ChcExpr::int(0)),
+                ChcExpr::int(0),
+            )),
+        ),
+        ClauseHead::Predicate(
+            *predicates.last().expect("nonempty predicate chain"),
+            vec![ChcExpr::store(
+                ChcExpr::var(array.clone()),
+                ChcExpr::int(1),
+                ChcExpr::select(ChcExpr::var(array.clone()), ChcExpr::int(0)),
+            )],
+        ),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(
+                *predicates.last().expect("nonempty predicate chain"),
+                vec![ChcExpr::var(array.clone())],
+            )],
+            Some(ChcExpr::eq(
+                ChcExpr::select(ChcExpr::var(array), ChcExpr::int(0)),
+                ChcExpr::int(0),
+            )),
+        ),
+        ClauseHead::False,
+    ));
+    problem
+}
+
+/// Reducible array-carrying wrapper graph around a scalar bounded loop.
+///
+/// The direct all-true model cannot prove the Safe variant because `x >= 7`
+/// is satisfiable without the loop invariant. The verified interval candidate
+/// `0 <= x <= 6` makes it infeasible after preprocessing. Setting
+/// `reachable_query` instead asks for reachable `x = 3`, pinning fail-closed
+/// behavior for the same transform and routing shape.
+fn create_reducible_interval_lia_array_problem(reachable_query: bool) -> ChcProblem {
+    let mut problem = ChcProblem::new();
+    let array_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let predicates: Vec<_> = (0..REDUCED_LIA_ARRAY_ROUTE_MIN_ORIGINAL_PREDICATES)
+        .map(|index| {
+            problem.declare_predicate(
+                format!("IntervalWrapper{index}"),
+                vec![array_sort.clone(), ChcSort::Int],
+            )
+        })
+        .collect();
+    let array = ChcVar::new("interval_array", array_sort);
+    let x = ChcVar::new("interval_x", ChcSort::Int);
+
+    problem.add_clause(HornClause::new(
+        ClauseBody::empty(),
+        ClauseHead::Predicate(
+            predicates[0],
+            vec![ChcExpr::var(array.clone()), ChcExpr::int(0)],
+        ),
+    ));
+    for pair in predicates.windows(2) {
+        problem.add_clause(HornClause::new(
+            ClauseBody::predicates_only(vec![(
+                pair[0],
+                vec![ChcExpr::var(array.clone()), ChcExpr::var(x.clone())],
+            )]),
+            ClauseHead::Predicate(
+                pair[1],
+                vec![ChcExpr::var(array.clone()), ChcExpr::var(x.clone())],
+            ),
+        ));
+    }
+    let loop_predicate = *predicates.last().expect("nonempty predicate chain");
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(
+                loop_predicate,
+                vec![ChcExpr::var(array.clone()), ChcExpr::var(x.clone())],
+            )],
+            Some(ChcExpr::lt(ChcExpr::var(x.clone()), ChcExpr::int(6))),
+        ),
+        ClauseHead::Predicate(
+            loop_predicate,
+            vec![
+                ChcExpr::var(array.clone()),
+                ChcExpr::add(ChcExpr::var(x.clone()), ChcExpr::int(1)),
+            ],
+        ),
+    ));
+    let query = if reachable_query {
+        ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(3))
+    } else {
+        ChcExpr::ge(ChcExpr::var(x.clone()), ChcExpr::int(7))
+    };
+    problem.add_clause(HornClause::query(ClauseBody::new(
+        vec![(loop_predicate, vec![ChcExpr::var(array), ChcExpr::var(x)])],
+        Some(query),
+    )));
+    problem
+}
+
+fn create_reducible_queryless_lia_array_chain() -> ChcProblem {
+    let mut problem = ChcProblem::new();
+    let array_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let predicates: Vec<_> = (0..REDUCED_LIA_ARRAY_ROUTE_MIN_ORIGINAL_PREDICATES)
+        .map(|index| problem.declare_predicate(format!("Reach{index}"), vec![array_sort.clone()]))
+        .collect();
+    let dead = problem.declare_predicate("Dead", vec![array_sort.clone()]);
+    let array = ChcVar::new("a", array_sort);
+
+    problem.add_clause(HornClause::new(
+        ClauseBody::empty(),
+        ClauseHead::Predicate(predicates[0], vec![ChcExpr::var(array.clone())]),
+    ));
+    for pair in predicates.windows(2) {
+        problem.add_clause(HornClause::new(
+            ClauseBody::predicates_only(vec![(pair[0], vec![ChcExpr::var(array.clone())])]),
+            ClauseHead::Predicate(pair[1], vec![ChcExpr::var(array.clone())]),
+        ));
+    }
+    problem.add_clause(HornClause::query(ClauseBody::predicates_only(vec![(
+        dead,
+        vec![ChcExpr::var(array)],
+    )])));
+    problem
+}
+
 fn create_array_argument_constant_safe_problem() -> ChcProblem {
     let mut problem = ChcProblem::new();
     let arr_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
@@ -1489,6 +1638,7 @@ fn test_final_demotes_unvalidated_preprocessed_query_only_discharge_9716() {
 #[cfg_attr(not(debug_assertions), timeout(20_000))]
 fn test_large_non_array_acyclic_linear_graph_uses_direct_dag_bmc_9004() {
     let problem = create_large_acyclic_int_safe_chain_9004();
+    let validation_problem = problem.clone();
     let adaptive = AdaptivePortfolio::new(
         problem,
         AdaptiveConfig {
@@ -1509,15 +1659,60 @@ fn test_large_non_array_acyclic_linear_graph_uses_direct_dag_bmc_9004() {
     );
 
     let proof_result = adaptive.try_acyclic_bmc_probe(&features, None);
+    let Some((
+        PortfolioResult::Safe(model),
+        ValidationEvidence::ScalarAcyclicBmcExhaustive { max_depth },
+    )) = proof_result
+    else {
+        panic!(
+            "large non-array acyclic BMC empty-model Safe should be accepted with scalar exhaustive evidence, got {proof_result:?}"
+        );
+    };
     assert!(
-        matches!(
-            proof_result,
-            Some((
-                PortfolioResult::Safe(_),
-                ValidationEvidence::ScalarAcyclicBmcExhaustive { .. }
-            ))
-        ),
-        "large non-array acyclic BMC empty-model Safe should be accepted with scalar exhaustive evidence, got {proof_result:?}"
+        model.is_empty(),
+        "scalar exhaustive BMC evidence must carry the empty certificate"
+    );
+    assert_eq!(
+        crate::acyclic_cert_cache::lookup_acyclic_bmc_safe(&adaptive.problem),
+        Some(max_depth),
+        "the direct exact BMC proof on the original problem must populate the reuse cache"
+    );
+
+    let zero_budget = PdrConfig {
+        solve_timeout: Some(Duration::ZERO),
+        ..PdrConfig::default()
+    };
+    assert!(
+        !crate::engines::validate_external_invariant_model(
+            &validation_problem,
+            &InvariantModel::new(),
+            &zero_budget,
+        )
+        .expect("zero-budget validation should fail closed, not error"),
+        "a cache hit must not bypass the zero-budget rejection"
+    );
+
+    let cancelled = crate::CancellationToken::new();
+    cancelled.cancel();
+    let cancelled_config = PdrConfig::default().with_cancellation_token(Some(cancelled));
+    assert!(
+        !crate::engines::validate_external_invariant_model(
+            &validation_problem,
+            &InvariantModel::new(),
+            &cancelled_config,
+        )
+        .expect("pre-cancelled validation should fail closed, not error"),
+        "a cache hit must not bypass pre-cancellation"
+    );
+
+    assert!(
+        crate::engines::validate_external_invariant_model(
+            &validation_problem,
+            &InvariantModel::new(),
+            &PdrConfig::default(),
+        )
+        .expect("cached exact BMC proof should validate without error"),
+        "an eligible external empty certificate should reuse the direct exact BMC proof"
     );
 }
 
@@ -1577,7 +1772,7 @@ fn test_budget_report_uses_original_exact_bv_acyclic_probe_9227() {
     .expect("empty scalar acyclic BMC certificate validation should not error");
     assert!(
         external_validation,
-        "model-checker-consumer-facing external validation must accept independently discharged scalar acyclic BMC evidence"
+        "model-checker-consumer-facing external validation must accept established scalar acyclic BMC evidence"
     );
 }
 
@@ -1605,6 +1800,72 @@ fn test_external_empty_bmc_certificate_rejects_unsafe_acyclic_bv_9227() {
     assert!(
         !accepted,
         "empty scalar acyclic BMC validation must reject reachable-error CHCs"
+    );
+}
+
+#[test]
+fn test_external_empty_bmc_certificate_strips_dead_end_cycle_8578() {
+    let input = r#"
+(set-logic HORN)
+(declare-rel P (Int))
+(declare-rel Dead (Int))
+(declare-rel error ())
+(declare-var x Int)
+(rule (=> (= x 0) (P x)))
+(rule (=> (and (P x) (< x 0)) error))
+(rule (=> (P x) (Dead x)))
+(rule (=> (Dead x) (Dead (+ x 1))))
+(query error)
+"#;
+    let problem = ChcParser::parse(input).expect("dead-end-cycle fixture should parse");
+    assert!(
+        problem.has_cycles(),
+        "the original problem must retain the dead-end self-loop"
+    );
+
+    let accepted = crate::engines::validate_external_invariant_model(
+        &problem,
+        &InvariantModel::new(),
+        &PdrConfig::default(),
+    )
+    .expect("external empty-certificate validation should not error");
+
+    assert!(
+        accepted,
+        "external validation must replay the safe acyclic query cone after stripping the dead end"
+    );
+}
+
+#[test]
+fn test_external_empty_bmc_certificate_dead_end_strip_rejects_reachable_error_8578() {
+    let input = r#"
+(set-logic HORN)
+(declare-rel P (Int))
+(declare-rel Dead (Int))
+(declare-rel error ())
+(declare-var x Int)
+(rule (=> (= x 0) (P x)))
+(rule (=> (and (P x) (= x 0)) error))
+(rule (=> (P x) (Dead x)))
+(rule (=> (Dead x) (Dead (+ x 1))))
+(query error)
+"#;
+    let problem = ChcParser::parse(input).expect("unsafe dead-end-cycle fixture should parse");
+    assert!(
+        problem.has_cycles(),
+        "the original problem must retain the dead-end self-loop"
+    );
+
+    let accepted = crate::engines::validate_external_invariant_model(
+        &problem,
+        &InvariantModel::new(),
+        &PdrConfig::default(),
+    )
+    .expect("unsafe external empty-certificate validation should not error");
+
+    assert!(
+        !accepted,
+        "stripping a query-irrelevant cycle must not hide a reachable error"
     );
 }
 
@@ -2353,6 +2614,232 @@ fn test_solidity_array_dt_projection_route_validation_failure_demotes_safe() {
 }
 
 #[test]
+#[timeout(20_000)]
+fn test_reduced_lia_array_route_replays_unsafe_on_original_chain() {
+    let problem = create_reducible_lia_array_chain();
+    let original = problem.clone();
+    let summary = PreprocessSummary::build(problem.clone(), false);
+    assert!(
+        summary.transformed_problem.predicates().len() <= REDUCED_LIA_ARRAY_ROUTE_MAX_PREDICATES,
+        "fixture must exercise the major-reduction gate"
+    );
+    assert!(
+        summary.transformed_problem.clauses().len() <= REDUCED_LIA_ARRAY_ROUTE_MAX_CLAUSES,
+        "fixture must reduce to the bounded early-route clause set"
+    );
+
+    let adaptive = AdaptivePortfolio::new(
+        problem,
+        AdaptiveConfig::with_budget(Duration::from_secs(5), false),
+    );
+    let result = adaptive
+        .try_reduced_lia_array_preprocessed_route(Some(Instant::now() + Duration::from_secs(5)));
+    let Some((PortfolioResult::Unsafe(counterexample), evidence)) = result else {
+        panic!("reduced LIA-array route did not return its replayed Unsafe result: {result:?}");
+    };
+    assert!(matches!(
+        evidence,
+        ValidationEvidence::CounterexampleVerification
+    ));
+
+    let mut verifier = PdrSolver::new(
+        original,
+        PdrConfig {
+            strict_proofs: true,
+            disable_array_scalarization: true,
+            preserve_original_clauses: true,
+            ..PdrConfig::default()
+        },
+    );
+    assert_eq!(
+        verifier.verify_counterexample(&counterexample),
+        crate::pdr::CexVerificationResult::Valid,
+        "route result must replay on the original unreduced clauses"
+    );
+}
+
+#[test]
+fn test_interval_pass_zero_duration_budget_is_identity() {
+    let problem = create_simple_loop();
+    let result = Box::new(
+        IntervalPropagator::new()
+            .with_enabled_for_test(true)
+            .with_pass_budget(Duration::ZERO),
+    )
+    .transform(problem.clone());
+
+    assert_eq!(
+        format!("{:?}", result.problem.clauses()),
+        format!("{:?}", problem.clauses())
+    );
+    assert_eq!(
+        result.back_translator.transform_memory().transform(),
+        "identity"
+    );
+}
+
+#[test]
+fn test_interval_pass_mid_analysis_work_exhaustion_is_identity() {
+    let problem = create_simple_loop();
+    let result = Box::new(
+        IntervalPropagator::new()
+            .with_enabled_for_test(true)
+            .with_work_budget_for_test(8),
+    )
+    .transform(problem.clone());
+
+    assert_eq!(
+        format!("{:?}", result.problem.clauses()),
+        format!("{:?}", problem.clauses()),
+        "partial interval analysis must be discarded after deterministic fuel exhaustion"
+    );
+    assert_eq!(
+        result.back_translator.transform_memory().transform(),
+        "identity"
+    );
+}
+
+#[test]
+#[timeout(10_000)]
+fn test_reduced_lia_array_interval_model_is_backtranslated_and_original_validated() {
+    let problem = create_reducible_interval_lia_array_problem(false);
+    let original = problem.clone();
+    let summary = PreprocessSummary::build(problem.clone(), false);
+    assert!(
+        summary.transformed_problem.predicates().len() <= REDUCED_LIA_ARRAY_ROUTE_MAX_PREDICATES
+            && summary.transformed_problem.clauses().len() <= REDUCED_LIA_ARRAY_ROUTE_MAX_CLAUSES,
+        "fixture must exercise the bounded reduced route"
+    );
+    assert!(
+        AdaptivePortfolio::try_top_model_query_infeasibility_candidate(
+            &summary.transformed_problem,
+            Duration::from_millis(500),
+        )
+        .is_none(),
+        "the raw reduced query x >= 7 is feasible under top; interval bounds must be essential"
+    );
+    let interval_result = Box::new(
+        IntervalPropagator::new()
+            .with_enabled_for_test(true)
+            .with_pass_budget(Duration::from_secs(1)),
+    )
+    .transform(summary.transformed_problem.clone());
+    assert_eq!(
+        interval_result
+            .back_translator
+            .transform_memory()
+            .transform(),
+        "interval_prop",
+        "the x < 6 loop must retain a verified finite post-widening upper bound"
+    );
+    assert!(
+        AdaptivePortfolio::try_top_model_query_infeasibility_candidate(
+            &interval_result.problem,
+            Duration::from_millis(500),
+        )
+        .is_some(),
+        "verified interval strengthening must make x >= 7 infeasible under top"
+    );
+
+    let adaptive = AdaptivePortfolio::new(
+        problem,
+        AdaptiveConfig::with_budget(Duration::from_secs(5), false),
+    );
+    let result = adaptive
+        .try_reduced_lia_array_preprocessed_route(Some(Instant::now() + Duration::from_secs(5)));
+    let Some((PortfolioResult::Safe(model), ValidationEvidence::FullVerification)) = result else {
+        panic!("verified interval model route did not prove the bounded loop Safe: {result:?}");
+    };
+    assert!(
+        crate::engines::validate_external_invariant_model(
+            &original,
+            &model,
+            &PdrConfig {
+                strict_proofs: true,
+                disable_array_scalarization: true,
+                preserve_original_clauses: true,
+                ..PdrConfig::default()
+            },
+        )
+        .expect("independent original-clause validation should complete"),
+        "the returned interval model must independently satisfy the unreduced original clauses"
+    );
+}
+
+#[test]
+#[timeout(10_000)]
+fn test_reduced_lia_array_interval_model_never_flips_reachable_query_safe() {
+    let problem = create_reducible_interval_lia_array_problem(true);
+    let adaptive = AdaptivePortfolio::new(
+        problem,
+        AdaptiveConfig::with_budget(Duration::from_secs(5), false),
+    );
+    let result = adaptive
+        .try_reduced_lia_array_preprocessed_route(Some(Instant::now() + Duration::from_secs(5)));
+
+    assert!(
+        !matches!(&result, Some((PortfolioResult::Safe(_), _))),
+        "reachable x = 3 must never be accepted as Safe by interval candidate generation: {result:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires the downloaded CHC-COMP 2025 HCAI corpus"]
+#[timeout(20_000)]
+fn test_reduced_lia_array_interval_model_solves_hcai_lu_cmp() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(concat!(
+        "../../benchmarks/chc/chc-comp25-benchmarks/hcai-bench/svcomp/O0/",
+        "O0_lu.cmp_true-unreach-call_000.smt2"
+    ));
+    let input = match std::fs::read_to_string(&path) {
+        Ok(input) => input,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!(
+                "skipping HCAI lu.cmp corpus regression: download benchmarks first ({})",
+                path.display()
+            );
+            return;
+        }
+        Err(error) => panic!("failed to read {}: {error}", path.display()),
+    };
+    let problem = ChcParser::parse(&input).expect("HCAI lu.cmp benchmark should parse");
+    let original = problem.clone();
+    let summary = PreprocessSummary::build(problem.clone(), false);
+    assert!(
+        AdaptivePortfolio::try_top_model_query_infeasibility_candidate(
+            &summary.transformed_problem,
+            Duration::from_millis(500),
+        )
+        .is_none(),
+        "lu.cmp needs its scalar interval invariant, not a raw top model"
+    );
+
+    let adaptive = AdaptivePortfolio::new(
+        problem,
+        AdaptiveConfig::with_budget(Duration::from_secs(5), false),
+    );
+    let result = adaptive
+        .try_reduced_lia_array_preprocessed_route(Some(Instant::now() + Duration::from_secs(5)));
+    let Some((PortfolioResult::Safe(model), ValidationEvidence::FullVerification)) = result else {
+        panic!("HCAI lu.cmp was not solved by the verified interval route: {result:?}");
+    };
+    assert!(
+        crate::engines::validate_external_invariant_model(
+            &original,
+            &model,
+            &PdrConfig {
+                strict_proofs: true,
+                disable_array_scalarization: true,
+                preserve_original_clauses: true,
+                ..PdrConfig::default()
+            },
+        )
+        .expect("independent lu.cmp original validation should complete"),
+        "lu.cmp interval model must satisfy every original clause"
+    );
+}
+
+#[test]
 fn test_array_const_key_cegar_route_accepts_original_validated_safe() {
     let problem = create_const_key_array_cegar_safe_problem();
     let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
@@ -2708,14 +3195,18 @@ fn test_algebraic_prestage_budget_extends_pure_polynomial_but_stays_capped() {
         Duration::from_secs(5),
         "short bounded runs can give polynomial synthesis up to half the budget"
     );
+    // Sub-6s budgets used to re-raise to the 3s ALGEBRAIC_PRESTAGE_BUDGET floor and
+    // then clamp to the caller budget, i.e. the pre-stage silently took 100% of the
+    // wall (63% of a 5s CHC-COMP budget) before any engine ran. The half-budget cap
+    // asserted above now applies at every scale.
     assert_eq!(
         algebraic_prestage_budget(&features, Duration::from_secs(1)),
-        Duration::from_secs(1),
-        "algebraic pre-stage must not exceed a bounded caller budget"
+        Duration::from_millis(500),
+        "algebraic pre-stage must not exceed half a bounded caller budget"
     );
     assert_eq!(
         algebraic_prestage_budget(&features, Duration::from_millis(500)),
-        Duration::from_millis(500),
+        Duration::from_millis(250),
         "sub-second bounded runs must not expand to the default algebraic budget"
     );
     assert_eq!(
@@ -5261,6 +5752,271 @@ fn test_acyclic_bmc_admission_demotes_recursive_datatype_but_admits_finite() {
     );
 }
 
+/// A scalar evidence label is not itself a proof. The finalizer may consume
+/// solver-internal evidence, but it must not turn that label into a
+/// process-global cache entry: doing so lets a fabricated Safe label poison
+/// later external empty-model validation for the same unsafe problem.
+#[test]
+fn test_fabricated_scalar_evidence_cannot_poison_acyclic_bmc_cache() {
+    let problem = ChcParser::parse(
+        "(set-logic HORN)\n\
+         (declare-datatypes ((CachePoisonFlag 0)) (((cache_poison_a) (cache_poison_b))))\n\
+         (declare-fun CachePoisonP (CachePoisonFlag) Bool)\n\
+         (declare-fun CachePoisonQ (CachePoisonFlag) Bool)\n\
+         (assert (CachePoisonP cache_poison_a))\n\
+         (assert (forall ((f CachePoisonFlag))\n\
+           (=> (CachePoisonP f) (CachePoisonQ f))))\n\
+         (assert (forall ((f CachePoisonFlag))\n\
+           (=> (CachePoisonQ f) false)))\n\
+         (check-sat)\n",
+    )
+    .expect("unique finite-datatype cache-poison fixture parses");
+    assert!(!problem.has_cycles());
+    assert!(problem.has_datatype_sorts());
+    assert!(!problem.has_recursive_datatype_sorts());
+
+    let validation_problem = problem.clone();
+    let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
+    let features = adaptive.features();
+    let depth = features.dag_depth.max(features.num_predicates).max(1);
+    assert!(
+        crate::acyclic_cert_cache::lookup_acyclic_bmc_safe(&adaptive.problem).is_none(),
+        "the unique unsafe fixture must begin without a cached proof"
+    );
+
+    let fabricated = adaptive.finalize_verified_result(
+        PortfolioResult::Safe(InvariantModel::default()),
+        ValidationEvidence::ScalarAcyclicBmcExhaustive { max_depth: depth },
+    );
+    assert!(
+        matches!(fabricated, VerifiedChcResult::Safe(_)),
+        "the regression must exercise the generic scalar-evidence admission arm"
+    );
+    assert!(
+        crate::acyclic_cert_cache::lookup_acyclic_bmc_safe(&adaptive.problem).is_none(),
+        "generic finalization must not cache a merely labelled Safe"
+    );
+
+    assert!(
+        !crate::engines::validate_external_invariant_model(
+            &validation_problem,
+            &InvariantModel::new(),
+            &PdrConfig::default(),
+        )
+        .expect("unsafe finite-DT validation should fail closed, not error"),
+        "independent exact BMC must reject the reachable query"
+    );
+
+    let shallow_depth = depth.saturating_sub(1);
+    crate::acyclic_cert_cache::record_acyclic_bmc_safe(&adaptive.problem, shallow_depth);
+    assert_eq!(
+        crate::acyclic_cert_cache::lookup_acyclic_bmc_safe(&adaptive.problem),
+        Some(shallow_depth)
+    );
+    assert!(
+        !crate::engines::validate_external_invariant_model(
+            &validation_problem,
+            &InvariantModel::new(),
+            &PdrConfig::default(),
+        )
+        .expect("shallow-cache validation should fail closed, not error"),
+        "a cached proof shallower than the recomputed exhaustive depth must not validate an unsafe empty model"
+    );
+}
+
+#[test]
+#[timeout(20_000)]
+fn test_reduced_lia_array_route_backtranslates_queryless_safe_model() {
+    let problem = create_reducible_queryless_lia_array_chain();
+    let original = problem.clone();
+    let summary = PreprocessSummary::build(problem.clone(), false);
+    assert!(
+        !summary
+            .transformed_problem
+            .clauses()
+            .iter()
+            .any(HornClause::is_query),
+        "unreachable query must disappear in the certified reduced problem"
+    );
+
+    let adaptive = AdaptivePortfolio::new(
+        problem,
+        AdaptiveConfig::with_budget(Duration::from_secs(5), false),
+    );
+    let result = adaptive
+        .try_reduced_lia_array_preprocessed_route(Some(Instant::now() + Duration::from_secs(5)));
+    let Some((PortfolioResult::Safe(model), ValidationEvidence::FullVerification)) = result else {
+        panic!("queryless reduced route did not return a fully verified Safe model: {result:?}");
+    };
+    assert!(
+        crate::engines::validate_external_invariant_model(
+            &original,
+            &model,
+            &PdrConfig::default(),
+        )
+        .expect("original validation must complete"),
+        "backtranslated queryless model must satisfy the original unreachable query"
+    );
+}
+
+// ============================================================================
+// All-predicates-top query-infeasibility certificate
+// ============================================================================
+
+fn create_top_model_array_candidate(
+    query_constraint: impl FnOnce(ChcExpr) -> ChcExpr,
+) -> ChcProblem {
+    let mut problem = ChcProblem::new();
+    let array_sort = ChcSort::Array(Box::new(ChcSort::Int), Box::new(ChcSort::Int));
+    let inv = problem.declare_predicate("TopInv", vec![array_sort.clone(), ChcSort::Int]);
+    let array = ChcVar::new("array", array_sort);
+    let index = ChcVar::new("index", ChcSort::Int);
+
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(true)),
+        ClauseHead::Predicate(inv, vec![ChcExpr::var(array.clone()), ChcExpr::int(0)]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(
+                inv,
+                vec![ChcExpr::var(array.clone()), ChcExpr::var(index.clone())],
+            )],
+            Some(ChcExpr::ge(ChcExpr::var(index.clone()), ChcExpr::int(0))),
+        ),
+        ClauseHead::Predicate(
+            inv,
+            vec![
+                ChcExpr::store(
+                    ChcExpr::var(array.clone()),
+                    ChcExpr::var(index.clone()),
+                    ChcExpr::int(7),
+                ),
+                ChcExpr::add(ChcExpr::var(index.clone()), ChcExpr::int(1)),
+            ],
+        ),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![(inv, vec![ChcExpr::var(array), ChcExpr::var(index.clone())])],
+            Some(query_constraint(ChcExpr::var(index))),
+        ),
+        ClauseHead::False,
+    ));
+    problem
+}
+
+#[test]
+#[timeout(5_000)]
+fn test_top_model_query_infeasibility_accepts_only_after_original_validation() {
+    let problem = create_top_model_array_candidate(|index| {
+        ChcExpr::and(
+            ChcExpr::lt(index.clone(), ChcExpr::int(0)),
+            ChcExpr::ge(index, ChcExpr::int(0)),
+        )
+    });
+    let original = problem.clone();
+    let Some(model) = AdaptivePortfolio::try_top_model_query_infeasibility_candidate(
+        &problem,
+        Duration::from_millis(500),
+    ) else {
+        panic!("contradictory original query constraint should admit the top model");
+    };
+
+    assert!(
+        crate::engines::validate_external_invariant_model(
+            &original,
+            &model,
+            &PdrConfig {
+                strict_proofs: true,
+                disable_array_scalarization: true,
+                preserve_original_clauses: true,
+                ..PdrConfig::default()
+            },
+        )
+        .expect("fresh unchanged-original validation should complete"),
+        "the returned top model must independently satisfy every original clause"
+    );
+}
+
+#[test]
+#[timeout(5_000)]
+fn test_top_model_query_infeasibility_rejects_satisfiable_query_constraint() {
+    let problem = create_top_model_array_candidate(|index| ChcExpr::eq(index, ChcExpr::int(0)));
+
+    assert!(
+        AdaptivePortfolio::try_top_model_query_infeasibility_candidate(
+            &problem,
+            Duration::from_millis(500),
+        )
+        .is_none(),
+        "a SAT query under the top interpretation must fail closed"
+    );
+}
+
+#[test]
+#[timeout(15_000)]
+fn test_top_model_query_infeasibility_solves_hcai_targets() {
+    let corpus_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benchmarks/chc/chc-comp25-benchmarks/hcai-bench/svcomp/O0");
+    for (name, file_name) in [
+        (
+            "trex02",
+            "O0_trex02_true-unreach-call_true-termination_000.smt2",
+        ),
+        (
+            "OpenSER stripFullBoth_arr",
+            "O0_veris.c_OpenSER__cases1_stripFullBoth_arr_true-unreach-call_true-termination_000.smt2",
+        ),
+    ] {
+        let path = corpus_root.join(file_name);
+        let input = match std::fs::read_to_string(&path) {
+            Ok(input) => input,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "skipping HCAI corpus regression: download benchmarks first ({})",
+                    path.display()
+                );
+                return;
+            }
+            Err(error) => panic!("failed to read {}: {error}", path.display()),
+        };
+        let problem =
+            ChcParser::parse(&input).unwrap_or_else(|error| panic!("{name} should parse: {error}"));
+        assert!(
+            AdaptivePortfolio::try_top_model_query_infeasibility_candidate(
+                &problem,
+                Duration::from_millis(500),
+            )
+            .is_none(),
+            "{name} raw nullary-error encoding must not admit the top model"
+        );
+        let summary = PreprocessSummary::build(problem.clone(), false);
+        assert!(
+            summary.transformed_problem.queries().next().is_some(),
+            "{name} must retain an explicit transformed query"
+        );
+        assert!(
+            AdaptivePortfolio::try_top_model_query_infeasibility_candidate(
+                &summary.transformed_problem,
+                Duration::from_millis(500),
+            )
+            .is_some(),
+            "{name} transformed query constraint must admit the top candidate"
+        );
+        let adaptive = AdaptivePortfolio::new(problem, AdaptiveConfig::test_default());
+        let result = adaptive.try_reduced_lia_array_preprocessed_route(Some(
+            Instant::now() + Duration::from_secs(5),
+        ));
+        let Some((PortfolioResult::Safe(_), ValidationEvidence::FullVerification)) = result else {
+            panic!(
+                "{name} should be discharged by the reduced, back-translated, \
+                 original-validated top certificate; got {result:?}"
+            );
+        };
+    }
+}
+
 // ============================================================================
 // FORALL-ARR ghost-pair lane (agenda #16)
 // ============================================================================
@@ -5296,6 +6052,36 @@ fn create_array_ghost_pair_unsafe_problem() -> ChcProblem {
          (check-sat)\n",
     )
     .expect("ghost-pair unsafe fixture parses")
+}
+
+/// Safe quantified-array loop hidden behind inlineable entry/exit wrappers.
+///
+/// After ghost instrumentation, clause inlining removes A/Q/R and predicate
+/// compaction remaps the surviving recursive P.  This exercises the exact
+/// vocabulary reconstruction required before the original-problem quantified
+/// certificate can be sealed.
+fn create_array_ghost_pair_compaction_safe_problem() -> ChcProblem {
+    ChcParser::parse(
+        "(set-logic HORN)\n\
+         (declare-fun A ((Array Int Int) Int) Bool)\n\
+         (declare-fun P ((Array Int Int) Int) Bool)\n\
+         (declare-fun Q ((Array Int Int) Int) Bool)\n\
+         (declare-fun R ((Array Int Int) Int) Bool)\n\
+         (assert (forall ((a (Array Int Int)))\n\
+           (=> (= a ((as const (Array Int Int)) 0)) (A a 0))))\n\
+         (assert (forall ((a (Array Int Int)) (n Int))\n\
+           (=> (A a n) (P a n))))\n\
+         (assert (forall ((a (Array Int Int)) (a2 (Array Int Int)) (n Int))\n\
+           (=> (and (P a n) (= a2 (store a n 0))) (P a2 (+ n 1)))))\n\
+         (assert (forall ((a (Array Int Int)) (n Int))\n\
+           (=> (P a n) (Q a n))))\n\
+         (assert (forall ((a (Array Int Int)) (n Int))\n\
+           (=> (Q a n) (R a n))))\n\
+         (assert (forall ((a (Array Int Int)) (n Int) (q Int))\n\
+           (=> (and (R a n) (not (= (select a q) 0))) false)))\n\
+         (check-sat)\n",
+    )
+    .expect("ghost-pair compaction fixture parses")
 }
 
 #[test]
@@ -5372,6 +6158,130 @@ fn test_array_ghost_pair_route_certifies_safe_quantified_fixture() {
     );
 }
 
+/// Regression for the preprocessed ghost lane's most important trust
+/// boundary: PDR solves in compacted predicate space, preprocessing rebuilds
+/// every inlined RAW-ghost interpretation, and only that reconstructed model
+/// is allowed into original-clause quantified certification.
+#[test]
+#[timeout(300000)]
+fn test_array_ghost_pair_preprocess_reconstructs_compacted_model_before_certificate() {
+    use crate::transform::{
+        recheck_ghost_pair_certificate, ArrayGhostPairTransformer, GhostPairCertificate,
+        GhostPairSpec, Transformer,
+    };
+
+    let _env_guard = lock_env();
+    // Keep the regression specifically on ClauseInliner's compaction/model
+    // reconstruction rather than letting the earlier condense superpass
+    // remove the wrappers first.
+    let condense_disable = ScopedEnvVar::set("AY_CHC_DISABLE_CONDENSE", "1");
+
+    let original = create_array_ghost_pair_compaction_safe_problem();
+    let spec = GhostPairSpec::analyze(&original, 1);
+    let raw_transform = Box::new(ArrayGhostPairTransformer::new(1)).transform(original.clone());
+    let raw_ghost_problem = raw_transform.problem;
+    let raw_p = raw_ghost_problem
+        .lookup_predicate("P")
+        .expect("raw ghost P declared");
+    assert_ne!(
+        raw_p.index(),
+        0,
+        "P must begin after an inlineable predicate so compaction remaps it"
+    );
+
+    let summary =
+        PreprocessSummary::build_with_graph_collapse(raw_ghost_problem.clone(), false, false);
+    drop(condense_disable);
+    assert_eq!(
+        summary.transformed_problem.predicates().len(),
+        1,
+        "A/Q/R must inline, leaving only recursive P"
+    );
+    let compact_p = summary
+        .transformed_problem
+        .lookup_predicate("P")
+        .expect("recursive P survives preprocessing");
+    assert_ne!(
+        compact_p, raw_p,
+        "surviving P must be renumbered so the test covers predicate compaction"
+    );
+    assert!(
+        raw_ghost_problem.predicates().len()
+            >= summary
+                .transformed_problem
+                .predicates()
+                .len()
+                .saturating_mul(ARRAY_GHOST_PAIR_PREPROCESS_REDUCTION_FACTOR),
+        "fixture must cross the adaptive lane's major-reduction gate"
+    );
+
+    // Supply the known compact invariant directly.  This regression targets
+    // the acceptance boundary, not PDR's search completeness: for this
+    // const-zero loop the final ghost value parameter is always zero.
+    let compact_predicate = summary
+        .transformed_problem
+        .predicates()
+        .first()
+        .expect("recursive compact predicate exists");
+    assert_eq!(compact_predicate.id, compact_p);
+    assert_eq!(
+        compact_predicate.arg_sorts.last(),
+        Some(&ChcSort::Int),
+        "the final compact argument must be the ghost value"
+    );
+    let compact_params: Vec<_> = compact_predicate
+        .arg_sorts
+        .iter()
+        .enumerate()
+        .map(|(index, sort)| {
+            ChcVar::new(format!("__p{}_a{index}", compact_p.index()), sort.clone())
+        })
+        .collect();
+    let ghost_value = ChcExpr::var(
+        compact_params
+            .last()
+            .expect("instrumented predicate has a ghost value")
+            .clone(),
+    );
+    let mut compact_model = InvariantModel::new();
+    compact_model.set(
+        compact_p,
+        PredicateInterpretation::new(compact_params, ChcExpr::eq(ghost_value, ChcExpr::int(0))),
+    );
+    let raw_ghost_model = summary.back_translator.translate_validity(compact_model);
+    for predicate in raw_ghost_problem.predicates() {
+        let interpretation = raw_ghost_model.get(&predicate.id).unwrap_or_else(|| {
+            panic!(
+                "preprocess validity backtranslation did not reconstruct '{}'",
+                predicate.name
+            )
+        });
+        assert_eq!(
+            interpretation.vars.len(),
+            predicate.arity(),
+            "reconstructed '{}' interpretation has the wrong raw-ghost arity",
+            predicate.name
+        );
+    }
+
+    let certificate = GhostPairCertificate::certify_and_seal(
+        &original,
+        spec,
+        raw_ghost_model,
+        Some(Duration::from_secs(60)),
+    )
+    .expect("reconstructed raw-ghost model must seal on the original clauses");
+    assert!(
+        recheck_ghost_pair_certificate(
+            &original,
+            certificate.as_ref(),
+            Some(Duration::from_secs(60)),
+            false,
+        ),
+        "sealed certificate must survive a full original-clause recheck"
+    );
+}
+
 /// SOUNDNESS PIN at the finalize boundary: a sealed ghost-pair certificate is
 /// only valid for the problem it was sealed against. Presenting it to a
 /// portfolio solving a DIFFERENT (unsafe) problem must demote to Unknown —
@@ -5445,7 +6355,7 @@ fn test_finalize_demotes_ghost_pair_certificate_from_wrong_problem() {
 }
 
 // ---------------------------------------------------------------------------
-// Cancellation handle (wishlist item 5) — scratch empirical probe
+// Cancellation handle (wishlist item 5) — bounded timeout and cancellation
 // ---------------------------------------------------------------------------
 
 /// Nonlinear orbit whose error state is off-orbit at a huge magnitude: no
@@ -5465,16 +6375,22 @@ fn guard_timeout_class_problem() -> ChcProblem {
 }
 
 #[test]
-#[ignore = "empirical probe documenting the uncancelled grind baseline; run manually"]
-fn probe_guard_timeout_class_uncancelled_grind() {
+#[timeout(15000)]
+fn guard_timeout_class_respects_small_budget() {
     let problem = guard_timeout_class_problem();
-    let config = AdaptiveConfig::with_budget(Duration::from_secs(45), false);
+    let budget = Duration::from_millis(500);
+    let config = AdaptiveConfig::with_budget(budget, false);
     let solver = AdaptivePortfolio::new(problem, config);
     let start = std::time::Instant::now();
     let result = solver.solve();
-    eprintln!(
-        "PROBE: uncancelled result={result} elapsed={:.1}s",
-        start.elapsed().as_secs_f64()
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(result, VerifiedChcResult::Unknown(_)),
+        "bounded hard solve must fail closed to Unknown, got {result}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "500ms solver budget was not enforced: elapsed={elapsed:?}"
     );
 }
 
@@ -5487,8 +6403,8 @@ fn cancellation_handle_cancels_solve_from_another_thread() {
     // driver would previously have had to orphan (KNOWN-UNCANCELLABLE).
     let problem = guard_timeout_class_problem();
     // Budget far beyond the wall-clock assertion bound below, so only the
-    // external cancel can explain a prompt return (the uncancelled baseline
-    // grinds the full budget — see probe_guard_timeout_class_uncancelled_grind).
+    // external cancel can explain a prompt return (the bounded test above
+    // establishes that this fixture otherwise consumes its allotted budget).
     let config = AdaptiveConfig::with_budget(Duration::from_mins(10), false);
     let solver = AdaptivePortfolio::new(problem, config);
     let handle = solver.cancellation_handle();

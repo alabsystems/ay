@@ -178,7 +178,7 @@ void         Z3_update_param_value(Z3_context c, Z3_string param_id,
 
 void Z3_get_version(unsigned int* major, unsigned int* minor,
                     unsigned int* build_number, unsigned int* revision_number);
-// Human-readable version string, e.g. "AY <ver> (Z3 4.15.4.0 compatible)".
+// Human-readable version string, e.g. "AY <ver> (Z3 5.0.0.0 compatible)".
 // Owned by the library; valid for the program lifetime.
 Z3_string    Z3_get_full_version(void);
 

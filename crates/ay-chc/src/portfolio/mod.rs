@@ -44,6 +44,7 @@ pub use types::{
     BudgetPolicy, BudgetReport, EngineBudgetEntry, EngineConfig, EngineStopReason, EngineType,
     PortfolioConfig, PortfolioResult,
 };
+pub(crate) use validation::backtranslate_counterexample_with_ground_evidence;
 use validation::{SafePrecheckResult, ValidationBudget, ValidationResult};
 
 use crate::cancellation::CancellationToken;

@@ -400,16 +400,15 @@ pub unsafe extern "C" fn Z3_get_version(
     // bounds-checked) above, and the caller's `# Safety` contract on this extern "C" function
     // guarantees they remain valid for the duration of the call.
     unsafe {
-        // Report Z3 API compatibility version 4.15.4.0 — the libz3 release whose
-        // exported-symbol surface AY matches 1:1 (nm-diff = 0 missing)
+        // Report the pinned Z3 API compatibility version 5.0.0.0.
         if !major.is_null() {
-            *major = 4;
+            *major = 5;
         }
         if !minor.is_null() {
-            *minor = 15;
+            *minor = 0;
         }
         if !build_number.is_null() {
-            *build_number = 4;
+            *build_number = 0;
         }
         if !revision_number.is_null() {
             *revision_number = 0;

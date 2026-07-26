@@ -18,6 +18,11 @@ sys.path.insert(0, str(SCRIPTS))
 
 import smtcomp_harness as harness  # noqa: E402
 
+if os.name != "posix":
+    raise RuntimeError(
+        "SMT-COMP harness tests require POSIX process-group semantics"
+    )
+
 
 def envelope(memlimit: int = 2048, requested: int = 4, admitted: int = 2,
              nbcore: int = 8, headroom: int = 16000) -> dict:
@@ -430,7 +435,6 @@ class ValidatorIdentityTests(unittest.TestCase):
         run.assert_called_once()
 
 
-@unittest.skipUnless(os.name == "posix", "process-group cleanup requires POSIX")
 class ProcessCleanupTests(unittest.TestCase):
     def test_nbcore_is_applied_to_child_environment(self) -> None:
         resource = envelope(nbcore=3)

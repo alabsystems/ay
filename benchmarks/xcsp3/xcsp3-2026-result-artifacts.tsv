@@ -1,0 +1,120 @@
+# XCSP3 2026 solver-result artifacts retrieved during 2026-07-24T04:15Z..04:29Z.
+# Format: URL<TAB>exact response bytes<TAB>SHA-256, sorted by competition id then solver id.
+# Discovery: https://xcsp26.alfweb.net/api/competitions; entrant endpoint: /api/solversincompetition/{id}.
+# Response endpoint: https://xcsp26.alfweb.net/api/solverresultincompetition/{competition_id}/{solver_id}.
+# Rules: https://www.cril.univ-artois.fr/~lecoutre/compets/callXCSP26.pdf; API rank arrays publish podiums.
+# Numeric points are reconstructed from responses; the derived no-proof view counts valid UNSAT/final-best-bound answers once.
+# Supporting-input SHA-256 (12 lines below after removing "# "): 02d236b5e0330849b28b6159c63d4e6e5ace2ac1dd259243933acf1ac46c3e64
+# https://xcsp26.alfweb.net/api/solversincompetition/2	3259	2c97a19b7ab33634b0c1402f26fa470b48bb8d55878b27dc3a57d8a3fd14bd6f
+# https://xcsp26.alfweb.net/api/benchmarksincompetition/2	73243	dda932e41b092c110244bf9a0987cc16a01c2c1eba9435441cc08993e773348b
+# https://xcsp26.alfweb.net/api/solversincompetition/3	1555	cc9dbe1e141433ec3e7bbc3710143abd66cb59d7b8f9d344189c1790da77deca
+# https://xcsp26.alfweb.net/api/benchmarksincompetition/3	56770	04a43420e05e6553cfc45668dbbabdc1622bc5e06b138ab74f480efc386c0bab
+# https://xcsp26.alfweb.net/api/solversincompetition/4	1408	41a42b1452ab690c9ce000b52e32ec9d2b125cece9dab6b65b63fc2c79120807
+# https://xcsp26.alfweb.net/api/benchmarksincompetition/4	60383	ab277fc3d60b82138a19bdba786a34c1c759d5e39addbc9bcd8c8ba2b8f09b2a
+# https://xcsp26.alfweb.net/api/solversincompetition/5	2962	01acc30f27136dbe1a9ecce01c4d2626f7fd8e6c15365dd0917d82ac9db730f1
+# https://xcsp26.alfweb.net/api/benchmarksincompetition/5	107723	315c8885b00c3af71b41ddf5d79c1d283411b500f8d122441edb13e155005d63
+# https://xcsp26.alfweb.net/api/solversincompetition/6	1848	64b42021f939c126a25b8b705aac744e3651ccabcbcb404bb0dceb37bd7401b2
+# https://xcsp26.alfweb.net/api/benchmarksincompetition/6	108775	338819ab40a2813413b44835e2617d5ef801575c7523d9fb980fc62e152207d6
+# https://xcsp26.alfweb.net/api/solversincompetition/7	3104	49ff32a08f96dbaa75292dc31c7b40c00c6a40ae3ff483c07785913d0f52e3ec
+# https://xcsp26.alfweb.net/api/benchmarksincompetition/7	106891	eb794f5dd046b7387619d4617d6cd6ea1661b1321d715a4d9d0f70df2b151eaf
+# Records-only SHA-256 (comments excluded): cb4d9db31bac866ae71b5b95aa3df204236fdf743e170f08387a22842e0a0671
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/3	66598	c383053e26a74dcff8dbdce0e0b7f793ef673061dd8bf2bf3be7729fecb4b05e
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/5	66597	584dc7858ebdc6c5d5eb0a2251a81de1173f07f1aa34661927169ca7f3dc2c4b
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/7	66677	4f5e6ec1b8c0cd7f27c17294f26d088693a0bfbc5027dd8a058eb258d8c73ead
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/8	66600	605c9dcad70fcf67d36da43446e53c8725c73cdff09b8adc029864037cae4d97
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/9	66823	e0b3c6885db3972b0b8781d540153e070c9a1c7ee5f6e6e0fac9ddf9366e95fb
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/10	67044	b467f6193e3b5a26d9402a5ee94a0abff161c22d39068fdedb5d107b18b07118
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/11	67134	6d97fcd40e8863abad8bf31e5bc3d89529184c1b1b6ea506d6323c9d69d1a6ce
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/12	67231	d74e4a42018aecc932aa0b527f7ccb48978b6953868273aafc06331195d7a66f
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/15	66890	6f7ae0c2fdd87d9d2a9d08e5ec3134607dc3060033b6177b533d3f055a0d5f12
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/16	67159	2848d326c4e353ce08d8ddafef37b65078dd264dcacb262d8c5cdac71a165e46
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/17	66875	ac83904b946d5379bf3fbc63af19d7648802b4057d4760383f50caa2d5d3eafb
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/18	67395	a5d020042fe1e5d83f3ca3a0c58cf872c3ba71c271c3371c1631b9ff6150f14f
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/19	67248	a577d1f7600ec1f38eefeb533d2e7464d74c37cd088c4ec7e7d7f61e832c162a
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/20	67395	d039a77c150edb7c790927489cca462deeb07d27baac752aabb69095e1063577
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/36	66864	846241f1ed7fba547e71974657f167d57fb60a6a56e82479854e552b7cc08bcd
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/37	67250	d20dc73faf2e619fe5820923877209b104d6da5ff0a4c31688f791053936db37
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/38	67102	ad82f1f6c5db2ae92e25852ddaa7119aa3af515994c7e65f81138ead1b24e70c
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/39	67277	b26394ab8e9150c271194f578e7cdc259f8595fab43e7b4fa21aad78c29a5a70
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/40	66906	0dd5241b485057fa8ef262cd5e08e5acc705f86b1d2d13829885c290e075d0f3
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/41	66833	61296168e7e8e2b5243971ee7cd7a9fe3f4d9fede0111fbd9559ded56d5bf8e3
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/42	67121	e344397abc21b7fe4bff0e65db9846b25ee3951a3592986129cbbfbec4d5cd5b
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/43	67141	24e3c262b140c81d10d6d13244032d468c40927725a092cadac68d3bce2f340d
+https://xcsp26.alfweb.net/api/solverresultincompetition/2/44	67256	96e3eb296d9db512651806a1f5f2702d5069398eea7da113094777da32bf8ad8
+https://xcsp26.alfweb.net/api/solverresultincompetition/3/7	50993	022f9c039b832d30901e6cb2b2aa2694f6f939870a02a6377841685eb63e1c43
+https://xcsp26.alfweb.net/api/solverresultincompetition/3/18	51296	0d36388a58ab0cb4f915a150035d25826d1974311f08c2e8ce4038f48a403b91
+https://xcsp26.alfweb.net/api/solverresultincompetition/3/19	51202	3ed44b43ce372f18c7dd87cbeec7a48afc89ef77f6857acfe27c4d9b2e2622bb
+https://xcsp26.alfweb.net/api/solverresultincompetition/3/20	51284	6d103bddf2aee0ed490c05dcc7d4132f5f3e32c0bd241709e1e809af0f077fd7
+https://xcsp26.alfweb.net/api/solverresultincompetition/3/27	51244	911af1c9ee5493c58c6daceda3b4714902111f242263f341df51ae6b1a73b4e8
+https://xcsp26.alfweb.net/api/solverresultincompetition/3/36	51130	f2bd808e1fc3dfa2a777209c57881eac247d6eaae3c3a97b4c7f3e5c5eafb0db
+https://xcsp26.alfweb.net/api/solverresultincompetition/3/40	51020	d7514b20d524e7d8348eb7b855b25e2579bc7a4e26474062c5beecae0b6e17af
+https://xcsp26.alfweb.net/api/solverresultincompetition/3/41	51035	7a555ba089a2a029c6f60d78d564d76c909f91a4ca07ddad494ee38dd89ce234
+https://xcsp26.alfweb.net/api/solverresultincompetition/3/43	51189	ffe1f1390084c2e0c38397442fbbc234a98f842575a1a82772dd79d6c456f992
+https://xcsp26.alfweb.net/api/solverresultincompetition/3/44	51233	502514c6ac64f6619b556fdf57c7b497a1faee1d80a16ac9598564000e16103b
+https://xcsp26.alfweb.net/api/solverresultincompetition/3/45	51256	ac70663b5f3fb4b0b10e3bed0a368207e45d4c7d83b958371118546f5a186c3b
+https://xcsp26.alfweb.net/api/solverresultincompetition/4/7	178168	465d635c99e9a1d21557bb64f89c326f50ece44719c88af13fe04ce0d10e6888
+https://xcsp26.alfweb.net/api/solverresultincompetition/4/19	97079	ead22c03fdf8c6d0439e4d424709fbb696ee586c0e38dfde8096b66a5b3825b3
+https://xcsp26.alfweb.net/api/solverresultincompetition/4/31	97335	6039d1b98e0610c3e13cbd1b7263a152bd2f5c8dd6d852b998f8f3d8909410f0
+https://xcsp26.alfweb.net/api/solverresultincompetition/4/35	95596	03fe0487f615cd06ae84e9420aa6f8e3472737d67a20118713c76632887e64dd
+https://xcsp26.alfweb.net/api/solverresultincompetition/4/36	247283	2efc20988d3b00a17db4e78932d0b2a99eee2885c3a3107ef612bf623008f6f5
+https://xcsp26.alfweb.net/api/solverresultincompetition/4/40	149428	3fe2da1ef3477a99b1f2b7a280e9916f0429e331b9136cd1201cad8c02514bf5
+https://xcsp26.alfweb.net/api/solverresultincompetition/4/43	74597	47c0d5a4705e9f59703f97dcebae8ad8a6957cebcf3ecae3dcb3dc337950f2a5
+https://xcsp26.alfweb.net/api/solverresultincompetition/4/44	190716	c53ede360a0ef46f3251a11a22d8e3d9bf569258d883840620d8f257ae50b59e
+https://xcsp26.alfweb.net/api/solverresultincompetition/4/45	72062	68b8157870e3689a3adc5f3dc1b91b4397c7b4220a0e047c14c549bce8606819
+https://xcsp26.alfweb.net/api/solverresultincompetition/4/46	151710	8fefe97b426f335e402f6b4a52a2a220ae97442e2739ae1121ac88c3f8e6d92a
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/3	284807	522e8b8859c000aaef0c3e19561d209755aeb7570387c469f8128b74e73d03cc
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/5	253013	6ab5fc39e9e8bed4af803badcea7f30511f07412772e63f06434a42195d8d532
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/7	252907	bd103d54106ad965516891cfcbc03a74c2d304760d2afde2089440c228fa46fa
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/10	129394	ec02e5905908b4e0d329e96853d69608c594107fef2748300fdef8356c9f6088
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/11	127614	adb0863576f217161491d417ea8723191f20f72968ad210db271996e7f3a7ddc
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/12	129136	7390fa09abf7adb1072755915ed5a2eeb423a6d006896398b7e91144feb28fca
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/15	129991	7592cf51b074d11eb8c6a858d01a1e880828feac23678db0105b879c2e47a33f
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/16	128516	bbc84c042900c6d7d0b466baed85220d381a84d7cac40518ee8b60ed9fab72d9
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/17	135062	969a08af894b11fbe6559b6e538d24788a4b0826e14a045337ed970ecf2d0196
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/19	138375	3b65986ced3205c989c62b17931d95e50d7f27a0925c7f008ae39ed25a2d5d08
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/29	257768	3a367d3f8f13fa59ebcae6f99b10e224a9128357121db080add2edf7f63a06da
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/30	286388	74164de3586e54a424632afb41f61823092f131b713dfcc67f55e68abede46c6
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/35	141859	ff8904a250c499e4826bc79b768082f4b3b55ad96315a2b678476c866cd52bba
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/36	269037	e44cf075581cd20144e141c9840917e6d1a4a9808d7242f59ab901c58e2f6a99
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/37	128372	8038d14ccbfd99ccd927d3d456a1f7a238543372385f54154244a81c9c13e286
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/39	128112	ab6fd6062ab45ad161cc54e0cedf00ee8f3bfc6420bdea448a477b2a3555a471
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/40	177332	525d58d83d45cf6adecbf2b36080d0907351cb0fb8c27846ca9c8fa8c6da3f29
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/42	179515	e706265b542ca2c5e4af40903db041cf8ade34c53a762f8b4e0706f313a9bdf3
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/44	195579	5c81bca254350342b6379855e426cdd54b4f97e2aa35aedab0e5a3f9a4195137
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/46	179493	3c15e987dd10eb692c64ceab603b74fd40c579b311dd54ba5c0d8bcef83992e0
+https://xcsp26.alfweb.net/api/solverresultincompetition/5/47	129030	44a26e41445b4b8f2d8f96e738cf54c262f7c735de500bc9575584ea6e695236
+https://xcsp26.alfweb.net/api/solverresultincompetition/6/7	525195	e681a18d4d0270c89e05482f38aee5435f1a70167cdfa1894c7c6a7537aa8c3e
+https://xcsp26.alfweb.net/api/solverresultincompetition/6/8	583296	ab1cf9a2bf7461ae8028c2cdff861aec92feb67ec74ec7067e4914605d13701c
+https://xcsp26.alfweb.net/api/solverresultincompetition/6/10	130558	66d14055a3aabc75d6fdb749e93a2266b3c83bb50f9c81b8b91da4272db45a52
+https://xcsp26.alfweb.net/api/solverresultincompetition/6/12	130868	d81364ad29c8aa97995da91b3e591666223e3ba0c0240c3ba85033c677ba20e0
+https://xcsp26.alfweb.net/api/solverresultincompetition/6/15	131682	2edea96f41636ccd84fb0202a0dde1c7cb95758bc6ee6f532c96817d04a52e9c
+https://xcsp26.alfweb.net/api/solverresultincompetition/6/19	153946	066d258f0f8c1ae8d3b77444de2033eeaeeda95c7371c25a37f50da34f32392e
+https://xcsp26.alfweb.net/api/solverresultincompetition/6/36	495456	f0816c8fa357581e1020b97eba1a87f924b5d0c35df9b350af159c14525d27df
+https://xcsp26.alfweb.net/api/solverresultincompetition/6/37	129824	2180013b27b86e49b597ce5486c30edc22d3d860d680490eae22d401ac6ae22b
+https://xcsp26.alfweb.net/api/solverresultincompetition/6/39	129469	0daca79c63673d6fc0a8bfe3e94e969c337a9c6f64e34ac951c377794b30be5c
+https://xcsp26.alfweb.net/api/solverresultincompetition/6/40	235546	913a72e967b6649c1924a63f9e9576eb3a2ee30fd22a1347bd0ab7a0093fa5d0
+https://xcsp26.alfweb.net/api/solverresultincompetition/6/42	276540	53ce6212e7dc3e8fa7a92e55be992fa92e5e8a3f52eaa3446b84b296d6302654
+https://xcsp26.alfweb.net/api/solverresultincompetition/6/43	128746	95253be79b402387c9cb20347233a0da5095420b205dd20349fdd51b98ec30f4
+https://xcsp26.alfweb.net/api/solverresultincompetition/6/46	247382	3b07ecbee7f53d1cb9fae534d02ad63241e15be6cc453a0d119960ed79f725e9
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/3	575200	e593664032e9795609f813c4788a2b9c90b74a235270a62fc660bc0e79cbaf2d
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/5	459769	a2b262a483c3031f2eb450de557d878a40881fa7a88565fd3f18a6e4286767a8
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/7	513756	b17193ff168bf1adc5a010065e74a1de86f323cd707708c98d6050263bdb38ac
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/10	129138	9fce9858957b7256b3ebe7d6daf8750bd24ff81090d41579f8330db768af77be
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/11	127479	f06238c05cb0d1a31ffc7949b529eae7f87e98d1b846259af3cad7aec89c914d
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/12	129265	f02dd3b0b6472497f5f701e7ed77eae0240a29eccf5bd708a75b88ea882ffeb2
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/15	129835	6c5e8da4273fbb915fa44237479d206cc19c1aa80f2ec0ea5c759597e88ca8d0
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/16	128124	fed4c2047c4ad554e793b44f9e77563f530a4300e32dc9b98e45767975cac44b
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/17	137603	7d613c4e16e3c42efd2fa435859b08c7d7b1d8af1ab83ee09acaca5935d49b96
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/19	150780	64e1f3e4a4fcb0866ea94800cdc5368f6b1a0a5623706004952bb5be445c4ae6
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/29	561385	16b8be96ee2cc4ac98086b18f08bbaa2d6d1116c99620d8cae73998b1bde912c
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/30	552286	6bca04251f32491f9643e351e3fde9139561029e70530d61bd6a4833504ea97b
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/35	168388	76a2dc494af4bf55fa3c6e1c759c179f66bc3586f056c5386a030b7ebe409da1
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/36	482316	a8b1d2fe6a0a60182c18212934beb809f266411fef2a9f776d10b9e579d61a5d
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/37	127883	fd95f40fa06c4be0d54be11b1b2b83f6b2ddd0357be181bc78c864cf1d3eca6e
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/39	127481	95053967dc433e92c8546c737cca179b064a4e5a3c324f6ece390f51b91ebeee
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/40	234861	836fa40f4c2c9bf37d0bdd5d3ac67e1f085fadecf44b4215f5fee2b686429daa
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/42	273742	28213ac818becf06b2bfe6f35a6604ee3d9b3b0abb922b42ca213066b77c3295
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/44	608740	44e8282c78d41a5fc289f6d819252bb13692a629ed159596e9e8675dd90cbab6
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/46	245873	a406233544930a9699eb162212389e19f212b937f0d8431c1d92f75b9ae4a815
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/47	130592	99b0cf1f81feb4b85d9b13c1d43ecf36cb12efc1ffa07629fe1672e82573be9e
+https://xcsp26.alfweb.net/api/solverresultincompetition/7/48	152110	19cd906d12e9d836a5ab570f19ab93acdc1526135a8553ebdc9cab1923c4bb20

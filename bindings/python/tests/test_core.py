@@ -265,7 +265,7 @@ def test_simplify_ite_and_store_select():
         assert z.simplify(sel).ast == v.ast
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_simplify_crosscheck_against_z3py():
     # The RESULT need not be syntactically identical to z3's, but the obvious
     # constant/identity folds must agree on the concrete value/structure. We
@@ -402,7 +402,7 @@ def _run_z3py(name):
     return str(res), out
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 @pytest.mark.parametrize("name", CROSS_SNIPPETS)
 def test_crosscheck_against_z3py(name):
     ay_res, ay_vals = _run_ayz3(name)

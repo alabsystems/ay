@@ -275,42 +275,14 @@ impl Executor {
     /// Body of [`Executor::new`] — only called through the stack guard above
     /// so the struct-literal frames land on the grown segment.
     fn new_stack_guarded() -> Self {
-        // Arm the process-wide memory ceiling for EVERY in-process embedder,
-        // exactly once, only if the embedder has not chosen one. Previously
-        // only the ay-bindings `execute_direct` entry armed it, so embedders
-        // that drive `Executor` directly (e.g. proof-replay-consumer's AyProofBackend
-        // inside compiler_consumer) ran with NO memory gate at all — the certify-lane
-        // divergence that grew a rustc past 300 GB. Uses the EMBEDDED default
-        // (~phys/8, 2–16 GB — see `default_embedded_memory_limit`): a
-        // verification pass shares its host process, and an abandoned PDR
-        // bit-blast was observed transiently holding ~28 GB under the
-        // standalone phys/2 default. The gate only ever degrades a solve to
-        // Unknown; standalone `ay` keeps its own explicit/auto limit.
-        //
-        // NOT under cfg(test): the auto-armed ceiling is PROCESS-GLOBAL state,
-        // and the unit-test harness is one long-lived process running thousands
-        // of solver tests whose aggregate allocator-retained footprint has
-        // nothing to do with the CURRENT solve. On a 24 GiB host the embedded
-        // default is 3 GiB; partway through the full `ay-dpll --lib` suite the
-        // harness's cumulative footprint legitimately crosses 95% of that, and
-        // from then on EVERY solve in the process — however tiny — degraded to
-        // Unknown(MemoryLimit): ~1200+ load-dependent failures that vanish when
-        // any test runs alone. Same principle as ay-sys's thread-local
-        // `force_process_memory_exceeded_for_testing` hook: tests must never
-        // couple through the process-global memory gate. Tests that exercise
-        // the memory-exit paths use that thread-local force hook (honored even
-        // with no limit armed); production embedders are unaffected — this arm
-        // is compiled into every non-test build exactly as before.
-        #[cfg(not(test))]
-        {
-            use std::sync::Once;
-            static ARM: Once = Once::new();
-            ARM.call_once(|| {
-                if ay_sys::get_process_memory_limit() == 0 {
-                    ay_sys::set_process_memory_limit(ay_sys::default_embedded_memory_limit());
-                }
-            });
-        }
+        // Process memory policy belongs to the host executable. In particular,
+        // constructing this library type must not mutate ay-sys's process-global
+        // ceiling: an AY dependency is compiled without cfg(test) inside another
+        // crate's libtest, and a constructor-side default then couples thousands
+        // of otherwise independent tests through the harness's retained RSS.
+        // The standalone AY binaries and the direct-bindings host arm their
+        // explicit defaults; compiler/server embedders must do likewise at their
+        // process entry point.
         Self {
             ctx: Context::new(),
             // No string lemma lowered yet — vacuously all-valid.
@@ -425,9 +397,13 @@ impl Executor {
             dt_validation_wants_egraph: false,
             dt_egraph_assignment: std::cell::RefCell::new(None),
             dt_egraph_building: Cell::new(false),
+            array_def_index: std::cell::RefCell::new(None),
+            select_by_array_index: std::cell::RefCell::new((0, Default::default())),
+            required_terms_index: std::cell::RefCell::new(None),
             recorded_var_substitutions: HashMap::default(),
             original_problem_had_quantifiers: false,
             sat_validated_by_mod_div_or_branch: false,
+            nested_array_row_reduction_unsat: false,
             bypass_string_tautology_guard: false,
             slia_accepted_unknown: false,
             w7_defs: None,
@@ -1032,6 +1008,11 @@ impl Executor {
     pub fn reset(&mut self) {
         self.ctx = Context::new();
         self.array_ext_witness_cache.clear();
+        // ctx (and its append-only TermStore) is replaced wholesale: term ids
+        // restart, so the prefix-extended select index MUST restart with them.
+        *self.select_by_array_index.borrow_mut() = (0, Default::default());
+        *self.array_def_index.borrow_mut() = None;
+        *self.required_terms_index.borrow_mut() = None;
         self.last_result = None;
         self.last_model = None;
         self.last_assumptions = None;

@@ -343,6 +343,13 @@ impl Solver {
         }
 
         let mut run = VivifyTierRun::default();
+        // A candidate is temporarily skipped by VIVIFY-mode BCP while its
+        // negated literals are assumed. If that BCP also derives level-0
+        // assignments, the skipped clause's watches are not visited for those
+        // assignments and qhead advances past them. Remember that the tier
+        // must replay the root trail after every skipped candidate has been
+        // restored to propagation.
+        let mut skipped_candidate_during_bcp = false;
         // Track effort consumption via vivify_ticks, which increments
         // in VIVIFY-mode BCP with the same cache-line granularity as
         // search_ticks. Budget and consumption in the same unit (#3758).
@@ -551,6 +558,7 @@ impl Solver {
 
             // Mark clause header to skip during propagation (CaDiCaL: ignore = c).
             self.arena.set_vivify_skip(clause_idx, true);
+            skipped_candidate_during_bcp = true;
 
             // Check if the clause is already the reason for forcing one of its
             // literals true. If so, we must backtrack below that level first
@@ -1172,6 +1180,22 @@ impl Solver {
             self.backtrack_without_phase_saving(0);
         }
         self.suppress_phase_saving = false;
+
+        // CaDiCaL resets both vivification propagation heads to zero after a
+        // vivification tier (vivify.cpp, end of vivify_round) before running
+        // ordinary propagation. AY must do the same: merely propagating newly
+        // enqueued units is insufficient because qhead already passed any
+        // level-0 assignments made while a candidate clause was skipped.
+        //
+        // Replaying the root trail restores the 2WL invariant for those
+        // clauses and exposes any resulting unit or conflict before search (or
+        // another vivification tier) can observe the incomplete watch state.
+        if skipped_candidate_during_bcp {
+            self.qhead = 0;
+            if self.propagate_check_unsat() {
+                run.conflict = true;
+            }
+        }
 
         debug_assert_eq!(
             self.decision_level, 0,

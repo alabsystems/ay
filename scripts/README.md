@@ -25,6 +25,7 @@ script does not exist until its index entry does
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
 | chc-cert-check | audit.chc | `scripts/chc_cert_check.py` | python | active | - | Independent CHC SAFE-certificate checker (external SMT arbiter). |
+| proof-checkability-sweep | audit.proof | `scripts/proof_checkability_sweep.py` | python | active | - | Sweep a corpus for AY UNSAT verdicts that are independently kernel-checkable via the complete-conflict Lean firewall, cross-checking each verdict against z3 and :status. |
 | firewall-selfcert-check | audit.smt | `scripts/firewall-selfcert-check.sh` | bash | active | - | End-to-end smoke check that --verify-firewall kernel-checks per-theory Lean firewall proofs and rejects corrupted ones. |
 | lra-bmc-validate | audit.smt | `scripts/lra_bmc_validate.sh` | bash | active | - | File-aligned soundness + coverage validation for QF_LRA .bmc files. |
 | lra-ind-validate | audit.smt | `scripts/lra_ind_validate.sh` | bash | active | - | File-aligned soundness + coverage validation for QF_LRA .ind files. |
@@ -45,6 +46,8 @@ script does not exist until its index entry does
 | milp-compare | bench.milp | `scripts/compare.py` | python | active | - | ay-milp vs HiGHS verdict agreement on the real .milp corpus. |
 | milp-refsolve | bench.milp | `scripts/refsolve.py` | python | active | - | HiGHS + SCIP + Gurobi verdicts on the .milp corpus via the exact-MPS bridge. |
 | milp2mps | bench.milp | `scripts/milp2mps.py` | python | active | - | Convert the .milp serialization to standard MPS (bit-exact f64 fields). |
+| milp-corpus | bench.milp | `scripts/milp_corpus.py` | python | active | - | Fetch and index the MIPLIB 2017 corpus (+ .solu reference optima) the W0 harness measures on. |
+| milp-w0 | bench.milp | `scripts/milp_w0.py` | python | active | - | W0 attribution harness: root closure, solver baselines, per-knob ablation, regression gate, Gurobi audit, LP-throughput gap. |
 | miplib-bench | bench.milp | `scripts/miplib_bench.py` | python | active | - | Run ay-milp and HiGHS on the same MPS files and compare verdicts. |
 | solver-portfolio | bench.milp | `scripts/solver_portfolio.py` | python | active | - | Run AY against a portfolio of reference MILP solvers at matched single-thread budgets. |
 | mzn-local-bench | bench.mzn | `benchmarks/minizinc/run_benchmarks.sh` | bash | deprecated | - | Run local FlatZinc benchmarks through the competition CLI surface. |
@@ -69,6 +72,12 @@ script does not exist until its index entry does
 | zig-cc | build.toolchain | `scripts/zig-cc-x86_64-linux-musl.sh` | bash | active | - | Zig cross-compile cc shim (x86_64-linux-musl) for the static Linux build. |
 | zig-cxx | build.toolchain | `scripts/zig-cxx-x86_64-linux-musl.sh` | bash | active | - | Zig cross-compile c++ shim (x86_64-linux-musl) for the static Linux build. |
 | zig-ranlib | build.toolchain | `scripts/zig-ranlib.sh` | bash | active | - | Zig ranlib shim for the static Linux build. |
+
+## campaign
+
+| Name | Group | Path | Lang | Status | CLI | Summary |
+|---|---|---|---|---|---|---|
+| continuous-benchmark | campaign.core | `scripts/continuous_benchmark.py` | python | active | - | Four-hour branch integration, correctness gates, rotating competition benchmarks, repair, and progress publication. |
 
 ## compare
 
@@ -118,7 +127,6 @@ script does not exist until its index entry does
 | satcomp25-sample-fetch | corpus.fetch | `scripts/_fetch_sat2025_sample.sh` | bash | active | - | Fetch a size-bounded SAT-COMP 2025 main-track sample for local iteration benchmarking. |
 | satlib-fetch | corpus.fetch | `scripts/download_satlib_benchmarks.sh` | bash | deprecated | - | Fetch the SATLIB uniform-random 3-SAT sets the ay-sat soundness/DRAT tests resolve. |
 | smtcomp-fetch | corpus.fetch | `scripts/download_smtcomp_benchmarks.sh` | bash | active | - | Fetch SMT-LIB non-incremental benchmarks for a logic into benchmarks/smtcomp/<LOGIC>/. |
-| smtlib-sample-fetch | corpus.fetch | `benchmarks/smtlib-sample/fetch.sh` | bash | active | - | Re-fetch the SMT-LIB sample corpus used by ay-z3-parity bench (Zenodo 11061097). |
 | mzn-gen-community | corpus.gen | `benchmarks/minizinc/gen_community.py` | python | active | - | Generate a FlatZinc community-detection benchmark (mexican.s26.k4-like). |
 
 ## dev
@@ -137,6 +145,7 @@ script does not exist until its index entry does
 | planted-sat-fuzz | fuzz | `scripts/fuzz/decompose_planted_sat_fuzz.py` | python | active | - | Differential soundness fuzz for SCC equivalent-literal substitution on planted-SAT CNFs. |
 | smt-diff-fuzz | fuzz | `scripts/diff_fuzz.py` | python | active | - | Differential SMT fuzzer: random well-typed formulas in a declared logic, AY vs Z3. |
 | smt-diff-fuzz-dt | fuzz | `scripts/diff_fuzz_dt.py` | python | active | - | Differential SMT fuzzer for datatypes (QF_DT, QF_UFDT, QF_UFDTLIA, AUFDTLIA). |
+| string-ground-diff-fuzz | fuzz | `scripts/fuzz/string_ground_diff_fuzz.sh` | bash | active | - | Scale runner for the differential fuzz harness guarding the proof checker's independent ground string/regex evaluator (string_ground.rs). |
 | word-eq-diff-fuzz | fuzz | `scripts/fuzz/word_eq_diff_fuzz.py` | python | active | - | Differential soundness fuzz for word-equation (string) solving. |
 
 ## gate
@@ -157,7 +166,7 @@ script does not exist until its index entry does
 
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
-| pre-push-hook | hook | `scripts/git-hooks/pre-push` | bash | active | - | In-tree pre-push hook: runs the SMT soundness-differential gate before every push. |
+| pre-push-hook | hook | `scripts/git-hooks/pre-push` | bash | active | - | In-tree pre-push hook: enforces zero active Python test skips, then runs the SMT soundness gate. |
 
 ## lib
 
@@ -185,9 +194,13 @@ script does not exist until its index entry does
 | Name | Group | Path | Lang | Status | CLI | Summary |
 |---|---|---|---|---|---|---|
 | chccomp-campaign-oom-guard-tests | test | `scripts/tests/test_chccomp_campaign_oom_guard.py` | python | active | - | Resource-envelope recording checks for the CHC campaign scripts. |
+| continuous-benchmark-tests | test | `scripts/tests/test_continuous_benchmark.py` | python | active | - | Unit and disposable-Git-worktree tests for the continuous benchmark campaign driver. |
 | frontend-resource-harness-tests | test | `scripts/tests/test_frontend_resource_harnesses.py` | python | active | - | Resource-envelope tests for the frontend benchmark harnesses. |
 | java-binding-smoke | test | `bindings/java/run.sh` | bash | active | - | Build and run the AY Java (FFM) binding test against libay_ffi. |
+| no-python-test-skips | test | `scripts/check_no_python_test_skips.py` | python | active | - | Fail-closed AST gate forbidding active skips and expected failures in first-party Python. |
+| no-python-test-skips-tests | test | `scripts/tests/test_no_python_test_skips.py` | python | active | - | Adversarial self-tests and repository-cleanliness pin for the Python zero-skip gate. |
 | ocaml-binding-smoke | test | `bindings/ocaml/run.sh` | bash | active | - | Build and run the AY OCaml binding test against libay_ffi. |
 | oom-guard-tests | test | `scripts/tests/test_oom_guard.py` | python | active | - | Tests for _oom_guard.py resource planning and the harness wiring. |
 | resource-harness-tests | test | `scripts/tests/test_resource_harnesses.py` | python | active | - | Tests for benchmark drivers that consume the shared OOM guard. |
+| sat-soundness-gate-resource-tests | test | `scripts/tests/test_sat_soundness_gate_resources.py` | python | active | - | Resource-envelope tests for the SAT soundness gate harness. |
 | smtcomp-harness-tests | test | `scripts/tests/test_smtcomp_harness.py` | python | active | - | Focused regression tests for SMT-COMP preparation, cache, and resource handling. |

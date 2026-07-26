@@ -23,7 +23,7 @@ fn main() {
     };
     let secs: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(60.0);
 
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+    let text = read_maybe_gz(&path).unwrap_or_else(|e| {
         eprintln!("cannot read {path}: {e}");
         std::process::exit(2);
     });
@@ -48,6 +48,32 @@ fn main() {
         p.model.num_cols(),
         p.model.sense()
     );
+
+    // W0 MEASUREMENT: root dual bound before and after the cut loop, no branching.
+    // The one signal that attributes a change to the CUTS rather than to the tree.
+    // Reported on stdout in the file's own objective frame (un-scaled, re-sensed), so
+    // it is directly comparable with a published optimum and with another solver's
+    // root bound.
+    if std::env::var_os("AY_ROOT_CLOSURE").is_some() {
+        use num_traits::ToPrimitive as _;
+        let line = ay_milp::diag_root_closure(&p.model, secs);
+        // The diagnostic already reports in the model's own sense/offset frame; what it
+        // cannot undo is the reader's integralising objective scale, which lives here.
+        let scale = p.obj_scale.to_f64().unwrap_or(1.0);
+        let rescaled = line
+            .split_whitespace()
+            .map(|tok| match tok.split_once('=') {
+                Some((k @ ("bound_lp" | "bound_cut" | "gain"), v)) => {
+                    let x: f64 = v.parse().unwrap_or(f64::NAN);
+                    format!("{k}={}", x / scale)
+                }
+                _ => tok.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("{rescaled}");
+        return;
+    }
 
     // Diagnostic: solve just the float-lane LP relaxation (cold) and report
     // iteration economics; AY_MILP_LP_STATS=1 adds per-phase LPSTAT lines.
@@ -144,7 +170,27 @@ fn main() {
         return;
     }
 
-    let opts = SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs));
+    let mut opts = SolveOpts::new().with_time_limit(Duration::from_secs_f64(secs));
+    // Measurement lever: `AY_MILP_TREE_CERT_LEAVES=N` sets the tree-certificate
+    // leaf budget (default 256). Set it to 0 to opt into the certificate-free
+    // fast path, which enables duplicate-column merging and makes the separately
+    // gated `AY_MILP_SINGLETON_SUB=1` substitution eligible to run.
+    if let Ok(v) = std::env::var("AY_MILP_TREE_CERT_LEAVES") {
+        if let Ok(n) = v.parse::<usize>() {
+            opts = opts.with_tree_cert_leaves(n);
+        }
+    }
+    // Typed parallelism, for measurement runs: `AY_MILP_THREADS=N` (N > 1)
+    // requests N worker threads through the SolveOpts contract and opts out of
+    // the determinism default (deterministic solves always take the serial
+    // paths). `AY_MILP_LATTICE_THREADS`/`NBCORE` remain ceilings only.
+    if let Ok(v) = std::env::var("AY_MILP_THREADS") {
+        if let Ok(n) = v.parse::<u32>() {
+            if n > 1 {
+                opts = opts.with_threads(n).with_determinism(false);
+            }
+        }
+    }
     // Lever A: MOVE the parsed model into the session so only ONE f64 matrix is
     // resident during the solve (was: `&p.model`, which kept the parser's copy
     // alive alongside the session's clone). The model is read back below via
@@ -247,6 +293,25 @@ fn main() {
             eprintln!("{sbline}");
         }
     }
+}
+
+/// MIPLIB ships `.mps.gz` and the corpus is kept that way (320 MB gzipped, several
+/// gigabytes not). Decompressing through the system `gzip` keeps the engine crate free of
+/// a compression dependency for the sake of a measurement example.
+fn read_maybe_gz(path: &str) -> std::io::Result<String> {
+    if !path.ends_with(".gz") {
+        return std::fs::read_to_string(path);
+    }
+    let out = std::process::Command::new("gzip")
+        .args(["-dc", path])
+        .output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "gzip -dc {path}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    String::from_utf8(out.stdout).map_err(std::io::Error::other)
 }
 
 /// A rational objective as a decimal, which is what every other solver prints.

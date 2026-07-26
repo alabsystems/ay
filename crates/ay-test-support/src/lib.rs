@@ -1486,6 +1486,29 @@ fn parent_nested_cargo_lock_path(target_root: &Path) -> PathBuf {
     target_root.join(PARENT_NESTED_CARGO_LOCK_FILE)
 }
 
+struct ParentNestedCargoLock {
+    path: PathBuf,
+    file: filesystem::File,
+}
+
+impl Drop for ParentNestedCargoLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.file.unlock() {
+            if std::thread::panicking() {
+                eprintln!(
+                    "[ay tests] failed to release parent nested-Cargo lock {} while unwinding: {error}",
+                    self.path.display()
+                );
+            } else {
+                panic!(
+                    "failed to release parent nested-Cargo lock {}: {error}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+}
+
 fn assert_parent_nested_cargo_lock_file(path: &Path, file: &filesystem::File) {
     let path_metadata = filesystem::symlink_metadata(path).unwrap_or_else(|error| {
         panic!(
@@ -1558,7 +1581,7 @@ fn open_parent_nested_cargo_lock(target_root: &Path) -> filesystem::File {
     file
 }
 
-fn acquire_parent_nested_cargo_lock(target_root: &Path) -> filesystem::File {
+fn acquire_parent_nested_cargo_lock(target_root: &Path) -> ParentNestedCargoLock {
     let path = parent_nested_cargo_lock_path(target_root);
     let file = open_parent_nested_cargo_lock(target_root);
     file.lock().unwrap_or_else(|error| {
@@ -1568,7 +1591,7 @@ fn acquire_parent_nested_cargo_lock(target_root: &Path) -> filesystem::File {
         )
     });
     assert_parent_nested_cargo_lock_file(&path, &file);
-    file
+    ParentNestedCargoLock { path, file }
 }
 
 fn run_with_environment(
@@ -3352,7 +3375,15 @@ mod tests {
     fn configured_target_root_preserves_nested_lock_avoidance() {
         let target_root = tempfile::tempdir().expect("temporary target root");
         let primary = isolated_cargo_target_dir_for_outer_in(target_root.path(), "exact", None);
-        assert_eq!(primary, target_root.path().join("exact"));
+        assert_eq!(
+            primary,
+            target_root
+                .path()
+                .canonicalize()
+                .expect("temporary target root should be canonicalizable")
+                .join("exact"),
+            "target identity must use the canonical root even when macOS exposes /var via /private/var"
+        );
 
         let outer_exe = primary.join("debug/deps/running-test");
         let nested =

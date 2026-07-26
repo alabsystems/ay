@@ -22,10 +22,12 @@ agreement only and does not ship a general soundness theorem for the procedure.
 
 ## The JSON -> Lean mapping (from the emitted fixtures)
 
-`crates/ay-pb/.../lp_bound.rs :: emit_farkas_cert_json_for_lean_anchor` drives a
-real on-disk `.opb` through AY's certificate path and writes the emitted
-`SCertZ` (serde, BigInt as decimal strings) to `farkas_anchor/{valid,
-tampered}_cert.json`. The mapping is direct:
+The explicit generator
+`cargo run -p ay-pb --features dev-tools --bin ay-pb-dev -- farkas-anchor
+verification/lean/farkas_anchor` drives a real on-disk `.opb` through AY's
+certificate path, validates both checker verdicts, stages both payloads, and
+atomically replaces each `SCertZ` fixture (serde, BigInt as decimal strings) at
+`farkas_anchor/{valid,tampered}_cert.json`. The mapping is direct:
 
   * `QPair {num, den}`  (decimal strings)  ->  `(num, den) : Int x Int`
   * variable name string  ->  the same `String` key

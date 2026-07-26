@@ -208,6 +208,12 @@ fn maxsat_bmo_enabled() -> bool {
 const BMO_CHECK_CONFLICTS: u64 = 200_000;
 /// Wall-clock cap for one BMO check.
 const BMO_CHECK_WALL: Duration = Duration::from_secs(8);
+
+/// Mean per-core wall-clock (ms) above which OLL cores count as "expensive"
+/// for the early descent kick (#expensive-core-descent). Chosen an order of
+/// magnitude above the `lsu_stall_ms_per_core` cheap-core threshold (30ms) so
+/// only genuinely SAT-call-bound instances (big hard formulas) qualify.
+const EXPENSIVE_CORE_MS: u64 = 250;
 /// Skip the BMO throwaway check entirely above this many clauses
 /// (hards + candidate softs) — the throwaway build would cost more than the
 /// promotion is worth.
@@ -236,6 +242,23 @@ fn maxsat_oneshot_preproc_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_PREPROC").as_deref() != Ok("0"))
+}
+
+/// Kill switch for the expensive-core early descent kick
+/// (#expensive-core-descent). DEFAULT ON: `AY_AB_MAXSAT_EARLY_DESCENT=0`
+/// restores the pre-fix gate. Motivation (rna-alignment_wt-k100 family): on a
+/// large hard formula each assumption solve costs ~1s, so OLL reaches neither
+/// the 64-core organic descent bar nor the 20s ub-stale kick floor within
+/// budget — yet the (reversible) uniform-residual totalizer descent, once
+/// engaged, converges from the ub side in a handful of solves. This brings the
+/// kick forward once cores are demonstrably expensive (high mean solve time)
+/// with a small remaining gap and a uniform-weight residual (so the descent
+/// encoding is the cheap totalizer). Reversible: a dry 10s slice hands control
+/// back to OLL, so a mis-fire costs at most one slice.
+fn maxsat_early_descent_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_EARLY_DESCENT").as_deref() != Ok("0"))
 }
 
 /// Wall-clock budget for one core-exhaustion SAT probe.
@@ -370,6 +393,32 @@ impl Default for OllTuning {
 /// `outs[j]` is a literal that is implied true whenever at least `j + 1` of
 /// the leaf input literals are true. Only the input→output direction is
 /// encoded (sufficient for enforcing upper bounds via assuming `¬outs[j]`).
+///
+/// MEASURED NEGATIVE — adding the reverse direction does NOT pay here
+/// (2026-07-25, branch `maxsat/tot-eqs-experiment`, not merged). The known
+/// gap is real: with implication-only clauses a PROVEN-true output satisfies
+/// every clause it occurs in and propagates nothing downward, so the engine
+/// re-derives an already-proven bound by search on every later conflict.
+/// CGSS2 closes it by calling `forced_true`/`add_partial_eqs` at the two
+/// points where an output is proven. A faithful port of that machinery —
+/// including CGSS2's budget model (decs/cost/prod = 50/50/2500) and a
+/// distilled "one permanent hard clause per core" variant — was measured on
+/// mse24 weighted, 30s, paired 3+3 legs on the same binary:
+///   #tot-eqs      net -3 solved (300 vs 303), median ratio 1.0045, +5.1% wall
+///   #core-clause  net -3 solved (298 vs 301), median ratio 1.0074, +7.2% wall
+/// Both legs: ZERO wrong answers, 0 cost mismatches over ~295 commonly-solved
+/// instances — the soundness argument held empirically; it simply loses on
+/// cost. WHY: CGSS2's equivalences earn their BCP cost by propagating into
+/// SHARED subtrees (it prunes with `!eql && !eqr && parents < 2`), but AY
+/// builds a FRESH balanced tree per core, so the port is a strictly weakened
+/// CGSS — full clause cost, little payoff.
+///
+/// The prerequisite that would change the verdict is STRUCTURE SHARING:
+/// arena-ify `TotNode` and intern leaves and child pairs (CGSS `lit_leafs` /
+/// `parents`). TRAP for that work: guarded-descent totalizers must NEVER be
+/// interned — a guard-weakened node does not entail input→output for another
+/// owner, which would under-charge the cost identity and report a cost BELOW
+/// the optimum.
 struct TotNode {
     outs: Vec<Literal>,
     size: usize,
@@ -3653,6 +3702,27 @@ impl OllEngine {
         }
     }
 
+    /// Uniform weight over the live (non-hardened) original softs, if every
+    /// such soft shares one positive weight — exactly the condition under which
+    /// `ensure_descent_enc` builds the cheap totalizer descent (rather than a
+    /// GTE/adder). Cheap O(softs) scan; consulted only at the descent entry
+    /// gate (#expensive-core-descent), so it never enters a per-core hot path.
+    fn residual_uniform_weight(&self) -> Option<Weight> {
+        let mut w0: Option<Weight> = None;
+        for i in 0..self.softs.len() {
+            if self.hardened_sels.contains(&self.soft_selectors[i]) {
+                continue;
+            }
+            let w = self.soft_weights[i];
+            match w0 {
+                None => w0 = Some(w),
+                Some(prev) if prev == w => {}
+                _ => return None,
+            }
+        }
+        w0.filter(|&w| w > 0)
+    }
+
     /// Build (once) the best-fitting descent encoding for this instance:
     /// totalizer for uniform weights, GTE for small mixed-weight instances,
     /// adder network otherwise. Returns false when none is available.
@@ -4269,11 +4339,44 @@ impl OllEngine {
             if !descent_kick
                 && self.best_model.is_some()
                 && self.ub.saturating_sub(self.effective_lb()) <= 32
-                && self.ub_last_improved.elapsed() > Duration::from_secs(15)
                 && Instant::now() >= descent_not_before
-                && started.elapsed() > Duration::from_secs(20)
+                && (self.ub_last_improved.elapsed() > Duration::from_secs(15)
+                    && started.elapsed() > Duration::from_secs(20))
             {
                 descent_kick = true;
+            }
+            // #expensive-core-descent: the organic 20s/15s floors above are
+            // calibrated for cheap-core instances; on a large hard formula each
+            // assumption solve costs ~1s, so OLL neither reaches the 64-core
+            // organic bar nor those floors within budget, yet the reversible
+            // totalizer descent converges from the ub side in a handful of
+            // solves. Bring the kick forward once cores are demonstrably
+            // expensive (mean solve >= EXPENSIVE_CORE_MS over >= 8 cores), the
+            // gap is already small, and the live residual is uniform-weight (so
+            // the descent encoding is the cheap totalizer). A dry 10s slice
+            // returns to OLL, so a mis-fire costs at most one slice.
+            if !descent_kick
+                && maxsat_early_descent_enabled()
+                && self.best_model.is_some()
+                && self.ub.saturating_sub(self.effective_lb()) <= 32
+                && Instant::now() >= descent_not_before
+                && self.stats.cores_found >= 8
+                && started.elapsed() > Duration::from_secs(4)
+                && (started.elapsed().as_millis() as u64)
+                    >= self.stats.cores_found.saturating_mul(EXPENSIVE_CORE_MS)
+                && self.residual_uniform_weight().is_some()
+            {
+                descent_kick = true;
+                if debug_trace() {
+                    eprintln!(
+                        "c expensive-core descent kick: cores={} elapsed_ms={} gap={} lb={} ub={}",
+                        self.stats.cores_found,
+                        started.elapsed().as_millis(),
+                        self.ub.saturating_sub(self.effective_lb()),
+                        self.effective_lb(),
+                        self.ub,
+                    );
+                }
             }
             if self.best_model.is_some()
                 && (descent_kick

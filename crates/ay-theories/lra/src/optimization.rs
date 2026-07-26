@@ -204,6 +204,8 @@ impl LraSolver {
         // break the tracked-only chain (#inc-guard-chain).
         self.guard_clean_valid = false;
         self.guard_tracked_only = false;
+        // #warm-simplex: untracked value write (and a new row below).
+        self.warm_invalidate();
         self.vars[obj_var as usize].value = obj_value;
         self.vars[obj_var as usize].status = Some(VarStatus::Basic(self.rows.len()));
 
@@ -444,6 +446,8 @@ impl LraSolver {
             // break the tracked-only chain (#inc-guard-chain).
             self.guard_clean_valid = false;
             self.guard_tracked_only = false;
+            // #warm-simplex: untracked value writes.
+            self.warm_invalidate();
             self.vars[pivot_var as usize].value = target_val;
 
             // Update all basic variables that depend on pivot_var

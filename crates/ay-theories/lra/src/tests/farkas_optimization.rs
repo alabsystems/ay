@@ -1433,3 +1433,152 @@ fn test_simplex_pivot_vec_shift_cost() {
     //   Σ_{row ∈ affected_rows} (K_row + K_pivot * K_row) = O(R * K_pivot * K_avg)
     // For dense problems (K_avg = K_pivot = K), this is O(R * K²).
 }
+
+// ========================================================================
+// #8471 - bound-presence guards in check_row_strict_infeasibility
+// ========================================================================
+//
+// The row-infeasibility pre-check skips each pass-1 sweep when the basic var
+// lacks the bound that sweep could contradict. These tests call the pre-check
+// DIRECTLY on a hand-built tableau.
+//
+// Going through check() cannot pin these guards: the pre-check is only a fast
+// path, so when it is disabled the dual simplex still finds the same conflict
+// by pivoting and the test still passes. Verified by mutation testing - an
+// end-to-end version of these tests survives a `basic_has_lower = false`
+// mutant, while the direct form below kills it.
+//
+// The failure mode being pinned is a row conflict going undetected here.
+
+/// Build a one-row tableau `basic = x + y` with the given bounds, and return
+/// the solver ready for a direct `check_row_strict_infeasibility()` call.
+/// Vars: 0 = x, 1 = y (non-basic), 2 = the row's basic var.
+fn one_row_solver(
+    terms: &TermStore,
+    x_bounds: (Option<Bound>, Option<Bound>),
+    y_bounds: (Option<Bound>, Option<Bound>),
+    basic_bounds: (Option<Bound>, Option<Bound>),
+) -> LraSolver {
+    let mut solver = LraSolver::new(terms);
+    let zero = || InfRational::from_rational(BigRational::zero());
+    solver.vars = vec![
+        VarInfo {
+            value: zero(),
+            lower: x_bounds.0,
+            upper: x_bounds.1,
+            status: Some(VarStatus::NonBasic),
+        },
+        VarInfo {
+            value: zero(),
+            lower: y_bounds.0,
+            upper: y_bounds.1,
+            status: Some(VarStatus::NonBasic),
+        },
+        VarInfo {
+            value: zero(),
+            lower: basic_bounds.0,
+            upper: basic_bounds.1,
+            status: Some(VarStatus::Basic(0)),
+        },
+    ];
+    // Row 0: var2 = 1*x + 1*y
+    solver.rows = vec![TableauRow::new(
+        2,
+        vec![
+            (0, BigRational::from(BigInt::from(1))),
+            (1, BigRational::from(BigInt::from(1))),
+        ],
+        BigRational::zero(),
+    )];
+    solver.col_index = vec![Vec::new(); 3];
+    solver.col_index[0].push(ColEntry::new(0, 0));
+    solver.col_index[1].push(ColEntry::new(0, 1));
+    solver.basic_var_to_row.insert(2, 0);
+    // Every bound reason must be asserted for the Farkas pass to accept the conflict.
+    for info in &solver.vars {
+        for b in [info.lower.as_ref(), info.upper.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            for &r in &b.reasons {
+                solver.asserted.insert(r, true);
+            }
+        }
+    }
+    solver
+}
+
+/// A bound at integer `v` justified by a single asserted reason atom, so
+/// pass 2 can actually build the Farkas certificate (an unjustified bound
+/// makes `conflict_literals_all_asserted` reject the conflict and the
+/// pre-check returns None regardless of the guards under test).
+fn plain_bound(reason: u32, v: i64, strict: bool) -> Bound {
+    Bound::new(
+        Rational::from(BigRational::from(BigInt::from(v))),
+        vec![TermId(reason)],
+        vec![true],
+        Vec::new(),
+        strict,
+    )
+}
+
+/// Basic var carries an UPPER bound only: the lower sweep must still fire.
+/// x > 0, y > 0, x + y <= 0.
+#[test]
+fn row_strict_infeasibility_upper_only_basic_still_detected() {
+    let terms = TermStore::new();
+    let mut solver = one_row_solver(
+        &terms,
+        (Some(plain_bound(101, 0, true)), None),
+        (Some(plain_bound(102, 0, true)), None),
+        (None, Some(plain_bound(103, 0, false))),
+    );
+
+    assert!(
+        solver.check_row_strict_infeasibility().is_some(),
+        "row pre-check must detect x>0, y>0, x+y<=0 (upper-only basic var)"
+    );
+}
+
+/// Basic var carries a LOWER bound only: the upper sweep must still fire.
+/// x < 0, y < 0, x + y >= 0. This is the case a stale or wrongly-hoisted
+/// `basic_has_lower` would silently skip.
+#[test]
+fn row_strict_infeasibility_lower_only_basic_still_detected() {
+    let terms = TermStore::new();
+    let mut solver = one_row_solver(
+        &terms,
+        (None, Some(plain_bound(101, 0, true))),
+        (None, Some(plain_bound(102, 0, true))),
+        (Some(plain_bound(103, 0, false)), None),
+    );
+
+    assert!(
+        solver.check_row_strict_infeasibility().is_some(),
+        "row pre-check must detect x<0, y<0, x+y>=0 (lower-only basic var)"
+    );
+}
+
+/// Both bounds present, and the LOWER sweep bails out early (`lower_valid`
+/// false: the non-basic vars carry no lower bounds). The upper sweep must
+/// still run - this pins the second guard, which sits after a `&mut self`
+/// pass-2 call and so must be re-read rather than hoisted across it.
+#[test]
+fn row_strict_infeasibility_both_bounds_upper_sweep_still_runs() {
+    let terms = TermStore::new();
+    let mut solver = one_row_solver(
+        &terms,
+        (None, Some(plain_bound(101, 0, true))),
+        (None, Some(plain_bound(102, 0, true))),
+        (
+            Some(plain_bound(103, 0, false)),
+            Some(plain_bound(104, 10, false)),
+        ),
+    );
+
+    assert!(
+        solver.check_row_strict_infeasibility().is_some(),
+        "row pre-check must detect the conflict via the upper sweep when the \
+         lower sweep bails out"
+    );
+}

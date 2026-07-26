@@ -14,8 +14,8 @@
  *
  * Memory Management:
  * - ay_solver_new() returns handles that must be freed with ay_solver_free()
- * - String returns (ay_get_model, ay_get_error, ay_get_statistics, ay_version)
- *   must be freed with ay_string_free()
+ * - String returns (including ay_get_model, ay_get_error, ay_get_statistics,
+ *   ay_search_*_json, and ay_version) must be freed with ay_string_free()
  *
  * Author: Andrew Yates <andrewyates.name@gmail.com>
  */
@@ -34,6 +34,9 @@ extern "C" {
 #define AY_UNSAT    0    /* Unsatisfiable - no model exists */
 #define AY_UNKNOWN  (-1) /* Unknown - solver could not determine */
 #define AY_ERROR    (-2) /* Error - invalid input or internal error */
+
+/* Maximum search JSON bytes accepted, excluding the terminating NUL. */
+#define AY_SEARCH_MAX_JSON_BYTES (16U * 1024U * 1024U)
 
 /* Opaque solver handle */
 typedef struct AYSolver AYSolver;
@@ -116,6 +119,37 @@ char* ay_get_statistics(AYSolver* solver);
  * @param s String to free (safe to call with null)
  */
 void ay_string_free(char* s);
+
+/* ============================================================================
+ * High-level finite-domain search (JSON one-shot API)
+ * ============================================================================ */
+
+/**
+ * Solve a versioned ay-search JSON specification.
+ *
+ * The returned JSON is always an envelope: successful solver results preserve
+ * sat/unsat/unknown, while malformed input and internal failures use an error
+ * status. The input is parsed as data by ay-search's restricted expression
+ * parser; it is never evaluated as host-language code.
+ * Inputs larger than AY_SEARCH_MAX_JSON_BYTES are rejected before JSON parsing.
+ *
+ * @param spec_json Null-terminated UTF-8 SearchSpec JSON
+ * @return Owned JSON string (caller must free with ay_string_free)
+ */
+char* ay_search_solve_json(const char* spec_json);
+
+/**
+ * Compile a versioned ay-search JSON specification to an SMT-LIB rendering.
+ *
+ * The returned value is a JSON envelope containing either `smt2` or an error.
+ * This is intended for inspection, reproducibility, and interoperability; the
+ * ordinary solve path uses AY's native finite-domain engine.
+ * Inputs larger than AY_SEARCH_MAX_JSON_BYTES are rejected before JSON parsing.
+ *
+ * @param spec_json Null-terminated UTF-8 SearchSpec JSON
+ * @return Owned JSON string (caller must free with ay_string_free)
+ */
+char* ay_search_compile_json(const char* spec_json);
 
 /**
  * Reset the solver state.

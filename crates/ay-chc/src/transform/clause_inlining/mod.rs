@@ -175,6 +175,12 @@ impl ClauseTrace {
     fn is_composite(&self) -> bool {
         !self.poisoned && self.original_clause.is_some() && !self.steps.is_empty()
     }
+
+    /// Whether another inlining round may compose into this trace while
+    /// retaining a one-level, ground-backtranslatable expansion.
+    fn is_uncomposed(&self) -> bool {
+        !self.poisoned && self.original_clause.is_none()
+    }
 }
 
 /// Clause inlining preprocessor.
@@ -290,8 +296,9 @@ impl ClauseInliner {
         // clause starts tracking its own INPUT index; retains/maps below keep
         // the alignment.
         let mut traces: Vec<ClauseTrace> = (0..clauses.len()).map(ClauseTrace::new).collect();
-        // Whether `traces` still records genuine INPUT clause indices (see the
-        // multi-def reset below).
+        // Whether `traces` still records genuine INPUT clause indices. The
+        // ground-enabled multi-def path preserves this exactly; the legacy
+        // kill-switch path retains its old fail-closed reset below.
         let mut traces_aligned = true;
 
         // Phase 1: Unique-definition inlining (Eldarica-style).
@@ -300,27 +307,37 @@ impl ClauseInliner {
         // Phase 2: Multi-definition inlining (Z3-style).
         // Part of #6047: reduces 4-predicate ay_watched to 1 predicate (matching Z3).
         let (multi_def_clauses, multi_def_rewritten) =
-            self.inline_multi_def(&clauses, &mut inlined_defs);
+            self.inline_multi_def(&clauses, &mut inlined_defs, &mut traces);
         clauses = multi_def_clauses;
         if multi_def_rewritten {
-            // Multi-def expansion rewrote the clause list (new clauses / new
-            // order). We cannot safely realign the unique-def traces, so drop
-            // them: fail closed (no expansion) rather than risk a stale trace.
-            // Sound — the kernel gate would reject a stale reconstruction
-            // anyway; this just avoids the wasted SMT work.
-            traces = (0..clauses.len()).map(ClauseTrace::new).collect();
-            // The reset traces carry OUTPUT indices in `c0_input_index`, so the
-            // output→input clause map is no longer meaningful either. Ground
-            // back-translation must fail closed rather than map a step onto an
-            // unrelated input clause.
-            traces_aligned = false;
+            if crate::ground_derivation::ground_backtranslation_enabled() {
+                // Multi-def expansion retained exact caller/definition source
+                // indices. Run the cleanup through the same trace-aware path
+                // as phase 1 instead of its former untracked private loop.
+                self.inline_unique_defs(&mut clauses, &mut inlined_defs, &mut traces);
+            } else {
+                // Preserve the kill-switch path exactly: without ground trace
+                // tracking, a multi-def rewrite invalidates clause alignment.
+                traces = (0..clauses.len()).map(ClauseTrace::new).collect();
+                traces_aligned = false;
+                self.inline_unique_defs(&mut clauses, &mut inlined_defs, &mut traces);
+                // The cleanup traces start from post-multi-def OUTPUT indices,
+                // not inliner INPUT indices. Keep legacy invalidity expansion
+                // disabled for them as well as ground index translation.
+                traces = (0..clauses.len()).map(ClauseTrace::new).collect();
+            }
         }
 
         // Phase 3: Compact predicates — remove eliminated predicates from declarations
-        // and remap IDs so PDR doesn't waste time on ghost predicates. Compaction
-        // keeps every clause and preserves order, so `traces` stays aligned with
-        // the final clause list.
-        let (new_problem, new_to_old) = self.compact_predicates(problem, &mut clauses);
+        // and remap IDs so PDR doesn't waste time on ghost predicates. Rebuilding
+        // may prune simplified-false/duplicate clauses, so compaction filters
+        // `traces` in lockstep to preserve final output-index alignment.
+        let (new_problem, new_to_old) = self.compact_predicates(problem, &mut clauses, &mut traces);
+        debug_assert_eq!(
+            traces.len(),
+            new_problem.clauses().len(),
+            "predicate compaction must retain one trace per emitted clause"
+        );
 
         // Output clause index -> input clause index, for the ground
         // back-translator. `None` whenever the alignment was lost.
@@ -331,6 +348,22 @@ impl ClauseInliner {
             .enumerate()
             .filter(|(_, t)| t.is_composite())
             .collect();
+        debug_assert!(
+            composition_traces
+                .keys()
+                .all(|index| *index < new_problem.clauses().len()),
+            "composition trace key escaped the final compacted clause list"
+        );
+        debug_assert!(
+            output_to_input
+                .as_ref()
+                .is_none_or(|map| map.len() == new_problem.clauses().len()),
+            "output-to-input clause map is not aligned with compacted clauses"
+        );
+        debug_assert!(
+            traces_aligned || composition_traces.is_empty(),
+            "unaligned multi-def cleanup leaked output-index composition traces"
+        );
         (
             new_problem,
             inlined_defs,
@@ -346,7 +379,13 @@ impl ClauseInliner {
         &self,
         original: &ChcProblem,
         clauses: &mut Vec<HornClause>,
+        traces: &mut Vec<ClauseTrace>,
     ) -> (ChcProblem, FxHashMap<PredicateId, PredicateId>) {
+        debug_assert_eq!(
+            clauses.len(),
+            traces.len(),
+            "clause/trace alignment was lost before predicate compaction"
+        );
         // Collect predicate IDs still referenced in clauses.
         let mut used: FxHashSet<PredicateId> = FxHashSet::default();
         for clause in clauses.iter() {
@@ -366,9 +405,15 @@ impl ClauseInliner {
             for pred in old_preds {
                 new_problem.declare_predicate(&pred.name, pred.arg_sorts.clone());
             }
-            for clause in clauses.drain(..) {
+            let mut retained_traces = Vec::with_capacity(traces.len());
+            for (clause, trace) in clauses.drain(..).zip(traces.drain(..)) {
+                let before = new_problem.clauses().len();
                 new_problem.add_clause(clause);
+                if new_problem.clauses().len() > before {
+                    retained_traces.push(trace);
+                }
             }
+            *traces = retained_traces;
             return (new_problem, FxHashMap::default());
         }
 
@@ -393,10 +438,20 @@ impl ClauseInliner {
             );
         }
 
-        // Remap predicate IDs in all clauses and add them.
-        for clause in clauses.drain(..) {
+        // Remap predicate IDs in all clauses and add them. `add_clause` may
+        // simplify a constant-false expanded clause away (or deduplicate it).
+        // Filter its trace in the SAME lockstep operation; otherwise every
+        // later output clause selects the preceding clause's composition trace
+        // and ground reconstruction addresses unrelated input rules.
+        let mut retained_traces = Vec::with_capacity(traces.len());
+        for (clause, trace) in clauses.drain(..).zip(traces.drain(..)) {
+            let before = new_problem.clauses().len();
             new_problem.add_clause(Self::remap_clause_preds(&clause, &old_to_new));
+            if new_problem.clauses().len() > before {
+                retained_traces.push(trace);
+            }
         }
+        *traces = retained_traces;
         (new_problem, new_to_old)
     }
 
@@ -439,7 +494,58 @@ impl ClauseInliner {
             if unique_def_indices.is_empty() {
                 break;
             }
-            let final_def_indices = self.extract_acyclic_def_indices(clauses, unique_def_indices);
+            let mut final_def_indices =
+                self.extract_acyclic_def_indices(clauses, unique_def_indices);
+            if crate::ground_derivation::ground_backtranslation_enabled() {
+                let multi_candidates = self.multi_def_candidates(clauses);
+
+                // A definition that only became inlineable after an earlier
+                // round is often itself a composite clause. Flattening that
+                // composite into another caller would require a nested trace;
+                // the current ground translator deliberately represents one
+                // composition layer. Likewise, composing into a caller that
+                // already has a trace poisons its evidence.
+                //
+                // Keep the immediate neighbours of a multi-defined predicate
+                // uncomposed as well. Phase 2 can then expand that predicate
+                // with an exact one-level caller/definition trace instead of
+                // inheriting a nested trace from phase 1.
+                //
+                // Keep those predicates explicit instead. This affects only
+                // completeness/performance: the CHC remains equivalent, while
+                // every transformed Unsafe derivation retains an exact
+                // output→input proof expansion.
+                final_def_indices.retain(|pred, clause_idx| {
+                    traces
+                        .get(*clause_idx)
+                        .is_some_and(ClauseTrace::is_uncomposed)
+                        && !clauses[*clause_idx]
+                            .body
+                            .predicates
+                            .iter()
+                            .any(|(body_pred, _)| multi_candidates.contains(body_pred))
+                        && clauses.iter().enumerate().all(|(caller_idx, clause)| {
+                            let calls_pred = clause
+                                .body
+                                .predicates
+                                .iter()
+                                .any(|(body_pred, _)| body_pred == pred);
+                            !calls_pred
+                                || (traces
+                                    .get(caller_idx)
+                                    .is_some_and(ClauseTrace::is_uncomposed)
+                                    && !clause
+                                        .body
+                                        .predicates
+                                        .iter()
+                                        .any(|(body_pred, _)| multi_candidates.contains(body_pred))
+                                    && clause
+                                        .head
+                                        .predicate_id()
+                                        .map_or(true, |head| !multi_candidates.contains(&head)))
+                        })
+                });
+            }
             if final_def_indices.is_empty() {
                 break;
             }
@@ -449,14 +555,17 @@ impl ClauseInliner {
                 .map(|(&pred_id, &clause_idx)| (pred_id, clauses[clause_idx].clone()))
                 .collect();
 
-            // Stable INPUT clause index of each definition, valid only on the
-            // first pass (later passes address a mutated clause list). This
-            // feeds the reconstructed entry's `incoming_clause`.
-            let def_input_indices: FxHashMap<PredicateId, usize> = if iteration == 1 {
-                final_def_indices.iter().map(|(&p, &i)| (p, i)).collect()
-            } else {
-                FxHashMap::default()
-            };
+            // `traces` stays aligned with `clauses` through every retain. For
+            // each definition admitted by the one-level gate above,
+            // c0_input_index is therefore its stable INPUT clause index.
+            let def_input_indices: FxHashMap<PredicateId, usize> = final_def_indices
+                .iter()
+                .filter_map(|(&pred, &clause_idx)| {
+                    traces
+                        .get(clause_idx)
+                        .map(|trace| (pred, trace.c0_input_index))
+                })
+                .collect();
 
             if self.verbose {
                 let inlined_preds: Vec<_> =

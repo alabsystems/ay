@@ -10,26 +10,30 @@
 //! (median + geometric mean of AY/z3, decided-by-both files only) with >2x
 //! win/loss counts.
 //!
-//! Isolation model: each (file, solver) pair is evaluated in a fresh child
-//! process (the hidden `bench-one` mode). This gives (a) crash isolation — a
-//! solver abort cannot take down or bias the campaign, (b) clean hard
-//! timeouts — the child is SIGKILLed, so no leaked thread keeps burning CPU
-//! and skewing later measurements, and (c) honest timing — the child measures
-//! wall time strictly around `Z3_eval_smtlib2_string`, excluding process
-//! spawn, `dlopen`, and file I/O.
+//! Isolation model: each (file, solver) pair is evaluated in a stopped-exec
+//! child process group (the hidden `bench-one` mode). The campaign planner
+//! caps parallel jobs, a zero-grace RSS watchdog is armed before exec, and
+//! residual descendants are killed before the leader is reaped. This gives
+//! crash/resource isolation, bounded hard timeouts, and honest eval-only wall
+//! timing around `Z3_eval_smtlib2_string`.
 //!
 //! Outputs: a stdout table, a JSON certificate, and a markdown report with an
 //! auto-populated "where z3 wins" section. Nothing is sampled or filtered:
 //! every `.smt2` under every given root is run and accounted for.
 
 use std::collections::BTreeMap;
-use std::io::Read as _;
+use std::ffi::OsString;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
+
+use ay_bench::{
+    effective_execution_envelope, PlannedResources, ResourcePlan, ENFORCEMENT_AY_MEMORY_RSS_V1,
+    ENFORCEMENT_RSS_WATCHDOG_V1,
+};
 
 use crate::diff::{verdicts_of, Verdict};
 use crate::loader;
@@ -48,13 +52,84 @@ pub(crate) const WIN_LOSS_MIN_SECS: f64 = 0.010; // 10 ms
 /// budget is recorded as a timeout regardless of the grace.
 pub(crate) const KILL_GRACE: Duration = Duration::from_secs(2);
 
+pub(crate) fn hard_timeout(timeout: Duration) -> Result<Duration, String> {
+    timeout
+        .checked_add(KILL_GRACE)
+        .ok_or_else(|| "child hard-timeout overflow".to_string())
+}
+
+pub(crate) fn resource_evidence(
+    plan: &ResourcePlan,
+    solver_timeout: Duration,
+    include_selfcheck: bool,
+) -> Result<serde_json::Value, String> {
+    let hard_timeout = hard_timeout(solver_timeout)?;
+    let hard_timeout_secs = hard_timeout.as_secs_f64();
+    let ffi_envelope =
+        effective_execution_envelope(plan, ENFORCEMENT_RSS_WATCHDOG_V1, hard_timeout_secs)
+            .map_err(|error| error.to_string())?;
+    let selfcheck = if include_selfcheck {
+        let envelope =
+            effective_execution_envelope(plan, ENFORCEMENT_AY_MEMORY_RSS_V1, hard_timeout_secs)
+                .map_err(|error| error.to_string())?;
+        Some(serde_json::json!({
+            "enforcement": ENFORCEMENT_AY_MEMORY_RSS_V1,
+            "execution_envelope": envelope,
+        }))
+    } else {
+        None
+    };
+    Ok(serde_json::json!({
+        "requested_jobs": plan.requested_jobs,
+        "effective_jobs": plan.jobs,
+        "memlimit_mb_per_child": plan.memlimit_mb_per_child,
+        "nbcore_per_child": plan.nbcore_per_child,
+        "headroom_mb": plan.headroom_mb,
+        "planner": plan.planner,
+        "solver_timeout_secs": solver_timeout.as_secs_f64(),
+        "hard_timeout_secs": hard_timeout_secs,
+        "external_ffi": {
+            "enforcement": ENFORCEMENT_RSS_WATCHDOG_V1,
+            "execution_envelope": ffi_envelope,
+        },
+        "ay_selfcheck": selfcheck,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Child mode: `bench-one <lib> <file>`
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
+fn process_peak_rss_bytes() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `usage` points to writable storage for one `rusage`, and
+    // `RUSAGE_SELF` asks the kernel to initialize it for this process.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: a successful `getrusage` call initialized the complete value.
+    let usage = unsafe { usage.assume_init() };
+    let raw = u64::try_from(usage.ru_maxrss).ok()?;
+    #[cfg(target_os = "macos")]
+    {
+        Some(raw)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Some(raw.saturating_mul(1024))
+    }
+}
+
+#[cfg(not(unix))]
+fn process_peak_rss_bytes() -> Option<u64> {
+    None
+}
+
 /// Child-process entry point. Loads ONE library, evaluates ONE script, and
-/// prints `AYZ3_WALL_NS <ns>` followed by the solver's raw output. The wall
-/// time covers exactly the `Z3_eval_smtlib2_string` call.
+/// prints strict wall-time and peak-RSS protocol headers followed by the
+/// solver's raw output. The wall time covers exactly the
+/// `Z3_eval_smtlib2_string` call.
 ///
 /// Exit codes: 0 ok, 3 unreadable input, 4 library load failure. Any other
 /// termination (signal, abort) is observed by the parent as a solver crash.
@@ -91,7 +166,7 @@ pub(crate) fn run_child(lib_path: &Path, file: &Path) -> i32 {
     // SAFETY: `api` holds valid function pointers into the library opened
     // above; each is called at its declared signature. The output string is
     // owned by the context and copied out before teardown.
-    unsafe {
+    let (wall, out) = unsafe {
         let cfg = (api.mk_config)();
         let ctx = (api.mk_context)(cfg);
         let t0 = Instant::now();
@@ -104,15 +179,23 @@ pub(crate) fn run_child(lib_path: &Path, file: &Path) -> i32 {
                 .to_string_lossy()
                 .into_owned()
         };
-        // Report BEFORE teardown so a teardown crash still surfaces as a
-        // nonzero exit (the parent treats any nonzero exit as a crash).
-        let mut stdout = std::io::stdout();
-        let _ = writeln!(stdout, "AYZ3_WALL_NS {}", wall.as_nanos());
-        let _ = stdout.write_all(out.as_bytes());
-        let _ = stdout.flush();
         (api.del_context)(ctx);
         (api.del_config)(cfg);
+        (wall, out)
+    };
+    let peak_rss = process_peak_rss_bytes();
+    let mut stdout = std::io::stdout();
+    let _ = writeln!(stdout, "AYZ3_WALL_NS {}", wall.as_nanos());
+    match peak_rss {
+        Some(bytes) => {
+            let _ = writeln!(stdout, "AYZ3_RSS_BYTES {bytes}");
+        }
+        None => {
+            let _ = writeln!(stdout, "AYZ3_RSS_BYTES -");
+        }
     }
+    let _ = stdout.write_all(out.as_bytes());
+    let _ = stdout.flush();
     0
 }
 
@@ -126,6 +209,8 @@ pub(crate) enum OutcomeKind {
     Verdicts(Vec<Verdict>),
     /// Exceeded the wall-clock budget (killed, or self-reported over budget).
     Timeout,
+    /// Exceeded the campaign's enforced per-process-group RSS envelope.
+    MemoryLimit,
     /// The solver process died (signal / abort / nonzero exit).
     Crash(String),
     /// The harness could not feed the file (unreadable / interior NUL).
@@ -138,10 +223,9 @@ pub(crate) struct BenchOutcome {
     /// Eval-only wall time as self-reported by the child; for timeouts this
     /// is clamped to the budget, for crashes it is the parent-observed span.
     pub(crate) wall: Duration,
-    /// Peak resident set size of the child process (BYTES), captured by
-    /// `wait4`/`rusage` when the child was reaped cleanly. `None` for a
-    /// SIGKILLed timeout, a harness spawn/wait error, or a non-unix host where
-    /// per-child `rusage` is unavailable.
+    /// Peak resident set size of the child process (BYTES), self-reported from
+    /// `getrusage(RUSAGE_SELF)` after successful solver teardown. `None` for a
+    /// killed/failed child or a host without per-process `rusage`.
     pub(crate) peak_rss: Option<u64>,
 }
 
@@ -151,6 +235,7 @@ impl BenchOutcome {
             OutcomeKind::Verdicts(v) if v.is_empty() => "-".to_string(),
             OutcomeKind::Verdicts(v) => v.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(","),
             OutcomeKind::Timeout => "timeout".to_string(),
+            OutcomeKind::MemoryLimit => "memout".to_string(),
             OutcomeKind::Crash(_) => "crash".to_string(),
             OutcomeKind::InputError(_) => "input-error".to_string(),
         }
@@ -201,6 +286,9 @@ pub(crate) enum Category {
     TimeoutAy,
     TimeoutZ3,
     TimeoutBoth,
+    MemoutAy,
+    MemoutZ3,
+    MemoutBoth,
     CrashAy,
     CrashZ3,
     CrashBoth,
@@ -222,6 +310,9 @@ impl Category {
             Category::TimeoutAy => "TIMEOUT-ay",
             Category::TimeoutZ3 => "TIMEOUT-z3",
             Category::TimeoutBoth => "TIMEOUT-both",
+            Category::MemoutAy => "MEMOUT-ay",
+            Category::MemoutZ3 => "MEMOUT-z3",
+            Category::MemoutBoth => "MEMOUT-both",
             Category::CrashAy => "CRASH-ay",
             Category::CrashZ3 => "CRASH-z3",
             Category::CrashBoth => "CRASH-both",
@@ -252,6 +343,9 @@ pub(crate) fn categorize(ay: &BenchOutcome, z3: &BenchOutcome) -> Category {
         (OutcomeKind::Crash(_), OutcomeKind::Crash(_)) => return Category::CrashBoth,
         (OutcomeKind::Crash(_), _) => return Category::CrashAy,
         (_, OutcomeKind::Crash(_)) => return Category::CrashZ3,
+        (OutcomeKind::MemoryLimit, OutcomeKind::MemoryLimit) => return Category::MemoutBoth,
+        (OutcomeKind::MemoryLimit, _) => return Category::MemoutAy,
+        (_, OutcomeKind::MemoryLimit) => return Category::MemoutZ3,
         (OutcomeKind::Timeout, OutcomeKind::Timeout) => return Category::TimeoutBoth,
         (OutcomeKind::Timeout, _) => return Category::TimeoutAy,
         (_, OutcomeKind::Timeout) => return Category::TimeoutZ3,
@@ -303,6 +397,8 @@ pub(crate) fn categorize(ay: &BenchOutcome, z3: &BenchOutcome) -> Category {
 pub(crate) struct RawRun {
     /// True iff the child was SIGKILLed for exceeding the deadline.
     pub(crate) killed: bool,
+    /// True iff the RSS watchdog terminated the process group.
+    pub(crate) memout: bool,
     /// Exit code if the child exited normally; `None` if it died by signal.
     pub(crate) code: Option<i32>,
     /// Human-readable status (`exit status: N` / `signal: 6`) for messages.
@@ -312,181 +408,68 @@ pub(crate) struct RawRun {
     /// Parent-observed wall time from spawn to reap (used as a fallback when
     /// the child does not self-report an eval time).
     pub(crate) observed: Duration,
-    /// Peak resident set size of the reaped child in BYTES (from `wait4`'s
-    /// `rusage.ru_maxrss`), or `None` when the child was killed / never reaped
-    /// cleanly / the host cannot report per-child `rusage`.
-    pub(crate) max_rss: Option<u64>,
+    /// The child produced more stdout than the fixed one-MiB parent cap.
+    pub(crate) output_truncated: bool,
     /// Set iff spawning or waiting on the child failed at the harness level
     /// (not the solver's fault).
     pub(crate) harness_error: Option<String>,
 }
 
-/// Peak resident set size from a reaped child's `rusage`, normalized to BYTES.
-///
-/// `ru_maxrss` unit differs by platform: Darwin/macOS reports BYTES, while
-/// Linux (and the other BSD-derived Unixes) report KILOBYTES. We normalize to
-/// bytes so callers compare like with like regardless of host.
-#[cfg(unix)]
-fn rusage_max_rss_bytes(usage: &libc::rusage) -> u64 {
-    let raw = u64::try_from(usage.ru_maxrss).unwrap_or(0);
-    #[cfg(target_os = "macos")]
-    {
-        raw // Darwin: already bytes.
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        raw.saturating_mul(1024) // Linux/BSD: kilobytes -> bytes.
-    }
-}
-
-/// Non-blocking reap of `child` that, on unix, ALSO captures the child's peak
-/// RSS by reaping through `wait4` (which fills a `rusage`) rather than the
-/// std `try_wait` (which throws the `rusage` away). Returns `Ok(None)` while
-/// the child is still running. On non-unix hosts there is no per-child
-/// `rusage`, so it falls back to `Child::try_wait` and reports no RSS.
-///
-/// Reaping the pid directly is sound here: we only ever call this on our own
-/// child, we stop the moment it is reaped (so the pid cannot be recycled under
-/// us), and `std::process::Child` performs no reap on drop, so there is no
-/// double-wait.
-#[cfg(unix)]
-fn try_reap_with_rss(
-    child: &mut std::process::Child,
-) -> std::io::Result<Option<(std::process::ExitStatus, Option<u64>)>> {
-    use std::os::unix::process::ExitStatusExt as _;
-    let pid = child.id() as libc::pid_t;
-    let mut status: libc::c_int = 0;
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    // SAFETY: `wait4` is called on our own child pid with `WNOHANG`; `status`
-    // and `usage` are initialized, properly aligned, writable out-parameters
-    // that remain alive for the call.
-    let r = unsafe { libc::wait4(pid, &raw mut status, libc::WNOHANG, &raw mut usage) };
-    if r == pid {
-        Ok(Some((
-            std::process::ExitStatus::from_raw(status),
-            Some(rusage_max_rss_bytes(&usage)),
-        )))
-    } else if r == 0 {
-        Ok(None) // still running
-    } else {
-        let err = std::io::Error::last_os_error();
-        // A signal interrupted the syscall — not a failure; poll again.
-        if err.raw_os_error() == Some(libc::EINTR) {
-            Ok(None)
-        } else {
-            Err(err)
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn try_reap_with_rss(
-    child: &mut std::process::Child,
-) -> std::io::Result<Option<(std::process::ExitStatus, Option<u64>)>> {
-    child.try_wait().map(|opt| opt.map(|status| (status, None)))
-}
-
-/// SIGKILL a timed-out child and every process it spawned. Because the child
-/// is a process-group leader (see [`spawn_timeboxed`]), signalling the negative
-/// group id reaches its forked grandchildren too, so nothing survives to hold
-/// the stdout pipe open or keep consuming CPU.
-fn kill_group(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        // SAFETY: `kill(2)` with a negative pid targets the process group led
-        // by `child`; SIGKILL is uncatchable, so the whole subtree dies.
-        let pid = child.id() as i32;
-        if pid > 0 {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
-        }
-    }
-    // Also signal the leader directly (a no-op if the group kill already got
-    // it; the only path on non-unix).
-    let _ = child.kill();
-}
-
-/// Spawn `cmd` with a hard timebox and drain its stdout. `stdin`/`stderr` are
-/// nulled and `stdout` is piped; a reader thread drains the pipe so a chatty
-/// child cannot block, while the main loop polls for exit and SIGKILLs the
-/// child's whole process group at `timeout + KILL_GRACE`. This is the
-/// crash/timeout isolation the whole campaign relies on — a fresh child per
-/// (file, solver) means no runaway or aborting solve can bias or abort the run.
-pub(crate) fn spawn_timeboxed(mut cmd: Command, timeout: Duration) -> RawRun {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    // Make the child a process-group leader so a timeout can SIGKILL its WHOLE
-    // subtree, not just the leader. `ay solve` forks a solve worker; killing
-    // only the leader would orphan that worker (reparented to init), where it
-    // keeps burning a core AND holds the stdout pipe open — hanging the reader
-    // thread below and stalling the entire campaign.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        cmd.process_group(0);
-    }
-    let spawn_t0 = Instant::now();
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return RawRun {
-                killed: false,
-                code: None,
-                status_str: String::new(),
-                stdout: Vec::new(),
-                observed: Duration::ZERO,
-                max_rss: None,
-                harness_error: Some(format!("spawn failed: {e}")),
-            }
-        }
+/// Run a stopped-exec child under the campaign's exact RSS watchdog and
+/// bounded stdout capture. The watchdog-owned wait keeps the group leader
+/// unreaped until residual descendants have been killed. Successful
+/// `bench-one` children self-report peak RSS in their protocol header.
+pub(crate) fn spawn_timeboxed(
+    resources: &PlannedResources,
+    program: &Path,
+    args: &[OsString],
+    timeout: Duration,
+    label: &str,
+) -> RawRun {
+    let Ok(hard_timeout) = hard_timeout(timeout) else {
+        return RawRun {
+            killed: false,
+            memout: false,
+            code: None,
+            status_str: String::new(),
+            stdout: Vec::new(),
+            observed: Duration::ZERO,
+            output_truncated: false,
+            harness_error: Some("child hard-timeout overflow".to_string()),
+        };
     };
-
-    let mut stdout = child.stdout.take().expect("stdout piped");
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-
-    let deadline = spawn_t0 + timeout + KILL_GRACE;
-    let mut killed = false;
-    let (status, max_rss) = loop {
-        match try_reap_with_rss(&mut child) {
-            Ok(Some((status, rss))) => break (status, rss),
-            Ok(None) => {
-                if Instant::now() >= deadline && !killed {
-                    kill_group(&mut child);
-                    killed = true;
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            Err(e) => {
-                kill_group(&mut child);
-                let _ = child.wait();
-                let _ = reader.join();
-                return RawRun {
-                    killed,
-                    code: None,
-                    status_str: String::new(),
-                    stdout: Vec::new(),
-                    observed: spawn_t0.elapsed(),
-                    max_rss: None,
-                    harness_error: Some(format!("wait failed: {e}")),
-                };
+    match resources.run_external_captured(program, args, hard_timeout, label) {
+        Ok(output) => {
+            let code = output
+                .status
+                .as_ref()
+                .and_then(std::process::ExitStatus::code);
+            let status_str = output
+                .status
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            RawRun {
+                killed: output.timed_out,
+                memout: output.memout,
+                code,
+                status_str,
+                stdout: output.stdout,
+                observed: output.observed,
+                output_truncated: output.output_truncated,
+                harness_error: None,
             }
         }
-    };
-    let bytes = reader.join().unwrap_or_default();
-    RawRun {
-        killed,
-        code: status.code(),
-        status_str: status.to_string(),
-        stdout: bytes,
-        observed: spawn_t0.elapsed(),
-        max_rss,
-        harness_error: None,
+        Err(error) => RawRun {
+            killed: false,
+            memout: false,
+            code: None,
+            status_str: String::new(),
+            stdout: Vec::new(),
+            observed: Duration::ZERO,
+            output_truncated: false,
+            harness_error: Some(error.to_string()),
+        },
     }
 }
 
@@ -495,18 +478,40 @@ pub(crate) fn spawn_timeboxed(mut cmd: Command, timeout: Duration) -> RawRun {
 /// The child self-reports eval-only wall time on its first stdout line; a
 /// result over budget is a timeout even if the child finished in the grace
 /// window. A SIGKILLed child is a timeout; any other abnormal exit is a crash.
-pub(crate) fn run_one(exe: &Path, lib: &Path, file: &Path, timeout: Duration) -> BenchOutcome {
-    let mut cmd = Command::new(exe);
-    cmd.arg("bench-one").arg(lib).arg(file);
-    let raw = spawn_timeboxed(cmd, timeout);
-    // Peak RSS is only a clean, comparable measurement for a child reaped
-    // normally; a killed timeout or a harness error carries no usable figure.
-    let peak_rss = raw.max_rss;
-
+pub(crate) fn run_one(
+    resources: &PlannedResources,
+    exe: &Path,
+    lib: &Path,
+    file: &Path,
+    timeout: Duration,
+    label: &str,
+) -> BenchOutcome {
+    let args = [
+        OsString::from("bench-one"),
+        lib.as_os_str().to_owned(),
+        file.as_os_str().to_owned(),
+    ];
+    let raw = spawn_timeboxed(resources, exe, &args, timeout, label);
     if let Some(err) = raw.harness_error {
         return BenchOutcome {
             kind: OutcomeKind::InputError(err),
             wall: raw.observed,
+            peak_rss: None,
+        };
+    }
+    if raw.output_truncated {
+        return BenchOutcome {
+            kind: OutcomeKind::InputError(
+                "child stdout exceeded the fixed one-MiB capture limit".to_string(),
+            ),
+            wall: raw.observed,
+            peak_rss: None,
+        };
+    }
+    if raw.memout {
+        return BenchOutcome {
+            kind: OutcomeKind::MemoryLimit,
+            wall: raw.observed.min(timeout),
             peak_rss: None,
         };
     }
@@ -520,15 +525,17 @@ pub(crate) fn run_one(exe: &Path, lib: &Path, file: &Path, timeout: Duration) ->
     let text = String::from_utf8_lossy(&raw.stdout);
     match raw.code {
         Some(0) => {
-            let mut lines = text.splitn(2, '\n');
-            let wall_ns: Option<u128> = lines
-                .next()
-                .and_then(|l| l.strip_prefix("AYZ3_WALL_NS "))
-                .and_then(|n| n.trim().parse().ok());
-            let output = lines.next().unwrap_or("");
-            let wall = wall_ns
-                .map(|ns| Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX)))
-                .unwrap_or(raw.observed);
+            let parsed = match parse_bench_child_output(&text) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return BenchOutcome {
+                        kind: OutcomeKind::InputError(error),
+                        wall: raw.observed,
+                        peak_rss: None,
+                    };
+                }
+            };
+            let wall = parsed.wall;
             if wall > timeout {
                 // Finished inside the kill grace but over budget: a timeout.
                 BenchOutcome {
@@ -538,28 +545,67 @@ pub(crate) fn run_one(exe: &Path, lib: &Path, file: &Path, timeout: Duration) ->
                 }
             } else {
                 BenchOutcome {
-                    kind: OutcomeKind::Verdicts(verdicts_of(output)),
+                    kind: OutcomeKind::Verdicts(verdicts_of(parsed.solver_output)),
                     wall,
-                    peak_rss,
+                    peak_rss: parsed.peak_rss,
                 }
             }
         }
         Some(3) | Some(4) => BenchOutcome {
             kind: OutcomeKind::InputError(format!("bench-one exited {}", raw.status_str)),
             wall: raw.observed,
-            peak_rss,
+            peak_rss: None,
         },
         Some(code) => BenchOutcome {
             kind: OutcomeKind::Crash(format!("exit code {code}")),
             wall: raw.observed,
-            peak_rss,
+            peak_rss: None,
         },
         None => BenchOutcome {
             kind: OutcomeKind::Crash(format!("killed by signal ({})", raw.status_str)),
             wall: raw.observed,
-            peak_rss,
+            peak_rss: None,
         },
     }
+}
+
+struct BenchChildOutput<'a> {
+    wall: Duration,
+    peak_rss: Option<u64>,
+    solver_output: &'a str,
+}
+
+fn parse_bench_child_output(text: &str) -> Result<BenchChildOutput<'_>, String> {
+    let mut fields = text.splitn(3, '\n');
+    let wall_ns = fields
+        .next()
+        .and_then(|line| line.strip_prefix("AYZ3_WALL_NS "))
+        .ok_or_else(|| "bench-one omitted its wall-time protocol header".to_string())?
+        .parse::<u64>()
+        .map_err(|_| "bench-one emitted an invalid wall-time protocol header".to_string())?;
+    let rss_field = fields
+        .next()
+        .and_then(|line| line.strip_prefix("AYZ3_RSS_BYTES "))
+        .ok_or_else(|| "bench-one omitted its peak-RSS protocol header".to_string())?;
+    let peak_rss = if rss_field == "-" {
+        None
+    } else {
+        let bytes = rss_field
+            .parse::<u64>()
+            .map_err(|_| "bench-one emitted an invalid peak-RSS protocol header".to_string())?;
+        if bytes == 0 {
+            return Err("bench-one emitted a zero peak-RSS measurement".to_string());
+        }
+        Some(bytes)
+    };
+    let solver_output = fields
+        .next()
+        .ok_or_else(|| "bench-one omitted its solver-output protocol separator".to_string())?;
+    Ok(BenchChildOutput {
+        wall: Duration::from_nanos(wall_ns),
+        peak_rss,
+        solver_output,
+    })
 }
 
 /// AY's fail-closed self-certification verdict for one file, obtained by
@@ -574,6 +620,8 @@ pub(crate) enum SelfCheck {
     Verdicts(Vec<Verdict>),
     /// Exceeded the wall-clock budget.
     Timeout,
+    /// Exceeded the enforced process-group RSS budget.
+    MemoryLimit,
     /// The `ay` process died by signal with no usable verdict.
     Crash(String),
     /// The harness could not spawn/await the `ay` binary at all.
@@ -604,6 +652,7 @@ impl SelfCheck {
             SelfCheck::Verdicts(v) if v.is_empty() => "-".to_string(),
             SelfCheck::Verdicts(v) => v.iter().map(|x| x.as_str()).collect::<Vec<_>>().join(","),
             SelfCheck::Timeout => "timeout".to_string(),
+            SelfCheck::MemoryLimit => "memout".to_string(),
             SelfCheck::Crash(_) => "crash".to_string(),
             SelfCheck::Error(_) => "error".to_string(),
         }
@@ -636,18 +685,37 @@ fn selfcheck_verdicts(output: &str) -> Vec<Verdict> {
 /// post-solve proof re-check, and — crucially — the default proof-certificate
 /// emission, so the run neither wastes time nor writes `*.alethe` artifacts
 /// into the corpus directory next to each input.
-pub(crate) fn run_selfcheck(ay_cli: &Path, file: &Path, timeout: Duration) -> SelfCheck {
-    let mut cmd = Command::new(ay_cli);
-    cmd.arg("solve")
-        .arg("--self-check")
-        .arg("--competition")
-        .arg(file);
-    interpret_selfcheck_raw(spawn_timeboxed(cmd, timeout), timeout)
+pub(crate) fn run_selfcheck(
+    resources: &PlannedResources,
+    ay_cli: &Path,
+    file: &Path,
+    timeout: Duration,
+) -> SelfCheck {
+    let args = [
+        OsString::from("solve"),
+        OsString::from("--self-check"),
+        OsString::from("--competition"),
+        OsString::from("--memory"),
+        OsString::from(resources.plan.memlimit_mb_per_child.to_string()),
+        file.as_os_str().to_owned(),
+    ];
+    interpret_selfcheck_raw(
+        spawn_timeboxed(resources, ay_cli, &args, timeout, "ay-z3-parity self-check"),
+        timeout,
+    )
 }
 
 fn interpret_selfcheck_raw(raw: RawRun, timeout: Duration) -> SelfCheck {
     if let Some(err) = raw.harness_error {
         return SelfCheck::Error(err);
+    }
+    if raw.output_truncated {
+        return SelfCheck::Error(
+            "self-check stdout exceeded the fixed one-MiB capture limit".to_string(),
+        );
+    }
+    if raw.memout {
+        return SelfCheck::MemoryLimit;
     }
     if raw.killed || raw.observed > timeout {
         return SelfCheck::Timeout;
@@ -743,6 +811,9 @@ struct DivStats {
     timeout_ay: usize,
     timeout_z3: usize,
     timeout_both: usize,
+    memout_ay: usize,
+    memout_z3: usize,
+    memout_both: usize,
     crash_ay: usize,
     crash_z3: usize,
     crash_both: usize,
@@ -766,6 +837,9 @@ impl DivStats {
             Category::TimeoutAy => self.timeout_ay += 1,
             Category::TimeoutZ3 => self.timeout_z3 += 1,
             Category::TimeoutBoth => self.timeout_both += 1,
+            Category::MemoutAy => self.memout_ay += 1,
+            Category::MemoutZ3 => self.memout_z3 += 1,
+            Category::MemoutBoth => self.memout_both += 1,
             Category::CrashAy => self.crash_ay += 1,
             Category::CrashZ3 => self.crash_z3 += 1,
             Category::CrashBoth => self.crash_both += 1,
@@ -796,6 +870,9 @@ impl DivStats {
         self.timeout_ay += o.timeout_ay;
         self.timeout_z3 += o.timeout_z3;
         self.timeout_both += o.timeout_both;
+        self.memout_ay += o.memout_ay;
+        self.memout_z3 += o.memout_z3;
+        self.memout_both += o.memout_both;
         self.crash_ay += o.crash_ay;
         self.crash_z3 += o.crash_z3;
         self.crash_both += o.crash_both;
@@ -970,11 +1047,32 @@ pub(crate) fn run(cfg: &BenchConfig) -> i32 {
     let (ay_version, z3_version) = (versions[0].clone(), versions[1].clone());
 
     let timeout = Duration::from_secs(cfg.timeout_secs);
+    let resources = match PlannedResources::plan(
+        &ay_bench::runner::repo_root_public(),
+        cfg.jobs,
+        "ay-z3-parity bench",
+    ) {
+        Ok(resources) => resources,
+        Err(error) => {
+            eprintln!("error: resource planning failed: {error}");
+            return 2;
+        }
+    };
+    let resource_evidence = match resource_evidence(&resources.plan, timeout, false) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            eprintln!("error: resource envelope failed: {error}");
+            return 2;
+        }
+    };
     let total = files.len();
     eprintln!(
-        "bench: {total} files, timeout {}s, jobs {}, AY={} z3={}",
+        "bench: {total} files, timeout {}s, jobs requested/effective {}/{}, memory {}MiB/child, NBCORE {}, AY={} z3={}",
         cfg.timeout_secs,
         cfg.jobs,
+        resources.plan.jobs,
+        resources.plan.memlimit_mb_per_child,
+        resources.plan.nbcore_per_child,
         cfg.ay.display(),
         cfg.z3.display()
     );
@@ -985,15 +1083,29 @@ pub(crate) fn run(cfg: &BenchConfig) -> i32 {
     let campaign_t0 = Instant::now();
 
     std::thread::scope(|scope| {
-        for _ in 0..cfg.jobs.max(1) {
+        for _ in 0..resources.plan.jobs {
             scope.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= total {
                     break;
                 }
                 let (division, file) = &files[i];
-                let z3 = run_one(&exe, &cfg.z3, file, timeout);
-                let ay = run_one(&exe, &cfg.ay, file, timeout);
+                let z3 = run_one(
+                    &resources,
+                    &exe,
+                    &cfg.z3,
+                    file,
+                    timeout,
+                    "ay-z3-parity bench z3",
+                );
+                let ay = run_one(
+                    &resources,
+                    &exe,
+                    &cfg.ay,
+                    file,
+                    timeout,
+                    "ay-z3-parity bench AY",
+                );
                 let category = categorize(&ay, &z3);
                 let ratio = matches!(
                     category,
@@ -1055,9 +1167,12 @@ pub(crate) fn run(cfg: &BenchConfig) -> i32 {
             z3_version.as_deref().unwrap_or("?")
         );
         println!(
-            "  timeout {}s | jobs {} | campaign wall {:.1}s",
+            "  timeout {}s | jobs requested/effective {}/{} | memory {}MiB/child | NBCORE {} | campaign wall {:.1}s",
             cfg.timeout_secs,
             cfg.jobs,
+            resources.plan.jobs,
+            resources.plan.memlimit_mb_per_child,
+            resources.plan.nbcore_per_child,
             campaign_wall.as_secs_f64()
         );
         println!();
@@ -1073,6 +1188,8 @@ pub(crate) fn run(cfg: &BenchConfig) -> i32 {
         ay_version.as_deref(),
         z3_version.as_deref(),
         campaign_wall,
+        &resources.plan,
+        &resource_evidence,
     );
     let cert_text = serde_json::to_string_pretty(&cert).unwrap_or_default();
     if let Some(dir) = cfg.json_out.parent() {
@@ -1095,6 +1212,8 @@ pub(crate) fn run(cfg: &BenchConfig) -> i32 {
         ay_version.as_deref(),
         z3_version.as_deref(),
         campaign_wall,
+        &resources.plan,
+        &resource_evidence,
     );
     if let Some(dir) = cfg.report_out.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -1151,6 +1270,7 @@ fn stats_row(name: &str, s: &DivStats) -> Vec<String> {
         s.ay_unknown.to_string(),
         s.z3_unknown.to_string(),
         format!("{}/{}/{}", s.timeout_ay, s.timeout_z3, s.timeout_both),
+        format!("{}/{}/{}", s.memout_ay, s.memout_z3, s.memout_both),
         format!(
             "{}/{}",
             s.crash_ay + s.crash_both,
@@ -1164,7 +1284,7 @@ fn stats_row(name: &str, s: &DivStats) -> Vec<String> {
     ]
 }
 
-const HEADERS: [&str; 15] = [
+const HEADERS: [&str; 16] = [
     "DIVISION",
     "FILES",
     "A-SAT",
@@ -1174,6 +1294,7 @@ const HEADERS: [&str; 15] = [
     "AY-UNK",
     "Z3-UNK",
     "T/O a/z/b",
+    "MEM a/z/b",
     "CRASH a/z",
     "OTHER",
     "DISAGREE",
@@ -1232,6 +1353,8 @@ fn build_certificate(
     ay_version: Option<&str>,
     z3_version: Option<&str>,
     campaign_wall: Duration,
+    resource_plan: &ResourcePlan,
+    resource_evidence: &serde_json::Value,
 ) -> serde_json::Value {
     let div_json = |name: &str, s: &DivStats| {
         let mut sorted = s.ratios.clone();
@@ -1248,6 +1371,9 @@ fn build_certificate(
             "timeout_ay": s.timeout_ay,
             "timeout_z3": s.timeout_z3,
             "timeout_both": s.timeout_both,
+            "memout_ay": s.memout_ay,
+            "memout_z3": s.memout_z3,
+            "memout_both": s.memout_both,
             "crash_ay": s.crash_ay,
             "crash_z3": s.crash_z3,
             "crash_both": s.crash_both,
@@ -1266,8 +1392,8 @@ fn build_certificate(
             serde_json::json!({
                 "file": r.file.display().to_string(),
                 "division": r.division,
-                "z3": { "outcome": r.z3.label(), "wall_ms": r.z3.wall.as_secs_f64() * 1000.0, "detail": r.z3.detail() },
-                "ay": { "outcome": r.ay.label(), "wall_ms": r.ay.wall.as_secs_f64() * 1000.0, "detail": r.ay.detail() },
+                "z3": { "outcome": r.z3.label(), "wall_ms": r.z3.wall.as_secs_f64() * 1000.0, "peak_rss_bytes": r.z3.peak_rss, "detail": r.z3.detail() },
+                "ay": { "outcome": r.ay.label(), "wall_ms": r.ay.wall.as_secs_f64() * 1000.0, "peak_rss_bytes": r.ay.peak_rss, "detail": r.ay.detail() },
                 "category": r.category.label(),
                 "wall_ratio_ay_over_z3": r.ratio,
             })
@@ -1287,7 +1413,7 @@ fn build_certificate(
         .collect();
     serde_json::json!({
         "kind": "ay-z3-bench-certificate",
-        "format_version": 1,
+        "format_version": 2,
         "generated_utc": utc_now_iso(),
         "invocation": std::env::args().collect::<Vec<_>>().join(" "),
         "host": host_info(),
@@ -1302,12 +1428,16 @@ fn build_certificate(
             "full_version": z3_version,
         },
         "timeout_secs": cfg.timeout_secs,
-        "jobs": cfg.jobs,
+        "jobs": resource_plan.jobs,
+        "requested_jobs": resource_plan.requested_jobs,
+        "resource": resource_evidence,
         "roots": cfg.roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
         "campaign_wall_secs": campaign_wall.as_secs_f64(),
         "methodology": {
-            "isolation": "each (file, solver) pair runs in a fresh child process; wall time measured inside the child strictly around Z3_eval_smtlib2_string (excludes spawn/dlopen/file-read)",
-            "timeout": "hard SIGKILL at timeout + 2s grace; any eval wall over the budget is recorded as timeout",
+            "isolation": "each (file, solver) pair runs in a stopped-exec child process group; the campaign RSS watchdog arms before exec, residual descendants are killed before the leader is reaped, and stdout retention is capped at one MiB",
+            "timeout": "hard process-group SIGKILL at timeout + 2s grace; any eval wall over the budget is recorded as timeout",
+            "memory": "zero-grace RSS watchdog enforces the persisted per-child process-group envelope; memout is distinct from timeout/crash",
+            "peak_rss": "each successful bench-one child self-reports getrusage(RUSAGE_SELF).ru_maxrss in bytes after solver teardown; missing measurements remain explicit",
             "ratio_floor_secs": RATIO_FLOOR_SECS,
             "win_loss_min_secs": WIN_LOSS_MIN_SECS,
             "decided_by_both": "verdict lists equal, nonempty, no unknown, no timeout/crash — the only files entering ratio statistics",
@@ -1329,6 +1459,8 @@ fn render_report(
     ay_version: Option<&str>,
     z3_version: Option<&str>,
     campaign_wall: Duration,
+    resource_plan: &ResourcePlan,
+    resource_evidence: &serde_json::Value,
 ) -> String {
     use std::fmt::Write as _;
     let mut md = String::new();
@@ -1343,9 +1475,30 @@ fn render_report(
         md,
         "derived from the run recorded in the JSON certificate next to this file;"
     );
+    // "no file was skipped" is a claim about THIS RUN over the corpus roots it
+    // was given. It says nothing about whether those roots are the whole of
+    // SMT-LIB, and readers took it to mean exactly that: reports generated over
+    // `benchmarks/smtlib-sample` (1,500 files, 5 of 84 divisions) were quoted as
+    // corpus-wide parity results. State the scope limit in the artifact itself.
     let _ = writeln!(
         md,
-        "nothing is hand-edited. No file under any corpus root was skipped or sampled."
+        "nothing is hand-edited. Within the corpus roots listed below, no file was"
+    );
+    let _ = writeln!(
+        md,
+        "skipped or sampled. SCOPE: these numbers describe exactly those roots and"
+    );
+    let _ = writeln!(
+        md,
+        "are not corpus-wide unless the roots are — `benchmarks/smtlib-sample` is a"
+    );
+    let _ = writeln!(
+        md,
+        "1,500-file, 5-division slice of SMT-LIB 2024 (84 divisions); the complete"
+    );
+    let _ = writeln!(
+        md,
+        "corpus is `benchmarks/smtlib-all` via `ay-z3-parity fetch`."
     );
     let _ = writeln!(md);
     let _ = writeln!(md, "## Reproduce");
@@ -1398,7 +1551,42 @@ fn render_report(
         "| timeout per (file, solver) | {} s |",
         cfg.timeout_secs
     );
-    let _ = writeln!(md, "| parallel jobs | {} |", cfg.jobs);
+    let _ = writeln!(
+        md,
+        "| hard process-group timeout | {} s |",
+        resource_evidence["hard_timeout_secs"]
+    );
+    let _ = writeln!(
+        md,
+        "| parallel jobs requested / effective | {} / {} |",
+        resource_plan.requested_jobs, resource_plan.jobs
+    );
+    let _ = writeln!(
+        md,
+        "| memory per child | {} MiB |",
+        resource_plan.memlimit_mb_per_child
+    );
+    let _ = writeln!(
+        md,
+        "| NBCORE per child | {} |",
+        resource_plan.nbcore_per_child
+    );
+    let _ = writeln!(
+        md,
+        "| reserved host headroom | {} MiB |",
+        resource_plan.headroom_mb
+    );
+    let _ = writeln!(
+        md,
+        "| resource enforcement | `{ENFORCEMENT_RSS_WATCHDOG_V1}` |"
+    );
+    let _ = writeln!(
+        md,
+        "| exact execution envelope | `{}` |",
+        resource_evidence["external_ffi"]["execution_envelope"]
+            .as_str()
+            .unwrap_or("?")
+    );
     let _ = writeln!(
         md,
         "| campaign wall time | {:.1} s |",
@@ -1413,10 +1601,13 @@ fn render_report(
     if totals.disagree == 0 {
         let _ = writeln!(
             md,
-            "**DISAGREE = 0** across {} files. On every instance both solvers decided,",
+            "**DISAGREE = 0** across {} files. No paired decisive answers conflicted;",
             totals.files
         );
-        let _ = writeln!(md, "the verdicts matched.");
+        let _ = writeln!(
+            md,
+            "unknown, timeout, memout, crash, and missing-verdict cases remain accounted below."
+        );
     } else {
         let _ = writeln!(
             md,
@@ -1475,13 +1666,14 @@ fn render_report(
         md,
         "`unknown` where z3 decided (AY incompleteness); Z3-UNK = the reverse;"
     );
+    let _ = writeln!(md, "T/O a/z/b = timeouts (AY only / z3 only / both);");
     let _ = writeln!(
         md,
-        "T/O a/z/b = timeouts (AY only / z3 only / both); CRASH a/z = solver process"
+        "MEM a/z/b = enforced memory-limit exits; CRASH a/z = solver process died"
     );
     let _ = writeln!(
         md,
-        "died (either alone or both); OTHER = verdict-count mismatch or no verdicts;"
+        "(either alone or both); OTHER = verdict-count mismatch or no verdicts;"
     );
     let _ = writeln!(
         md,
@@ -1559,6 +1751,37 @@ fn render_report(
                 md,
                 "| … and {} more (see certificate) | | |",
                 ay_to_z3_decided.len() - 20
+            );
+        }
+        let _ = writeln!(md);
+    }
+
+    let ay_memout_z3_decided: Vec<&FileRecord> = records
+        .iter()
+        .filter(|r| r.category == Category::MemoutAy && r.z3.decided())
+        .collect();
+    if !ay_memout_z3_decided.is_empty() {
+        z3_wins_any = true;
+        let _ = writeln!(
+            md,
+            "### AY exceeded its memory envelope where z3 decided ({} files)",
+            ay_memout_z3_decided.len()
+        );
+        let _ = writeln!(md);
+        for r in ay_memout_z3_decided.iter().take(20) {
+            let _ = writeln!(
+                md,
+                "- `{}` (z3: {} in {} ms)",
+                r.file.display(),
+                r.z3.label(),
+                fmt_ms(r.z3.wall)
+            );
+        }
+        if ay_memout_z3_decided.len() > 20 {
+            let _ = writeln!(
+                md,
+                "- … and {} more (see certificate)",
+                ay_memout_z3_decided.len() - 20
             );
         }
         let _ = writeln!(md);
@@ -1705,6 +1928,17 @@ fn render_report(
             "- z3 timed out where AY decided: {z3_to_ay_decided} files"
         );
     }
+    let z3_memout_ay_decided = records
+        .iter()
+        .filter(|r| r.category == Category::MemoutZ3 && r.ay.decided())
+        .count();
+    if z3_memout_ay_decided > 0 {
+        ay_wins_any = true;
+        let _ = writeln!(
+            md,
+            "- z3 exceeded its memory envelope where AY decided: {z3_memout_ay_decided} files"
+        );
+    }
     if totals.z3_unknown > 0 {
         ay_wins_any = true;
         let _ = writeln!(
@@ -1764,9 +1998,17 @@ fn render_report(
     );
     let _ = writeln!(
         md,
-        "  fresh child process (`ay-z3-parity bench-one <lib> <file>`), so a crash or"
+        "  stopped-exec child process group (`ay-z3-parity bench-one <lib> <file>`)."
     );
-    let _ = writeln!(md, "  runaway solve cannot bias any other measurement.");
+    let _ = writeln!(
+        md,
+        "  `_oom_guard.py` caps jobs and arms a zero-grace RSS watchdog before exec;"
+    );
+    let _ = writeln!(
+        md,
+        "  residual descendants are killed before leader reap, and stdout retention is"
+    );
+    let _ = writeln!(md, "  capped at one MiB.");
     let _ = writeln!(
         md,
         "- Wall time is measured inside the child strictly around"
@@ -1830,6 +2072,13 @@ mod tests {
         BenchOutcome {
             kind: OutcomeKind::Timeout,
             wall: Duration::from_secs(20),
+            peak_rss: None,
+        }
+    }
+    fn memout() -> BenchOutcome {
+        BenchOutcome {
+            kind: OutcomeKind::MemoryLimit,
+            wall: Duration::from_secs(1),
             peak_rss: None,
         }
     }
@@ -1906,6 +2155,9 @@ mod tests {
             Category::TimeoutZ3
         );
         assert_eq!(categorize(&timeout(), &timeout()), Category::TimeoutBoth);
+        assert_eq!(categorize(&memout(), &verdicts(&[Sat])), Category::MemoutAy);
+        assert_eq!(categorize(&verdicts(&[Sat]), &memout()), Category::MemoutZ3);
+        assert_eq!(categorize(&memout(), &memout()), Category::MemoutBoth);
         assert_eq!(categorize(&crash(), &verdicts(&[Sat])), Category::CrashAy);
         assert_eq!(categorize(&verdicts(&[Sat]), &crash()), Category::CrashZ3);
         assert_eq!(categorize(&crash(), &crash()), Category::CrashBoth);
@@ -1934,6 +2186,38 @@ mod tests {
             "geomean of reciprocal pair is 1, got {g}"
         );
         assert_eq!(geomean(&[]), None);
+    }
+
+    #[test]
+    fn resource_evidence_persists_requested_and_effective_envelope() {
+        let plan = ResourcePlan {
+            requested_jobs: 8,
+            jobs: 3,
+            memlimit_mb_per_child: 2048,
+            nbcore_per_child: 2,
+            headroom_mb: 16_384,
+            planner: "scripts/_oom_guard.py".to_string(),
+        };
+        let evidence =
+            resource_evidence(&plan, Duration::from_secs(20), true).expect("resource evidence");
+        assert_eq!(evidence["requested_jobs"], 8);
+        assert_eq!(evidence["effective_jobs"], 3);
+        assert_eq!(evidence["memlimit_mb_per_child"], 2048);
+        assert_eq!(evidence["nbcore_per_child"], 2);
+        assert_eq!(evidence["headroom_mb"], 16_384);
+        assert_eq!(evidence["solver_timeout_secs"], 20.0);
+        assert_eq!(evidence["hard_timeout_secs"], 22.0);
+        assert_eq!(
+            evidence["external_ffi"]["enforcement"],
+            ENFORCEMENT_RSS_WATCHDOG_V1
+        );
+        assert_eq!(
+            evidence["ay_selfcheck"]["enforcement"],
+            ENFORCEMENT_AY_MEMORY_RSS_V1
+        );
+        assert!(evidence["external_ffi"]["execution_envelope"]
+            .as_str()
+            .is_some_and(|value| value.contains("jobs=3")));
     }
 
     #[test]
@@ -2036,13 +2320,30 @@ mod tests {
     fn selfcheck_raw(code: Option<i32>, stdout: &str, observed: Duration) -> RawRun {
         RawRun {
             killed: false,
+            memout: false,
             code,
             status_str: code.map_or_else(|| "signal: 6".to_string(), |code| code.to_string()),
             stdout: stdout.as_bytes().to_vec(),
             observed,
-            max_rss: None,
+            output_truncated: false,
             harness_error: None,
         }
+    }
+
+    #[test]
+    fn bench_child_protocol_requires_rss_and_preserves_solver_output() {
+        let parsed =
+            parse_bench_child_output("AYZ3_WALL_NS 123\nAYZ3_RSS_BYTES 4096\nsat\n(model)\n")
+                .expect("valid child protocol");
+        assert_eq!(parsed.wall, Duration::from_nanos(123));
+        assert_eq!(parsed.peak_rss, Some(4096));
+        assert_eq!(parsed.solver_output, "sat\n(model)\n");
+
+        assert!(parse_bench_child_output("AYZ3_WALL_NS 123\nsat\n").is_err());
+        let without_host_rss =
+            parse_bench_child_output("AYZ3_WALL_NS 1\nAYZ3_RSS_BYTES -\nunsat\n")
+                .expect("unsupported hosts use an explicit missing-RSS marker");
+        assert_eq!(without_host_rss.peak_rss, None);
     }
 
     #[test]
@@ -2077,6 +2378,24 @@ mod tests {
                 timeout
             ),
             SelfCheck::Timeout
+        ));
+    }
+
+    #[test]
+    fn selfcheck_distinguishes_memout_and_stdout_limit() {
+        let timeout = Duration::from_secs(1);
+        let mut memout = selfcheck_raw(None, "", Duration::from_millis(10));
+        memout.memout = true;
+        assert!(matches!(
+            interpret_selfcheck_raw(memout, timeout),
+            SelfCheck::MemoryLimit
+        ));
+
+        let mut oversized = selfcheck_raw(Some(0), "unsat\n", Duration::from_millis(10));
+        oversized.output_truncated = true;
+        assert!(matches!(
+            interpret_selfcheck_raw(oversized, timeout),
+            SelfCheck::Error(message) if message.contains("capture limit")
         ));
     }
 }

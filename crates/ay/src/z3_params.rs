@@ -23,11 +23,12 @@
 //! Garbage still fails loudly, exactly as z3 fails it -- that honest-rejection
 //! property is deliberate and is what keeps a typo from being silently ignored.
 //!
-//! PROVENANCE: mechanically generated from libz3 4.15.4 via `z3 -pm` and
-//! `z3 -pm:<module>`. To regenerate against a newer z3, re-run that pair and
-//! rebuild this list; do not hand-edit entries.
+//! PROVENANCE: mechanically generated from libz3 5.0.0 via
+//! `/opt/homebrew/bin/z3 -pm` and `/opt/homebrew/bin/z3 -pm:<module>`.
+//! To regenerate against a newer z3, re-run that pair and rebuild this list;
+//! do not hand-edit entries.
 
-/// Every module-qualified parameter name libz3 4.15.4 exposes (630 across
+/// Every module-qualified parameter name libz3 5.0.0 exposes (654 across
 /// 21 modules). Sorted, so the lookup can binary-search.
 pub(crate) const Z3_MODULE_PARAMS: &[&str] = &[
     "ackermannization.eager",
@@ -74,6 +75,7 @@ pub(crate) const Z3_MODULE_PARAMS: &[&str] = &[
     "fp.print_low_level_smt2",
     "fp.print_statistics",
     "fp.print_with_variable_declarations",
+    "fp.rlimit",
     "fp.spacer.arith.solver",
     "fp.spacer.blast_term_ite_inflation",
     "fp.spacer.ctp",
@@ -162,10 +164,16 @@ pub(crate) const Z3_MODULE_PARAMS: &[&str] = &[
     "lp.dio",
     "lp.dio_branching_period",
     "lp.dio_calls_period",
+    "lp.dio_calls_period_decrease",
     "lp.dio_cuts_enable_gomory",
     "lp.dio_cuts_enable_hnf",
+    "lp.dio_gomory_enable_period",
     "lp.dio_ignore_big_nums",
     "lp.dio_run_gcd",
+    "lp.int_hammer_period",
+    "lp.lcube",
+    "lp.lcube_flips",
+    "lp.random_hammers",
     "model.compact",
     "model.completion",
     "model.inline_def",
@@ -179,14 +187,19 @@ pub(crate) const Z3_MODULE_PARAMS: &[&str] = &[
     "model_evaluator.max_memory",
     "model_evaluator.max_steps",
     "nlsat.add_all_coeffs",
-    "nlsat.cell_sample",
+    "nlsat.canonicalize",
     "nlsat.check_lemmas",
     "nlsat.dump_mathematica",
     "nlsat.factor",
     "nlsat.inline_vars",
     "nlsat.known_sat_assignment_file_name",
     "nlsat.lazy",
+    "nlsat.log_lemma_smtrat",
     "nlsat.log_lemmas",
+    "nlsat.lws",
+    "nlsat.lws_spt_threshold",
+    "nlsat.lws_witness_subs_disc",
+    "nlsat.lws_witness_subs_lc",
     "nlsat.max_conflicts",
     "nlsat.max_memory",
     "nlsat.minimize_conflicts",
@@ -197,6 +210,7 @@ pub(crate) const Z3_MODULE_PARAMS: &[&str] = &[
     "nlsat.simple_check",
     "nlsat.simplify_conflicts",
     "nlsat.variable_ordering_strategy",
+    "nlsat.zero_disc",
     "nnf.ignore_labels",
     "nnf.max_memory",
     "nnf.mode",
@@ -229,11 +243,15 @@ pub(crate) const Z3_MODULE_PARAMS: &[&str] = &[
     "opt.rlimit",
     "opt.solution_prefix",
     "opt.timeout",
+    "parallel.ablate_backtracking",
     "parallel.conquer.backtrack_frequency",
     "parallel.conquer.batch_size",
     "parallel.conquer.delay",
     "parallel.conquer.restart.max",
+    "parallel.core_minimize",
+    "parallel.cube.lookahead",
     "parallel.enable",
+    "parallel.num_bb_threads",
     "parallel.simplify.exp",
     "parallel.simplify.inprocess.max",
     "parallel.simplify.max_conflicts",
@@ -244,6 +262,7 @@ pub(crate) const Z3_MODULE_PARAMS: &[&str] = &[
     "parser.ignore_user_patterns",
     "pi.arith",
     "pi.arith_weight",
+    "pi.avoid_skolems",
     "pi.block_loop_patterns",
     "pi.decompose_patterns",
     "pi.enabled",
@@ -334,6 +353,7 @@ pub(crate) const Z3_MODULE_PARAMS: &[&str] = &[
     "rewriter.sort_store",
     "rewriter.sort_sums",
     "rewriter.split_concat_eq",
+    "rewriter.unfold_recursive_functions",
     "sat.abce",
     "sat.acce",
     "sat.anf",
@@ -361,15 +381,6 @@ pub(crate) const Z3_MODULE_PARAMS: &[&str] = &[
     "sat.cce",
     "sat.core.minimize",
     "sat.core.minimize_partial",
-    "sat.cut",
-    "sat.cut.aig",
-    "sat.cut.delay",
-    "sat.cut.dont_cares",
-    "sat.cut.force",
-    "sat.cut.lut",
-    "sat.cut.npn3",
-    "sat.cut.redundancies",
-    "sat.cut.xor",
     "sat.ddfw.init_clause_weight",
     "sat.ddfw.reinit_base",
     "sat.ddfw.restart_base",
@@ -521,6 +532,7 @@ pub(crate) const Z3_MODULE_PARAMS: &[&str] = &[
     "smt.arith.nl.expp",
     "smt.arith.nl.gr_q",
     "smt.arith.nl.grobner",
+    "smt.arith.nl.grobner_adaptive",
     "smt.arith.nl.grobner_cnfl_to_report",
     "smt.arith.nl.grobner_eqs_growth",
     "smt.arith.nl.grobner_exp_delay",
@@ -538,13 +550,20 @@ pub(crate) const Z3_MODULE_PARAMS: &[&str] = &[
     "smt.arith.nl.horner_row_length_limit",
     "smt.arith.nl.horner_subs_fixed",
     "smt.arith.nl.log",
+    "smt.arith.nl.monomial_binomial_sign",
+    "smt.arith.nl.monomial_sandwich",
+    "smt.arith.nl.monomial_sandwich.max_fanout",
     "smt.arith.nl.nra",
+    "smt.arith.nl.nra_check_assignment",
+    "smt.arith.nl.nra_check_assignment_max_fail",
     "smt.arith.nl.optimize_bounds",
     "smt.arith.nl.order",
+    "smt.arith.nl.order.binomial_sign",
     "smt.arith.nl.propagate_linear_monomials",
     "smt.arith.nl.reduce_pseudo_linear",
     "smt.arith.nl.rounds",
     "smt.arith.nl.tangents",
+    "smt.arith.nl.tangents.box_corners",
     "smt.arith.print_ext_var_names",
     "smt.arith.print_stats",
     "smt.arith.propagate_eqs",
@@ -584,6 +603,8 @@ pub(crate) const Z3_MODULE_PARAMS: &[&str] = &[
     "smt.dt_lazy_splits",
     "smt.elim_unconstrained",
     "smt.ematching",
+    "smt.ho_matching",
+    "smt.ho_matching_bound",
     "smt.induction",
     "smt.lemma_gc_strategy",
     "smt.logic",
@@ -624,13 +645,17 @@ pub(crate) const Z3_MODULE_PARAMS: &[&str] = &[
     "smt.restricted_quasi_macros",
     "smt.seq.max_unfolding",
     "smt.seq.min_unfolding",
+    "smt.seq.regex_factorization_enabled",
+    "smt.seq.regex_factorization_threshold",
     "smt.seq.split_w_len",
     "smt.seq.validate",
     "smt.sls.enable",
     "smt.sls.parallel",
     "smt.solve_eqs",
+    "smt.solve_eqs.linear",
     "smt.solve_eqs.non_ground",
     "smt.string_solver",
+    "smt.term_enumeration",
     "smt.theory_aware_branching",
     "smt.theory_case_split",
     "smt.threads",
@@ -670,4 +695,23 @@ pub(crate) const Z3_MODULE_PARAMS: &[&str] = &[
 pub(crate) fn is_known_z3_module_param(key: &str) -> bool {
     let normalized = key.replace('-', "_").to_ascii_lowercase();
     Z3_MODULE_PARAMS.binary_search(&normalized.as_str()).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_known_z3_module_param, Z3_MODULE_PARAMS};
+
+    #[test]
+    fn registry_matches_z3_5_0_0_shape() {
+        assert_eq!(Z3_MODULE_PARAMS.len(), 654);
+        assert!(
+            Z3_MODULE_PARAMS.windows(2).all(|pair| pair[0] < pair[1]),
+            "Z3 module parameter registry must remain strictly sorted"
+        );
+        assert!(is_known_z3_module_param(
+            "smt.seq.regex-factorization-enabled"
+        ));
+        assert!(!is_known_z3_module_param("nlsat.cell_sample"));
+        assert!(!is_known_z3_module_param("sat.cut"));
+    }
 }

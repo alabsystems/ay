@@ -28,10 +28,9 @@
 //! *prove* those incumbents optimal. A naive "replace CDCL with MILP" lane is a
 //! no-go until ay-milp is competition-grade (its own design docs call the current
 //! simplex a "toy" dense-tableau engine). The viable lane is narrower: extract a
-//! strong root LP+cuts *lower bound* for the prove-optimum class. Re-run this
-//! probe as ay-milp matures:
-//!   PROBE_FILES=a.opb,b.opb PROBE_SECS=45 \
-//!     cargo test -p ay-pb --release --test milp_lane_probe -- --ignored --nocapture
+//! strong root LP+cuts *lower bound* for the prove-optimum class. The bounded
+//! regression below keeps exact translation, optimum, and original-PB witness
+//! checks continuously exercised.
 
 use ay_milp::{BabSession, Col, Model, Outcome, Sense, SolveOpts};
 use ay_pb::{parse_opb, PbConstraint, PbInstance, PbRel, PbTerm};
@@ -112,84 +111,40 @@ fn point_is_feasible(inst: &PbInstance, point: &[bool]) -> bool {
     inst.constraints.iter().all(|c| eval(c) == Some(true))
 }
 
-fn probe(path: &str, budget_secs: u64) {
-    let raw = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(_) => {
-            eprintln!("SKIP {path}: not found");
-            return;
-        }
-    };
-    let inst = parse_opb(&raw).expect("parse opb");
-    let Some((model, _cols)) = pb_to_milp(&inst) else {
-        println!("{path}: DECLINE (non-linear)");
-        return;
-    };
-    let opts = SolveOpts::new().with_time_limit(Duration::from_secs(budget_secs));
+#[test]
+fn milp_lane_finds_and_rechecks_cover_optimum() {
+    // The old opt-in corpus probe only printed timing data.  Keep its essential
+    // contract as a bounded fixture: translate a genuine PB covering model,
+    // prove its optimum in the MILP lane, then re-check the returned point using
+    // the original integer PB semantics.
+    let inst = parse_opb(
+        "* #variable= 3 #constraint= 1\n\
+         min: +1 x1 +1 x2 +1 x3 ;\n\
+         +1 x1 +1 x2 +1 x3 >= 2 ;\n",
+    )
+    .expect("parse fixture");
+    let (model, _cols) = pb_to_milp(&inst).expect("linear fixture");
+    let opts = SolveOpts::new().with_time_limit(Duration::from_secs(2));
     let mut session = BabSession::new(model.clone(), &opts).expect("bab session");
-    let t0 = std::time::Instant::now();
     let outcome = session.check().expect("check");
-    let dt = t0.elapsed().as_secs_f64();
 
-    let name = path.rsplit('/').next().unwrap_or(path);
     let extract = |vals: &[num_rational::BigRational]| -> Vec<bool> {
         use num_traits::ToPrimitive;
         (0..inst.num_vars as usize)
             .map(|i| vals.get(i).and_then(|r| r.to_f64()).unwrap_or(0.0) > 0.5)
             .collect()
     };
-    match &outcome {
+    match outcome {
         Outcome::Optimal {
             value,
             model_values,
             ..
         } => {
-            let pt = extract(model_values);
-            let feas = point_is_feasible(&inst, &pt);
-            use num_traits::ToPrimitive;
-            println!(
-                "{name}: OPTIMAL value={:.0} feasible-recheck={feas} time={dt:.1}s",
-                value.to_f64().unwrap_or(f64::NAN)
-            );
+            let point = extract(&model_values);
+            assert_eq!(value, num_rational::BigRational::from_integer(2.into()));
+            assert!(point_is_feasible(&inst, &point));
+            assert_eq!(point.iter().filter(|&&selected| selected).count(), 2);
         }
-        Outcome::Feasible {
-            model_values,
-            incumbent_only,
-            dual_bound,
-        } => {
-            use num_traits::ToPrimitive;
-            let pt = extract(model_values);
-            let feas = point_is_feasible(&inst, &pt);
-            let db = dual_bound.as_ref().and_then(|d| d.to_f64());
-            println!("{name}: FEASIBLE (incumbent_only={incumbent_only}) feasible-recheck={feas} dual_bound={db:?} time={dt:.1}s");
-        }
-        Outcome::Infeasible { .. } => println!("{name}: INFEASIBLE time={dt:.1}s"),
-        Outcome::Bound {
-            dual_bound,
-            rigorous,
-        } => {
-            use num_traits::ToPrimitive;
-            println!(
-                "{name}: BOUND dual={:.1} rigorous={rigorous} time={dt:.1}s",
-                dual_bound.to_f64().unwrap_or(f64::NAN)
-            );
-        }
-        Outcome::Unbounded => println!("{name}: UNBOUNDED time={dt:.1}s"),
-        Outcome::Unknown { reason } => println!("{name}: UNKNOWN ({reason:?}) time={dt:.1}s"),
-        _ => println!("{name}: OTHER {outcome:?} time={dt:.1}s"),
-    }
-}
-
-#[test]
-#[ignore = "manual MILP-lane feasibility probe; run with --ignored --nocapture"]
-fn milp_lane_probe_hard_instances() {
-    let budget: u64 = std::env::var("PROBE_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60);
-    for p in std::env::var("PROBE_FILES").unwrap_or_default().split(',') {
-        if !p.is_empty() {
-            probe(p, budget);
-        }
+        other => panic!("expected a proved optimum, got {other:?}"),
     }
 }

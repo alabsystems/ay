@@ -347,6 +347,42 @@ impl LraSolver {
             for (v, _) in &row.coeffs {
                 self.col_index_remove(*v, popped_idx);
             }
+            // #8471: drop the popped row's basic-variable bookkeeping. Row identity IS
+            // the `rows`-vec index (`col_index`, `basic_var_to_row`, `VarStatus::Basic`
+            // and `ImpliedBound.row_idx` all key on it), so a leftover entry aliases
+            // whatever row later occupies the freed slot — `atom_assertion.rs`
+            // dereferences `VarStatus::Basic(idx)` straight into `self.rows[idx]`.
+            //
+            // Unreachable today, by design: all three callers (optimization.rs:331,430,
+            // 485) pop the objective row, whose basic var is always `obj_var`. `obj_var`
+            // is never inserted into `basic_var_to_row` (optimization.rs:210 sets only
+            // `status`; the only inserts are in atom_assertion.rs and `pivot`) and is
+            // created from `VarInfo::default()`, so it carries no bound and
+            // `find_pivot_limit` can never return it as the blocking leaving var. Hence
+            // `pivot(obj_row_idx, _)` never runs and the objective row's basic var never
+            // changes. This is NOT evidence that those callers are buggy — they are not.
+            //
+            // The assert is the real guard; the cleanup below is release-mode
+            // belt-and-braces. If a var W ever WERE pivoted into the objective row, this
+            // cleanup would NOT make the pop safe: that pivot substitutes `obj_var` into
+            // every live row containing W, so deleting the objective row deletes
+            // `obj_var`'s defining equation and relaxes those rows — SAT on UNSAT. Fail
+            // loud rather than tidy quietly.
+            let bv = row.basic_var;
+            debug_assert!(
+                self.basic_var_to_row.get(&bv) != Some(&popped_idx),
+                "BUG: popped row {popped_idx} still owns basic var {bv} — the objective \
+                 row was pivoted into, which leaves live rows referencing an undefined \
+                 column"
+            );
+            if self.basic_var_to_row.get(&bv) == Some(&popped_idx) {
+                self.basic_var_to_row.remove(&bv);
+            }
+            if let Some(info) = self.vars.get_mut(bv as usize) {
+                if matches!(info.status, Some(VarStatus::Basic(r)) if r == popped_idx) {
+                    info.status = None;
+                }
+            }
         }
     }
 

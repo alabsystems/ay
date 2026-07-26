@@ -149,6 +149,18 @@ impl Transformer for UnreachableClauseEliminator {
         if problem.is_fixedpoint_format() {
             new_problem.set_fixedpoint_format();
         }
+        for (name, ctors) in problem.datatype_defs() {
+            new_problem.add_datatype_def(name.clone(), ctors.clone());
+        }
+        for name in problem.action_names() {
+            new_problem.declare_action(name.clone());
+        }
+        if problem.has_query_evidence() && !new_problem.has_query_evidence() {
+            new_problem.add_clause(HornClause::new(
+                crate::ClauseBody::new(Vec::new(), Some(ChcExpr::Bool(false))),
+                crate::ClauseHead::False,
+            ));
+        }
 
         // Predicates absent from every kept clause get a fixed interpretation
         // on back-translation: `false` if forward-unreachable, else `true`

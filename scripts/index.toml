@@ -21,6 +21,7 @@ exempt = [
   "bindings/python/examples/**", # README-documented examples
   "bindings/python/conftest.py",
   "bindings/python/setup.py",    # packaging convention
+  "scripts/tests/fixtures/python_skip_gate/**", # literal zero-skip gate fixtures
   "third_party/**",              # vendored
   "publish/**",                  # publication-repo shim
 ]
@@ -220,6 +221,33 @@ publish = "public"
 entrypoint = "test"
 
 [[script]]
+name    = "no-python-test-skips"
+path    = "scripts/check_no_python_test_skips.py"
+lang    = "python"
+group   = "test"
+summary = "Fail-closed AST gate forbidding active skips and expected failures in first-party Python."
+publish = "public"
+cli_note = "no fronting subcommand yet; run the gate directly via `ay scripts run no-python-test-skips`"
+
+[[script]]
+name    = "sat-soundness-gate-resource-tests"
+path    = "scripts/tests/test_sat_soundness_gate_resources.py"
+lang    = "python"
+group   = "test"
+summary = "Resource-envelope tests for the SAT soundness gate harness."
+publish = "public"
+entrypoint = "test"
+
+[[script]]
+name    = "no-python-test-skips-tests"
+path    = "scripts/tests/test_no_python_test_skips.py"
+lang    = "python"
+group   = "test"
+summary = "Adversarial self-tests and repository-cleanliness pin for the Python zero-skip gate."
+publish = "public"
+entrypoint = "test"
+
+[[script]]
 name    = "continuous-benchmark-tests"
 path    = "scripts/tests/test_continuous_benchmark.py"
 lang    = "python"
@@ -279,6 +307,16 @@ summary = "Arbitrate every AY-vs-ground-truth disagreement in a harness run."
 publish = "public"
 tools   = ["z3"]
 requires = ["oom-guard"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "proof-checkability-sweep"
+path    = "scripts/proof_checkability_sweep.py"
+lang    = "python"
+group   = "audit.proof"
+summary = "Sweep a corpus for AY UNSAT verdicts that are independently kernel-checkable via the complete-conflict Lean firewall, cross-checking each verdict against z3 and :status."
+publish = "public"
+tools   = ["z3"]
 cli_note = "no fronting subcommand yet"
 
 [[script]]
@@ -395,10 +433,19 @@ name    = "pre-push-hook"
 path    = "scripts/git-hooks/pre-push"
 lang    = "bash"
 group   = "hook"
-summary = "In-tree pre-push hook: runs the SMT soundness-differential gate before every push."
+summary = "In-tree pre-push hook: enforces zero active Python test skips, then runs the SMT soundness gate."
 publish = "public"
 entrypoint = "hook"
 docs    = "scripts/git-hooks/README.md"
+
+[[script]]
+name    = "string-ground-diff-fuzz"
+path    = "scripts/fuzz/string_ground_diff_fuzz.sh"
+lang    = "bash"
+group   = "fuzz"
+summary = "Scale runner for the differential fuzz harness guarding the proof checker's independent ground string/regex evaluator (string_ground.rs)."
+publish = "public"
+cli_note = "no fronting subcommand yet"
 
 [[script]]
 name    = "smt-diff-fuzz"
@@ -551,6 +598,28 @@ summary = "Run ay-milp and HiGHS on the same MPS files and compare verdicts."
 publish = "public"
 tools   = ["highs", "scip", "gurobi"]
 requires = ["oom-guard"]
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "milp-corpus"
+path    = "scripts/milp_corpus.py"
+lang    = "python"
+group   = "bench.milp"
+summary = "Fetch and index the MIPLIB 2017 corpus (+ .solu reference optima) the W0 harness measures on."
+publish = "public"
+tools   = []
+requires = []
+cli_note = "no fronting subcommand yet"
+
+[[script]]
+name    = "milp-w0"
+path    = "scripts/milp_w0.py"
+lang    = "python"
+group   = "bench.milp"
+summary = "W0 attribution harness: root closure, solver baselines, per-knob ablation, regression gate, Gurobi audit, LP-throughput gap."
+publish = "public"
+tools   = ["highs", "gurobi"]
+requires = ["milp-corpus"]
 cli_note = "no fronting subcommand yet"
 
 [[script]]
@@ -926,16 +995,6 @@ summary = "Run local FlatZinc benchmarks through the competition CLI surface."
 publish = "public"
 status  = "deprecated"
 cli_note = "deprecated (zero refs)"
-
-[[script]]
-name    = "smtlib-sample-fetch"
-path    = "benchmarks/smtlib-sample/fetch.sh"
-lang    = "bash"
-group   = "corpus.fetch"
-summary = "Re-fetch the SMT-LIB sample corpus used by ay-z3-parity bench (Zenodo 11061097)."
-publish = "public"
-cli_note = "no fronting subcommand yet"
-docs    = "benchmarks/smtlib-sample/MANIFEST.md"
 
 [[script]]
 name    = "java-binding-smoke"

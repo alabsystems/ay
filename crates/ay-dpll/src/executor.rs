@@ -76,6 +76,7 @@ mod check_sat_assuming;
 mod commands;
 mod core_minimize;
 mod diff_logic;
+pub(crate) mod dl_theory;
 mod dt_axioms;
 pub(crate) mod ite_lift;
 pub(crate) mod lean_firewall;
@@ -985,6 +986,44 @@ pub struct Executor {
     /// Reentrancy latch for the assignment builder: while building, nested
     /// evaluation must not consult the (incomplete) assignment.
     dt_egraph_building: Cell<bool>,
+    /// Exact-snapshot-keyed index for array definitional-equality lookups
+    /// (`array_variable_definition*` / `unique_array_constructor_definition_
+    /// excluding`): maps each side TermId of every asserted binary `=` to the
+    /// equality assertions mentioning it, in assertion order. Rebuilt whenever
+    /// the (assertions, assumptions) snapshot differs BYTE-EXACTLY from the
+    /// cached one — never trusted across any change, so it can never serve a
+    /// stale definition (model validation is a soundness gate). Motivation:
+    /// the previous per-lookup linear scan made model evaluation
+    /// O(selects × assertions); an n-ary `distinct` over N selects expands to
+    /// ~N²/2 assertions, so validation cost exploded to tens of seconds by
+    /// N≈400 on instances whose solve took 0.1s.
+    array_def_index: std::cell::RefCell<Option<model::ArrayDefIndexCache>>,
+    /// Reverse index `array term -> select(array, _) terms`, extended lazily
+    /// over the APPEND-ONLY term store: `(scanned_prefix_len, map)`. Existing
+    /// `TermId`s are immutable, so extending the scan over `[scanned, len)` is
+    /// exact by construction — no snapshot compares needed. The one hazard is
+    /// wholesale `ctx` replacement (`reset()`), which clears this index
+    /// explicitly; a shrink of `terms.len()` also forces a from-scratch
+    /// rebuild as belt-and-braces. Motivation: `array_witness_base_interp`
+    /// scanned the WHOLE term store per array to find its constrained reads —
+    /// O(arrays × terms) during model-output completion.
+    #[allow(clippy::type_complexity)]
+    select_by_array_index:
+        std::cell::RefCell<(usize, ay_core::kani_compat::DetHashMap<TermId, Vec<TermId>>)>,
+    /// Cached ground-term reachability closure of `(assertions, assumptions)`
+    /// behind `term_is_required_by_last_query`: `(assertions snapshot,
+    /// assumptions snapshot, reachable set)`. Validated by BYTE-EXACT snapshot
+    /// compare on every query (cheap: one id-vector compare vs the full-forest
+    /// DFS it replaces, which previously ran PER CANDIDATE READ during array
+    /// completion — O(reads × forest) with fresh hash-set churn each time).
+    #[allow(clippy::type_complexity)]
+    required_terms_index: std::cell::RefCell<
+        Option<(
+            Vec<TermId>,
+            Option<Vec<TermId>>,
+            ay_core::kani_compat::DetHashSet<TermId>,
+        )>,
+    >,
     /// Variable substitutions (`eliminated var -> replacement RHS`) recorded
     /// by preprocessing passes during the current solve call.
     ///
@@ -1012,6 +1051,16 @@ pub struct Executor {
     /// but satisfiability follows from the stronger branch after the strict
     /// definitive-false gate has ruled out known model violations.
     sat_validated_by_mod_div_or_branch: bool,
+    /// When true, the current UNSAT was derived by the trust-free nested-array
+    /// store-flat read-over-write reduction (`try_ufnia_store_flat_row_refutation`):
+    /// each single-definition `var = store(…)` was inlined (equisatisfiable) and
+    /// exact `select(store(a,i,v),i)=v` rewriting folded EVERY array term away,
+    /// leaving a pure-arithmetic residue the sound NIA solver refuted. Such a
+    /// refutation uses NO array-theory combination reasoning, so it is
+    /// authoritative and is exempt from `quarantine_unverified_nested_array_unsat`
+    /// (which fail-closes the UNVERIFIED lazy array+arith combination, a distinct
+    /// path). Set only on that exact reduction; reset at each check-sat entry.
+    nested_array_row_reduction_unsat: bool,
     /// When true, `has_negated_string_equivalence_tautology` is bypassed.
     /// Set during incremental SLIA pipeline where `self.ctx.assertions` is
     /// temporarily replaced with preprocessed assertions that may falsely
@@ -1421,6 +1470,14 @@ mod maxsmt_tests;
 #[cfg(test)]
 #[path = "executor/diff_logic_tests.rs"]
 mod diff_logic_tests;
+
+#[cfg(test)]
+#[path = "executor/dl_theory_tests.rs"]
+mod dl_theory_tests;
+
+#[cfg(test)]
+#[path = "executor/dl_theory_rollback_tests.rs"]
+mod dl_theory_rollback_tests;
 
 impl Executor {
     /// Execute a single command

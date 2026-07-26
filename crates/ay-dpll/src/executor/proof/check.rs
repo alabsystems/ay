@@ -452,6 +452,133 @@ impl Executor {
             out.push(lean);
         }
 
+        // Store COMMUTATIVITY: two `store`-chains that permute the same writes
+        // over a common base — `(not (= (store (store a i v) j w) (store (store a
+        // j w) i v)))` directly, or `(not (= (select L k) (select R k)))` through
+        // a shared read — are equal under the asserted pairwise index
+        // disequalities, so asserting they differ is UNSAT. Reconstruct from the
+        // frontend assertions and ground the guarded `row_eq ∨ (⋁ coincidences)`
+        // clause (`sel_upd_same`/`sel_upd_other` + extensionality).
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_store_commute_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            if !out.push(lean) {
+                return None;
+            }
+        }
+
+        // Array WRITE-BACK identity: `store a i (select a i) ≠ a` is refuted by
+        // extensionality (storing the value already present is a no-op). ay
+        // refutes arrays eagerly (bare-trust); reconstruct from the frontend
+        // assertions and ground the `ArrayThy.ext_nonvacuous` mirror.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_write_back_identity_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            if !out.push(lean) {
+                return None;
+            }
+        }
+
+        // Array store-equality ⇒ value-equality (ROW-1 on both sides):
+        // `store a i v = store b i w` with `v ≠ w` is UNSAT. Reconstruct from the
+        // frontend assertions and ground the `ArrayThy.sel_upd_same` mirror.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_store_eq_select_eq_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            if !out.push(lean) {
+                return None;
+            }
+        }
+
+        // Array store-equality ⇒ base-equality at a DISTINCT index (ROW-2):
+        // `store a i v = store b i w`, `i ≠ j`, `select a j ≠ select b j` is UNSAT.
+        // Reconstruct from the frontend assertions and ground the
+        // `ArrayThy.sel_upd_other` mirror.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_store_eq_base_other_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            if !out.push(lean) {
+                return None;
+            }
+        }
+
+        // Conflicting stores (ROW-1 through a shared array variable): a variable
+        // bound to two stores at the same index with distinct values —
+        // `x = store b i e1`, `x = store b i e2`, `e1 ≠ e2` — is UNSAT.
+        // Reconstruct from the frontend assertions and ground the
+        // `ArrayThy.sel_upd_same` mirror.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_conflicting_stores_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            if !out.push(lean) {
+                return None;
+            }
+        }
+
+        // Diamond conflict (store-equality ⇒ ROW-1 vs ROW-2 at one index):
+        // `b = store a i v`, `c = store a j w`, `b = c`, `i ≠ j`,
+        // `v ≠ select a i` is UNSAT. Reconstruct from the frontend assertions and
+        // ground the `ArrayThy.sel_upd_same`/`sel_upd_other` mirror.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_diamond_conflict_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            if !out.push(lean) {
+                return None;
+            }
+        }
+
+        // Array-equality ⇒ select-equality (select congruence): `a = b` with
+        // `select a i ≠ select b i` is UNSAT. Reconstruct from the frontend
+        // assertions and ground the functional-`sel` congruence (`congrFun`).
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_eq_select_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            if !out.push(lean) {
+                return None;
+            }
+        }
+
+        // Array-equality ⇒ store-equality (store congruence): `a = b` with
+        // `store a i v ≠ store b i v` is UNSAT. Reconstruct from the frontend
+        // assertions and ground the functional-`upd` congruence (`congrArg`).
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_store_congruence_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            if !out.push(lean) {
+                return None;
+            }
+        }
+
+        // Array equality-chain ⇒ ROW-1: a chain of asserted array equalities
+        // carries the read array to a `store … i v` term, so `select a i ≠ v` is
+        // UNSAT. Reconstruct from the frontend assertions and ground the
+        // `Eq.trans` chain + `ArrayThy.sel_upd_same` mirror.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_eq_chain_row1_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+            )
+        {
+            if !out.push(lean) {
+                return None;
+            }
+        }
+
         // Floating-point classification conflict: a float in two mutually-exclusive
         // IEEE classes (e.g. `(fp.isInfinite x) ∧ (fp.isNaN x)`) is UNSAT. ay reduces
         // FP to bit-vectors and refutes eagerly (bare-trust), so reconstruct from the
@@ -926,13 +1053,76 @@ impl Executor {
             out.push(lean);
         }
 
+        // Array WRITE-BACK IDENTITY CHAIN behind `define-fun` macros
+        // (`storeinv_sf_chain`): `store (store a i (select a i)) j (select a j) ≠ a`
+        // is unsat because each level writes the base's own value back. Expand the
+        // macros and ground the pointwise `ext` identity (the LIA firewall below is
+        // gated off these array macros so it no longer mis-emits an omega-unclosable
+        // artifact for this shape).
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_writeback_chain_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+                &self.ctx.nullary_defined_terms(),
+            )
+        {
+            out.push(lean);
+        }
+
+        // Single-index array STORE-INVERSE cross-swap (`storeinv_cross_1idx`):
+        // `store a2 i (select a1 i) = store a1 i (select a2 i)` with `a1 ≠ a2`
+        // forces `a1 = a2` pointwise (array extensionality), a contradiction.
+        // Inline the array-lets and ground the disjunctive `ext` theory lemma.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_storeinv_swap_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+                &self.ctx.nullary_defined_terms(),
+            )
+        {
+            out.push(lean);
+        }
+
+        // Fused array-ROW + LINEAR-INTEGER conflict (bucket "array_sum_bound"):
+        // `arr = store(base, i, v)` pins `select arr i = v` (RoW-1), and the pinned
+        // reads make an integer (in)equality infeasible (closed by `omega`).
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_array_sum_bound_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+                &self.ctx,
+            )
+        {
+            out.push(lean);
+        }
+
         // Linear-integer conflicts: ay refutes a jointly integer-UNSAT conjunction
         // of linear (in)equalities with a bare `:rule trust` integer step (no
         // `la_generic` lemma clause to ground), so reconstruct from the frontend
         // assertions and discharge the all-negated blocking clause by `omega`.
+        // `nullary_defined_terms` gates this OFF array-typed macros (a
+        // `store`-bodied `define-fun` disequality is an array, not integer, atom).
         if let Some(lean) = crate::executor::lean_firewall::emit_lia_firewall_lean_from_parsed(
             self.ctx.assertions_parsed(),
+            &self.ctx.nullary_defined_terms(),
+            &self.ctx,
         ) {
+            out.push(lean);
+        }
+
+        // NONLINEAR-INTEGER conflicts carried by ONE bilinear product (bucket
+        // "nia_product"): the LIA emitter above DECLINES on any `var*var` term
+        // because `omega` atomises the product and then cannot close the goal.
+        // This one injects the verified `AySoundness.NiaProduct` McCormick corner
+        // lemmas, which relate the atomised product to its two factors LINEARLY,
+        // and only fires after proving the reconstructed system integer-infeasible
+        // over exactly the atom set `omega` will see. Takes the same
+        // `nullary_defined_terms` array-macro gate as the LIA emitter: an array
+        // disequality is not an Int atom and must not be modelled as one.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_nia_product_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+                &self.ctx.nullary_defined_terms(),
+                &self.ctx,
+            )
+        {
             out.push(lean);
         }
 
@@ -944,8 +1134,28 @@ impl Executor {
         if let Some(lean) =
             crate::executor::lean_firewall::emit_euf_lia_congruence_firewall_lean_from_parsed(
                 self.ctx.assertions_parsed(),
+                &self.ctx,
             )
         {
+            out.push(lean);
+        }
+
+        // EUF CONGRUENCE bridge closing an LIA (in)equality/disequality system
+        // (bucket "euf_cong_bridge"): a congruence-derived `f s = f t` (from an
+        // LIA-implied `s = t`) makes `f a < 0 ∧ f b ≥ 0` (with `a = b`) or
+        // `f x ≠ f y` (with `x + 1 = y + 1`) linearly UNSAT — the `omega` cascade
+        // then closes it. The GENERAL firewall below reconstructs `f a`, `f b` as
+        // INDEPENDENT integers and mis-emits an `omega`-unclosable artifact for
+        // this shape, so when this dedicated emitter fires we SUPPRESS the general
+        // one (its output would be a redundant fail-lake duplicate). MUST be
+        // inserted BEFORE the emit_general_firewall_lean call.
+        let euf_cong_bridge =
+            crate::executor::lean_firewall::emit_euf_congruence_bridge_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+                &self.ctx,
+            );
+        let euf_cong_bridge_fired = euf_cong_bridge.is_some();
+        if let Some(lean) = euf_cong_bridge {
             out.push(lean);
         }
 
@@ -955,12 +1165,16 @@ impl Executor {
         // Nelson–Oppen composition shape generalised from `CombinedExample`.
         // Complementary to the per-lemma emitters above (which ground each lemma
         // in isolation); only fires for fully-renderable arithmetic/equality
-        // proofs, declining otherwise.
-        if let Some(lean) =
-            crate::executor::lean_firewall::emit_general_firewall_lean(&self.ctx.terms, proof)
-        {
-            if !out.push(lean) {
-                return None;
+        // proofs, declining otherwise. Skipped when the EUF-congruence-bridge
+        // emitter already covered this conflict (avoids an omega-unclosable
+        // duplicate for the `f a`/`f b`-in-bounds shape).
+        if !euf_cong_bridge_fired {
+            if let Some(lean) =
+                crate::executor::lean_firewall::emit_general_firewall_lean(&self.ctx.terms, proof)
+            {
+                if !out.push(lean) {
+                    return None;
+                }
             }
         }
         out.finish()

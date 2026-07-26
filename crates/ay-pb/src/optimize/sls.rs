@@ -1437,8 +1437,8 @@ impl Default for SlsOptions<'_> {
 /// weighting/SCC options matrix, i.e. including the DDFW/SCC worker
 /// configuration) — the flag is purely a throughput lever, and
 /// [`Tracker::new`] re-checks it fail-closed.
-/// Measured (`bench_tracker_i64_vs_i128_flip_rate`, release, busy host, best
-/// of 2, 2026-07-11): i64 is 1.95–2.08× the i128 flip rate on the 10k-var and
+/// Measured by the fixed-seed release campaign (busy host, best of 2,
+/// 2026-07-11): i64 is 1.95–2.08× the i128 flip rate on the 10k-var and
 /// 2.42–2.48× on the 100k-var mixed Ge/Eq synthetic instances.
 pub(crate) fn search_with_seeds(
     instance: &PbInstance,
@@ -4817,13 +4817,10 @@ mod tests {
         println!("unified(warm) <= baseline(scratch) on {unified_wins}/{total} shapes");
     }
 
-    // ---- microbenchmark (design §4 performance contract) ----
+    // ---- distilled microbenchmark invariant (design §4) ----
     //
-    // Ignored by default: run explicitly, release build, e.g.
-    //   cargo test -p ay-pb --release -j 4 --lib -- --ignored bench_ --nocapture
-    // Deterministic synthetic instances (10k/100k vars, mixed Ge/Eq, negated
-    // literals) and fixed flip budgets; wall clock printed. Justifies the i64
-    // fast-path benefit for the two-phase tracker (Change 1).
+    // A fixed planted mixed-row fixture keeps the i64/i128 trajectory
+    // equivalence load-bearing without making wall-clock throughput a test.
 
     /// Deterministic synthetic instance: mixed Ge/Eq rows (every 3rd Eq),
     /// ~half negated literals, small (i64-fitting) coefficients, objective
@@ -4833,23 +4830,28 @@ mod tests {
         rows: usize,
         row_len: usize,
         seed: u64,
-    ) -> (PbInstance, PbObjective) {
+    ) -> (PbInstance, PbObjective, Vec<bool>) {
         let mut rng = SplitMix64::new(seed);
+        let planted: Vec<bool> = (0..num_vars).map(|var| var % 3 == 0).collect();
         let mut constraints = Vec::with_capacity(rows);
         for r in 0..rows {
             let mut terms = Vec::with_capacity(row_len);
             let mut sum: i128 = 0;
+            let mut planted_lhs: i128 = 0;
             for _ in 0..row_len {
                 let v = rng.below(num_vars) as u32 + 1;
                 let negated = rng.below(2) == 1;
                 let c = 1 + rng.below(16) as i128;
                 sum += c;
+                if planted[v as usize - 1] != negated {
+                    planted_lhs += c;
+                }
                 terms.push(term(c, if negated { neg(v) } else { lit(v) }));
             }
             if r % 3 == 0 {
-                constraints.push(eq(terms, sum / 2));
+                constraints.push(eq(terms, planted_lhs));
             } else {
-                constraints.push(ge(terms, sum / 4));
+                constraints.push(ge(terms, planted_lhs - sum / 8 - 1));
             }
         }
         let objective = PbObjective {
@@ -4863,51 +4865,58 @@ mod tests {
             constraints,
             objective: Some(objective.clone()),
         };
-        (instance, objective)
+        (instance, objective, planted)
     }
 
     #[test]
-    #[ignore = "microbench: run explicitly with --ignored --nocapture (release)"]
-    fn bench_tracker_i64_vs_i128_flip_rate() {
-        println!("\n=== two-phase tracker flip-rate: i64 fast path vs i128 (search_loop) ===");
-        println!(
-            "{:>8} {:>9} {:>6} {:>10} {:>12} {:>12}",
-            "vars", "rows", "width", "flips", "secs", "flips/sec"
+    fn tracker_i64_and_i128_match_on_planted_mixed_rows() {
+        let num_vars = 128usize;
+        let (instance, objective, planted) = synth_mixed_instance(num_vars, 256, 5, 0x5EED_5EED);
+        assert!(rows_fit::<i64>(&instance.constraints));
+        assert!(verify_all_constraints(&instance.constraints, &planted));
+
+        let run = |wide: bool| {
+            let stop = no_stop();
+            let mut reported = Vec::new();
+            let mut on_improve = |value: i128, assignment: &[bool]| {
+                assert!(verify_all_constraints(&instance.constraints, assignment));
+                assert_eq!(eval_objective(&objective, assignment), value);
+                reported.push((value, assignment.to_vec()));
+            };
+            let options = SlsOptions {
+                start: Some(&planted),
+                fast_bump: true,
+                max_flips: 5_000,
+                ..SlsOptions::default()
+            };
+            let result = if wide {
+                search_loop::<i128>(
+                    &instance,
+                    &objective,
+                    None,
+                    &stop,
+                    &mut on_improve,
+                    &options,
+                )
+            } else {
+                search_loop::<i64>(
+                    &instance,
+                    &objective,
+                    None,
+                    &stop,
+                    &mut on_improve,
+                    &options,
+                )
+            };
+            (reported, result)
+        };
+        let narrow = run(false);
+        let wide = run(true);
+        assert!(narrow.1.is_some(), "the planted start is feasible");
+        assert!(
+            !narrow.0.is_empty(),
+            "the incumbent stream must be exercised"
         );
-        for &(num_vars, rows, flips) in &[
-            (10_000usize, 20_000usize, 1_000_000u64),
-            (100_000, 200_000, 1_000_000),
-        ] {
-            let (instance, objective) = synth_mixed_instance(num_vars, rows, 5, 0x5EED_5EED);
-            assert!(rows_fit::<i64>(&instance.constraints));
-            let mut secs = [0.0f64; 2];
-            for (i, wide) in [(0, false), (1, true)] {
-                let stop = no_stop();
-                let mut noop = |_o: i128, _m: &[bool]| {};
-                let options = SlsOptions {
-                    fast_bump: true,
-                    max_flips: flips,
-                    ..SlsOptions::default()
-                };
-                let t0 = std::time::Instant::now();
-                let result = if wide {
-                    search_loop::<i128>(&instance, &objective, None, &stop, &mut noop, &options)
-                } else {
-                    search_loop::<i64>(&instance, &objective, None, &stop, &mut noop, &options)
-                };
-                secs[i] = t0.elapsed().as_secs_f64();
-                println!(
-                    "{:>8} {:>9} {:>6} {:>10} {:>12.3} {:>12.0}   (best {:?})",
-                    num_vars,
-                    rows,
-                    if wide { "i128" } else { "i64" },
-                    flips,
-                    secs[i],
-                    flips as f64 / secs[i],
-                    result.map(|r| r.objective)
-                );
-            }
-            println!("          i64 speedup: {:.2}x", secs[1] / secs[0]);
-        }
+        assert_eq!(narrow, wide, "tracker widths must agree bit-for-bit");
     }
 }

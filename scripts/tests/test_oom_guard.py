@@ -13,6 +13,7 @@ import contextlib
 import io
 import lzma
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -35,6 +36,20 @@ import chccomp_track_sweep  # noqa: E402
 import pb_sweep  # noqa: E402
 import pbcomp_harness  # noqa: E402
 import wind_tunnel  # noqa: E402
+
+_missing_posix_apis = [
+    name for name in ("getuid", "getpgid") if not hasattr(os, name)
+]
+if os.name != "posix" or _missing_posix_apis:
+    raise RuntimeError(
+        "OOM-guard tests require POSIX user and process-group APIs; missing "
+        + ", ".join(_missing_posix_apis)
+    )
+TRUE_BIN = Path("/usr/bin/true")
+if not TRUE_BIN.is_file():
+    raise RuntimeError(
+        "OOM-guard tests require the POSIX /usr/bin/true executable"
+    )
 
 
 class PlanSolverResourcesTest(unittest.TestCase):
@@ -162,7 +177,6 @@ class PlanSolverResourcesTest(unittest.TestCase):
                     acquire_lease=True,
                 )
 
-    @unittest.skipUnless(hasattr(os, "getuid"), "POSIX user lease")
     def test_production_lease_path_is_tmpdir_independent(self):
         with mock.patch.dict(os.environ, {"TMPDIR": "/tmp/first-campaign"}):
             first = og._host_harness_lease_path()
@@ -172,12 +186,10 @@ class PlanSolverResourcesTest(unittest.TestCase):
         self.assertEqual(first, expected)
         self.assertEqual(second, expected)
 
-    @unittest.skipUnless(hasattr(os, "getuid"), "POSIX user lease")
     def test_hidden_lease_path_requires_absolute_path(self):
         with self.assertRaisesRegex(ValueError, "must be absolute"):
             og.acquire_harness_lease("relative test lease", _lock_path="lease.lock")
 
-    @unittest.skipUnless(hasattr(os, "getuid"), "POSIX user lease")
     def test_hidden_lease_path_coordinates_sidecars_with_distinct_tmpdirs(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -327,7 +339,6 @@ class WindTunnelEnvMergeTest(unittest.TestCase):
         self.assertNotIn("NBCORE", env)
 
 
-@unittest.skipUnless(os.path.exists("/usr/bin/true"), "needs /usr/bin/true")
 class ChcEnvelopeRecordingTest(unittest.TestCase):
     """The CHC harnesses must record the enforced per-child --memory envelope:
     baselines/sweeps were measured under ay's 85%-of-RAM default, so results
@@ -337,7 +348,7 @@ class ChcEnvelopeRecordingTest(unittest.TestCase):
     def test_track_sweep_record_carries_memlimit(self):
         task = types.SimpleNamespace(smt2=os.devnull, verdict=None,
                                      rel_id="fam/x.smt2")
-        rec = chccomp_track_sweep.run_one(task, 5, "/usr/bin/true",
+        rec = chccomp_track_sweep.run_one(task, 5, str(TRUE_BIN),
                                           memlimit_mb=777)
         self.assertEqual(rec["memlimit_mb"], 777)
         self.assertEqual(rec["status"], "unknown")
@@ -346,20 +357,19 @@ class ChcEnvelopeRecordingTest(unittest.TestCase):
         task = types.SimpleNamespace(smt2=os.devnull, verdict=None,
                                      rel_id="fam/x.smt2")
         with self.assertRaises(ValueError):
-            chccomp_track_sweep.run_one(task, 5, "/usr/bin/true")
+            chccomp_track_sweep.run_one(task, 5, str(TRUE_BIN))
 
     def test_regression_record_carries_memlimit(self):
         entry = {"year": "2025", "track": "LIA-Lin", "instance": "i.yml",
                  "verdict": "sat", "wall": 1.0}
         with mock.patch.object(chccomp_regression, "resolve_smt2",
                                return_value=os.devnull):
-            rec = chccomp_regression.run(entry, 1, "/usr/bin/true",
+            rec = chccomp_regression.run(entry, 1, str(TRUE_BIN),
                                          memlimit_mb=777)
         self.assertEqual(rec["memlimit_mb"], 777)
         self.assertEqual(rec["status"], "unknown")
 
 
-@unittest.skipUnless(hasattr(os, "getpgid"), "needs POSIX process groups")
 class RssWatchdogTest(unittest.TestCase):
     """rss_watchdog: the external backstop for solver children that do not
     enforce their envelope themselves (the main ay binary's `pb` subcommand
@@ -1050,7 +1060,6 @@ class RssWatchdogTest(unittest.TestCase):
         guard._thread.join.assert_called_once_with(timeout=10)
 
 
-@unittest.skipUnless(hasattr(os, "getpgid"), "needs POSIX process groups")
 class SmtcompEnvelopeTest(unittest.TestCase):
     """smtcomp_harness governed TIME and nothing else until 2026-07-15: --jobs N
     puts N concurrent children in flight for the full --timeout with no memory
@@ -1085,7 +1094,6 @@ class SmtcompEnvelopeTest(unittest.TestCase):
                       smtcomp_harness.run_one.__code__.co_varnames)
 
 
-@unittest.skipUnless(hasattr(os, "getpgid"), "needs POSIX process groups")
 class PbSweepMemoutTest(unittest.TestCase):
     """pb_sweep.run_one labels a watchdog kill as 'memout' — the envelope is
     enforced externally because the default ./target/release/ay `pb`
@@ -1105,14 +1113,37 @@ class PbSweepMemoutTest(unittest.TestCase):
         self.assertEqual(rec["status"], "memout")
 
 
-@unittest.skipUnless(hasattr(os, "getpgid"), "needs POSIX process groups")
 class PbBenchEnvelopeTest(unittest.TestCase):
     """The shell PB harness must use the shared watchdog even at jobs=1 and
     persist the actual envelope in its CSV."""
 
     def test_shell_harness_records_guarded_envelope(self):
-        script = os.path.join(SCRIPTS_DIR, "pb_bench.sh")
         with tempfile.TemporaryDirectory() as td:
+            script = os.path.join(td, "pb_bench.sh")
+            shutil.copyfile(os.path.join(SCRIPTS_DIR, "pb_bench.sh"), script)
+            os.chmod(script, 0o755)
+            guard_log = os.path.join(td, "guard.log")
+            guard = os.path.join(td, "_oom_guard.py")
+            Path(guard).write_text(
+                """\
+import os
+import subprocess
+import sys
+
+with open(os.environ["AY_TEST_GUARD_LOG"], "a", encoding="utf-8") as log:
+    log.write(" ".join(sys.argv[1:]) + "\\n")
+if sys.argv[1] == "plan":
+    print("PLAN_JOBS=1")
+    print("PLAN_MEMLIMIT_MB=64")
+    print("PLAN_NBCORE=1")
+    print("PLAN_HEADROOM_MB=128")
+elif sys.argv[1] == "run":
+    command = sys.argv[sys.argv.index("--") + 1:]
+    raise SystemExit(subprocess.run(command, check=False).returncode)
+else:
+    raise SystemExit(f"unexpected guard command: {sys.argv[1]}")
+"""
+            )
             solver = os.path.join(td, "solver")
             with open(solver, "w") as fh:
                 fh.write("#!/bin/sh\nprintf 's SATISFIABLE\\n'\n")
@@ -1121,20 +1152,25 @@ class PbBenchEnvelopeTest(unittest.TestCase):
             os.makedirs(corpus)
             Path(corpus, "tiny.opb").write_text("* #variable= 0 #constraint= 0\n")
             output = os.path.join(td, "results.csv")
+            environment = os.environ.copy()
+            environment["AY_TEST_GUARD_LOG"] = guard_log
             proc = subprocess.run(
                 [script, solver, "1", corpus, output, "1"],
                 capture_output=True,
                 text=True,
                 timeout=30,
+                env=environment,
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             rows = Path(output).read_text().splitlines()
             self.assertIn("resource_memlimit_mb", rows[0])
             self.assertIn("resource_enforcement", rows[0])
             self.assertTrue(rows[1].endswith("|rss_watchdog"), rows[1])
+            guard_calls = Path(guard_log).read_text().splitlines()
+            self.assertIn("--warn-concurrent-build", guard_calls[0])
+            self.assertIn("run --limit-mb 64", guard_calls[1])
 
 
-@unittest.skipUnless(hasattr(os, "getpgid"), "needs POSIX process groups")
 class WindTunnelMemoutTest(unittest.TestCase):
     """wind_tunnel.run_instance enforces the MEMLIMIT envelope externally:
     a --bin that ignores MEMLIMIT (e.g. the main ay binary's `pb` subcommand,
@@ -1209,7 +1245,6 @@ class PbcompChildEnvTest(unittest.TestCase):
         self.assertEqual(r2.memlimit_mb, 1072)
 
 
-@unittest.skipUnless(os.path.exists("/usr/bin/true"), "needs /usr/bin/true")
 class ChccompHarnessEnvelopeTest(unittest.TestCase):
     """chccomp_harness cmd_run wiring: ay children get --memory and every
     record carries the enforced envelope (resumable JSONL files can span
@@ -1228,7 +1263,7 @@ class ChccompHarnessEnvelopeTest(unittest.TestCase):
             chccomp_harness._AY_MEMLIMIT_MB = old
 
     def test_run_one_record_carries_memlimit(self):
-        chccomp_harness.SOLVERS["truebin"] = lambda f, t: ["/usr/bin/true"]
+        chccomp_harness.SOLVERS["truebin"] = lambda f, t: [str(TRUE_BIN)]
         try:
             task = chccomp_harness.Task(rel_id="fam/x.yml", smt2=os.devnull,
                                         verdict=None, placeholder=False)

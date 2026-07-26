@@ -254,155 +254,41 @@ fn test_drain_witness_entries_reconstruction_still_works() {
 }
 
 // ---------------------------------------------------------------------------
-// Tests for #8179: suppress_prior_witness_entries (CCE+BVE interaction)
+// BCE followed by BVE on the same variable.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_suppress_prior_witness_entries_prevents_double_flip() {
-    // Scenario: CCE removes clause (x0 | x1) with witness x0, then BVE
-    // eliminates x0 with clauses (x0 | x2) and (!x0 | x3).
-    // Without suppression, reverse reconstruction processes BVE first
-    // (setting x0 correctly), then the CCE entry flips x0 again.
+fn test_bce_then_bve_witnesses_compose() {
     let mut stack = ReconstructionStack::new();
 
-    // CCE entry pushed first (earlier in time).
-    stack.push_bce(lit(0, true), vec![lit(0, true), lit(1, true)]);
+    // BCE first removes C=(x0|x1), blocked on x0. The only remaining clause
+    // with -x0 is Dn=(-x0|-x1), so their resolvent is tautological.
+    let bce_clause = vec![lit(0, true), lit(1, true)];
+    stack.push_bce(lit(0, true), bce_clause.clone());
 
-    // BVE eliminates x0 — suppress prior entries for var 0.
-    stack.suppress_prior_witness_entries(0);
+    // BVE later eliminates x0 from Dp=(x0|x2) and Dn. CaDiCaL retains all
+    // three extension entries; reverse chronological replay composes the
+    // transformations without dropping C's sole reconstruction obligation.
+    let bve_pos = vec![lit(0, true), lit(2, true)];
+    let bve_neg = vec![lit(0, false), lit(1, false)];
+    stack.push_witness_clause(vec![lit(0, true)], bve_pos.clone());
+    stack.push_witness_clause(vec![lit(0, false)], bve_neg.clone());
 
-    // BVE pushes its own witness entries.
-    stack.push_witness_clause(vec![lit(0, true)], vec![lit(0, true), lit(2, true)]);
-    stack.push_witness_clause(vec![lit(0, false)], vec![lit(0, false), lit(3, true)]);
-
-    // Model: x0=false, x1=false, x2=true, x3=true.
-    // BVE needs x0=true to satisfy (x0|x2) — but x2=true already satisfies
-    // it, so no flip needed. For (!x0|x3): x3=true already satisfies it.
-    // The CCE entry (x0|x1) would try to flip x0 if not suppressed.
-    let mut model = vec![false, false, true, true];
+    // This satisfies the BVE resolvent (x2|-x1). BVE needs no pivot flip,
+    // then BCE must set x0=true to restore C. The blocking property guarantees
+    // that this final flip cannot break Dn.
+    let mut model = vec![false, false, true];
     stack.reconstruct(&mut model);
 
-    // BVE clauses should be satisfied.
-    assert!(
-        model[0] || model[2],
-        "(x0|x2) must be satisfied after reconstruction"
-    );
-    assert!(
-        !model[0] || model[3],
-        "(!x0|x3) must be satisfied after reconstruction"
-    );
-    // The CCE entry was suppressed, so it should NOT have flipped x0.
-    // x0 should stay false because both BVE clauses are already satisfied.
-    assert!(
-        !model[0],
-        "x0 should remain false — CCE entry was suppressed (#8179)"
-    );
-}
-
-#[test]
-fn test_suppress_prior_witness_entries_only_affects_matching_var() {
-    // Suppression for var 0 should not affect entries with witness var 1.
-    let mut stack = ReconstructionStack::new();
-
-    // BCE entry for var 1.
-    stack.push_bce(lit(1, true), vec![lit(1, true), lit(2, true)]);
-    // BCE entry for var 0.
-    stack.push_bce(lit(0, true), vec![lit(0, true), lit(3, true)]);
-
-    // Suppress only var 0.
-    stack.suppress_prior_witness_entries(0);
-
-    // The var-1 entry should still be active; only var-0 entry suppressed.
-    let mut model = vec![false, false, false, false];
-    stack.reconstruct(&mut model);
-
-    // var 1's BCE entry should have flipped x1 to true.
-    assert!(model[1], "x1 should be flipped by unsuppressed BCE entry");
-    // var 0's BCE entry was suppressed — x0 stays false.
-    assert!(!model[0], "x0 should stay false — its entry was suppressed");
-}
-
-#[test]
-fn test_compact_suppressed_drops_only_suppressed_entries() {
-    let mut stack = ReconstructionStack::new();
-    stack.push_witness_clause(vec![lit(0, true)], vec![lit(0, true), lit(3, true)]);
-    stack.push_witness_clause(vec![lit(1, true)], vec![lit(1, true), lit(4, true)]);
-    stack.push_witness_clause(vec![lit(2, false)], vec![lit(2, false), lit(5, true)]);
-
-    let original_len = stack.len();
-    stack.suppress_prior_witness_entries(1);
-    let removed = stack.compact_suppressed();
-
-    assert_eq!(removed, 1);
-    assert_eq!(stack.len(), original_len - removed);
-
-    let mut model = vec![false, false, false, true, false, true];
-    stack.reconstruct(&mut model);
-    assert!(
-        model[0] || model[3],
-        "first remaining clause must be satisfied"
-    );
-    assert!(
-        !model[2] || model[5],
-        "last remaining clause must be satisfied"
-    );
-}
-
-#[test]
-fn test_compact_suppressed_preserves_preserve_flag() {
-    let mut stack = ReconstructionStack::new();
-    stack.push_preserved_witness_clause(vec![lit(5, true)], vec![lit(5, true), lit(6, true)]);
-    stack.push_witness_clause(vec![lit(5, true)], vec![lit(5, true), lit(7, true)]);
-
-    stack.suppress_prior_witness_entries(5);
-    let removed = stack.compact_suppressed();
-
-    assert_eq!(removed, 1);
-    assert_eq!(stack.len(), 1);
-    assert!(stack.steps.iter().any(|step| {
-        matches!(step, ReconstructionStep::Witness(wc)
-            if wc.preserve && wc.witness.iter().any(|w| w.variable().index() == 5))
-    }));
-}
-
-#[test]
-fn test_compact_suppressed_retains_sweep_steps() {
-    let mut stack = ReconstructionStack::new();
-    // push_sweep currently emits witness entries, so inject a real Sweep step
-    // directly to cover retention of the enum variant during compaction.
-    stack.steps.push(ReconstructionStep::Sweep {
-        num_vars: 2,
-        lit_map: vec![lit(0, true), lit(0, false), lit(1, true), lit(1, false)],
-    });
-    stack.push_witness_clause(vec![lit(3, true)], vec![lit(3, true), lit(4, true)]);
-
-    stack.suppress_prior_witness_entries(3);
-    let removed = stack.compact_suppressed();
-
-    assert_eq!(removed, 1);
-    assert!(stack.len() >= 1);
-    assert!(matches!(
-        stack.steps.first(),
-        Some(ReconstructionStep::Sweep { .. })
-    ));
-}
-
-#[test]
-fn test_suppress_prior_witness_entries_opportunistic_compaction_8672() {
-    let mut stack = ReconstructionStack::new();
-    for _ in 0..5_000 {
-        stack.push_witness_clause(vec![lit(0, true)], vec![lit(0, true), lit(1, true)]);
+    for clause in [&bce_clause, &bve_pos, &bve_neg] {
+        assert!(
+            clause
+                .iter()
+                .any(|lit| model[lit.variable().index()] == lit.is_positive()),
+            "reconstructed model must satisfy {clause:?}"
+        );
     }
-    stack.push_witness_clause(vec![lit(1, true)], vec![lit(1, true), lit(2, true)]);
-
-    stack.suppress_prior_witness_entries(0);
-
-    assert_eq!(stack.len(), 1);
-    assert!(matches!(
-        stack.steps.first(),
-        Some(ReconstructionStep::Witness(wc))
-            if wc.witness.iter().any(|w| w.variable().index() == 1)
-    ));
+    assert!(model[0], "the retained BCE witness must restore C");
 }
 
 // ---------------------------------------------------------------------------
@@ -558,56 +444,10 @@ fn test_bve_multi_round_noncontiguous_entries() {
 }
 
 #[test]
-fn test_bve_multi_round_noncontiguous_forced_flip() {
-    // Multi-round BVE with suppress_prior_witness_entries, ensuring forced
-    // flips work correctly when earlier entries are suppressed.
-    //
-    // Round 1 eliminates x2:
-    //   [0] witness x2,  clause (x2 | x4)
-    //   [1] witness !x2, clause (!x2 | x5)
-    //
-    // Round 1 also eliminates x0:
-    //   [2] witness x0,  clause (x0 | x3)
-    //   [3] witness !x0, clause (!x0 | x6)
-    //
-    // Round 2 re-eliminates x2 (entries [0],[1] get suppressed):
-    //   [4] witness x2,  clause (x2 | x7)
-    //   [5] witness !x2, clause (!x2 | x8)
-    //
-    // Model: x0=true, x2=true, all others false.
-    //
-    // Reconstruction (reverse order, entries [0],[1] suppressed):
-    //   [5] (!x2|x8): !x2=false, x8=false → unsatisfied → flip x2 to false
-    //   [4] (x2|x7): x2=false, x7=false → unsatisfied → flip x2 to true
-    //       Wait: witness is x2 (positive). x2 is false → flip to true.
-    //       But then [5]'s clause is broken again.
-    //
-    //   Actually let's trace more carefully with the algorithm.
-    //   [5] clause (!x2|x8). x2=true → !x2=false, x8=false → unsatisfied.
-    //       Witness = !x2. lit_satisfied = !model[2] = !true = false → flip x2.
-    //       model[2] = false.
-    //   [4] clause (x2|x7). x2=false, x7=false → unsatisfied.
-    //       Witness = x2. lit_satisfied = model[2] = false → flip x2.
-    //       model[2] = true.
-    //   [3] clause (!x0|x6). x0=true → !x0=false, x6=false → unsatisfied.
-    //       Witness = !x0. lit_satisfied = !model[0] = false → flip x0.
-    //       model[0] = false.
-    //   [2] clause (x0|x3). x0=false, x3=false → unsatisfied.
-    //       Witness = x0. lit_satisfied = model[0] = false → flip x0.
-    //       model[0] = true.
-    //   [1] SUPPRESSED, skip.
-    //   [0] SUPPRESSED, skip.
-    //
-    // Final model: x0=true, x2=true.
-    // Check: [4] (x2|x7) = (true|false) = sat. [5] (!x2|x8) = (false|false) = UNSAT.
-    //
-    // The issue is the same: positive and negative entries for the same var
-    // conflict. But this IS how real BVE works -- the last entry processed
-    // (earliest in stack, i.e. [4]) wins. The key insight is that in real BVE,
-    // the clauses removed are resolvable, so ONE polarity always satisfies.
-    //
-    // Let's construct a valid scenario: eliminate different variables in each
-    // round, with interleaving, and forced flips for all of them.
+fn test_bve_multiple_eliminations_forced_flip() {
+    // Independent BVE groups are replayed in reverse chronological order.
+    // Each negative-polarity parent is satisfied by a non-pivot literal,
+    // while each positive-polarity parent forces its pivot true.
     //
     // Round 1: eliminate x0 (positive and negative clauses)
     //   [0] witness x0,  clause (x0 | x3)
@@ -620,30 +460,6 @@ fn test_bve_multi_round_noncontiguous_forced_flip() {
     // Round 2: eliminate x1 (interleaved between x0 and x2 entries)
     //   [4] witness x1,  clause (x1 | x7)
     //   [5] witness !x1, clause (!x1 | x8)
-    //
-    // Model: x0=true, x1=false, x2=true, x3=false, x4=false, x5=false,
-    //         x6=false, x7=false, x8=true.
-    //
-    // Reconstruction (reverse):
-    //   [5] (!x1|x8): !x1=true (x1=false), x8=true → satisfied. No flip.
-    //   [4] (x1|x7): x1=false, x7=false → unsatisfied → flip x1 to true.
-    //   [3] (!x2|x6): !x2=false (x2=true), x6=false → unsatisfied → flip x2 to false.
-    //   [2] (x2|x5): x2=false, x5=false → unsatisfied → flip x2 to true.
-    //   [1] (!x0|x4): !x0=false (x0=true), x4=false → unsatisfied → flip x0 to false.
-    //   [0] (x0|x3): x0=false, x3=false → unsatisfied → flip x0 to true.
-    //
-    // Final: x0=true, x1=true, x2=true.
-    // Verify:
-    //   [0] (x0|x3) = (true|false) = sat
-    //   [1] (!x0|x4) = (false|false) = UNSAT!
-    //
-    // Same problem. The fundamental issue is that for a single variable,
-    // the positive entry is processed LAST (lowest index, reverse order),
-    // so positive polarity always wins. The negative clause is only satisfied
-    // if another literal in it is true.
-    //
-    // Valid test: ensure at least one non-witness literal is true in each
-    // negative-polarity clause.
 
     let mut stack = ReconstructionStack::new();
 

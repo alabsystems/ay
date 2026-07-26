@@ -774,39 +774,25 @@ mod tests {
         assert_eq!(result.value, 2);
     }
 
-    /// Direct B&B power-probe: run `solve_branch_and_bound` on a real `.opb` with a
-    /// LARGE time/node budget (not the portfolio's 20s post-solve reserve) to answer
-    /// whether this engine can *close* a hard OPT-LIN instance given real time, or
-    /// whether its design is inadequate. Ignored; drive with env:
-    ///   BNB_PROBE_FILE=/abs/path.opb BNB_PROBE_SECS=120 \
-    ///     cargo test -p ay-pb --release --lib optimize::branch_and_bound::tests::bnb_power_probe -- --ignored --nocapture
     #[test]
-    #[ignore = "manual B&B power-probe; set BNB_PROBE_FILE + BNB_PROBE_SECS"]
-    fn bnb_power_probe() {
-        use std::time::{Duration, Instant};
-        let path = std::env::var("BNB_PROBE_FILE").expect("set BNB_PROBE_FILE");
-        let secs: u64 = std::env::var("BNB_PROBE_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(120);
-        let raw = std::fs::read_to_string(&path).expect("read opb");
-        let inst = crate::parse_opb(&raw).expect("parse opb");
-        let objective = inst.objective.clone().expect("optimization instance");
-        let name = path.rsplit('/').next().unwrap_or(&path);
-        let deadline = Instant::now() + Duration::from_secs(secs);
-        let stop = || Instant::now() >= deadline;
-        let t0 = Instant::now();
-        let result = solve_branch_and_bound(&inst, &objective, None, u64::MAX, &stop);
-        let dt = t0.elapsed().as_secs_f64();
-        match result {
-            Some(r) => println!(
-                "BNB_PROBE {name}: proven_optimal={} value={} time={dt:.1}s vars={}",
-                r.proven_optimal, r.value, inst.num_vars
-            ),
-            None => println!(
-                "BNB_PROBE {name}: NO INCUMBENT time={dt:.1}s vars={}",
-                inst.num_vars
-            ),
-        }
+    fn bnb_proves_weighted_cover_optimum_with_bounded_nodes() {
+        // Selecting at least three items with costs 1..=8 has the unique value
+        // floor 1+2+3=6.  This distils the old corpus power probe into a fixed
+        // branch-and-bound closure and verifies the returned witness exactly.
+        let objective = PbObjective {
+            terms: (1..=8).map(|var| term(i128::from(var), var)).collect(),
+        };
+        let constraint = ge((1..=8).map(|var| term(1, var)).collect(), 3);
+        let inst = instance(8, vec![constraint]);
+        let result = solve_branch_and_bound(&inst, &objective, None, 100_000, &never_stop)
+            .expect("cover is feasible");
+
+        assert!(result.proven_optimal);
+        assert_eq!(result.value, 6);
+        assert!(verify_all_constraints(
+            &inst.constraints,
+            &result.assignment
+        ));
+        assert_eq!(eval_objective(&objective, &result.assignment), 6);
     }
 }

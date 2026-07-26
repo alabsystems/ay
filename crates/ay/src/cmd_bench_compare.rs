@@ -5,18 +5,23 @@
 //! `ay bench compare` — compare AY against a competition's field under
 //! labeled run classes (design: the development design notes).
 //!
-//! Registry: `benchmarks/comparisons.toml`. 0.1.0 verbs: `list`, `show`,
-//! `check` — read-only preflight; the runner verbs (`refs`, `run`, `import`,
-//! `report`) land post-0.1.0 and the group help states this. `check` is
-//! self-contained so it can be run on the machine that would host a replay:
-//! it reads local hardware and compares it field by field against the
-//! entry's cited official specs.
+//! Registry: `benchmarks/comparisons.toml`. `list`, `show`, `check`, and
+//! `check-all` provide read-only comparison preflight. `campaign-check`
+//! validates exact coverage of the catalog/official-field/AY-report join and
+//! recomputes ranks for every score kind admitted by its typed comparator
+//! registry. The runner verbs (`refs`, `run`, `import`, `report`) remain
+//! roadmap items.
+//! `check` is self-contained so it can be run on the machine that would host
+//! a replay: it reads local hardware and compares it field by field against
+//! the entry's cited official specs.
 
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "bench")]
+use std::collections::BTreeMap;
 #[cfg(any(feature = "bench", test))]
 use std::collections::BTreeSet;
 #[cfg(any(feature = "bench", test))]
@@ -30,6 +35,9 @@ use std::process::Command as ProcCommand;
 use anyhow::{anyhow, bail, Context, Result};
 
 const DEFAULT_REGISTRY: &str = "benchmarks/comparisons.toml";
+const DEFAULT_CAMPAIGN_CATALOG: &str = "benchmarks/continuous-2025-2026.toml";
+const DEFAULT_OFFICIAL_FIELD: &str = "benchmarks/continuous-official-field-2025-2026.json";
+const DEFAULT_AY_REPORT: &str = "benchmarks/continuous-ay-scoreboard.json";
 #[cfg(any(feature = "bench", test))]
 const CORPORA_MANIFEST: &str = "benchmarks/corpora.toml";
 #[cfg(any(feature = "bench", test))]
@@ -58,7 +66,11 @@ asserted: replay is granted by a host check and refused on mismatch, with
 no override. official packets are created only by `import`, with a citation.";
 
 const GROUP_AFTER_HELP: &str = "\
-At 0.1.0 this group provides `list`, `show`, and `check`. Post-0.1.0 roadmap:
+This group provides `list`, `show`, `check`, `check-all`, and `campaign-check`.
+`campaign-check` fails closed unless the continuous catalog, official field,
+and AY report contain exactly one compatible row per track. It reports
+incompleteness explicitly and recomputes every admitted score/rank claim.
+Runner roadmap:
   refs    Show or install an entry's winner reference solvers
   run     Execute a replay- or laptop-class comparison run
   import  Record the competition's published results as class=official
@@ -102,6 +114,17 @@ hardware is class=laptop by definition.
 Exit codes: 0 = entry runnable and replay-eligible; 1 = runnable,
 laptop-only; 2 = entry not runnable (missing corpus/tools) or specs unknown.";
 
+const CHECK_ALL_LONG_ABOUT: &str = "\
+Preflight every registry entry on this machine
+
+Runs the same read-only corpus, winner-reference, scoring, budget, and host
+checks as `compare check` for every selected entry. The JSON form is intended
+for external-reviewer and machine-provisioning audits.
+
+Exit codes: 0 = every entry runnable and replay-eligible; 1 = every entry
+runnable but at least one is laptop-only; 2 = at least one entry is not
+runnable or has unknown official specs.";
+
 // ---------------------------------------------------------------------------
 // Clap surface (compiled unconditionally, like the rest of `ay bench`)
 // ---------------------------------------------------------------------------
@@ -134,6 +157,11 @@ enum CompareCommand {
     /// Preflight one entry: corpus, winner builds, scoring, host verdict
     #[command(long_about = CHECK_LONG_ABOUT)]
     Check(CheckArgs),
+    /// Preflight every registry entry on this machine
+    #[command(long_about = CHECK_ALL_LONG_ABOUT)]
+    CheckAll(CheckAllArgs),
+    /// Validate exact catalog coverage and campaign-packet structure
+    CampaignCheck(CampaignCheckArgs),
 }
 
 #[derive(Args)]
@@ -163,6 +191,45 @@ struct CheckArgs {
     /// Comparison id (e.g. smtcomp-2025-single-query-qf-lia)
     id: String,
     /// Emit findings as JSON
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+#[cfg_attr(not(feature = "bench"), allow(dead_code))]
+struct CheckAllArgs {
+    /// Filter by competition
+    #[arg(long, value_name = "COMP", value_enum)]
+    competition: Option<Competition>,
+    /// Emit one aggregate machine-readable preflight
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+#[cfg_attr(not(feature = "bench"), allow(dead_code))]
+struct CampaignCheckArgs {
+    /// Continuous competition catalog
+    #[arg(
+        long,
+        value_name = "FILE",
+        default_value = DEFAULT_CAMPAIGN_CATALOG
+    )]
+    catalog: PathBuf,
+
+    /// Normalized official competitor field
+    #[arg(
+        long,
+        value_name = "FILE",
+        default_value = DEFAULT_OFFICIAL_FIELD
+    )]
+    official_field: PathBuf,
+
+    /// Normalized AY score report
+    #[arg(long, value_name = "FILE", default_value = DEFAULT_AY_REPORT)]
+    ay_report: PathBuf,
+
+    /// Emit validated coverage, score, and incompleteness counts as JSON
     #[arg(long)]
     json: bool,
 }
@@ -468,23 +535,44 @@ fn load_tools(root: &Path) -> Vec<ToolRow> {
 // Path resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve a repo-relative path by walking from the cwd to the repo root
-/// (corpora precedent extended per the design: registry-reading verbs work
-/// from any subdirectory).
+/// Search a set of starting locations and their ancestors for a repo-relative
+/// path. A starting location may be either a directory or the executable
+/// itself.
+#[cfg(any(feature = "bench", test))]
+fn find_from_ancestors(p: &Path, starts: &[PathBuf]) -> Option<PathBuf> {
+    for start in starts {
+        let start = if start.is_dir() {
+            start.as_path()
+        } else {
+            start.parent().unwrap_or(start)
+        };
+        for dir in start.ancestors() {
+            let candidate = dir.join(p);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a repo-relative path by walking both from the cwd and from the
+/// running executable. The executable fallback is what lets an absolute
+/// `target/{debug,release}/ay` invocation find its checkout while the caller
+/// is in `/tmp` or another unrelated directory.
 #[cfg(any(feature = "bench", test))]
 fn resolve_repo_path(p: &Path) -> PathBuf {
     if p.is_absolute() || p.exists() {
         return p.to_path_buf();
     }
+    let mut starts = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
-        for dir in cwd.ancestors() {
-            let cand = dir.join(p);
-            if cand.exists() {
-                return cand;
-            }
-        }
+        starts.push(cwd);
     }
-    p.to_path_buf()
+    if let Ok(executable) = std::env::current_exe() {
+        starts.push(executable);
+    }
+    find_from_ancestors(p, &starts).unwrap_or_else(|| p.to_path_buf())
 }
 
 /// Repo root the sibling registries and packet dirs hang off: the parent of
@@ -1104,6 +1192,191 @@ fn snippet(s: &str, max_chars: usize) -> String {
 // Verb implementations
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "bench")]
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+struct DispositionCounts {
+    scored: usize,
+    partial: usize,
+    unmaterialized: usize,
+    pending_normalization: usize,
+    pending: usize,
+    cancelled: usize,
+    not_held: usize,
+    not_ranked: usize,
+    unsupported: usize,
+}
+
+#[cfg(feature = "bench")]
+impl DispositionCounts {
+    fn record(&mut self, disposition: ay_bench::campaign::ScoreDisposition) {
+        use ay_bench::campaign::ScoreDisposition;
+
+        match disposition {
+            ScoreDisposition::Scored => self.scored += 1,
+            ScoreDisposition::Partial => self.partial += 1,
+            ScoreDisposition::Unmaterialized => self.unmaterialized += 1,
+            ScoreDisposition::PendingNormalization => self.pending_normalization += 1,
+            ScoreDisposition::Pending => self.pending += 1,
+            ScoreDisposition::Cancelled => self.cancelled += 1,
+            ScoreDisposition::NotHeld => self.not_held += 1,
+            ScoreDisposition::NotRanked => self.not_ranked += 1,
+            ScoreDisposition::Unsupported => self.unsupported += 1,
+        }
+    }
+}
+
+#[cfg(feature = "bench")]
+#[derive(Debug, PartialEq, Eq, Serialize)]
+struct CampaignCoverage {
+    catalog_join_structurally_valid: bool,
+    exact_catalog_coverage: bool,
+    score_claims_recomputed: bool,
+    catalog_scope: String,
+    catalog_tracks: usize,
+    catalog_readiness: BTreeMap<String, usize>,
+    official_leaderboards: usize,
+    official_competitors: usize,
+    official: DispositionCounts,
+    ay_rows: usize,
+    ay: DispositionCounts,
+    recomputed_retroactive_wins: usize,
+}
+
+#[cfg(feature = "bench")]
+fn load_campaign_coverage(
+    catalog_path: &Path,
+    official_field_path: &Path,
+    ay_report_path: &Path,
+) -> std::result::Result<CampaignCoverage, ay_bench::campaign::CampaignError> {
+    let campaign = ay_bench::campaign::load_and_validate_campaign(
+        catalog_path,
+        official_field_path,
+        ay_report_path,
+    )?;
+
+    let mut official = DispositionCounts::default();
+    for leaderboard in &campaign.official_field.leaderboards {
+        official.record(leaderboard.disposition);
+    }
+    let mut ay = DispositionCounts::default();
+    for row in &campaign.ay_report.rows {
+        ay.record(row.disposition);
+    }
+    let mut catalog_readiness = BTreeMap::new();
+    for track in &campaign.catalog.tracks {
+        *catalog_readiness
+            .entry(track.readiness.clone())
+            .or_default() += 1;
+    }
+
+    Ok(CampaignCoverage {
+        catalog_join_structurally_valid: true,
+        exact_catalog_coverage: true,
+        score_claims_recomputed: true,
+        catalog_scope: campaign.catalog.scope.clone(),
+        catalog_tracks: campaign.catalog.tracks.len(),
+        catalog_readiness,
+        official_leaderboards: campaign.official_field.leaderboards.len(),
+        official_competitors: campaign
+            .official_field
+            .leaderboards
+            .iter()
+            .map(|leaderboard| leaderboard.competitors.len())
+            .sum(),
+        official,
+        ay_rows: campaign.ay_report.rows.len(),
+        ay,
+        recomputed_retroactive_wins: campaign
+            .ay_report
+            .rows
+            .iter()
+            .filter(|row| {
+                row.disposition == ay_bench::campaign::ScoreDisposition::Scored
+                    && row.win == Some(true)
+            })
+            .count(),
+    })
+}
+
+#[cfg(any(feature = "bench", test))]
+fn run_campaign_check(args: CampaignCheckArgs) -> Result<i32> {
+    #[cfg(feature = "bench")]
+    {
+        let catalog_path = resolve_repo_path(&args.catalog);
+        let official_field_path = resolve_repo_path(&args.official_field);
+        let ay_report_path = resolve_repo_path(&args.ay_report);
+        let coverage = load_campaign_coverage(&catalog_path, &official_field_path, &ay_report_path)
+            .with_context(|| {
+                format!(
+                    "validate continuous campaign catalog={} official_field={} ay_report={}",
+                    catalog_path.display(),
+                    official_field_path.display(),
+                    ay_report_path.display()
+                )
+            })?;
+
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&coverage)?);
+        } else {
+            let readiness = coverage
+                .catalog_readiness
+                .iter()
+                .map(|(state, count)| format!("{state}={count}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!(
+                "catalog join structurally valid: scope={} exact_catalog_coverage={} tracks={} \
+                 official_leaderboards={} official_competitors={} ay_rows={}",
+                coverage.catalog_scope,
+                coverage.exact_catalog_coverage,
+                coverage.catalog_tracks,
+                coverage.official_leaderboards,
+                coverage.official_competitors,
+                coverage.ay_rows,
+            );
+            println!("catalog readiness: {readiness}");
+            println!(
+                "typed score check: score_claims_recomputed={} \
+                 recomputed_retroactive_wins={}",
+                coverage.score_claims_recomputed, coverage.recomputed_retroactive_wins
+            );
+            println!(
+                "official: scored={} partial={} unmaterialized={} pending-normalization={} \
+                 pending={} cancelled={} not-held={} not-ranked={} unsupported={}",
+                coverage.official.scored,
+                coverage.official.partial,
+                coverage.official.unmaterialized,
+                coverage.official.pending_normalization,
+                coverage.official.pending,
+                coverage.official.cancelled,
+                coverage.official.not_held,
+                coverage.official.not_ranked,
+                coverage.official.unsupported
+            );
+            println!(
+                "ay: scored={} partial={} unmaterialized={} pending-normalization={} pending={} \
+                 cancelled={} not-held={} not-ranked={} unsupported={}",
+                coverage.ay.scored,
+                coverage.ay.partial,
+                coverage.ay.unmaterialized,
+                coverage.ay.pending_normalization,
+                coverage.ay.pending,
+                coverage.ay.cancelled,
+                coverage.ay.not_held,
+                coverage.ay.not_ranked,
+                coverage.ay.unsupported
+            );
+        }
+        Ok(0)
+    }
+
+    #[cfg(not(feature = "bench"))]
+    {
+        let _ = args;
+        bail!("campaign checking requires benchmark support; rebuild with --features bench")
+    }
+}
+
 /// Entry point for `ay bench compare`, dispatched from `cmd_bench::run`
 /// (which carries the `--features bench` gate for the whole group).
 #[cfg(any(feature = "bench", test))]
@@ -1114,6 +1387,8 @@ pub(crate) fn run(args: BenchCompareArgs) -> Result<()> {
         CompareCommand::List(list) => run_list(&registry_path, list)?,
         CompareCommand::Show(show) => run_show(&registry_path, show)?,
         CompareCommand::Check(check) => run_check(&registry_path, check)?,
+        CompareCommand::CheckAll(check) => run_check_all(&registry_path, check)?,
+        CompareCommand::CampaignCheck(check) => run_campaign_check(check)?,
     };
     if code != 0 {
         use std::io::Write as _;
@@ -1275,16 +1550,33 @@ fn run_show(registry_path: &Path, args: ShowArgs) -> Result<i32> {
 }
 
 #[cfg(any(feature = "bench", test))]
-fn run_check(registry_path: &Path, args: CheckArgs) -> Result<i32> {
-    let registry = Registry::load(registry_path)?;
-    let entry = registry.find(&args.id)?;
-    let root = repo_root_for(registry_path);
-    let corpora = load_corpora(&root);
-    let tools = load_tools(&root);
+struct CheckEvaluation {
+    corpus: CorpusState,
+    refs: Vec<RefCheck>,
+    built: usize,
+    scoring_stated: bool,
+    budgets_stated: bool,
+    runnable: bool,
+    not_runnable: Vec<String>,
+    verdict: Verdict,
+    fields: Vec<FieldCheck>,
+    code: i32,
+}
 
-    let corpus = corpus_state(&root, corpora.as_deref(), entry);
-    let refs = check_refs(&root, &tools, entry);
-    let built = refs.iter().filter(|r| r.resolved.is_some()).count();
+#[cfg(any(feature = "bench", test))]
+fn evaluate_check(
+    root: &Path,
+    corpora: Option<&[CorpusRow]>,
+    tools: &[ToolRow],
+    entry: &Comparison,
+    local: &LocalHost,
+) -> CheckEvaluation {
+    let corpus = corpus_state(root, corpora, entry);
+    let refs = check_refs(root, tools, entry);
+    let built = refs
+        .iter()
+        .filter(|reference| reference.resolved.is_some())
+        .count();
     let scoring_stated = stated(&entry.scoring);
     let budgets_stated = stated(&entry.budgets);
 
@@ -1297,7 +1589,7 @@ fn run_check(registry_path: &Path, args: CheckArgs) -> Result<i32> {
         CorpusState::Missing(_) | CorpusState::Unmapped(_) | CorpusState::NoRegistry => false,
     };
     let refs_ok = !refs.is_empty() && built == refs.len();
-    let mut not_runnable: Vec<String> = Vec::new();
+    let mut not_runnable = Vec::new();
     if !corpus_ok {
         not_runnable.push(format!("corpus: {}", corpus.detail()));
     }
@@ -1315,13 +1607,11 @@ fn run_check(registry_path: &Path, args: CheckArgs) -> Result<i32> {
     }
     let runnable = not_runnable.is_empty();
 
-    let local = read_local_host();
     let (verdict, fields) = if entry.specs_cited() {
-        host_check(&entry.official, &local)
+        host_check(&entry.official, local)
     } else {
         (Verdict::SpecsPending, Vec::new())
     };
-
     let code = if verdict == Verdict::SpecsPending || !runnable {
         2
     } else if verdict == Verdict::ReplayEligible {
@@ -1330,21 +1620,80 @@ fn run_check(registry_path: &Path, args: CheckArgs) -> Result<i32> {
         1
     };
 
+    CheckEvaluation {
+        corpus,
+        refs,
+        built,
+        scoring_stated,
+        budgets_stated,
+        runnable,
+        not_runnable,
+        verdict,
+        fields,
+        code,
+    }
+}
+
+#[cfg(any(feature = "bench", test))]
+fn check_evaluation_json(entry: &Comparison, check: &CheckEvaluation) -> serde_json::Value {
+    serde_json::json!({
+        "id": entry.id,
+        "competition": entry.competition.label(),
+        "edition": entry.edition,
+        "status": entry.status.label(),
+        "corpus": {
+            "state": check.corpus.column(),
+            "detail": check.corpus.detail(),
+        },
+        "refs": check.refs,
+        "scoring_stated": check.scoring_stated,
+        "budgets_stated": check.budgets_stated,
+        "runnable": check.runnable,
+        "not_runnable": check.not_runnable,
+        "official": entry.official,
+        "host_fields": check.fields,
+        "verdict": check.verdict.label(),
+        "exit_code": check.code,
+    })
+}
+
+#[cfg(any(feature = "bench", test))]
+fn run_check(registry_path: &Path, args: CheckArgs) -> Result<i32> {
+    let registry = Registry::load(registry_path)?;
+    let entry = registry.find(&args.id)?;
+    let root = repo_root_for(registry_path);
+    let corpora = load_corpora(&root);
+    let tools = load_tools(&root);
+
+    let local = read_local_host();
+    let CheckEvaluation {
+        corpus,
+        refs,
+        built,
+        scoring_stated,
+        budgets_stated,
+        runnable,
+        not_runnable,
+        verdict,
+        fields,
+        code,
+    } = evaluate_check(&root, corpora.as_deref(), &tools, entry, &local);
+
     if args.json {
-        let value = serde_json::json!({
-            "id": entry.id,
-            "status": entry.status.label(),
-            "corpus": { "state": corpus.column(), "detail": corpus.detail() },
-            "refs": refs,
-            "scoring_stated": scoring_stated,
-            "budgets_stated": budgets_stated,
-            "runnable": runnable,
-            "local_host": local,
-            "official": entry.official,
-            "host_fields": fields,
-            "verdict": verdict.label(),
-            "exit_code": code,
-        });
+        let check = CheckEvaluation {
+            corpus,
+            refs,
+            built,
+            scoring_stated,
+            budgets_stated,
+            runnable,
+            not_runnable,
+            verdict,
+            fields,
+            code,
+        };
+        let mut value = check_evaluation_json(entry, &check);
+        value["local_host"] = serde_json::to_value(&local)?;
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(code);
     }
@@ -1473,6 +1822,102 @@ fn run_check(registry_path: &Path, args: CheckArgs) -> Result<i32> {
     Ok(code)
 }
 
+#[cfg(any(feature = "bench", test))]
+fn run_check_all(registry_path: &Path, args: CheckAllArgs) -> Result<i32> {
+    let registry = Registry::load(registry_path)?;
+    let root = repo_root_for(registry_path);
+    let corpora = load_corpora(&root);
+    let tools = load_tools(&root);
+    let local = read_local_host();
+    let checks = registry
+        .comparisons
+        .iter()
+        .filter(|entry| {
+            args.competition
+                .map_or(true, |competition| entry.competition == competition)
+        })
+        .map(|entry| {
+            (
+                entry,
+                evaluate_check(&root, corpora.as_deref(), &tools, entry, &local),
+            )
+        })
+        .collect::<Vec<_>>();
+    if checks.is_empty() {
+        bail!("comparison registry selection is empty");
+    }
+
+    let runnable = checks.iter().filter(|(_, check)| check.runnable).count();
+    let replay_eligible = checks
+        .iter()
+        .filter(|(_, check)| check.verdict == Verdict::ReplayEligible)
+        .count();
+    let laptop_only = checks
+        .iter()
+        .filter(|(_, check)| check.verdict == Verdict::LaptopOnly)
+        .count();
+    let specs_pending = checks
+        .iter()
+        .filter(|(_, check)| check.verdict == Verdict::SpecsPending)
+        .count();
+    let exit_code = checks
+        .iter()
+        .map(|(_, check)| check.code)
+        .max()
+        .unwrap_or(2);
+
+    if args.json {
+        let entries = checks
+            .iter()
+            .map(|(entry, check)| check_evaluation_json(entry, check))
+            .collect::<Vec<_>>();
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "registry": registry_path,
+            "local_host": local,
+            "summary": {
+                "entries": checks.len(),
+                "runnable": runnable,
+                "not_runnable": checks.len() - runnable,
+                "replay_eligible": replay_eligible,
+                "laptop_only": laptop_only,
+                "specs_pending": specs_pending,
+                "exit_code": exit_code,
+            },
+            "entries": entries,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(exit_code);
+    }
+
+    println!(
+        "{:<40} {:<10} {:<10} {:<9} {:<16} EXIT",
+        "ID", "CORPUS", "RUNNABLE", "REFS", "HOST"
+    );
+    for (entry, check) in &checks {
+        println!(
+            "{:<40} {:<10} {:<10} {:<9} {:<16} {}",
+            entry.id,
+            check.corpus.column(),
+            if check.runnable { "yes" } else { "no" },
+            format!("{}/{}", check.built, check.refs.len()),
+            check.verdict.label(),
+            check.code,
+        );
+    }
+    println!(
+        "summary: entries={} runnable={} not-runnable={} replay-eligible={} \
+         laptop-only={} specs-pending={} exit={exit_code}",
+        checks.len(),
+        runnable,
+        checks.len() - runnable,
+        replay_eligible,
+        laptop_only,
+        specs_pending,
+    );
+    Ok(exit_code)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1485,6 +1930,31 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join(rel)
+    }
+
+    #[test]
+    fn repo_relative_path_resolves_from_executable_ancestor() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("checkout");
+        let registry = repo.join(DEFAULT_REGISTRY);
+        fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        fs::write(&registry, "schema_version = 1\n").unwrap();
+        let executable = repo.join("target/debug/ay");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, "").unwrap();
+        let unrelated_cwd = temp.path().join("unrelated");
+        fs::create_dir_all(&unrelated_cwd).unwrap();
+
+        let resolved =
+            find_from_ancestors(Path::new(DEFAULT_REGISTRY), &[unrelated_cwd, executable]);
+        assert_eq!(resolved.as_deref(), Some(registry.as_path()));
+    }
+
+    #[cfg(feature = "bench")]
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+
+        format!("{:x}", sha2::Sha256::digest(bytes))
     }
 
     fn minimal_entry(id: &str, status: &str) -> String {
@@ -1518,13 +1988,54 @@ citations   = ["https://example.org"]
     fn shipped_registry_parses_and_validates() {
         let path = repo_path(DEFAULT_REGISTRY);
         let registry = Registry::load(&path).expect("shipped comparisons.toml loads");
-        assert_eq!(registry.comparisons.len(), 37);
+        assert_eq!(registry.comparisons.len(), 44);
         let ids: BTreeSet<&str> = registry.comparisons.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids.len(), 37, "ids must be unique");
+        assert_eq!(ids.len(), 44, "ids must be unique");
+        assert!(ids.contains("smtcomp-2025-published-score-view-inventory"));
         assert!(ids.contains("smtcomp-2025-single-query-qf-lia"));
+        assert!(ids.contains("smtcomp-2026-standard-tracks"));
+        assert!(ids.contains("smtcomp-2026-parallel"));
+        assert!(ids.contains("smtcomp-2026-cloud"));
         assert!(ids.contains("satcomp-2025-main"));
+        assert!(ids.contains("satcomp-2026-main"));
+        assert!(ids.contains("satcomp-2026-parallel"));
+        assert!(ids.contains("satcomp-2026-cloud"));
+        let main_2026 = registry.find("satcomp-2026-main").unwrap();
+        assert!(
+            main_2026.specs_cited() && main_2026.official.memory_gb == 0,
+            "SAT 2026 Main must retain cited CPU/node cores but fail closed on unstated node RAM"
+        );
+        let cloud_2026 = registry.find("satcomp-2026-cloud").unwrap();
+        assert_eq!(cloud_2026.status, Status::Unsupported);
+        assert!(
+            !cloud_2026.specs_cited(),
+            "a single-host official block must not represent the 100-node Cloud topology"
+        );
+        let smt_standard_2026 = registry.find("smtcomp-2026-standard-tracks").unwrap();
+        assert!(
+            smt_standard_2026.specs_cited()
+                && smt_standard_2026.official.cpu_model == "Intel Xeon E3-1230 v5"
+                && smt_standard_2026.official.cores == 4
+                && smt_standard_2026.official.memory_gb == 33,
+            "SMT-COMP 2026 standard tracks must retain the published apollon node identity"
+        );
+        let smt_parallel_2026 = registry.find("smtcomp-2026-parallel").unwrap();
+        assert!(
+            smt_parallel_2026.specs_cited()
+                && smt_parallel_2026.official.cpu_model.is_empty()
+                && smt_parallel_2026.official.cores == 128
+                && smt_parallel_2026.official.memory_gb == 1024,
+            "SMT-COMP 2026 Parallel must retain its enforced envelope but fail closed on unknown CPU identity"
+        );
+        let smt_cloud_2026 = registry.find("smtcomp-2026-cloud").unwrap();
+        assert_eq!(smt_cloud_2026.status, Status::Unsupported);
+        assert!(
+            !smt_cloud_2026.specs_cited(),
+            "the 2024 reference topology must not be treated as SMT-COMP 2026 Cloud hardware"
+        );
         // Every ready entry has cited + parsed specs; specs-pending entries
-        // are exactly the two with "n/a" hosts.
+        // are exactly the three inventory/exhibition/legacy rows without
+        // replayable official hosts.
         for c in &registry.comparisons {
             match c.status {
                 Status::Ready => assert!(c.specs_cited(), "{}: ready without cited specs", c.id),
@@ -1543,7 +2054,11 @@ citations   = ["https://example.org"]
             .collect();
         assert_eq!(
             pending,
-            vec!["smtcomp-2025-proof-exhibition", "miplib-2017-benchmark"]
+            vec![
+                "smtcomp-2025-published-score-view-inventory",
+                "smtcomp-2025-proof-exhibition",
+                "miplib-2017-benchmark"
+            ]
         );
     }
 
@@ -1834,6 +2349,18 @@ CPU part : 0xd4f\n";
             (0..=2).contains(&code),
             "check exit code {code} out of contract"
         );
+        let code = run_check_all(
+            &registry,
+            CheckAllArgs {
+                competition: Some(Competition::Sygus),
+                json: true,
+            },
+        )
+        .expect("check-all runs");
+        assert!(
+            (0..=2).contains(&code),
+            "check-all exit code {code} out of contract"
+        );
         assert!(run_check(
             &registry,
             CheckArgs {
@@ -1853,8 +2380,8 @@ CPU part : 0xd4f\n";
         assert!(group.contains("Every number produced here carries exactly one run class"));
         assert!(group.contains("official  imported published results"));
         assert!(group.contains("replay is granted by a host check and refused on mismatch"));
-        // 0.1.0 verbs present; runner verbs only as roadmap.
-        for verb in ["list", "show", "check"] {
+        // Read-only verbs present; runner verbs only as roadmap.
+        for verb in ["list", "show", "check", "check-all", "campaign-check"] {
             assert!(
                 cmd.find_subcommand(verb).is_some(),
                 "verb {verb} missing from the compare group"
@@ -1891,6 +2418,209 @@ CPU part : 0xd4f\n";
             .to_string();
         assert!(list.contains("ID, COMPETITION, EDITION, STATUS, SPECS (cited/unknown)"));
         assert!(list.contains("--competition"));
+
+        let campaign_check = cmd
+            .find_subcommand("campaign-check")
+            .unwrap()
+            .clone()
+            .render_long_help()
+            .to_string();
+        for expected in [
+            "--catalog",
+            DEFAULT_CAMPAIGN_CATALOG,
+            "--official-field",
+            DEFAULT_OFFICIAL_FIELD,
+            "--ay-report",
+            DEFAULT_AY_REPORT,
+            "--json",
+        ] {
+            assert!(
+                campaign_check.contains(expected),
+                "campaign-check help missing {expected:?}"
+            );
+        }
+        assert!(campaign_check.contains("exact catalog coverage"));
+        assert!(group.contains("recomputes every admitted score/rank claim"));
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn campaign_check_validates_join_and_reports_coverage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog_path = dir.path().join("catalog.toml");
+        let official_path = dir.path().join("official.json");
+        let ay_path = dir.path().join("ay.json");
+
+        let catalog_body = r#"
+schema_version = 1
+scope = "bounded-test-inventory"
+
+[[track]]
+id = "track-final"
+status = "final"
+readiness = "official-results-public"
+official_score_kind = "correct-count-then-runtime"
+official_score_direction = "mixed-lexicographic"
+ay_adapter_status = "ready"
+
+[[track]]
+id = "track-future"
+status = "scheduled"
+readiness = "pending"
+official_score_kind = "pending"
+official_score_direction = "pending"
+ay_adapter_status = "ready"
+"#;
+        fs::write(&catalog_path, catalog_body).unwrap();
+        let catalog_sha256 = sha256_hex(catalog_body.as_bytes());
+        let official_body = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2026-07-23T22:00:00Z",
+            "catalog": {
+                "id": "catalog.toml",
+                "sha256": catalog_sha256.clone(),
+            },
+            "leaderboards": [
+                {
+                    "track_id": "track-final",
+                    "disposition": "scored",
+                    "competitors": [
+                        {
+                            "rank": 1,
+                            "name": "Reference Solver",
+                            "eligible": true,
+                            "winner": true,
+                            "tied": false,
+                            "score": {"solved": 10, "cpu_seconds": 100},
+                            "metrics": {"solved": 10}
+                        }
+                    ],
+                    "denominator": 10,
+                    "evidence": [{
+                        "id": "https://example.test/results",
+                        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    }]
+                },
+                {
+                    "track_id": "track-future",
+                    "disposition": "pending",
+                    "competitors": [],
+                    "evidence": []
+                }
+            ]
+        }))
+        .unwrap();
+        fs::write(&official_path, &official_body).unwrap();
+        let official_sha256 = sha256_hex(&official_body);
+        let ay_body = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2026-07-23T22:01:00Z",
+            "catalog": {
+                "id": "catalog.toml",
+                "sha256": catalog_sha256,
+            },
+            "official_field": {
+                "id": "official.json",
+                "sha256": official_sha256,
+            },
+            "rows": [
+                {"track_id": "track-final", "disposition": "pending"},
+                {"track_id": "track-future", "disposition": "pending"}
+            ]
+        }))
+        .unwrap();
+        fs::write(&ay_path, ay_body).unwrap();
+
+        let coverage = load_campaign_coverage(&catalog_path, &official_path, &ay_path)
+            .expect("valid campaign");
+        assert!(coverage.catalog_join_structurally_valid);
+        assert!(coverage.exact_catalog_coverage);
+        assert!(coverage.score_claims_recomputed);
+        assert_eq!(coverage.catalog_scope, "bounded-test-inventory");
+        assert_eq!(coverage.catalog_tracks, 2);
+        assert_eq!(coverage.catalog_readiness["official-results-public"], 1);
+        assert_eq!(coverage.catalog_readiness["pending"], 1);
+        assert_eq!(coverage.official_leaderboards, 2);
+        assert_eq!(coverage.official_competitors, 1);
+        assert_eq!(coverage.official.scored, 1);
+        assert_eq!(coverage.official.pending, 1);
+        assert_eq!(coverage.ay_rows, 2);
+        assert_eq!(coverage.ay.pending, 2);
+        assert_eq!(coverage.recomputed_retroactive_wins, 0);
+
+        let code = run_campaign_check(CampaignCheckArgs {
+            catalog: catalog_path,
+            official_field: official_path,
+            ay_report: ay_path,
+            json: true,
+        })
+        .expect("CLI campaign check");
+        assert_eq!(code, 0);
+    }
+
+    #[cfg(feature = "bench")]
+    #[test]
+    fn campaign_check_preserves_typed_validation_error_with_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let catalog_path = dir.path().join("catalog.toml");
+        let official_path = dir.path().join("official.json");
+        let ay_path = dir.path().join("ay.json");
+
+        let catalog_body = "schema_version = 1\nscope = \"bounded-test-inventory\"\n\
+                            [[track]]\nid = \"missing-ay\"\n\
+                            status = \"scheduled\"\nreadiness = \"pending\"\n\
+                            official_score_kind = \"pending\"\n\
+                            official_score_direction = \"pending\"\n\
+                            ay_adapter_status = \"ready\"\n";
+        fs::write(&catalog_path, catalog_body).unwrap();
+        let catalog_sha256 = sha256_hex(catalog_body.as_bytes());
+        let official_body = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2026-07-23T22:00:00Z",
+            "catalog": {
+                "id": "catalog.toml",
+                "sha256": catalog_sha256.clone(),
+            },
+            "leaderboards": [{
+                "track_id": "missing-ay",
+                "disposition": "pending",
+                "competitors": [],
+                "evidence": []
+            }]
+        }))
+        .unwrap();
+        fs::write(&official_path, &official_body).unwrap();
+        let official_sha256 = sha256_hex(&official_body);
+        let ay_body = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "generated_at": "2026-07-23T22:01:00Z",
+            "catalog": {
+                "id": "catalog.toml",
+                "sha256": catalog_sha256,
+            },
+            "official_field": {
+                "id": "official.json",
+                "sha256": official_sha256,
+            },
+            "rows": []
+        }))
+        .unwrap();
+        fs::write(&ay_path, ay_body).unwrap();
+
+        let error = run_campaign_check(CampaignCheckArgs {
+            catalog: catalog_path.clone(),
+            official_field: official_path,
+            ay_report: ay_path,
+            json: false,
+        })
+        .expect_err("missing AY row must fail closed");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("validate continuous campaign"),
+            "{rendered}"
+        );
+        assert!(rendered.contains(&catalog_path.display().to_string()));
+        assert!(rendered.contains("AY score report is missing catalog track \"missing-ay\""));
     }
 
     // ---------- packets ----------

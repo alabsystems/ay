@@ -164,39 +164,34 @@ fn test_multi_def_inlining() {
     let result = inliner.inline(&problem);
 
     // P should be inlined via multi-def expansion (2 defs, 1 tail use).
-    // After P is inlined into Q, Q has 2 definitions and 1 tail use,
-    // so Q is also eligible for unique-def inlining in the cleanup phase
-    // (each Q definition is a fact clause with no body predicates).
-    // The result is all predicates eliminated — only queries remain.
-    let p_in_body = result
-        .clauses()
-        .iter()
-        .any(|c| c.body.predicates.iter().any(|(id, _)| *id == p));
-    assert!(!p_in_body, "P should be inlined via multi-def expansion");
-
+    // After P is inlined into Q, Q has 2 composite definitions. It stays
+    // explicit: eliminating Q as well would require nesting P's definition
+    // trace inside a second multi-def trace.
+    assert!(
+        result.lookup_predicate("P").is_none(),
+        "P should be eliminated by multi-def expansion"
+    );
+    let transformed_q = result
+        .lookup_predicate("Q")
+        .expect("Q must remain declared");
     let q_in_body = result
         .clauses()
         .iter()
-        .any(|c| c.body.predicates.iter().any(|(id, _)| *id == q));
+        .any(|c| c.body.predicates.iter().any(|(id, _)| *id == transformed_q));
     assert!(
-        !q_in_body,
-        "Q should also be inlined (becomes unique-def fact after P expansion)"
+        q_in_body,
+        "Q's composite definitions must remain explicit for ground replay"
     );
 
-    // Only query clauses should remain
-    assert!(
-        result.clauses().iter().all(HornClause::is_query),
-        "All remaining clauses should be queries"
-    );
     assert_eq!(
         result.clauses().len(),
-        2,
-        "Should have 2 query clauses (one per P definition path)"
+        3,
+        "Should have 2 Q definitions (one per P path) plus the query"
     );
 }
 
 #[test]
-fn equal_cardinality_multi_def_rewrite_invalidates_clause_alignment() {
+fn equal_cardinality_multi_def_rewrite_preserves_exact_clause_alignment() {
     // Two definitions and two query uses preserve the total clause count:
     // 4 input clauses -> 4 expanded query clauses. Cardinality therefore
     // cannot tell whether output indices still address input clauses.
@@ -221,13 +216,160 @@ fn equal_cardinality_multi_def_rewrite_invalidates_clause_alignment() {
     let (transformed, _, _, traces, output_to_input) =
         ClauseInliner::new().inline_tracked(&problem);
     assert_eq!(transformed.clauses().len(), input_len);
+    assert_eq!(
+        output_to_input,
+        Some(vec![2, 2, 3, 3]),
+        "each expanded query must map to its exact caller input clause"
+    );
+    assert_eq!(
+        traces.len(),
+        transformed.clauses().len(),
+        "each multi-def output clause must retain a composition trace"
+    );
+    assert!(traces.values().all(ClauseTrace::is_composite));
+}
+
+#[test]
+fn multi_def_ground_backtranslation_expands_definition_and_caller() {
+    use crate::ground_derivation::{
+        complete::complete_env_for_clause, validate_ground_derivation, GroundDerivation,
+        GroundDerivationStep,
+    };
+    use crate::smt::SmtValue;
+
+    // P has two fact definitions. The query is satisfiable through only the
+    // second one, so its transformed one-step proof must expand back to that
+    // exact definition followed by the original query.
+    let mut original = ChcProblem::new();
+    let p = original.declare_predicate("P", vec![ChcSort::Int]);
+    let x = ChcVar::new("x", ChcSort::Int);
+    for value in [0, 1] {
+        original.add_clause(HornClause::new(
+            ClauseBody::constraint(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(value))),
+            ClauseHead::Predicate(p, vec![ChcExpr::var(x.clone())]),
+        ));
+    }
+    let y = ChcVar::new("y", ChcSort::Int);
+    original.add_clause(HornClause::query(ClauseBody::new(
+        vec![(p, vec![ChcExpr::var(y.clone())])],
+        Some(ChcExpr::eq(ChcExpr::var(y), ChcExpr::int(1))),
+    )));
+
+    let transformed = Box::new(ClauseInliner::new()).transform(original.clone());
+    let mut proof = None;
+    for (clause_index, clause) in transformed.problem.clauses().iter().enumerate() {
+        let mut env: FxHashMap<String, SmtValue> =
+            [("y".to_string(), SmtValue::Int(1))].into_iter().collect();
+        if !complete_env_for_clause(clause, &mut env) {
+            continue;
+        }
+        let candidate = GroundDerivation {
+            steps: vec![GroundDerivationStep {
+                clause_index,
+                env,
+                premises: vec![],
+            }],
+            query_step: 0,
+        };
+        if validate_ground_derivation(&transformed.problem, &candidate).is_ok() {
+            proof = Some(candidate);
+            break;
+        }
+    }
+    let proof = proof.expect("one expanded query must be true through P(1)");
+
+    let expanded = transformed
+        .back_translator
+        .translate_ground_derivation(&proof)
+        .expect("multi-def trace must expand the selected definition");
+    validate_ground_derivation(&original, &expanded)
+        .expect("expanded multi-def proof must validate on the input clauses");
+    assert_eq!(expanded.len(), 2);
+    assert_eq!(expanded.steps[0].clause_index, 1);
+    assert_eq!(expanded.steps[1].clause_index, 2);
+}
+
+#[test]
+fn phase_one_preserves_callers_of_eligible_multi_def_candidates() {
+    // U is unique, while M is a phase-2 candidate. Their shared caller must
+    // remain uncomposed in phase 1 so phase 2 can eliminate M with an exact
+    // trace. Without the caller-body adjacency gate, U is inlined first and M
+    // is then rejected because its caller already has a composition trace.
+    let mut problem = ChcProblem::new();
+    let u = problem.declare_predicate("U", vec![ChcSort::Int]);
+    let m = problem.declare_predicate("M", vec![ChcSort::Int]);
+    let q = problem.declare_predicate("Q", vec![ChcSort::Int]);
+    let x = ChcVar::new("x", ChcSort::Int);
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0))),
+        ClauseHead::Predicate(u, vec![ChcExpr::var(x.clone())]),
+    ));
+    for value in [0, 1] {
+        problem.add_clause(HornClause::new(
+            ClauseBody::constraint(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(value))),
+            ClauseHead::Predicate(m, vec![ChcExpr::var(x.clone())]),
+        ));
+    }
+    problem.add_clause(HornClause::new(
+        ClauseBody::predicates_only(vec![
+            (u, vec![ChcExpr::var(x.clone())]),
+            (m, vec![ChcExpr::var(x.clone())]),
+        ]),
+        ClauseHead::Predicate(q, vec![ChcExpr::var(x.clone())]),
+    ));
+    problem.add_clause(HornClause::query(ClauseBody::predicates_only(vec![(
+        q,
+        vec![ChcExpr::var(x)],
+    )])));
+
+    let result = ClauseInliner::new().inline(&problem);
     assert!(
-        traces.is_empty(),
-        "rewritten clauses must not retain stale traces"
+        result.lookup_predicate("M").is_none(),
+        "eligible M must reach traceable phase-2 expansion"
     );
     assert!(
-        output_to_input.is_none(),
-        "a multi-def rewrite must invalidate index alignment even when clause counts happen to match"
+        result.lookup_predicate("U").is_some(),
+        "U must stay explicit rather than composing M's caller in phase 1"
+    );
+}
+
+#[test]
+fn phase_one_does_not_preserve_neighbors_of_ineligible_multi_defs() {
+    // M has three tail uses, above the standard phase-2 cap. U is adjacent to
+    // M but must still be eliminated: preserving neighbours of every merely
+    // multi-defined predicate caused severe under-inlining on LIA-Array.
+    let mut problem = ChcProblem::new();
+    let u = problem.declare_predicate("U", vec![ChcSort::Int]);
+    let m = problem.declare_predicate("M", vec![ChcSort::Int]);
+    let x = ChcVar::new("x", ChcSort::Int);
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0))),
+        ClauseHead::Predicate(u, vec![ChcExpr::var(x.clone())]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::predicates_only(vec![(u, vec![ChcExpr::var(x.clone())])]),
+        ClauseHead::Predicate(m, vec![ChcExpr::var(x.clone())]),
+    ));
+    problem.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(1))),
+        ClauseHead::Predicate(m, vec![ChcExpr::var(x.clone())]),
+    ));
+    for value in [0, 1, 2] {
+        let y = ChcVar::new(format!("y_{value}"), ChcSort::Int);
+        problem.add_clause(HornClause::query(ClauseBody::new(
+            vec![(m, vec![ChcExpr::var(y.clone())])],
+            Some(ChcExpr::eq(ChcExpr::var(y), ChcExpr::int(value))),
+        )));
+    }
+
+    let result = ClauseInliner::new().inline(&problem);
+    assert!(
+        result.lookup_predicate("U").is_none(),
+        "ineligible M must not block ordinary unique-definition collapse"
+    );
+    assert!(
+        result.lookup_predicate("M").is_some(),
+        "M exceeds the phase-2 tail-use cap and must remain explicit"
     );
 }
 
@@ -1638,6 +1780,355 @@ fn ground_back_translation_recovers_the_projected_intermediate() {
     );
 }
 
+#[test]
+fn ground_backtranslation_matches_reordered_surviving_premises_by_predicate() {
+    use crate::ground_derivation::{
+        complete::complete_env_for_clause, validate_ground_derivation, GroundDerivation,
+        GroundDerivationStep,
+    };
+    use crate::smt::SmtValue;
+
+    // A and B survive because they are self-recursive. C is uniquely defined
+    // and is inlined out of the query. The inliner's stack emits the surviving
+    // output body as [B, A], while the original C0 body is [A, C, B].
+    let mut original = ChcProblem::new();
+    let a = original.declare_predicate("A", vec![ChcSort::Int]);
+    let b = original.declare_predicate("B", vec![ChcSort::Int]);
+    let c = original.declare_predicate("C", vec![ChcSort::Int]);
+    let x = ChcVar::new("x", ChcSort::Int);
+    let args = || vec![ChcExpr::var(x.clone())];
+    for pred in [a, b] {
+        original.add_clause(HornClause::new(
+            ClauseBody::constraint(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0))),
+            ClauseHead::Predicate(pred, args()),
+        ));
+        original.add_clause(HornClause::new(
+            ClauseBody::predicates_only(vec![(pred, args())]),
+            ClauseHead::Predicate(pred, args()),
+        ));
+    }
+    original.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0))),
+        ClauseHead::Predicate(c, args()),
+    ));
+    original.add_clause(HornClause::query(ClauseBody::new(
+        vec![(a, args()), (c, args()), (b, args())],
+        Some(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0))),
+    )));
+
+    let result = Box::new(ClauseInliner::new()).transform(original.clone());
+    let transformed_a = result.problem.lookup_predicate("A").expect("A retained");
+    let transformed_b = result.problem.lookup_predicate("B").expect("B retained");
+    assert!(result.problem.lookup_predicate("C").is_none());
+    let query_index = result
+        .problem
+        .clauses()
+        .iter()
+        .position(HornClause::is_query)
+        .expect("query retained");
+    let output_body: Vec<_> = result.problem.clauses()[query_index]
+        .body
+        .predicates
+        .iter()
+        .map(|(pred, _)| *pred)
+        .collect();
+    assert_eq!(output_body, vec![transformed_b, transformed_a]);
+
+    let fact_index = |pred| {
+        result
+            .problem
+            .clauses()
+            .iter()
+            .position(|clause| {
+                clause.head.predicate_id() == Some(pred) && clause.body.predicates.is_empty()
+            })
+            .expect("retained fact clause")
+    };
+    let mut steps = Vec::new();
+    for pred in [transformed_a, transformed_b] {
+        let clause_index = fact_index(pred);
+        let mut env: FxHashMap<String, SmtValue> =
+            [("x".to_string(), SmtValue::Int(0))].into_iter().collect();
+        assert!(complete_env_for_clause(
+            &result.problem.clauses()[clause_index],
+            &mut env
+        ));
+        steps.push(GroundDerivationStep {
+            clause_index,
+            env,
+            premises: vec![],
+        });
+    }
+    let query_premises: Vec<usize> = output_body
+        .iter()
+        .map(|pred| if *pred == transformed_a { 0 } else { 1 })
+        .collect();
+    let mut query_env: FxHashMap<String, SmtValue> =
+        [("x".to_string(), SmtValue::Int(0))].into_iter().collect();
+    assert!(complete_env_for_clause(
+        &result.problem.clauses()[query_index],
+        &mut query_env
+    ));
+    steps.push(GroundDerivationStep {
+        clause_index: query_index,
+        env: query_env,
+        premises: query_premises,
+    });
+    let transformed = GroundDerivation {
+        steps,
+        query_step: 2,
+    };
+    validate_ground_derivation(&result.problem, &transformed)
+        .expect("setup: reversed output-premise proof must validate");
+
+    let expanded = result
+        .back_translator
+        .translate_ground_derivation(&transformed)
+        .expect("predicate-keyed premise selection must recover C0 order");
+    validate_ground_derivation(&original, &expanded)
+        .expect("expanded proof must validate on the original clauses");
+    let query = &expanded.steps[expanded.query_step];
+    let actual_heads: Vec<_> = query
+        .premises
+        .iter()
+        .map(|premise| {
+            original.clauses()[expanded.steps[*premise].clause_index]
+                .head
+                .predicate_id()
+                .expect("query premise derives a predicate")
+        })
+        .collect();
+    assert_eq!(actual_heads, vec![a, c, b]);
+}
+
+#[test]
+fn uncomposed_ground_boundary_reorders_premises_by_input_predicate() {
+    use crate::ground_derivation::{
+        validate_ground_derivation, GroundDerivation, GroundDerivationStep,
+    };
+    use crate::transform::BackTranslator;
+    use back_translator::InliningBackTranslator;
+    use std::sync::Arc;
+
+    let mut input = ChcProblem::new();
+    let a = input.declare_predicate("A", vec![]);
+    let b = input.declare_predicate("B", vec![]);
+    input.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(true)),
+        ClauseHead::Predicate(a, vec![]),
+    ));
+    input.add_clause(HornClause::new(
+        ClauseBody::constraint(ChcExpr::Bool(true)),
+        ClauseHead::Predicate(b, vec![]),
+    ));
+    input.add_clause(HornClause::query(ClauseBody::predicates_only(vec![
+        (a, vec![]),
+        (b, vec![]),
+    ])));
+
+    // This is the shape received from an earlier back-translator whose output
+    // body order was [B, A]. The current inliner did not compose clause 2, so
+    // its boundary must still restore the input clause's [A, B] order.
+    let reversed = GroundDerivation {
+        steps: vec![
+            GroundDerivationStep {
+                clause_index: 0,
+                env: FxHashMap::default(),
+                premises: vec![],
+            },
+            GroundDerivationStep {
+                clause_index: 1,
+                env: FxHashMap::default(),
+                premises: vec![],
+            },
+            GroundDerivationStep {
+                clause_index: 2,
+                env: FxHashMap::default(),
+                premises: vec![1, 0],
+            },
+        ],
+        query_step: 2,
+    };
+    assert!(
+        validate_ground_derivation(&input, &reversed).is_err(),
+        "setup must expose the reversed uncomposed boundary"
+    );
+
+    let translator = InliningBackTranslator {
+        inlined_defs: Vec::new(),
+        new_to_old: FxHashMap::default(),
+        composition_traces: FxHashMap::default(),
+        output_to_input: Some(vec![0, 1, 2]),
+        input_problem: Some(Arc::new(input.clone())),
+    };
+    let translated = translator
+        .translate_ground_derivation(&reversed)
+        .expect("uncomposed boundary must restore input predicate order");
+    validate_ground_derivation(&input, &translated)
+        .expect("predicate-ordered uncomposed derivation must validate");
+    assert_eq!(translated.steps[translated.query_step].premises, vec![0, 1]);
+}
+
+/// Multi-def expansion can create constant-false clauses that `add_clause`
+/// drops while predicate compaction rebuilds the problem.  Traces must be
+/// filtered in exactly the same lockstep, or a later surviving query expands
+/// through an earlier pruned clause's definition.
+#[test]
+fn compacting_pruned_multi_def_clauses_keeps_ground_traces_aligned() {
+    use crate::ground_derivation::{
+        complete::complete_env_for_clause, validate_ground_derivation, GroundDerivation,
+        GroundDerivationStep,
+    };
+    use crate::parser::ChcParser;
+    use crate::smt::SmtValue;
+
+    let original = ChcParser::parse(
+        r#"
+(set-logic HORN)
+(declare-fun P (Int) Bool)
+(assert (forall ((x Int)) (=> (= x 0) (P x))))
+(assert (forall ((x Int)) (=> (= x 1) (P x))))
+(assert (forall ((tag0 Int)) (=> (and (P 0) (= tag0 10)) false)))
+(assert (forall ((tag1 Int)) (=> (and (P 1) (= tag1 20)) false)))
+(check-sat)
+"#,
+    )
+    .expect("multi-def trace-pruning fixture parses");
+    let result = Box::new(ClauseInliner::new()).transform(original.clone());
+    assert_eq!(
+        result.problem.clauses().len(),
+        2,
+        "two matching expansions survive; the two mismatches must simplify away"
+    );
+    assert!(
+        result.problem.predicates().is_empty(),
+        "multi-defined P must be fully inlined"
+    );
+
+    // Select the SECOND surviving query. Before lockstep trace filtering,
+    // output index 1 still addressed the pruned P(0)/x=1 expansion instead of
+    // the surviving P(1)/x=1 expansion.
+    let query_index = 1;
+    let mut env: FxHashMap<String, SmtValue> = [("tag1".to_string(), SmtValue::Int(20))]
+        .into_iter()
+        .collect();
+    assert!(complete_env_for_clause(
+        &result.problem.clauses()[query_index],
+        &mut env
+    ));
+    let transformed = GroundDerivation {
+        steps: vec![GroundDerivationStep {
+            clause_index: query_index,
+            env,
+            premises: vec![],
+        }],
+        query_step: 0,
+    };
+    validate_ground_derivation(&result.problem, &transformed)
+        .expect("setup: second compacted query must be a valid transformed derivation");
+
+    let translated = result
+        .back_translator
+        .translate_ground_derivation(&transformed)
+        .expect("second surviving query must retain its own composition trace");
+    validate_ground_derivation(&original, &translated)
+        .expect("trace-aligned expansion must validate on the original clauses");
+    assert_eq!(
+        translated.steps[translated.query_step].clause_index, 3,
+        "the second surviving query must map back to original caller clause 3"
+    );
+    assert!(
+        translated.steps.iter().any(|step| step.clause_index == 1),
+        "the expansion must use P's x=1 definition"
+    );
+}
+
+/// A definition that becomes inlineable only after round one may itself be a
+/// composite. Keep that predicate explicit so its own one-level trace can be
+/// expanded, instead of flattening it into a nested trace with no stable
+/// original derivation.
+#[test]
+fn later_composite_definition_stays_ground_backtranslatable() {
+    use crate::ground_derivation::{
+        complete::complete_env_for_clause, validate_ground_derivation, GroundDerivation,
+        GroundDerivationStep,
+    };
+    use crate::parser::ChcParser;
+    use crate::smt::SmtValue;
+
+    let original = ChcParser::parse(
+        r#"
+(set-logic HORN)
+(declare-fun A (Int) Bool)
+(declare-fun B (Int) Bool)
+(declare-fun P (Int) Bool)
+(assert (forall ((x Int)) (=> (= x 0) (A x))))
+(assert (forall ((x Int)) (=> (= x 0) (B x))))
+(assert (forall ((x Int)) (=> (and (A x) (B x)) (P x))))
+(assert (forall ((x Int)) (=> (and (P x) (= x 0)) false)))
+(check-sat)
+"#,
+    )
+    .expect("parse later-round composite fixture");
+    let p = original.lookup_predicate("P").expect("P declared");
+    let result = Box::new(ClauseInliner::new()).transform(original.clone());
+    let transformed_p = result.problem.lookup_predicate("P").expect(
+        "P's definition became a composite in round one and must remain explicit for ground replay",
+    );
+    assert_ne!(
+        transformed_p, p,
+        "predicate compaction should make this fixture exercise remapped output ids"
+    );
+
+    let fact_index = result
+        .problem
+        .clauses()
+        .iter()
+        .position(|clause| clause.head.predicate_id() == Some(transformed_p))
+        .expect("transformed P definition retained");
+    let query_index = result
+        .problem
+        .clauses()
+        .iter()
+        .position(HornClause::is_query)
+        .expect("query retained");
+    let mut fact_env: FxHashMap<String, SmtValue> =
+        [("x".to_string(), SmtValue::Int(0))].into_iter().collect();
+    let mut query_env = fact_env.clone();
+    assert!(complete_env_for_clause(
+        &result.problem.clauses()[fact_index],
+        &mut fact_env
+    ));
+    assert!(complete_env_for_clause(
+        &result.problem.clauses()[query_index],
+        &mut query_env
+    ));
+    let transformed = GroundDerivation {
+        steps: vec![
+            GroundDerivationStep {
+                clause_index: fact_index,
+                env: fact_env,
+                premises: vec![],
+            },
+            GroundDerivationStep {
+                clause_index: query_index,
+                env: query_env,
+                premises: vec![0],
+            },
+        ],
+        query_step: 1,
+    };
+    validate_ground_derivation(&result.problem, &transformed)
+        .expect("setup: retained P derivation must validate after inlining");
+
+    let translated = result
+        .back_translator
+        .translate_ground_derivation(&transformed)
+        .expect("one-level traces must expand the retained composite definition");
+    validate_ground_derivation(&original, &translated)
+        .expect("expanded A/B/P/query derivation must validate on original clauses");
+}
+
 /// ANTI-FABRICATION: recovery synthesizes VALUES, and a wrong one must be
 /// caught. Corrupting the recovered intermediate has to make the derivation
 /// fail ground validation against the original clauses — the guarantee that
@@ -1813,5 +2304,43 @@ fn unconstrained_call_defaults_only_when_absence_is_syntactic() {
     assert!(
         !recovered.contains_key(&mentioned.name),
         "a variable mentioned by the composite must flow to propagation or the fail-closed solve"
+    );
+}
+
+#[test]
+fn boolean_call_completion_requires_a_unique_polarity() {
+    use crate::smt::SmtValue;
+
+    let guard = ChcVar::new("guard", ChcSort::Bool);
+    let call_flag = ChcVar::new("call_flag", ChcSort::Bool);
+    let guard_expr = ChcExpr::var(guard);
+    let flag_expr = ChcExpr::var(call_flag.clone());
+    let timeout = std::time::Duration::from_secs(2);
+
+    // `guard /\ (!guard \/ call_flag)` uniquely forces the call argument.
+    let forced_true = ChcExpr::and(
+        guard_expr.clone(),
+        ChcExpr::or(ChcExpr::not(guard_expr.clone()), flag_expr.clone()),
+    );
+    assert_eq!(
+        InliningBackTranslator::uniquely_forced_bool_value(&forced_true, &call_flag, timeout),
+        Some(SmtValue::Bool(true))
+    );
+
+    let forced_false = ChcExpr::and(
+        guard_expr.clone(),
+        ChcExpr::or(ChcExpr::not(guard_expr), ChcExpr::not(flag_expr.clone())),
+    );
+    assert_eq!(
+        InliningBackTranslator::uniquely_forced_bool_value(&forced_false, &call_flag, timeout),
+        Some(SmtValue::Bool(false))
+    );
+
+    // Both polarities satisfy a tautological occurrence, so choosing either
+    // would be ambiguous and must fail closed.
+    let ambiguous = ChcExpr::or(flag_expr.clone(), ChcExpr::not(flag_expr));
+    assert_eq!(
+        InliningBackTranslator::uniquely_forced_bool_value(&ambiguous, &call_flag, timeout),
+        None
     );
 }

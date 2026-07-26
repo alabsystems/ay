@@ -1,21 +1,29 @@
 {
   "name": "ayz3",
   "version": "0.1.0",
-  "description": "JavaScript/Node binding for AY's Z3-shaped C ABI (koffi native FFI over libay_ffi).",
+  "description": "Z3-shaped and declarative finite-domain Node APIs backed by the AY solver.",
   "type": "module",
   "main": "ayz3.mjs",
   "exports": {
     ".": "./ayz3.mjs",
-    "./lib": "./_lib.mjs"
+    "./lib": "./_lib.mjs",
+    "./search": {
+      "types": "./search.d.ts",
+      "import": "./search.mjs"
+    }
   },
   "files": [
     "ayz3.mjs",
     "_lib.mjs",
+    "search.mjs",
+    "search.d.ts",
+    "examples",
     "README.md",
-    "test.mjs"
+    "test.mjs",
+    "test-search.mjs"
   ],
   "scripts": {
-    "test": "node test.mjs"
+    "test": "node test.mjs && node test-search.mjs"
   },
   "keywords": [
     "smt",
@@ -24,6 +32,9 @@
     "ay",
     "sat",
     "ffi",
+    "constraint-programming",
+    "optimization",
+    "search",
     "koffi",
     "wasm"
   ],

@@ -18,6 +18,11 @@ from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 
+if not hasattr(os, "killpg"):
+    raise RuntimeError(
+        "resource-harness tests require POSIX process-group support"
+    )
+
 
 def load_script(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -41,7 +46,6 @@ wind_tunnel = load_script("wind_tunnel_under_test",
                           SCRIPTS / "wind_tunnel.py")
 
 
-@unittest.skipUnless(hasattr(os, "killpg"), "needs POSIX process groups")
 class ProofOverheadResourceTest(unittest.TestCase):
     def test_run_applies_environment_and_reads_bounded_status(self):
         with tempfile.TemporaryDirectory() as td:
@@ -125,7 +129,6 @@ class ProofOverheadResourceTest(unittest.TestCase):
         self.assertEqual(rc, 3)
 
 
-@unittest.skipUnless(hasattr(os, "killpg"), "needs POSIX process groups")
 class MiniZincResourceTest(unittest.TestCase):
     def _write_wrapper(self, directory):
         wrapper = Path(directory, "gtimeout")
@@ -234,16 +237,99 @@ class MiniZincResourceTest(unittest.TestCase):
 
 
 class TwoClubCampaignSyntaxTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.script = SCRIPTS / "two_club_campaign.sh"
+        cls.source = cls.script.read_text()
+
     def test_shell_syntax(self):
         proc = subprocess.run(
-            ["bash", "-n", str(SCRIPTS / "two_club_campaign.sh")],
+            ["bash", "-n", str(self.script)],
             capture_output=True,
             text=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
+    def test_rejects_noncanonical_or_out_of_range_partition_values(self):
+        for overrides in (
+            {"K": "08"},
+            {"K": "21"},
+            {"N": "0"},
+            {"SECS": "0001"},
+            {"SECS": "1234567890"},
+        ):
+            with self.subTest(overrides=overrides):
+                proc = subprocess.run(
+                    ["bash", str(self.script)],
+                    env={**os.environ, **overrides},
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertIn("ERROR:", proc.stderr)
 
-@unittest.skipUnless(hasattr(os, "killpg"), "needs POSIX process groups")
+    def test_resume_identity_pins_solver_and_enforcement_code(self):
+        self.assertIn("oom_guard_sha=$OOM_GUARD_SHA", self.source)
+        self.assertIn("sdp_worker_sha=$SDP_WORKER_SHA", self.source)
+        self.assertIn("sdp_certifier_sha=$SDP_CERTIFIER_SHA", self.source)
+        self.assertIn("sdp_pilot_sha=$SDP_PILOT_SHA", self.source)
+        self.assertIn(
+            "resource_sha=$RESOURCE_SHA oom_guard_sha=$OOM_GUARD_SHA",
+            self.source,
+        )
+        self.assertNotIn("two_club_file_probe --ignored", self.source)
+
+    def test_marked_ab_schedule_is_typed_and_part_of_the_identity(self):
+        self.assertIn(
+            "branch_schedule=first_below_floor_half+"
+            "marked_at_or_above_floor_half",
+            self.source,
+        )
+        self.assertIn('local branch_rule=first', self.source)
+        self.assertIn('branch_rule=marked', self.source)
+        self.assertIn('--branch "$branch_rule"', self.source)
+        self.assertIn("'--branch first|viol|marked'", self.source)
+        self.assertIn('branch_rule=%s timestamp_utc=', self.source)
+
+    def test_planning_and_binary_probe_use_the_private_snapshot(self):
+        stage = self.source.index(
+            'ARTIFACT_STAGE=$(mktemp -d "$ARTIFACT_ROOT/.stage.XXXXXXXX")'
+        )
+        bind_guard = self.source.index(
+            'OOM_GUARD=$ARTIFACT_STAGE/_oom_guard.py'
+        )
+        bind_binary = self.source.index("BIN=$ARTIFACT_STAGE/ay-pb-dev")
+        lease = self.source.index('python3 "$OOM_GUARD" lease')
+        binary_probe = self.source.index('dev_help=$("$BIN" help')
+        plan = self.source.index('PLAN=$(python3 "$OOM_GUARD" plan')
+        identity = self.source.index("CAMPAIGN_ID=$(sha256_text")
+
+        self.assertLess(stage, bind_guard)
+        self.assertLess(stage, bind_binary)
+        self.assertLess(bind_guard, lease)
+        self.assertLess(bind_guard, plan)
+        self.assertLess(bind_binary, binary_probe)
+        self.assertLess(lease, identity)
+        self.assertLess(binary_probe, identity)
+        self.assertLess(plan, identity)
+
+    def test_optimum_claim_requires_every_exact_identity_worker(self):
+        self.assertIn('while [ "$worker" -lt "$N" ]', self.source)
+        self.assertIn(
+            "has no exact-identity proven row",
+            self.source,
+        )
+        self.assertIn(
+            'if [ "$worker_best" -ne "$SEED_SIZE" ]',
+            self.source,
+        )
+        self.assertIn('if [ "$covered" -ne "$N" ]', self.source)
+        self.assertIn(
+            'grep -F " all_done=true run_status=ok "',
+            self.source,
+        )
+
+
 class WindTunnelResourceEnvelopeTest(unittest.TestCase):
     def test_checker_rejects_incomplete_model_and_missing_optimum_objective(self):
         incomplete = wind_tunnel.check_answer(
@@ -310,7 +396,6 @@ class WindTunnelResourceEnvelopeTest(unittest.TestCase):
         self.assertEqual(envelope["rss_grace_mb"], 0)
 
 
-@unittest.skipUnless(hasattr(os, "killpg"), "needs POSIX process groups")
 class ChccompResumeEnvelopeTest(unittest.TestCase):
     @staticmethod
     def _record(instance, solver, envelope):
@@ -478,10 +563,9 @@ class ChccompResumeEnvelopeTest(unittest.TestCase):
         self.assertEqual(envelope["jobs"], 2)
         self.assertEqual(envelope["nbcore_per_child"], 2)
         self.assertEqual(envelope["rss_grace_mb"], 0)
-        self.assertEqual(envelope["executable"]["path"], str(solver))
+        self.assertEqual(envelope["executable"]["path"], str(solver.resolve()))
 
 
-@unittest.skipUnless(hasattr(os, "killpg"), "needs POSIX process groups")
 class PbcompResourceEnvelopeTest(unittest.TestCase):
     @staticmethod
     def _envelope(timeout=10.0, memory=512):
@@ -622,7 +706,6 @@ class PbcompResourceEnvelopeTest(unittest.TestCase):
         self.assertEqual(sidecar["rss_grace_mb"], 0)
 
 
-@unittest.skipUnless(hasattr(os, "killpg"), "needs POSIX process groups")
 class ChccompRegressionComparabilityTest(unittest.TestCase):
     def test_resource_comparison_requires_complete_matching_fields(self):
         current = {

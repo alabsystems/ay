@@ -1512,11 +1512,14 @@ fn spec_model_anchors() {
     assert!(!spec_in_re(&Re::Pow(Box::new(Re::AllChar), 0), &s));
 }
 
-/// Code points ABOVE the SMT-LIB alphabet (`> 0x2FFFF`). AY's `\u{...}` reader
-/// accepts up to `0x10FFFF`, so such a `String` constant is reachable — but it
-/// is not a value of the theory's `String` sort, so the CHECKER must refuse to
-/// evaluate `str.to_code` on it rather than commit to a code point the solver
-/// (`eval_str_to_code`, which answers `-1`) would never agree with.
+/// Code points ABOVE the SMT-LIB alphabet (`> 0x2FFFF`). Such a value is no
+/// longer reachable through the SMT-LIB reader — `unescape_string_contents`
+/// now treats an out-of-alphabet `\u{...}` form as literal characters rather
+/// than decoding it — but it remains constructible through the Rust API, as
+/// below. It is not a value of the theory's `String` sort, so the CHECKER must
+/// refuse to evaluate `str.to_code` on it rather than commit to a code point
+/// the solver (`eval_str_to_code`, which answers `-1`) would never agree with.
+/// This is the defence-in-depth layer behind the reader-level fix.
 #[test]
 fn out_of_alphabet_code_point_is_not_certified() {
     let big = '\u{30000}'; // 196608 = one past the SMT-LIB alphabet

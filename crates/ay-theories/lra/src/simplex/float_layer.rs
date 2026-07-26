@@ -363,6 +363,9 @@ impl LraSolver {
         // Values changed out from under the incremental guards → invalidate.
         self.guard_clean_valid = false;
         self.heap_stale = true;
+        // #warm-simplex: wholesale value install bypassed the delta log and
+        // the dirty-set tracking — invalidate; the next full scan re-arms.
+        self.warm_invalidate();
         self.vars_tightened_since_simplex.clear();
         // This exit verified EVERY bound and EVERY row equation — a full
         // verification, matching the exact simplex's `all_bounds_satisfied`

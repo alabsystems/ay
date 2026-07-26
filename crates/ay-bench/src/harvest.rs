@@ -667,6 +667,16 @@ pub fn cmd_harvest(args: HarvestArgs) -> Result<usize> {
 
     let pool = build_thread_pool(resources.plan.jobs)?;
     let now = current_iso8601();
+    let mut private_input_builder = tempfile::Builder::new();
+    private_input_builder.prefix("ay-harvest-inputs-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        private_input_builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let private_input_dir = private_input_builder
+        .tempdir()
+        .with_bench_context(|| "reserving private harvest input staging directory".to_string())?;
 
     let mut store = BaselineStore::open(&store_path)?;
     let harvest_context = HarvestContext {
@@ -679,6 +689,7 @@ pub fn cmd_harvest(args: HarvestArgs) -> Result<usize> {
         solver_size_bytes,
         timeout_s: args.timeout_s,
         harvested_at: &now,
+        private_input_dir: private_input_dir.path(),
         resources: &resources,
         resource_requested_jobs,
         resource_jobs,
@@ -773,6 +784,7 @@ struct HarvestContext<'a> {
     solver_size_bytes: i64,
     timeout_s: f64,
     harvested_at: &'a str,
+    private_input_dir: &'a Path,
     resources: &'a crate::resource::PlannedResources,
     resource_requested_jobs: i64,
     resource_jobs: i64,
@@ -786,8 +798,13 @@ fn harvest_one(
     benchmark_id: &str,
     context: &HarvestContext<'_>,
 ) -> Result<BaselineRow> {
-    let prepared =
-        crate::native::prepare_benchmark(file, benchmark_id, context.resources, context.timeout_s)?;
+    let prepared = crate::native::prepare_benchmark(
+        file,
+        benchmark_id,
+        context.private_input_dir,
+        context.resources,
+        context.timeout_s,
+    )?;
     let expected = read_expected_for_id(&prepared.solver_path, benchmark_id)?;
 
     let outcome = run_solver(

@@ -75,7 +75,10 @@ pub use proof::{
     AletheRule, BvGateType, CuttingPlaneAnnotation, FarkasAnnotation, FpOp, LiaAnnotation, Proof,
     ProofId, ProofStep, TheoryLemmaKind, TheoryLemmaProof,
 };
-pub use smtlib::{escape_string_contents, quote_symbol, string_literal, unescape_string_contents};
+pub use smtlib::{
+    escape_string_contents, quote_symbol, string_literal, unescape_string_contents,
+    StringDecodeError, SMTLIB_MAX_CODE_POINT,
+};
 pub use sort::{ArraySort, BitVecSort, DatatypeConstructor, DatatypeField, DatatypeSort, Sort};
 pub use term::{Constant, RationalWrapper, Symbol, TermData, TermId, TermStore};
 pub use theory::{

@@ -2252,6 +2252,1551 @@ end AySoundness.Emitted.ArrUncond_{hash}
     )
 }
 
+/// Distinct-scalar pool for the store-commutativity model: every index / value /
+/// base scalar gets a stable `m.2` valuation slot in first-appearance order, and
+/// the single named base array is recorded once. Mirrors the identity discipline
+/// of `NestedStoreCtx` (named / literal scalars share the `NestedScalarKey`
+/// namespace).
+struct StoreCommPool {
+    scalars: Vec<NestedScalarKey>,
+    base: Option<String>,
+}
+
+impl StoreCommPool {
+    fn new() -> Self {
+        StoreCommPool {
+            scalars: Vec::new(),
+            base: None,
+        }
+    }
+
+    fn slot(&mut self, key: NestedScalarKey) -> usize {
+        if let Some(p) = self.scalars.iter().position(|s| s == &key) {
+            p
+        } else {
+            self.scalars.push(key);
+            self.scalars.len() - 1
+        }
+    }
+}
+
+/// Parse a `store`-chain `store(store(… base …, iₖ, vₖ) …)` into its writes in
+/// OUTERMOST-first order as `(index_slot, value_slot)` pairs, bottoming out at a
+/// single named base array (recorded/checked in `pool.base`). Indices and values
+/// must be opaque scalars (Symbol / nullary app / literal). `None` for any shape
+/// outside this fragment (compound index/value, a second base array, a non-store
+/// non-base leaf).
+fn parse_store_commute_chain(t: &PTerm, pool: &mut StoreCommPool) -> Option<Vec<(usize, usize)>> {
+    match t {
+        PTerm::App(op, args) if op == "store" && args.len() == 3 => {
+            let idx = pool.slot(nested_scalar_key(&args[1])?);
+            let val = pool.slot(nested_scalar_key(&args[2])?);
+            let mut rest = parse_store_commute_chain(&args[0], pool)?;
+            let mut v = Vec::with_capacity(rest.len() + 1);
+            v.push((idx, val));
+            v.append(&mut rest);
+            Some(v)
+        }
+        _ => {
+            let name = nested_base_name(t)?;
+            match &pool.base {
+                Some(b) if b != &name => None,
+                _ => {
+                    pool.base = Some(name);
+                    Some(Vec::new())
+                }
+            }
+        }
+    }
+}
+
+/// Cap on the number of DISTINCT store indices in a store-commute conflict: the
+/// read-index reduction emits a `2ⁿ`-leaf `by_cases … <;> simp_all` product and
+/// the guard clause carries `n·(n−1)/2` index-coincidence atoms, so `n` must stay
+/// small. All targeted regressions have `n ≤ 3`.
+const STORE_COMMUTE_MAX_INDICES: usize = 6;
+
+/// The two `store`-chain sides of a candidate store-commute disequality, reduced
+/// to a shared scalar pool.
+struct StoreCommuteSides {
+    /// `Some(k_slot)` for the SELECT form (`select CHAIN k` on both sides, same
+    /// `k`); `None` for the DIRECT array-disequality form.
+    read: Option<usize>,
+    lhs: Vec<(usize, usize)>,
+    rhs: Vec<(usize, usize)>,
+}
+
+/// Recognize `(select CHAIN k)` — the read-forwarding side shape.
+fn store_commute_select(t: &PTerm) -> Option<(&PTerm, &PTerm)> {
+    match t {
+        PTerm::App(o, a) if o == "select" && a.len() == 2 => Some((&a[0], &a[1])),
+        _ => None,
+    }
+}
+
+/// Reduce the two sides `lt`, `rt` of a `(not (= lt rt))` assertion to their
+/// store-chains over a shared pool, detecting the SELECT (`select CHAIN k`) or
+/// DIRECT (`CHAIN` = array) form. `None` when the shape does not fit (mixed
+/// forms, differing read indices, non-store leaves).
+fn store_commute_extract(
+    lt: &PTerm,
+    rt: &PTerm,
+    pool: &mut StoreCommPool,
+) -> Option<StoreCommuteSides> {
+    if let (Some((al, kl)), Some((ar, kr))) = (store_commute_select(lt), store_commute_select(rt)) {
+        // SELECT form: both `(select CHAIN k)` with the SAME read index `k`.
+        let kk = nested_scalar_key(kl)?;
+        if Some(&kk) != nested_scalar_key(kr).as_ref() {
+            return None;
+        }
+        let lhs = parse_store_commute_chain(al, pool)?;
+        let rhs = parse_store_commute_chain(ar, pool)?;
+        let read = pool.slot(kk);
+        Some(StoreCommuteSides {
+            read: Some(read),
+            lhs,
+            rhs,
+        })
+    } else {
+        // DIRECT form: both sides are store-chains over the common base.
+        let lhs = parse_store_commute_chain(lt, pool)?;
+        let rhs = parse_store_commute_chain(rt, pool)?;
+        Some(StoreCommuteSides {
+            read: None,
+            lhs,
+            rhs,
+        })
+    }
+}
+
+/// Emit a verified-firewall Lean proof for a STORE-COMMUTATIVITY conflict among
+/// the PARSED assertions: `(not (= LHS RHS))` where `LHS`/`RHS` are two `store`-
+/// chains that permute the SAME set of writes over the SAME base — directly as
+/// arrays (`(not (= (store (store a i v) j w) (store (store a j w) i v)))`) or
+/// forwarded through a shared read (`(not (= (select L k) (select R k)))`) — and
+/// the pairwise index disequalities that make the permutation value-preserving
+/// are all asserted. Under those disequalities each index is written once, so the
+/// two chains denote the same array (`sel_upd_same` / `sel_upd_other` + `ext`);
+/// asserting they differ is UNSAT.
+///
+/// Grounding: the same verified `firewall_combined_unsat` and functional array
+/// model (`(Nat → Nat) × (Nat → Nat)` = base array × scalar valuation) as the
+/// ROW1 / nested-store emitters. Each `store`-chain unfolds to a raw `if`-tree
+/// (McCarthy read-over-write); the theory lemma is the guarded clause
+/// `row_eq ∨ (⋁ index-coincidences)`, proved by `by_cases` on each asserted index
+/// coincidence and, in the all-distinct leaf, `funext`/`by_cases` on the read
+/// index (`<;> simp_all`) — the impossible joint branch (two indices equal to the
+/// read yet asserted-distinct) closes by the coincidence hypothesis. The DIRECT
+/// form compares functions, so its atom is `noncomputable` via
+/// `Classical.propDecidable`; the SELECT form compares `Nat`s and stays
+/// computable. The artifact does not import `AySoundness.ArrayThy`.
+///
+/// Fail-closed: declines (`None`) unless there is a single base array, both
+/// chains permute an identical set of `(index, value)` writes with the indices
+/// distinct within each chain, and EVERY pairwise index coincidence is backed by
+/// an asserted disequality (so the guarded clause is valid). NO verdict/clause
+/// change on decline.
+pub(crate) fn emit_array_store_commute_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+) -> Option<String> {
+    // Pass 1: collect asserted index disequalities that back the guard literals —
+    // from `(not (= x y))` and expanded `(distinct t1 … tn)` (same discipline as
+    // the nested-store emitter).
+    let mut diseqs: Vec<(NestedScalarKey, NestedScalarKey)> = Vec::new();
+    for asrt in parsed {
+        let PTerm::App(op, args) = asrt else { continue };
+        if op == "distinct" && args.len() >= 2 {
+            let keys: Vec<Option<NestedScalarKey>> = args.iter().map(nested_scalar_key).collect();
+            for a in 0..keys.len() {
+                for b in (a + 1)..keys.len() {
+                    if let (Some(x), Some(y)) = (keys[a].clone(), keys[b].clone()) {
+                        diseqs.push((x, y));
+                    }
+                }
+            }
+            continue;
+        }
+        if op != "not" || args.len() != 1 {
+            continue;
+        }
+        let PTerm::App(eq, ea) = &args[0] else {
+            continue;
+        };
+        if eq != "=" || ea.len() != 2 {
+            continue;
+        }
+        if let (Some(x), Some(y)) = (nested_scalar_key(&ea[0]), nested_scalar_key(&ea[1])) {
+            diseqs.push((x, y));
+        }
+    }
+
+    // Pass 2: find the main store-commute disequality and reconstruct it.
+    for asrt in parsed {
+        let PTerm::App(op, args) = asrt else { continue };
+        if op != "not" || args.len() != 1 {
+            continue;
+        }
+        let PTerm::App(eq, ea) = &args[0] else {
+            continue;
+        };
+        if eq != "=" || ea.len() != 2 {
+            continue;
+        }
+        let mut pool = StoreCommPool::new();
+        let Some(sides) = store_commute_extract(&ea[0], &ea[1], &mut pool) else {
+            continue;
+        };
+        // Both sides must be genuine (non-empty) store-chains.
+        if sides.lhs.is_empty() || sides.rhs.is_empty() {
+            continue;
+        }
+        // Indices distinct within each chain (no repeated write to one slot);
+        // keeps the last-write set the full write set and the guard set complete.
+        let idx_set = |chain: &[(usize, usize)]| -> Option<Vec<usize>> {
+            let mut seen: Vec<usize> = Vec::new();
+            for &(i, _) in chain {
+                if seen.contains(&i) {
+                    return None;
+                }
+                seen.push(i);
+            }
+            Some(seen)
+        };
+        let (Some(mut li), Some(mut ri)) = (idx_set(&sides.lhs), idx_set(&sides.rhs)) else {
+            continue;
+        };
+        li.sort_unstable();
+        ri.sort_unstable();
+        if li != ri {
+            continue; // different index sets — not a permutation of the same writes
+        }
+        // Same SET of `(index, value)` writes (value agreement per index): both
+        // chains must denote the same array once the indices are distinct.
+        let mut lw: Vec<(usize, usize)> = sides.lhs.clone();
+        let mut rw: Vec<(usize, usize)> = sides.rhs.clone();
+        lw.sort_unstable();
+        rw.sort_unstable();
+        if lw != rw {
+            continue;
+        }
+        let indices = li; // sorted, distinct, shared
+        if indices.len() < 2 || indices.len() > STORE_COMMUTE_MAX_INDICES {
+            continue;
+        }
+        // Guard set: every pairwise index coincidence, each backed by an asserted
+        // disequality. Fail closed if any pair is unbacked (the guarded clause
+        // would not be valid).
+        let mut guards: Vec<(usize, usize)> = Vec::new();
+        let mut all_backed = true;
+        for a in 0..indices.len() {
+            for b in (a + 1)..indices.len() {
+                let (sa, sb) = (indices[a], indices[b]);
+                let ka = &pool.scalars[sa];
+                let kb = &pool.scalars[sb];
+                let backed = diseqs
+                    .iter()
+                    .any(|(x, y)| (x == ka && y == kb) || (x == kb && y == ka));
+                if !backed {
+                    all_backed = false;
+                }
+                guards.push((sa, sb));
+            }
+        }
+        if !all_backed || guards.is_empty() {
+            continue;
+        }
+        return Some(render_array_store_commute_lean(
+            sides.read,
+            &sides.lhs,
+            &sides.rhs,
+            &indices,
+            &guards,
+            fnv_hex(&format!("store_commute:{asrt:?}")),
+        ));
+    }
+    None
+}
+
+/// Unfold a `store`-chain (outermost-first `(index_slot, value_slot)` writes) at
+/// read expression `read` into nested raw `if`-updates, bottoming out at the base
+/// read `m.1 read`.
+fn store_commute_tree(chain: &[(usize, usize)], read: &str) -> String {
+    match chain.split_first() {
+        None => format!("(m.1 {read})"),
+        Some(((idx, val), rest)) => format!(
+            "(if {read} = (m.2 {idx}) then (m.2 {val}) else {})",
+            store_commute_tree(rest, read)
+        ),
+    }
+}
+
+fn render_array_store_commute_lean(
+    read: Option<usize>,
+    lhs: &[(usize, usize)],
+    rhs: &[(usize, usize)],
+    indices: &[usize],
+    guards: &[(usize, usize)],
+    hash: String,
+) -> String {
+    use std::fmt::Write as _;
+
+    let is_select = read.is_some();
+    let read_expr = match read {
+        Some(k) => format!("(m.2 {k})"),
+        None => "x".to_string(),
+    };
+    let lhs_tree = store_commute_tree(lhs, &read_expr);
+    let rhs_tree = store_commute_tree(rhs, &read_expr);
+    // The SELECT form compares `Nat`s at the shared read index; the DIRECT form
+    // compares whole arrays, so the equated terms are `fun x => …` functions and
+    // the row lemma is a function equality proved under `funext`.
+    let lhs_side = if is_select {
+        lhs_tree.clone()
+    } else {
+        format!("(fun x => {lhs_tree})")
+    };
+    let rhs_side = if is_select {
+        rhs_tree.clone()
+    } else {
+        format!("(fun x => {rhs_tree})")
+    };
+    let g = guards.len();
+
+    // atomVal: atom 1 = row_eq, atoms 2..=1+g = pairwise index coincidences.
+    let mut guard_arms = String::new();
+    for (k, (a, b)) in guards.iter().enumerate() {
+        let _ = writeln!(
+            &mut guard_arms,
+            "  | {id} => decide ((m.2 {a}) = (m.2 {b}))",
+            id = 2 + k
+        );
+    }
+    let original: String = std::iter::once("(1, [-1])".to_string())
+        .chain((0..g).map(|k| format!("({id}, [-{id}])", id = 2 + k)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let lemma_lits: String = (1..=1 + g)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let lemma_id = 2 + g;
+    let proof_id = 3 + g;
+    let proof_prems: String = (1..=lemma_id)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // The all-guards-distinct leaf: prove `row_eq` (LHS-tree = RHS-tree). For the
+    // DIRECT form the equality is between array functions, so `funext` first; then
+    // `by_cases` on the read index vs each store index reduces both trees, and
+    // `simp_all` closes every branch (the joint branch that equates two
+    // asserted-distinct indices is discharged by the guard hypotheses in scope).
+    let leaf = |indent: &str| -> String {
+        let inner = format!("{indent}  ");
+        let bycases: String = indices
+            .iter()
+            .enumerate()
+            .map(|(k, s)| format!("by_cases hk{k} : {read_expr} = (m.2 {s})"))
+            .collect::<Vec<_>>()
+            .join(" <;> ");
+        let funext = if is_select {
+            String::new()
+        } else {
+            format!("{inner}funext x\n")
+        };
+        format!(
+            "{indent}have hrow : {lhs_side} = {rhs_side} := by\n\
+             {funext}{inner}{bycases} <;> simp_all\n\
+             {indent}simp [clauseSat, litSat, atomVal, hrow]"
+        )
+    };
+
+    // Guard cascade: case on each backed index coincidence; a TRUE coincidence
+    // satisfies its own disjunct, and the single all-distinct spine proves
+    // `row_eq`.
+    fn cascade(
+        guards: &[(usize, usize)],
+        idx: usize,
+        indent: &str,
+        leaf: &dyn Fn(&str) -> String,
+    ) -> String {
+        if idx == guards.len() {
+            return leaf(indent);
+        }
+        let (a, b) = guards[idx];
+        let id = 2 + idx;
+        let inner_ind = format!("{indent}  ");
+        let inner = cascade(guards, idx + 1, &inner_ind, leaf);
+        let inner_trimmed = inner.strip_prefix(inner_ind.as_str()).unwrap_or(&inner);
+        format!(
+            "{indent}by_cases hg{id} : (m.2 {a}) = (m.2 {b})\n\
+             {indent}· simp [clauseSat, litSat, atomVal, hg{id}]\n\
+             {indent}· {inner_trimmed}"
+        )
+    }
+    let proof_body = cascade(guards, 0, "  ", &leaf);
+
+    let classical_attr = if is_select {
+        String::new()
+    } else {
+        "attribute [local instance] Classical.propDecidable\n\n".to_string()
+    };
+    let noncomputable = if is_select { "" } else { "noncomputable " };
+    let axiom_note = if is_select {
+        "{propext, Quot.sound}"
+    } else {
+        "{propext, Classical.choice, Quot.sound}"
+    };
+    let form_note = if is_select {
+        "forwarded through a shared read `select _ k` (values compared as `Nat`)"
+    } else {
+        "compared directly as arrays (`funext`; the function-equality atom is \
+         `noncomputable` via `Classical.propDecidable`)"
+    };
+
+    format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — STORE-COMMUTATIVITY conflict, grounded
+  in the verified `firewall_combined_unsat`. Two `store`-chains permute the same
+  writes over the same base and are {form_note}; under the asserted pairwise index
+  disequalities each index is written once, so the chains denote the SAME array
+  (McCarthy `sel_upd_same`/`sel_upd_other` + extensionality) and asserting they
+  differ is UNSAT. Reconstructed from the frontend assertions (ay refutes arrays
+  eagerly as bare-trust). Model: `(Nat → Nat) × (Nat → Nat)` = base array × scalar
+  valuation (`m.1` the array, `m.2 k` the k-th index/element). The theory lemma is
+  the guarded clause `row_eq ∨ (⋁ index-coincidences)`, valid by `by_cases` on
+  each asserted index coincidence + read-index reduction. Pure Lean 4 core; axioms
+  ⊆ {axiom_note}.
+-/
+namespace AySoundness.Emitted.ArrStoreComm_{hash}
+open AySoundness
+
+{classical_attr}abbrev Val := (Nat → Nat) × (Nat → Nat)
+
+-- atom 1 = (LHS = RHS) with each store-chain unfolded to nested if-updates;
+-- atoms 2.. = the pairwise index coincidences that guard the permutation.
+{noncomputable}def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide ({lhs_side} = {rhs_side})
+{guard_arms}  | _ => false
+
+def original : List (Cid × Clause) := [{original}]
+def lemmas   : List (Cid × Clause) := [({lemma_id}, [{lemma_lits}])]
+def proof    : List (Cid × Clause × List Int) := [({proof_id}, [], [{proof_prems}])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [{lemma_lits}] = true := by
+{proof_body}
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- The store-commutativity conflict has no model — via the firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.ArrStoreComm_{hash}
+"#,
+    )
+}
+
+/// A `Symbol` / nullary-application array name.
+fn ax_sym_name(t: &PTerm) -> Option<&str> {
+    match t {
+        PTerm::Symbol(s) => Some(s.as_str()),
+        PTerm::App(f, a) if a.is_empty() => Some(f.as_str()),
+        _ => None,
+    }
+}
+
+/// All `(symbol, store-term)` bindings from `(= sym (store …))` /
+/// `(= (store …) sym)` assertions — the array-let facts a transitive
+/// read-over-write conflict is reconstructed through.
+fn ax_array_store_bindings(parsed: &[PTerm]) -> Vec<(&str, &PTerm)> {
+    let mut out: Vec<(&str, &PTerm)> = Vec::new();
+    for asrt in parsed {
+        let Some((p, q)) = ax_as_eq2(asrt) else {
+            continue;
+        };
+        for (s, store) in [(p, q), (q, p)] {
+            if let Some(name) = ax_sym_name(s) {
+                if ax_as_store3(store).is_some() {
+                    out.push((name, store));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `(not (= p q))` asserted (either orientation)?
+fn ax_has_diseq(parsed: &[PTerm], p: &PTerm, q: &PTerm) -> bool {
+    parsed.iter().any(
+        |t| matches!(ax_as_not_eq2(t), Some((x, y)) if (x == p && y == q) || (x == q && y == p)),
+    )
+}
+
+/// **conflicting stores** (ROW-1 through a shared array variable,
+/// `ArrayThy.sel_upd_same`): a variable bound to two stores at the SAME index
+/// with distinct values — `X = store b i e1`, `X = store b i e2`, `e1 ≠ e2` —
+/// forces `store b i e1 = store b i e2`, whose read at `i` gives `e1 = e2`.
+/// Covers `conflicting_stores.smt2`.
+pub(crate) fn emit_array_conflicting_stores_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+) -> Option<String> {
+    let bindings = ax_array_store_bindings(parsed);
+    for a in 0..bindings.len() {
+        for b in (a + 1)..bindings.len() {
+            let (x1, s1) = bindings[a];
+            let (x2, s2) = bindings[b];
+            if x1 != x2 {
+                continue; // must be the SAME array variable to force `s1 = s2`
+            }
+            let (Some((_, i1, e1)), Some((_, i2, e2))) = (ax_as_store3(s1), ax_as_store3(s2))
+            else {
+                continue;
+            };
+            // Same store index (else `e1 = e2` does not follow) and an asserted
+            // value disequality to contradict.
+            if i1 == i2 && e1 != e2 && ax_has_diseq(parsed, e1, e2) {
+                return Some(render_array_conflicting_stores_lean(fnv_hex(&format!(
+                    "conflicting_stores:{x1}:{s1:?}{s2:?}"
+                ))));
+            }
+        }
+    }
+    None
+}
+
+fn render_array_conflicting_stores_lean(hash: String) -> String {
+    format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — CONFLICTING STORES (ROW-1 through a
+  shared array variable), grounded in the verified `firewall_combined_unsat`.
+  `x = store b1 i e1`, `x = store b2 i e2`, `e1 ≠ e2` are unsatisfiable: the two
+  bindings force `store b1 i e1 = store b2 i e2`, and reading index `i` gives
+  `e1 = sel (upd b1 i e1) i = sel (upd b2 i e2) i = e2` (the mirror of
+  `AySoundness.ArrayThy.sel_upd_same`). Reconstructed from the frontend assertions
+  (ay refutes arrays eagerly as bare-trust). Arrays are `Nat → Nat`, `store` the
+  `if`-update; the store equalities are function equalities (`decide` over
+  `Classical.propDecidable`). Axioms ⊆ {{propext, Classical.choice, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.ArrConflStores_{hash}
+open AySoundness
+
+attribute [local instance] Classical.propDecidable
+
+structure Val where
+  x : Nat -> Nat
+  b1 : Nat -> Nat
+  b2 : Nat -> Nat
+  i : Nat
+  e1 : Nat
+  e2 : Nat
+
+-- atom 1 = (x = store b1 i e1); atom 2 = (x = store b2 i e2); atom 3 = (e1 = e2).
+noncomputable def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide (m.x = (fun j => if j = m.i then m.e1 else m.b1 j))
+  | 2 => decide (m.x = (fun j => if j = m.i then m.e2 else m.b2 j))
+  | 3 => decide (m.e1 = m.e2)
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1]), (2, [2]), (3, [-3])]
+def lemmas   : List (Cid × Clause) := [(4, [-1, -2, 3])]
+def proof    : List (Cid × Clause × List Int) := [(5, [], [1, 2, 3, 4])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1, -2, 3] = true := by
+  by_cases h1 : m.x = (fun j => if j = m.i then m.e1 else m.b1 j)
+  · by_cases h2 : m.x = (fun j => if j = m.i then m.e2 else m.b2 j)
+    · have he : m.e1 = m.e2 := by
+        have hc := congrFun (h1.symm.trans h2) m.i
+        simpa using hc
+      simp [clauseSat, litSat, atomVal, he]
+    · simp [clauseSat, litSat, atomVal, h2]
+  · simp [clauseSat, litSat, atomVal, h1]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- `x = store b1 i e1 ∧ x = store b2 i e2 ∧ e1 ≠ e2` is unsatisfiable — via the
+    firewall (ROW-1). -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.ArrConflStores_{hash}
+"#,
+    )
+}
+
+/// **diamond conflict** (store-eq ⇒ ROW-1 vs ROW-2 at one index): two variables
+/// bound to stores over a COMMON base that are asserted equal —
+/// `b = store a i v`, `c = store a j w`, `b = c`, `i ≠ j` — force
+/// `store a i v = store a j w`; reading index `i` gives
+/// `v = sel (upd a i v) i = sel (upd a j w) i = sel a i` (ROW-1 on the left,
+/// ROW-2 on the right under `i ≠ j`), contradicting `v ≠ select a i`.
+/// Covers `diamond_conflict.smt2`.
+pub(crate) fn emit_array_diamond_conflict_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+) -> Option<String> {
+    let bindings = ax_array_store_bindings(parsed);
+    let binding_of = |name: &str| -> Option<&PTerm> {
+        bindings.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
+    };
+    for asrt in parsed {
+        // `(= b c)` between two DISTINCT array symbols, each bound to a store.
+        let Some((p, q)) = ax_as_eq2(asrt) else {
+            continue;
+        };
+        let (Some(bn), Some(cn)) = (ax_sym_name(p), ax_sym_name(q)) else {
+            continue;
+        };
+        if bn == cn {
+            continue;
+        }
+        let (Some(sb), Some(sc)) = (binding_of(bn), binding_of(cn)) else {
+            continue;
+        };
+        let (Some((ab, ib, vb)), Some((ac, ic, vc))) = (ax_as_store3(sb), ax_as_store3(sc)) else {
+            continue;
+        };
+        // Same base array and an asserted index disequality (so ROW-2 leaves the
+        // base at the other index).
+        if ab != ac || ib == ic || !ax_has_diseq(parsed, ib, ic) {
+            continue;
+        }
+        // One side asserts its stored value differs from the base read at its own
+        // index — the contradiction ROW forces to equality.
+        for (base, idx, val) in [(ab, ib, vb), (ac, ic, vc)] {
+            let sel = PTerm::App("select".to_string(), vec![base.clone(), idx.clone()]);
+            if ax_has_diseq(parsed, val, &sel) {
+                return Some(render_array_diamond_conflict_lean(fnv_hex(&format!(
+                    "diamond:{asrt:?}{sb:?}{sc:?}"
+                ))));
+            }
+        }
+    }
+    None
+}
+
+fn render_array_diamond_conflict_lean(hash: String) -> String {
+    format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — DIAMOND conflict (store-equality ⇒ ROW-1
+  vs ROW-2 at one index), grounded in the verified `firewall_combined_unsat`.
+  `b = store a i v`, `c = store a j w`, `b = c`, `i ≠ j`, `v ≠ select a i` are
+  unsatisfiable: the bindings force `store a i v = store a j w`, and reading index
+  `i` gives `v = sel (upd a i v) i = sel (upd a j w) i = sel a i` (ROW-1 on the
+  left; ROW-2 on the right, since `i ≠ j` — the mirror of
+  `AySoundness.ArrayThy.sel_upd_same`/`sel_upd_other`), contradicting
+  `v ≠ select a i`. Reconstructed from the frontend assertions (ay refutes arrays
+  eagerly as bare-trust). Arrays are `Nat → Nat`, `store` the `if`-update; the
+  store equality is a function equality (`decide` over `Classical.propDecidable`).
+  Axioms ⊆ {{propext, Classical.choice, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.ArrDiamond_{hash}
+open AySoundness
+
+attribute [local instance] Classical.propDecidable
+
+structure Val where
+  a : Nat -> Nat
+  i : Nat
+  j : Nat
+  v : Nat
+  w : Nat
+
+-- atom 1 = (store a i v = store a j w); atom 2 = (i = j); atom 3 = (v = select a i).
+noncomputable def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide ((fun t => if t = m.i then m.v else m.a t) = (fun t => if t = m.j then m.w else m.a t))
+  | 2 => decide (m.i = m.j)
+  | 3 => decide (m.v = m.a m.i)
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1]), (2, [-2]), (3, [-3])]
+def lemmas   : List (Cid × Clause) := [(4, [-1, 2, 3])]
+def proof    : List (Cid × Clause × List Int) := [(5, [], [1, 2, 3, 4])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1, 2, 3] = true := by
+  by_cases h1 : (fun t => if t = m.i then m.v else m.a t) = (fun t => if t = m.j then m.w else m.a t)
+  · by_cases h2 : m.i = m.j
+    · simp [clauseSat, litSat, atomVal, h2]
+    · have hv : m.v = m.a m.i := by
+        have hc := congrFun h1 m.i
+        simp [h2] at hc
+        exact hc
+      simp [clauseSat, litSat, atomVal, hv]
+  · simp [clauseSat, litSat, atomVal, h1]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- `store a i v = store a j w ∧ i ≠ j ∧ v ≠ select a i` is unsatisfiable — via
+    the firewall (ROW-1 / ROW-2). -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.ArrDiamond_{hash}
+"#,
+    )
+}
+
+// ===========================================================================
+// QF_AX extensionality / read-over-write / congruence firewall emitters.
+//
+// Six fail-closed matchers over the FRONTEND parsed assertions, each grounding
+// the corresponding McCarthy-array conflict through the verified
+// `firewall_combined_unsat`. Arrays are the standard functional model
+// (`Nat → Nat`, `select` = application, `store` = `if`-update), indices/values
+// are `Nat`; extensionality atoms are function equalities (`decide` over the
+// `Classical.propDecidable` instance, hence `noncomputable atomVal`). Every
+// rendered theorem kernel-checks with axioms ⊆ {propext, Classical.choice,
+// Quot.sound} — the mirror of `AySoundness.ArrayThy`
+// (`ext_nonvacuous` / `sel_upd_same` / `sel_upd_other`), whose own proofs
+// discharge exactly these obligations.
+// ===========================================================================
+
+/// `(= X Y)` → `(X, Y)`.
+fn ax_as_eq2(t: &PTerm) -> Option<(&PTerm, &PTerm)> {
+    let PTerm::App(op, a) = t else { return None };
+    (op == "=" && a.len() == 2).then(|| (&a[0], &a[1]))
+}
+
+/// `(not (= X Y))` → `(X, Y)`.
+fn ax_as_not_eq2(t: &PTerm) -> Option<(&PTerm, &PTerm)> {
+    let PTerm::App(op, a) = t else { return None };
+    if op != "not" || a.len() != 1 {
+        return None;
+    }
+    ax_as_eq2(&a[0])
+}
+
+/// `(store A I V)` → `(A, I, V)`.
+fn ax_as_store3(t: &PTerm) -> Option<(&PTerm, &PTerm, &PTerm)> {
+    let PTerm::App(op, a) = t else { return None };
+    (op == "store" && a.len() == 3).then(|| (&a[0], &a[1], &a[2]))
+}
+
+/// `(select A I)` → `(A, I)`.
+fn ax_as_select2(t: &PTerm) -> Option<(&PTerm, &PTerm)> {
+    let PTerm::App(op, a) = t else { return None };
+    (op == "select" && a.len() == 2).then(|| (&a[0], &a[1]))
+}
+
+/// **write-back identity** (`ArrayThy.ext_nonvacuous`):
+/// `(not (= (store a i (select a i)) a))` — storing the value already present is
+/// a no-op, refuted by extensionality with the bounded `j = i` / `j ≠ i` split.
+/// Covers `write_back_identity.smt2`, `storeinv_minimal.smt2`,
+/// `store_select_inverse.smt2` (byte-identical assertion).
+pub(crate) fn emit_array_write_back_identity_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+) -> Option<String> {
+    for asrt in parsed {
+        let Some((lhs, rhs)) = ax_as_not_eq2(asrt) else {
+            continue;
+        };
+        // `(store a i (select a i)) = a` in either orientation.
+        for (store_side, a_side) in [(lhs, rhs), (rhs, lhs)] {
+            let Some((sa, si, sv)) = ax_as_store3(store_side) else {
+                continue;
+            };
+            let Some((va, vi)) = ax_as_select2(sv) else {
+                continue;
+            };
+            // stored value is `select a i` over the SAME base + index, and the
+            // other side of the disequality is that same base array.
+            if sa == va && si == vi && a_side == sa {
+                return Some(render_array_write_back_lean(fnv_hex(&format!("{asrt:?}"))));
+            }
+        }
+    }
+    None
+}
+
+fn render_array_write_back_lean(hash: String) -> String {
+    format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — array WRITE-BACK identity, grounded in
+  the verified `firewall_combined_unsat`. The assertion
+  `store a i (select a i) ≠ a` contradicts extensionality: storing the value
+  already present at `i` is a no-op (`upd a i (sel a i) = a`, the mirror of
+  `AySoundness.ArrayThy.ext_nonvacuous`, whose proof does the same `j = i` /
+  `j ≠ i` by_cases). Reconstructed from the frontend assertions (ay refutes
+  arrays eagerly as bare-trust). Arrays are `Nat → Nat`, `select` application,
+  `store` the `if`-update; the extension equality is a function equality (`decide`
+  over `Classical.propDecidable`). Axioms ⊆ {{propext, Classical.choice,
+  Quot.sound}}.
+-/
+namespace AySoundness.Emitted.ArrWriteBack_{hash}
+open AySoundness
+
+attribute [local instance] Classical.propDecidable
+
+structure Val where
+  a : Nat -> Nat
+  i : Nat
+
+-- atom 1 = (store a i (select a i) = a) = ((fun j => if j = i then a i else a j) = a).
+noncomputable def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide ((fun j => if j = m.i then m.a m.i else m.a j) = m.a)
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [-1])]
+def lemmas   : List (Cid × Clause) := [(2, [1])]
+def proof    : List (Cid × Clause × List Int) := [(3, [], [1, 2])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [1] = true := by
+  have hp : (fun j => if j = m.i then m.a m.i else m.a j) = m.a := by
+    funext j
+    by_cases h : j = m.i
+    · subst h; simp
+    · simp [h]
+  simp [clauseSat, litSat, atomVal, hp]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- `store a i (select a i) ≠ a` is unsatisfiable — via the firewall (extensionality). -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.ArrWriteBack_{hash}
+"#,
+    )
+}
+
+/// **store-eq ⇒ value-eq** (ROW-1 on both sides, `ArrayThy.sel_upd_same`):
+/// `(= (store a i v) (store b i w))` with `(not (= v w))` — applying `select` at
+/// the shared index `i` reduces both sides to the stored value, so `v = w`.
+/// Covers `store_eq_implies_select_eq.smt2`, `conflicting_stores.smt2`.
+pub(crate) fn emit_array_store_eq_select_eq_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+) -> Option<String> {
+    for eq_asrt in parsed {
+        let Some((x, y)) = ax_as_eq2(eq_asrt) else {
+            continue;
+        };
+        let (Some((_a, i1, v)), Some((_b, i2, w))) = (ax_as_store3(x), ax_as_store3(y)) else {
+            continue;
+        };
+        // The two stores MUST be at the same index — otherwise `v = w` does not
+        // follow (declining is fail-closed).
+        if i1 != i2 {
+            continue;
+        }
+        let has_diseq = parsed.iter().any(|t| {
+            matches!(ax_as_not_eq2(t), Some((p, q)) if (p == v && q == w) || (p == w && q == v))
+        });
+        if has_diseq {
+            return Some(render_array_store_eq_select_eq_lean(fnv_hex(&format!(
+                "{eq_asrt:?}"
+            ))));
+        }
+    }
+    None
+}
+
+fn render_array_store_eq_select_eq_lean(hash: String) -> String {
+    format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — store-equality ⇒ value-equality
+  (ROW-1 on both sides), grounded in the verified `firewall_combined_unsat`.
+  `store a i v = store b i w` with `v ≠ w` is unsatisfiable: reading index `i`
+  gives `v = sel (upd a i v) i = sel (upd b i w) i = w` (the mirror of
+  `AySoundness.ArrayThy.sel_upd_same`). Reconstructed from the frontend
+  assertions (ay refutes arrays eagerly as bare-trust). Arrays are `Nat → Nat`,
+  `store` the `if`-update; the store equality is a function equality (`decide`
+  over `Classical.propDecidable`). Axioms ⊆ {{propext, Classical.choice,
+  Quot.sound}}.
+-/
+namespace AySoundness.Emitted.ArrStoreEqSel_{hash}
+open AySoundness
+
+attribute [local instance] Classical.propDecidable
+
+structure Val where
+  a : Nat -> Nat
+  b : Nat -> Nat
+  i : Nat
+  v : Nat
+  w : Nat
+
+-- atom 1 = (store a i v = store b i w); atom 2 = (v = w).
+noncomputable def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide ((fun j => if j = m.i then m.v else m.a j) = (fun j => if j = m.i then m.w else m.b j))
+  | 2 => decide (m.v = m.w)
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1]), (2, [-2])]
+def lemmas   : List (Cid × Clause) := [(3, [-1, 2])]
+def proof    : List (Cid × Clause × List Int) := [(4, [], [1, 2, 3])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1, 2] = true := by
+  by_cases h1 : (fun j => if j = m.i then m.v else m.a j) = (fun j => if j = m.i then m.w else m.b j)
+  · have hi : m.v = m.w := by have h := congrFun h1 m.i; simpa using h
+    simp [clauseSat, litSat, atomVal, hi]
+  · simp [clauseSat, litSat, atomVal, h1]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- `store a i v = store b i w ∧ v ≠ w` is unsatisfiable — via the firewall (ROW-1). -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.ArrStoreEqSel_{hash}
+"#,
+    )
+}
+
+/// **store-eq ⇒ base-eq at other index** (ROW-2 on both sides,
+/// `ArrayThy.sel_upd_other`): `(= (store a i v) (store b i w))`, `(not (= i j))`,
+/// `(not (= (select a j) (select b j)))` — under `i ≠ j`, reading index `j`
+/// leaves both bases, so `select a j = select b j`.
+/// Covers `store_eq_implies_base_eq_at_other.smt2`.
+pub(crate) fn emit_array_store_eq_base_other_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+) -> Option<String> {
+    for eq_asrt in parsed {
+        let Some((x, y)) = ax_as_eq2(eq_asrt) else {
+            continue;
+        };
+        let (Some((a, i1, _v)), Some((b, i2, _w))) = (ax_as_store3(x), ax_as_store3(y)) else {
+            continue;
+        };
+        if i1 != i2 {
+            continue;
+        }
+        let i = i1;
+        for neg in parsed {
+            let Some((p, q)) = ax_as_not_eq2(neg) else {
+                continue;
+            };
+            // `(not (= i j))` — one operand is the store index `i`, the other is
+            // the distinct read index `j`.
+            let j = if p == i {
+                q
+            } else if q == i {
+                p
+            } else {
+                continue;
+            };
+            if j == i {
+                continue;
+            }
+            // `(not (= (select a j) (select b j)))` over the two store bases.
+            let has_sel = parsed.iter().any(|t| {
+                let Some((s1, s2)) = ax_as_not_eq2(t) else {
+                    return false;
+                };
+                let (Some((sa, sj1)), Some((sb, sj2))) = (ax_as_select2(s1), ax_as_select2(s2))
+                else {
+                    return false;
+                };
+                sj1 == j && sj2 == j && ((sa == a && sb == b) || (sa == b && sb == a))
+            });
+            if has_sel {
+                return Some(render_array_store_eq_base_other_lean(fnv_hex(&format!(
+                    "{eq_asrt:?}{neg:?}"
+                ))));
+            }
+        }
+    }
+    None
+}
+
+fn render_array_store_eq_base_other_lean(hash: String) -> String {
+    format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — store-equality ⇒ base-equality at a
+  DISTINCT index (ROW-2 on both sides), grounded in the verified
+  `firewall_combined_unsat`. `store a i v = store b i w` with `i ≠ j` forces
+  `select a j = select b j`: reading the untouched index `j` leaves each base
+  (the mirror of `AySoundness.ArrayThy.sel_upd_other`), so the asserted
+  disequality is refuted. Reconstructed from the frontend assertions (ay refutes
+  arrays eagerly as bare-trust). Arrays are `Nat → Nat`, `store` the `if`-update;
+  the store equality is a function equality (`decide` over
+  `Classical.propDecidable`). Axioms ⊆ {{propext, Classical.choice, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.ArrStoreEqOther_{hash}
+open AySoundness
+
+attribute [local instance] Classical.propDecidable
+
+structure Val where
+  a : Nat -> Nat
+  b : Nat -> Nat
+  i : Nat
+  j : Nat
+  v : Nat
+  w : Nat
+
+-- atom 1 = (store a i v = store b i w); atom 2 = (i = j); atom 3 = (select a j = select b j).
+noncomputable def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide ((fun k => if k = m.i then m.v else m.a k) = (fun k => if k = m.i then m.w else m.b k))
+  | 2 => decide (m.i = m.j)
+  | 3 => decide (m.a m.j = m.b m.j)
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1]), (2, [-2]), (3, [-3])]
+def lemmas   : List (Cid × Clause) := [(4, [-1, 2, 3])]
+def proof    : List (Cid × Clause × List Int) := [(5, [], [1, 2, 3, 4])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1, 2, 3] = true := by
+  by_cases h2 : m.i = m.j
+  · simp [clauseSat, litSat, atomVal, h2]
+  · by_cases h1 : (fun k => if k = m.i then m.v else m.a k) = (fun k => if k = m.i then m.w else m.b k)
+    · have hj := congrFun h1 m.j
+      rw [if_neg (fun hji => h2 hji.symm), if_neg (fun hji => h2 hji.symm)] at hj
+      simp [clauseSat, litSat, atomVal, hj]
+    · simp [clauseSat, litSat, atomVal, h1]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- `store a i v = store b i w ∧ i ≠ j ∧ select a j ≠ select b j` is unsatisfiable
+    — via the firewall (ROW-2). -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.ArrStoreEqOther_{hash}
+"#,
+    )
+}
+
+/// **array-eq ⇒ select-eq** (select congruence, `ArrayThy.sel`/`congrFun`):
+/// `(= a b)`, `(not (= (select a i) (select b i)))` — `a = b` forces
+/// `select a i = select b i`. Covers `array_eq_select.smt2`.
+pub(crate) fn emit_array_eq_select_firewall_lean_from_parsed(parsed: &[PTerm]) -> Option<String> {
+    for neg in parsed {
+        let Some((s1, s2)) = ax_as_not_eq2(neg) else {
+            continue;
+        };
+        let (Some((a, i1)), Some((b, i2))) = (ax_as_select2(s1), ax_as_select2(s2)) else {
+            continue;
+        };
+        // Distinct arrays, shared read index; the array equality must be asserted.
+        if i1 != i2 || a == b {
+            continue;
+        }
+        let has_eq = parsed.iter().any(
+            |t| matches!(ax_as_eq2(t), Some((p, q)) if (p == a && q == b) || (p == b && q == a)),
+        );
+        if has_eq {
+            return Some(render_array_eq_select_lean(fnv_hex(&format!("{neg:?}"))));
+        }
+    }
+    None
+}
+
+fn render_array_eq_select_lean(hash: String) -> String {
+    format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — array-equality ⇒ select-equality
+  (select congruence), grounded in the verified `firewall_combined_unsat`.
+  `a = b` with `select a i ≠ select b i` is unsatisfiable: equal arrays read
+  equally at every index (`congrFun` over the functional `sel = ·`). Reconstructed
+  from the frontend assertions (ay refutes arrays eagerly as bare-trust). Arrays
+  are `Nat → Nat`, `select` application; the array equality is a function
+  equality (`decide` over `Classical.propDecidable`). Axioms ⊆ {{propext,
+  Classical.choice, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.ArrEqSel_{hash}
+open AySoundness
+
+attribute [local instance] Classical.propDecidable
+
+structure Val where
+  a : Nat -> Nat
+  b : Nat -> Nat
+  i : Nat
+
+-- atom 1 = (a = b); atom 2 = (select a i = select b i).
+noncomputable def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide (m.a = m.b)
+  | 2 => decide (m.a m.i = m.b m.i)
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1]), (2, [-2])]
+def lemmas   : List (Cid × Clause) := [(3, [-1, 2])]
+def proof    : List (Cid × Clause × List Int) := [(4, [], [1, 2, 3])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1, 2] = true := by
+  by_cases h1 : m.a = m.b
+  · have hi := congrFun h1 m.i
+    simp [clauseSat, litSat, atomVal, hi]
+  · simp [clauseSat, litSat, atomVal, h1]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- `a = b ∧ select a i ≠ select b i` is unsatisfiable — via the firewall (congruence). -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.ArrEqSel_{hash}
+"#,
+    )
+}
+
+/// **array-eq ⇒ store-eq** (store congruence, `ArrayThy.upd`/`congrArg`):
+/// `(= a b)`, `(not (= (store a i v) (store b i v)))` — `a = b` forces the two
+/// updates equal. Covers `ext_congruence.smt2`.
+pub(crate) fn emit_array_store_congruence_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+) -> Option<String> {
+    for neg in parsed {
+        let Some((x, y)) = ax_as_not_eq2(neg) else {
+            continue;
+        };
+        let (Some((a, i1, v1)), Some((b, i2, v2))) = (ax_as_store3(x), ax_as_store3(y)) else {
+            continue;
+        };
+        // Same index + same stored value + distinct bases; `a = b` must be asserted.
+        if i1 != i2 || v1 != v2 || a == b {
+            continue;
+        }
+        let has_eq = parsed.iter().any(
+            |t| matches!(ax_as_eq2(t), Some((p, q)) if (p == a && q == b) || (p == b && q == a)),
+        );
+        if has_eq {
+            return Some(render_array_store_congruence_lean(fnv_hex(&format!(
+                "{neg:?}"
+            ))));
+        }
+    }
+    None
+}
+
+fn render_array_store_congruence_lean(hash: String) -> String {
+    format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — array-equality ⇒ store-equality
+  (store congruence), grounded in the verified `firewall_combined_unsat`.
+  `a = b` with `store a i v ≠ store b i v` is unsatisfiable: equal arrays give
+  equal updates (`congrArg` over the functional `upd`). Reconstructed from the
+  frontend assertions (ay refutes arrays eagerly as bare-trust). Arrays are
+  `Nat → Nat`, `store` the `if`-update; the (dis)equalities are function
+  equalities (`decide` over `Classical.propDecidable`). Axioms ⊆ {{propext,
+  Classical.choice, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.ArrStoreCong_{hash}
+open AySoundness
+
+attribute [local instance] Classical.propDecidable
+
+structure Val where
+  a : Nat -> Nat
+  b : Nat -> Nat
+  i : Nat
+  v : Nat
+
+-- atom 1 = (a = b); atom 2 = (store a i v = store b i v).
+noncomputable def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide (m.a = m.b)
+  | 2 => decide ((fun j => if j = m.i then m.v else m.a j) = (fun j => if j = m.i then m.v else m.b j))
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1]), (2, [-2])]
+def lemmas   : List (Cid × Clause) := [(3, [-1, 2])]
+def proof    : List (Cid × Clause × List Int) := [(4, [], [1, 2, 3])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1, 2] = true := by
+  by_cases h1 : m.a = m.b
+  · have h2 : (fun j => if j = m.i then m.v else m.a j) = (fun j => if j = m.i then m.v else m.b j) := by
+      rw [h1]
+    simp [clauseSat, litSat, atomVal, h2]
+  · simp [clauseSat, litSat, atomVal, h1]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- `a = b ∧ store a i v ≠ store b i v` is unsatisfiable — via the firewall (congruence). -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.ArrStoreCong_{hash}
+"#,
+    )
+}
+
+/// State for the equality-chain ROW-1 emitter: registries assigning a distinct
+/// model field to each array-symbol / scalar-symbol leaf, in first-appearance
+/// order. Array leaves become `m.arr{k}` (`Nat → Nat`); scalar leaves become
+/// `m.sca{k}` (`Nat`). The two namespaces are disjoint (a QF_AX symbol has a
+/// single sort); a name appearing in both aborts the render (fail-closed).
+struct ChainCtx {
+    arrs: Vec<String>,
+    scalars: Vec<String>,
+    collision: bool,
+}
+
+impl ChainCtx {
+    fn new() -> Self {
+        ChainCtx {
+            arrs: Vec::new(),
+            scalars: Vec::new(),
+            collision: false,
+        }
+    }
+
+    fn arr_field(&mut self, name: &str) -> String {
+        if self.scalars.iter().any(|s| s == name) {
+            self.collision = true;
+        }
+        let k = if let Some(p) = self.arrs.iter().position(|s| s == name) {
+            p
+        } else {
+            self.arrs.push(name.to_string());
+            self.arrs.len() - 1
+        };
+        format!("m.arr{k}")
+    }
+
+    fn scalar_field(&mut self, name: &str) -> String {
+        if self.arrs.iter().any(|s| s == name) {
+            self.collision = true;
+        }
+        let k = if let Some(p) = self.scalars.iter().position(|s| s == name) {
+            p
+        } else {
+            self.scalars.push(name.to_string());
+            self.scalars.len() - 1
+        };
+        format!("m.sca{k}")
+    }
+}
+
+/// Leaf symbol name (a `Symbol` or a nullary application); `None` for a compound.
+fn ax_leaf_name(t: &PTerm) -> Option<&str> {
+    match t {
+        PTerm::Symbol(s) => Some(s.as_str()),
+        PTerm::App(f, args) if args.is_empty() => Some(f.as_str()),
+        _ => None,
+    }
+}
+
+/// Render an array-valued term into a Lean expression over the model fields:
+/// a leaf → its `m.arr{k}` field; a `(store A I V)` → the raw `if`-update
+/// `(fun j => if j = <I> then <V> else <A> j)`. `None` for any other shape.
+fn ax_render_arr(t: &PTerm, ctx: &mut ChainCtx) -> Option<String> {
+    if let Some((a, i, v)) = ax_as_store3(t) {
+        let ia = ax_render_scalar(i, ctx)?;
+        let va = ax_render_scalar(v, ctx)?;
+        let aa = ax_render_arr(a, ctx)?;
+        Some(format!("(fun j => if j = {ia} then {va} else {aa} j)"))
+    } else {
+        ax_leaf_name(t).map(|name| ctx.arr_field(name))
+    }
+}
+
+/// Render a scalar (index/element) leaf into its `m.sca{k}` field. Only leaf
+/// symbols are supported (declines compound scalar terms — fail-closed).
+fn ax_render_scalar(t: &PTerm, ctx: &mut ChainCtx) -> Option<String> {
+    ax_leaf_name(t).map(|name| ctx.scalar_field(name))
+}
+
+/// **equality-chain ⇒ ROW-1** (`Eq.trans` chain + `ArrayThy.sel_upd_same`):
+/// `(not (= (select a i) v))` where `a` reaches a `(store c i v)` term through a
+/// chain of asserted array equalities (e.g. `a = b`, `b = store c i v`). Follows
+/// the chain, rewrites the read array to the store, and discharges by ROW-1.
+/// Covers `eq_chain_four_arrays.smt2`.
+pub(crate) fn emit_array_eq_chain_row1_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+) -> Option<String> {
+    for neg in parsed {
+        let Some((p, q)) = ax_as_not_eq2(neg) else {
+            continue;
+        };
+        for (sel_t, val_t) in [(p, q), (q, p)] {
+            let Some((arr0, idx)) = ax_as_select2(sel_t) else {
+                continue;
+            };
+            // BFS over the asserted array equalities from `arr0` to a
+            // `(store _ idx val_t)` term.
+            let mut nodes: Vec<&PTerm> = vec![arr0];
+            let mut pred: Vec<Option<usize>> = vec![None];
+            let mut found: Option<usize> = None;
+            let mut head = 0;
+            while head < nodes.len() {
+                let cur = nodes[head];
+                if let Some((_c, si, sv)) = ax_as_store3(cur) {
+                    if si == idx && sv == val_t {
+                        found = Some(head);
+                        break;
+                    }
+                }
+                for t in parsed {
+                    if let Some((x, y)) = ax_as_eq2(t) {
+                        for (from, to) in [(x, y), (y, x)] {
+                            if from == cur && !nodes.iter().any(|n| *n == to) {
+                                nodes.push(to);
+                                pred.push(Some(head));
+                            }
+                        }
+                    }
+                }
+                head += 1;
+            }
+            let Some(mut fi) = found else {
+                continue;
+            };
+            // Reconstruct the oriented path arr0 = … = store.
+            let mut path: Vec<usize> = vec![fi];
+            while let Some(pp) = pred[fi] {
+                path.push(pp);
+                fi = pp;
+            }
+            path.reverse();
+            // Require at least one equality edge (a direct `select (store …) i`
+            // is the ROW-1 emitter's job — decline here, fail-closed).
+            if path.len() < 2 {
+                continue;
+            }
+            if let Some(lean) = render_array_eq_chain_row1_lean(
+                &path.iter().map(|&pi| nodes[pi]).collect::<Vec<_>>(),
+                idx,
+                val_t,
+                fnv_hex(&format!("{neg:?}")),
+            ) {
+                return Some(lean);
+            }
+        }
+    }
+    None
+}
+
+fn render_array_eq_chain_row1_lean(
+    path: &[&PTerm],
+    idx: &PTerm,
+    val: &PTerm,
+    hash: String,
+) -> Option<String> {
+    use std::fmt::Write as _;
+    let mut ctx = ChainCtx::new();
+    // Render every path node once; edges relate consecutive nodes.
+    let node_exprs: Vec<String> = path
+        .iter()
+        .map(|t| ax_render_arr(t, &mut ctx))
+        .collect::<Option<Vec<_>>>()?;
+    let idx_field = ax_render_scalar(idx, &mut ctx)?;
+    let val_field = ax_render_scalar(val, &mut ctx)?;
+    if ctx.collision {
+        return None;
+    }
+    let k = node_exprs.len() - 1; // number of edges
+    if k == 0 {
+        return None;
+    }
+    let sel_atom = k + 1;
+
+    // Struct fields.
+    let mut fields = String::new();
+    for a in 0..ctx.arrs.len() {
+        let _ = writeln!(&mut fields, "  arr{a} : Nat -> Nat");
+    }
+    for s in 0..ctx.scalars.len() {
+        let _ = writeln!(&mut fields, "  sca{s} : Nat");
+    }
+
+    // atomVal arms: edges 1..k, then the select-value atom.
+    let mut arms = String::new();
+    for m in 1..=k {
+        let _ = writeln!(
+            &mut arms,
+            "  | {m} => decide ({lhs} = {rhs})",
+            lhs = node_exprs[m - 1],
+            rhs = node_exprs[m]
+        );
+    }
+    let arr0 = &node_exprs[0];
+    let _ = writeln!(
+        &mut arms,
+        "  | {sel_atom} => decide ({arr0} {idx_field} = {val_field})"
+    );
+
+    // Clauses.
+    let original: String = (1..=k)
+        .map(|m| format!("({m}, [{m}])"))
+        .chain(std::iter::once(format!("({sel_atom}, [-{sel_atom}])")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let lemma_id = sel_atom + 1;
+    let proof_id = lemma_id + 1;
+    let lemma_lits: String = (1..=k)
+        .map(|m| format!("-{m}"))
+        .chain(std::iter::once(sel_atom.to_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let proof_prems: String = (1..=k)
+        .map(|m| m.to_string())
+        .chain([sel_atom.to_string(), lemma_id.to_string()])
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // lemma_valid: cascade of by_cases on each edge; all-true leaf chains the
+    // equalities (Eq.trans) then reads at `idx` (ROW-1).
+    let trans_chain: String = if k == 1 {
+        "h1".to_string()
+    } else {
+        let mut s = format!("h{k}");
+        for m in (1..k).rev() {
+            s = format!("h{m}.trans ({s})");
+        }
+        s
+    };
+    let store_expr = &node_exprs[k];
+    // The all-edges-true leaf: chain the equalities and read at `idx` (ROW-1).
+    // Rendered as three lines at a given indent (the first line rides the `·`
+    // bullet at the call site).
+    let leaf_at = |ind: &str| -> String {
+        format!(
+            "{ind}have hchain : {arr0} = {store_expr} := {trans_chain}\n\
+             {ind}have hi : {arr0} {idx_field} = {val_field} := by have h := congrFun hchain {idx_field}; simpa using h\n\
+             {ind}simp [clauseSat, litSat, atomVal, hi]\n"
+        )
+    };
+    // Recursive by_cases cascade: each edge's TRUE branch continues to the next
+    // edge (or the leaf); its FALSE branch closes immediately (that negative
+    // disjunct is satisfied). Every returned line is prefixed with `ind`.
+    fn build(
+        d: usize,
+        k: usize,
+        ind: &str,
+        edge_props: &[String],
+        leaf_at: &dyn Fn(&str) -> String,
+    ) -> String {
+        let inner_ind = format!("{ind}  ");
+        let header = format!("{ind}by_cases h{d} : ({})\n", edge_props[d - 1]);
+        // TRUE branch: the nested cascade / leaf, first line riding the bullet.
+        let true_block = if d == k {
+            leaf_at(&inner_ind)
+        } else {
+            build(d + 1, k, &inner_ind, edge_props, leaf_at)
+        };
+        let true_trimmed = true_block
+            .strip_prefix(inner_ind.as_str())
+            .unwrap_or(true_block.as_str());
+        let true_arm = format!("{ind}· {true_trimmed}");
+        // FALSE branch: that edge is false ⇒ `-d` literal satisfied.
+        let false_arm = format!("{ind}· simp [clauseSat, litSat, atomVal, h{d}]\n");
+        format!("{header}{true_arm}{false_arm}")
+    }
+    let edge_props: Vec<String> = (1..=k)
+        .map(|m| format!("{} = {}", node_exprs[m - 1], node_exprs[m]))
+        .collect();
+    let proof_body = build(1, k, "  ", &edge_props, &leaf_at);
+    let proof_body = proof_body.trim_end_matches('\n');
+
+    Some(format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — equality-chain ⇒ ROW-1, grounded in the
+  verified `firewall_combined_unsat`. A chain of asserted array equalities carries
+  the read array to a `store … idx val` term; reading `idx` then yields `val`
+  (the mirror of `AySoundness.ArrayThy.sel_upd_same`), contradicting
+  `select a idx ≠ val`. Reconstructed from the frontend assertions (ay refutes
+  arrays eagerly as bare-trust). Arrays are `Nat → Nat`, `store` the `if`-update;
+  each chain equality is a function equality (`decide` over
+  `Classical.propDecidable`). Axioms ⊆ {{propext, Classical.choice, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.ArrEqChain_{hash}
+open AySoundness
+
+attribute [local instance] Classical.propDecidable
+
+structure Val where
+{fields}
+noncomputable def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+{arms}  | _ => false
+
+def original : List (Cid × Clause) := [{original}]
+def lemmas   : List (Cid × Clause) := [({lemma_id}, [{lemma_lits}])]
+def proof    : List (Cid × Clause × List Int) := [({proof_id}, [], [{proof_prems}])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [{lemma_lits}] = true := by
+{proof_body}
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- The equality-chain read-over-write conflict has no model — via the firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.ArrEqChain_{hash}
+"#,
+    ))
+}
+
 /// Emit a verified-firewall Lean proof for a SET subset refutation found among
 /// the PARSED (frontend) assertions: `(set.member x s)`, `(not (set.member x t))`,
 /// `(set.subset s t)` over a shared ground witness `x` and sets `s`, `t`.
@@ -7620,7 +9165,7 @@ pub(crate) fn emit_lia_firewall_lean(terms: &TermStore, lemma_clause: &[TermId])
     if literals.len() < 2 {
         return None;
     }
-    let mut vars: Vec<String> = Vec::new();
+    let mut vars: Vec<(String, u32)> = Vec::new();
     // (rendered comparison, polarity-in-lemma: true = positive). Mixed polarity
     // is supported (e.g. antisymmetry `¬(x≤y) ∨ ¬(y≤x) ∨ (x=y)`), not just
     // all-negated bound conflicts.
@@ -7632,7 +9177,106 @@ pub(crate) fn emit_lia_firewall_lean(terms: &TermStore, lemma_clause: &[TermId])
         };
         atoms.push((render_comparison(terms, comp_term, &mut vars)?, positive));
     }
+    // SUBSET-REFUTATION FAITHFULNESS. `original` asserts one unit clause per
+    // rendered atom and nothing else, so the artifact refutes a SUBSET of the
+    // query's atoms. That is sound only while the rendering is faithful: every
+    // `(m i)` must denote one distinct SMT variable and no two distinct
+    // variables may share an index. `render_int` keys the map on the term
+    // store's unique `(name, id)` variable identity, which makes the map
+    // injective by construction; this check witnesses the remaining half — that
+    // no atom mentions an index outside the recorded map. Fail closed.
+    if !lia_atom_indices_are_in_range(atoms.iter().map(|(a, _)| a.as_str()), vars.len()) {
+        return None;
+    }
     Some(render_lia_lean(&atoms))
+}
+
+/// Witness that every `(m i)` valuation index occurring in the rendered atoms
+/// was actually allocated in the emitter's variable map (`i < vars`).
+///
+/// Together with the map's injectivity this is the faithfulness side-condition
+/// of the SUBSET refutation the LIA firewall emits: `original` asserts exactly
+/// the rendered atoms, so an index that escaped the map — or two variables
+/// sharing one — would let a kernel-checked artifact refute a system that is
+/// not a subset of the query's.
+fn lia_atom_indices_are_in_range<'a>(
+    atoms: impl IntoIterator<Item = &'a str>,
+    vars: usize,
+) -> bool {
+    atoms.into_iter().all(|atom| {
+        atom.match_indices("(m ").all(|(at, _)| {
+            let rest = &atom[at + 3..];
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            match digits.parse::<usize>() {
+                Ok(idx) => idx < vars,
+                Err(_) => false,
+            }
+        })
+    })
+}
+
+/// Widest clause for which the historical `2ⁿ`-leaf `by_cases … <;> simp <;>
+/// omega` product is still attempted FIRST inside the `first` combinator.
+///
+/// Ordering matters because Lean's heartbeat budget is per-DECLARATION: a
+/// sibling alternative that exhausts it aborts the whole declaration, and
+/// `first` cannot recover (`Lean.Core`'s `withOptions` refreshes `maxRecDepth`
+/// from the options but not `maxHeartbeats`, so a `set_option maxHeartbeats … in`
+/// wrapper around one alternative buys it nothing). Measured on the 142
+/// LIA/general firewall artifacts emitted across `benchmarks/smt`: the case-split
+/// product closes at widths up to 6 and, from width 11 on, burns the entire
+/// default budget before failing. Keeping it first at or below this bound
+/// preserves every artifact that closes today — including the ones that close
+/// CONSTRUCTIVELY, with axioms ⊆ {propext, Quot.sound} — byte for byte; above
+/// it the product is unaffordable anyway, so the linear script leads.
+const MAX_CASE_SPLIT_FIRST_ATOMS: usize = 8;
+
+/// Linear alternative for a `clauseSat` goal that has already been unfolded by
+/// `simp only [clauseSat, atomVal, litSat, List.any_cons, List.any_nil]`.
+///
+/// It finishes the `Bool`→`Prop` normalisation the unfolding leaves behind
+/// (`decide`/`ite`/`Bool.or` scaffolding around the literal indices) and hands
+/// ONE linear disjunction to `omega`, in `O(n)` rather than the `2ⁿ` leaves of
+/// the case-split product.
+///
+/// This is what the case-split script cannot do on these inputs, and the reason
+/// is tactic HYGIENE rather than any missing theory: `simp [h₁, …, hₙ]` takes an
+/// equality hypothesis such as `h₃ : 1 = m 4 + m 1` as a left-to-right rewrite
+/// rule and rewrites the literal INDICES `1`, `-1`, `2`, … inside the still-folded
+/// `atomVal` match, turning the goal into a shape no arithmetic tactic can close.
+const CLAUSE_LINEAR_ALTERNATIVE: &str = "simp only [gt_iff_lt, Int.reduceNeg, Int.reduceLT, Int.reduceGT,\n         Int.reduceToNat, reduceIte, Bool.not_eq_eq_eq_not, Bool.not_true,\n         Bool.or_eq_true, decide_eq_false_iff_not, decide_eq_true_eq,\n         Bool.false_or, Bool.or_false]\n       omega";
+
+/// Combine the historical case-split script with [`CLAUSE_LINEAR_ALTERNATIVE`]
+/// under Lean's `first` TACTIC combinator.
+///
+/// `first` is pure proof SEARCH: whichever alternative succeeds still produces a
+/// term the kernel checks in full, so this cannot weaken soundness — it can only
+/// turn a previously-unclosable emission into a checked one, or leave it failing
+/// (fail-closed). `case_split` stays FIRST while it is affordable, so artifacts
+/// that already close keep their exact proof term and axiom basis; see
+/// [`MAX_CASE_SPLIT_FIRST_ATOMS`].
+fn clause_tactic(case_split: &str, atoms: usize) -> String {
+    let linear = CLAUSE_LINEAR_ALTERNATIVE;
+    if atoms <= MAX_CASE_SPLIT_FIRST_ATOMS {
+        format!("first\n    | ({case_split})\n    | ({linear})")
+    } else {
+        format!("first\n    | ({linear})\n    | ({case_split})")
+    }
+}
+
+/// Lean's default `maxRecDepth` (512) is sized for hand-written proofs; a
+/// `clauseSat` goal over hundreds of literals unfolds into a term far deeper
+/// than that, and the emitted artifact fails for want of stack frames rather
+/// than for want of a proof. Scale that guard — and ONLY that guard — with the
+/// rendered clause size.
+///
+/// `maxHeartbeats` is deliberately left at the Lean default. These artifacts are
+/// attacker/input-amplifiable through proof size, so the wall-clock guard must
+/// stay in force; `maxHeartbeats 0` is never emitted.
+fn scaled_max_rec_depth(atoms: usize) -> usize {
+    512usize
+        .saturating_add(atoms.saturating_mul(256))
+        .clamp(4_096, 262_144)
 }
 
 fn render_lia_lean(atoms: &[(String, bool)]) -> String {
@@ -7692,6 +9336,8 @@ fn render_lia_lean(atoms: &[(String, bool)]) -> String {
         .map(|i| format!("h{i}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let tactic = clause_tactic(&format!("{bycases} <;> simp [{hs}] <;> omega"), n);
+    let rec_depth = scaled_max_rec_depth(n);
     format!(
         r#"import AySoundness.Firewall
 /-
@@ -7699,8 +9345,13 @@ fn render_lia_lean(atoms: &[(String, bool)]) -> String {
   the verified `firewall_combined_unsat`. The asserted comparisons are jointly
   unsatisfiable; premise (a) is the resolution (`lratCheck` by `decide`),
   premise (b) is the `la_generic` lemma holding in every valuation, discharged by
-  `omega`. Model: a valuation `Nat → Int`. Pure Lean 4 core.
+  the `first` combinator: the `2ⁿ`-leaf case-split product where that is
+  affordable, else ONE linear `omega` pass. Model: a valuation `Nat → Int`.
+  Pure Lean 4 core.
 -/
+set_option linter.unusedSimpArgs false
+set_option maxRecDepth {rec_depth}
+
 namespace AySoundness.Emitted.Lia_{hash}
 open AySoundness
 
@@ -7717,7 +9368,7 @@ def proof    : List (Cid × Clause × List Int) := [({proof2}, [], [{proof_hints
 
 theorem lemma_valid (m : Val) : clauseSat (atomVal m) [{neg}] = true := by
   simp only [clauseSat, atomVal, litSat, List.any_cons, List.any_nil]
-  {bycases} <;> simp [{hs}] <;> omega
+  {tactic}
 
 theorem lemmas_valid :
     ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
@@ -7741,8 +9392,8 @@ end AySoundness.Emitted.Lia_{hash}
         lemma_id = lemma_id,
         proof2 = lemma_id + 1,
         proof_hints = proof_hints,
-        bycases = bycases,
-        hs = hs,
+        tactic = tactic,
+        rec_depth = rec_depth,
     )
 }
 
@@ -8122,6 +9773,7 @@ pub(crate) fn emit_general_firewall_lean(
     //     (dis)equality reasoning).
     let mut lemma_thms = String::new();
     let mut dispatch_bullets = String::new();
+    let mut max_lemma_atoms = 0usize;
     for (i, lits) in lemmas.iter().enumerate() {
         let cid = a + i + 1;
         let id_of = |x: &i64| x.unsigned_abs() as usize;
@@ -8174,10 +9826,19 @@ pub(crate) fn emit_general_firewall_lean(
         } else {
             format!("<;> simp [{hs}] <;> omega")
         };
+        // The case-split product stays the FIRST alternative here (it is the one
+        // that closes the congruence shapes, and — measured — every general
+        // artifact that closes today does so through it, several with axioms
+        // ⊆ {propext, Quot.sound}); the linear script only runs when it fails.
+        // Above `MAX_CASE_SPLIT_FIRST_ATOMS` the product cannot finish inside
+        // Lean's per-declaration heartbeat budget at all, and exhausting it would
+        // abort the declaration before the fallback ever ran, so the order flips.
+        let tactic = clause_tactic(&format!("{bycases} {close}"), seen.len());
+        max_lemma_atoms = max_lemma_atoms.max(seen.len());
         lemma_thms.push_str(&format!(
             "theorem lemma_{cid}_valid (m : Val) : clauseSat (atomVal m) [{lits_src}] = true := by\n  \
              simp only [clauseSat, atomVal, litSat, List.any_cons, List.any_nil]\n  \
-             {bycases} {close}\n\n"
+             {tactic}\n\n"
         ));
         dispatch_bullets.push_str(&format!("  · exact lemma_{cid}_valid m\n"));
     }
@@ -8214,6 +9875,7 @@ pub(crate) fn emit_general_firewall_lean(
     );
     let hash = fnv_hex(&signature);
 
+    let rec_depth = scaled_max_rec_depth(atom_render.len().max(max_lemma_atoms));
     Some(format!(
         r#"import AySoundness.Firewall
 /-
@@ -8224,6 +9886,9 @@ pub(crate) fn emit_general_firewall_lean(
   {model_note}
   Pure Lean 4 core; axioms ⊆ {{propext, Classical.choice, Quot.sound}}.
 -/
+set_option linter.unusedSimpArgs false
+set_option maxRecDepth {rec_depth}
+
 namespace AySoundness.Emitted.General_{hash}
 open AySoundness
 
@@ -9086,8 +10751,12 @@ fn fnv_hex(s: &str) -> String {
 }
 
 /// Render a comparison `(<op> a b)` as a Lean `Prop`, collecting variables into
-/// `vars` (a stable valuation index per distinct variable name).
-fn render_comparison(terms: &TermStore, term: TermId, vars: &mut Vec<String>) -> Option<String> {
+/// `vars` (a stable valuation index per distinct variable IDENTITY).
+fn render_comparison(
+    terms: &TermStore,
+    term: TermId,
+    vars: &mut Vec<(String, u32)>,
+) -> Option<String> {
     let TermData::App(sym, args) = terms.get(term) else {
         return None;
     };
@@ -9109,12 +10778,19 @@ fn render_comparison(terms: &TermStore, term: TermId, vars: &mut Vec<String>) ->
 
 /// Render a linear integer term as Lean. Variables become `(m i)` for a stable
 /// valuation index `i`; only `+`, `-`, `*` and integer constants are handled.
-fn render_int(terms: &TermStore, term: TermId, vars: &mut Vec<String>) -> Option<String> {
+///
+/// The index is keyed on the term store's UNIQUE variable identity — the
+/// `(name, id)` pair, not the printed name alone. Two distinct variables that
+/// happen to print the same would otherwise collapse onto one `(m i)`, and the
+/// emitted `original` would no longer be a faithful subset of the query's
+/// atoms.
+fn render_int(terms: &TermStore, term: TermId, vars: &mut Vec<(String, u32)>) -> Option<String> {
     match terms.get(term) {
         TermData::Const(ay_core::Constant::Int(v)) => Some(format!("({v} : Int)")),
-        TermData::Var(name, _) => {
-            let idx = vars.iter().position(|v| v == name).unwrap_or_else(|| {
-                vars.push(name.clone());
+        TermData::Var(name, id) => {
+            let key = (name.clone(), *id);
+            let idx = vars.iter().position(|v| *v == key).unwrap_or_else(|| {
+                vars.push(key);
                 vars.len() - 1
             });
             Some(format!("(m {idx})"))
@@ -10728,6 +12404,7 @@ pub(crate) fn emit_array_defexpanded_firewall_lean_from_parsed(
         return None;
     }
     emit_array_nested_store_row_firewall_lean_from_parsed(&expanded)
+        .or_else(|| emit_array_store_commute_firewall_lean_from_parsed(&expanded))
         .or_else(|| emit_array_inlined_nested_store_firewall_lean_from_parsed(&expanded))
         .or_else(|| emit_array_row1_firewall_lean_from_parsed(&expanded))
         .or_else(|| emit_array_row_mismatch_firewall_lean_from_parsed(&expanded))
@@ -10785,6 +12462,441 @@ end AySoundness.Emitted.ArrRowMismatch_{hash}
     )
 }
 
+/// View a term as a `(store base idx val)` application.
+fn as_store_app(t: &PTerm) -> Option<(&PTerm, &PTerm, &PTerm)> {
+    match t {
+        PTerm::App(op, args) if op == "store" && args.len() == 3 => {
+            Some((&args[0], &args[1], &args[2]))
+        }
+        _ => None,
+    }
+}
+
+/// View a term as a `(select base idx)` application.
+fn as_select_app(t: &PTerm) -> Option<(&PTerm, &PTerm)> {
+    match t {
+        PTerm::App(op, args) if op == "select" && args.len() == 2 => Some((&args[0], &args[1])),
+        _ => None,
+    }
+}
+
+/// Recognize a WRITE-BACK IDENTITY store-chain over a single named base array
+/// `a`: `store (store … (store a k₁ (select a k₁)) …) kₙ (select a kₙ)`. Every
+/// store level writes back the base array's OWN value at that index
+/// (`(select a kᵢ)` with the select base = the chain's base and the select index
+/// = the store index), so the whole chain equals `a` pointwise. Returns
+/// `(base_name, index_names)` with the index names OUTER-first, or `None` if the
+/// term is not a pure write-back chain over one base with distinct index names.
+fn array_writeback_chain(t: &PTerm) -> Option<(String, Vec<String>)> {
+    match t {
+        PTerm::Symbol(s) => Some((s.clone(), Vec::new())),
+        PTerm::App(f, args) if args.is_empty() => Some((f.clone(), Vec::new())),
+        _ => {
+            let (inner, idx, val) = as_store_app(t)?;
+            let idx_name = nested_scalar_name(idx)?;
+            // val must be `(select <sb> <sidx>)` with sidx == this store index.
+            let (sb, sidx) = as_select_app(val)?;
+            if nested_scalar_name(sidx)? != idx_name {
+                return None;
+            }
+            let sb_name = nested_scalar_name(sb)?;
+            let (base, mut inner_idxs) = array_writeback_chain(inner)?;
+            // The written-back value must reference the CHAIN BASE, not an
+            // intermediate array — that is exactly the write-back identity.
+            if sb_name != base {
+                return None;
+            }
+            let mut idxs = vec![idx_name];
+            idxs.append(&mut inner_idxs);
+            Some((base, idxs))
+        }
+    }
+}
+
+/// Emit a verified-firewall Lean proof for an array WRITE-BACK IDENTITY CHAIN
+/// conflict: `(not (= CHAIN a))` where `CHAIN` is `store (store … (store a k₁
+/// (select a k₁)) …) kₙ (select a kₙ)` — every level writes the base array's own
+/// value back at its index, so `CHAIN = a` in EVERY model, contradicting the
+/// asserted `CHAIN ≠ a`. This is the store-forwarding chain that ay's frontend
+/// hides behind nullary `define-fun` macros (`storeinv_sf_chain`): expanding the
+/// macros exposes the chain, which ay refutes eagerly (bare trust) with no array
+/// theory-lemma clause to ground.
+///
+/// Grounding: the standard functional array model `(Nat → Nat) × (Nat → Nat)`
+/// (base array × scalar valuation); `store` inlines to nested `if`-updates and
+/// the write-back identity `store a k (select a k) = a` is discharged by
+/// `funext` + `by_cases` on each index (the same content as
+/// `AySoundness.ArrayThy.ext_nonvacuous`), composed through the verified
+/// `firewall_combined_unsat`. The array-equality atom uses
+/// `Classical.propDecidable` (so `atomVal` is `noncomputable`); axioms of the
+/// emitted `no_model` are ⊆ {propext, Classical.choice, Quot.sound}.
+///
+/// Fail-closed: declines unless some assertion is `(not (= CHAIN a))` /
+/// `(not (= a CHAIN))` with `CHAIN` a non-empty write-back chain over the base
+/// symbol `a` and DISTINCT store-index names. No verdict/clause change on decline.
+pub(crate) fn emit_array_writeback_chain_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    defs: &[(String, PTerm)],
+) -> Option<String> {
+    let expanded: Vec<PTerm> = parsed
+        .iter()
+        .map(|a| expand_nullary_defs(a, defs))
+        .collect();
+    let inlined = inline_array_store_defs(&expanded);
+    for asrt in &inlined {
+        let PTerm::App(op, args) = asrt else { continue };
+        if op != "not" || args.len() != 1 {
+            continue;
+        }
+        let PTerm::App(eq, ea) = &args[0] else {
+            continue;
+        };
+        if eq != "=" || ea.len() != 2 {
+            continue;
+        }
+        for (chain_t, base_t) in [(&ea[0], &ea[1]), (&ea[1], &ea[0])] {
+            let Some((base, idxs)) = array_writeback_chain(chain_t) else {
+                continue;
+            };
+            if idxs.is_empty() {
+                continue; // `(not (= a a))` — not a write-back chain.
+            }
+            // The other side must be exactly the base array symbol.
+            if nested_scalar_name(base_t).as_deref() != Some(base.as_str()) {
+                continue;
+            }
+            // Distinct store-index names keep the per-level `by_cases` guards
+            // syntactically independent.
+            let mut seen = std::collections::HashSet::new();
+            if !idxs.iter().all(|n| seen.insert(n.clone())) {
+                continue;
+            }
+            return Some(render_array_writeback_chain_lean(
+                idxs.len(),
+                fnv_hex(&format!("writeback:{asrt:?}")),
+            ));
+        }
+    }
+    None
+}
+
+/// Render the write-back-identity-chain firewall Lean for `n` store levels
+/// (valuation indices `0..n-1`, OUTER→INNER). The nested `if`-update tree and its
+/// `funext`+`by_cases` discharge are generated from `n`; the model components are
+/// opaque, so only `n` and the namespace hash vary.
+fn render_array_writeback_chain_lean(n: usize, hash: String) -> String {
+    // Nested `if`-update tree: outermost level 0 first, bottoming at `m.1 x`.
+    fn nested_if(k: usize, n: usize) -> String {
+        if k == n {
+            "m.1 x".to_string()
+        } else {
+            format!(
+                "(if x = (m.2 {k}) then m.1 (m.2 {k}) else {})",
+                nested_if(k + 1, n)
+            )
+        }
+    }
+    // `by_cases` cascade; the returned first line carries NO leading indent (the
+    // caller / parent bullet supplies it), subsequent lines use `indent`.
+    fn cases(k: usize, n: usize, indent: usize) -> String {
+        let sp = " ".repeat(indent);
+        let li = k - 1;
+        let then_hint = if k == 1 {
+            String::new()
+        } else {
+            let hs: Vec<String> = (1..k).map(|i| format!("h{i}")).collect();
+            format!(" [{}]", hs.join(", "))
+        };
+        let then_line = format!("{sp}· subst h{k}; simp{then_hint}");
+        let else_line = if k == n {
+            let hs: Vec<String> = (1..=n).map(|i| format!("h{i}")).collect();
+            format!("{sp}· simp [{}]", hs.join(", "))
+        } else {
+            format!("{sp}· {}", cases(k + 1, n, indent + 2))
+        };
+        format!("by_cases h{k} : x = (m.2 {li})\n{then_line}\n{else_line}")
+    }
+    let bigif = nested_if(0, n);
+    let proof_tree = format!("    {}", cases(1, n, 4));
+    format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — array WRITE-BACK IDENTITY CHAIN,
+  grounded in the verified `firewall_combined_unsat`. The assertion
+  `store (store … (store a k1 (select a k1)) …) kn (select a kn) ≠ a` is
+  unsatisfiable: writing back the base array's own value at each index leaves the
+  array unchanged, so the chain equals `a` in every model (McCarthy read-over-
+  write; the same content as `AySoundness.ArrayThy.ext_nonvacuous`). ay hides the
+  chain behind nullary `define-fun` macros and refutes arrays eagerly (bare
+  trust), so it is reconstructed from the (macro-expanded) frontend assertions.
+  Model: `(Nat -> Nat) x (Nat -> Nat)` = base array x scalar valuation; `store`
+  is an `if`-update; the pointwise identity is closed by `funext` + `by_cases`.
+  The array-equality atom uses `Classical.propDecidable` (so `atomVal` is
+  `noncomputable`); axioms of `no_model` are propext / Classical.choice /
+  Quot.sound.
+-/
+namespace AySoundness.Emitted.ArrWriteBack_{hash}
+open AySoundness
+
+attribute [local instance] Classical.propDecidable
+
+abbrev Val := (Nat -> Nat) × (Nat -> Nat)
+
+-- atom 1 = (write-back chain = a); each level `store _ k (select a k)` is an
+-- `if x = k then a k else …` update, so the whole tree collapses to `a x`.
+noncomputable def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide ((fun x => {bigif}) = m.1)
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [-1])]
+def lemmas   : List (Cid × Clause) := [(2, [1])]
+def proof    : List (Cid × Clause × List Int) := [(3, [], [1, 2])]
+
+theorem writeback_lemma_valid (m : Val) : clauseSat (atomVal m) [1] = true := by
+  have heq : (fun x => {bigif}) = m.1 := by
+    funext x
+{proof_tree}
+  simp [clauseSat, litSat, atomVal, heq]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact writeback_lemma_valid m
+
+/-- The write-back chain differs from `a` in NO model — via the verified firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.ArrWriteBack_{hash}
+"#,
+    )
+}
+
+/// Emit a verified-firewall Lean proof for a single-index array STORE-INVERSE
+/// (cross-swap) conflict: `(= (store P i (select Q i)) (store Q i (select P i)))`
+/// together with `(not (= P Q))`. Equating the two swapped stores forces `P = Q`
+/// pointwise — at `i`, `P i = Q i` (the swapped values), and off `i`, `Q j = P j`
+/// (the swapped bases) — contradicting `P ≠ Q`. This is `storeinv_cross_1idx`;
+/// ay refutes it eagerly with no array theory-lemma clause to ground.
+///
+/// Grounding: the standard functional model (arrays `Nat → Nat`); `store` inlines
+/// to `if`-updates and the disjunctive theory-lemma clause `¬(v0 = v1) ∨ (P = Q)`
+/// is discharged by `by_cases` on `P = Q` — the false branch derives `P = Q` from
+/// `v0 = v1` by `funext` + `by_cases` on `j = i` (the array `ext` axiom), a
+/// contradiction. Composed through the verified `firewall_combined_unsat`; both
+/// array-equality atoms use `Classical.propDecidable` (so `atomVal` is
+/// `noncomputable`); axioms of `no_model` ⊆ {propext, Classical.choice,
+/// Quot.sound}.
+///
+/// Fail-closed: declines unless some assertion equates a genuine `i`-swap of two
+/// DISTINCT base arrays `P`, `Q` and a matching `(not (= P Q))` is present. No
+/// verdict/clause change on decline.
+pub(crate) fn emit_array_storeinv_swap_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    defs: &[(String, PTerm)],
+) -> Option<String> {
+    // Substitutable array bindings: nullary `define-fun` macros (`defs`) PLUS
+    // asserted array-lets `(= v (store …))`. Unlike `inline_array_store_defs`,
+    // this keeps a `(= v0 v1)` CONSTRAINT between two let-vars (it is not a
+    // binding) and expands BOTH sides — exactly the store-inverse swap equality.
+    let mut binds: Vec<(String, PTerm)> = defs.to_vec();
+    for asrt in parsed {
+        if let PTerm::App(op, args) = asrt {
+            if op == "=" && args.len() == 2 {
+                for (a, b) in [(&args[0], &args[1]), (&args[1], &args[0])] {
+                    if let PTerm::Symbol(s) = a {
+                        if matches!(b, PTerm::App(o, ba) if o == "store" && ba.len() == 3)
+                            && !binds.iter().any(|(n, _)| n == s)
+                        {
+                            binds.push((s.clone(), b.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // A pure binding assertion `(= v STORE)` / `(= STORE v)` is dropped; every
+    // other assertion is macro/let-expanded to a fixpoint.
+    let is_binding = |asrt: &PTerm| -> bool {
+        matches!(asrt, PTerm::App(op, args) if op == "=" && args.len() == 2
+            && [(&args[0], &args[1]), (&args[1], &args[0])].iter().any(|(a, b)|
+                matches!(a, PTerm::Symbol(s) if binds.iter().any(|(n, _)| n == s))
+                    && matches!(b, PTerm::App(o, ba) if o == "store" && ba.len() == 3)))
+    };
+    let inlined: Vec<PTerm> = parsed
+        .iter()
+        .filter(|a| !is_binding(a))
+        .map(|a| expand_nullary_defs(a, &binds))
+        .collect();
+    // Collect asserted array disequalities `(not (= X Y))` as unordered name pairs.
+    let diseqs: Vec<(String, String)> = inlined
+        .iter()
+        .filter_map(|asrt| {
+            let PTerm::App(op, args) = asrt else {
+                return None;
+            };
+            if op != "not" || args.len() != 1 {
+                return None;
+            }
+            let PTerm::App(eq, ea) = &args[0] else {
+                return None;
+            };
+            if eq != "=" || ea.len() != 2 {
+                return None;
+            }
+            Some((nested_scalar_name(&ea[0])?, nested_scalar_name(&ea[1])?))
+        })
+        .collect();
+    let backed = |p: &str, q: &str| {
+        diseqs
+            .iter()
+            .any(|(x, y)| (x == p && y == q) || (x == q && y == p))
+    };
+    for asrt in &inlined {
+        let PTerm::App(op, args) = asrt else { continue };
+        if op != "=" || args.len() != 2 {
+            continue;
+        }
+        // args[0] = store(P, i, (select Q i)); args[1] = store(Q, i, (select P i)).
+        let (Some((b0, i0, v0)), Some((b1, i1, v1))) =
+            (as_store_app(&args[0]), as_store_app(&args[1]))
+        else {
+            continue;
+        };
+        let (Some(i0n), Some(i1n)) = (nested_scalar_name(i0), nested_scalar_name(i1)) else {
+            continue;
+        };
+        if i0n != i1n {
+            continue; // both stores must write the SAME index.
+        }
+        let (Some((sb0, si0)), Some((sb1, si1))) = (as_select_app(v0), as_select_app(v1)) else {
+            continue;
+        };
+        // Each written value reads the OTHER base at the same index `i`.
+        if nested_scalar_name(si0).as_deref() != Some(i0n.as_str())
+            || nested_scalar_name(si1).as_deref() != Some(i0n.as_str())
+        {
+            continue;
+        }
+        let (Some(p), Some(q)) = (nested_scalar_name(b0), nested_scalar_name(b1)) else {
+            continue;
+        };
+        let (Some(vp), Some(vq)) = (nested_scalar_name(sb0), nested_scalar_name(sb1)) else {
+            continue;
+        };
+        // Bases swapped: store P writes Q's value, store Q writes P's value.
+        if p == q || vp != q || vq != p {
+            continue;
+        }
+        if !backed(&p, &q) {
+            continue; // the `P ≠ Q` premise must be asserted.
+        }
+        return Some(render_array_storeinv_swap_lean(fnv_hex(&format!(
+            "storeinv1:{asrt:?}"
+        ))));
+    }
+    None
+}
+
+/// Render the single-index store-inverse (cross-swap) firewall Lean. The model
+/// (`a1`, `a2`, `i`) is fully opaque, so the body is a constant template up to the
+/// namespace hash.
+fn render_array_storeinv_swap_lean(hash: String) -> String {
+    format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — single-index array STORE-INVERSE
+  (cross-swap), grounded in the verified `firewall_combined_unsat`. The
+  assertions `store a2 i (select a1 i) = store a1 i (select a2 i)` and `a1 ≠ a2`
+  are unsatisfiable: equating the two index-`i` swaps forces `a1 = a2` pointwise
+  (at `i`: `a1 i = a2 i`; off `i`: `a1 j = a2 j`) by the array extensionality
+  axiom, contradicting `a1 ≠ a2`. ay refutes arrays eagerly (bare trust), so the
+  conflict is reconstructed from the frontend assertions. Model: arrays as
+  `Nat -> Nat`; `store` is an `if`-update; the disjunctive theory lemma
+  `¬(v0 = v1) ∨ (a1 = a2)` is discharged by `by_cases` + `funext`. Equality atoms
+  use `Classical.propDecidable` (so `atomVal` is `noncomputable`); axioms of
+  `no_model` are propext / Classical.choice / Quot.sound.
+-/
+namespace AySoundness.Emitted.ArrStoreInv1_{hash}
+open AySoundness
+
+attribute [local instance] Classical.propDecidable
+
+structure Val where
+  a1 : Nat -> Nat
+  a2 : Nat -> Nat
+  i : Nat
+
+-- atom 1 = (store a2 i (select a1 i) = store a1 i (select a2 i)); atom 2 = (a1 = a2).
+noncomputable def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide ((fun x => if x = m.i then m.a1 m.i else m.a2 x)
+                   = (fun x => if x = m.i then m.a2 m.i else m.a1 x))
+  | 2 => decide (m.a1 = m.a2)
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1]), (2, [-2])]
+def lemmas   : List (Cid × Clause) := [(3, [-1, 2])]
+def proof    : List (Cid × Clause × List Int) := [(4, [], [1, 2, 3])]
+
+theorem storeinv_lemma_valid (m : Val) : clauseSat (atomVal m) [-1, 2] = true := by
+  by_cases h : m.a1 = m.a2
+  · simp [clauseSat, litSat, atomVal, h]
+  · have hne : ¬ ((fun x => if x = m.i then m.a1 m.i else m.a2 x)
+                    = (fun x => if x = m.i then m.a2 m.i else m.a1 x)) := by
+      intro heq
+      apply h
+      funext x
+      have hx := congrFun heq x
+      by_cases hxi : x = m.i
+      · subst hxi; simpa using hx
+      · simp [hxi] at hx; exact hx.symm
+    simp [clauseSat, litSat, atomVal, hne]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact storeinv_lemma_valid m
+
+/-- The single-index store-inverse with `a1 ≠ a2` has NO model — via the firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.ArrStoreInv1_{hash}
+"#,
+    )
+}
+
+/// Names of nullary `define-fun` macros whose body is a `store` (array-valued),
+/// used to gate the LINEAR-INTEGER firewall OFF array-typed macros: a
+/// disequality between such array macros (e.g. `storeinv_sf_chain`'s
+/// `(not (= a2 a))`) is NOT an integer atom and must not be reconstructed as one.
+fn array_valued_def_names(defs: &[(String, PTerm)]) -> std::collections::HashSet<String> {
+    defs.iter()
+        .filter(|(_, body)| matches!(body, PTerm::App(op, a) if op == "store" && a.len() == 3))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Whether a parsed term mentions any name in `syms` (as a symbol leaf or a
+/// nullary/compound application head).
+fn term_mentions_name(t: &PTerm, syms: &std::collections::HashSet<String>) -> bool {
+    match t {
+        PTerm::Symbol(s) => syms.contains(s),
+        PTerm::App(f, args) => syms.contains(f) || args.iter().any(|a| term_mentions_name(a, syms)),
+        _ => false,
+    }
+}
+
 // ==== APPENDED BUCKET: b_lia.rs ====
 /// Render a parsed LINEAR integer term to a Lean `Int` expression over the model
 /// `Val := Nat → Int`, assigning each distinct variable a stable index `(m i)`.
@@ -10792,21 +12904,29 @@ end AySoundness.Emitted.ArrRowMismatch_{hash}
 /// (linearity — a `var*var` product returns `None`), and Euclidean `mod`/`div` by
 /// a constant divisor (rendered `Int.emod`/`Int.ediv`, which `omega` supports).
 /// Returns `(expr, references_var)`; `None` on any non-linear or unsupported shape.
-fn render_int_lia_parsed(t: &PTerm, vars: &mut Vec<String>) -> Option<(String, bool)> {
+fn render_int_lia_parsed(
+    t: &PTerm,
+    vars: &mut Vec<String>,
+    context: &ay_frontend::Context,
+) -> Option<(String, bool)> {
     match t {
         PTerm::Symbol(v) => {
+            if cbr_is_int_constant(context, v) {
+                let idx = vars.iter().position(|x| x == v).unwrap_or_else(|| {
+                    vars.push(v.clone());
+                    vars.len() - 1
+                });
+                return Some((format!("(m {idx})"), true));
+            }
             // SMT-LIB numerals are non-negative, so a negative literal such as
             // `-1` in `(* -1 v0)` reaches the parser as a SYMBOL. Treat any
-            // symbol whose text is an integer as a constant (matches ay's own
-            // lenient elaboration), never a free variable.
-            if let Ok(val) = v.parse::<i64>() {
+            // undeclared symbol whose text is an integer as a constant (matches
+            // ay's own lenient elaboration). A declaration wins first: `|-1|`
+            // may legally name an Int/Real constant or a function.
+            if let Some(val) = firewall_undeclared_i64_symbol_literal(context, v) {
                 return Some((format!("({val} : Int)"), false));
             }
-            let idx = vars.iter().position(|x| x == v).unwrap_or_else(|| {
-                vars.push(v.clone());
-                vars.len() - 1
-            });
-            Some((format!("(m {idx})"), true))
+            None
         }
         PTerm::Const(PConst::Numeral(n)) => {
             let val: i64 = n.parse().ok()?;
@@ -10817,40 +12937,40 @@ fn render_int_lia_parsed(t: &PTerm, vars: &mut Vec<String>) -> Option<(String, b
                 let mut parts = Vec::with_capacity(k);
                 let mut refs = false;
                 for a in args {
-                    let (e, r) = render_int_lia_parsed(a, vars)?;
+                    let (e, r) = render_int_lia_parsed(a, vars, context)?;
                     parts.push(e);
                     refs |= r;
                 }
                 Some((format!("({})", parts.join(" + ")), refs))
             }
             ("-", 2) => {
-                let (a, ar) = render_int_lia_parsed(&args[0], vars)?;
-                let (b, br) = render_int_lia_parsed(&args[1], vars)?;
+                let (a, ar) = render_int_lia_parsed(&args[0], vars, context)?;
+                let (b, br) = render_int_lia_parsed(&args[1], vars, context)?;
                 Some((format!("({a} - {b})"), ar || br))
             }
             ("-", 1) => {
-                let (a, ar) = render_int_lia_parsed(&args[0], vars)?;
+                let (a, ar) = render_int_lia_parsed(&args[0], vars, context)?;
                 Some((format!("(- {a})"), ar))
             }
             ("*", 2) => {
-                let (a, ar) = render_int_lia_parsed(&args[0], vars)?;
-                let (b, br) = render_int_lia_parsed(&args[1], vars)?;
+                let (a, ar) = render_int_lia_parsed(&args[0], vars, context)?;
+                let (b, br) = render_int_lia_parsed(&args[1], vars, context)?;
                 if ar && br {
                     return None; // nonlinear var*var — omega cannot discharge
                 }
                 Some((format!("({a} * {b})"), ar || br))
             }
             ("mod", 2) => {
-                let (a, ar) = render_int_lia_parsed(&args[0], vars)?;
-                let (b, br) = render_int_lia_parsed(&args[1], vars)?;
+                let (a, ar) = render_int_lia_parsed(&args[0], vars, context)?;
+                let (b, br) = render_int_lia_parsed(&args[1], vars, context)?;
                 if br {
                     return None; // non-constant modulus — omega supports literals only
                 }
                 Some((format!("(Int.emod {a} {b})"), ar))
             }
             ("div", 2) => {
-                let (a, ar) = render_int_lia_parsed(&args[0], vars)?;
-                let (b, br) = render_int_lia_parsed(&args[1], vars)?;
+                let (a, ar) = render_int_lia_parsed(&args[0], vars, context)?;
+                let (b, br) = render_int_lia_parsed(&args[1], vars, context)?;
                 if br {
                     return None; // non-constant divisor — omega supports literals only
                 }
@@ -10865,7 +12985,11 @@ fn render_int_lia_parsed(t: &PTerm, vars: &mut Vec<String>) -> Option<(String, b
 /// Render a parsed arithmetic comparison `(op lhs rhs)` — `op ∈ {<=,>=,<,>,=}` —
 /// to a Lean `Prop` over the `Val := Nat → Int` model. Returns `None` for any
 /// non-comparison head, wrong arity, or non-linear side.
-fn lia_comparison_atom(t: &PTerm, vars: &mut Vec<String>) -> Option<String> {
+fn lia_comparison_atom(
+    t: &PTerm,
+    vars: &mut Vec<String>,
+    context: &ay_frontend::Context,
+) -> Option<String> {
     let PTerm::App(op, args) = t else {
         return None;
     };
@@ -10880,8 +13004,8 @@ fn lia_comparison_atom(t: &PTerm, vars: &mut Vec<String>) -> Option<String> {
         "=" => "=",
         _ => return None,
     };
-    let (l, _) = render_int_lia_parsed(&args[0], vars)?;
-    let (r, _) = render_int_lia_parsed(&args[1], vars)?;
+    let (l, _) = render_int_lia_parsed(&args[0], vars, context)?;
+    let (r, _) = render_int_lia_parsed(&args[1], vars, context)?;
     Some(format!("{l} {lean_op} {r}"))
 }
 
@@ -10895,8 +13019,10 @@ fn lia_comparison_atom(t: &PTerm, vars: &mut Vec<String>) -> Option<String> {
 /// Recognizer (fail-closed): each assertion must be a linear comparison
 /// (`<=,>=,<,>,=` over `+`, binary/unary `-`, `const*var`, `mod`/`div` by a
 /// constant), a negated such comparison, or a `distinct` (expanded to pairwise
-/// `≠`). Any `var*var` product, non-arithmetic atom, or `or`/`ite`/`and`
-/// propositional structure returns `None`.
+/// `≠`). Every surface variable must resolve uniquely in `context` as a nullary
+/// Int declaration. Any Real/ambiguous/missing variable, `var*var` product,
+/// non-arithmetic atom, or `or`/`ite`/`and` propositional structure returns
+/// `None`.
 ///
 /// Render: each atom is asserted POSITIVELY (`original`); the single all-negated
 /// blocking clause is the `lemmas`; the RUP `proof` resolves to empty. The
@@ -10905,21 +13031,38 @@ fn lia_comparison_atom(t: &PTerm, vars: &mut Vec<String>) -> Option<String> {
 /// `by_cases <;> … <;> omega` of `render_lia_lean`, which explodes on the
 /// ~30-atom ring files. Runtime counterpart of the worked instance
 /// `FirewallExample.no_x_gt5_lt3`; axioms ⊆ {propext, Quot.sound}.
-pub(crate) fn emit_lia_firewall_lean_from_parsed(parsed: &[PTerm]) -> Option<String> {
+///
+/// `defs` are the nullary `define-fun` bodies: any assertion mentioning an
+/// ARRAY-valued (`store`-bodied) macro is NOT a linear-integer atom, so the whole
+/// reconstruction declines — otherwise an array disequality like
+/// `storeinv_sf_chain`'s `(not (= a2 a))` is mis-modeled as two fresh integer
+/// vars and yields an `omega`-unclosable (fail-lake) artifact.
+pub(crate) fn emit_lia_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    defs: &[(String, PTerm)],
+    context: &ay_frontend::Context,
+) -> Option<String> {
+    // Gate OFF array-typed `define-fun` macros: their (dis)equalities are array,
+    // not integer, atoms — reconstructing them as LIA is unsound-looking and
+    // fails the kernel check. The array firewalls handle these shapes instead.
+    let array_defs = array_valued_def_names(defs);
+    if !array_defs.is_empty() && parsed.iter().any(|a| term_mentions_name(a, &array_defs)) {
+        return None;
+    }
     let mut vars: Vec<String> = Vec::new();
     let mut atoms: Vec<String> = Vec::new();
     for asrt in parsed {
         match asrt {
             // (not <comparison>) → the negated comparison as a single atom.
             PTerm::App(op, args) if op == "not" && args.len() == 1 => {
-                let inner = lia_comparison_atom(&args[0], &mut vars)?;
+                let inner = lia_comparison_atom(&args[0], &mut vars, context)?;
                 atoms.push(format!("¬ ({inner})"));
             }
             // (distinct t1 t2 …) → pairwise `ti ≠ tj`, each a positive atom.
             PTerm::App(op, args) if op == "distinct" && args.len() >= 2 => {
                 let rendered: Vec<String> = args
                     .iter()
-                    .map(|a| render_int_lia_parsed(a, &mut vars).map(|(e, _)| e))
+                    .map(|a| render_int_lia_parsed(a, &mut vars, context).map(|(expr, _)| expr))
                     .collect::<Option<Vec<_>>>()?;
                 for i in 0..rendered.len() {
                     for j in (i + 1)..rendered.len() {
@@ -10929,7 +13072,7 @@ pub(crate) fn emit_lia_firewall_lean_from_parsed(parsed: &[PTerm]) -> Option<Str
             }
             // Any other assertion must be a bare linear comparison.
             other => {
-                atoms.push(lia_comparison_atom(other, &mut vars)?);
+                atoms.push(lia_comparison_atom(other, &mut vars, context)?);
             }
         }
     }
@@ -10947,6 +13090,17 @@ pub(crate) fn emit_lia_firewall_lean_from_parsed(parsed: &[PTerm]) -> Option<Str
 /// hypotheses keeps the proof axiom-clean — `omega` on a *disjunction* goal would
 /// otherwise pull in `Classical.choice`.
 fn lia_cascade_term(atoms: &[String]) -> String {
+    cascade_term_with_closer(atoms, "omega")
+}
+
+/// `lia_cascade_term` with the bottom-of-cascade tactic script made explicit.
+/// The NIA-product emitter reuses the identical cascade but first introduces the
+/// verified McCormick bridge facts (`closer` = `have … ; have … ; omega`), which
+/// is what lets `omega` see a LINEAR relation between the atomised product term
+/// and its two factors. `closer` must be a single-line tactic script: it is
+/// spliced inside `(show False by …)` on one line, so no indentation-sensitive
+/// multi-line block can be introduced here.
+fn cascade_term_with_closer(atoms: &[String], closer: &str) -> String {
     let n = atoms.len();
     fn disjunct(i: usize, n: usize) -> String {
         let inner = if i < n {
@@ -10964,10 +13118,10 @@ fn lia_cascade_term(atoms: &[String]) -> String {
         }
         s
     }
-    fn build(k: usize, n: usize, atoms: &[String]) -> String {
+    fn build(k: usize, n: usize, atoms: &[String], closer: &str) -> String {
         if k == n {
             format!(
-                "if h{k} : {a} then (show False by omega).elim else {d}",
+                "if h{k} : {a} then (show False by {closer}).elim else {d}",
                 a = atoms[k - 1],
                 d = disjunct(k, n)
             )
@@ -10975,12 +13129,12 @@ fn lia_cascade_term(atoms: &[String]) -> String {
             format!(
                 "if h{k} : {a} then\n  {rest}\nelse {d}",
                 a = atoms[k - 1],
-                rest = build(k + 1, n, atoms),
+                rest = build(k + 1, n, atoms, closer),
                 d = disjunct(k, n)
             )
         }
     }
-    build(1, n, atoms)
+    build(1, n, atoms, closer)
 }
 
 /// Render the `firewall_combined_unsat`-grounded Lean for a linear-integer
@@ -11010,6 +13164,12 @@ fn render_lia_lean_from_parsed(atoms: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     let cascade = lia_cascade_term(atoms);
+    // Stack-depth guard only: the cascade term nests one `if … then … else` per
+    // atom, so a several-hundred-atom reconstruction outruns Lean's 512-frame
+    // default long before it outruns the (deliberately unchanged) heartbeat
+    // budget. Raising it keeps the CONSTRUCTIVE cascade — axioms ⊆ {propext,
+    // Quot.sound} — rather than falling back to a classical tactic.
+    let rec_depth = scaled_max_rec_depth(n);
     format!(
         r#"import AySoundness.Firewall
 /-
@@ -11024,6 +13184,7 @@ fn render_lia_lean_from_parsed(atoms: &[String]) -> String {
   axioms ⊆ {{propext, Quot.sound}}.
 -/
 set_option linter.unusedSimpArgs false
+set_option maxRecDepth {rec_depth}
 
 namespace AySoundness.Emitted.Lia_{hash}
 open AySoundness
@@ -11077,30 +13238,18 @@ struct EufLiaLin {
     konst: i64,
 }
 
-/// `a + sign*b` (coefficient-wise), preserving determinism (sorted keys).
-fn euf_lia_lin_add(a: &EufLiaLin, b: &EufLiaLin, sign: i64) -> EufLiaLin {
-    let mut coeffs = a.coeffs.clone();
-    for (v, &c) in &b.coeffs {
-        let e = coeffs.entry(v.clone()).or_insert(0);
-        *e += sign * c;
-    }
-    coeffs.retain(|_, &mut c| c != 0);
-    EufLiaLin {
-        coeffs,
-        konst: a.konst + sign * b.konst,
-    }
-}
-
-/// `s*a` (coefficient-wise).
-fn euf_lia_lin_scale(a: &EufLiaLin, s: i64) -> EufLiaLin {
-    let mut coeffs = a.coeffs.clone();
-    for c in coeffs.values_mut() {
-        *c *= s;
-    }
-    coeffs.retain(|_, &mut c| c != 0);
-    EufLiaLin {
-        coeffs,
-        konst: a.konst * s,
+/// Parse the frontend's two integer-literal representations.
+///
+/// Ordinary SMT-LIB numerals arrive as `Numeral`; ay's lenient elaboration can
+/// also preserve an *undeclared* signed literal such as `-1` as a numeric-text
+/// `Symbol`. A declared numeric-looking surface name is not a literal: quoted
+/// `|-1|` is a legal constant/function name and declaration resolution precedes
+/// ay's lenient signed-literal fallback.
+fn euf_lia_i64_literal(t: &PTerm, context: &ay_frontend::Context) -> Option<i64> {
+    match t {
+        PTerm::Const(PConst::Numeral(n)) => n.parse::<i64>().ok(),
+        PTerm::Symbol(n) => firewall_undeclared_i64_symbol_literal(context, n),
+        _ => None,
     }
 }
 
@@ -11109,14 +13258,18 @@ fn euf_lia_lin_scale(a: &EufLiaLin, s: i64) -> EufLiaLin {
 /// an uninterpreted application — the latter forces UF-value classification /
 /// decline). This is the linearity + Int gate: `omega` (Lean core) discharges
 /// only Int, so declining here keeps QF_UFLRA / nonlinear fail-closed.
-fn euf_lia_lin_of(t: &PTerm) -> Option<EufLiaLin> {
+fn euf_lia_lin_of(t: &PTerm, context: &ay_frontend::Context) -> Option<EufLiaLin> {
     use std::collections::BTreeMap;
     match t {
-        PTerm::Symbol(v) => {
+        PTerm::Symbol(v) if cbr_is_int_constant(context, v) => {
             let mut coeffs = BTreeMap::new();
             coeffs.insert(v.clone(), 1i64);
             Some(EufLiaLin { coeffs, konst: 0 })
         }
+        PTerm::Symbol(v) => Some(EufLiaLin {
+            coeffs: BTreeMap::new(),
+            konst: firewall_undeclared_i64_symbol_literal(context, v)?,
+        }),
         PTerm::Const(PConst::Numeral(n)) => Some(EufLiaLin {
             coeffs: BTreeMap::new(),
             konst: n.parse::<i64>().ok()?,
@@ -11128,15 +13281,15 @@ fn euf_lia_lin_of(t: &PTerm) -> Option<EufLiaLin> {
                     konst: 0,
                 };
                 for a in args {
-                    acc = euf_lia_lin_add(&acc, &euf_lia_lin_of(a)?, 1);
+                    acc = firewall_lin_add_checked(&acc, &euf_lia_lin_of(a, context)?, 1)?;
                 }
                 Some(acc)
             }
-            ("-", 1) => Some(euf_lia_lin_scale(&euf_lia_lin_of(&args[0])?, -1)),
+            ("-", 1) => firewall_lin_scale_checked(&euf_lia_lin_of(&args[0], context)?, -1),
             ("-", n) if n >= 2 => {
-                let mut acc = euf_lia_lin_of(&args[0])?;
+                let mut acc = euf_lia_lin_of(&args[0], context)?;
                 for a in &args[1..] {
-                    acc = euf_lia_lin_add(&acc, &euf_lia_lin_of(a)?, -1);
+                    acc = firewall_lin_add_checked(&acc, &euf_lia_lin_of(a, context)?, -1)?;
                 }
                 Some(acc)
             }
@@ -11146,11 +13299,11 @@ fn euf_lia_lin_of(t: &PTerm) -> Option<EufLiaLin> {
                     konst: 1,
                 };
                 for a in args {
-                    let l = euf_lia_lin_of(a)?;
+                    let l = euf_lia_lin_of(a, context)?;
                     if acc.coeffs.is_empty() {
-                        acc = euf_lia_lin_scale(&l, acc.konst);
+                        acc = firewall_lin_scale_checked(&l, acc.konst)?;
                     } else if l.coeffs.is_empty() {
-                        acc = euf_lia_lin_scale(&acc, l.konst);
+                        acc = firewall_lin_scale_checked(&acc, l.konst)?;
                     } else {
                         return None; // nonlinear product of two variable terms
                     }
@@ -11176,25 +13329,40 @@ fn euf_lia_san(s: &str) -> String {
 /// Render a linear-integer frontend term to a Lean `Int` expression over the
 /// `Val` model (`m.x_<san>` per variable, `(n : Int)` per numeral). Mirrors
 /// `euf_lia_lin_of`'s accepted shapes; `None` otherwise.
-fn euf_lia_render_int(t: &PTerm) -> Option<String> {
+fn euf_lia_render_int(t: &PTerm, context: &ay_frontend::Context) -> Option<String> {
     match t {
-        PTerm::Symbol(v) => Some(format!("m.x_{}", euf_lia_san(v))),
+        PTerm::Symbol(v) if cbr_is_int_constant(context, v) => {
+            Some(format!("m.x_{}", euf_lia_san(v)))
+        }
+        PTerm::Symbol(v) => Some(format!(
+            "({} : Int)",
+            firewall_undeclared_i64_symbol_literal(context, v)?
+        )),
         PTerm::Const(PConst::Numeral(n)) => {
             n.parse::<i64>().ok()?;
             Some(format!("({n} : Int)"))
         }
         PTerm::App(op, args) => match (op.as_str(), args.len()) {
             ("+", _) if !args.is_empty() => {
-                let parts: Option<Vec<String>> = args.iter().map(euf_lia_render_int).collect();
+                let parts: Option<Vec<String>> = args
+                    .iter()
+                    .map(|arg| euf_lia_render_int(arg, context))
+                    .collect();
                 Some(format!("({})", parts?.join(" + ")))
             }
-            ("-", 1) => Some(format!("(- {})", euf_lia_render_int(&args[0])?)),
+            ("-", 1) => Some(format!("(- {})", euf_lia_render_int(&args[0], context)?)),
             ("-", n) if n >= 2 => {
-                let parts: Option<Vec<String>> = args.iter().map(euf_lia_render_int).collect();
+                let parts: Option<Vec<String>> = args
+                    .iter()
+                    .map(|arg| euf_lia_render_int(arg, context))
+                    .collect();
                 Some(format!("({})", parts?.join(" - ")))
             }
             ("*", _) if !args.is_empty() => {
-                let parts: Option<Vec<String>> = args.iter().map(euf_lia_render_int).collect();
+                let parts: Option<Vec<String>> = args
+                    .iter()
+                    .map(|arg| euf_lia_render_int(arg, context))
+                    .collect();
                 Some(format!("({})", parts?.join(" * ")))
             }
             _ => None,
@@ -11207,7 +13375,11 @@ fn euf_lia_render_int(t: &PTerm) -> Option<String> {
 /// `head` against an Int numeral on `tail` → `(g, arg, value)`. `g` must not be
 /// an arithmetic operator (those are LIA, not UF). The argument must be a bare
 /// symbol (single application; congruence over compound args is out of scope).
-fn euf_lia_match_uf_value(head: &PTerm, tail: &PTerm) -> Option<(String, String, i64)> {
+fn euf_lia_match_uf_value(
+    head: &PTerm,
+    tail: &PTerm,
+    context: &ay_frontend::Context,
+) -> Option<(String, String, i64)> {
     let PTerm::App(g, gargs) = head else {
         return None;
     };
@@ -11223,10 +13395,10 @@ fn euf_lia_match_uf_value(head: &PTerm, tail: &PTerm) -> Option<(String, String,
     let PTerm::Symbol(arg) = &gargs[0] else {
         return None;
     };
-    let PTerm::Const(PConst::Numeral(n)) = tail else {
+    if !cbr_is_int_constant(context, arg) || !cbr_is_int_unary_function(context, g) {
         return None;
-    };
-    let val = n.parse::<i64>().ok()?;
+    }
+    let val = euf_lia_i64_literal(tail, context)?;
     Some((g.clone(), arg.clone(), val))
 }
 
@@ -11263,10 +13435,12 @@ struct EufLiaAtom {
 ///
 /// Fail-closed: an unrecognized atom, a non-linear/non-Int (Real) shape, a
 /// non-symbol UF argument, or the absence of a genuine congruence-closing
-/// conflict all return `None`. axioms ⊆ {propext, Quot.sound}; NO Mathlib, no new
-/// AySoundness lemma, no `sorry`.
+/// conflict all return `None`. Every surface variable/function must resolve
+/// uniquely in `context` as Int / Int → Int. axioms ⊆ {propext, Quot.sound}; NO
+/// Mathlib, no new AySoundness lemma, no `sorry`.
 pub(crate) fn emit_euf_lia_congruence_firewall_lean_from_parsed(
     parsed: &[PTerm],
+    context: &ay_frontend::Context,
 ) -> Option<String> {
     use std::collections::{BTreeSet, HashMap};
 
@@ -11294,8 +13468,8 @@ pub(crate) fn emit_euf_lia_congruence_firewall_lean_from_parsed(
         };
         // UF value atom: `(= (f x) c)` / `(= c (f x))`.
         if op == "=" && args.len() == 2 {
-            if let Some((g, arg, val)) = euf_lia_match_uf_value(&args[0], &args[1])
-                .or_else(|| euf_lia_match_uf_value(&args[1], &args[0]))
+            if let Some((g, arg, val)) = euf_lia_match_uf_value(&args[0], &args[1], context)
+                .or_else(|| euf_lia_match_uf_value(&args[1], &args[0], context))
             {
                 let prop = format!(
                     "m.f_{} (m.x_{}) = ({} : Int)",
@@ -11322,12 +13496,15 @@ pub(crate) fn emit_euf_lia_congruence_firewall_lean_from_parsed(
         if args.len() != 2 {
             return None;
         }
-        let (la, lb) = (euf_lia_lin_of(&args[0]), euf_lia_lin_of(&args[1]));
+        let (la, lb) = (
+            euf_lia_lin_of(&args[0], context),
+            euf_lia_lin_of(&args[1], context),
+        );
         let (Some(la), Some(lb)) = (la, lb) else {
             return None;
         };
-        let sa = euf_lia_render_int(&args[0])?;
-        let sb = euf_lia_render_int(&args[1])?;
+        let sa = euf_lia_render_int(&args[0], context)?;
+        let sb = euf_lia_render_int(&args[1], context)?;
         for v in la.coeffs.keys().chain(lb.coeffs.keys()) {
             int_vars.insert(v.clone());
         }
@@ -11336,7 +13513,7 @@ pub(crate) fn emit_euf_lia_congruence_firewall_lean_from_parsed(
             cv: positive,
         });
         if positive {
-            let diff = euf_lia_lin_add(&la, &lb, -1);
+            let diff = firewall_lin_add_checked(&la, &lb, -1)?;
             if op == "=" {
                 eq_diffs.push(diff);
             } else {
@@ -11381,17 +13558,7 @@ pub(crate) fn emit_euf_lia_congruence_firewall_lean_from_parsed(
         let (v, &c) = diff.coeffs.iter().next().unwrap();
         let d = diff.konst;
         // c*v + d  (op)  0
-        let (lo, hi): (Option<i64>, Option<i64>) = match (op.as_str(), c) {
-            (">=", 1) => (Some(-d), None),
-            (">=", -1) => (None, Some(d)),
-            (">", 1) => (Some(-d + 1), None),
-            (">", -1) => (None, Some(d - 1)),
-            ("<=", 1) => (None, Some(-d)),
-            ("<=", -1) => (Some(d), None),
-            ("<", 1) => (None, Some(-d - 1)),
-            ("<", -1) => (Some(d + 1), None),
-            _ => (None, None),
-        };
+        let (lo, hi) = cbr_bound_lo_hi(op, c, d)?;
         if let Some(l) = lo {
             let e = lb.entry(v.clone()).or_insert(l);
             if l > *e {
@@ -11431,14 +13598,13 @@ pub(crate) fn emit_euf_lia_congruence_firewall_lean_from_parsed(
                 .collect();
             for v in pinned {
                 let c = coeffs.remove(&v).unwrap();
-                konst += c * pins[&v];
+                konst = konst.checked_add(c.checked_mul(pins[&v])?)?;
             }
             coeffs.retain(|_, &mut c| c != 0);
             match coeffs.len() {
                 1 => {
                     let (v, &c) = coeffs.iter().next().unwrap();
-                    if c != 0 && konst % c == 0 {
-                        let val = -konst / c;
+                    if let Some(val) = cbr_single_key_pin(c, konst)? {
                         if pins.get(v) != Some(&val) {
                             pins.insert(v.clone(), val);
                             changed = true;
@@ -11449,7 +13615,7 @@ pub(crate) fn emit_euf_lia_congruence_firewall_lean_from_parsed(
                     let mut it = coeffs.iter();
                     let (v1, &c1) = it.next().unwrap();
                     let (v2, &c2) = it.next().unwrap();
-                    if c1 == -c2 && c1 != 0 && konst == 0 {
+                    if c1 != 0 && c1.checked_neg() == Some(c2) && konst == 0 {
                         let r1 = euf_lia_find(&mut parent, v1);
                         let r2 = euf_lia_find(&mut parent, v2);
                         if r1 != r2 {
@@ -11722,6 +13888,1969 @@ fn euf_lia_emit_block(
         lines.extend(bulletize(&cont));
     }
     lines
+}
+
+/// Reserved separator: an SMT symbol cannot contain U+0001, so a UF-application
+/// linear-form key `"<g>\u{1}<arg>"` never collides with a bare int-variable key.
+fn cbr_uf_key(g: &str, arg: &str) -> String {
+    format!("{g}\u{1}{arg}")
+}
+
+/// `true` iff `op` is a builtin (arithmetic / relational / logical / array /
+/// datatype) operator rather than an uninterpreted function symbol.
+fn cbr_is_builtin_op(op: &str) -> bool {
+    matches!(
+        op,
+        "+" | "-"
+            | "*"
+            | "/"
+            | "div"
+            | "mod"
+            | "abs"
+            | "="
+            | ">="
+            | "<="
+            | ">"
+            | "<"
+            | "not"
+            | "and"
+            | "or"
+            | "=>"
+            | "xor"
+            | "ite"
+            | "select"
+            | "store"
+            | "distinct"
+            | "to_int"
+            | "to_real"
+    )
+}
+
+/// Resolve one surface symbol only when it has exactly one active declaration.
+///
+/// Parsed assertions retain the surface name, not an overload identity. Any
+/// overloaded name is therefore ambiguous at this diagnostic boundary and must
+/// be declined rather than guessed.
+fn firewall_unique_symbol_info<'a>(
+    context: &'a ay_frontend::Context,
+    name: &str,
+) -> Option<&'a ay_frontend::SymbolInfo> {
+    let mut matches = context
+        .symbols_iter()
+        .filter_map(|(surface, info)| (surface == name).then_some(info));
+    let info = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(info)
+}
+
+/// Parse `name` as ay's lenient signed-Int literal only when no declaration has
+/// that exact surface name. SMT-LIB quoted symbols lose their quoting in
+/// `ParsedTerm`, so a declared `|-1|` and the numeric-looking text `-1` are
+/// distinguishable here only through `Context`. One wrong-signature declaration
+/// or multiple overloaded declarations must therefore decline, not fall back to
+/// a literal.
+fn firewall_undeclared_i64_symbol_literal(
+    context: &ay_frontend::Context,
+    name: &str,
+) -> Option<i64> {
+    if context.symbols_iter().any(|(surface, _)| surface == name) {
+        return None;
+    }
+    name.parse::<i64>().ok()
+}
+
+fn cbr_is_int_constant(context: &ay_frontend::Context, name: &str) -> bool {
+    firewall_unique_symbol_info(context, name)
+        .is_some_and(|info| info.arg_sorts.is_empty() && info.sort == Sort::Int)
+}
+
+fn cbr_is_int_unary_function(context: &ay_frontend::Context, name: &str) -> bool {
+    firewall_unique_symbol_info(context, name).is_some_and(|info| {
+        matches!(info.arg_sorts.as_slice(), [Sort::Int]) && info.sort == Sort::Int
+    })
+}
+
+/// Checked linear-form addition shared by the parsed-assertion emitters. A
+/// source-level integer expression is unbounded, while these recognizers use
+/// `i64` as a deliberately small analysis domain; any coefficient/constant
+/// that leaves that domain must decline instead of panicking or wrapping.
+fn firewall_lin_add_checked(a: &EufLiaLin, b: &EufLiaLin, sign: i64) -> Option<EufLiaLin> {
+    let mut coeffs = a.coeffs.clone();
+    for (v, &c) in &b.coeffs {
+        let scaled = sign.checked_mul(c)?;
+        let current = coeffs.get(v).copied().unwrap_or_default();
+        let next = current.checked_add(scaled)?;
+        if next == 0 {
+            coeffs.remove(v);
+        } else {
+            coeffs.insert(v.clone(), next);
+        }
+    }
+    Some(EufLiaLin {
+        coeffs,
+        konst: a.konst.checked_add(sign.checked_mul(b.konst)?)?,
+    })
+}
+
+/// Checked linear-form scaling shared by the parsed-assertion emitters.
+fn firewall_lin_scale_checked(a: &EufLiaLin, scale: i64) -> Option<EufLiaLin> {
+    let mut coeffs = a.coeffs.clone();
+    for coeff in coeffs.values_mut() {
+        *coeff = coeff.checked_mul(scale)?;
+    }
+    coeffs.retain(|_, &mut coeff| coeff != 0);
+    Some(EufLiaLin {
+        coeffs,
+        konst: a.konst.checked_mul(scale)?,
+    })
+}
+
+/// Convert a single-key comparison `c*x + d op 0` into inclusive integer
+/// bounds. Intermediate arithmetic uses `i128`; conversion back to the
+/// recognizer's `i64` domain is checked and an out-of-range boundary declines.
+fn cbr_bound_lo_hi(
+    op: &str,
+    coefficient: i64,
+    constant: i64,
+) -> Option<(Option<i64>, Option<i64>)> {
+    let d = i128::from(constant);
+    let checked = |value: i128| i64::try_from(value).ok();
+    match (op, coefficient) {
+        (">=", 1) => Some((Some(checked(-d)?), None)),
+        (">=", -1) => Some((None, Some(constant))),
+        (">", 1) => Some((Some(checked(-d + 1)?), None)),
+        (">", -1) => Some((None, Some(checked(d - 1)?))),
+        ("<=", 1) => Some((None, Some(checked(-d)?))),
+        ("<=", -1) => Some((Some(constant), None)),
+        ("<", 1) => Some((None, Some(checked(-d - 1)?))),
+        ("<", -1) => Some((Some(checked(d + 1)?), None)),
+        _ => Some((None, None)),
+    }
+}
+
+/// Solve `coefficient*x + constant = 0` inside the recognizer's `i64`
+/// analysis domain without `MIN / -1` or negation overflow.
+fn cbr_single_key_pin(coefficient: i64, constant: i64) -> Option<Option<i64>> {
+    if coefficient == 0 {
+        return Some(None);
+    }
+    let numerator = -i128::from(constant);
+    let denominator = i128::from(coefficient);
+    if numerator % denominator != 0 {
+        return Some(None);
+    }
+    Some(Some(i64::try_from(numerator / denominator).ok()?))
+}
+
+/// Like `euf_lia_lin_of`, but a single-application UF term `(g x)` (g NOT a
+/// builtin operator, x a bare symbol) is admitted as an OPAQUE integer atom,
+/// keyed `cbr_uf_key(g, x)` and recorded in `uf_apps`. This lets a congruence
+/// bridge `f s = f t` be closed by `omega` over these atoms. Any other
+/// non-linear / non-Int shape (a Real `Decimal`, a nested/compound UF argument,
+/// a nonlinear product) returns `None` (fail-closed).
+fn cbr_lin_of(
+    t: &PTerm,
+    uf_apps: &mut std::collections::BTreeMap<String, (String, String)>,
+    context: &ay_frontend::Context,
+) -> Option<EufLiaLin> {
+    use std::collections::BTreeMap;
+    match t {
+        PTerm::Symbol(v) if cbr_is_int_constant(context, v) => {
+            let mut coeffs = BTreeMap::new();
+            coeffs.insert(v.clone(), 1i64);
+            Some(EufLiaLin { coeffs, konst: 0 })
+        }
+        PTerm::Const(PConst::Numeral(n)) => Some(EufLiaLin {
+            coeffs: BTreeMap::new(),
+            konst: n.parse::<i64>().ok()?,
+        }),
+        PTerm::App(op, args) => match (op.as_str(), args.len()) {
+            ("+", _) if !args.is_empty() => {
+                let mut acc = EufLiaLin {
+                    coeffs: BTreeMap::new(),
+                    konst: 0,
+                };
+                for a in args {
+                    acc = firewall_lin_add_checked(&acc, &cbr_lin_of(a, uf_apps, context)?, 1)?;
+                }
+                Some(acc)
+            }
+            ("-", 1) => firewall_lin_scale_checked(&cbr_lin_of(&args[0], uf_apps, context)?, -1),
+            ("-", n) if n >= 2 => {
+                let mut acc = cbr_lin_of(&args[0], uf_apps, context)?;
+                for a in &args[1..] {
+                    acc = firewall_lin_add_checked(&acc, &cbr_lin_of(a, uf_apps, context)?, -1)?;
+                }
+                Some(acc)
+            }
+            ("*", _) if !args.is_empty() => {
+                let mut acc = EufLiaLin {
+                    coeffs: BTreeMap::new(),
+                    konst: 1,
+                };
+                for a in args {
+                    let l = cbr_lin_of(a, uf_apps, context)?;
+                    if acc.coeffs.is_empty() {
+                        acc = firewall_lin_scale_checked(&l, acc.konst)?;
+                    } else if l.coeffs.is_empty() {
+                        acc = firewall_lin_scale_checked(&acc, l.konst)?;
+                    } else {
+                        return None; // nonlinear product of two variable terms
+                    }
+                }
+                Some(acc)
+            }
+            // Single-application UF atom `(g x)` — an opaque integer atom.
+            (g, 1) if !cbr_is_builtin_op(g) => {
+                let PTerm::Symbol(arg) = &args[0] else {
+                    return None;
+                };
+                if !cbr_is_int_constant(context, arg) || !cbr_is_int_unary_function(context, g) {
+                    return None;
+                }
+                let key = cbr_uf_key(g, arg);
+                uf_apps.insert(key.clone(), (g.to_string(), arg.clone()));
+                let mut coeffs = BTreeMap::new();
+                coeffs.insert(key, 1i64);
+                Some(EufLiaLin { coeffs, konst: 0 })
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Render a linear-integer term (admitting single-application UF terms) to a Lean
+/// `Int` expression over the `Val` model: `m.x_<v>` per int variable, `(n : Int)`
+/// per numeral, `m.f_<g> (m.x_<arg>)` per UF application. Mirrors `cbr_lin_of`.
+fn cbr_render_int(t: &PTerm, context: &ay_frontend::Context) -> Option<String> {
+    match t {
+        PTerm::Symbol(v) if cbr_is_int_constant(context, v) => {
+            Some(format!("m.x_{}", euf_lia_san(v)))
+        }
+        PTerm::Const(PConst::Numeral(n)) => {
+            n.parse::<i64>().ok()?;
+            Some(format!("({n} : Int)"))
+        }
+        PTerm::App(op, args) => match (op.as_str(), args.len()) {
+            ("+", _) if !args.is_empty() => {
+                let parts: Option<Vec<String>> = args
+                    .iter()
+                    .map(|arg| cbr_render_int(arg, context))
+                    .collect();
+                Some(format!("({})", parts?.join(" + ")))
+            }
+            ("-", 1) => Some(format!("(- {})", cbr_render_int(&args[0], context)?)),
+            ("-", n) if n >= 2 => {
+                let parts: Option<Vec<String>> = args
+                    .iter()
+                    .map(|arg| cbr_render_int(arg, context))
+                    .collect();
+                Some(format!("({})", parts?.join(" - ")))
+            }
+            ("*", _) if !args.is_empty() => {
+                let parts: Option<Vec<String>> = args
+                    .iter()
+                    .map(|arg| cbr_render_int(arg, context))
+                    .collect();
+                Some(format!("({})", parts?.join(" * ")))
+            }
+            (g, 1) if !cbr_is_builtin_op(g) => {
+                let PTerm::Symbol(arg) = &args[0] else {
+                    return None;
+                };
+                if !cbr_is_int_constant(context, arg) || !cbr_is_int_unary_function(context, g) {
+                    return None;
+                }
+                Some(format!("m.f_{} (m.x_{})", euf_lia_san(g), euf_lia_san(arg)))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Emit a verified-firewall Lean proof for an EUF CONGRUENCE conflict that closes
+/// a LINEAR-INTEGER (bound / equality / disequality) system once the
+/// congruence-derived equality `f s = f t` (from an LIA-implied `s = t`) is
+/// injected — bucket "euf_cong_bridge".
+///
+/// This is the sibling of `emit_euf_lia_congruence_firewall_lean_from_parsed`:
+/// that one closes a VALUE-atom pair (`f x = c1`, `f y = c2`); this one closes the
+/// cases where the UF applications appear inside INEQUALITY bounds
+/// (`f a < 0 ∧ f b ≥ 0` with `a = b`) or a DIRECT disequality
+/// (`f x ≠ f y` with `x + 1 = y + 1`). Assertions that are not linear-integer /
+/// UF atoms (e.g. an inert array `store`-equality) are DROPPED from the emitted
+/// core — sound because a refutation of a SUBSET of the assertions refutes the
+/// whole (the kernel-checked `no_model` is over exactly the retained atoms).
+///
+/// Fail-closed: fires ONLY when a genuine congruence-mediated conflict is
+/// detected (a single-variable bound infeasibility over a merged UF-application
+/// class, or a disequality between two congruent applications) AND at least one
+/// congruence bridge is generated — so pure-LIA conflicts (no UF) are left to the
+/// LIA emitter. Every retained surface symbol must also resolve unambiguously in
+/// `context` as an Int constant or Int → Int function; Real, missing, or
+/// overloaded declarations decline. axioms ⊆ {propext, Quot.sound}; NO Mathlib,
+/// no new AySoundness lemma, no `sorry`.
+pub(crate) fn emit_euf_congruence_bridge_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    context: &ay_frontend::Context,
+) -> Option<String> {
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    const MAX_CBR_ATOMS: usize = 64;
+    const MAX_CBR_BRIDGES: usize = 64;
+
+    if parsed.is_empty() {
+        return None;
+    }
+
+    let mut atoms: Vec<EufLiaAtom> = Vec::new();
+    let mut int_vars: BTreeSet<String> = BTreeSet::new();
+    let mut uf_funcs: BTreeSet<String> = BTreeSet::new();
+    let mut uf_apps: BTreeMap<String, (String, String)> = BTreeMap::new();
+    // Positive `=` diffs with ONLY int-variable keys (drive arg equivalence).
+    let mut iv_eq_diffs: Vec<EufLiaLin> = Vec::new();
+    // Positive bounds with ONLY int-variable keys (drive int-variable pins).
+    let mut iv_bound_atoms: Vec<(String, EufLiaLin)> = Vec::new();
+    // Every positive single-key bound (int-variable OR UF-application key).
+    let mut all_bounds: Vec<(String, EufLiaLin)> = Vec::new();
+    // Positive single-key equalities (pins) over any key.
+    let mut all_eq_diffs: Vec<EufLiaLin> = Vec::new();
+    // Negative `=` atom diffs — candidate disequality conflicts.
+    let mut neg_eq_diffs: Vec<EufLiaLin> = Vec::new();
+
+    for asrt in parsed {
+        let (inner, positive) = match asrt {
+            PTerm::App(op, a) if op == "not" && a.len() == 1 => (&a[0], false),
+            other => (other, true),
+        };
+        let PTerm::App(op, args) = inner else {
+            // A non-application assertion (bare symbol/const): drop it.
+            continue;
+        };
+        let lean_op = match op.as_str() {
+            "=" => "=",
+            ">=" => ">=",
+            "<=" => "<=",
+            ">" => ">",
+            "<" => "<",
+            // Any other head (store-equality already handled via `=`; disjunctions,
+            // array atoms, …) is inert to this conflict shape — drop from the core.
+            _ => continue,
+        };
+        if args.len() != 2 {
+            continue;
+        }
+        let mut local_apps: BTreeMap<String, (String, String)> = BTreeMap::new();
+        let (la, lb) = (
+            cbr_lin_of(&args[0], &mut local_apps, context),
+            cbr_lin_of(&args[1], &mut local_apps, context),
+        );
+        let (Some(la), Some(lb)) = (la, lb) else {
+            // Un-modellable operand (array store, compound UF arg, Real, …): drop.
+            continue;
+        };
+        let (Some(sa), Some(sb)) = (
+            cbr_render_int(&args[0], context),
+            cbr_render_int(&args[1], context),
+        ) else {
+            continue;
+        };
+        if atoms.len() >= MAX_CBR_ATOMS {
+            return None;
+        }
+        // Commit this atom's symbols.
+        for (k, (g, arg)) in &local_apps {
+            uf_apps.insert(k.clone(), (g.clone(), arg.clone()));
+            uf_funcs.insert(g.clone());
+            int_vars.insert(arg.clone());
+        }
+        for k in la.coeffs.keys().chain(lb.coeffs.keys()) {
+            if !k.contains('\u{1}') {
+                int_vars.insert(k.clone());
+            }
+        }
+        atoms.push(EufLiaAtom {
+            prop: format!("{sa} {lean_op} {sb}"),
+            cv: positive,
+        });
+        let diff = firewall_lin_add_checked(&la, &lb, -1)?;
+        let has_uf_key = diff.coeffs.keys().any(|k| k.contains('\u{1}'));
+        if op == "=" {
+            if positive {
+                all_eq_diffs.push(diff.clone());
+                if !has_uf_key {
+                    iv_eq_diffs.push(diff);
+                }
+            } else {
+                neg_eq_diffs.push(diff);
+            }
+        } else if positive {
+            all_bounds.push((op.clone(), diff.clone()));
+            if !has_uf_key {
+                iv_bound_atoms.push((op.clone(), diff));
+            }
+        }
+    }
+
+    if atoms.is_empty() || uf_apps.is_empty() {
+        return None;
+    }
+    // Determinism / collision guard (mirrors the value-atom emitter).
+    {
+        let mut seen: HashMap<String, String> = HashMap::new();
+        for v in &int_vars {
+            if let Some(prev) = seen.insert(euf_lia_san(v), v.clone()) {
+                if &prev != v {
+                    return None;
+                }
+            }
+        }
+        let mut seenf: HashMap<String, String> = HashMap::new();
+        for g in &uf_funcs {
+            if let Some(prev) = seenf.insert(euf_lia_san(g), g.clone()) {
+                if &prev != g {
+                    return None;
+                }
+            }
+        }
+    }
+
+    // --- Int-variable pin / union-find analysis (over int-variable keys only, so
+    // an implied `s = t` is genuinely LIA-derivable — the bridge's inner `by
+    // omega` then always succeeds). ---
+    let mut lbnd: HashMap<String, i64> = HashMap::new();
+    let mut ubnd: HashMap<String, i64> = HashMap::new();
+    for (op, diff) in &iv_bound_atoms {
+        if diff.coeffs.len() != 1 {
+            continue;
+        }
+        let Some((v, &c)) = diff.coeffs.iter().next() else {
+            continue;
+        };
+        let (lo, hi) = cbr_bound_lo_hi(op, c, diff.konst)?;
+        if let Some(l) = lo {
+            let e = lbnd.entry(v.clone()).or_insert(l);
+            if l > *e {
+                *e = l;
+            }
+        }
+        if let Some(h) = hi {
+            let e = ubnd.entry(v.clone()).or_insert(h);
+            if h < *e {
+                *e = h;
+            }
+        }
+    }
+    let mut pins: HashMap<String, i64> = HashMap::new();
+    for v in &int_vars {
+        if let (Some(&l), Some(&h)) = (lbnd.get(v), ubnd.get(v)) {
+            if l == h {
+                pins.insert(v.clone(), l);
+            }
+        }
+    }
+    let mut parent: HashMap<String, String> = HashMap::new();
+    for v in &int_vars {
+        parent.insert(v.clone(), v.clone());
+    }
+    loop {
+        let mut changed = false;
+        for diff in &iv_eq_diffs {
+            let mut coeffs = diff.coeffs.clone();
+            let mut konst = diff.konst;
+            let pinned: Vec<String> = coeffs
+                .keys()
+                .filter(|v| pins.contains_key(*v))
+                .cloned()
+                .collect();
+            for v in pinned {
+                let c = coeffs.remove(&v)?;
+                let pin = *pins.get(&v)?;
+                konst = konst.checked_add(c.checked_mul(pin)?)?;
+            }
+            coeffs.retain(|_, &mut c| c != 0);
+            match coeffs.len() {
+                1 => {
+                    let Some((v, &c)) = coeffs.iter().next() else {
+                        continue;
+                    };
+                    if let Some(val) = cbr_single_key_pin(c, konst)? {
+                        if pins.get(v) != Some(&val) {
+                            pins.insert(v.clone(), val);
+                            changed = true;
+                        }
+                    }
+                }
+                2 => {
+                    let mut it = coeffs.iter();
+                    let (Some((v1, &c1)), Some((v2, &c2)), None) =
+                        (it.next(), it.next(), it.next())
+                    else {
+                        continue;
+                    };
+                    if i128::from(c1) == -i128::from(c2) && c1 != 0 && konst == 0 {
+                        let r1 = euf_lia_find(&mut parent, v1);
+                        let r2 = euf_lia_find(&mut parent, v2);
+                        if r1 != r2 {
+                            parent.insert(r1, r2);
+                            changed = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut class_pin: HashMap<String, i64> = HashMap::new();
+    for (v, &p) in &pins {
+        let r = euf_lia_find(&mut parent, v);
+        class_pin.entry(r).or_insert(p);
+    }
+    // Canonical arg class: two int variables collapse iff LIA-implied equal
+    // (same union root, or pinned to the same constant).
+    let mut arg_class = |v: &str| -> String {
+        let r = euf_lia_find(&mut parent, v);
+        match class_pin.get(&r) {
+            Some(p) => format!("\u{2}pin\u{2}{p}"),
+            None => r,
+        }
+    };
+    // Canonical class of any linear-form key (int variable or UF application).
+    let mut key_class = |k: &str| -> String {
+        if let Some((g, arg)) = uf_apps.get(k) {
+            format!("{g}\u{1}{}", arg_class(arg))
+        } else {
+            arg_class(k)
+        }
+    };
+
+    // --- Conflict detection (SOUND under-approximation of infeasibility). ---
+    // (A) single-key bound infeasibility over merged classes: a lower bound above
+    //     an upper bound (candidate `f a < 0 ∧ f b ≥ 0`, a = b).
+    let mut clb: HashMap<String, i64> = HashMap::new();
+    let mut cub: HashMap<String, i64> = HashMap::new();
+    for (op, diff) in &all_bounds {
+        if diff.coeffs.len() != 1 {
+            continue;
+        }
+        let Some((k, &c)) = diff.coeffs.iter().next() else {
+            continue;
+        };
+        let (lo, hi) = cbr_bound_lo_hi(op, c, diff.konst)?;
+        let cls = key_class(k);
+        if let Some(l) = lo {
+            let e = clb.entry(cls.clone()).or_insert(l);
+            if l > *e {
+                *e = l;
+            }
+        }
+        if let Some(h) = hi {
+            let e = cub.entry(cls).or_insert(h);
+            if h < *e {
+                *e = h;
+            }
+        }
+    }
+    for diff in &all_eq_diffs {
+        // A single-key equality `k + d = 0` pins class(k) to -d.
+        if diff.coeffs.len() == 1 {
+            let Some((k, &c)) = diff.coeffs.iter().next() else {
+                continue;
+            };
+            if let Some(val) = cbr_single_key_pin(c, diff.konst)? {
+                let cls = key_class(k);
+                let el = clb.entry(cls.clone()).or_insert(val);
+                if val > *el {
+                    *el = val;
+                }
+                let eu = cub.entry(cls).or_insert(val);
+                if val < *eu {
+                    *eu = val;
+                }
+            }
+        }
+    }
+    let mut has_conflict = false;
+    for (cls, &l) in &clb {
+        if let Some(&h) = cub.get(cls) {
+            if l > h {
+                has_conflict = true;
+            }
+        }
+    }
+    // (B) disequality between two congruent terms (candidate `f x ≠ f y`, x = y).
+    for diff in &neg_eq_diffs {
+        if diff.coeffs.len() == 2 && diff.konst == 0 {
+            let mut it = diff.coeffs.iter();
+            let (Some((k1, &c1)), Some((k2, &c2)), None) = (it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            if i128::from(c1) == -i128::from(c2) && c1 != 0 && key_class(k1) == key_class(k2) {
+                has_conflict = true;
+            }
+        }
+    }
+
+    // --- Congruence bridges: every pair of DISTINCT UF applications sharing a
+    // function whose arguments are LIA-implied equal. ---
+    let mut bridges: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let app_list: Vec<(String, String)> = uf_apps.values().cloned().collect();
+    for i in 0..app_list.len() {
+        for j in (i + 1)..app_list.len() {
+            let (gi, ai) = &app_list[i];
+            let (gj, aj) = &app_list[j];
+            if gi != gj || ai == aj {
+                continue;
+            }
+            if arg_class(ai) == arg_class(aj) {
+                let (lo, hi) = if ai <= aj { (ai, aj) } else { (aj, ai) };
+                bridges.insert((gi.clone(), lo.clone(), hi.clone()));
+            }
+        }
+    }
+
+    if !has_conflict || bridges.is_empty() || bridges.len() > MAX_CBR_BRIDGES {
+        return None;
+    }
+
+    Some(render_euf_lia_congruence_lean(
+        &atoms,
+        &int_vars,
+        &uf_funcs,
+        &bridges.into_iter().collect::<Vec<_>>(),
+    ))
+}
+
+/// One `(= ARR (store BASE IDX VAL))` array-defining equality (IDX/VAL Int
+/// numerals; ARR/BASE array symbols). BASE may equal ARR (a self-store fixpoint).
+struct C4Store {
+    arr: String,
+    base: String,
+    idx: i64,
+    val: i64,
+}
+
+fn c4_is_int_array_constant(context: &ay_frontend::Context, name: &str) -> bool {
+    firewall_unique_symbol_info(context, name).is_some_and(|info| {
+        if !info.arg_sorts.is_empty() {
+            return false;
+        }
+        matches!(
+            &info.sort,
+            Sort::Array(array)
+                if array.index_sort.is_int() && array.element_sort.is_int()
+        )
+    })
+}
+
+/// Match `(select ARR IDX)` with ARR a symbol and IDX an Int numeral.
+fn c4_match_select(t: &PTerm, context: &ay_frontend::Context) -> Option<(String, i64)> {
+    let PTerm::App(op, args) = t else {
+        return None;
+    };
+    if op != "select" || args.len() != 2 {
+        return None;
+    }
+    let PTerm::Symbol(arr) = &args[0] else {
+        return None;
+    };
+    if !c4_is_int_array_constant(context, arr) {
+        return None;
+    }
+    let PTerm::Const(PConst::Numeral(n)) = &args[1] else {
+        return None;
+    };
+    Some((arr.clone(), n.parse::<i64>().ok()?))
+}
+
+/// Match `(store BASE IDX VAL)` with BASE a symbol and IDX/VAL Int numerals.
+fn c4_match_store(t: &PTerm, context: &ay_frontend::Context) -> Option<(String, i64, i64)> {
+    let PTerm::App(op, args) = t else {
+        return None;
+    };
+    if op != "store" || args.len() != 3 {
+        return None;
+    }
+    let PTerm::Symbol(base) = &args[0] else {
+        return None;
+    };
+    if !c4_is_int_array_constant(context, base) {
+        return None;
+    }
+    let PTerm::Const(PConst::Numeral(i)) = &args[1] else {
+        return None;
+    };
+    let PTerm::Const(PConst::Numeral(v)) = &args[2] else {
+        return None;
+    };
+    Some((base.clone(), i.parse::<i64>().ok()?, v.parse::<i64>().ok()?))
+}
+
+/// Linear-integer form over `select`-atoms: `(select ARR IDX)` (IDX a numeral) is
+/// an opaque integer atom keyed `"select\u{1}<arr>\u{1}<idx>"`; numerals /
+/// `+`/`-`/`*` compose linearly. Any other shape (a bare symbol, a symbolic
+/// index, …) returns `None` (fail-closed — keeps the emitter to the fully-ground
+/// select→arithmetic case it can prove).
+fn c4_lin_of(
+    t: &PTerm,
+    selects: &mut std::collections::BTreeMap<String, (String, i64)>,
+    context: &ay_frontend::Context,
+) -> Option<EufLiaLin> {
+    use std::collections::BTreeMap;
+    if let Some((arr, idx)) = c4_match_select(t, context) {
+        let key = format!("select\u{1}{arr}\u{1}{idx}");
+        selects.insert(key.clone(), (arr, idx));
+        let mut coeffs = BTreeMap::new();
+        coeffs.insert(key, 1i64);
+        return Some(EufLiaLin { coeffs, konst: 0 });
+    }
+    match t {
+        PTerm::Const(PConst::Numeral(n)) => Some(EufLiaLin {
+            coeffs: BTreeMap::new(),
+            konst: n.parse::<i64>().ok()?,
+        }),
+        PTerm::App(op, args) => match (op.as_str(), args.len()) {
+            ("+", _) if !args.is_empty() => {
+                let mut acc = EufLiaLin {
+                    coeffs: BTreeMap::new(),
+                    konst: 0,
+                };
+                for a in args {
+                    acc = firewall_lin_add_checked(&acc, &c4_lin_of(a, selects, context)?, 1)?;
+                }
+                Some(acc)
+            }
+            ("-", 1) => firewall_lin_scale_checked(&c4_lin_of(&args[0], selects, context)?, -1),
+            ("-", n) if n >= 2 => {
+                let mut acc = c4_lin_of(&args[0], selects, context)?;
+                for a in &args[1..] {
+                    acc = firewall_lin_add_checked(&acc, &c4_lin_of(a, selects, context)?, -1)?;
+                }
+                Some(acc)
+            }
+            ("*", _) if !args.is_empty() => {
+                let mut acc = EufLiaLin {
+                    coeffs: BTreeMap::new(),
+                    konst: 1,
+                };
+                for a in args {
+                    let l = c4_lin_of(a, selects, context)?;
+                    if acc.coeffs.is_empty() {
+                        acc = firewall_lin_scale_checked(&l, acc.konst)?;
+                    } else if l.coeffs.is_empty() {
+                        acc = firewall_lin_scale_checked(&acc, l.konst)?;
+                    } else {
+                        return None;
+                    }
+                }
+                Some(acc)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Render a `select`-bearing linear term to a Lean `Int` expression over the array
+/// model: `(select ARR IDX)` → `m.<arr> (<idx> : Int)`; numeral → `(n : Int)`.
+fn c4_render_lia(t: &PTerm, context: &ay_frontend::Context) -> Option<String> {
+    if let Some((arr, idx)) = c4_match_select(t, context) {
+        return Some(format!("m.{} ({idx} : Int)", euf_lia_san(&arr)));
+    }
+    match t {
+        PTerm::Const(PConst::Numeral(n)) => {
+            n.parse::<i64>().ok()?;
+            Some(format!("({n} : Int)"))
+        }
+        PTerm::App(op, args) => match (op.as_str(), args.len()) {
+            ("+", _) if !args.is_empty() => {
+                let parts: Option<Vec<String>> =
+                    args.iter().map(|arg| c4_render_lia(arg, context)).collect();
+                Some(format!("({})", parts?.join(" + ")))
+            }
+            ("-", 1) => Some(format!("(- {})", c4_render_lia(&args[0], context)?)),
+            ("-", n) if n >= 2 => {
+                let parts: Option<Vec<String>> =
+                    args.iter().map(|arg| c4_render_lia(arg, context)).collect();
+                Some(format!("({})", parts?.join(" - ")))
+            }
+            ("*", _) if !args.is_empty() => {
+                let parts: Option<Vec<String>> =
+                    args.iter().map(|arg| c4_render_lia(arg, context)).collect();
+                Some(format!("({})", parts?.join(" * ")))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Emit a verified-firewall Lean proof for a FUSED array-ROW + LINEAR-INTEGER
+/// conflict (bucket "array_sum_bound"): array-defining equalities
+/// `arr = store(base, i, v)` PIN the reads `select arr i = v` (McCarthy RoW-1,
+/// the verified `AySoundness.ArrayThy.sel_upd_same`), and those pinned values make
+/// an integer (in)equality over the reads infeasible — the residual conflict is
+/// closed by `omega`. Example: `b = store(a,0,10) ∧ b = store(b,1,20) ∧
+/// (select b 0) + (select b 1) > 31` — `b[0]=10, b[1]=20`, so `30 > 31` is false.
+///
+/// Model: arrays are `Int → Int` functions, `store` is an `if`-update; each read
+/// `select arr i` is grounded to its written value at the leaf by `congrFun` on
+/// the store-equality hypothesis + `simp` (RoW-1), then the fully-ground integer
+/// conflict is discharged by `omega`. Composed through `firewall_combined_unsat`;
+/// the array-equality atoms use `Classical.propDecidable` (so `atomVal` is
+/// `noncomputable`); axioms of `no_model` ⊆ {propext, Classical.choice, Quot.sound}.
+///
+/// Fail-closed: fires ONLY when every array surface symbol resolves uniquely in
+/// `context` as a nullary `(Array Int Int)`, every `select` in the integer atoms
+/// is grounded by a matching store-equality, and the ground integer system is
+/// genuinely infeasible; declines otherwise.
+pub(crate) fn emit_array_sum_bound_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    context: &ay_frontend::Context,
+) -> Option<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const MAX_C4_ATOMS: usize = 64;
+
+    if parsed.is_empty() {
+        return None;
+    }
+
+    // atoms[i] is EITHER a store-defining equality (recorded in `store_at[i]`) or
+    // an integer atom (recorded in `lia_at[i]`), preserving assertion order so the
+    // `by_cases` hypothesis `h{i+1}` lines up with the atom index.
+    let mut atoms: Vec<EufLiaAtom> = Vec::new();
+    let mut store_at: BTreeMap<usize, C4Store> = BTreeMap::new();
+    let mut lia_at: BTreeMap<usize, EufLiaLin> = BTreeMap::new();
+    let mut lia_ops: BTreeMap<usize, String> = BTreeMap::new();
+    let mut arrays: BTreeSet<String> = BTreeSet::new();
+    let mut selects: BTreeMap<String, (String, i64)> = BTreeMap::new();
+
+    for asrt in parsed {
+        // Only positively-asserted atoms participate in this ground conflict.
+        let PTerm::App(op, args) = asrt else {
+            continue;
+        };
+        if atoms.len() >= MAX_C4_ATOMS {
+            return None;
+        }
+        // Array-defining equality `(= ARR (store BASE IDX VAL))` (either side).
+        if op == "=" && args.len() == 2 {
+            let stored = [(&args[0], &args[1]), (&args[1], &args[0])]
+                .into_iter()
+                .find_map(|(lhs, rhs)| {
+                    let PTerm::Symbol(arr) = lhs else { return None };
+                    if !c4_is_int_array_constant(context, arr) {
+                        return None;
+                    }
+                    let (base, idx, val) = c4_match_store(rhs, context)?;
+                    Some(C4Store {
+                        arr: arr.clone(),
+                        base,
+                        idx,
+                        val,
+                    })
+                });
+            if let Some(st) = stored {
+                arrays.insert(st.arr.clone());
+                arrays.insert(st.base.clone());
+                atoms.push(EufLiaAtom {
+                    prop: format!(
+                        "m.{} = (fun x => if x = ({} : Int) then ({} : Int) else m.{} x)",
+                        euf_lia_san(&st.arr),
+                        st.idx,
+                        st.val,
+                        euf_lia_san(&st.base),
+                    ),
+                    cv: true,
+                });
+                store_at.insert(atoms.len() - 1, st);
+                continue;
+            }
+        }
+        // Integer relational atom over `select` reads.
+        let lean_op = match op.as_str() {
+            "=" => "=",
+            ">=" => ">=",
+            "<=" => "<=",
+            ">" => ">",
+            "<" => "<",
+            _ => continue,
+        };
+        if args.len() != 2 {
+            continue;
+        }
+        let mut local_selects = BTreeMap::new();
+        let (la, lb) = (
+            c4_lin_of(&args[0], &mut local_selects, context),
+            c4_lin_of(&args[1], &mut local_selects, context),
+        );
+        let (Some(la), Some(lb)) = (la, lb) else {
+            continue;
+        };
+        let (Some(sa), Some(sb)) = (
+            c4_render_lia(&args[0], context),
+            c4_render_lia(&args[1], context),
+        ) else {
+            continue;
+        };
+        selects.extend(local_selects);
+        atoms.push(EufLiaAtom {
+            prop: format!("{sa} {lean_op} {sb}"),
+            cv: true,
+        });
+        let idx = atoms.len() - 1;
+        lia_at.insert(idx, firewall_lin_add_checked(&la, &lb, -1)?);
+        lia_ops.insert(idx, op.clone());
+    }
+
+    if store_at.is_empty() || lia_at.is_empty() || selects.is_empty() {
+        return None;
+    }
+    // Field-name collision guard.
+    {
+        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for a in &arrays {
+            if let Some(prev) = seen.insert(euf_lia_san(a), a.clone()) {
+                if &prev != a {
+                    return None;
+                }
+            }
+        }
+    }
+
+    // Ground each read `select arr i` to a written value via the FIRST matching
+    // store-equality (arr matches, store index == read index → RoW-1 value).
+    let mut ground_val: BTreeMap<String, i64> = BTreeMap::new();
+    let mut groundings: Vec<Vec<String>> = Vec::new();
+    for (key, (arr, idx)) in &selects {
+        let mut found = None;
+        for (pos, st) in &store_at {
+            if &st.arr == arr && st.idx == *idx {
+                found = Some((*pos, st.val));
+                break;
+            }
+        }
+        let Some((pos, val)) = found else {
+            return None; // ungroundable read — decline
+        };
+        ground_val.insert(key.clone(), val);
+        let hyp = pos + 1;
+        let asan = euf_lia_san(arr);
+        groundings.push(vec![format!(
+            "have e_{asan}_{idx} : m.{asan} ({idx} : Int) = ({val} : Int) := by \
+have t := congrFun h{hyp} ({idx} : Int); simpa using t"
+        )]);
+    }
+
+    // Ground infeasibility check: every read is a concrete value, so each integer
+    // atom is a concrete comparison; fire only if at least one is FALSE.
+    let mut infeasible = false;
+    for (idx, diff) in &lia_at {
+        // diff = (L - R); the atom is `L op R`, i.e. `diff op 0` in the reads.
+        let mut konst = diff.konst;
+        let mut all_ground = true;
+        for (k, &c) in &diff.coeffs {
+            match ground_val.get(k) {
+                Some(&v) => konst = konst.checked_add(c.checked_mul(v)?)?,
+                None => {
+                    all_ground = false;
+                    break;
+                }
+            }
+        }
+        if !all_ground {
+            return None; // a read escaped grounding — decline
+        }
+        // konst `op` 0 must be FALSE for a conflict.
+        let holds = match lia_ops.get(idx)?.as_str() {
+            "=" => konst == 0,
+            ">=" => konst >= 0,
+            "<=" => konst <= 0,
+            ">" => konst > 0,
+            "<" => konst < 0,
+            _ => return None,
+        };
+        if !holds {
+            infeasible = true;
+        }
+    }
+    if !infeasible {
+        return None;
+    }
+
+    let hash = fnv_hex(
+        &atoms
+            .iter()
+            .map(|a| format!("{}:{}", a.cv, a.prop))
+            .collect::<Vec<_>>()
+            .join("\u{1}"),
+    );
+    Some(render_array_sum_bound_lean(
+        &atoms,
+        &arrays,
+        &groundings,
+        &hash,
+    ))
+}
+
+/// Render the fused array-ROW + LIA firewall file. The nested `by_cases` proof
+/// tree (each deviating branch closed by `simp`, the all-consistent leaf grounding
+/// every read then closing by `omega`) is generated by `euf_lia_emit_block`, the
+/// same spine the EUF+LIA congruence emitter uses.
+fn render_array_sum_bound_lean(
+    atoms: &[EufLiaAtom],
+    arrays: &std::collections::BTreeSet<String>,
+    groundings: &[Vec<String>],
+    hash: &str,
+) -> String {
+    let n = atoms.len();
+    let lemma_id = n + 1;
+    let proof_id = n + 2;
+
+    let fields = arrays
+        .iter()
+        .map(|a| format!("  {} : Int -> Int", euf_lia_san(a)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let arms = atoms
+        .iter()
+        .enumerate()
+        .map(|(i, a)| format!("  | {} => decide ({})", i + 1, a.prop))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let orig = atoms
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("({}, [{}])", i + 1, i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let lemma_lits = (1..=n)
+        .map(|i| format!("-{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let proof_hints = (1..=lemma_id)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let proof_body = euf_lia_emit_block(atoms, 0, "  ", groundings).join("\n");
+
+    format!(
+        r#"import AySoundness.Firewall
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — FUSED array-ROW + LINEAR-INTEGER
+  conflict, grounded in the verified `firewall_combined_unsat`. Array-defining
+  equalities `arr = store(base, i, v)` PIN the reads `select arr i = v` (McCarthy
+  read-over-write RoW-1, the content of `AySoundness.ArrayThy.sel_upd_same`); the
+  pinned values then make an integer (in)equality over the reads infeasible, and
+  the residual ground conflict is closed by `omega`. Reconstructed from the
+  frontend assertions. Arrays are modelled as `Int → Int` functions and `store`
+  as an `if`-update; each read is grounded at the leaf by `congrFun` on the
+  store-equality hypothesis + `simp`. The array-equality atoms use
+  `Classical.propDecidable` (so `atomVal` is `noncomputable`); axioms of
+  `no_model` ⊆ {{propext, Classical.choice, Quot.sound}}. Pure Lean 4 core.
+-/
+namespace AySoundness.Emitted.ArrSumBound_{hash}
+open AySoundness
+
+attribute [local instance] Classical.propDecidable
+
+structure Val where
+{fields}
+
+/-- Atoms (one per asserted frontend atom, in assertion order). -/
+noncomputable def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+{arms}
+  | _ => false
+
+def original : List (Cid × Clause) := [{orig}]
+def lemmas   : List (Cid × Clause) := [({lemma_id}, [{lemma_lits}])]
+def proof    : List (Cid × Clause × List Int) := [({proof_id}, [], [{proof_hints}])]
+
+/-- The fused conflict clause is valid in EVERY model: any deviation from the
+    asserted polarities satisfies the clause; the all-consistent leaf grounds
+    every read (RoW-1) and closes the residual integer conflict by `omega`. -/
+theorem array_sum_lemma_valid (m : Val) : clauseSat (atomVal m) [{lemma_lits}] = true := by
+{proof_body}
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact array_sum_lemma_valid m
+
+/-- No model satisfies the fused array-ROW + LIA conflict — via the verified
+    firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.ArrSumBound_{hash}
+"#,
+    )
+}
+
+// ==== APPENDED BUCKET: b_nia_product.rs ====
+// ===========================================================================
+// NONLINEAR-INTEGER *product* firewall (bucket "nia_product").
+//
+// `omega` is a LINEAR decision procedure: it atomises a bilinear term `x * y`
+// into an opaque unknown with no residual link to `x` or `y`. The verified
+// module `AySoundness.NiaProduct` supplies that link as four LINEAR McCormick
+// corner facts, each an `Int.mul_nonneg` instance. This bucket reconstructs the
+// conflict from the frontend assertions, proves INFEASIBILITY IN RUST over
+// exactly the system `omega` will see after atomisation, and only then emits.
+//
+// Soundness posture (`--emit-firewall-lean` is verdict-publication-gating: an
+// emission turns an exit-1 "no supported obligation" decline into a published
+// `unsat`, and that path never kernel-checks the file). Therefore every gate
+// below is an UNDER-approximation of what `omega` can prove:
+//
+//   * the Rust gate reasons over the SAME atom set `omega` sees — the product
+//     is ONE slot, exactly as `omega` atomises it, and the emitted Lean text is
+//     rendered FROM that normal form, so the two cannot drift apart;
+//   * the gate refutes with rational Fourier–Motzkin plus per-row integer
+//     tightening. Every derived row is an integer consequence of the asserted
+//     rows, so a derived `k ≤ 0` with `k > 0` means the system really is
+//     integer-infeasible — and `omega`, being COMPLETE for linear integer
+//     arithmetic, then closes the same goal;
+//   * atoms the gate cannot linearise (disequalities) are DROPPED from the gate
+//     system while still being rendered and hypothesised in Lean. Dropping only
+//     weakens the gate, so it can never manufacture a false infeasibility;
+//   * every bound fed to a McCormick corner comes from a SINGLE asserted unit
+//     row, so the corner's `(by omega)` side goals are discharged from the very
+//     hypotheses the cascade has in scope;
+//   * any unsupported shape, unresolved symbol, second distinct product,
+//     coefficient overflow or elimination blow-up returns `None` (decline).
+// ===========================================================================
+
+/// Maximum assertions / rendered atoms / distinct Int variables the recognizer
+/// will consider. The cascade is linear in the atom count and Fourier–Motzkin is
+/// exponential in the variable count, so both are capped well below the
+/// diagnostic source-size ceiling.
+const NIA_MAX_ASSERTIONS: usize = 64;
+const NIA_MAX_ATOMS: usize = 64;
+const NIA_MAX_VARS: usize = 8;
+/// Fourier–Motzkin working-set ceiling and coefficient magnitude ceiling.
+const NIA_FM_MAX_ROWS: usize = 512;
+const NIA_FM_MAX_MAGNITUDE: i128 = 1 << 40;
+
+/// A slot in the linear normal form: either a declared nullary Int variable
+/// (rendered `(m i)`) or THE single bilinear product atom of the query
+/// (rendered `((m i) * (m j))` with `i ≤ j`).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum NiaSlot {
+    Var(usize),
+    Product,
+}
+
+/// `Σ coeffs[slot]·slot + konst` over `Int`.
+#[derive(Clone, Default, PartialEq, Eq)]
+struct NiaLin {
+    coeffs: std::collections::BTreeMap<NiaSlot, i64>,
+    konst: i64,
+}
+
+impl NiaLin {
+    fn constant(k: i64) -> Self {
+        Self {
+            coeffs: std::collections::BTreeMap::new(),
+            konst: k,
+        }
+    }
+
+    fn slot(s: NiaSlot) -> Self {
+        let mut coeffs = std::collections::BTreeMap::new();
+        coeffs.insert(s, 1i64);
+        Self { coeffs, konst: 0 }
+    }
+
+    fn is_constant(&self) -> bool {
+        self.coeffs.is_empty()
+    }
+
+    /// `Some((index, coeff))` when this form is exactly `coeff · varᵢ` — the only
+    /// shape allowed as a factor of the bilinear product.
+    fn single_var(&self) -> Option<(usize, i64)> {
+        if self.konst != 0 || self.coeffs.len() != 1 {
+            return None;
+        }
+        match self.coeffs.iter().next()? {
+            (NiaSlot::Var(i), c) => Some((*i, *c)),
+            (NiaSlot::Product, _) => None,
+        }
+    }
+
+    /// `self + sign·other`, declining on `i64` overflow.
+    fn add(&self, other: &Self, sign: i64) -> Option<Self> {
+        let mut coeffs = self.coeffs.clone();
+        for (slot, &c) in &other.coeffs {
+            let scaled = sign.checked_mul(c)?;
+            let next = coeffs
+                .get(slot)
+                .copied()
+                .unwrap_or_default()
+                .checked_add(scaled)?;
+            if next == 0 {
+                coeffs.remove(slot);
+            } else {
+                coeffs.insert(*slot, next);
+            }
+        }
+        let konst = self.konst.checked_add(sign.checked_mul(other.konst)?)?;
+        Some(Self { coeffs, konst })
+    }
+
+    fn scale(&self, factor: i64) -> Option<Self> {
+        if factor == 0 {
+            return Some(Self::constant(0));
+        }
+        let mut coeffs = std::collections::BTreeMap::new();
+        for (slot, &c) in &self.coeffs {
+            coeffs.insert(*slot, c.checked_mul(factor)?);
+        }
+        Some(Self {
+            coeffs,
+            konst: self.konst.checked_mul(factor)?,
+        })
+    }
+}
+
+/// A rendered assertion atom, kept STRUCTURAL until the canonical product key is
+/// known (it is only fixed once every assertion has been walked).
+struct NiaAtom {
+    lhs: NiaLin,
+    rhs: NiaLin,
+    /// Lean comparison operator text.
+    op: &'static str,
+    negated: bool,
+}
+
+/// Multiply two normal forms. Linear·constant scales; variable·variable becomes
+/// THE product slot (registering / checking the canonical key). Every other
+/// combination — in particular a product appearing inside a further product, and
+/// a second, DIFFERENT bilinear pair — declines.
+fn nia_lin_mul(a: &NiaLin, b: &NiaLin, prod: &mut Option<(usize, usize)>) -> Option<NiaLin> {
+    if a.is_constant() {
+        return b.scale(a.konst);
+    }
+    if b.is_constant() {
+        return a.scale(b.konst);
+    }
+    let (i, ci) = a.single_var()?;
+    let (j, cj) = b.single_var()?;
+    // O1 CANONICALIZATION. `x * y` and `y * x` are the SAME product, but `omega`
+    // atomises them as two INDEPENDENT unknowns. Ordering the factor indices
+    // here — and rendering the slot from that order everywhere — makes every
+    // occurrence syntactically identical in the emitted Lean, so `omega` and the
+    // Rust gate agree on how many unknowns there are.
+    let key = if i <= j { (i, j) } else { (j, i) };
+    match prod {
+        Some(existing) if *existing != key => return None,
+        Some(_) => {}
+        None => *prod = Some(key),
+    }
+    NiaLin::slot(NiaSlot::Product).scale(ci.checked_mul(cj)?)
+}
+
+/// Parse a frontend integer term into the NIA normal form, allocating a stable
+/// `(m i)` index per distinct declared Int variable. Declines on any Real /
+/// undeclared / non-Int symbol, on `mod`/`div` (outside the Fourier–Motzkin
+/// domain), and on any product shape richer than `linear · linear`.
+fn nia_lin_of(
+    t: &PTerm,
+    vars: &mut Vec<String>,
+    prod: &mut Option<(usize, usize)>,
+    context: &ay_frontend::Context,
+) -> Option<NiaLin> {
+    match t {
+        PTerm::Symbol(v) => {
+            if cbr_is_int_constant(context, v) {
+                let idx = vars.iter().position(|x| x == v).unwrap_or_else(|| {
+                    vars.push(v.clone());
+                    vars.len() - 1
+                });
+                if vars.len() > NIA_MAX_VARS {
+                    return None;
+                }
+                return Some(NiaLin::slot(NiaSlot::Var(idx)));
+            }
+            // ay's lenient elaboration keeps an undeclared signed literal such as
+            // `-1` as a Symbol; a DECLARED numeric-looking name is not a literal.
+            Some(NiaLin::constant(firewall_undeclared_i64_symbol_literal(
+                context, v,
+            )?))
+        }
+        PTerm::Const(PConst::Numeral(n)) => Some(NiaLin::constant(n.parse::<i64>().ok()?)),
+        PTerm::App(op, args) => match (op.as_str(), args.len()) {
+            ("+", k) if k >= 1 => {
+                let mut acc = NiaLin::constant(0);
+                for a in args {
+                    acc = acc.add(&nia_lin_of(a, vars, prod, context)?, 1)?;
+                }
+                Some(acc)
+            }
+            ("-", 1) => nia_lin_of(&args[0], vars, prod, context)?.scale(-1),
+            ("-", k) if k >= 2 => {
+                let mut acc = nia_lin_of(&args[0], vars, prod, context)?;
+                for a in &args[1..] {
+                    acc = acc.add(&nia_lin_of(a, vars, prod, context)?, -1)?;
+                }
+                Some(acc)
+            }
+            ("*", k) if k >= 1 => {
+                let mut acc = nia_lin_of(&args[0], vars, prod, context)?;
+                for a in &args[1..] {
+                    let next = nia_lin_of(a, vars, prod, context)?;
+                    acc = nia_lin_mul(&acc, &next, prod)?;
+                }
+                Some(acc)
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The integer-tightened rows `Σ c·slot + k ≤ 0` implied by `lhs op rhs` under
+/// `negated`. A disequality has no such rows and yields an EMPTY list: the atom
+/// is still rendered and hypothesised in Lean, it merely does not strengthen the
+/// Rust gate.
+fn nia_comparison_rows(lhs: &NiaLin, rhs: &NiaLin, op: &str, negated: bool) -> Option<Vec<NiaLin>> {
+    let le = |a: &NiaLin, b: &NiaLin| a.add(b, -1); // a - b ≤ 0
+    let lt = |a: &NiaLin, b: &NiaLin| a.add(b, -1)?.add(&NiaLin::constant(1), 1); // a - b + 1 ≤ 0
+    Some(match (op, negated) {
+        ("<=", false) | (">", true) => vec![le(lhs, rhs)?],
+        ("<", false) | (">=", true) => vec![lt(lhs, rhs)?],
+        (">=", false) | ("<", true) => vec![le(rhs, lhs)?],
+        (">", false) | ("<=", true) => vec![lt(rhs, lhs)?],
+        ("=", false) => vec![le(lhs, rhs)?, le(rhs, lhs)?],
+        ("=", true) => Vec::new(),
+        _ => return None,
+    })
+}
+
+/// Recognize one frontend assertion as a list of `(atom, gate rows)`. Accepts a
+/// comparison, a negated comparison, and `distinct` (expanded to pairwise `≠`).
+/// Anything else — `or`/`and`/`ite`, a Bool variable, a non-Int atom — declines.
+fn nia_assertion_atoms(
+    t: &PTerm,
+    vars: &mut Vec<String>,
+    prod: &mut Option<(usize, usize)>,
+    context: &ay_frontend::Context,
+) -> Option<Vec<(NiaAtom, Vec<NiaLin>)>> {
+    let comparison = |t: &PTerm,
+                      negated: bool,
+                      vars: &mut Vec<String>,
+                      prod: &mut Option<(usize, usize)>|
+     -> Option<(NiaAtom, Vec<NiaLin>)> {
+        let PTerm::App(op, args) = t else { return None };
+        if args.len() != 2 {
+            return None;
+        }
+        let lean_op = match op.as_str() {
+            "<=" => "≤",
+            ">=" => "≥",
+            "<" => "<",
+            ">" => ">",
+            "=" => "=",
+            _ => return None,
+        };
+        let lhs = nia_lin_of(&args[0], vars, prod, context)?;
+        let rhs = nia_lin_of(&args[1], vars, prod, context)?;
+        let rows = nia_comparison_rows(&lhs, &rhs, op, negated)?;
+        Some((
+            NiaAtom {
+                lhs,
+                rhs,
+                op: lean_op,
+                negated,
+            },
+            rows,
+        ))
+    };
+    match t {
+        PTerm::App(op, args) if op == "not" && args.len() == 1 => {
+            Some(vec![comparison(&args[0], true, vars, prod)?])
+        }
+        PTerm::App(op, args) if op == "distinct" && args.len() >= 2 => {
+            let rendered: Vec<NiaLin> = args
+                .iter()
+                .map(|a| nia_lin_of(a, vars, prod, context))
+                .collect::<Option<Vec<_>>>()?;
+            let mut out = Vec::new();
+            for i in 0..rendered.len() {
+                for j in (i + 1)..rendered.len() {
+                    out.push((
+                        NiaAtom {
+                            lhs: rendered[i].clone(),
+                            rhs: rendered[j].clone(),
+                            op: "≠",
+                            negated: false,
+                        },
+                        Vec::new(),
+                    ));
+                }
+            }
+            Some(out)
+        }
+        other => Some(vec![comparison(other, false, vars, prod)?]),
+    }
+}
+
+/// Render one slot. The product renders with the CANONICAL factor order at every
+/// occurrence — the O1 requirement that makes it a single `omega` atom.
+fn render_nia_slot(slot: NiaSlot, prod: (usize, usize)) -> String {
+    match slot {
+        NiaSlot::Var(i) => format!("(m {i})"),
+        NiaSlot::Product => format!("((m {}) * (m {}))", prod.0, prod.1),
+    }
+}
+
+/// Render a normal form as a Lean `Int` expression. Rendering FROM the normal
+/// form (rather than from the surface term) is what makes the emitted goal and
+/// the Rust gate the same system by construction.
+fn render_nia_lin(lin: &NiaLin, prod: (usize, usize)) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (slot, &c) in &lin.coeffs {
+        let expr = render_nia_slot(*slot, prod);
+        parts.push(match c {
+            1 => expr,
+            -1 => format!("(- {expr})"),
+            _ => format!("(({c} : Int) * {expr})"),
+        });
+    }
+    if parts.is_empty() || lin.konst != 0 {
+        parts.push(format!("({} : Int)", lin.konst));
+    }
+    if parts.len() == 1 {
+        parts.swap_remove(0)
+    } else {
+        format!("({})", parts.join(" + "))
+    }
+}
+
+fn render_nia_atom(atom: &NiaAtom, prod: (usize, usize)) -> String {
+    let body = format!(
+        "{} {} {}",
+        render_nia_lin(&atom.lhs, prod),
+        atom.op,
+        render_nia_lin(&atom.rhs, prod)
+    );
+    if atom.negated {
+        format!("¬ ({body})")
+    } else {
+        body
+    }
+}
+
+/// Tightest integer bounds on `var` derivable from the SINGLE-variable gate rows
+/// — never from a combination, so the matching Lean `(by omega)` side goal is
+/// discharged directly from one hypothesis already in the cascade's scope.
+fn nia_unit_bounds(rows: &[NiaLin], var: usize) -> (Option<i64>, Option<i64>) {
+    let (mut lo, mut hi) = (None::<i64>, None::<i64>);
+    for row in rows {
+        if row.coeffs.len() != 1 {
+            continue;
+        }
+        let Some((NiaSlot::Var(i), &coeff)) = row.coeffs.iter().next() else {
+            continue;
+        };
+        if *i != var {
+            continue;
+        }
+        // coeff·v + k ≤ 0.
+        if coeff > 0 {
+            // v ≤ -k/coeff, floored (v is an integer).
+            let Some(neg_k) = row.konst.checked_neg() else {
+                continue;
+            };
+            let Some(b) = nia_floor_div(neg_k, coeff) else {
+                continue;
+            };
+            hi = Some(hi.map_or(b, |h| h.min(b)));
+        } else if coeff < 0 {
+            // v ≥ k/(-coeff), ceiled.
+            let Some(den) = coeff.checked_neg() else {
+                continue;
+            };
+            let Some(b) = nia_ceil_div(row.konst, den) else {
+                continue;
+            };
+            lo = Some(lo.map_or(b, |l| l.max(b)));
+        }
+    }
+    (lo, hi)
+}
+
+/// Floor of `a / b` for `b > 0`.
+fn nia_floor_div(a: i64, b: i64) -> Option<i64> {
+    let q = a.checked_div(b)?;
+    let r = a.checked_rem(b)?;
+    if r < 0 {
+        q.checked_sub(1)
+    } else {
+        Some(q)
+    }
+}
+
+/// Ceiling of `a / b` for `b > 0`.
+fn nia_ceil_div(a: i64, b: i64) -> Option<i64> {
+    let q = a.checked_div(b)?;
+    let r = a.checked_rem(b)?;
+    if r > 0 {
+        q.checked_add(1)
+    } else {
+        Some(q)
+    }
+}
+
+/// One McCormick corner: the Lean `have` that introduces it and the LINEAR row
+/// it contributes to the Rust gate. Both are built from the same `(i, j, p, q)`
+/// data, so the gate cannot assume a bound the emitted proof does not derive.
+struct NiaCorner {
+    have_line: String,
+    row: NiaLin,
+}
+
+/// Which corner of the McCormick envelope: the `AySoundness.NiaProduct` lemma
+/// name, its two bound binder names, and whether it bounds `x · y` from BELOW
+/// (`sign = 1`) or from ABOVE (`sign = -1`). In every corner the first bound `p`
+/// constrains `x = varᵢ` and the second bound `q` constrains `y = varⱼ`, and the
+/// conclusion is `p·y + q·x - p·q ≤ x·y` (below) or `x·y ≤ p·y + q·x - p·q`
+/// (above).
+struct NiaCornerKind {
+    lemma: &'static str,
+    x_binder: &'static str,
+    y_binder: &'static str,
+    sign: i64,
+}
+
+/// `a ≤ x`, `c ≤ y` ⟹ `a·y + c·x - a·c ≤ x·y`.
+const NIA_CORNER_LB_LL: NiaCornerKind = NiaCornerKind {
+    lemma: "mul_lb_ll",
+    x_binder: "a",
+    y_binder: "c",
+    sign: 1,
+};
+/// `x ≤ b`, `y ≤ d` ⟹ `b·y + d·x - b·d ≤ x·y`.
+const NIA_CORNER_LB_UU: NiaCornerKind = NiaCornerKind {
+    lemma: "mul_lb_uu",
+    x_binder: "b",
+    y_binder: "d",
+    sign: 1,
+};
+/// `x ≤ b`, `c ≤ y` ⟹ `x·y ≤ b·y + c·x - b·c`.
+const NIA_CORNER_UB_UL: NiaCornerKind = NiaCornerKind {
+    lemma: "mul_ub_ul",
+    x_binder: "b",
+    y_binder: "c",
+    sign: -1,
+};
+/// `a ≤ x`, `y ≤ d` ⟹ `x·y ≤ a·y + d·x - a·d`.
+const NIA_CORNER_UB_LU: NiaCornerKind = NiaCornerKind {
+    lemma: "mul_ub_lu",
+    x_binder: "a",
+    y_binder: "d",
+    sign: -1,
+};
+
+/// Build corner `kind` (named `hb{index}` in the emitted proof) under factor
+/// indices `(i, j)` and the two bounds `p` (on `x = varᵢ`) and `q` (on
+/// `y = varⱼ`). Squares (`i == j`) need no special case: both coefficient
+/// contributions land on the same slot.
+fn nia_corner(
+    kind: &NiaCornerKind,
+    index: usize,
+    i: usize,
+    j: usize,
+    p: i64,
+    q: i64,
+) -> Option<NiaCorner> {
+    let sign = kind.sign;
+    let mut row = NiaLin::constant(p.checked_mul(q)?.checked_neg()?.checked_mul(sign)?);
+    for (slot, coeff) in [(NiaSlot::Var(j), p), (NiaSlot::Var(i), q)] {
+        let scaled = coeff.checked_mul(sign)?;
+        let next = row
+            .coeffs
+            .get(&slot)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(scaled)?;
+        if next == 0 {
+            row.coeffs.remove(&slot);
+        } else {
+            row.coeffs.insert(slot, next);
+        }
+    }
+    // `sign = +1` ⟹ subtract the product slot; `sign = -1` ⟹ add it.
+    let product = row
+        .coeffs
+        .get(&NiaSlot::Product)
+        .copied()
+        .unwrap_or_default()
+        .checked_sub(sign)?;
+    if product == 0 {
+        row.coeffs.remove(&NiaSlot::Product);
+    } else {
+        row.coeffs.insert(NiaSlot::Product, product);
+    }
+    Some(NiaCorner {
+        have_line: format!(
+            "have hb{index} := AySoundness.NiaProduct.{lemma} (x := (m {i})) (y := (m {j})) \
+             ({x_binder} := ({p} : Int)) ({y_binder} := ({q} : Int)) (by omega) (by omega)",
+            lemma = kind.lemma,
+            x_binder = kind.x_binder,
+            y_binder = kind.y_binder,
+        ),
+        row,
+    })
+}
+
+/// A Fourier–Motzkin working row `Σ c·slot + k ≤ 0` over `i128`.
+#[derive(Clone)]
+struct NiaFmRow {
+    coeffs: std::collections::BTreeMap<NiaSlot, i128>,
+    konst: i128,
+}
+
+fn nia_gcd(a: i128, b: i128) -> i128 {
+    let (mut a, mut b) = (a.abs(), b.abs());
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+/// Ceiling of `a / b` for `b > 0`, over `i128`.
+fn nia_i128_ceil_div(a: i128, b: i128) -> i128 {
+    let q = a / b;
+    if a % b > 0 {
+        q + 1
+    } else {
+        q
+    }
+}
+
+/// Drop zero coefficients, divide through by the coefficient gcd and TIGHTEN the
+/// constant: `Σ c·s ≤ -k` with `g | c` for all `c` means the (integral) left side
+/// is a multiple of `g`, so `Σ (c/g)·s ≤ ⌊-k/g⌋`. Every row produced this way is
+/// an INTEGER consequence of its input, which is exactly what lets a derived
+/// contradiction transfer to `omega`. `None` on a magnitude blow-up.
+fn nia_fm_normalise(mut row: NiaFmRow) -> Option<NiaFmRow> {
+    row.coeffs.retain(|_, c| *c != 0);
+    let mut g: i128 = 0;
+    for c in row.coeffs.values() {
+        g = nia_gcd(g, *c);
+    }
+    if g > 1 {
+        for c in row.coeffs.values_mut() {
+            *c /= g;
+        }
+        row.konst = nia_i128_ceil_div(row.konst, g);
+    }
+    if row.konst.abs() > NIA_FM_MAX_MAGNITUDE
+        || row.coeffs.values().any(|c| c.abs() > NIA_FM_MAX_MAGNITUDE)
+    {
+        return None;
+    }
+    Some(row)
+}
+
+/// Eliminate `slot` from `pos` (coefficient > 0) and `neg` (coefficient < 0) by
+/// the positive combination `(-cn)·pos + cp·neg`.
+fn nia_fm_combine(pos: &NiaFmRow, neg: &NiaFmRow, slot: NiaSlot) -> Option<NiaFmRow> {
+    let cp = *pos.coeffs.get(&slot)?;
+    let cn = *neg.coeffs.get(&slot)?;
+    let (m_pos, m_neg) = (cn.checked_neg()?, cp);
+    let mut coeffs: std::collections::BTreeMap<NiaSlot, i128> = std::collections::BTreeMap::new();
+    for (s, &c) in &pos.coeffs {
+        coeffs.insert(*s, c.checked_mul(m_pos)?);
+    }
+    for (s, &c) in &neg.coeffs {
+        let add = c.checked_mul(m_neg)?;
+        let next = coeffs
+            .get(s)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(add)?;
+        coeffs.insert(*s, next);
+    }
+    coeffs.remove(&slot);
+    let konst = pos
+        .konst
+        .checked_mul(m_pos)?
+        .checked_add(neg.konst.checked_mul(m_neg)?)?;
+    nia_fm_normalise(NiaFmRow { coeffs, konst })
+}
+
+/// Decide whether `rows` (each `Σ c·slot + k ≤ 0`) is INFEASIBLE over the
+/// integers, by Fourier–Motzkin elimination with per-row integer tightening.
+///
+/// This is deliberately an UNDER-approximation: `true` is a proof of
+/// infeasibility (every derived row is an integer consequence of the input), and
+/// `false` merely means "not established here" — including every resource-limit
+/// and overflow bail-out. `omega` is complete for linear integer arithmetic, so
+/// `true` guarantees `omega` closes the corresponding Lean goal.
+fn nia_rows_infeasible(rows: &[NiaLin]) -> bool {
+    let Some(mut work) = rows
+        .iter()
+        .map(|r| {
+            nia_fm_normalise(NiaFmRow {
+                coeffs: r.coeffs.iter().map(|(s, &c)| (*s, i128::from(c))).collect(),
+                konst: i128::from(r.konst),
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    // At most one elimination round per slot (NIA_MAX_VARS variables + product).
+    for _ in 0..=NIA_MAX_VARS {
+        if work.len() > NIA_FM_MAX_ROWS {
+            return false;
+        }
+        if work.iter().any(|r| r.coeffs.is_empty() && r.konst > 0) {
+            return true;
+        }
+        work.retain(|r| !r.coeffs.is_empty());
+        // Eliminate the slot with the smallest pos×neg product.
+        let mut slots: Vec<NiaSlot> = work.iter().flat_map(|r| r.coeffs.keys().copied()).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let Some(slot) = slots.into_iter().min_by_key(|s| {
+            let pos = work
+                .iter()
+                .filter(|r| r.coeffs.get(s).is_some_and(|c| *c > 0))
+                .count();
+            let neg = work
+                .iter()
+                .filter(|r| r.coeffs.get(s).is_some_and(|c| *c < 0))
+                .count();
+            pos * neg
+        }) else {
+            return false; // no slots left and no contradiction found
+        };
+        let pos: Vec<&NiaFmRow> = work
+            .iter()
+            .filter(|r| r.coeffs.get(&slot).is_some_and(|c| *c > 0))
+            .collect();
+        let neg: Vec<&NiaFmRow> = work
+            .iter()
+            .filter(|r| r.coeffs.get(&slot).is_some_and(|c| *c < 0))
+            .collect();
+        if pos.len().saturating_mul(neg.len()) > NIA_FM_MAX_ROWS {
+            return false;
+        }
+        let mut next: Vec<NiaFmRow> = Vec::new();
+        for p in &pos {
+            for n in &neg {
+                let Some(row) = nia_fm_combine(p, n, slot) else {
+                    return false;
+                };
+                next.push(row);
+            }
+        }
+        next.extend(
+            work.iter()
+                .filter(|r| !r.coeffs.contains_key(&slot))
+                .cloned(),
+        );
+        work = next;
+    }
+    false
+}
+
+/// Emit a verified-firewall Lean proof for a NONLINEAR-INTEGER conflict carried
+/// by ONE bilinear product term, reconstructed from the PARSED frontend
+/// assertions.
+///
+/// ay refutes QF_NIA eagerly (bounded enumeration / bare `:rule trust`), so there
+/// is no theory-lemma clause to ground per step; and the LIA emitter DECLINES the
+/// moment it meets a `var·var` product, because `omega` atomises the product and
+/// then cannot close the goal. This bucket supplies the missing link: the
+/// verified `AySoundness.NiaProduct` McCormick corners relate the atomised
+/// product to its two factors LINEARLY, and the cascade's bottom `omega` finishes.
+///
+/// Recognizer (fail-closed at every step):
+///  * `defs` gates OFF array-valued (`store`-bodied) `define-fun` macros exactly
+///    as the LIA emitter does — an array disequality is NOT an Int atom, and
+///    modelling one as two fresh integers would be an unsound abstraction;
+///  * every surface variable must resolve in `context` as a nullary **Int**
+///    declaration (`cbr_is_int_constant`), so Real/Bool/array/UF atoms decline;
+///  * every assertion must be a comparison, a negated comparison, or `distinct`;
+///  * EXACTLY ONE canonical bilinear product `varᵢ · varⱼ` (`i ≤ j`, squares
+///    allowed) may occur; a second distinct pair, a degree-3 term, or a product
+///    of compound terms declines;
+///  * the reconstructed system — the atom rows PLUS the injected corner rows —
+///    must be proved integer-infeasible by `nia_rows_infeasible` BEFORE anything
+///    is emitted. Without a product there is nothing for this bucket to add over
+///    the LIA emitter, so it declines then too.
+pub(crate) fn emit_nia_product_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    defs: &[(String, PTerm)],
+    context: &ay_frontend::Context,
+) -> Option<String> {
+    // O2: an assertion mentioning an ARRAY-valued macro is not an integer atom.
+    let array_defs = array_valued_def_names(defs);
+    if !array_defs.is_empty() && parsed.iter().any(|a| term_mentions_name(a, &array_defs)) {
+        return None;
+    }
+    if parsed.is_empty() || parsed.len() > NIA_MAX_ASSERTIONS {
+        return None;
+    }
+    let mut vars: Vec<String> = Vec::new();
+    let mut prod: Option<(usize, usize)> = None;
+    let mut atoms: Vec<NiaAtom> = Vec::new();
+    let mut rows: Vec<NiaLin> = Vec::new();
+    for asrt in parsed {
+        for (atom, atom_rows) in nia_assertion_atoms(asrt, &mut vars, &mut prod, context)? {
+            atoms.push(atom);
+            rows.extend(atom_rows);
+        }
+        if atoms.len() > NIA_MAX_ATOMS {
+            return None;
+        }
+    }
+    // No bilinear product ⟹ nothing this bucket can add; the LIA emitter owns it.
+    let (pi, pj) = prod?;
+    if atoms.is_empty() {
+        return None;
+    }
+    // McCormick corners for whichever of the four bound pairs the assertions
+    // actually establish. `sign_consistency` has LOWER bounds only.
+    let (lo_i, hi_i) = nia_unit_bounds(&rows, pi);
+    let (lo_j, hi_j) = nia_unit_bounds(&rows, pj);
+    let mut corners: Vec<NiaCorner> = Vec::new();
+    for (kind, p, q) in [
+        (&NIA_CORNER_LB_LL, lo_i, lo_j),
+        (&NIA_CORNER_LB_UU, hi_i, hi_j),
+        (&NIA_CORNER_UB_UL, hi_i, lo_j),
+        (&NIA_CORNER_UB_LU, lo_i, hi_j),
+    ] {
+        if let (Some(p), Some(q)) = (p, q) {
+            corners.push(nia_corner(kind, corners.len(), pi, pj, p, q)?);
+        }
+    }
+
+    // O5: gate on EXACTLY the system `omega` will see — same slots (one product
+    // atom), same polarities, same corner rows as the emitted `have`s.
+    let mut gate = rows.clone();
+    gate.extend(corners.iter().map(|c| c.row.clone()));
+    if !nia_rows_infeasible(&gate) {
+        return None;
+    }
+
+    let rendered: Vec<String> = atoms.iter().map(|a| render_nia_atom(a, (pi, pj))).collect();
+    let mut closer = String::new();
+    for corner in &corners {
+        closer.push_str(&corner.have_line);
+        closer.push_str("; ");
+    }
+    closer.push_str("omega");
+    Some(render_nia_product_lean(&rendered, &closer))
+}
+
+/// Render the `firewall_combined_unsat`-grounded Lean for a bilinear-product
+/// conflict over the rendered atoms `S₁ … Sₙ`. Identical in shape to
+/// `render_lia_lean_from_parsed`, except that the cascade's bottom introduces the
+/// verified McCormick corner facts before calling `omega`.
+fn render_nia_product_lean(atoms: &[String], closer: &str) -> String {
+    let n = atoms.len();
+    let hash = fnv_hex(&format!("{}\u{1}{closer}", atoms.join("\u{1}")));
+    let arms = atoms
+        .iter()
+        .enumerate()
+        .map(|(i, a)| format!("  | {} => decide ({a})", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let orig = (1..=n)
+        .map(|i| format!("({i}, [{i}])"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let neg = (1..=n)
+        .map(|i| format!("-{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let lemma_id = n + 1;
+    let proof_id = n + 2;
+    let hints = (1..=lemma_id)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cascade = cascade_term_with_closer(atoms, closer);
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.NiaProduct
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — NONLINEAR-INTEGER conflict carried by a
+  single BILINEAR PRODUCT, reconstructed from the parsed frontend assertions and
+  grounded in the verified `firewall_combined_unsat`.
+
+  `omega` decides LINEAR integer arithmetic: it atomises `x * y` into an opaque
+  unknown, so the conflict is not linear-closable on its own. The verified
+  McCormick corner lemmas of `AySoundness.NiaProduct` (each an `Int.mul_nonneg`
+  instance — Lean CORE, no Mathlib) reintroduce the product as LINEAR bounds in
+  the two factors, and the cascade's bottom `omega` then closes `False`.
+
+  Every assertion is asserted POSITIVELY and the single all-negated blocking
+  clause `¬S₁ ∨ … ∨ ¬Sₙ` is discharged by a constructive linear case cascade.
+  Every occurrence of the product uses ONE canonical factor order, so `omega`
+  sees exactly ONE product atom. Model: a valuation `Nat → Int`.
+  axioms ⊆ {{propext, Quot.sound}}.
+-/
+set_option linter.unusedSimpArgs false
+
+namespace AySoundness.Emitted.NiaProd_{hash}
+open AySoundness
+
+abbrev Val := Nat → Int
+
+def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+{arms}
+  | _ => false
+
+def original : List (Cid × Clause) := [{orig}]
+def lemmas   : List (Cid × Clause) := [({lemma_id}, [{neg}])]
+def proof    : List (Cid × Clause × List Int) := [({proof_id}, [], [{hints}])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [{neg}] = true := by
+  simp only [clauseSat, litSat, atomVal, List.any_cons, List.any_nil,
+    Int.reduceGT, Int.reduceNeg, Int.reduceToNat, reduceIte, Bool.or_false,
+    Bool.or_eq_true, Bool.not_eq_eq_eq_not, Bool.not_true, decide_eq_false_iff_not]
+  exact
+    {cascade}
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- No integer valuation satisfies all the asserted (non)linear constraints —
+    through the verified firewall and the verified McCormick product bridge. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.NiaProd_{hash}
+"#
+    )
 }
 
 #[cfg(test)]

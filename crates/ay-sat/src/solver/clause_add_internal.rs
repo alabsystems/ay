@@ -137,6 +137,24 @@ impl Solver {
             let depth_u16 = (depth.min(u16::MAX as usize)) as u16;
             self.arena.set_scope_lim(idx, depth_u16);
         }
+        // #unguarded-tvalid-lemmas STAGE 0 (replay counter): birth-solve
+        // stamp, recorded beside the scope_lim stamp. `incremental_solve_count`
+        // is incremented by `reset_search_state` at solve entry, so clauses
+        // born DURING solve N carry stamp N and conflict analysis counts a
+        // conflict as "from a prior solve's clause" iff stamp < current count.
+        // Clauses added BETWEEN solves carry the previous solve's epoch and
+        // therefore also read as prior-solve births — semantically "created
+        // before the current solve's search began", which is the intended
+        // reading for the cross-solve carryover diagnostic. Gated on
+        // count > 0 so single-shot sessions never allocate the side vec
+        // (a missing entry reads as epoch 0).
+        if self.cold.incremental_solve_count > 0 {
+            if idx >= self.cold.clause_birth_solve.len() {
+                self.cold.clause_birth_solve.resize(idx + 1, 0);
+            }
+            self.cold.clause_birth_solve[idx] =
+                self.cold.incremental_solve_count.min(u64::from(u32::MAX)) as u32;
+        }
         if let Some(ref mut gc_occ) = self.gc_occ {
             // Verify gc_occ can accommodate all literals before adding (#8078).
             for &lit in literals {

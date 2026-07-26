@@ -406,6 +406,14 @@ impl AdaptivePortfolio {
             budget_secs = budget.as_secs_f64(),
             "Adaptive: Fix V1 acyclic-BMC safety re-proof on the original problem"
         );
+        if reproved {
+            // This just ran the SAME exhaustive acyclic BMC on `self.problem`
+            // (already dead-end-stripped in `AdaptivePortfolio::new`) that the
+            // external re-validation path re-runs; record the completed proof so
+            // that path can reuse it instead of recomputing it. Recorded only on
+            // a genuine Safe re-proof. See `crate::acyclic_cert_cache`.
+            crate::acyclic_cert_cache::record_acyclic_bmc_safe(&self.problem, depth);
+        }
         reproved
     }
 

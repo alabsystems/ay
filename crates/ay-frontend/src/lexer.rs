@@ -37,8 +37,20 @@ pub(crate) enum Token<'a> {
     #[regex(r"#b[01]+", |lex| lex.slice())]
     Binary(&'a str),
 
-    /// String literal (SMT-LIB 2.6: `""` escapes a literal quote; also accepts `\"`)
-    #[regex(r#""([^"\\]|\\.|"")*""#, |lex| lex.slice())]
+    /// String literal.
+    ///
+    /// SMT-LIB 2.6: the ONLY in-literal escape is `""`, which denotes one literal
+    /// quote. Backslash is an ordinary printable character, NOT an escape — so a
+    /// literal ends at the first unpaired `"` even when a backslash precedes it.
+    ///
+    /// The previous pattern carried a `\\.` alternative, which made the lexer
+    /// treat `\"` as an escaped quote and therefore SWALLOW the terminating
+    /// quote: `"a\"` was scanned past its real end and on into the rest of the
+    /// file, so well-formed input z3 accepts (`(str.len "a\")` = 2) was rejected
+    /// with "Invalid token in list". This mirrors the same backslash-is-not-an-
+    /// escape rule already enforced when decoding contents in
+    /// `ay_core::unescape_string_contents`.
+    #[regex(r#""([^"]|"")*""#, |lex| lex.slice())]
     String(&'a str),
 
     /// Symbol (identifier)

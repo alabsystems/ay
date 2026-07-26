@@ -154,6 +154,32 @@ const F64_TIER_SIMPLEX_BUDGET: std::time::Duration = std::time::Duration::from_m
 /// sound).
 const F64_TIER_QUALITY_SLACK: f64 = 1e-6;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct CutLoopObservation {
+    rounds_with_cuts: u32,
+    target_reached_after_cut: u32,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CUT_LOOP_OBSERVATION: std::cell::Cell<CutLoopObservation> =
+        const { std::cell::Cell::new(CutLoopObservation {
+            rounds_with_cuts: 0,
+            target_reached_after_cut: 0,
+        }) };
+}
+
+#[cfg(test)]
+fn reset_cut_loop_observation() {
+    CUT_LOOP_OBSERVATION.with(|slot| slot.set(CutLoopObservation::default()));
+}
+
+#[cfg(test)]
+fn cut_loop_observation() -> CutLoopObservation {
+    CUT_LOOP_OBSERVATION.with(std::cell::Cell::get)
+}
+
 /// Computes a sound LP-relaxation lower bound for `min objective` subject to
 /// `constraints`, where every variable is Boolean.
 ///
@@ -396,6 +422,12 @@ fn lp_lower_bound_with_cuts(
         if cuts.is_empty() {
             break; // nothing violated -> LP point is cut-free for these families.
         }
+        #[cfg(test)]
+        CUT_LOOP_OBSERVATION.with(|slot| {
+            let mut observation = slot.get();
+            observation.rounds_with_cuts += 1;
+            slot.set(observation);
+        });
         let take = cuts.len().min(MAX_TOTAL_CUTS - added_cuts);
         working.extend(cuts.into_iter().take(take));
         added_cuts += take;
@@ -418,6 +450,12 @@ fn lp_lower_bound_with_cuts(
         // Same early exit inside the loop: a floor at the target ends the
         // tightening (any further cut round is paid-for but unusable work).
         if early_exit_target.is_some_and(|target| best_bound >= target) {
+            #[cfg(test)]
+            CUT_LOOP_OBSERVATION.with(|slot| {
+                let mut observation = slot.get();
+                observation.target_reached_after_cut += 1;
+                slot.set(observation);
+            });
             return Some(best_bound);
         }
         current_primal = primal;
@@ -590,8 +628,8 @@ fn solve_with_cuts_for_fixing(
 
 /// Test-only: the *base* LP bound with **no** cutting planes (round 0 only).
 /// Used to measure how much the cut loop tightens the bound.
-#[cfg(test)]
-fn lp_lower_bound_no_cuts(
+#[cfg(any(test, feature = "dev-tools"))]
+pub(crate) fn lp_lower_bound_no_cuts(
     objective: &PbObjective,
     constraints: &[PbConstraint],
     num_vars: u32,
@@ -2075,6 +2113,67 @@ fn rational_ceil_to_i64(value: &BigRational) -> Option<i128> {
     i128::try_from(int).ok()
 }
 
+#[cfg(any(test, feature = "dev-tools"))]
+const FARKAS_ANCHOR_OPB_REL: &str =
+    "../../benchmarks/pb-comp/test-instances/optimization-small.opb";
+
+/// Generates the valid/tampered JSON pair consumed by the Lean kernel anchor.
+/// The caller owns persistence; both strings are fully generated and
+/// round-trip-checked before either can be written.
+#[cfg(any(test, feature = "dev-tools"))]
+pub(crate) fn generate_farkas_anchor_json() -> Result<(String, String), String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FARKAS_ANCHOR_OPB_REL);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let instance = crate::parser::parse_opb(&text)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    let objective = instance
+        .objective
+        .as_ref()
+        .ok_or_else(|| format!("{} has no objective", path.display()))?;
+    let model = LpModel::build(objective, &instance.constraints, instance.num_vars)
+        .ok_or_else(|| "build Farkas anchor LP model".to_owned())?;
+    let dual = model
+        .solve_dual(&|| false, None)
+        .ok_or_else(|| "solve Farkas anchor LP".to_owned())?;
+    if dual.bound != 3 {
+        return Err(format!(
+            "anchor LP bound changed: expected 3, got {}",
+            dual.bound
+        ));
+    }
+    let valid = model
+        .build_farkas_cert(&dual)
+        .ok_or_else(|| "build Farkas anchor certificate".to_owned())?;
+    if valid.claimed_bound != dual.bound || !farkas_cert::check_slack(&valid.cert) {
+        return Err("generated valid Farkas anchor failed its checker".to_owned());
+    }
+
+    let mut tampered = valid.clone();
+    let one = QPair::from_int(&num_bigint::BigInt::from(1));
+    let constant = &tampered.cert.base.conclusion.constant;
+    tampered.cert.base.conclusion.constant = QPair::new(
+        &constant.num * &one.den + &one.num * &constant.den,
+        &constant.den * &one.den,
+    );
+    if farkas_cert::check_slack(&tampered.cert) {
+        return Err("generated tampered Farkas anchor unexpectedly passed".to_owned());
+    }
+
+    let valid_json = serde_json::to_string_pretty(&valid.cert)
+        .map_err(|error| format!("serialize valid Farkas anchor: {error}"))?;
+    let tampered_json = serde_json::to_string_pretty(&tampered.cert)
+        .map_err(|error| format!("serialize tampered Farkas anchor: {error}"))?;
+    let valid_back: SCertZ = serde_json::from_str(&valid_json)
+        .map_err(|error| format!("round-trip valid Farkas anchor: {error}"))?;
+    let tampered_back: SCertZ = serde_json::from_str(&tampered_json)
+        .map_err(|error| format!("round-trip tampered Farkas anchor: {error}"))?;
+    if !farkas_cert::check_slack(&valid_back) || farkas_cert::check_slack(&tampered_back) {
+        return Err("round-tripped Farkas anchor verdict changed".to_owned());
+    }
+    Ok((format!("{valid_json}\n"), format!("{tampered_json}\n")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3113,65 +3212,44 @@ mod tests {
         );
     }
 
-    /// Corpus measurement (run explicitly): how often does the i128 fast tier
-    /// overflow into the BigRational fallback on the repo's real PB instances?
-    ///
-    /// Run with:
-    ///   cargo test -p ay-pb --release measure_small_tier_fallback_rate -- --ignored --nocapture
     #[test]
-    #[ignore = "manual corpus measurement of the i128-tier fallback rate"]
-    fn measure_small_tier_fallback_rate() {
-        let root =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/pb-comp");
-        let mut opb_files = Vec::new();
-        let mut stack = vec![root];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "opb") {
-                    opb_files.push(path);
-                }
-            }
-        }
-        opb_files.sort();
-        let (mut attempted, mut built, mut solved, mut overflowed) =
-            (0usize, 0usize, 0usize, 0usize);
-        for path in &opb_files {
-            let Ok(text) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            let Ok(inst) = crate::parser::parse_opb(&text) else {
-                continue;
-            };
-            let Some(obj) = inst.objective.as_ref() else {
-                continue;
-            };
-            attempted += 1;
-            let Some(model) = LpModel::build(obj, &inst.constraints, inst.num_vars) else {
-                continue;
-            };
-            built += 1;
-            // Small-tier only, bounded per instance so the sweep stays quick.
-            let started = std::time::Instant::now();
-            let stop = || started.elapsed() > std::time::Duration::from_secs(5);
-            match model.solve_dual_small(&stop, None) {
-                SmallDualOutcome::Solved(_) => solved += 1,
-                SmallDualOutcome::Overflow => {
-                    overflowed += 1;
-                    eprintln!("OVERFLOW -> bigint fallback: {}", path.display());
-                }
-            }
-        }
-        eprintln!(
-            "small-tier fallback rate: {overflowed}/{built} models overflowed \
-             ({solved} solved small; {attempted} objective instances; {} files)",
-            opb_files.len()
-        );
+    fn small_tier_and_overflow_fallback_are_both_soundly_exercised() {
+        let small_obj = PbObjective {
+            terms: vec![term(1, lit(1)), term(1, lit(2))],
+        };
+        let small_constraint = ge(vec![term(2, lit(1)), term(2, lit(2))], 3);
+        let small_model = LpModel::build(&small_obj, &[small_constraint], 2).expect("small model");
+        let SmallDualOutcome::Solved(Some(small)) = small_model.solve_dual_small(&never_stop, None)
+        else {
+            panic!("bounded coefficients must complete in the i128 tier");
+        };
+        assert_eq!(small.bound, 2);
+
+        let a = (1i128 << 126) - 3;
+        let b = (1i128 << 126) - 5;
+        let huge_obj = PbObjective {
+            terms: vec![term(a, lit(1)), term(b, lit(2))],
+        };
+        let huge_constraint = ge(vec![term(3, lit(1)), term(5, lit(2))], 7);
+        let integer_optimum =
+            brute_force_optimum(&huge_obj, std::slice::from_ref(&huge_constraint), 2)
+                .expect("feasible");
+        let huge_model = LpModel::build(&huge_obj, std::slice::from_ref(&huge_constraint), 2)
+            .expect("huge model");
+        assert!(matches!(
+            huge_model.solve_dual_small(&never_stop, None),
+            SmallDualOutcome::Overflow
+        ));
+        let exact = huge_model
+            .solve_dual_big(&never_stop, None)
+            .expect("exact fallback");
+        let dispatched = huge_model
+            .solve_dual(&never_stop, None)
+            .expect("public fallback");
+        assert_eq!(integer_optimum, a + b);
+        assert!(dispatched.bound <= exact.bound);
+        assert!(exact.bound <= integer_optimum);
+        assert!(dispatched.bound <= integer_optimum);
     }
 
     /// Corpus root for the manual measurement sweeps: `$AY_PBCOMP_BENCH_ROOT`
@@ -3191,234 +3269,95 @@ mod tests {
         measurement_corpus_root().join(rel).display().to_string()
     }
 
-    /// Collects every parseable objective-bearing `.opb` under `root` whose
-    /// [`LpModel`] builds, sorted by path.
-    fn corpus_lp_models(
-        root: &std::path::Path,
-    ) -> Vec<(std::path::PathBuf, PbObjective, Vec<PbConstraint>, u32)> {
-        let mut opb_files = Vec::new();
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "opb") {
-                    opb_files.push(path);
-                }
-            }
-        }
-        opb_files.sort();
-        let mut models = Vec::new();
-        for path in opb_files {
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let Ok(inst) = crate::parser::parse_opb(&text) else {
-                continue;
-            };
-            let Some(obj) = inst.objective else {
-                continue;
-            };
-            if LpModel::build(&obj, &inst.constraints, inst.num_vars).is_none() {
-                continue;
-            }
-            models.push((path, obj, inst.constraints, inst.num_vars));
-        }
-        models
-    }
-
-    /// MEASUREMENT (run explicitly): on every corpus model whose i128 tier
-    /// overflows, compare the f64-certified tier against the BigRational tier —
-    /// bound quality (certified must never exceed a COMPLETED big solve) and
-    /// wall time (3-run medians for both, plus the production-realistic big run
-    /// under the 5s root budget). This is the honest evidence for the certified
-    /// tier: it must win on the data or not ship.
-    ///
-    /// Run with:
-    ///   cargo test -p ay-pb --release measure_f64_certified_tier_on_overflow_corpus -- --ignored --nocapture
     #[test]
-    #[ignore = "manual corpus measurement of the f64-certified tier on the i128-overflow models"]
-    fn measure_f64_certified_tier_on_overflow_corpus() {
-        const BIG_REFERENCE_CAP: std::time::Duration = std::time::Duration::from_secs(10);
-        const BIG_PRODUCTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-
-        fn median(mut xs: Vec<f64>) -> f64 {
-            xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            xs[xs.len() / 2]
-        }
-
-        let root = measurement_corpus_root();
-        let models = corpus_lp_models(&root);
-        eprintln!("corpus: {} LP-modelable objective instances", models.len());
-
-        let mut overflowed = 0usize;
-        let mut certified = 0usize;
-        let mut bound_matches_reference = 0usize;
-        let mut total_cert_ms = 0.0f64;
-        let mut total_big_ref_ms = 0.0f64;
-        for (path, obj, constraints, num_vars) in &models {
-            let model = LpModel::build(obj, constraints, *num_vars).expect("prefiltered");
-            let started = std::time::Instant::now();
-            let stop = || started.elapsed() > std::time::Duration::from_secs(5);
-            if !matches!(
-                model.solve_dual_small(&stop, None),
-                SmallDualOutcome::Overflow
-            ) {
-                continue;
-            }
-            overflowed += 1;
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-
-            // f64-certified tier: 3 timed runs.
-            let mut cert_ms = Vec::new();
-            let mut cert_bounds = Vec::new();
-            for _ in 0..3 {
-                let t = std::time::Instant::now();
-                let result = model.solve_dual_f64_certified(&never_stop);
-                cert_ms.push(t.elapsed().as_secs_f64() * 1e3);
-                cert_bounds.push(result.map(|r| r.bound));
-            }
-            // BigRational tier, production-realistic budget: 3 timed runs.
-            let mut big5_ms = Vec::new();
-            let mut big5_bounds = Vec::new();
-            for _ in 0..3 {
-                let t = std::time::Instant::now();
-                let stop = || t.elapsed() >= BIG_PRODUCTION_BUDGET;
-                let result = model.solve_dual_big(&stop, None);
-                big5_ms.push(t.elapsed().as_secs_f64() * 1e3);
-                big5_bounds.push(result.map(|r| r.bound));
-            }
-            // Budget-theft check: when the certified tier fails closed it steals
-            // its budget from the exact tier. Does the exact tier's floor at
-            // (5s - F64_TIER_SIMPLEX_BUDGET) differ from its floor at 5s? (3 runs.)
-            let mut theft_bounds = Vec::new();
-            for _ in 0..3 {
-                let t = std::time::Instant::now();
-                let reduced = BIG_PRODUCTION_BUDGET.saturating_sub(F64_TIER_SIMPLEX_BUDGET);
-                let stop = || t.elapsed() >= reduced;
-                theft_bounds.push(model.solve_dual_big(&stop, None).map(|r| r.bound));
-            }
-            // BigRational reference (bound-quality yardstick): one capped run.
-            let t = std::time::Instant::now();
-            let stop = || t.elapsed() >= BIG_REFERENCE_CAP;
-            let big_ref = model.solve_dual_big(&stop, None);
-            let big_ref_ms = t.elapsed().as_secs_f64() * 1e3;
-            let big_ref_completed = t.elapsed() < BIG_REFERENCE_CAP.mul_f64(0.95);
-
-            let cert_med = median(cert_ms.clone());
-            let big5_med = median(big5_ms.clone());
-            total_cert_ms += cert_med;
-            total_big_ref_ms += big_ref_ms;
-            let cert_bound = cert_bounds[0];
-            if cert_bound.is_some() {
-                certified += 1;
-            }
-            let big_ref_bound = big_ref.as_ref().map(|r| r.bound);
-            if cert_bound.is_some() && cert_bound == big_ref_bound {
-                bound_matches_reference += 1;
-            }
-            // THE ordering gate, wherever the exact reference COMPLETED.
-            if let (Some(cb), Some(rb), true) = (cert_bound, big_ref_bound, big_ref_completed) {
-                assert!(
-                    cb <= rb,
-                    "{name}: certified bound {cb} EXCEEDS completed exact bound {rb}"
-                );
-            }
-            eprintln!(
-                "{name}: vars={num_vars} cons={} | cert bound={cert_bound:?} med={cert_med:.1}ms \
-                 (runs {cert_ms:?}) | big@5s bound={:?} med={big5_med:.1}ms | big@theft \
-                 bounds={theft_bounds:?} | big@{}s ref bound={big_ref_bound:?} {}ms \
-                 completed={big_ref_completed}",
-                constraints.len(),
-                big5_bounds[0],
-                BIG_REFERENCE_CAP.as_secs(),
-                big_ref_ms as u64,
-            );
-        }
-        eprintln!(
-            "== summary: {overflowed} overflow models; {certified} certified; \
-             {bound_matches_reference} certified bounds equal the exact reference; \
-             total cert median time {total_cert_ms:.0}ms vs total big reference time \
-             {total_big_ref_ms:.0}ms =="
-        );
-    }
-
-    /// FOCUSED MEASUREMENT (run explicitly): the certified tier vs the exact
-    /// tier's production-budget floor on the handful of corpus models the full
-    /// sweep flagged as interesting — the certifying families (hw32, diagcomm)
-    /// and fail-closed representatives (domset, bnatt350). Fast enough to
-    /// re-run after every tier change.
-    ///
-    /// Run with:
-    ///   cargo test -p ay-pb --release measure_f64_certified_tier_focused -- --ignored --nocapture
-    #[test]
-    #[ignore = "manual focused measurement of the certified tier on key overflow models"]
-    fn measure_f64_certified_tier_focused() {
-        let interesting = [
-            "mult_diagcomm_opt_less_teq_nbits_15",
-            "mult_diagcomm_opt_less_teq_nbits_17",
-            "hw32-vm25p",
-            "bnatt350",
-            "domset_v500_e2000_w30_mw19_10",
-        ];
-        let root = measurement_corpus_root();
-        let models = corpus_lp_models(&root);
-        let mut seen = std::collections::BTreeSet::new();
-        for (path, obj, constraints, num_vars) in &models {
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            let Some(&tag) = interesting.iter().find(|t| name.contains(*t)) else {
-                continue;
-            };
-            if !seen.insert(tag) {
-                continue; // the corpus holds duplicates across selected dirs.
-            }
-            let model = LpModel::build(obj, constraints, *num_vars).expect("prefiltered");
-            let mut cert_ms = Vec::new();
-            let mut cert_bounds = Vec::new();
-            for _ in 0..3 {
-                let t = std::time::Instant::now();
-                let result = model.solve_dual_f64_certified(&never_stop);
-                cert_ms.push(t.elapsed().as_secs_f64() * 1e3);
-                cert_bounds.push(result.map(|r| r.bound));
-            }
-            let t = std::time::Instant::now();
-            let stop = || t.elapsed() >= std::time::Duration::from_secs(5);
-            let big5 = model.solve_dual_big(&stop, None).map(|r| r.bound);
-            let big5_ms = t.elapsed().as_secs_f64() * 1e3;
-            eprintln!(
-                "{name}: cert bounds={cert_bounds:?} times={cert_ms:?}ms | big@5s {big5:?} \
-                 {big5_ms:.0}ms"
-            );
-        }
-    }
-
-    /// DIAGNOSIS (run explicitly): does the advisory f64 simplex CONVERGE on a
-    /// domset overflow model given a long budget, or does it cycle? Prints the
-    /// elapsed time (elapsed << budget means it reached optimality) and the
-    /// certified bound at several budgets. Drives the certified tier's budget
-    /// choice honestly.
-    ///
-    /// Run with:
-    ///   cargo test -p ay-pb --release diagnose_f64_simplex_on_domset -- --ignored --nocapture
-    #[test]
-    #[ignore = "manual diagnosis of the f64 simplex on the domset overflow family"]
-    fn diagnose_f64_simplex_on_domset() {
-        let root = measurement_corpus_root();
-        let path = root.join(
-            "selected-PB24/PB24/normalized-PB06/OPT-LIN/submitted-PB06/liu/domset/\
-             normalized-domset_v500_e2000_w30_mw19_10.opb.PB06.opb",
-        );
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            eprintln!("domset model absent at {}; skipping", path.display());
-            return;
+    fn f64_certified_overflow_bound_is_exactly_rechecked() {
+        let a = (1i128 << 126) - 3;
+        let b = (1i128 << 126) - 5;
+        let objective = PbObjective {
+            terms: vec![term(a, lit(1)), term(b, lit(2))],
         };
-        let inst = crate::parser::parse_opb(&text).expect("parse domset");
-        let obj = inst.objective.clone().expect("objective");
-        let model = LpModel::build(&obj, &inst.constraints, inst.num_vars).expect("model");
+        let constraint = ge(vec![term(3, lit(1)), term(5, lit(2))], 7);
+        let integer_optimum = brute_force_optimum(&objective, std::slice::from_ref(&constraint), 2)
+            .expect("feasible");
+        let model =
+            LpModel::build(&objective, std::slice::from_ref(&constraint), 2).expect("model");
+        assert!(matches!(
+            model.solve_dual_small(&never_stop, None),
+            SmallDualOutcome::Overflow
+        ));
+
+        let certified = model
+            .solve_dual_f64_certified(&never_stop)
+            .expect("bounded overflow fixture must certify");
+        let exact = model
+            .solve_dual_big(&never_stop, None)
+            .expect("exact reference");
+        assert_certified_dual_verifies(&model, &certified, "overflow fixture");
+        assert!(certified.bound <= exact.bound);
+        assert!(certified.bound <= integer_optimum);
+
+        let cert = model.build_farkas_cert(&certified).expect("Farkas cert");
+        assert_eq!(cert.claimed_bound, certified.bound);
+        assert!(
+            farkas_cert::check_slack(&cert.cert),
+            "the checker must accept the certified overflow bound"
+        );
+    }
+
+    #[test]
+    fn certified_tier_is_sound_across_focused_overflow_shapes() {
+        let a = (1i128 << 126) - 3;
+        let b = (1i128 << 126) - 5;
+        for rhs in [3i128, 5, 7] {
+            let objective = PbObjective {
+                terms: vec![term(a, lit(1)), term(b, lit(2))],
+            };
+            let constraint = ge(vec![term(3, lit(1)), term(5, lit(2))], rhs);
+            let integer_optimum =
+                brute_force_optimum(&objective, std::slice::from_ref(&constraint), 2)
+                    .expect("feasible");
+            let model =
+                LpModel::build(&objective, std::slice::from_ref(&constraint), 2).expect("model");
+            assert!(matches!(
+                model.solve_dual_small(&never_stop, None),
+                SmallDualOutcome::Overflow
+            ));
+            let certified = model
+                .solve_dual_f64_certified(&never_stop)
+                .expect("focused overflow fixture must certify");
+            let exact = model
+                .solve_dual_big(&never_stop, None)
+                .expect("exact reference");
+            assert_certified_dual_verifies(&model, &certified, "focused fixture");
+            assert!(certified.bound <= exact.bound);
+            assert!(certified.bound <= integer_optimum);
+        }
+    }
+
+    #[test]
+    fn f64_simplex_converges_on_bounded_dominating_cycle() {
+        // Closed-neighborhood cover on a 12-cycle. Selecting every third vertex
+        // is feasible with value 4, which is also the exact LP optimum.
+        let n_vars = 12u32;
+        let objective = PbObjective {
+            terms: (1..=n_vars).map(|var| term(1, lit(var))).collect(),
+        };
+        let constraints: Vec<_> = (0..n_vars)
+            .map(|index| {
+                let prev = (index + n_vars - 1) % n_vars + 1;
+                let this = index + 1;
+                let next = (index + 1) % n_vars + 1;
+                ge(
+                    vec![term(1, lit(prev)), term(1, lit(this)), term(1, lit(next))],
+                    1,
+                )
+            })
+            .collect();
+        assert_eq!(
+            brute_force_optimum(&objective, &constraints, n_vars),
+            Some(4)
+        );
+        let model = LpModel::build(&objective, &constraints, n_vars).expect("model");
 
         // Rebuild the f64 image exactly as the certified tier does.
         let n = model.c.len();
@@ -3437,127 +3376,77 @@ mod tests {
             })
             .collect();
 
-        for budget_ms in [1_500u64, 6_000, 20_000] {
-            let budget = std::time::Duration::from_millis(budget_ms);
-            let t = std::time::Instant::now();
-            let solved = crate::optimize::safe_lp_bound::approx_dual_for_box_lp(
+        let (dual, primal, converged) =
+            crate::optimize::safe_lp_bound::approx_dual_for_box_lp_with_iteration_budget(
                 n,
-                c_f64.clone(),
-                rows_f64.clone(),
-                budget,
+                c_f64,
+                rows_f64,
+                20_000,
                 &never_stop,
-            );
-            let elapsed = t.elapsed();
-            let Some((dual, primal, converged)) = solved else {
-                eprintln!("budget {budget_ms}ms: simplex declined");
-                continue;
-            };
-            // NS-style f64 estimates of the dual bound and primal objective.
-            let mut ns = model.offset.to_f64().unwrap_or(0.0);
-            let mut aty = vec![0.0f64; n];
-            for (r, (coeffs, b)) in rows_f64.iter().enumerate() {
-                let yr = dual[r].max(0.0);
-                if yr == 0.0 {
-                    continue;
-                }
-                ns += b * yr;
-                for &(v, a) in coeffs {
-                    aty[v] += a * yr;
-                }
-            }
-            for v in 0..n {
-                ns += (c_f64[v] - aty[v]).min(0.0);
-            }
-            let mut primal_obj = model.offset.to_f64().unwrap_or(0.0);
-            for (v, &x) in primal.iter().enumerate() {
-                primal_obj += c_f64[v] * x.clamp(0.0, 1.0);
-            }
-            eprintln!(
-                "budget {budget_ms}ms: elapsed {elapsed:?} (converged: {converged}), NS dual \
-                 estimate {ns:.3}, primal objective estimate {primal_obj:.3}"
-            );
-        }
+            )
+            .expect("bounded f64 relaxation");
+        assert!(converged);
+        assert_eq!(dual.len(), constraints.len());
+        assert_eq!(primal.len(), n);
+        assert!(dual.iter().all(|value| value.is_finite()));
+        assert!(primal.iter().all(|value| value.is_finite()));
+
+        let certified = model
+            .solve_dual_f64_certified(&never_stop)
+            .expect("certified cycle bound");
+        assert_certified_dual_verifies(&model, &certified, "dominating cycle");
+        assert_eq!(certified.bound, 4);
     }
 
-    /// PROFILE (run explicitly): LP re-entry candidate `lo_14x14_007` — the
-    /// class where the first incumbent sits ABOVE the LP optimum, so the root
-    /// LP's early-exit target cannot fire and the call pays full tightening.
-    /// Measures (a) the base and cut-tightened LP floor and their cost, (b) the
-    /// cost of targeted re-solves at targets around the floor (what a re-entry
-    /// would pay), and (c) a short real optimize run's incumbent trajectory
-    /// (does the incumbent ever approach the floor within a sane budget?).
-    /// The re-entry feature ships only if these numbers show a win.
-    ///
-    /// Run with:
-    ///   cargo test -p ay-pb --release profile_lp_reentry_lo_14x14_007 -- --ignored --nocapture
     #[test]
-    #[ignore = "manual profile for the LP re-entry decision on lo_14x14_007"]
-    fn profile_lp_reentry_lo_14x14_007() {
-        let path = measurement_corpus_root().join(
-            "selected-PB25/PB24/normalized-PB15eval/OPT-LIN/dt-problems/\
-             normalized-lo_14x14_007.opb.metafix.opb",
+    fn targeted_lp_reentry_is_sound_and_lossless_on_gap_fixture() {
+        // Minimum vertex cover of K4: the integer optimum is 3 while the base
+        // LP relaxation has the all-halves solution of value 2.
+        let objective = PbObjective {
+            terms: (1..=4).map(|var| term(1, lit(var))).collect(),
+        };
+        let mut constraints = Vec::new();
+        for left in 1..=4u32 {
+            for right in (left + 1)..=4 {
+                constraints.push(ge(vec![term(1, lit(left)), term(1, lit(right))], 1));
+            }
+        }
+        let optimum = brute_force_optimum(&objective, &constraints, 4).expect("feasible");
+        assert_eq!(optimum, 3);
+        let base = lp_lower_bound_no_cuts(&objective, &constraints, 4, &never_stop).expect("base");
+        let full = lp_lower_bound(&objective, &constraints, 4, &never_stop).expect("full");
+        assert_eq!(base, 2, "the all-halves base LP must remain fractional");
+        assert_eq!(
+            full, 3,
+            "the clique cut must close the K4 cover gap exactly"
         );
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            eprintln!("lo_14x14_007 absent at {}; skipping", path.display());
-            return;
-        };
-        let inst = crate::parser::parse_opb(&text).expect("parse lo_14x14_007");
-        let obj = inst.objective.clone().expect("objective");
 
-        // (a) Base vs cut-tightened floor, timed (3 runs each, median by eye).
-        for run in 0..3 {
-            let t = std::time::Instant::now();
-            let base = lp_lower_bound_no_cuts(&obj, &inst.constraints, inst.num_vars, &never_stop);
-            let t_base = t.elapsed();
-            let t = std::time::Instant::now();
-            let full = lp_lower_bound(&obj, &inst.constraints, inst.num_vars, &never_stop);
-            let t_full = t.elapsed();
-            eprintln!(
-                "run {run}: base floor {base:?} in {t_base:?}; cut floor {full:?} in {t_full:?}"
-            );
-        }
-        let floor =
-            lp_lower_bound(&obj, &inst.constraints, inst.num_vars, &never_stop).expect("cut floor");
+        reset_cut_loop_observation();
+        let reachable =
+            lp_lower_bound_with_target(&objective, &constraints, 4, Some(full), &never_stop)
+                .expect("reachable target");
+        assert_eq!(reachable, 3);
+        let reachable_path = cut_loop_observation();
+        assert!(
+            reachable_path.rounds_with_cuts >= 1,
+            "the target must re-enter the cut loop rather than return the base bound"
+        );
+        assert_eq!(
+            reachable_path.target_reached_after_cut, 1,
+            "the reachable target must take the after-cut early-exit path"
+        );
 
-        // (b) Targeted re-solves around the floor: what one re-entry would cost.
-        for delta in [0i128, 1, 2, 5, 20] {
-            let target = floor + delta;
-            let t = std::time::Instant::now();
-            let bound = lp_lower_bound_with_target(
-                &obj,
-                &inst.constraints,
-                inst.num_vars,
-                Some(target),
-                &never_stop,
-            );
-            eprintln!(
-                "target floor+{delta} = {target}: bound {bound:?} in {:?} (fires: {})",
-                t.elapsed(),
-                bound.is_some_and(|b| b >= target)
-            );
-        }
-
-        // (c) Short real optimize run: incumbent trajectory vs the floor.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        let t0 = std::time::Instant::now();
-        let mut trajectory: Vec<(f64, i128)> = Vec::new();
-        let mut on_improve = |value: i128, _model: &[bool]| {
-            trajectory.push((t0.elapsed().as_secs_f64(), value));
-        };
-        let mut solver = crate::cdcl::PbCdclSolver::new(&inst);
-        let result = solver.solve_optimize_interruptible(&obj, Some(&mut on_improve), || {
-            std::time::Instant::now() >= deadline
-        });
-        let summary = match &result {
-            crate::cdcl::PbCdclResult::Optimal(_, v) => format!("Optimal({v})"),
-            crate::cdcl::PbCdclResult::Feasible(_, v) => format!("Feasible({v})"),
-            other => format!("{other:?}"),
-        };
-        eprintln!("optimize (20s cap) result: {summary}");
-        eprintln!("cut floor = {floor}; incumbent trajectory (t_secs, value):");
-        for (t, v) in &trajectory {
-            eprintln!("  {t:8.2}s  {v}");
-        }
+        reset_cut_loop_observation();
+        let unreachable =
+            lp_lower_bound_with_target(&objective, &constraints, 4, Some(optimum + 1), &never_stop)
+                .expect("completed unreachable target");
+        assert_eq!(unreachable, 3);
+        let unreachable_path = cut_loop_observation();
+        assert!(unreachable_path.rounds_with_cuts >= 1);
+        assert_eq!(
+            unreachable_path.target_reached_after_cut, 0,
+            "an unreachable target must complete instead of taking the target exit"
+        );
     }
 
     // --- Farkas certificate: build + check a REAL ay LP bound. --- //
@@ -3662,24 +3551,10 @@ mod tests {
     /// the certificate this instance produces.
     const ANCHOR_OPB_REL: &str = "../../benchmarks/pb-comp/test-instances/optimization-small.opb";
 
-    /// KERNEL-ANCHOR EXPORT (ignored by default; run explicitly to refresh the
-    /// Lean fixtures): drive a REAL on-disk `.opb` through ay's *gated production*
-    /// certificate path ([`lp_lower_bound_with_cert`] with `AY_PB_FARKAS_CERT` set),
-    /// then emit the genuine emitted certificate plus a TAMPERED variant, as JSON via
-    /// the existing serde, into `verification/lean/farkas_anchor/`. The companion
-    /// Lean file `verification/lean/FarkasAnchor.lean` reconstructs the `SCertZ`
-    /// literal from these decimal-string QPairs and re-checks `checkSlackEntailmentZ`
-    /// in the Lean kernel (must agree with `check_slack`: valid -> true, tampered ->
-    /// false).
-    ///
-    /// The instance is the real on-disk [`ANCHOR_OPB_REL`] (`optimization-small.opb`,
-    /// exact LP floor 3) — the SAME bytes a user would solve.
-    ///
-    /// Run with:
-    ///   cargo test -p ay-pb --lib emit_farkas_cert_json_for_lean_anchor -- --ignored --nocapture
+    /// Build and serialize the kernel anchor in memory from the tracked OPB,
+    /// then require the checker to accept it and reject a one-unit inflation.
     #[test]
-    #[ignore = "fixture exporter for the Lean kernel anchor; run explicitly"]
-    fn emit_farkas_cert_json_for_lean_anchor() {
+    fn farkas_anchor_serialization_preserves_checker_verdicts() {
         // Parse the REAL on-disk instance (the exact bytes shipped in the repo).
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(ANCHOR_OPB_REL);
         let text = std::fs::read_to_string(&path).expect("read anchor OPB");
@@ -3689,27 +3564,12 @@ mod tests {
             .clone()
             .expect("anchor instance has objective");
 
-        // Drive ay's GATED PRODUCTION path: with AY_PB_FARKAS_CERT set, this is the
-        // exact wiring `native_oll` uses — build the cert from the dual point in hand,
-        // then `check_slack` it. (Env is process-global; serialized + restored via
-        // the one workspace env choke point.)
-        let result = with_serialized_env_vars(&[("AY_PB_FARKAS_CERT", "1")], || {
-            lp_lower_bound_with_cert(
-                &objective,
-                &instance.constraints,
-                instance.num_vars,
-                &never_stop,
-            )
-        });
-
-        let (bound, valid, outcome) = result.expect("certified bound");
-        assert_eq!(
-            outcome,
-            CertOutcome::Verified,
-            "the gated path MUST verify the certificate for the real anchor instance"
-        );
-        let valid = valid.expect("a cert is present when Verified");
-        assert_eq!(valid.claimed_bound, bound);
+        let model =
+            LpModel::build(&objective, &instance.constraints, instance.num_vars).expect("model");
+        let dual = model.solve_dual(&never_stop, None).expect("dual");
+        assert_eq!(dual.bound, 3);
+        let valid = model.build_farkas_cert(&dual).expect("certificate");
+        assert_eq!(valid.claimed_bound, dual.bound);
         assert!(
             farkas_cert::check_slack(&valid.cert),
             "valid real cert MUST pass check_slack (Rust)"
@@ -3726,38 +3586,18 @@ mod tests {
             "tampered real cert MUST be rejected by check_slack (Rust)"
         );
 
-        // Emit both certs (the checkable SCertZ payload) as JSON next to the Lean
-        // anchor file, using the existing serde (BigInt as decimal strings).
-        let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../verification/lean/farkas_anchor");
-        std::fs::create_dir_all(&out_dir).expect("create anchor dir");
-
         let valid_json = serde_json::to_string_pretty(&valid.cert).expect("serialize valid");
         let tampered_json =
             serde_json::to_string_pretty(&tampered.cert).expect("serialize tampered");
-        std::fs::write(out_dir.join("valid_cert.json"), &valid_json).expect("write valid");
-        std::fs::write(out_dir.join("tampered_cert.json"), &tampered_json).expect("write tampered");
 
-        // Round-trip sanity: the persisted JSON re-checks identically (true / false),
-        // confirming the bytes the Lean side reads carry the same decision.
+        // Round-trip sanity: the in-memory JSON retains both checker verdicts.
         let valid_back: SCertZ = serde_json::from_str(&valid_json).expect("deser valid");
         let tampered_back: SCertZ = serde_json::from_str(&tampered_json).expect("deser tampered");
         assert!(farkas_cert::check_slack(&valid_back));
         assert!(!farkas_cert::check_slack(&tampered_back));
-
-        eprintln!(
-            "anchor instance: {ANCHOR_OPB_REL}  (vars={}, constraints={}, bound={bound})",
-            instance.num_vars,
-            instance.constraints.len()
-        );
-        eprintln!("wrote {}", out_dir.join("valid_cert.json").display());
-        eprintln!("wrote {}", out_dir.join("tampered_cert.json").display());
-        eprintln!("--- valid_cert.json ---\n{valid_json}");
-        eprintln!("--- tampered_cert.json ---\n{tampered_json}");
     }
 
-    /// CROSS-CHECKED FUSION: load the FRESH fixtures regenerated by
-    /// `emit_farkas_cert_json_for_lean_anchor` and assert the Rust checker
+    /// CROSS-CHECKED FUSION: load the committed fixtures and assert the Rust checker
     /// [`farkas_cert::check_slack`] ACCEPTS `valid_cert.json` and REJECTS
     /// `tampered_cert.json` — the SAME two artifacts the Lean kernel anchor
     /// (`verification/lean/FarkasAnchor.lean`) reduces by `decide`. This is the
@@ -3777,6 +3617,21 @@ mod tests {
         let valid: SCertZ = serde_json::from_str(&valid_text).expect("deserialize valid_cert.json");
         let tampered: SCertZ =
             serde_json::from_str(&tampered_text).expect("deserialize tampered_cert.json");
+        let (generated_valid_text, generated_tampered_text) =
+            generate_farkas_anchor_json().expect("regenerate Farkas anchor fixtures");
+        let generated_valid: SCertZ = serde_json::from_str(&generated_valid_text)
+            .expect("deserialize regenerated valid certificate");
+        let generated_tampered: SCertZ = serde_json::from_str(&generated_tampered_text)
+            .expect("deserialize regenerated tampered certificate");
+
+        assert_eq!(
+            generated_valid, valid,
+            "committed valid_cert.json must equal the current generator output"
+        );
+        assert_eq!(
+            generated_tampered, tampered,
+            "committed tampered_cert.json must equal the current generator output"
+        );
 
         assert!(
             farkas_cert::check_slack(&valid),
@@ -4277,109 +4132,83 @@ mod tests {
         eprintln!("cut loop tightened {tightened}/{checked} feasible instances");
     }
 
-    // --- Real-instance soundness: LP_LB <= known Exact optimum. ---
-
     #[test]
-    #[ignore = "manual benchmark measurement against local PB25 instances"]
-    fn measure_opt_lin_lp_bounds() {
-        let dir = pbcomp_path("PB25/normalized-PB25/OPT-LIN/wallon");
-        for name in [
-            "normalized-Clique-c0125-9_c24.opb",
-            "normalized-GolombRuler-a3v18-15_c18.opb",
-            "normalized-FoolSolitaire-table-2-0_c24.opb",
-            "normalized-Charlotte-mini-24-2_c24.opb",
-            "normalized-AztecDiamondSym-mini-07_c24.opb",
-        ] {
-            let path = format!("{dir}/{name}");
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                eprintln!("{name}: absent");
-                continue;
-            };
-            let inst = match crate::parser::parse_opb(&text) {
-                Ok(i) => i,
-                Err(e) => {
-                    eprintln!("{name}: parse error {e:?}");
-                    continue;
-                }
-            };
-            let Some(obj) = inst.objective.as_ref() else {
-                eprintln!("{name}: no objective");
-                continue;
-            };
-            let t0 = std::time::Instant::now();
-            let base = lp_lower_bound_no_cuts(obj, &inst.constraints, inst.num_vars, &never_stop);
-            let t_base = t0.elapsed().as_millis();
-            let t1 = std::time::Instant::now();
-            let lb = lp_lower_bound(obj, &inst.constraints, inst.num_vars, &never_stop);
-            eprintln!(
-                "{name}: vars={} cons={} LP_LB(base)={:?} ({} ms)  LP_LB(cuts)={:?} ({} ms)",
-                inst.num_vars,
-                inst.constraints.len(),
-                base,
-                t_base,
-                lb,
-                t1.elapsed().as_millis()
-            );
+    fn lp_bounds_are_sound_across_bounded_optimization_families() {
+        let cases = vec![
+            (
+                PbObjective {
+                    terms: vec![term(1, lit(1)), term(1, lit(2))],
+                },
+                vec![ge(vec![term(2, lit(1)), term(2, lit(2))], 3)],
+                2u32,
+                2i128,
+                2i128,
+                2i128,
+            ),
+            (
+                PbObjective {
+                    terms: vec![term(2, neg(1)), term(2, neg(2)), term(2, neg(3))],
+                },
+                vec![
+                    ge(vec![term(-1, lit(1)), term(-1, lit(2))], -1),
+                    ge(vec![term(-1, lit(1)), term(-1, lit(3))], -1),
+                    ge(vec![term(-1, lit(2)), term(-1, lit(3))], -1),
+                ],
+                3,
+                3,
+                4,
+                4,
+            ),
+            (
+                PbObjective {
+                    terms: vec![term(3, lit(1)), term(5, lit(2)), term(7, lit(3))],
+                },
+                vec![ge(
+                    vec![term(1, lit(1)), term(1, lit(2)), term(1, lit(3))],
+                    1,
+                )],
+                3,
+                3,
+                3,
+                3,
+            ),
+        ];
+        for (objective, constraints, num_vars, expected_base, expected_cut, expected_optimum) in
+            cases
+        {
+            let optimum =
+                brute_force_optimum(&objective, &constraints, num_vars).expect("feasible");
+            assert_eq!(optimum, expected_optimum);
+            let base = lp_lower_bound_no_cuts(&objective, &constraints, num_vars, &never_stop)
+                .expect("base bound");
+            let cut =
+                lp_lower_bound(&objective, &constraints, num_vars, &never_stop).expect("cut bound");
+            assert_eq!(base, expected_base);
+            assert_eq!(cut, expected_cut);
+            assert!(base <= cut && cut <= optimum);
         }
     }
 
     #[test]
-    #[ignore = "manual benchmark measurement against local PB24/PB25 instances"]
-    fn measure_cut_tightening_across_families() {
-        // (path, optional known optimum) across families that have hard
-        // clique/cover structure. Reports base vs cut LP_LB and the gap closed.
-        // Instances where the exact-rational base LP itself is tractable so the
-        // cut-loop overhead is visible. (Some PB instances have very large
-        // exact-rational base LP solves unrelated to cuts; those are excluded by the
-        // work-proxy gate and not measured here.)
-        let cases: &[(&str, Option<i128>)] = &[
-            (
-                "PB25/normalized-PB25/OPT-LIN/wallon/normalized-Clique-c0125-9_c24.opb",
-                None,
-            ),
-            (
-                "PB24/normalized-PB24/OPT-LIN/pettersson/StableMatchings/KidneyTransplantBenchmarks/normalized-KE_60_004.opb",
-                None,
-            ),
+    fn clique_cut_strictly_closes_scaled_triangle_gap() {
+        // Pairwise exclusions admit x1=x2=x3=1/2 in the base LP. With objective
+        // 2*(~x1+~x2+~x3), that floor is 3. The clique cut permits at most one
+        // selected vertex and raises the sound floor to the integer optimum 4.
+        let objective = PbObjective {
+            terms: vec![term(2, neg(1)), term(2, neg(2)), term(2, neg(3))],
+        };
+        let constraints = vec![
+            ge(vec![term(-1, lit(1)), term(-1, lit(2))], -1),
+            ge(vec![term(-1, lit(1)), term(-1, lit(3))], -1),
+            ge(vec![term(-1, lit(2)), term(-1, lit(3))], -1),
         ];
-        for (rel, opt) in cases {
-            let path = pbcomp_path(rel);
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                eprintln!("{path}: absent");
-                continue;
-            };
-            let inst = match crate::parser::parse_opb(&text) {
-                Ok(i) => i,
-                Err(e) => {
-                    eprintln!("{path}: parse error {e:?}");
-                    continue;
-                }
-            };
-            let Some(obj) = inst.objective.as_ref() else {
-                eprintln!("{path}: no objective");
-                continue;
-            };
-            let name = path.rsplit('/').next().unwrap_or(&path);
-            let base = lp_lower_bound_no_cuts(obj, &inst.constraints, inst.num_vars, &never_stop);
-            let t = std::time::Instant::now();
-            let cut = lp_lower_bound(obj, &inst.constraints, inst.num_vars, &never_stop);
-            // Soundness re-assertion against any known optimum.
-            if let (Some(c), Some(o)) = (cut, opt) {
-                assert!(
-                    c <= *o,
-                    "SOUNDNESS VIOLATION: {name} cut LP_LB {c} > opt {o}"
-                );
-            }
-            if let (Some(b), Some(c)) = (base, cut) {
-                assert!(c >= b, "{name}: cut bound {c} regressed below base {b}");
-            }
-            eprintln!(
-                "{name}: vars={} cons={} base={base:?} cut={cut:?} opt={opt:?} ({} ms)",
-                inst.num_vars,
-                inst.constraints.len(),
-                t.elapsed().as_millis()
-            );
-        }
+        let optimum = brute_force_optimum(&objective, &constraints, 3).expect("feasible");
+        let base = lp_lower_bound_no_cuts(&objective, &constraints, 3, &never_stop).expect("base");
+        let cut = lp_lower_bound(&objective, &constraints, 3, &never_stop).expect("cut");
+        assert_eq!(optimum, 4);
+        assert_eq!(base, 3);
+        assert_eq!(cut, 4);
+        assert!(cut > base);
     }
 
     #[test]

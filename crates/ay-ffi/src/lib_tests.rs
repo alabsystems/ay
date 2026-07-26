@@ -20,6 +20,86 @@ fn version_string() -> String {
     }
 }
 
+unsafe fn take_owned_string(pointer: *mut c_char) -> String {
+    assert!(!pointer.is_null());
+    // SAFETY: The test only passes pointers returned by AY owned-string APIs;
+    // they are valid C strings until the matching ay_string_free below.
+    let result = unsafe { CStr::from_ptr(pointer) }
+        .to_str()
+        .expect("AY should return UTF-8")
+        .to_owned();
+    // SAFETY: `pointer` came from an AY owned-string API and is consumed once.
+    unsafe { ay_string_free(pointer) };
+    result
+}
+
+#[test]
+fn search_json_ffi_solves_and_renders() {
+    let input = CString::new(
+        r#"{"version":1,"variables":[{"name":"x","domain":{"min":0,"max":2}}],"constraints":[{"expression":"x >= 1"}]}"#,
+    )
+    .expect("literal has no NUL");
+    // SAFETY: `input` is a live, NUL-terminated C string. Both returned
+    // allocations are consumed exactly once by take_owned_string.
+    unsafe {
+        let solved = take_owned_string(ay_search_solve_json(input.as_ptr()));
+        let solved: serde_json::Value = serde_json::from_str(&solved).expect("valid JSON");
+        assert_eq!(solved["status"], "sat");
+        assert!(solved["assignments"]["x"].as_i64().is_some());
+
+        let rendered = take_owned_string(ay_search_compile_json(input.as_ptr()));
+        let rendered: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert_eq!(rendered["status"], "ok");
+        assert!(rendered["smt2"]
+            .as_str()
+            .expect("SMT-LIB string")
+            .contains("x"));
+    }
+}
+
+#[test]
+fn search_json_ffi_returns_owned_error_envelopes() {
+    let input = CString::new(r#"{"version":1,"variables":[],"constraints":[],"extra":7}"#)
+        .expect("literal has no NUL");
+    // SAFETY: `input` is a live C string and null is explicitly accepted by
+    // the search one-shot API. Returned strings are consumed exactly once.
+    unsafe {
+        for pointer in [
+            ay_search_solve_json(input.as_ptr()),
+            ay_search_compile_json(std::ptr::null()),
+        ] {
+            let response = take_owned_string(pointer);
+            let response: serde_json::Value =
+                serde_json::from_str(&response).expect("valid error JSON");
+            assert_eq!(response["status"], "error");
+            assert!(response["error"].as_str().is_some());
+        }
+    }
+}
+
+#[test]
+fn search_json_ffi_rejects_inputs_over_fixed_limit() {
+    let input = CString::new(vec![b' '; AY_SEARCH_MAX_JSON_BYTES + 1])
+        .expect("spaces do not contain NUL bytes");
+    // SAFETY: `input` is a live, NUL-terminated C string. Both returned
+    // allocations are consumed exactly once by take_owned_string.
+    unsafe {
+        for pointer in [
+            ay_search_solve_json(input.as_ptr()),
+            ay_search_compile_json(input.as_ptr()),
+        ] {
+            let response = take_owned_string(pointer);
+            let response: serde_json::Value =
+                serde_json::from_str(&response).expect("valid error JSON");
+            assert_eq!(response["status"], "error");
+            assert_eq!(
+                response["error"],
+                format!("search specification exceeds {AY_SEARCH_MAX_JSON_BYTES}-byte input limit")
+            );
+        }
+    }
+}
+
 #[test]
 fn test_solver_new_free() {
     // SAFETY: Test-scope unsafe block: all handles (solvers, contexts, AST ids, etc.) are

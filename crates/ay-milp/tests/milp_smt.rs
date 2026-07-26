@@ -246,8 +246,10 @@ fn advice_surfaces_accept_input() {
     let mut s = BabSession::new(m.clone(), &SolveOpts::new()).unwrap();
     s.seed_incumbent(&[1.0, 0.0]);
     s.hint_branch_order(&[y, x]);
+    s.shortlist_root_strong_branch_candidates(&[x, y]);
     assert_eq!(s.incumbent_seed(), Some(&[1.0, 0.0][..]));
     assert_eq!(s.branch_hints(), &[y, x]);
+    assert_eq!(s.root_strong_branch_shortlist(), &[x, y]);
     assert!(s.harvest_cuts().is_empty(), "L0 lanes never emit cuts");
     assert!(s.check().unwrap().is_sat());
 }
@@ -511,10 +513,9 @@ fn gomory_cuts_preserve_an_independently_known_optimum() {
 /// it is a silent quality ceiling, and this test is what stops one being
 /// reintroduced. HiGHS puts the primal bound at 270.
 ///
-/// Marked `#[ignore]`: ~50s is too slow for the default suite. Run with
-/// `cargo test -p ay-milp --all-features -- --ignored`.
+/// This is intentionally part of the default suite: a deadline, rather than a
+/// hidden internal node ceiling, is the caller-visible way to bound search.
 #[test]
-#[ignore = "~50s: proves optimality over 236k nodes"]
 fn seventy_binaries_are_proven_optimal_not_merely_feasible() {
     let mut lcg: u64 = 2_026;
     let mut next = || {
@@ -544,7 +545,8 @@ fn seventy_binaries_are_proven_optimal_not_merely_feasible() {
         .collect();
     m.set_objective(&obj, Sense::Maximize);
 
-    let mut s = BabSession::new(m.clone(), &SolveOpts::new()).unwrap();
+    let opts = SolveOpts::new().with_time_limit(Duration::from_mins(2));
+    let mut s = BabSession::new(m.clone(), &opts).unwrap();
     match s.check().unwrap() {
         Outcome::Optimal {
             value,

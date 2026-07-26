@@ -2229,9 +2229,9 @@ fn unsupported_get_info_parameters() -> &'static str {
 }
 
 /// Z3 version reported under explicit `--z3-mode` (full impersonation). Matches
-/// the cached Z3 baseline that `ay --z3-mode` is documented and smoke-tested
+/// the pinned Z3 baseline that `ay --z3-mode` is documented and smoke-tested
 /// against (the development design notes). Kept in sync with that baseline.
-const Z3_COMPAT_BASELINE_VERSION: &str = "4.15.4";
+const Z3_COMPAT_BASELINE_VERSION: &str = "5.0.0";
 
 fn z3_compat_get_info_output(
     state: &SmtTranscriptState,
@@ -2263,7 +2263,7 @@ fn z3_compat_get_info_output(
         ),
         // Explicit `--z3-mode` is opt-in full Z3 impersonation: this filter
         // already reports `:name "Z3"` and Z3's authors, and the mode is
-        // documented (the development design notes) to match a cached Z3 4.15.4
+        // documented (the development design notes) to match the pinned Z3 5.0.0
         // baseline. Report a matching Z3 version so the identity triple
         // (name/authors/version) is internally consistent and tools that gate
         // on the Z3 version see a real one. Plain `-in` (no --z3-mode)
@@ -6622,7 +6622,15 @@ pub(super) fn run_interactive(
             // SMT-LIB: stream. Chain the sniffed prefix back in front of the live
             // stream so no byte is lost.
             let reader = io::BufReader::new(io::Cursor::new(prefix).chain(locked));
-            run_interactive_smt_stream(reader, false, stats_cfg, proof_config, visualization);
+            run_interactive_smt_stream(
+                reader,
+                false,
+                stats_cfg,
+                proof_config,
+                visualization,
+                verbose,
+                validate,
+            );
             return;
         }
 
@@ -6654,7 +6662,13 @@ pub(super) fn run_interactive(
             reject_firewall_emission_for_route("CHC stdin");
             reject_firewall_verification_for_route("CHC stdin");
             reject_explicit_proof_verification_for_route("CHC", "replay");
-            chc_runner::run_chc_from_content(&content, verbose, validate, stats_cfg, proof_config);
+            let _ = chc_runner::run_chc_from_content(
+                &content,
+                verbose,
+                validate,
+                stats_cfg,
+                proof_config,
+            );
             return;
         }
 
@@ -6666,7 +6680,13 @@ pub(super) fn run_interactive(
             reject_firewall_emission_for_route("fixedpoint stdin");
             reject_firewall_verification_for_route("fixedpoint stdin");
             reject_explicit_proof_verification_for_route("fixedpoint", "CHC replay");
-            chc_runner::run_chc_from_content(&content, verbose, validate, stats_cfg, proof_config);
+            let _ = chc_runner::run_chc_from_content(
+                &content,
+                verbose,
+                validate,
+                stats_cfg,
+                proof_config,
+            );
             return;
         }
 
@@ -6688,7 +6708,15 @@ pub(super) fn run_interactive(
     }
 
     // Line-by-line mode: TTY interactive OR piped incremental (#5360).
-    run_interactive_smt_stream(stdin.lock(), is_tty, stats_cfg, proof_config, visualization);
+    run_interactive_smt_stream(
+        stdin.lock(),
+        is_tty,
+        stats_cfg,
+        proof_config,
+        visualization,
+        verbose,
+        validate,
+    );
 }
 
 /// Drive SMT-LIB input command-by-command from `reader`, flushing stdout after
@@ -6704,6 +6732,8 @@ fn run_interactive_smt_stream(
     stats_cfg: stats_output::StatsConfig,
     proof_config: Option<&ProofConfig>,
     visualization: Option<VisualizationFormat>,
+    verbose: bool,
+    validate: bool,
 ) {
     reject_explicit_proof_verification_for_route("SMT-LIB", "Alethe");
     if is_tty {
@@ -6728,6 +6758,13 @@ fn run_interactive_smt_stream(
     let mut transcript = SmtTranscriptState::new();
     let mut formula_stats = FormulaStats::default();
     let mut smt_logic: Option<String> = None;
+    // Z3's `-in` is a live stream, so HORN cannot be routed by waiting for
+    // EOF. Accumulate only the problem-defining commands, solve at each
+    // `check-sat`, and retain the independently validated invariant for the
+    // following `get-model` query.
+    let mut chc_stream_mode = false;
+    let mut chc_problem_input = String::new();
+    let mut chc_last_model: Option<String> = None;
     // Rewrite synthesized non-Alethe configs to Alethe for SMT
     // (Finding A in the development design notes).
     let adapted = adapt_proof_config_for_smt(proof_config);
@@ -6813,6 +6850,70 @@ fn run_interactive_smt_stream(
                             logic_from_commands(std::slice::from_ref(cmd)).map(str::to_owned);
                     }
                     formula_stats.observe_command(cmd);
+                    let enters_horn = matches!(
+                        cmd,
+                        Command::SetLogic(logic) if logic.eq_ignore_ascii_case("HORN")
+                    );
+                    if chc_stream_mode || enters_horn {
+                        if !chc_stream_mode {
+                            reject_decision_trace_for_route("incremental CHC stdin");
+                            reject_bv_cnf_export_for_non_smt_route("incremental CHC stdin");
+                            reject_firewall_emission_for_route("incremental CHC stdin");
+                            reject_firewall_verification_for_route("incremental CHC stdin");
+                            reject_explicit_proof_verification_for_route(
+                                "incremental CHC",
+                                "CHC replay",
+                            );
+                            chc_stream_mode = true;
+                        }
+
+                        match cmd {
+                            Command::Exit => {
+                                cleanup_temp_proof(adapted.as_ref());
+                                return;
+                            }
+                            Command::Reset => {
+                                chc_stream_mode = false;
+                                chc_problem_input.clear();
+                                chc_last_model = None;
+                                formula_stats = FormulaStats::default();
+                                smt_logic = None;
+                            }
+                            Command::GetModel => match &chc_last_model {
+                                Some(model) => safe_print!("{model}"),
+                                None => safe_println!("(error \"model is not available\")"),
+                            },
+                            Command::CheckSat => {
+                                let mut solve_input = chc_problem_input.clone();
+                                solve_input.push_str("(check-sat)\n");
+                                chc_last_model = chc_runner::run_chc_from_content(
+                                    &solve_input,
+                                    verbose,
+                                    validate,
+                                    stats_cfg,
+                                    proof_config,
+                                );
+                            }
+                            _ => {
+                                if let Some(source) = command_sources.get(cmd_index) {
+                                    // Any accepted problem command starts a new
+                                    // model epoch. Serving the previously
+                                    // certified invariant after an assertion,
+                                    // rule, declaration, push, or pop would
+                                    // attach stale evidence to a changed CHC
+                                    // problem. A fresh check-sat is the only
+                                    // operation allowed to repopulate it.
+                                    chc_last_model = None;
+                                    chc_problem_input.push_str(&source.text);
+                                    if !source.text.ends_with('\n') {
+                                        chc_problem_input.push('\n');
+                                    }
+                                }
+                            }
+                        }
+                        let _ = stdout.flush();
+                        continue;
+                    }
                     if matches!(cmd, Command::Exit) {
                         publish_pending_smt_unsat(
                             &mut executor,
@@ -6921,6 +7022,10 @@ fn run_interactive_smt_stream(
                 }
             }
         }
+    }
+    if chc_stream_mode {
+        cleanup_temp_proof(adapted.as_ref());
+        return;
     }
     publish_pending_smt_unsat(
         &mut executor,
@@ -7098,7 +7203,7 @@ pub(super) fn run_file(
                 reject_firewall_emission_for_route("CHC file");
                 reject_firewall_verification_for_route("CHC file");
                 reject_explicit_proof_verification_for_route("CHC", "replay");
-                chc_runner::run_chc_from_content(
+                let _ = chc_runner::run_chc_from_content(
                     &content,
                     verbose,
                     validate,
@@ -7116,7 +7221,7 @@ pub(super) fn run_file(
                 reject_firewall_emission_for_route("fixedpoint file");
                 reject_firewall_verification_for_route("fixedpoint file");
                 reject_explicit_proof_verification_for_route("fixedpoint", "CHC replay");
-                chc_runner::run_chc_from_content(
+                let _ = chc_runner::run_chc_from_content(
                     &content,
                     verbose,
                     validate,

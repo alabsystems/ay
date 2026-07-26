@@ -29,7 +29,7 @@ const koffi = require("koffi");
 // Locating the shared library
 // ---------------------------------------------------------------------------
 // Resolution order mirrors ayz3 (Python):
-//   1. The AYZ3_LIB environment variable, if set (highest priority).
+//   1. AYSEARCH_LIB, then AYZ3_LIB, if set (highest priority).
 //   2. A library bundled next to this module (installed-package layout).
 //   3. The in-tree Cargo build output: walk up to the workspace root (a dir
 //      with `target/`) and probe target/{debug,release}/.
@@ -47,8 +47,10 @@ function platformBasename() {
 }
 
 function* candidatePaths() {
-  const env = process.env.AYZ3_LIB;
-  if (env) yield env;
+  for (const variable of ["AYSEARCH_LIB", "AYZ3_LIB"]) {
+    const configured = process.env[variable];
+    if (configured) yield configured;
+  }
 
   const basename = platformBasename();
   // Bundled next to this module (installed layout).
@@ -75,7 +77,7 @@ function loadLibrary() {
   }
   throw new Error(
     "Could not locate libay_ffi shared library. Build it with " +
-      "`cargo build -p ay-ffi`, or set AYZ3_LIB to its full path.\nTried:\n  " +
+      "`cargo build -p ay-ffi`, or set AYSEARCH_LIB/AYZ3_LIB to its full path.\nTried:\n  " +
       tried.join("\n  "),
   );
 }
@@ -370,7 +372,14 @@ lib.Z3_get_version = dylib.func("Z3_get_version", VOID, [
   koffi.out("uint *"),
 ]);
 
+// ay-search is deliberately a tiny one-shot JSON ABI. Return values stay as
+// pointers so the high-level wrapper can decode and then release the Rust-owned
+// allocation with ay_string_free.
+lib.ay_search_solve_json = dylib.func("ay_search_solve_json", PTR, [STR]);
+lib.ay_search_compile_json = dylib.func("ay_search_compile_json", PTR, [STR]);
+lib.ay_string_free = dylib.func("ay_string_free", VOID, [PTR]);
+
 /** Number of Z3_* functions bound by this module. */
-export const BOUND_FUNCTION_COUNT = Object.keys(lib).length;
+export const BOUND_FUNCTION_COUNT = SIGS.length + 2;
 
 export { koffi };

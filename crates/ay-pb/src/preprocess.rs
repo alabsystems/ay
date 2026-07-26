@@ -4850,81 +4850,64 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "benchmark-style stress case"]
-    fn bench_preprocess_nested_frontier_cardinality_family() {
-        let instance = nested_frontier_instance(48, 40);
-
-        let start = std::time::Instant::now();
+    fn preprocess_collapses_each_nested_cardinality_frontier() {
+        let instance = nested_frontier_instance(12, 8);
         let result = preprocess(&instance);
-        let elapsed = start.elapsed();
 
         let PreprocessResult::Simplified {
             instance: simplified,
-            ..
+            fixed_literals,
         } = result
         else {
-            panic!("nested frontier benchmark instance should remain satisfiable");
+            panic!("nested frontier fixture should remain satisfiable");
         };
 
+        assert!(fixed_literals.is_empty());
         assert_eq!(
             simplified.constraints.len(),
-            48,
+            12,
             "each family should collapse to its minimal frontier"
         );
-        eprintln!(
-            "bench_preprocess_nested_frontier_cardinality_family: constraints={} simplified={} elapsed={:.3}s",
-            instance.constraints.len(),
-            simplified.constraints.len(),
-            elapsed.as_secs_f64()
-        );
+        assert!(simplified
+            .constraints
+            .iter()
+            .all(|row| row.terms.len() == 2));
     }
 
     #[test]
-    #[ignore = "benchmark-style stress case"]
-    fn bench_preprocess_deep_nested_frontier_cardinality_family() {
-        let instance = nested_frontier_instance(4, 800);
-
-        let start = std::time::Instant::now();
+    fn preprocess_collapses_deep_nested_cardinality_frontiers() {
+        let instance = nested_frontier_instance(2, 128);
         let result = preprocess(&instance);
-        let elapsed = start.elapsed();
 
         let PreprocessResult::Simplified {
             instance: simplified,
-            ..
+            fixed_literals,
         } = result
         else {
-            panic!("deep nested frontier benchmark instance should remain satisfiable");
+            panic!("deep nested frontier fixture should remain satisfiable");
         };
 
+        assert!(fixed_literals.is_empty());
         assert_eq!(
             simplified.constraints.len(),
-            4,
+            2,
             "each family should collapse to its minimal frontier"
         );
-        eprintln!(
-            "bench_preprocess_deep_nested_frontier_cardinality_family: constraints={} simplified={} elapsed={:.3}s",
-            instance.constraints.len(),
-            simplified.constraints.len(),
-            elapsed.as_secs_f64()
-        );
+        assert!(simplified
+            .constraints
+            .iter()
+            .all(|row| row.terms.len() == 2));
     }
 
     #[test]
-    #[ignore = "benchmark-style stress case"]
-    fn bench_root_startup_threshold_crossing_nested_frontier_family() {
-        let instance = nested_frontier_instance(8, 800);
+    fn preprocess_crosses_old_pair_threshold_without_skipping_dominance() {
+        // 4,002 rows cross the former 16,000,000-pair guard with only
+        // two or three literals per row, keeping this a bounded fixture.
+        let instance = nested_frontier_instance(2_001, 2);
 
-        let old_preprocess_start = std::time::Instant::now();
         let old_constraints = old_threshold_subsumed_constraints(&instance.constraints);
-        let old_preprocess_elapsed = old_preprocess_start.elapsed();
-
-        let old_build_start = std::time::Instant::now();
         let old_propagator = build_propagator(&old_constraints);
-        let old_build_elapsed = old_build_start.elapsed();
-
-        let new_preprocess_start = std::time::Instant::now();
         let result = preprocess(&instance);
-        let new_preprocess_elapsed = new_preprocess_start.elapsed();
 
         let PreprocessResult::Simplified {
             instance: simplified,
@@ -4934,9 +4917,7 @@ mod tests {
             panic!("threshold-crossing frontier benchmark instance should remain satisfiable");
         };
 
-        let new_build_start = std::time::Instant::now();
         let new_propagator = build_propagator(&simplified.constraints);
-        let new_build_elapsed = new_build_start.elapsed();
 
         assert!(fixed_literals.is_empty());
         assert_eq!(
@@ -4945,22 +4926,10 @@ mod tests {
             "pre-#8893 thresholding should skip subset dominance above 4000 cardinality constraints"
         );
         assert_eq!(old_propagator.num_constraints(), old_constraints.len());
-        assert_eq!(simplified.constraints.len(), 8);
+        assert_eq!(simplified.constraints.len(), 2_001);
         assert_eq!(
             new_propagator.num_constraints(),
             simplified.constraints.len()
-        );
-
-        eprintln!(
-            "bench_root_startup_threshold_crossing_nested_frontier_family: \
-old_preprocess={:.3}s old_constraints={} old_build={:.3}s \
-new_preprocess={:.3}s new_constraints={} new_build={:.3}s",
-            old_preprocess_elapsed.as_secs_f64(),
-            old_constraints.len(),
-            old_build_elapsed.as_secs_f64(),
-            new_preprocess_elapsed.as_secs_f64(),
-            simplified.constraints.len(),
-            new_build_elapsed.as_secs_f64()
         );
     }
 

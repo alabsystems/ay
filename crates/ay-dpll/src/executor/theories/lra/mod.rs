@@ -69,8 +69,33 @@ fn inc_engine_warm_on() -> bool {
     *V.get_or_init(|| !std::env::var("AY_LRA_INC_WARM").is_ok_and(|v| v == "0"))
 }
 
+/// #unguarded-tvalid-lemmas (`AY_LRA_INC_UNGUARDED_LEMMAS`): permanently retain
+/// T-valid theory-CONFLICT lemmas on the inc-engine persistent SAT solver
+/// (OpenSMT-style) instead of appending the innermost scope selector that gets
+/// the whole lemma pool (and every CDCL resolvent it poisons) deleted at each
+/// pop(). An LRA Farkas-core conflict lemma is a theory tautology over
+/// term-semantic atoms — valid at every scope forever — and this lane's
+/// atom<->var Tseitin binding (`local_term_to_var`) is session-persistent and
+/// append-only, so retention is sound. Only conflict lemmas are unguarded;
+/// theory PROPAGATION reasons stay scoped in this phase. DEFAULT-ON on this
+/// lane. DEFAULT OFF (opt in with `AY_LRA_INC_UNGUARDED_LEMMAS=1`): measured
+/// 2026-07-24 on fisher_star.ind — neutral @90s (31=31 exact, 2-sample) but
+/// STRONGLY NEGATIVE @1200s (56 vs 82): the retained pool compounds over 100+
+/// cycles into BCP/clause-DB drag without matching replay benefit (resolvents
+/// still inherit selectors through SCOPED propagation reasons, so replay is
+/// blocked while pool cost is paid). Soundness is NOT the issue (adversarially
+/// reviewed SHIP_CANDIDATE; 0 verdict mismatches at both horizons). Retention
+/// needs OpenSMT-style aggressive learnt-DB discipline + unscoped propagation
+/// reasons (phase 2) before it can pay; the flag stays as the experiment gate.
+fn inc_engine_unguarded_lemmas_on() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("AY_LRA_INC_UNGUARDED_LEMMAS").is_ok_and(|v| v != "0" && !v.is_empty())
+    })
+}
+
 impl Executor {
-    fn preprocess_lra_assertions(&mut self) -> Vec<TermId> {
+    pub(in crate::executor) fn preprocess_lra_assertions(&mut self) -> Vec<TermId> {
         // Keep the dedicated QF_LRA entrypoint aligned with the generic
         // arithmetic preprocessing used by the shared theory harness.
         let mut assertions = self.ctx.assertions.clone();
@@ -255,6 +280,24 @@ impl Executor {
             // paths force the state-preserving incremental reset. CHC/PDR IC3
             // (ic3_mode without this flag) is unaffected.
             sat.set_inc_engine_reset_mode(true);
+            // #unguarded-tvalid-lemmas STAGE 1: retain T-valid theory-CONFLICT
+            // lemmas (Farkas cores + batch bound conflicts) permanently across
+            // pop() on this session-persistent solver. Default-ON, opt out with
+            // AY_LRA_INC_UNGUARDED_LEMMAS=0. Sound on THIS lane because the
+            // atom<->var binding is session-stable (vars never reused across
+            // pop; `local_term_to_var` persists append-only) and every routed
+            // clause is a theory tautology over term-semantic atoms
+            // (map_conflict_lits / TheoryExtension term_to_literal both fail
+            // closed on partial mappings). NOTE: the inc-engine lane
+            // structurally EXCLUDES proof sessions — solve_lra only routes
+            // here under `inc_engine_on && !self.produce_proofs_enabled()` —
+            // so no proof stream ever has to justify an unguarded lemma
+            // surviving its birth scope (debug-asserted below).
+            debug_assert!(
+                !self.produce_proofs_enabled(),
+                "#lra-inc-engine lane must exclude proof sessions (routing guard in solve_lra)"
+            );
+            sat.set_unguarded_theory_conflict_lemmas(inc_engine_unguarded_lemmas_on());
             sat.set_random_seed(random_seed);
             // #8093: Z3-style geometric restarts for QF_LRA.
             sat.set_geometric_restarts(100.0, 1.5);
@@ -373,12 +416,21 @@ impl Executor {
                 // inc_reset_hits growing across check-sats with full_reset_hits
                 // ~constant proves the accumulated formula was NOT re-solved from
                 // scratch (SAT state persisted).
+                // #unguarded-tvalid-lemmas STAGE 0: conflicts_prior_solve is
+                // the carryover proof — conflicts on clauses born in EARLIER
+                // check-sats (near zero while T-valid lemmas are
+                // selector-guarded on .ind; grows with permanent retention).
+                // assumption_level_conflicts counts conflicts inside the
+                // scope-selector assumption prefix (the resolvent-poisoning
+                // site).
                 eprintln!(
-                    "#lra-inc-engine-stats inc_reset_hits={} full_reset_hits={} assumption_cache_hits={} assumption_cache_misses={}",
+                    "#lra-inc-engine-stats inc_reset_hits={} full_reset_hits={} assumption_cache_hits={} assumption_cache_misses={} conflicts_prior_solve={} assumption_level_conflicts={}",
                     sat.ext_incremental_reset_hits(),
                     sat.ext_full_reset_hits(),
                     sat.assumption_cache_hits(),
                     sat.assumption_cache_misses(),
+                    sat.conflicts_from_prior_solve_clauses(),
+                    sat.assumption_level_conflicts(),
                 );
             }
         }

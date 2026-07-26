@@ -28,7 +28,7 @@ except Exception:  # pragma: no cover
     _z3 = None
     HAVE_Z3PY = False
 
-requires_z3 = pytest.mark.skipif(not HAVE_Z3PY, reason="z3py 4.15.4 not installed")
+requires_z3 = pytest.mark.usefixtures("required_reference_z3")
 
 
 def _f32(x):

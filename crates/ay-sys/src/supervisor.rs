@@ -176,6 +176,99 @@ pub fn wait_for_child(pid: i32) -> Option<i32> {
     }
 }
 
+/// A child state observed without consuming its wait status on macOS.
+///
+/// Keeping an exited process-group leader waitable prevents its numeric PID
+/// (and therefore PGID) from being reused before the caller has terminated any
+/// residual descendants. The caller must eventually reap the child through its
+/// owned [`std::process::Child`] handle.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreapedChildState {
+    /// The child has neither stopped nor exited.
+    Running,
+    /// The child stopped because of the contained signal number.
+    Stopped(i32),
+    /// The child exited normally or because of a signal.
+    Exited,
+}
+
+/// Observe a child on macOS without consuming its wait status.
+///
+/// `nix` deliberately does not expose `waitid(2)` on Apple targets, even though
+/// macOS provides `waitid(P_PID, ..., WNOWAIT)`. Isolating that call here keeps
+/// the rest of the workspace free of unsafe code while retaining the process-
+/// group ownership invariant required by benchmark watchdog cleanup.
+#[cfg(target_os = "macos")]
+pub fn observe_child_unreaped(
+    child: &std::process::Child,
+    include_stopped: bool,
+) -> std::io::Result<UnreapedChildState> {
+    let raw_pid = libc::pid_t::try_from(child.id()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "child PID does not fit macOS pid_t",
+        )
+    })?;
+    let child_id = libc::id_t::try_from(raw_pid).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "child PID does not fit macOS id_t",
+        )
+    })?;
+    let mut options = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+    if include_stopped {
+        options |= libc::WSTOPPED;
+    }
+
+    loop {
+        // `waitid(..., WNOHANG)` reports no event by leaving `si_pid` zero, so
+        // start from a fully initialized value on every try (including EINTR).
+        // SAFETY: `siginfo_t` is a C POD value; `waitid` receives a valid owned
+        // output pointer, a positive PID obtained from an owned `Child`, and the
+        // documented wait flags. WNOWAIT guarantees that the status is observed
+        // but not consumed.
+        let (result, info) = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let result = libc::waitid(libc::P_PID, child_id, &raw mut info, options);
+            (result, info)
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(error);
+        }
+        if info.si_pid == 0 {
+            return Ok(UnreapedChildState::Running);
+        }
+        if info.si_pid != raw_pid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "waitid returned PID {} while observing child {raw_pid}",
+                    info.si_pid
+                ),
+            ));
+        }
+        return match info.si_code {
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED => {
+                Ok(UnreapedChildState::Exited)
+            }
+            libc::CLD_STOPPED if include_stopped => Ok(UnreapedChildState::Stopped(info.si_status)),
+            libc::CLD_CONTINUED => Ok(UnreapedChildState::Running),
+            code => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "waitid returned unexpected child status code {code} (status {})",
+                    info.si_status
+                ),
+            )),
+        };
+    }
+}
+
 /// Force-kill a child and reap its zombie (best-effort), used on the unrecoverable
 /// [`wait_for_child`] error path so no orphan is left behind.
 pub fn kill_and_reap(pid: i32) {
@@ -250,6 +343,78 @@ mod tests {
             "child limit {kib} KiB exceeds requested {} KiB",
             LIMIT_BYTES / 1024
         );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+    use std::io::Write as _;
+    use std::process::{Child, Stdio};
+    use std::time::{Duration, Instant};
+
+    struct ChildGuard(Option<Child>);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    fn wait_for_non_running(child: &Child, include_stopped: bool) -> UnreapedChildState {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = observe_child_unreaped(child, include_stopped)
+                .expect("observe child without reaping");
+            if state != UnreapedChildState::Running {
+                return state;
+            }
+            assert!(Instant::now() < deadline, "timed out observing child state");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn waitid_observes_stop_and_exit_without_reaping() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "read token; kill -STOP $$; exit 7"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut guarded = ChildGuard(Some(command.spawn().expect("spawn waitid probe")));
+        let child = guarded.0.as_mut().expect("guard owns child");
+
+        assert_eq!(
+            observe_child_unreaped(child, true).expect("observe blocked child"),
+            UnreapedChildState::Running
+        );
+        child
+            .stdin
+            .take()
+            .expect("probe stdin")
+            .write_all(b"continue\n")
+            .expect("release child read");
+        assert_eq!(
+            wait_for_non_running(child, true),
+            UnreapedChildState::Stopped(libc::SIGSTOP)
+        );
+
+        let raw_pid = libc::pid_t::try_from(child.id()).expect("child PID fits pid_t");
+        // SAFETY: `raw_pid` names the live child owned by `guarded`; SIGCONT has
+        // no memory-safety preconditions and merely resumes the stopped probe.
+        assert_eq!(unsafe { libc::kill(raw_pid, libc::SIGCONT) }, 0);
+        assert_eq!(
+            wait_for_non_running(child, false),
+            UnreapedChildState::Exited
+        );
+
+        let mut child = guarded.0.take().expect("guard owns child");
+        let status = child.wait().expect("owned Child reaps observed exit");
+        assert_eq!(status.code(), Some(7));
     }
 }
 

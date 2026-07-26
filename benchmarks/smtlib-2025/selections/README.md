@@ -25,6 +25,31 @@ relative to `benchmarks/smtlib-2025/`.
   `benchmarks/smtlib-2025/` (trees gitignored via the local `.gitignore`).
 - The selections are re-derivable from the repo tag + records above.
 
+## Divisions present
+
+| Track | Division | Rows | Derived |
+|---|---|---|---|
+| UnsatCore | QF_Datatypes | 400 | earlier session |
+| UnsatCore | **QF_LinearIntArith** | **1069** | **2026-07-26 (this file's provenance rules, re-derived from the pinned tag)** |
+| SingleQuery / ModelValidation / Incremental | see files | — | earlier sessions |
+
+`UnsatCore/QF_LinearIntArith.jsonl` was derived 2026-07-26 by exactly the
+procedure documented above, and the derivation was VALIDATED by re-deriving
+`UnsatCore/QF_Datatypes.jsonl` with the same code first and reproducing its 400
+rows (QF_DT 300 + QF_UFDT 100). The division spans three logics —
+**QF_LIA 964 + QF_IDL 100 + QF_LIRA 5 = 1069**, matching the official division
+size on smt-comp.github.io/2025/results/qf_linearintarith-unsat-core. Expected
+provenance: 1035 `known` (official status), 33 `sound-consensus`, 1 `unknown`;
+distribution 1068 `unsat` + 1 `unknown`. All 7 UnsatCore-track solvers are
+0-error by the rule below (none contradicted a known status anywhere in the
+track), so rule 2 had a 7-solver quorum available.
+
+Official 2025 bar for this division (sequential): Yices2 **3,580,653** (968/1069
+solved), SMTInterpol 3,234,355, cvc5 2,189,130; OpenSMT scored 3,539,809 but
+recorded **36 errors** and OpenSMT (min-ucore) 32 — the 0-error discipline is
+itself worth points here, and AY's UC path cannot emit an invalid core by
+construction.
+
 ## `expected` field
 
 1. `status` from `benchmarks-2025.json.gz` when it is `sat`/`unsat`;

@@ -513,60 +513,36 @@ mod tests {
         }
     }
 
-    /// Manual benchmark (ignored): set `AY_IR_BENCH_CNF` to a DIMACS path and run
-    /// `cargo test -p ay-sat --lib symmetry::ir::tests::bench_clique -- --ignored --nocapture`.
+    /// Bounded replacement for the former environment-driven timing benchmark.
+    ///
+    /// Exercise both search limits on a fixed composite-symmetry instance:
+    /// a zero-node budget must stop before finding a leaf, while a sufficient
+    /// budget with a one-generator cap must return exactly one deterministic,
+    /// gate-verified automorphism.
     #[test]
-    #[ignore = "manual benchmark requires AY_IR_BENCH_CNF"]
-    fn bench_clique() {
-        let path = std::env::var("AY_IR_BENCH_CNF").expect("set AY_IR_BENCH_CNF");
-        let text = std::fs::read_to_string(&path).unwrap();
-        let mut clauses: Vec<Vec<Literal>> = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('p') || line.starts_with('c') {
-                continue;
-            }
-            let mut c = Vec::new();
-            for tok in line.split_whitespace() {
-                let v: i64 = tok.parse().unwrap();
-                if v == 0 {
-                    break;
-                }
-                let var = Variable(v.unsigned_abs() as u32 - 1);
-                c.push(if v > 0 {
-                    Literal::positive(var)
-                } else {
-                    Literal::negative(var)
-                });
-            }
-            if !c.is_empty() {
-                c.sort_unstable_by_key(|l| l.raw());
-                clauses.push(c);
-            }
-        }
+    fn test_ir_respects_deterministic_search_limits() {
+        let clauses = clique_coloring_2v2c();
         let counts = build_formula_counts(&clauses);
-        let nb: u64 = std::env::var("AY_IR_BENCH_NB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8_000);
-        let mg: usize = std::env::var("AY_IR_BENCH_MG")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(96);
-        let t0 = ay_core::time::Instant::now();
-        let gens = find_automorphisms(&clauses, &counts, nb, mg);
-        let dt = t0.elapsed();
-        let mut sup_total = 0usize;
+
+        assert!(
+            find_automorphisms(&clauses, &counts, 0, 1).is_empty(),
+            "a zero-node budget must stop before exploring an IR leaf"
+        );
+
+        let gens = find_automorphisms(&clauses, &counts, 10_000, 1);
+        assert_eq!(gens.len(), 1, "the generator cap must be enforced exactly");
         for g in &gens {
-            assert!(permutation_preserves_formula(&counts, g));
-            sup_total += g.len();
+            assert!(
+                permutation_preserves_formula(&counts, g),
+                "a bounded result must still pass the formula-preservation gate"
+            );
+            assert!(g.iter().any(|(from, to)| from != to));
         }
-        eprintln!(
-            "IR bench [nb={nb} mg={mg}]: {} clauses, {} generators, total support {}, time {:?}",
-            clauses.len(),
-            gens.len(),
-            sup_total,
-            dt
+
+        assert_eq!(
+            gens,
+            find_automorphisms(&clauses, &counts, 10_000, 1),
+            "fixed search limits must produce deterministic generators"
         );
     }
 

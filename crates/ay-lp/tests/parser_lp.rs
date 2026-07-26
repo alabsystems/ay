@@ -5,7 +5,7 @@
 //! LP parser unit tests, kept as an integration test file so
 //! `crates/ay-lp/src/parser/lp.rs` stays under the 500-line module budget.
 
-use ay_lp::{parse_lp, Sense, VarKind};
+use ay_lp::{parse_lp, LpError, Sense, VarKind};
 
 #[test]
 fn test_parse_lp_trivial_min() {
@@ -50,6 +50,24 @@ End
 }
 
 #[test]
+fn test_parse_lp_binary_section_preserves_explicit_bounds() {
+    let input = "\
+Maximize
+ x
+Bounds
+ x >= 2
+Binary
+ x
+End
+";
+    let p = parse_lp(input).expect("parse");
+    let x = p.var_index("x").expect("x");
+    assert_eq!(p.variables[x].kind, VarKind::Binary);
+    assert_eq!(p.variables[x].lower, 2.0);
+    assert!(p.variables[x].upper.is_infinite() && p.variables[x].upper > 0.0);
+}
+
+#[test]
 fn test_parse_lp_bound_range_and_free() {
     let input = "\
 Minimize
@@ -68,4 +86,46 @@ End
     assert_eq!(p.variables[x].upper, 5.0);
     assert!(p.variables[y].lower.is_infinite() && p.variables[y].lower < 0.0);
     assert!(p.variables[y].upper.is_infinite() && p.variables[y].upper > 0.0);
+}
+
+#[test]
+fn test_parse_lp_rejects_non_finite_numeric_tokens() {
+    let input = "\
+Minimize
+ 1e999 x
+Subject To
+ x <= 1
+End
+";
+    assert!(matches!(
+        parse_lp(input),
+        Err(LpError::InvalidNumber { .. })
+    ));
+
+    let input = "\
+Minimize
+ x
+Subject To
+ x <= 1e999
+End
+";
+    assert!(matches!(
+        parse_lp(input),
+        Err(LpError::InvalidNumber { .. })
+    ));
+}
+
+#[test]
+fn test_parse_lp_still_accepts_infinite_bounds_syntax() {
+    let input = "\
+Minimize
+ x
+Bounds
+ -inf <= x <= inf
+End
+";
+    let p = parse_lp(input).expect("parse");
+    let x = p.var_index("x").expect("x");
+    assert!(p.variables[x].lower.is_infinite() && p.variables[x].lower < 0.0);
+    assert!(p.variables[x].upper.is_infinite() && p.variables[x].upper > 0.0);
 }

@@ -227,6 +227,24 @@ impl Solver {
             }
             self.cold.bcp_learned_clause_birth_conflicts = new_birth_conflicts;
         }
+        // #unguarded-tvalid-lemmas STAGE 0: remap the birth-solve stamps
+        // exactly like the LRAT clause_ids side vector above.
+        if !self.cold.clause_birth_solve.is_empty() {
+            let old_birth_solves = std::mem::take(&mut self.cold.clause_birth_solve);
+            let new_arena_len = self.arena.len();
+            let mut new_birth_solves = vec![0u32; new_arena_len];
+            for &old_off in &ordered {
+                let old_idx = old_off as usize;
+                let new_off = remap[old_idx];
+                if new_off != u32::MAX && old_idx < old_birth_solves.len() {
+                    let new_off_usize = new_off as usize;
+                    if new_off_usize < new_birth_solves.len() {
+                        new_birth_solves[new_off_usize] = old_birth_solves[old_idx];
+                    }
+                }
+            }
+            self.cold.clause_birth_solve = new_birth_solves;
+        }
         self.stats.remap_bcp_learned_1963_blocker_certs(&remap);
 
         // 7. Invalidate reason_clause_marks (#8100).

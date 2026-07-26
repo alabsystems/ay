@@ -240,6 +240,12 @@ impl Solver {
             }
             self.reset_search_state();
         }
+        // #unguarded-tvalid-lemmas STAGE 0: record the assumption-prefix
+        // depth (scope selectors + user assumptions) for this solve so
+        // conflict analysis can classify assumption-level conflicts. Set
+        // AFTER the reset above (the reset zeroes it); no-assumption solve
+        // entries leave it at the reset value 0.
+        self.cold.active_assumption_count = assumptions.len().min(u32::MAX as usize) as u32;
         // MiniSat assumption-based solving invariant: search must start at
         // level 0. Assumptions are assigned at levels 1..=n.
         debug_assert_eq!(

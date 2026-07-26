@@ -5,16 +5,25 @@
 #               Requires `asset` and `sha256`. Supports `ay corpus upload`.
 #   - http:    archive fetched from a fixed URL. `archive` is "tar" (default),
 #              "zip", or "none". `sha256` is optional but recommended.
-#   - git:     `git clone --depth <depth>` from `url`. Optional `commit` pin.
+#   - git:     shallow fetch from `url` at optional exact `commit`. Set
+#              `requires_git_lfs = true` only when the pinned tree has actual
+#              Git LFS pointer blobs (attributes alone do not count).
 #   - gbd:     per-file fetch from the Global Benchmark Database. `manifest`
-#              names a CSV with `hash` and `local_path` columns; each row's
-#              content is downloaded from https://benchmark-database.de/file/<hash>
-#              and written to <local_path> (a `…cnf.xz`); when the payload is xz
-#              the decompressed `…cnf` sibling (what the tests read) is written
-#              too. Rows already present (either form) are skipped unless --force.
+#              names a CSV with `hash` and `local_path` columns. Campaign
+#              manifests also pin every response with `size_bytes` and
+#              `sha256`; those files remain compressed for private run-time
+#              decompression. Legacy unpinned fixtures retain plain siblings.
+#   - uri-list: fetch every HTTPS URL in a separately downloaded, pinned
+#               manifest into `extract_to`. Campaign rows carry exact response
+#               sizes/SHA-256 values and remain compressed; legacy unpinned
+#               lists may retain their historical decompressed siblings.
 #
 # `extract_to` is the destination directory (or, for archive="none", the
-# destination file path). `ay corpus check-urls` validates every entry.
+# destination file path). By default an archive must have exactly one root with
+# the same basename as `extract_to`. For multi-root HTTP archives,
+# `wrap_archive = true` extracts every root inside that exact directory and
+# installs/prunes it as one owned tree.
+# `ay corpus check-urls` validates every entry.
 
 schema_version = 2
 repo = "alabsystems/ay"
@@ -51,16 +60,1427 @@ sha256 = "a243dbe78292c1338221b3c804157fed668f6a62eeeb7d8b34fdbe2f6be16385"
 size_bytes = 180741
 
 [[corpus]]
-name = "pb-comp-selected-pb25"
+# Official 400-instance SAT Competition 2025 selection. Keep the small,
+# immutable URI list as its own pinned asset so a fresh clone can materialize
+# the content-addressed GBD files without a repository-generated manifest.
+name = "satcomp-2025-main-uri-list"
+groups = ["competition-2025-2026"]
 source = "http"
+archive = "none"
+extract_to = "benchmarks/sat/satcomp2025-main/SC2025.uri"
+url = "https://satcompetition.github.io/2025/downloads/SC2025.uri"
+sha256 = "d02406bb212498ea1d2d9f2e968f9a8f6ad3b6bc479ae1b1368d5b4d638a9120"
+size_bytes = 27200
+
+[[corpus]]
+name = "satcomp-2025-main"
+groups = ["competition-2025-2026"]
+depends_on = ["satcomp-2025-main-uri-list"]
+source = "uri-list"
+extract_to = "benchmarks/sat/satcomp2025-main/instances"
+# Derived once from the organizer's SHA-256-pinned SC2025.uri. Every response
+# now has its own byte length and SHA-256, because the 32-hex GBD object ID is
+# not a digest of either the served xz bytes or the decompressed CNF.
+manifest = "benchmarks/sat/satcomp2025-main/SC2025.pinned.tsv"
+
+[[corpus]]
+# Exact organizer-selected 400-row SAT Competition 2026 Main inventory,
+# pinned to the competition repository commit advertised by the downloads
+# page. The response manifest below preserves duplicate selected payloads as
+# distinct scored rows.
+name = "satcomp-2026-main-selection"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/sat/satcomp2026-main/selected_benchmarks.csv"
+url = "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/benchmark-compilation-script/selected_benchmarks.csv"
+sha256 = "d439903fe23482ec848e5223fa1865f8e29c12b065e655e2297d669afe50948d"
+size_bytes = 32297
+
+[[corpus]]
+name = "satcomp-2026-main"
+groups = ["competition-2025-2026"]
+depends_on = ["satcomp-2026-main-selection"]
+source = "gbd"
+extract_to = "benchmarks/sat/satcomp2026-main/instances"
+# Each ordered row carries the organizer's GBD content ID, a unique local path,
+# and exact response size/SHA-256. Duplicate selected payloads remain separate
+# benchmark rows while the downloader fetches each unique content ID once.
+manifest = "benchmarks/sat/satcomp2026-main/SC2026.pinned.csv"
+
+[[corpus]]
+name = "pb-comp-selected-pb25"
+groups = ["competition-2025-2026"]
+source = "http"
+# The archive has multiple top-level edition roots. Own all of them under this
+# edition-specific directory so force/prune cannot affect another edition.
 extract_to = "benchmarks/pb-comp/selected-PB25"
+wrap_archive = true
 url = "https://www.cril.univ-artois.fr/PB25/benchs/selected-PB25.tar"
+sha256 = "a53ecb956b80f6dc24fd4c0ca0eb4ac67346156a4aebd8d65d39b4e11ad34e7e"
+size_bytes = 373524480
+
+[[corpus]]
+name = "pb-comp-selected-pb26"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/pb-comp/selected-PB26"
+wrap_archive = true
+url = "https://www.cril.univ-artois.fr/PB26/files/selected-PB26.tar"
+sha256 = "4137d1874af8d96c6d56dec4865441ed434f0efcba34206c8ddd4dad3a586cc7"
+size_bytes = 382074880
+
+[[corpus]]
+name = "minizinc-challenge-2025"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/minizinc/challenge-2025/mznc2025_probs"
+url = "https://www.minizinc.org/challenge/2025/mznc2025_probs.tar.gz"
+sha256 = "6ee42441936b7c301c554fbb2cd9e726bba67fb9c3fed003f64b6c0d00d99945"
+size_bytes = 21172931
+
+[[corpus]]
+name = "minizinc-challenge-2025-results"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/minizinc/challenge-2025/results-2025.json"
+url = "https://raw.githubusercontent.com/MiniZinc/minizinc.github.io/2c459676c377aba1921dd68c34484320a80e8eb5/public/challenge/2025/results.json"
+sha256 = "fa5beb7c8ab6d4e9a6786e647179f960abd4902d61bfdbc0c9c2aaa7e9cbd5bd"
+size_bytes = 3662071
+
+[[corpus]]
+name = "minizinc-challenge-2026"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/minizinc/challenge-2026/mznc2026_probs"
+url = "https://www.minizinc.org/challenge/2026/mznc2026_probs.tar.gz"
+sha256 = "34c5929b29ee743e971bd3f3d7615cc4769e52f8ce82e63064b1ad8b5a44da3e"
+size_bytes = 1021150
+
+[[corpus]]
+name = "minizinc-challenge-2026-results"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/minizinc/challenge-2026/results-2026.json"
+url = "https://raw.githubusercontent.com/MiniZinc/minizinc.github.io/3f60db539085799f33a3ae63034f4138b6c2ed9f/public/challenge/2026/results.json"
+sha256 = "01087c0feeb3236e42fdd945a265d0103a159115eb613e7dc3263d06c3218c5c"
+size_bytes = 40372080
+
+[[corpus]]
+name = "casc-2025-problems"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/casc/2025/problems"
+wrap_archive = true
+# The official origin now returns HTTP 403 to fresh clients. This immutable
+# Wayback snapshot has the official origin URL, timestamp, byte length, and
+# content hash recorded below.
+url = "https://web.archive.org/web/20250804103625id_/https://tptp.org/CASC/30/Problems.tgz"
+sha256 = "7a3e701d0cb374a3dae9ec6f40419985d648a1d5e65e97f85f832a3871d65720"
+size_bytes = 217470866
+
+[[corpus]]
+name = "casc-2025-axioms"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/casc/2025/axioms"
+wrap_archive = true
+url = "https://web.archive.org/web/20250804103625id_/https://tptp.org/CASC/30/Axioms.tgz"
+sha256 = "83901fa2041dfe98d8a49a25cc878ef9d0b479f47dbe47dd3f4f5450e9e04e8a"
+size_bytes = 167952935
+
+[[corpus]]
+name = "coco-2025-csr"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/coco/2025/csr"
+wrap_archive = true
+url = "https://ari-cops.uibk.ac.at/CoCo/2025/competition/CSR/?m=download&d=CoCo.2025.competition.CSR"
+cache_name = "CoCo.2025.competition.CSR.zip"
+sha256 = "b03922cc7c323df1f01d424e6b6ba5bf921dc7499775cde1dc07b9e3fdc5ed3c"
+size_bytes = 38402
+
+[[corpus]]
+name = "coco-2025-ctrs"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/coco/2025/ctrs"
+wrap_archive = true
+url = "https://ari-cops.uibk.ac.at/CoCo/2025/competition/CTRS/?m=download&d=CoCo.2025.competition.CTRS"
+cache_name = "CoCo.2025.competition.CTRS.zip"
+sha256 = "fb4dac2bbe2195da2e84cd3d00c561f2029683e6f21ae484a62064a9595d720c"
+size_bytes = 34791
+
+[[corpus]]
+name = "coco-2025-inf"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/coco/2025/inf"
+wrap_archive = true
+url = "https://ari-cops.uibk.ac.at/CoCo/2025/competition/INF/?m=download&d=CoCo.2025.competition.INF"
+cache_name = "CoCo.2025.competition.INF.zip"
+sha256 = "7395dedeac97edd93384a2b157a6b2d57caf2ae55fa36773841c1f468d64d140"
+size_bytes = 42757
+
+[[corpus]]
+name = "coco-2025-lctrs"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/coco/2025/lctrs"
+wrap_archive = true
+url = "https://ari-cops.uibk.ac.at/CoCo/2025/competition/LCTRS/?m=download&d=CoCo.2025.competition.LCTRS"
+cache_name = "CoCo.2025.competition.LCTRS.zip"
+sha256 = "69223ba48699b363342df1fd35a9f4736b467bb4601b5e2539e39361998aed81"
+size_bytes = 39316
+
+[[corpus]]
+name = "coco-2025-trs"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/coco/2025/trs"
+wrap_archive = true
+url = "https://ari-cops.uibk.ac.at/CoCo/2025/competition/TRS/?m=download&d=CoCo.2025.competition.TRS"
+cache_name = "CoCo.2025.competition.TRS.zip"
+sha256 = "cfca88a6a740f6483b98305dc478071df8a5ca8c4ff0efcbc269694f5da454e1"
+size_bytes = 31937
+
+[[corpus]]
+name = "syntcomp-2025-results-final"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/syntcomp/2025/results-final"
+wrap_archive = true
+url = "https://zenodo.org/api/records/19509025/files/ResultsSyntComp25.zip/content"
+sha256 = "fe340ff903cae255ba4ca5ac5de00407578f7002e016e78be6c6cc1c9422949d"
+size_bytes = 1904031668
+
+[[corpus]]
+name = "syntcomp-2026-results-first-snapshot"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/syntcomp/2026/results-first-snapshot"
+wrap_archive = true
+url = "https://zenodo.org/api/records/21451603/files/SyntComp26_prelim.zip/content"
+sha256 = "d64b3648c8109395669292cc5b386f86eaa7d2b9e1f60661fb2d8cf34cf8830b"
+size_bytes = 7298747
+
+[[corpus]]
+name = "chc-comp-2026-benchmarks"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/chc/chc-comp26-benchmarks"
+url = "https://github.com/chc-comp/chc-comp26-benchmarks"
+commit = "b4fa7a708e5863bbcdb5de50d692ead3a67cbedc"
+
+[[corpus]]
+name = "chc-comp-2025-runner"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/chc/chc-comp-2025-runner"
+url = "https://github.com/chc-comp/chc-comp25-scripts"
+commit = "674721f1f9e5afb97528fc14a02c2afc5354c409"
+
+[[corpus]]
+name = "chc-comp-2026-runner"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/chc/chc-comp-2026-runner"
+url = "https://github.com/chc-comp/chc-comp-2026"
+commit = "927e10311b54d1337317199f53aed4c47ac33674"
+
+# HWMCC 2025: all four official benchmark families, raw/certified results, and
+# replay evidence from the immutable Zenodo record 17428464. Zenodo publishes
+# MD5 values; these size pins are upgraded to local SHA-256 pins after fetch.
+[[corpus]]
+name = "hwmcc-2025-wordlevel-array"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/hwmcc/2025/wordlevel-array"
+wrap_archive = true
+url = "https://zenodo.org/api/records/17428464/files/hwmcc25-benchmarks-wordlevel-array.tar.gz/content"
+cache_name = "hwmcc25-benchmarks-wordlevel-array.tar.gz"
+size_bytes = 85963965
+sha256 = "05ff7a35b6c4afef265dea5a3d3a147c28706932fe7e727fc55cd4d5d357f13a"
+
+[[corpus]]
+name = "hwmcc-2025-wordlevel-bv"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/hwmcc/2025/wordlevel-bv"
+wrap_archive = true
+url = "https://zenodo.org/api/records/17428464/files/hwmcc25-benchmarks-wordlevel-bv.tar.gz/content"
+cache_name = "hwmcc25-benchmarks-wordlevel-bv.tar.gz"
+size_bytes = 58405113
+sha256 = "c99af310eaf5a9b2c6e7f835e44d339993b06b17f78e2d37b1856dae1555d055"
+
+[[corpus]]
+name = "hwmcc-2025-bitlevel-safety"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/hwmcc/2025/bitlevel-safety"
+wrap_archive = true
+url = "https://zenodo.org/api/records/17428464/files/hwmcc25-benchmarks-bitlevel-safety.tar.gz/content"
+cache_name = "hwmcc25-benchmarks-bitlevel-safety.tar.gz"
+size_bytes = 91114933
+sha256 = "0b82c67999552f1848bf4880ae0cdb34a1b5237941088af73f29c307276c7c4e"
+
+[[corpus]]
+name = "hwmcc-2025-bitlevel-live"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/hwmcc/2025/bitlevel-live"
+wrap_archive = true
+url = "https://zenodo.org/api/records/17428464/files/hwmcc25-benchmarks-bitlevel-live.tar.gz/content"
+cache_name = "hwmcc25-benchmarks-bitlevel-live.tar.gz"
+size_bytes = 92863731
+sha256 = "ca962eff39fa199d58d3a21ef1600237317b1ad499a8abdbfab7cc22fc0238c9"
+
+[[corpus]]
+name = "hwmcc-2025-results-wordlevel-array"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/hwmcc/2025/results/hwmcc25-wordlevel-array.csv"
+url = "https://zenodo.org/api/records/17428464/files/hwmcc25-wordlevel-array.csv/content"
+size_bytes = 138245
+sha256 = "7df32fcb984817a069e49870f42f336e649ce0d273d25a05d7a0465f3dcf38f5"
+
+[[corpus]]
+name = "hwmcc-2025-results-wordlevel-bv"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/hwmcc/2025/results/hwmcc25-wordlevel-bv.csv"
+url = "https://zenodo.org/api/records/17428464/files/hwmcc25-wordlevel-bv.csv/content"
+size_bytes = 253268
+sha256 = "c3c7636ecc1724ed056c0c9853cfa05b543d9cc8191ddf730418b45abf3312a4"
+
+[[corpus]]
+name = "hwmcc-2025-results-bitlevel-safety"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/hwmcc/2025/results/hwmcc25-bitlevel-safety.csv"
+url = "https://zenodo.org/api/records/17428464/files/hwmcc25-bitlevel-safety.csv/content"
+size_bytes = 283239
+sha256 = "ec80c62424b231bb4dd9505362c9a62519eaeb8ba4bc6357e105af1182525d4e"
+
+[[corpus]]
+name = "hwmcc-2025-results-bitlevel-live"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/hwmcc/2025/results/hwmcc25-bitlevel-live.csv"
+url = "https://zenodo.org/api/records/17428464/files/hwmcc25-bitlevel-live.csv/content"
+size_bytes = 36191
+sha256 = "e4386ab3aa2a5ac5c20acffaaba74038e6644af815d68e8f10ceb34f9992325b"
+
+[[corpus]]
+name = "hwmcc-2025-results-wordlevel-array-certified"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/hwmcc/2025/results/hwmcc25-wordlevel-array-cert.csv"
+url = "https://zenodo.org/api/records/17428464/files/hwmcc25-wordlevel-array-cert.csv/content"
+size_bytes = 135480
+sha256 = "fb5609f413df13bfc6ccb913828515bc75bac78cc4fbf6afdc38bafd29da601e"
+
+[[corpus]]
+name = "hwmcc-2025-results-wordlevel-bv-certified"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/hwmcc/2025/results/hwmcc25-wordlevel-bv-cert.csv"
+url = "https://zenodo.org/api/records/17428464/files/hwmcc25-wordlevel-bv-cert.csv/content"
+size_bytes = 248325
+sha256 = "5b083d86f19eb10d5103d3af24a82d3809044a5d88537e77b0d691cf61568b43"
+
+[[corpus]]
+name = "hwmcc-2025-results-bitlevel-safety-certified"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/hwmcc/2025/results/hwmcc25-bitlevel-safety-cert.csv"
+url = "https://zenodo.org/api/records/17428464/files/hwmcc25-bitlevel-safety-cert.csv/content"
+size_bytes = 277729
+sha256 = "909accfcd7b06fbcf5be48ab32632736c3fb7b4f4e9e3b0d875d1527a91633fb"
+
+[[corpus]]
+name = "hwmcc-2025-results-bitlevel-live-certified"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/hwmcc/2025/results/hwmcc25-bitlevel-live-cert.csv"
+url = "https://zenodo.org/api/records/17428464/files/hwmcc25-bitlevel-live-cert.csv/content"
+size_bytes = 35421
+sha256 = "11f70f4841ef5c6e460d0736ef50218a71783874dbea9916e3f0556ed99a4cf8"
+
+[[corpus]]
+name = "hwmcc-2025-logfiles"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/hwmcc/2025/logs"
+wrap_archive = true
+url = "https://zenodo.org/api/records/17428464/files/hwmcc25-logfiles.tar.gz/content"
+cache_name = "hwmcc25-logfiles.tar.gz"
+sha256 = "aab988ea2816d32ae47e866eabf44f056ad9856d2318cf06fccf0d6ada790392"
+size_bytes = 513515283
+
+[[corpus]]
+name = "iccma-2025-instances"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/iccma/2025/instances"
+wrap_archive = true
+url = "https://zenodo.org/api/records/17949380/files/ICCMA-2025-instances.zip/content"
+cache_name = "ICCMA-2025-instances.zip"
+sha256 = "be6d0d62501ea3d097859171be5e6f104bdcc7952f4723f04db3a86b71ea8a96"
+size_bytes = 866229263
+
+[[corpus]]
+name = "iccma-2025-results"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/iccma/2025/results"
+wrap_archive = true
+url = "https://zenodo.org/api/records/18506390/files/ICCMA-2025-results.zip/content"
+cache_name = "ICCMA-2025-results.zip"
+sha256 = "632a6940c93249c289169dc02b2c26a6d993cd0487abd23bb8240c5f372a0e06"
+size_bytes = 1351761
+
+# MaxSAT Evaluation 2026 exact, anytime, and incremental tracks plus complete
+# raw result/log evidence (Zenodo record 21358014).
+[[corpus]]
+name = "maxsat-2026-exact-unweighted"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/maxsat/mse26/exact-unweighted"
+wrap_archive = true
+url = "https://zenodo.org/api/records/21358014/files/benchmarks-exact-unweighted.zip/content"
+cache_name = "benchmarks-exact-unweighted.zip"
+sha256 = "5ce712ee2183a19de8f7ae22c1193271726dff364555c82f96099176344b32c6"
+size_bytes = 2711644493
+
+[[corpus]]
+name = "maxsat-2026-exact-weighted"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/maxsat/mse26/exact-weighted"
+wrap_archive = true
+url = "https://zenodo.org/api/records/21358014/files/benchmarks-exact-weighted.zip/content"
+cache_name = "benchmarks-exact-weighted.zip"
+sha256 = "192440e63e30719ce4c097693e800895a71ab508de1a2a0aeb5d1304638b0833"
+size_bytes = 5401223505
+
+[[corpus]]
+name = "maxsat-2026-anytime-unweighted"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/maxsat/mse26/anytime-unweighted"
+wrap_archive = true
+url = "https://zenodo.org/api/records/21358014/files/benchmarks-anytime-unweighted.zip/content"
+cache_name = "benchmarks-anytime-unweighted.zip"
+sha256 = "6ebf66f5ff80780a8a9303d878d1ad12eea5e29081f20f135e93f40a56a1caa7"
+size_bytes = 701547473
+
+[[corpus]]
+name = "maxsat-2026-anytime-weighted"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/maxsat/mse26/anytime-weighted"
+wrap_archive = true
+url = "https://zenodo.org/api/records/21358014/files/benchmarks-anytime-weighted.zip/content"
+cache_name = "benchmarks-anytime-weighted.zip"
+sha256 = "4b9bc198d1bb12a5125194e8c5cbcc98976852e01f53849db5d80bb9d4715fb5"
+size_bytes = 1969015603
+
+[[corpus]]
+name = "maxsat-2026-incremental"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/maxsat/mse26/incremental"
+wrap_archive = true
+url = "https://zenodo.org/api/records/21358014/files/incremental.zip/content"
+cache_name = "incremental.zip"
+sha256 = "ee3e450e998cb75604efb3316610b209c67346784e482a18fc59c4d6769a47cf"
+size_bytes = 95725181
+
+[[corpus]]
+name = "maxsat-2026-results"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/maxsat/mse26/results"
+wrap_archive = true
+url = "https://zenodo.org/api/records/21358014/files/results.zip/content"
+cache_name = "results.zip"
+sha256 = "661a3ac433dbf253811a4a733ba73c35fafc08606bf8476e501fcdea35d3f52c"
+size_bytes = 1874664
+
+[[corpus]]
+name = "maxsat-2026-benchmark-metadata"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/maxsat/mse26/benchmark-metadata.csv"
+url = "https://zenodo.org/api/records/21358014/files/benchmark-metadata.csv/content"
+sha256 = "33ae45c6b83ee82d8da8a8cd7e8e0ef848eabe0ea1513a51b6e3aca738f6fa90"
+size_bytes = 81089
+
+[[corpus]]
+name = "maxsat-2026-logs"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/maxsat/mse26/logs"
+wrap_archive = true
+url = "https://zenodo.org/api/records/21358014/files/logs.zip/content"
+cache_name = "logs.zip"
+sha256 = "29128cb38b0b02860b8660f742e2587e934cdf499ab3f0fc34a95b9ba959eb5d"
+size_bytes = 1828201401
+
+[[corpus]]
+name = "maxsat-2026-incremental-logs"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/maxsat/mse26/incremental-logs"
+wrap_archive = true
+url = "https://zenodo.org/api/records/21358014/files/logs-incremental.zip/content"
+cache_name = "logs-incremental.zip"
+sha256 = "9f64f9d7bcdfb1f99a638a30582b37b0f6d413e82d560a4a083a59388f735577"
+size_bytes = 20243278
+
+# SMT-COMP 2025 selected/scrambled corpora (Zenodo record 16887742).
+[[corpus]]
+name = "smtcomp-2025-single-query"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/smtcomp/2025/single-query"
+wrap_archive = true
+url = "https://zenodo.org/api/records/16887742/files/single_query.tar.gz/content"
+cache_name = "single_query.tar.gz"
+sha256 = "e4a1a35cc6f790477f861aa801b09f5f5b7bdbe6b5ee5872a4a90aaa4a4bba5b"
+size_bytes = 4524415293
+
+[[corpus]]
+name = "smtcomp-2025-incremental"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/smtcomp/2025/incremental"
+wrap_archive = true
+url = "https://zenodo.org/api/records/16887742/files/incremental.tar.gz/content"
+cache_name = "incremental.tar.gz"
+sha256 = "94e2981b47373f2f1677b9f66e0112054699577983fdff6739d01a2bd749b678"
+size_bytes = 3670402817
+
+[[corpus]]
+name = "smtcomp-2025-model-validation"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/smtcomp/2025/model-validation"
+wrap_archive = true
+url = "https://zenodo.org/api/records/16887742/files/model_validation.tar.gz/content"
+cache_name = "model_validation.tar.gz"
+sha256 = "c57285633ed26ae35796bca2ab6171d43a62908e61408954c1eae349795cb8d8"
+size_bytes = 2449541721
+
+[[corpus]]
+name = "smtcomp-2025-unsat-core"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/smtcomp/2025/unsat-core"
+wrap_archive = true
+url = "https://zenodo.org/api/records/16887742/files/unsat_core.tar.gz/content"
+cache_name = "unsat_core.tar.gz"
+sha256 = "1ee08f4d7ae2f06155b480a1c54daf5637d36d6edf73551406ded5ef16dca42b"
+size_bytes = 1064490360
+
+[[corpus]]
+name = "smtcomp-2025-parallel"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/smtcomp/2025/parallel"
+wrap_archive = true
+url = "https://zenodo.org/api/records/16887742/files/parallel.tar.gz/content"
+cache_name = "parallel.tar.gz"
+sha256 = "c1dfe544b3db770e2f6fca058bde8d983263996f04389c1279f6c143aaa9d991"
+size_bytes = 278730619
+
+# Official immutable result blobs and benchmark selections. These are kept
+# compressed exactly as published.
+[[corpus]]
+name = "smtcomp-2025-selection"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/smtcomp/2025/results/benchmarks-2025.json.gz"
+url = "https://raw.githubusercontent.com/SMT-COMP/smt-comp.github.io/401302678311593efcef8a79b614b33a3b853eac/data/benchmarks-2025.json.gz"
+sha256 = "fffb1cd96324bae53053a93f5fed6312e12f93e0f527112022e4e9f3d71590e1"
+size_bytes = 3239884
+
+[[corpus]]
+name = "smtcomp-2025-results-single-query"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/smtcomp/2025/results/results-sq-2025.json.gz"
+url = "https://raw.githubusercontent.com/SMT-COMP/smt-comp.github.io/401302678311593efcef8a79b614b33a3b853eac/data/results-sq-2025.json.gz"
+sha256 = "d79dd5d693e9cc645817ecbcad8ccc3cb92fba97418dbe011be3f181a6dd4a1e"
+size_bytes = 21841375
+
+[[corpus]]
+name = "smtcomp-2025-results-incremental"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/smtcomp/2025/results/results-inc-2025.json.gz"
+url = "https://raw.githubusercontent.com/SMT-COMP/smt-comp.github.io/401302678311593efcef8a79b614b33a3b853eac/data/results-inc-2025.json.gz"
+sha256 = "29b3473c0e511470725288e72ab89e4aa3f0c7fee1df593a2cb9cccdb1769e6e"
+size_bytes = 1433155
+
+[[corpus]]
+name = "smtcomp-2025-results-model-validation"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/smtcomp/2025/results/results-mv-2025.json.gz"
+url = "https://raw.githubusercontent.com/SMT-COMP/smt-comp.github.io/401302678311593efcef8a79b614b33a3b853eac/data/results-mv-2025.json.gz"
+sha256 = "e0e2773b24a268bd3fd2299176645925ffbe0d6bdc5f5029bbb2fc847833ea5a"
+size_bytes = 4286948
+
+[[corpus]]
+name = "smtcomp-2025-results-unsat-core"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/smtcomp/2025/results/results-uc-2025.json.gz"
+url = "https://raw.githubusercontent.com/SMT-COMP/smt-comp.github.io/401302678311593efcef8a79b614b33a3b853eac/data/results-uc-2025.json.gz"
+sha256 = "8d5633a1a32a2b8d80851ebc2853475e2776de1ea1ba64793da3a7d777d25c9b"
+size_bytes = 4726917
+
+[[corpus]]
+name = "smtcomp-2025-results-parallel"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/smtcomp/2025/results/results-parallel-2025.json.gz"
+url = "https://raw.githubusercontent.com/SMT-COMP/smt-comp.github.io/401302678311593efcef8a79b614b33a3b853eac/data/results-parallel-2025.json.gz"
+sha256 = "4800e9e1ff665005fd8b13d0ab2089a1058b46b0264791766480bba906dd69fd"
+size_bytes = 32449
+
+# SMT-COMP 2026 has published candidate inventory/provisional result blobs but
+# not a frozen selected corpus. These assets intentionally do not imply final
+# corpus readiness.
+[[corpus]]
+name = "smtcomp-2026-candidate-selection"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/smtcomp/2026/results/benchmarks-2026.json.gz"
+url = "https://raw.githubusercontent.com/SMT-COMP/smt-comp.github.io/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/data/benchmarks-2026.json.gz"
+sha256 = "ba855e47e1ed88e2e6bb26272e84a20a0e8f0c320adc704b062f4c287e586a54"
+size_bytes = 3239841
+
+[[corpus]]
+name = "smtcomp-2026-results-single-query-provisional"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/smtcomp/2026/results/results-sq-2026.json.gz"
+url = "https://raw.githubusercontent.com/SMT-COMP/smt-comp.github.io/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/data/results-sq-2026.json.gz"
+sha256 = "7abe5cadf800cc84db00506f85176378f714cdaa8c02a0e491059835f5039c58"
+size_bytes = 12728309
+
+[[corpus]]
+name = "smtcomp-2026-results-incremental-provisional"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/smtcomp/2026/results/results-inc-2026.json.gz"
+url = "https://raw.githubusercontent.com/SMT-COMP/smt-comp.github.io/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/data/results-inc-2026.json.gz"
+sha256 = "02553cb2a11547c032022184f97acf5938969c680c053e928d5caf4d67b612db"
+size_bytes = 983416
+
+[[corpus]]
+name = "smtcomp-2026-results-model-validation-provisional"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/smtcomp/2026/results/results-mv-2026.json.gz"
+url = "https://raw.githubusercontent.com/SMT-COMP/smt-comp.github.io/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/data/results-mv-2026.json.gz"
+sha256 = "ff49b61ddddab39246bea6652030be91162bd02e0f6bf6ead3efaf4b5611829e"
+size_bytes = 2588349
+
+[[corpus]]
+name = "smtcomp-2026-results-unsat-core-provisional"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/smtcomp/2026/results/results-uc-2026.json.gz"
+url = "https://raw.githubusercontent.com/SMT-COMP/smt-comp.github.io/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/data/results-uc-2026.json.gz"
+sha256 = "f917049c0ccfb123899309ca2c8e33284d20945f3d67dca92251e7b7c78b494a"
+size_bytes = 3513053
+
+[[corpus]]
+name = "smtcomp-2026-results-parallel-provisional"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/smtcomp/2026/results/results-parallel-2026.json.gz"
+url = "https://raw.githubusercontent.com/SMT-COMP/smt-comp.github.io/9e86f266ecd80fadb3d41272a75b46c5a8497bb1/data/results-parallel-2026.json.gz"
+sha256 = "177dca66ba3514263c95a6ba628e54c12cf3874adeb4833e9bbda17cc0e12edb"
+size_bytes = 36572
+
+[[corpus]]
+# Exact organizer tree containing the 2026 scorer, track definitions, and
+# competition metadata used to interpret the provisional result blobs above.
+name = "smtcomp-2026-results-tooling"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/smtcomp/2026/results-tooling"
+url = "https://github.com/SMT-COMP/smt-comp.github.io"
+commit = "9e86f266ecd80fadb3d41272a75b46c5a8497bb1"
+
+# SYNTCOMP competition selections. The 2025 release API predates GitHub's
+# digest field, so exact sizes and locally computed SHA-256 values are pinned.
+[[corpus]]
+name = "syntcomp-2025-ltl"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/syntcomp/2025/ltl"
+wrap_archive = true
+url = "https://github.com/SYNTCOMP/benchmarks/releases/download/v2025.1/selection-ltl-2025v2.zip"
+sha256 = "5064a101b644cbfcd28318064f4786621fe63f735d3bff0cd9680e55f3193995"
+size_bytes = 2158525
+
+[[corpus]]
+name = "syntcomp-2025-ltlf"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/syntcomp/2025/ltlf"
+wrap_archive = true
+url = "https://github.com/SYNTCOMP/benchmarks/releases/download/v2025.1/selection-ltlf-2025.zip"
+sha256 = "46bb12a2b6ca0409a3f705056cf4e741ff79ebf4636473170820ead45161e9f8"
+size_bytes = 4286741
+
+[[corpus]]
+name = "syntcomp-2025-parity"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/syntcomp/2025/parity"
+wrap_archive = true
+url = "https://github.com/SYNTCOMP/benchmarks/releases/download/v2025.1/selection-parity-2025.zip"
+sha256 = "c1bed5b9f005c95ff0e22a22c66f5a7f55f387a7d56682a1d9d347fc6bf3267e"
+size_bytes = 124384611
+
+[[corpus]]
+name = "syntcomp-2026-ltl"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/syntcomp/2026/ltl"
+wrap_archive = true
+url = "https://github.com/SYNTCOMP/benchmarks/releases/download/v2026/tlsf.zip"
+sha256 = "8a7038322ec6c4f7ca7754d3660c3e3b6c79fecab8c41b1304ed0a0589a89843"
+size_bytes = 2132108
+
+[[corpus]]
+name = "syntcomp-2026-ltlf"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/syntcomp/2026/ltlf"
+wrap_archive = true
+url = "https://github.com/SYNTCOMP/benchmarks/releases/download/v2026/tlsf-fin.zip"
+sha256 = "b18e6f8fc3d873ef31ccae0db3dde359c60fbcb432b53a76feeecad0e282849f"
+size_bytes = 4015864
+
+[[corpus]]
+name = "syntcomp-2026-parity"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/syntcomp/2026/parity"
+wrap_archive = true
+url = "https://github.com/SYNTCOMP/benchmarks/releases/download/v2026/parity.zip"
+sha256 = "8e3f0c463cb816bd9a7696595d0d4629f1bad8526384b369896e9731e17fcd1a"
+size_bytes = 129237265
+
+# Public Model Counting Competition sets. Organizers label these "public";
+# they are useful same-host corpora but are not asserted to be frozen private
+# competition selections.
+[[corpus]]
+name = "mcc-2025-track1-public"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/mcc/2025/track1-public"
+wrap_archive = true
+url = "https://nextcloud.liu.se/s/2zbn4APWnjLxRLo/download?path=%2F&files=mc2025_track1_public.tar"
+cache_name = "mc2025_track1_public.tar"
+sha256 = "02ab3d7a58a57b09190438136897c2c9b6f9723819b51021ee45a5353accc0d9"
+size_bytes = 43233280
+
+[[corpus]]
+name = "mcc-2025-track3-public"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/mcc/2025/track3-public"
+wrap_archive = true
+url = "https://nextcloud.liu.se/s/2zbn4APWnjLxRLo/download?path=%2F&files=mc2025_track3_public.tar"
+cache_name = "mc2025_track3_public.tar"
+sha256 = "7d0226d8b574dd7d1b61c6d772c6a37e7bbec537d37a3cdf2af92c049bbdacaf"
+size_bytes = 56698880
+
+[[corpus]]
+name = "mcc-2025-track4-public"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/mcc/2025/track4-public"
+wrap_archive = true
+url = "https://nextcloud.liu.se/s/2zbn4APWnjLxRLo/download?path=%2F&files=mc2025_track4_public.tar"
+cache_name = "mc2025_track4_public.tar"
+sha256 = "539ee5ad84e89e34abd5fa2491f16fd424a92c0391fa293badc514cefa1d9a95"
+size_bytes = 45424640
+
+[[corpus]]
+name = "mcc-2025-track5b-public"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/mcc/2025/track5b-public"
+wrap_archive = true
+url = "https://nextcloud.liu.se/s/2zbn4APWnjLxRLo/download?path=%2F&files=mc2025_track5b_public.tar"
+cache_name = "mc2025_track5b_public.tar"
+sha256 = "65a54497b519604327e4ed350673be26ee3133fb880200fe3f3e65a64ce98f9a"
+size_bytes = 13885440
+
+[[corpus]]
+name = "mcc-2026-track1-public"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/mcc/2026/track1-public"
+wrap_archive = true
+url = "https://nextcloud.liu.se/s/STzdpXNgZDZaPRo/download?path=%2F&files=mc2026_track1_public.tar"
+cache_name = "mc2026_track1_public.tar"
+sha256 = "30766e5e4e69bcca2d5d2b33ab4884cedd4dd5362e3dd72361b5cd68e9270a03"
+size_bytes = 11304960
+
+[[corpus]]
+name = "mcc-2026-track2b-public"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/mcc/2026/track2b-public"
+wrap_archive = true
+url = "https://nextcloud.liu.se/s/STzdpXNgZDZaPRo/download?path=%2F&files=mc2026_track2B_public.tar"
+cache_name = "mc2026_track2B_public.tar"
+sha256 = "2b3539376b37304a6efd28da5e30aeb338cc96a267b7ed457158d56b23bec06f"
+size_bytes = 25272320
+
+[[corpus]]
+name = "mcc-2026-track3-public"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/mcc/2026/track3-public"
+wrap_archive = true
+url = "https://nextcloud.liu.se/s/STzdpXNgZDZaPRo/download?path=%2F&files=mc2026_track3_public.tar"
+cache_name = "mc2026_track3_public.tar"
+sha256 = "d830b94c5ae2d5d4ad0b41697e2e638259a97e25bc0b538255e278bdb1c57ab4"
+size_bytes = 51804160
+
+[[corpus]]
+name = "mcc-2026-track4-public"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/mcc/2026/track4-public"
+wrap_archive = true
+url = "https://nextcloud.liu.se/s/STzdpXNgZDZaPRo/download?path=%2F&files=mc2026_track4_public.tar"
+cache_name = "mc2026_track4_public.tar"
+sha256 = "318a6bf1af33e1dc7ecaa56c5d9636c8e891726ca11af1667c37c7c96dee5f69"
+size_bytes = 74352640
+
+[[corpus]]
+name = "mcc-2026-track5b-public"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/mcc/2026/track5b-public"
+wrap_archive = true
+url = "https://nextcloud.liu.se/s/STzdpXNgZDZaPRo/download?path=%2F&files=mc2026_track5B_public.tar"
+cache_name = "mc2026_track5B_public.tar"
+sha256 = "c5c7f4770de7c4230b60cd548bd2e03e1794eb96703f3e1a5c8b44c465d46ccc"
+size_bytes = 8304640
+
+[[corpus]]
+name = "satcomp-2026-scores"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/sat/satcomp2026/results/scores.csv"
+url = "https://satcompetition.github.io/2026/downloads/scores.csv"
+sha256 = "1b804de14b45bc05f7f01a23f2c41847492b61d171ed1f6b78211fe0cae07137"
+size_bytes = 1190049
+
+[[corpus]]
+name = "satcomp-2026-slides"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/sat/satcomp2026/results/satcomp26slides.pdf"
+url = "https://satcompetition.github.io/2026/downloads/satcomp26slides.pdf"
+sha256 = "416511469da9dcdbe723f6eeee2e0e88d6ee1a423cf232e59d5cf4884d95dced"
+size_bytes = 1891485
+
+[[corpus]]
+name = "satcomp-2026-benchmark-compilation"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "none"
+extract_to = "benchmarks/sat/satcomp2026/benchmark-compilation-script.tar.xz"
+url = "https://satcompetition.github.io/2026/downloads/benchmark-compilation-script.tar.xz"
+sha256 = "8946e7f1fe3c18dd55d5043c98e8a2023c97ae37f813a2a1d66e5bdd712ea5e8"
+size_bytes = 4971900
+
+[[corpus]]
+name = "proover-2026-examples"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/proover/2026/examples"
+wrap_archive = true
+url = "https://proover-competition.github.io/assets/proover.tgz"
+sha256 = "0ba89c8fb09a2bc2810117cf83bc8528df1261d4dfee0b6c502cb273f4f97869"
+size_bytes = 200045
+
+[[corpus]]
+name = "proover-2026-samples"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/proover/2026/samples"
+wrap_archive = true
+url = "https://proover-competition.github.io/assets/samples.tgz"
+sha256 = "cee81de59c7826928a0418cd4ddf30454eca25382c7fb22c3d1275cfe858e8c3"
+size_bytes = 197971
+
+[[corpus]]
+name = "xcsp3-2025-instances"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/xcsp3/2025/instances"
+wrap_archive = true
+url = "https://www.cril.univ-artois.fr/~lecoutre/compets/instancesXCSP25.zip"
+sha256 = "b0c363f0407d80e2980bcbd925db8999633e94f19a9fe1aaba051e36140d96a2"
+size_bytes = 32634265
+
+[[corpus]]
+name = "xcsp3-2025-models"
+groups = ["competition-2025-2026"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/xcsp3/2025/models"
+wrap_archive = true
+url = "https://www.cril.univ-artois.fr/~lecoutre/compets/modelsXCSP25.zip"
+sha256 = "d22f73595bbda02537fe702d92292cc90b2e005b103a0fc04aa05cee3d69cd26"
+size_bytes = 9900536
+
+[[corpus]]
+# The tracked TSV pins all 77 mutable API responses by exact byte count and
+# SHA-256. Each response is materialized as <competition>-<solver>.json.
+name = "xcsp3-2025-result-artifacts"
+groups = ["competition-2025-2026"]
+source = "uri-list"
+uri_list_format = "raw-json"
+extract_to = "benchmarks/xcsp3/2025/result-artifacts"
+manifest = "benchmarks/xcsp3/xcsp3-2025-result-artifacts.tsv"
+
+[[corpus]]
+name = "xcsp3-2026-result-artifacts"
+groups = ["competition-2025-2026"]
+source = "uri-list"
+uri_list_format = "raw-json"
+extract_to = "benchmarks/xcsp3/2026/result-artifacts"
+manifest = "benchmarks/xcsp3/xcsp3-2026-result-artifacts.tsv"
+
+# SV-COMP/Test-Comp task and runner definitions. Edition commits are separate
+# because the same upstream repository moves after each competition.
+[[corpus]]
+name = "svcomp-2025-benchmarks"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/svcomp/2025/sv-benchmarks"
+url = "https://gitlab.com/sosy-lab/benchmarking/sv-benchmarks.git"
+commit = "1e5856db49f3a4766f416cc60382aa92012b2939"
+
+[[corpus]]
+name = "svcomp-2026-benchmarks"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/svcomp/2026/sv-benchmarks"
+url = "https://gitlab.com/sosy-lab/benchmarking/sv-benchmarks.git"
+commit = "7efe28dd29576b46927b7a34e8f742bd90966a75"
+
+[[corpus]]
+name = "testcomp-2025-benchmarks"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/testcomp/2025/sv-benchmarks"
+url = "https://gitlab.com/sosy-lab/benchmarking/sv-benchmarks.git"
+commit = "38cc9d9381861e5ddbc3c14488376a0957432e43"
+
+[[corpus]]
+name = "testcomp-2026-benchmarks"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/testcomp/2026/sv-benchmarks"
+url = "https://gitlab.com/sosy-lab/benchmarking/sv-benchmarks.git"
+commit = "7efe28dd29576b46927b7a34e8f742bd90966a75"
+
+[[corpus]]
+name = "svcomp-2025-definitions"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/svcomp/2025/benchmark-definitions"
+url = "https://gitlab.com/sosy-lab/sv-comp/bench-defs.git"
+commit = "8872249ca5a20fb426c665e253fb16cbf3368f5c"
+
+[[corpus]]
+name = "svcomp-2026-definitions"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/svcomp/2026/benchmark-definitions"
+url = "https://gitlab.com/sosy-lab/sv-comp/bench-defs.git"
+commit = "1e60f4918c216ce9f538c3b75fd715ac5a25925c"
+
+[[corpus]]
+name = "testcomp-2025-definitions"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/testcomp/2025/benchmark-definitions"
+url = "https://gitlab.com/sosy-lab/test-comp/bench-defs.git"
+commit = "59a8f39e4c022731db3558897e11a32eb76577ea"
+
+[[corpus]]
+name = "testcomp-2026-definitions"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/testcomp/2026/benchmark-definitions"
+url = "https://gitlab.com/sosy-lab/test-comp/bench-defs.git"
+commit = "eefb08406b79e42c1d169a4de41bf2c871a1f8da"
+
+# Complete official output/witness bundles are intentionally in a second
+# group: they are reproducible score evidence, but exceed 140 GB compressed
+# and must never enter the four-hour default corpus refresh.
+[[corpus]]
+name = "svcomp-2025-witnesses"
+groups = ["competition-2025-2026-external"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/svcomp/2025/witnesses"
+wrap_archive = true
+url = "https://zenodo.org/api/records/15012077/files/svcomp25-witnesses.zip/content"
+cache_name = "svcomp25-witnesses.zip"
+sha256 = "bce4a9f739d1e7ff9c546a97aec4ebad6f0aec33204fa0891a6f3084b2d197ff"
+size_bytes = 19081123087
+
+[[corpus]]
+name = "svcomp-2026-witnesses"
+groups = ["competition-2025-2026-external"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/svcomp/2026/witnesses"
+wrap_archive = true
+url = "https://zenodo.org/api/records/18651735/files/svcomp26-witnesses.zip/content"
+cache_name = "svcomp26-witnesses.zip"
+sha256 = "fbd21e2c260fa45bb97cc7b1fba8e7381d0051c13b55e02f2633dab371b49ee8"
+size_bytes = 15754375760
+
+[[corpus]]
+name = "svcomp-2025-results-full"
+groups = ["competition-2025-2026-external"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/svcomp/2025/results-full"
+wrap_archive = true
+url = "https://zenodo.org/api/records/15012085/files/svcomp25-results.zip/content"
+cache_name = "svcomp25-results.zip"
+sha256 = "132b2fb2de1e5e6fcb4d0b68510e2cc15a59e7d913a5a6e03788387dad5ddfef"
+size_bytes = 54419250915
+
+[[corpus]]
+name = "svcomp-2026-results-full"
+groups = ["competition-2025-2026-external"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/svcomp/2026/results-full"
+wrap_archive = true
+url = "https://zenodo.org/api/records/18651757/files/svcomp26-results.zip/content"
+cache_name = "svcomp26-results.zip"
+sha256 = "3297671d28c190fc44245660ed0252bd3f2ce3965a6fdce831d795c0b336f13e"
+size_bytes = 27986574709
+
+[[corpus]]
+name = "testcomp-2025-results-full"
+groups = ["competition-2025-2026-external"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/testcomp/2025/results-full"
+wrap_archive = true
+url = "https://zenodo.org/api/records/15034433/files/testcomp25-results.zip/content"
+cache_name = "testcomp25-results.zip"
+sha256 = "972121f72a43748fe6025c736b9c8e630996f18bdb4f2a78165562c2e7bb6d87"
+size_bytes = 11203129202
+
+[[corpus]]
+name = "testcomp-2026-results-full"
+groups = ["competition-2025-2026-external"]
+source = "http"
+archive = "zip"
+extract_to = "benchmarks/testcomp/2026/results-full"
+wrap_archive = true
+url = "https://zenodo.org/api/records/18650772/files/testcomp26-results.zip/content"
+cache_name = "testcomp26-results.zip"
+sha256 = "1624cb797aa0faba24d0fea5a9fc47d66845c4512f7569eba4a587f93ca78064"
+size_bytes = 16450239789
+
+[[corpus]]
+name = "termcomp-tpdb-11-5"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/termcomp/TPDB-11.5"
+url = "https://github.com/TermCOMP/TPDB"
+commit = "bf19a3c906ac76a49251779e41c3adf144caa16c"
+
+[[corpus]]
+name = "termcomp-runner-config"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/termcomp/starexec-master"
+url = "https://github.com/TermCOMP/starexec-master"
+commit = "04f62435c16061c03e16533ab2fb3915a0b9d049"
+
+[[corpus]]
+name = "termcomp-results"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/termcomp/results-site"
+url = "https://github.com/TermCOMP/termcomp.github.io"
+commit = "f6bc1a7b72a27e86fab774443c51d743bee4dd5b"
+
+[[corpus]]
+name = "termcomp-registration-2026"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/termcomp/registration-2026"
+url = "https://github.com/TermCOMP/registration"
+commit = "9465fba581c4d0a3a8cdd09a15e2e243928c1698"
+
+[[corpus]]
+name = "vnncomp-2025-benchmarks"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/vnncomp/2025/benchmarks"
+url = "https://github.com/VNN-COMP/vnncomp2025_benchmarks"
+commit = "8b7b811b78ce6a329dc96f04ae6652da3c245948"
+
+[[corpus]]
+name = "vnncomp-2025-results"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/vnncomp/2025/results"
+url = "https://github.com/VNN-COMP/vnncomp2025_results"
+commit = "ea89fbc2518b6729f17c96eeec22c56c88e496a9"
+
+[[corpus]]
+name = "vnncomp-2026-benchmarks"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/vnncomp/2026/benchmarks"
+url = "https://github.com/VNN-COMP/vnncomp2026_benchmarks"
+commit = "303f2327a8e8411efc4457da03d2016ce42733cf"
+
+[[corpus]]
+name = "vnncomp-2026-results-tooling"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/vnncomp/2026/results-tooling"
+url = "https://github.com/VNN-COMP/vnncomp2026_results"
+commit = "b0ae71109ad0fe89661d5989405dc533bc3a9ee7"
+
+[[corpus]]
+name = "archcomp-repository"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/archcomp/repository"
+url = "https://gitlab.com/goranf/ARCH-COMP.git"
+commit = "5e8f72b8d5f30be002f40ae5df4a8e04d7f64e3c"
+allowed_unmapped_gitlinks = [
+  "2023/AINNCS/nnv/nnv/code/nnv/engine/cora",
+  "2023/AINNCS/nnv/nnv/code/nnv/engine/hyst",
+]
+
+[[corpus]]
+name = "floc-modeling-2025-samples"
+groups = ["competition-2025-2026"]
+source = "git"
+extract_to = "benchmarks/floc-modeling/2025/samples"
+url = "https://github.com/lpcp-contest/lpcp-contest-2025"
+commit = "bb27a762605d57836915a04dba367f77c7a2e546"
+
+# First exact same-host competitor bundles. These packages are downloadable
+# and content-pinned, but acquisition alone does not make them runnable: each
+# still needs its official build/argv/checker adapter and a license gate.
+[[corpus]]
+name = "satcomp-2025-competitor-ae-kissat-mab"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2025/AE-Kissat-MAB"
+wrap_archive = true
+url = "https://raw.githubusercontent.com/satcompetition/2025/5f286f4443ab2e1f3c1deded3255d8500ae46e2e/downloads/solvers/main/AE_kissat2025_MAB.tar.xz"
+sha256 = "069cc73be6ca20e2d1f22cf63dec858026deab041bf3b98bfa20c6676697013c"
+size_bytes = 1642148
+
+[[corpus]]
+name = "satcomp-2025-competitor-kissat-public"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2025/Kissat-public"
+wrap_archive = true
+url = "https://raw.githubusercontent.com/satcompetition/2025/5f286f4443ab2e1f3c1deded3255d8500ae46e2e/downloads/solvers/main/kissat-public.tar.xz"
+sha256 = "89a07d496eca8ca1676590dbfd9714bc5c6f706095f0d56370e372583025b9fc"
+size_bytes = 1489192
+
+[[corpus]]
+name = "satcomp-2025-competitor-kissat-vsa"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2025/Kissat-VSA"
+wrap_archive = true
+url = "https://raw.githubusercontent.com/satcompetition/2025/5f286f4443ab2e1f3c1deded3255d8500ae46e2e/downloads/solvers/main/vsa.tar.xz"
+sha256 = "959c95de4376f04655c0df3e1e73a0b3e86e24337f5c93da0aef0a44e4f76011"
+size_bytes = 813700
+
+[[corpus]]
+name = "satcomp-2026-competitor-satsuma-iter-kissat"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2026/satsuma-iter-kissat"
+wrap_archive = true
+url = "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/solvers/anders.tar.xz"
+sha256 = "1951097402831eaaa9cdd6b670a09b9e9cbe1714e16d48b17d420e3b40816623"
+size_bytes = 2253192
+
+[[corpus]]
+name = "satcomp-2026-competitor-kissat-mab-hypre"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2026/Kissat-MAB-HyPre"
+wrap_archive = true
+url = "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/solvers/zheng.tar.xz"
+sha256 = "398d9eb8dce74b4d5d185384b41ffb39580639b068c9ac23eec48cf8f15f42ec"
+size_bytes = 2210572
+
+[[corpus]]
+name = "satcomp-2026-competitor-eda-kissat-v2"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2026/EDA-Kissat-v2"
+wrap_archive = true
+url = "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/solvers/yalun.tar.xz"
+sha256 = "53a73890c4094bb9da680e7d6676effd9058cbbd212c32d60cd0d91458645c7c"
+size_bytes = 791180
+
+[[corpus]]
+# Organizer author archive: cadical3, isasat, and kissat submissions.
+name = "satcomp-2026-competitor-biere-submissions"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2026/by-author/biere"
+normalize_absolute_archive_symlinks = true
+url = "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/solvers/biere.tar.xz"
+sha256 = "69fbdae7a9a0a96955ea953976257712388834fca7000a844d3d736b61d8b3f3"
+size_bytes = 8978608
+
+[[corpus]]
+# Organizer author archive: kissat-mab-eae1/eae2/eae3 submissions.
+name = "satcomp-2026-competitor-ding-submissions"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2026/by-author/ding"
+normalize_absolute_archive_symlinks = true
+url = "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/solvers/ding.tar.xz"
+sha256 = "36d59b1df4a6ddb4c31303010729851eec1d1f0d8d54b413ac1ef952dc3d3966"
+size_bytes = 720472
+
+[[corpus]]
+# Organizer author archive: llmg submission.
+name = "satcomp-2026-competitor-faraja-llmg"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2026/by-author/faraja"
+normalize_absolute_archive_symlinks = true
+url = "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/solvers/faraja.tar.xz"
+sha256 = "3fd15b69d31b3cbc0d8e13326c456d6584e4d79515bf86b0ac044b4734e5750e"
+size_bytes = 6896364
+
+[[corpus]]
+# Organizer filename is `gopalan.tar.xz`; it contains four kissat-evolve variants.
+name = "satcomp-2026-competitor-gopalan-submissions"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2026/by-author/gopalan"
+normalize_absolute_archive_symlinks = true
+url = "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/solvers/gopalan.tar.xz"
+sha256 = "1f6723af51673c2103245181928adb60f61302b87fca0237b57e9d0981528a9e"
+size_bytes = 753976
+
+[[corpus]]
+# Organizer author archive: lymphosat and lymphosat-verified submissions.
+name = "satcomp-2026-competitor-green-lymphosat"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2026/by-author/green"
+normalize_absolute_archive_symlinks = true
+url = "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/solvers/green.tar.xz"
+sha256 = "7bc2ad3278197261cee221fd8c2dd583069821213f31d63e6873495000713c70"
+size_bytes = 24596892
+
+[[corpus]]
+# Organizer author archive: kissat-ae-eg and kissat-ae-hucb checker bundles.
+name = "satcomp-2026-competitor-guo-kissat-ae"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2026/by-author/guo"
+url = "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/solvers/guo.tar.xz"
+sha256 = "bec05d5ca14c6245d35656014726502b616516b9c43517f7b4102cdf622c1670"
+size_bytes = 252
+
+[[corpus]]
+# Organizer author archive: kissat-bva submission.
+name = "satcomp-2026-competitor-hangjiang-kissat-bva"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2026/by-author/hangjiang"
+normalize_absolute_archive_symlinks = true
+url = "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/solvers/hangjiang.tar.xz"
+sha256 = "b825f8825db27591eb2059aa1a963fdb47f0fed12e3a4662c67bbcf648ce6e15"
+size_bytes = 661704
+
+[[corpus]]
+# Organizer author archive: kissat-lr-ds and kissat-mab-da submissions.
+name = "satcomp-2026-competitor-liang-submissions"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2026/by-author/liang"
+normalize_absolute_archive_symlinks = true
+url = "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/solvers/liang.tar.xz"
+sha256 = "043c7e2e550f973b1bac84209e87e7dff4bedc0369b8c94c7d2501c67b0150f6"
+size_bytes = 810700
+
+[[corpus]]
+# Organizer author archive: satsuma-lex-kissat variants.
+name = "satcomp-2026-competitor-oertel-satsuma-lex"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2026/by-author/oertel"
+normalize_absolute_archive_symlinks = true
+url = "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/solvers/oertel.tar.xz"
+sha256 = "931a452dd76abf01aced77fb349039faf3a1d2e2310877fc3ad8321a84fed7f9"
+size_bytes = 1200924
+
+[[corpus]]
+# Organizer author archive: cadical-xlc-freeze submission.
+name = "satcomp-2026-competitor-reeves-cadical-xlc-freeze"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2026/by-author/reeves"
+normalize_absolute_archive_symlinks = true
+url = "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/solvers/reeves.tar.xz"
+sha256 = "cccff702605bd9ed981a03a4bb7d9a419e0157d065d91957e3078c72be245c65"
+size_bytes = 1604072
+
+[[corpus]]
+# Organizer author archive: kissat-sup and mergesat variants.
+name = "satcomp-2026-competitor-zhenwei-submissions"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+extract_to = "reference/competition/satcomp-2026/by-author/zhenwei"
+normalize_absolute_archive_symlinks = true
+url = "https://raw.githubusercontent.com/satcompetition/2026/6aed7e2d0d6f6dc9d39b2d94de3944a0d212c67c/downloads/solvers/zhenwei.tar.xz"
+sha256 = "660cb5a001f5fd2594335b57de3b4cb197797ba3680eeb1aefc8daf0edc2dd27"
+size_bytes = 28585200
+
+[[corpus]]
+name = "maxsat-2026-competitor-uwrmaxsat"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+archive = "zip"
+extract_to = "reference/competition/maxsat-2026/UWrMaxSAT-2026"
+wrap_archive = true
+url = "https://zenodo.org/api/records/21358014/files/solver-UWrMaxSAT-2026.zip/content"
+cache_name = "solver-UWrMaxSAT-2026.zip"
+sha256 = "dd0b700121c2d642fac343b12957868ae9a84a8773c826bbd2492896ecdc58aa"
+size_bytes = 48376781
+
+[[corpus]]
+name = "maxsat-2026-competitor-uwrmaxsat-maxcdcl"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+archive = "zip"
+extract_to = "reference/competition/maxsat-2026/UWrMaxSat-MaxCDCL"
+wrap_archive = true
+url = "https://zenodo.org/api/records/21358014/files/solver-UWrMaxSat-MaxCDCL.zip/content"
+cache_name = "solver-UWrMaxSat-MaxCDCL.zip"
+sha256 = "2f8b70c452c686fac64d36173f46af77d86bf3e1675bde480200c5bfdcdd7cd0"
+size_bytes = 25596745
+
+[[corpus]]
+name = "maxsat-2026-competitor-wmaxcdcl"
+groups = ["competition-2025-2026-competitors"]
+source = "http"
+archive = "zip"
+extract_to = "reference/competition/maxsat-2026/WMaxCDCL2026"
+wrap_archive = true
+url = "https://zenodo.org/api/records/21358014/files/solver-WMaxCDCL2026.zip/content"
+cache_name = "solver-WMaxCDCL2026.zip"
+sha256 = "9c58b8245f02959c52828532692136c22b6d177c26282d8567a4e00dab778fa8"
+size_bytes = 36953956
 
 [[corpus]]
 name = "pb-comp-normalized-pb25"
+groups = ["competition-2025-2026"]
 source = "http"
 extract_to = "benchmarks/pb-comp/normalized-PB25"
+wrap_archive = true
 url = "https://www.cril.univ-artois.fr/PB25/benchs/normalized-PB25.tar"
+sha256 = "e9828d2e8a9aa55a1847d4209f03bd41eb75c252bf92a0940ab2c3538269908a"
+size_bytes = 1002629120
+
+[[corpus]]
+name = "pb-comp-normalized-pb26"
+groups = ["competition-2025-2026"]
+source = "http"
+extract_to = "benchmarks/pb-comp/normalized-PB26"
+wrap_archive = true
+url = "https://www.cril.univ-artois.fr/PB26/files/normalized-PB26.tar"
+sha256 = "a407a0c73664aebd488133870c9a81a2381a9d1faa1b544d2121ff72248af7a2"
+size_bytes = 1615687680
 
 [[corpus]]
 name = "pb-comp-selected-pb24"
@@ -187,6 +1607,7 @@ commit = "ddd279cab0717db6effe69baad451a8eb04ffd86"
 # backing the chccomp-2025-lia-lin eval. Large; fetch only when running the
 # full CHC replacement-surface comparison.
 name = "chc-comp-2025-benchmarks"
+groups = ["competition-2025-2026"]
 source = "git"
 extract_to = "benchmarks/chc/chc-comp25-benchmarks"
 url = "https://github.com/chc-comp/chc-comp25-benchmarks"

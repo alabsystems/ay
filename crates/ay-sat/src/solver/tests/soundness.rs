@@ -1431,21 +1431,17 @@ fn test_incremental_assumptions_add_clause_between_solves_7987() {
     }
 }
 
-/// Isolation test: braun.11 with BVE disabled must return UNSAT (#8482).
+/// Bounded core-search isolation for the Braun circuit-equivalence family.
 ///
-/// If CDCL alone (no BVE) returns UNSAT, then the BVE reduction is the
-/// source of the soundness bug.
+/// `braun.11` made the former ignored test unsuitable for the default suite.
+/// The tracked `braun.8` instance is small enough for normal testing while
+/// still exercising the same parser, circuit CNF, and no-inprocessing path.
 #[test]
-#[ignore = "expensive braun.11 isolation check; run explicitly when auditing #8482"]
-fn test_isolation_braun11_no_bve() {
+fn test_isolation_braun8_core_search_only() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../benchmarks/sat/eq_atree_braun/eq.atree.braun.11.unsat.cnf");
-    if !path.exists() {
-        eprintln!("braun.11 missing, skipping isolation test");
-        return;
-    }
-    let dimacs = std::fs::read_to_string(&path).expect("read braun.11");
-    let formula = crate::parse_dimacs(&dimacs).expect("parse braun.11");
+        .join("../../benchmarks/sat/eq_atree_braun/eq.atree.braun.8.unsat.cnf");
+    let dimacs = std::fs::read_to_string(&path).expect("read tracked braun.8 fixture");
+    let formula = crate::parse_dimacs(&dimacs).expect("parse braun.8");
     let mut solver = Solver::new(formula.num_vars);
     solver.disable_all_inprocessing();
     for clause in formula.clauses {
@@ -1464,11 +1460,7 @@ fn test_isolation_braun11_no_bve() {
 fn test_isolation_braun7_no_bve_default_regression() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../benchmarks/sat/eq_atree_braun/eq.atree.braun.7.unsat.cnf");
-    if !path.exists() {
-        eprintln!("braun.7 missing, skipping default isolation regression");
-        return;
-    }
-    let dimacs = std::fs::read_to_string(&path).expect("read braun.7");
+    let dimacs = std::fs::read_to_string(&path).expect("read tracked braun.7 fixture");
     let formula = crate::parse_dimacs(&dimacs).expect("parse braun.7");
     let mut solver = Solver::new(formula.num_vars);
     solver.disable_all_inprocessing();
@@ -1479,19 +1471,16 @@ fn test_isolation_braun7_no_bve_default_regression() {
     assert_unsat_result_for_known_unsat(&solver, result, &path);
 }
 
-/// Isolation test: braun.11 with backward subsumption strengthening
-/// disabled during BVE.
+/// Bounded #8482 isolation with backward subsumption strengthening disabled.
+///
+/// The default-budget `braun.7` odd instance retains the original regression
+/// shape without making every test run solve the much slower `braun.11`.
 #[test]
-#[ignore = "expensive braun.11 isolation check; run explicitly when auditing #8482"]
-fn test_isolation_braun11_no_bw_strengthen() {
+fn test_isolation_braun7_no_bw_strengthen() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../benchmarks/sat/eq_atree_braun/eq.atree.braun.11.unsat.cnf");
-    if !path.exists() {
-        eprintln!("braun.11 missing, skipping isolation test");
-        return;
-    }
-    let dimacs = std::fs::read_to_string(&path).expect("read braun.11");
-    let formula = crate::parse_dimacs(&dimacs).expect("parse braun.11");
+        .join("../../benchmarks/sat/eq_atree_braun/eq.atree.braun.7.unsat.cnf");
+    let dimacs = std::fs::read_to_string(&path).expect("read tracked braun.7 fixture");
+    let formula = crate::parse_dimacs(&dimacs).expect("parse braun.7");
     let mut solver = formula.into_solver();
     // Disable backward subsumption entirely to check if it causes the bug
     solver.disable_technique(crate::SatTechnique::Subsume);

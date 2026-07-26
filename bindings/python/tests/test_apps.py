@@ -58,7 +58,7 @@ def test_sudoku4_ayz3_solves_and_is_valid():
     )
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_sudoku4_agrees_with_z3py():
     with fresh_ay():
         ay_res, ay_grid = sudoku.solve(ayz3, sudoku.PUZZLE_4)
@@ -118,7 +118,7 @@ def test_nqueens_ayz3_solves_and_is_valid(n):
     )
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 @pytest.mark.parametrize("n", [4, 6, 8])
 def test_nqueens_agrees_with_z3py(n):
     with fresh_ay():
@@ -159,7 +159,7 @@ def test_graph_coloring_not_2_colorable_ayz3():
     assert coloring is None
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 @pytest.mark.parametrize("k", [2, 3])
 def test_graph_coloring_agrees_with_z3py(k):
     with fresh_ay():
@@ -191,7 +191,7 @@ def test_bmc_finds_counterexample_ayz3():
     assert bmc.reaches_bad(trace), f"ayz3 BMC trace must hit a bad state: {trace}"
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 @pytest.mark.parametrize("buggy", [False, True])
 def test_bmc_agrees_with_z3py(buggy):
     with fresh_ay():
@@ -253,7 +253,7 @@ def test_model_repr_bool_and_string_values():
         assert repr(s.model()) == '[s = "hi"]'
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_model_repr_pairs_match_z3py():
     # The SET of "name = value" pairs in the repr must match z3py exactly
     # (ayz3 sorts for stability; z3py uses engine order). Compare as sets.

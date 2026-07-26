@@ -556,6 +556,10 @@ pub(crate) struct MemoryBackTranslator {
     /// keeping the step structure and re-completing each environment against
     /// the richer input clause. `None` disables ground back-translation.
     input_problem: Option<std::sync::Arc<ChcProblem>>,
+    /// Exact OUTPUT clause index -> INPUT clause index map for passes that may
+    /// delete clauses while rewriting the survivors. `None` means indices are
+    /// preserved.
+    output_to_input: Option<Vec<usize>>,
     /// Name used in ground back-translation diagnostics.
     name: &'static str,
 }
@@ -565,6 +569,7 @@ impl MemoryBackTranslator {
         Self {
             report,
             input_problem: None,
+            output_to_input: None,
             name: "memory-pass",
         }
     }
@@ -575,6 +580,21 @@ impl MemoryBackTranslator {
         self.name = name;
         if crate::ground_derivation::ground_backtranslation_enabled() {
             self.input_problem = Some(std::sync::Arc::new(problem.clone()));
+        }
+        self
+    }
+
+    /// Enable ground back-translation with an exact surviving-clause map.
+    pub(crate) fn with_ground_index_map(
+        mut self,
+        name: &'static str,
+        problem: &ChcProblem,
+        output_to_input: Vec<usize>,
+    ) -> Self {
+        self.name = name;
+        if crate::ground_derivation::ground_backtranslation_enabled() {
+            self.input_problem = Some(std::sync::Arc::new(problem.clone()));
+            self.output_to_input = Some(output_to_input);
         }
         self
     }
@@ -598,9 +618,14 @@ impl BackTranslator for MemoryBackTranslator {
         // The mapping is only a hint — the translator self-validates on the
         // input problem, and the final result is validated again on the
         // ORIGINAL problem, so a shifted index can only cause a rejection.
-        let candidates = (0..input_problem.clauses().len())
-            .map(|index| vec![index])
-            .collect();
+        let candidates = self.output_to_input.as_ref().map_or_else(
+            || {
+                (0..input_problem.clauses().len())
+                    .map(|index| vec![index])
+                    .collect()
+            },
+            |map| map.iter().map(|index| vec![*index]).collect(),
+        );
         crate::ground_derivation::clause_map::ClauseMapGroundTranslator::new(
             self.name,
             input_problem,

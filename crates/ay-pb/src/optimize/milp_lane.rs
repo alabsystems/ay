@@ -299,78 +299,56 @@ mod tests {
 #[cfg(test)]
 mod lane_probe {
     use super::*;
+    use crate::types::{PbConstraint, PbLit};
 
-    /// Manual lane probe: MILP_LANE_FILE=<opb> runs the lane on the real instance
-    /// with the engine's own first answer as the seed. PROBE_SECS overrides the
-    /// per-phase budget (default 30). MILP_LANE_SEED_FILE=<txt of space-separated
-    /// 0/1 per var> skips the unseeded phase and seeds an EXTERNAL verified
-    /// incumbent instead — the warm-restart experiment: the whole budget goes to
-    /// the lane with the best-known point pruning from t=0. Prints the outcome,
-    /// including the rigorous dual bound on interrupted runs — the number to
-    /// watch on the hard tail.
     #[test]
-    #[ignore = "manual; set MILP_LANE_FILE"]
-    fn milp_lane_file_probe() {
-        let path = std::env::var("MILP_LANE_FILE").expect("set MILP_LANE_FILE");
-        let secs: u64 = std::env::var("PROBE_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(30);
-        let raw = std::fs::read_to_string(&path).expect("read");
-        let inst = crate::parse_opb(&raw).expect("parse");
-        let obj = inst.objective.clone().expect("objective");
-        let seed: Vec<bool> = if let Ok(sf) = std::env::var("MILP_LANE_SEED_FILE") {
-            let toks = std::fs::read_to_string(&sf).expect("read seed");
-            let s: Vec<bool> = toks.split_whitespace().map(|t| t == "1").collect();
-            assert_eq!(s.len(), inst.num_vars as usize, "seed length");
-            assert!(
-                verify_all_constraints(&inst.constraints, &s),
-                "external seed does not satisfy the instance"
-            );
-            eprintln!("external seed verified");
-            s
-        } else {
-            // Unseeded engine run to obtain a feasible point + value for the seed.
-            let model = build_model(&inst, &obj).expect("model");
-            let opts = SolveOpts::new().with_time_limit(Duration::from_secs(secs));
-            let mut s = BabSession::new(model.clone(), &opts).expect("session");
-            let out = s.check().expect("check");
-            let mvals = match &out {
-                Outcome::Optimal {
-                    model_values,
-                    value,
-                    ..
-                } => {
-                    eprintln!("unseeded: Optimal value={value}");
-                    model_values.clone()
-                }
-                Outcome::Feasible {
-                    model_values,
-                    dual_bound,
-                    ..
-                } => {
-                    eprintln!("unseeded: Feasible dual_bound={dual_bound:?}");
-                    model_values.clone()
-                }
-                other => panic!("unseeded run gave {other:?}"),
-            };
-            (0..inst.num_vars as usize)
-                .map(|i| mvals.get(i).and_then(|r| r.to_f64()).unwrap_or(0.0) > 0.5)
-                .collect()
+    fn seeded_milp_lane_improves_and_proves_exact_optimum() {
+        let term = |coeff, var| PbTerm {
+            coeff,
+            lits: vec![PbLit {
+                var,
+                negated: false,
+            }],
         };
+        let inst = PbInstance {
+            num_vars: 3,
+            num_constraints: 2,
+            constraints: vec![
+                PbConstraint {
+                    terms: vec![term(1, 1), term(1, 2)],
+                    rel: PbRel::Eq,
+                    rhs: 1,
+                },
+                PbConstraint {
+                    terms: vec![term(1, 2), term(1, 3)],
+                    rel: PbRel::Ge,
+                    rhs: 1,
+                },
+            ],
+            objective: Some(PbObjective {
+                terms: vec![term(3, 1), term(1, 2), term(2, 3)],
+            }),
+        };
+        let obj = inst.objective.clone().expect("objective");
+        let seed = vec![true, false, true];
         let seed_val = eval_objective(&obj, &seed);
-        eprintln!("seed value = {seed_val}");
+        assert_eq!(seed_val, 5);
+        assert!(verify_all_constraints(&inst.constraints, &seed));
+
         let mut streamed = vec![];
         let got = try_milp_optimum_upgrade(
             &inst,
             &obj,
             Some((&seed[..], seed_val)),
-            Duration::from_secs(secs),
-            &mut |v, _| streamed.push(v),
-        );
-        eprintln!(
-            "LANE RESULT: {:?} streamed={streamed:?}",
-            got.map(|(_, v)| v)
-        );
+            Duration::from_secs(2),
+            &mut |value, assignment| streamed.push((value, assignment.to_vec())),
+        )
+        .expect("MILP lane must prove the bounded fixture");
+
+        assert_eq!(got.1, 1);
+        assert_eq!(got.0, vec![false, true, false]);
+        assert!(verify_all_constraints(&inst.constraints, &got.0));
+        assert_eq!(eval_objective(&obj, &got.0), got.1);
+        assert_eq!(streamed, vec![(got.1, got.0)]);
     }
 }

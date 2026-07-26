@@ -111,6 +111,16 @@ impl LraSolver {
             implied_tighten_streak: Vec::new(),
             implied_tighten_scratch: Vec::new(),
             implied_tighten_touched: Vec::new(),
+            ib_lb_contribs_scratch: Vec::new(),
+            ib_ub_contribs_scratch: Vec::new(),
+            ib_lb_contribs_f64_scratch: Vec::new(),
+            ib_ub_contribs_f64_scratch: Vec::new(),
+            ib_updates_scratch: Vec::new(),
+            ib_row_indices_scratch: Vec::new(),
+            ib_round_newly_bounded_scratch: Vec::new(),
+            ib_cross_neg_updates_scratch: Vec::new(),
+            ib_cascade_rows_scratch: Vec::new(),
+            ib_fixed_vars_scratch: Vec::new(),
             implied_work_done: 0,
             big_bound_seen: false,
             last_simplex_feasible: false,
@@ -141,6 +151,7 @@ impl LraSolver {
             heap_epoch: 1,
             in_infeasible_heap: Vec::new(),
             heap_stale: true,
+            warm: warm_state::WarmSimplexState::new(),
             float_simplex: simplex::float_simplex::FloatSimplex::new(),
             reason_seen_buf: HashSet::default(),
             not_inner_cache: HashMap::default(),
@@ -172,6 +183,11 @@ impl LraSolver {
             propagation_output_buf: Vec::new(),
             interval_reason_seen_buf: HashSet::default(),
             all_newly_bounded_buf: DenseU32Set::default(),
+            // reason-alloc-wip: reused reason-collection DFS scratch (pure
+            // scratch, cleared on each use — starts empty).
+            scratch_reason_visited: std::cell::RefCell::default(),
+            scratch_reason_on_stack: std::cell::RefCell::default(),
+            scratch_reason_seen: std::cell::RefCell::default(),
         }
     }
 
@@ -308,6 +324,16 @@ impl LraSolver {
             implied_tighten_streak: Vec::new(),
             implied_tighten_scratch: Vec::new(),
             implied_tighten_touched: Vec::new(),
+            ib_lb_contribs_scratch: Vec::new(),
+            ib_ub_contribs_scratch: Vec::new(),
+            ib_lb_contribs_f64_scratch: Vec::new(),
+            ib_ub_contribs_f64_scratch: Vec::new(),
+            ib_updates_scratch: Vec::new(),
+            ib_row_indices_scratch: Vec::new(),
+            ib_round_newly_bounded_scratch: Vec::new(),
+            ib_cross_neg_updates_scratch: Vec::new(),
+            ib_cascade_rows_scratch: Vec::new(),
+            ib_fixed_vars_scratch: Vec::new(),
             implied_work_done: 0,
             big_bound_seen: false,
             last_simplex_feasible: false,
@@ -333,6 +359,7 @@ impl LraSolver {
             heap_epoch: 1,
             in_infeasible_heap: vec![0; var_count],
             heap_stale: true,
+            warm: warm_state::WarmSimplexState::new(),
             float_simplex: simplex::float_simplex::FloatSimplex::new(),
             reason_seen_buf: HashSet::default(),
             bcp_implied_dry_streak: 0,
@@ -364,6 +391,11 @@ impl LraSolver {
             propagation_output_buf: Vec::new(),
             interval_reason_seen_buf: HashSet::default(),
             all_newly_bounded_buf: DenseU32Set::default(),
+            // reason-alloc-wip: reused reason-collection DFS scratch (pure
+            // scratch, cleared on each use — starts empty).
+            scratch_reason_visited: std::cell::RefCell::default(),
+            scratch_reason_on_stack: std::cell::RefCell::default(),
+            scratch_reason_seen: std::cell::RefCell::default(),
         };
         // Clear variable bounds and restore simplex invariant (same as import_structural_snapshot).
         for var_info in &mut solver.vars {
@@ -477,6 +509,16 @@ impl LraSolver {
             implied_tighten_streak: Vec::new(),
             implied_tighten_scratch: Vec::new(),
             implied_tighten_touched: Vec::new(),
+            ib_lb_contribs_scratch: Vec::new(),
+            ib_ub_contribs_scratch: Vec::new(),
+            ib_lb_contribs_f64_scratch: Vec::new(),
+            ib_ub_contribs_f64_scratch: Vec::new(),
+            ib_updates_scratch: Vec::new(),
+            ib_row_indices_scratch: Vec::new(),
+            ib_round_newly_bounded_scratch: Vec::new(),
+            ib_cross_neg_updates_scratch: Vec::new(),
+            ib_cascade_rows_scratch: Vec::new(),
+            ib_fixed_vars_scratch: Vec::new(),
             implied_work_done: 0,
             big_bound_seen: false,
             last_simplex_feasible: false,
@@ -507,6 +549,7 @@ impl LraSolver {
             heap_epoch: 1,
             in_infeasible_heap: Vec::new(),
             heap_stale: true,
+            warm: warm_state::WarmSimplexState::new(),
             float_simplex: simplex::float_simplex::FloatSimplex::new(),
             reason_seen_buf: HashSet::default(),
             not_inner_cache: HashMap::default(),
@@ -529,6 +572,11 @@ impl LraSolver {
             propagation_output_buf: Vec::new(),
             interval_reason_seen_buf: HashSet::default(),
             all_newly_bounded_buf: DenseU32Set::default(),
+            // reason-alloc-wip: reused reason-collection DFS scratch (pure
+            // scratch, cleared on each use — starts empty).
+            scratch_reason_visited: std::cell::RefCell::default(),
+            scratch_reason_on_stack: std::cell::RefCell::default(),
+            scratch_reason_seen: std::cell::RefCell::default(),
         }
     }
 
@@ -701,6 +749,9 @@ impl LraSolver {
         // #inc-heap-epoch: O(1) logical clear of heap membership.
         self.bump_heap_epoch();
         self.heap_stale = true;
+        // #warm-simplex: bounds cleared wholesale (values kept) — all warm
+        // tracking is stale.
+        self.warm_invalidate();
         self.disequality_trail.clear();
         self.disequality_trail_scopes.clear();
         self.shared_disequality_trail.clear();

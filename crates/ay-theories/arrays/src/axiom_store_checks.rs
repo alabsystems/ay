@@ -326,6 +326,19 @@ impl ArraySolver<'_> {
             };
 
             if let (Some((base1, idx1)), Some((base2, idx2))) = (sel1.normalized, sel2.normalized) {
+                // M6 weak-component prune (verdict-preserving, work-only):
+                // prune the normalized bases, not the original select arrays.
+                // Nested read-over-write normalization can replace a select
+                // array with the stored array value, and those two terms need
+                // not share a weak-equivalence component even though the
+                // normalized bases are identical. For the normalized bases,
+                // however, `base_eq ⟹ weakly_connected` holds by construction
+                // because the weak graph ingests every equality edge traversed
+                // by `explain_equal_if_provable`.
+                if !self.weakly_connected(base1, base2) {
+                    continue;
+                }
+
                 let same_base_reasons = self.explain_equal_if_provable(base1, base2);
                 let same_index_reasons = self.explain_equal_if_provable(idx1, idx2);
                 let same_base = same_base_reasons.is_some();
@@ -383,6 +396,17 @@ impl ArraySolver<'_> {
             let Some(&(array2, index2)) = self.select_cache.get(&sel2_term) else {
                 continue;
             };
+
+            // M6 weak-component prune (verdict-preserving, work-only): this pair
+            // fires below only when `base1 = base2` is provable (the base-equality
+            // gate over `collect_complete_effective_stores`), which implies
+            // `weakly_connected(array1, array2)` by construction. So pairs whose
+            // arrays lie in different weak-eq components can never fire — skip them
+            // before the O(store-chain) effective-store collection. Same graph API
+            // and corpus-validated invariant as the M5 SingletonOnly witness.
+            if !self.weakly_connected(array1, array2) {
+                continue;
+            }
 
             let Some(mut index_eq_reasons) = self.explain_equal_if_provable(index1, index2) else {
                 continue;

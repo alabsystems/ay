@@ -70,5 +70,9 @@ mod quantifier_model_3441;
 mod quantprod_model_production;
 #[path = "group_quantifiers/skolemization_5840.rs"]
 mod skolemization_5840;
+#[path = "group_quantifiers/ufbv_deferred_selfcheck_failclosed.rs"]
+mod ufbv_deferred_selfcheck_failclosed;
+#[path = "group_quantifiers/ufbv_fixpoint_premise_forced_unsat.rs"]
+mod ufbv_fixpoint_premise_forced_unsat;
 #[path = "group_quantifiers/vacuous_trigger_completeness.rs"]
 mod vacuous_trigger_completeness;

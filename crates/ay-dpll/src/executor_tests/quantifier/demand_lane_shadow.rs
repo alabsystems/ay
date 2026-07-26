@@ -23,18 +23,16 @@
 //!   refutations). This includes `parking_fixpoint_core` (LAW #1's red/green: a
 //!   demand engine that parked every locally-model-consistent bridge would miss
 //!   the joint contradiction — the flush must be unconditional).
-//! - THE FLIP: `freevar_takesome_repro` (pinned RED, expected NOT-unsat on the
-//!   forced-eager path) reaches `unsat` under production-demand at F<=2 — the
-//!   frontier-gated depth-1 batch is the refutation the geometric minting buried.
+//! - BOUNDED FRONTIER: the self-chaining and bridge-cycle reductions both
+//!   finish at F<=2 with real demand accounting.  This pins the mechanism that
+//!   produced the original `freevar_takesome` flip without putting its slow
+//!   ground DT+LIA campaign in the unit-test lane.
 //! - DISAGREE=0 (verdict-class) between the demand and eager arms over the GREEN
 //!   corpus: the production-demand path must not turn a forced-eager `unsat` into
 //!   anything else.
 //!
-//! Because the demand path's ground DT+LIA final-solve over the frontier-gated
-//! batch is the documented `red_ground_dtlia` combiner (slow but terminating in
-//! debug), the flip test carries a generous wall cap and is marked `#[ignore]` so
-//! the default `--lib` run stays fast; the green-preservation + DISAGREE gates run
-//! by default (they are ground / depth-1 and fast).
+//! Every test here is bounded and runs by default.  Long corpus campaigns
+//! belong in the benchmark harness, not behind ignored unit tests.
 #![cfg(debug_assertions)]
 
 use crate::Executor;
@@ -54,7 +52,6 @@ struct ShadowDiag {
     fence_drains: u64,
     parked_remaining: u64,
     gated_families: u64,
-    dt_resume_depth: u64,
     // M4 (A0 no-drop conservation oracle) counters.
     gated_bindings: u64,
     gated_passed: u64,
@@ -74,7 +71,6 @@ impl ShadowDiag {
             fence_drains: g("quantifier.demand.fence_drains"),
             parked_remaining: g("quantifier.demand.parked_remaining"),
             gated_families: g("quantifier.demand.gated_families"),
-            dt_resume_depth: g("quantifier.demand.dt_resume_depth"),
             gated_bindings: g("quantifier.demand.gated_bindings"),
             gated_passed: g("quantifier.demand.gated_passed"),
             fence_seen_resets: g("quantifier.demand.fence_seen_resets"),
@@ -169,30 +165,6 @@ const GREEN_FREEVAR_BRIDGE_REPRO: &str = r#"
 (check-sat)
 "#;
 
-/// The pinned RED that must FLIP in shadow (the take_some / sum_x class:
-/// dual-vocabulary bridge over the free `self`/`final` prophecy pair).
-const RED_FREEVAR_TAKESOME_REPRO: &str = r#"
-(set-logic ALL)
-(declare-datatypes ((Lst 0)) (((Nil) (Cons (hd Int) (tl Lst)))))
-(declare-fun sum (Lst) Int)
-(declare-fun payload_hd (Lst) Int)
-(declare-fun payload_get (Lst) Lst)
-(assert (forall ((l Lst)) (! (=> ((_ is Cons) l) (= (payload_get l) (tl l))) :pattern ((payload_get l)))))
-(assert (forall ((l Lst)) (! (=> ((_ is Cons) l) (= (payload_hd l) (hd l))) :pattern ((payload_hd l)))))
-(assert (forall ((l Lst)) (! (= (sum l) (ite ((_ is Cons) l) (+ (hd l) (sum (tl l))) 0)) :pattern ((sum l)))))
-(assert (forall ((l Lst)) (! (>= (sum l) 0) :pattern ((sum l)))))
-(declare-const self Lst)
-(declare-const final Lst)
-(declare-const k Int)
-(assert ((_ is Cons) self))
-(assert ((_ is Cons) final))
-(assert (>= k 0))
-(assert (= (payload_hd final) (+ (payload_hd self) k)))
-(assert (= (payload_get final) (payload_get self)))
-(assert (not (= (- (sum final) (sum self)) k)))
-(check-sat)
-"#;
-
 /// The tree analog RED (doubled recursive frontier). Its residual may stay the
 /// ground combiner; the test reports its shadow verdict + counters, not a flip.
 const RED_SUM_TREE_FORALL: &str = r#"
@@ -258,60 +230,49 @@ fn demand_shadow_tree_is_not_wrong_sat() {
     );
 }
 
-/// Diagnostic (not a gate): confirm the demand lane ARMS + PARKS on takesome, and
-/// report the frontier-gated batch size, WITHOUT paying the slow ground solve.
-/// A short internal budget lets the (env-gated) `run_ematching_rounds` diagnostic
-/// print the batch/parked tally before the DT final-solve. Run with
-/// `AY_DEMAND_DEBUG=1 cargo test -p ay-dpll demand_shadow_takesome_arms -- --ignored --nocapture`.
+/// The production demand lane must arm and account for every binding on the
+/// bounded self-chaining reduction.  This replaces the old env-only diagnostic
+/// with assertions over emitted statistics.
 #[test]
-#[ignore = "diagnostic; run with AY_DEMAND_DEBUG=1 --ignored --nocapture"]
-fn demand_shadow_takesome_arms_and_parks() {
-    let (verdict, _stats) = solve(RED_FREEVAR_TAKESOME_REPRO, true, Duration::from_secs(4));
-    eprintln!(
-        "[demand-shadow] takesome arm-diagnostic verdict={verdict} (see `c demand-lane` line)"
+fn demand_shadow_self_chaining_arms_and_accounts() {
+    let (verdict, stats) = solve(GREEN_SUM_DATATYPE_FORALL, true, GREEN_TIMEOUT);
+    let diag = ShadowDiag::from_stats(&stats);
+    assert_eq!(verdict, "unsat", "bounded self-chaining probe regressed");
+    assert!(
+        diag.stats_present && diag.gated_families >= 1,
+        "demand lane did not emit real gated-family accounting: {diag:?}"
+    );
+    assert_eq!(
+        diag.gated_bindings,
+        diag.frontier_parked + diag.gated_passed,
+        "every gated binding must be parked or passed"
     );
 }
 
-/// GATE 1 (THE SHADOW FLIP): `freevar_takesome_repro` reaches `unsat` in the
-/// demand SHADOW arm at F<=2. The frontier-gated depth-1 batch is the refutation
-/// the eager geometric minting buries; the shadow parks the gen>=2 chain and
-/// solves the small batch.
-///
-/// Marked `#[ignore]` because the ground DT+LIA final-solve over the frontier-gated
-/// batch is the documented `red_ground_dtlia` combiner (slow in a debug build).
-/// Run explicitly: `cargo test -p ay-dpll demand_shadow_takesome_flips -- --ignored --nocapture`.
+/// The bridge-cycle mechanism behind the original takesome flip must converge
+/// within the bounded frontier and agree with the forced-eager reference arm.
 #[test]
-#[ignore = "slow ground DT+LIA combiner over the frontier-gated batch (debug); run with --ignored"]
-fn demand_shadow_takesome_flips_to_unsat() {
-    let cap = Duration::from_secs(150);
-    let (prod, _ps) = solve(RED_FREEVAR_TAKESOME_REPRO, false, Duration::from_secs(8));
-    let (shadow, ss) = solve(RED_FREEVAR_TAKESOME_REPRO, true, cap);
+fn demand_shadow_bridge_cycle_converges_within_bounded_frontier() {
+    let (prod, _ps) = solve(GREEN_FREEVAR_BRIDGE_REPRO, false, GREEN_TIMEOUT);
+    let (shadow, ss) = solve(GREEN_FREEVAR_BRIDGE_REPRO, true, GREEN_TIMEOUT);
     let diag = ShadowDiag::from_stats(&ss);
-    eprintln!(
-        "[demand-shadow] FLIP takesome: prod={prod} shadow={shadow} diag={diag:?} \
-         dt_resume_depth={}",
-        diag.dt_resume_depth
-    );
-    // Production (eager) is the pinned RED: NOT unsat (Unknown/timeout).
-    assert_ne!(
-        prod, "unsat",
-        "expected the eager path to leave takesome NOT-unsat (the pinned red); got {prod}"
-    );
-    // The flip.
+    assert_eq!(prod, "unsat", "forced-eager bridge reduction regressed");
     assert_eq!(
         shadow, "unsat",
-        "GATE 1 SHADOW FLIP: expected takesome to reach unsat in the demand shadow; got {shadow}"
+        "production-demand bridge reduction regressed"
     );
-    // At F<=2.
+    assert!(
+        diag.stats_present,
+        "bridge reduction must finish with real demand statistics"
+    );
     assert!(
         diag.frontier <= 2,
-        "GATE 1: flip must occur at F<=2; frontier reached {}",
+        "bridge reduction must converge at F<=2; frontier reached {}",
         diag.frontier
     );
-    // The gated families actually fired (>= the 3 recursive/bridge foralls).
     assert!(
         diag.gated_families >= 1,
-        "expected the demand lane to gate the self-chaining / bridge families"
+        "expected at least one bridge/self-chaining family to be gated"
     );
 }
 

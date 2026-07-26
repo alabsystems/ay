@@ -506,6 +506,29 @@ impl ArraySolver<'_> {
         array: TermId,
         index: TermId,
     ) -> (SelectResolution, Vec<TheoryLit>) {
+        // Window-scoped memo (#no-cross-flood). Inside a frozen-graph
+        // `eq_paths_cache` window this resolution is a deterministic pure
+        // function of `store_cache`, `eq_adj`, external facts, `assigns`,
+        // `diseq_set` and immutable affine structure — all frozen for the
+        // window's lifetime — so a hit is byte-identical to a recomputation
+        // (its reasons are sorted+deduped before return). The same
+        // `(array, index)` is otherwise re-resolved once per asserted-array
+        // equality (`lhs`/`rhs`) partner in the cross-chain
+        // O(eq_pairs × indices) loop, plus once in the per-select scan.
+        // Outside a window every call recomputes, exactly as before.
+        if let Some(hit) = eq_paths_cache::get_resolve_base(array, index) {
+            return (hit.0, hit.1.clone());
+        }
+        let result = self.resolve_select_base_for_propagation_with_reasons_uncached(array, index);
+        eq_paths_cache::put_resolve_base(array, index, &Rc::new((result.0, result.1.clone())));
+        result
+    }
+
+    fn resolve_select_base_for_propagation_with_reasons_uncached(
+        &self,
+        array: TermId,
+        index: TermId,
+    ) -> (SelectResolution, Vec<TheoryLit>) {
         let mut current = array;
         let mut reasons = Vec::new();
         let mut iterations = 0;

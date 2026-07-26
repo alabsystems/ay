@@ -238,7 +238,7 @@ def test_eval_model_completion_fills_var():
 # z3py cross-checks (oracle = real z3py 4.15.4)
 # ===========================================================================
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_crosscheck_mixed_add():
     # ayz3
     sa = fresh_solver()
@@ -261,7 +261,7 @@ def test_crosscheck_mixed_add():
     assert ay_y == z3_y == Fraction(2)
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_crosscheck_mixed_lt():
     sa = fresh_solver()
     with sa.using():
@@ -277,7 +277,7 @@ def test_crosscheck_mixed_lt():
     assert ay_res == z3_res == "sat"
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_crosscheck_mixed_if():
     sa = fresh_solver()
     with sa.using():
@@ -299,7 +299,7 @@ def test_crosscheck_mixed_if():
     assert ay_sort == "Real" and str(ite2.sort()) == "Real"
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_crosscheck_eval_compound():
     # m.eval(x + 2*y) returns a concrete numeral equal to z3py's.
     sa = fresh_solver()
@@ -318,7 +318,7 @@ def test_crosscheck_eval_compound():
     assert ay_val == z3_val == 5
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_crosscheck_eval_compound_mixed_real():
     sa = fresh_solver()
     with sa.using():
@@ -336,7 +336,7 @@ def test_crosscheck_eval_compound_mixed_real():
     assert ay_val == z3_val == Fraction(9, 2)
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_crosscheck_eval_completion_value():
     # With model_completion, both engines yield a concrete value for an
     # unconstrained var. (AY's model is total, so the value agrees with z3py's

@@ -193,109 +193,182 @@ pub fn string_literal(s: &str) -> String {
     format!("\"{}\"", escape_string_contents(s))
 }
 
+/// Largest code point in the SMT-LIB 2.6 Unicode Strings alphabet.
+///
+/// The theory fixes the alphabet at code points `0x00000..=0x2FFFF`. A `\u`
+/// form denoting a value outside this range is NOT an escape sequence at all —
+/// its characters are taken literally (see [`unescape_string_contents`]).
+pub const SMTLIB_MAX_CODE_POINT: u32 = 0x2FFFF;
+
+/// Why an SMT-LIB string literal could not be decoded into a Rust `String`.
+///
+/// Decoding fails closed rather than returning an approximate string: a decoded
+/// string of the wrong length flips every `str.len`/membership verdict that
+/// mentions it, which is a wrong-verdict (soundness) defect. An honest error is
+/// strictly better than a confident wrong answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringDecodeError {
+    /// A well-formed, in-alphabet escape denotes a Unicode *surrogate* code
+    /// point (`U+D800..=U+DFFF`). These are legal SMT-LIB characters — the
+    /// alphabet is defined over code points, which include surrogates — but
+    /// Rust's `char`/`String` can only hold Unicode *scalar values*, so such a
+    /// literal is not representable in this decoder's return type.
+    SurrogateCodePoint(u32),
+}
+
+impl core::fmt::Display for StringDecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            StringDecodeError::SurrogateCodePoint(code) => write!(
+                f,
+                "SMT-LIB string literal denotes surrogate code point U+{code:04X}, \
+                 which is not representable as a Rust char"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StringDecodeError {}
+
 /// Unescape an SMT-LIB string literal's contents.
 ///
 /// SMT-LIB 2.6 conformant: the only escapes are `""` -> `"` and the unicode
-/// forms `\u{XXXX}` / `\uXXXX`. A backslash is otherwise a LITERAL character
+/// forms `\u{d...}` / `\udddd`. A backslash is otherwise a LITERAL character
 /// (so `\\` is two backslashes, `\t` is backslash+`t`), matching z3 — decoding
 /// `\\` as a single `\` flips `str.len`/membership verdicts on such literals.
 /// The input should be the contents without the surrounding quotes.
+///
+/// A `\u` form that is not a well-formed, in-alphabet escape is NOT an escape:
+/// every one of its characters is literal and NOTHING is consumed. This matters
+/// for soundness — see [`parse_unicode_escape`] for the exact grammar and for
+/// the verdict-flipping failure mode that consuming-on-failure produced.
 ///
 /// # Examples
 /// ```
 /// use ay_core::unescape_string_contents;
 ///
-/// assert_eq!(unescape_string_contents("hello"), "hello");
-/// assert_eq!(unescape_string_contents(r#"say ""hi"""#), r#"say "hi""#);
+/// assert_eq!(unescape_string_contents("hello").unwrap(), "hello");
+/// assert_eq!(unescape_string_contents(r#"say ""hi"""#).unwrap(), r#"say "hi""#);
 /// // Backslash is literal (SMT-LIB 2.6): `\\` stays two backslashes.
-/// assert_eq!(unescape_string_contents(r"path\\to\\file"), r"path\\to\\file");
-/// assert_eq!(unescape_string_contents(r"x\u{41}y"), "xAy");
+/// assert_eq!(unescape_string_contents(r"path\\to\\file").unwrap(), r"path\\to\\file");
+/// assert_eq!(unescape_string_contents(r"x\u{41}y").unwrap(), "xAy");
+/// // Out-of-alphabet: `\u{FFFFF}` is not an escape, so it is nine characters.
+/// assert_eq!(unescape_string_contents(r"\u{FFFFF}").unwrap().chars().count(), 9);
 /// ```
-pub fn unescape_string_contents(s: &str) -> String {
+pub fn unescape_string_contents(s: &str) -> Result<String, StringDecodeError> {
+    let chars: Vec<char> = s.chars().collect();
     let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
         if c == '"' {
-            // SMT-LIB 2.6: `""` inside string contents = literal `"`
-            if chars.peek() == Some(&'"') {
-                chars.next(); // consume second `"`
-                result.push('"');
-            } else {
-                // Stray quote — should not happen in well-formed input
-                result.push(c);
-            }
+            // SMT-LIB 2.6: `""` inside string contents = literal `"`. A stray
+            // quote should not occur in well-formed input; pass it through.
+            result.push('"');
+            i += if chars.get(i + 1) == Some(&'"') { 2 } else { 1 };
         } else if c == '\\' {
             // SMT-LIB 2.6: a backslash is a LITERAL character EXCEPT in the two
-            // unicode escapes `\u{XXXX}` / `\uXXXX`. It is NOT a C-style escape.
-            // Collapsing `\\` -> `\` (or `\"` -> `"`) is a SOUNDNESS bug, not a
-            // cosmetic one: z3 (correctly) reads `"a\\b"` as FOUR characters,
-            // while the old behaviour read THREE, flipping every str.len- (and
-            // membership-) sensitive verdict on any backslash-bearing literal.
-            // `\t`/`\n`/etc. are already handled correctly (backslash + letter).
-            if chars.peek() == Some(&'u') {
-                chars.next(); // consume 'u'
-                if let Some(ch) = parse_unicode_escape(&mut chars) {
+            // unicode escapes. It is NOT a C-style escape. Collapsing `\\` ->
+            // `\` (or `\"` -> `"`) is a SOUNDNESS bug, not a cosmetic one: z3
+            // (correctly) reads `"a\\b"` as FOUR characters, while the old
+            // behaviour read THREE, flipping every str.len- (and membership-)
+            // sensitive verdict on any backslash-bearing literal.
+            match parse_unicode_escape(&chars, i + 1) {
+                Some((code, next)) => {
+                    // In-alphabet by construction, so the only value `char`
+                    // cannot represent is a surrogate. Fail closed rather than
+                    // substituting a replacement character or dropping it:
+                    // either would silently change the string's length.
+                    let ch =
+                        char::from_u32(code).ok_or(StringDecodeError::SurrogateCodePoint(code))?;
                     result.push(ch);
-                } else {
-                    // Malformed unicode escape — emit the `\u` literally.
-                    result.push('\\');
-                    result.push('u');
+                    i = next;
                 }
-            } else {
-                // Literal backslash; the following character is decoded normally
-                // on the next iteration (so `\\` yields two literal backslashes).
-                result.push('\\');
+                None => {
+                    // Not an escape: the backslash is literal and the following
+                    // characters are decoded normally on later iterations.
+                    result.push('\\');
+                    i += 1;
+                }
             }
         } else {
             result.push(c);
+            i += 1;
         }
     }
-    result
+    Ok(result)
 }
 
-/// Parse a unicode escape after `\u` has been consumed.
+/// Try to parse an SMT-LIB 2.6 unicode escape whose `u` sits at `start` (i.e.
+/// the index just after the backslash).
 ///
-/// Supports two forms per SMT-LIB 2.6:
-/// - `\u{XXXX}` — 1 to 6 hex digits in braces (any Unicode code point)
-/// - `\uXXXX` — exactly 4 hex digits (BMP only)
-fn parse_unicode_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<char> {
-    if chars.peek() == Some(&'{') {
-        chars.next(); // consume '{'
-        let mut hex = String::new();
-        while let Some(&c) = chars.peek() {
+/// Returns the denoted code point and the index just past the escape, or `None`
+/// if the text at `start` is not an escape — in which case NOTHING is consumed
+/// and the backslash is an ordinary character.
+///
+/// SMT-LIB 2.6 defines exactly two forms:
+/// - `\udddd` — EXACTLY 4 hex digits
+/// - `\u{d}` .. `\u{ddddd}` — 1 to 5 hex digits enclosed in braces
+///
+/// and in both the denoted value must lie in the alphabet
+/// zero up to [`SMTLIB_MAX_CODE_POINT`]. Anything else — 6+ digits, out-of-range
+/// value, a missing `}`, a non-hex character, end of input — is not an escape
+/// sequence, and the standard requires its characters be taken literally.
+///
+/// This is soundness-critical in two independent ways, both of which were live
+/// wrong-verdict defects that this function's previous version exhibited:
+/// 1. Accepting an out-of-alphabet value (`\u{FFFFF}`, `\u{100000}`) or an
+///    unterminated brace (`\u{41`) decodes many characters as one, so `str.len`
+///    reports 1 where z3 reports 9, 10 and 5 respectively.
+/// 2. Consuming input before discovering the escape is malformed silently DROPS
+///    those characters (`\u{}` decoded to `\u`, losing the braces), again
+///    shortening the string. Returning an index means failure consumes nothing.
+fn parse_unicode_escape(chars: &[char], start: usize) -> Option<(u32, usize)> {
+    if chars.get(start) != Some(&'u') {
+        return None;
+    }
+    let after_u = start + 1;
+
+    if chars.get(after_u) == Some(&'{') {
+        let mut hex = String::with_capacity(5);
+        let mut j = after_u + 1;
+        loop {
+            let &c = chars.get(j)?; // end of input before `}` — not an escape
             if c == '}' {
-                chars.next(); // consume '}'
                 break;
             }
-            if c.is_ascii_hexdigit() && hex.len() < 6 {
-                hex.push(c);
-                chars.next();
-            } else {
+            if !c.is_ascii_hexdigit() || hex.len() == 5 {
+                // Non-hex, or a 6th digit: not an escape sequence.
                 return None;
             }
+            hex.push(c);
+            j += 1;
         }
         if hex.is_empty() {
-            return None;
+            return None; // `\u{}` is not an escape
         }
         let code = u32::from_str_radix(&hex, 16).ok()?;
-        char::from_u32(code)
+        if code > SMTLIB_MAX_CODE_POINT {
+            return None; // outside the alphabet: not an escape
+        }
+        Some((code, j + 1)) // skip the closing `}`
     } else {
-        // \uXXXX — exactly 4 hex digits
+        // `\udddd` — exactly 4 hex digits. The maximum such value is 0xFFFF,
+        // which is inside the alphabet, so the range check cannot fail here;
+        // it is kept so the two branches enforce one identical contract.
         let mut hex = String::with_capacity(4);
-        for _ in 0..4 {
-            if let Some(&c) = chars.peek() {
-                if c.is_ascii_hexdigit() {
-                    hex.push(c);
-                    chars.next();
-                } else {
-                    return None;
-                }
-            } else {
+        for k in 0..4 {
+            let &c = chars.get(after_u + k)?;
+            if !c.is_ascii_hexdigit() {
                 return None;
             }
+            hex.push(c);
         }
         let code = u32::from_str_radix(&hex, 16).ok()?;
-        char::from_u32(code)
+        if code > SMTLIB_MAX_CODE_POINT {
+            return None;
+        }
+        Some((code, after_u + 4))
     }
 }
 

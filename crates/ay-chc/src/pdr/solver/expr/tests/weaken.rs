@@ -39,10 +39,16 @@ fn try_weaken_interpolant_equalities_handles_deep_and_tree() {
     let mut solver = PdrSolver::new(problem, PdrConfig::default());
 
     let x = ChcVar::new("x", ChcSort::Int);
-    let atom = ChcExpr::ge(ChcExpr::var(x.clone()), ChcExpr::int(0));
-    let mut deep = atom.clone();
-    for _ in 0..5000 {
-        deep = ChcExpr::and(deep, atom.clone());
+    let mut deep = ChcExpr::ge(ChcExpr::var(x.clone()), ChcExpr::int(0));
+    for bound in 1..=5000 {
+        // Construct the pathological left spine directly. Canonical `and`
+        // flattens in production; distinct atoms prevent canonical
+        // deduplication when the weakening result is rebuilt.
+        let atom = ChcExpr::ge(ChcExpr::var(x.clone()), ChcExpr::int(bound));
+        deep = ChcExpr::Op(
+            crate::ChcOp::And,
+            vec![std::sync::Arc::new(deep), std::sync::Arc::new(atom)],
+        );
     }
 
     let bad_state = ChcExpr::lt(ChcExpr::var(x), ChcExpr::int(0));

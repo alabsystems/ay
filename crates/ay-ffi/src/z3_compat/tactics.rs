@@ -19,7 +19,7 @@
 //! tactic-solver yields the SAME SAT/UNSAT verdict as solving the original goal
 //! — applying a tactic can never change the answer. All but one are additionally
 //! *equivalence-preserving* (they rewrite the goal into one with exactly the same
-//! set of models). The exception is `tseitin-cnf` (alias `cnf`), which is
+//! set of models). The exception is `tseitin-cnf`, which is
 //! **equisatisfiable**: it introduces fresh auxiliary Boolean variables, so the
 //! CNF's models differ from the input's on those new variables while `check-sat`
 //! is preserved (the aux variables are existentially quantified / free).
@@ -35,7 +35,7 @@
 //!
 //! Recognized (all real Z3 tactic names, each backed by a real pass):
 //! `skip`, `simplify`, `solve-eqs`, `propagate-values`, `elim-and`, `qe-light`,
-//! `nnf`, `tseitin-cnf` (alias `cnf`), `bit-blast`. `nnf` is AY's
+//! `nnf`, `tseitin-cnf`, `bit-blast`. `nnf` is AY's
 //! negation-normal-form pass: negations are pushed to atoms and
 //! `=>`/`<->`/`xor`/`ite`-over-Bool are eliminated into `and`/`or`
 //! (equivalence-preserving). `bit-blast` is AY's `BitBlast` pass: a QF_BV goal is
@@ -50,15 +50,15 @@
 //! logically equivalent by Cooper's self-check), so the bound variable never
 //! escapes and the transform is equivalence-preserving even under negation.
 //!
-//! `tseitin-cnf` (alias `cnf`) is AY's Tseitin CNF pass: the one verdict-
+//! `tseitin-cnf` is AY's Tseitin CNF pass: the one verdict-
 //! preserving-but-not-equivalent member (it mints fresh existential aux
 //! variables). All of them form the faithfully-printable set that this surface
 //! shares verbatim with the SMT-LIB `(apply ...)` path — the two recognize an
 //! identical set and map each name to the identical transform, so they can never
 //! drift.
 //!
-//! Beyond the pass-backed set, the registry now covers EVERY z3-4.15.4 tactic
-//! name (116 total): per-logic solver strategies and no-op-safe transforms are
+//! Beyond the pass-backed set, the registry now covers EVERY pinned Z3 5.0.0
+//! tactic name (118 total): per-logic solver strategies and no-op-safe transforms are
 //! realized as the truthful identity, alias names reduce to an existing
 //! verified pass, and fragment tactics (`diff-neq`, `pb2bv`, `bv1-blast`, …)
 //! are HONEST failures matching z3's own measured failure routing. Every
@@ -121,7 +121,7 @@ fn tactic_from_name(name: &str) -> Result<Tactic, String> {
 /// Create a tactic by name.
 ///
 /// Recognizes the shared real-Z3 printable set (`skip`, `simplify`, `solve-eqs`,
-/// `propagate-values`, `elim-and`, `qe-light`, `tseitin-cnf`/`cnf`) via the same
+/// `propagate-values`, `elim-and`, `qe-light`, `tseitin-cnf`) via the same
 /// registry the SMT-LIB `(apply ...)` path uses. Any
 /// unknown/unsupported name (including Z3-nonexistent names like `flatten-and`)
 /// returns NULL and sets `Z3_INVALID_ARG` — the honest path, matching Z3. A NULL
@@ -706,8 +706,7 @@ pub unsafe extern "C" fn Z3_tactic_par_or(
 /// an HONEST description of AY's actual realization of that tactic (e.g.
 /// `elim-and` is described as AY's conjunction-flattening, which is what its goal
 /// output really is, not a rewrite AY does not perform). An unknown/unsupported
-/// name returns NULL and sets `Z3_INVALID_ARG` (the honest path). AY additionally
-/// describes the `cnf` alias (a documented superset — libz3 has no `cnf` tactic).
+/// name returns NULL and sets `Z3_INVALID_ARG` (the honest path).
 ///
 /// # Safety
 /// `c` must be a valid context pointer; `name`, when non-null, a null-terminated
@@ -738,8 +737,8 @@ pub unsafe extern "C" fn Z3_tactic_get_descr(c: Z3_context, name: Z3_string) -> 
 }
 
 /// The honest per-name description for [`Z3_tactic_get_descr`]. Covers exactly the
-/// names [`Z3_mk_tactic`] accepts ([`ay_frontend::SUPPORTED_TACTIC_NAMES`], plus
-/// the `cnf` alias); every string describes AY's real transform. `None` for any
+/// names [`Z3_mk_tactic`] accepts ([`ay_frontend::SUPPORTED_TACTIC_NAMES`]);
+/// every string describes AY's real transform. `None` for any
 /// other name (⇒ NULL + `Z3_INVALID_ARG`).
 fn tactic_descr(name: &str) -> Option<&'static str> {
     Some(match name {
@@ -758,7 +757,7 @@ fn tactic_descr(name: &str) -> Option<&'static str> {
             "eliminate quantifiers; AY realizes this with the same Cooper pass as qe-light (in-fragment single-Int-variable existentials are eliminated, out-of-fragment quantifiers kept verbatim — a documented sound coverage divergence from z3's LIA-complete qe)."
         }
         "nnf" => "put goal in negation normal form.",
-        "tseitin-cnf" | "cnf" => {
+        "tseitin-cnf" => {
             "convert goal into CNF using a tseitin-like encoding (introduces fresh auxiliary Boolean variables; equisatisfiable)."
         }
         "bit-blast" => {

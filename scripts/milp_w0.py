@@ -1,0 +1,766 @@
+#!/usr/bin/env python3
+# ay-script: milp-w0
+"""milp_w0.py — the W0 measurement harness from the MILP engine gap-closing plan.
+
+The plan's first finding was that ay-milp's gap to the commercial solvers is
+per-component QUALITY, not a missing component — and that without attribution you
+cannot tell a refinement from noise. This is the attribution tool.
+
+Four modes, each answering one question:
+
+``closure``   *What are the cuts worth, on their own?*
+    Root dual bound before and after the cut loop, no branching (``AY_ROOT_CLOSURE``).
+    Normalised against MIPLIB's reference optimum this is the **root closure** —
+    the fraction of the integrality gap the cut loop closes. It is the cleanest
+    cut-quality signal there is, because no tree, heuristic or branching decision
+    can contaminate it.
+
+``baseline``  *What do the other solvers get on the same bytes?*
+    Gurobi and HiGHS at a matched budget. Gurobi is also run at ``NodeLimit=0`` to
+    extract ITS root bound, which is the number ay's closure is actually racing.
+
+``ablate``    *What is each component worth?*
+    Re-runs ``closure`` (or a full solve) with one env knob flipped at a time and
+    reports the per-instance delta. This is the tool that says which of the eight
+    cut families is carrying the bound and which is freight.
+
+``gate``      *Did this change break anything?*
+    Full solves across the corpus, checked against MIPLIB's reference values.
+    A proven optimum that disagrees with the reference is a hard FAIL and is
+    reported as a soundness alarm, never averaged into a score. Wall/node
+    regressions are reported separately, because a slow answer and a wrong answer
+    are not the same kind of event.
+
+Results are JSON so that two runs can be diffed exactly; ``compare`` does that.
+
+Usage:
+  scripts/milp_w0.py closure  --tier gurobi --secs 30 --out the development design notes
+  scripts/milp_w0.py baseline --tier gurobi --secs 30 --out the development design notes
+  scripts/milp_w0.py ablate   --tier gurobi --secs 30 --knob AY_MILP_NO_ZERO_HALF=1
+  scripts/milp_w0.py gate     --tier gurobi --secs 30 --out the development design notes
+  scripts/milp_w0.py compare  the development design notes the development design notes
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import math
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+
+CORPUS = pathlib.Path(os.environ.get("AY_MILP_CORPUS",
+                                     pathlib.Path.home() / "ay-bench" / "milp"))
+MANIFEST = CORPUS / "manifest.json"
+AY_BIN = os.path.abspath(os.environ.get("AY_BIN", "./target/release/examples/mps_solve"))
+
+# Relative tolerance for calling two objective values "the same number". The
+# reference values in MIPLIB's .solu are themselves rounded decimals, and the
+# float solvers stop at their own MIP gap, so anything tighter produces false
+# alarms rather than real ones.
+REL_TOL = 1e-6
+
+
+# --------------------------------------------------------------------------- corpus
+
+def load_corpus(tier: str | None, only: list[str] | None, limit: int,
+                opt_only: bool) -> list[dict]:
+    if not MANIFEST.exists():
+        sys.exit(f"no corpus manifest at {MANIFEST}; run scripts/milp_corpus.py fetch && index")
+    man = json.loads(MANIFEST.read_text())
+    out = []
+    for name, e in man["instances"].items():
+        if tier and e.get("tier") != tier:
+            continue
+        if only and name not in only:
+            continue
+        if opt_only and e.get("ref_status") != "opt":
+            continue
+        out.append({"name": name, **e})
+    out.sort(key=lambda e: (e.get("cols") or 0, e["name"]))
+    return out[:limit] if limit else out
+
+
+def close_enough(a: float | None, b: float | None, tol: float = REL_TOL) -> bool:
+    if a is None or b is None:
+        return False
+    return abs(a - b) <= tol * max(1.0, abs(a), abs(b))
+
+
+# --------------------------------------------------------------------------- ay
+
+def run_ay(inst: dict, secs: float, env_extra: dict[str, str] | None = None,
+           mode: str = "solve") -> dict:
+    env = dict(os.environ)
+    env.pop("AY_ROOT_CLOSURE", None)
+    if mode == "closure":
+        env["AY_ROOT_CLOSURE"] = "1"
+    if env_extra:
+        for k, v in env_extra.items():
+            if v == "":
+                env.pop(k, None)
+            else:
+                env[k] = v
+    t0 = time.monotonic()
+    try:
+        r = subprocess.run([AY_BIN, inst["file"], str(secs)], capture_output=True,
+                           text=True, timeout=secs + 120, env=env)
+    except subprocess.TimeoutExpired:
+        return {"status": "HARDTIMEOUT", "t": secs + 120}
+    except OSError as e:
+        return {"status": "CRASH", "err": str(e), "t": time.monotonic() - t0}
+    wall = time.monotonic() - t0
+    out = (r.stdout or "").strip().splitlines()
+    if r.returncode != 0 and not out:
+        return {"status": "CRASH", "rc": r.returncode,
+                "err": (r.stderr or "").strip()[-400:], "t": wall}
+    if not out:
+        return {"status": "NOOUTPUT", "t": wall}
+    last = out[-1]
+    if mode == "closure":
+        d = {"status": "CLOSURE", "t": wall}
+        for tok in last.split():
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                try:
+                    d[k] = float(v)
+                except ValueError:
+                    d[k] = v
+        if not last.startswith("ROOTCLOSURE"):
+            d["status"] = "BADLINE"
+            d["raw"] = last[:200]
+        return d
+    f = last.split()
+    st = f[0]
+    val = None
+    if len(f) > 1 and f[1] != "-":
+        try:
+            val = float(f[1])
+        except ValueError:
+            val = None
+    # The rigorous dual bound is on stderr; a FEASIBLE result without it cannot be
+    # scored on how close it got.
+    bound = None
+    mb = re.search(r"dual bound \(rigorous\) = ([-\d.eE+]+)", r.stderr or "")
+    if mb:
+        try:
+            bound = float(mb.group(1))
+        except ValueError:
+            bound = None
+    return {"status": st, "obj": val, "bound": bound, "t": wall}
+
+
+# --------------------------------------------------------------------------- gurobi
+
+_GRB = None
+
+
+def gurobi():
+    global _GRB
+    if _GRB is None:
+        try:
+            import gurobipy as gp
+            _GRB = gp
+        except ImportError:
+            _GRB = False
+    return _GRB
+
+
+def run_gurobi(inst: dict, secs: float, node_limit: int | None = None) -> dict:
+    gp = gurobi()
+    if not gp:
+        return {"status": "SKIP", "why": "gurobipy missing"}
+    t0 = time.monotonic()
+    try:
+        env = gp.Env(params={"OutputFlag": 0})
+        m = gp.read(inst["file"], env=env)
+        m.setParam("Threads", 1)
+        m.setParam("TimeLimit", secs)
+        if node_limit is not None:
+            m.setParam("NodeLimit", node_limit)
+        m.optimize()
+    except Exception as e:  # size-limited license, unreadable file, ...
+        msg = str(e)
+        why = "size-limited" if "size-limited" in msg else msg[:200]
+        return {"status": "SKIP", "why": why, "t": time.monotonic() - t0}
+    wall = time.monotonic() - t0
+    st = {2: "OPTIMAL", 3: "INFEASIBLE", 5: "UNBOUNDED", 9: "TIMEOUT",
+          11: "INTERRUPTED", 13: "SUBOPTIMAL"}.get(m.Status, f"STATUS{m.Status}")
+    obj = None
+    try:
+        obj = m.ObjVal if m.SolCount > 0 else None
+    except Exception:
+        obj = None
+    bound = None
+    try:
+        bound = m.ObjBound
+    except Exception:
+        bound = None
+    nodes = None
+    try:
+        nodes = int(m.NodeCount)
+    except Exception:
+        nodes = None
+    m.dispose()
+    return {"status": st, "obj": obj, "bound": bound, "nodes": nodes, "t": wall}
+
+
+def gurobi_root(inst: dict, secs: float) -> dict:
+    """Gurobi's dual bound after root processing — the number ay's closure races.
+
+    ``NodeLimit=1``, not ``0``: with a zero node limit Gurobi stops *before* its root
+    cut loop and reports the bare presolved LP bound (measured — on gt2 it returned
+    20147, exactly ay's presolved relaxation, and on neos5 a flat 13.0). One node lets
+    the root cut loop and root heuristics run and then stops, which is the bound the
+    closure metric is actually racing. Where Gurobi proves optimality at the root the
+    status is OPTIMAL and the bound IS the optimum — that is an honest root result, not
+    an artefact.
+    """
+    r = run_gurobi(inst, secs, node_limit=1)
+    return {"root_bound": r.get("bound"), "status": r.get("status"),
+            "why": r.get("why"), "t": r.get("t")}
+
+
+# --------------------------------------------------------------------------- highs
+
+def run_highs(inst: dict, secs: float) -> dict:
+    exe = os.environ.get("HIGHS_BIN", "highs")
+    t0 = time.monotonic()
+    try:
+        r = subprocess.run([exe, "--time_limit", str(secs), "--parallel", "off",
+                            inst["file"]],
+                           capture_output=True, text=True, timeout=secs + 120)
+    except FileNotFoundError:
+        return {"status": "SKIP", "why": "highs missing"}
+    except subprocess.TimeoutExpired:
+        return {"status": "HARDTIMEOUT", "t": secs + 120}
+    wall = time.monotonic() - t0
+    txt = (r.stdout or "") + (r.stderr or "")
+    st = "UNKNOWN"
+    if re.search(r"Status\s+Optimal", txt):
+        st = "OPTIMAL"
+    elif re.search(r"Status\s+Infeasible", txt):
+        st = "INFEASIBLE"
+    elif re.search(r"Status\s+Time limit reached", txt):
+        st = "TIMEOUT"
+    obj = bound = None
+    mo = re.search(r"Objective value\s*:\s*([-\d.eE+]+)", txt)
+    if mo:
+        obj = float(mo.group(1))
+    md = re.search(r"Dual bound\s*([-\d.eE+]+)", txt)
+    if md:
+        bound = float(md.group(1))
+    mn = re.search(r"Nodes\s+(\d+)", txt)
+    nodes = int(mn.group(1)) if mn else None
+    return {"status": st, "obj": obj, "bound": bound, "nodes": nodes, "t": wall}
+
+
+# --------------------------------------------------------------------------- modes
+
+def closure_row(inst: dict, secs: float, env_extra=None) -> dict:
+    r = run_ay(inst, secs, env_extra, mode="closure")
+    ref = inst.get("ref_obj")
+    row = {"name": inst["name"], "rows": inst.get("rows"), "cols": inst.get("cols"),
+           "ref_obj": ref, "ref_status": inst.get("ref_status"), **r}
+    # Root closure as a FRACTION of the integrality gap: 0 = the cut loop bought
+    # nothing, 1 = the cuts alone closed the problem. Reported only when the
+    # reference optimum is known and the gap is real; a zero-gap instance has no
+    # closure to measure and reporting 0/0 as "0%" would defame the cut loop.
+    bl, bc = r.get("bound_lp"), r.get("bound_cut")
+    if (ref is not None and isinstance(bl, float) and isinstance(bc, float)
+            and math.isfinite(bl) and math.isfinite(bc)):
+        gap = abs(ref - bl)
+        row["gap0"] = gap
+        if gap > 1e-9 * max(1.0, abs(ref)):
+            row["closure"] = max(0.0, min(1.0, abs(bc - bl) / gap))
+    return row
+
+
+def cmd_closure(args) -> int:
+    corpus = load_corpus(args.tier, args.only, args.limit, opt_only=True)
+    print(f"[closure] {len(corpus)} instances, {args.secs}s each", flush=True)
+    env_extra = parse_knobs(args.knob)
+    rows = []
+    for i, inst in enumerate(corpus):
+        row = closure_row(inst, args.secs, env_extra)
+        if args.with_gurobi:
+            g = gurobi_root(inst, args.secs)
+            row["gurobi_root"] = g.get("root_bound")
+            row["gurobi_root_status"] = g.get("status")
+            # Gurobi's root closure on the SAME denominator as ay's, so the two
+            # numbers are the same measurement of the same thing.
+            bl, ref, gb = row.get("bound_lp"), row.get("ref_obj"), g.get("root_bound")
+            if row.get("gap0") and isinstance(bl, float) and isinstance(gb, float) \
+                    and ref is not None:
+                row["gurobi_closure"] = max(0.0, min(1.0, abs(gb - bl) / row["gap0"]))
+        rows.append(row)
+        c, gc = row.get("closure"), row.get("gurobi_closure")
+        extra = "" if gc is None else f" grb={100*gc:6.2f}%"
+        print(f"  {i+1:3d}/{len(corpus)} {inst['name']:26s} "
+              f"closure={'--' if c is None else f'{100*c:6.2f}%'}{extra} "
+              f"cuts={row.get('cuts', '?')} t={row.get('t', 0):6.1f}s "
+              f"{row.get('SUSPECT', '')}", flush=True)
+    emit(args.out, {"mode": "closure", "secs": args.secs, "tier": args.tier,
+                    "knobs": env_extra, "rows": rows})
+    summarise_closure(rows)
+    return 0
+
+
+def summarise_closure(rows: list[dict]) -> None:
+    have = [r for r in rows if r.get("closure") is not None]
+    if not have:
+        print("[closure] no measurable instances")
+        return
+    mean = sum(r["closure"] for r in have) / len(have)
+    full = sum(1 for r in have if r["closure"] > 0.999)
+    zero = sum(1 for r in have if r["closure"] < 1e-9)
+    print(f"[closure] mean={100*mean:.2f}% over {len(have)} instances "
+          f"({full} fully closed, {zero} closed nothing)")
+    both = [r for r in have if r.get("gurobi_closure") is not None]
+    if both:
+        gm = sum(r["gurobi_closure"] for r in both) / len(both)
+        am = sum(r["closure"] for r in both) / len(both)
+        win = sum(1 for r in both if r["closure"] > r["gurobi_closure"] + 1e-9)
+        loss = sum(1 for r in both if r["closure"] < r["gurobi_closure"] - 1e-9)
+        print(f"[closure] head-to-head on {len(both)}: ay {100*am:.2f}% vs "
+              f"gurobi {100*gm:.2f}%  ({win} ay-better, {loss} gurobi-better, "
+              f"{len(both)-win-loss} tied)")
+
+
+def cmd_baseline(args) -> int:
+    corpus = load_corpus(args.tier, args.only, args.limit, opt_only=False)
+    print(f"[baseline] {len(corpus)} instances, {args.secs}s each", flush=True)
+    rows = []
+    for i, inst in enumerate(corpus):
+        row = {"name": inst["name"], "rows": inst.get("rows"), "cols": inst.get("cols"),
+               "ref_obj": inst.get("ref_obj"), "ref_status": inst.get("ref_status")}
+        row["gurobi"] = run_gurobi(inst, args.secs)
+        row["gurobi_root"] = gurobi_root(inst, args.secs)
+        row["highs"] = run_highs(inst, args.secs)
+        rows.append(row)
+        g, h = row["gurobi"], row["highs"]
+        print(f"  {i+1:3d}/{len(corpus)} {inst['name']:26s} "
+              f"grb={g['status']:9s} {g.get('t', 0):6.1f}s | "
+              f"highs={h['status']:9s} {h.get('t', 0):6.1f}s", flush=True)
+    emit(args.out, {"mode": "baseline", "secs": args.secs, "tier": args.tier, "rows": rows})
+    return 0
+
+
+def parse_knobs(spec: list[str] | None) -> dict[str, str]:
+    """``["A=1", "B=2 C=3"]`` -> ``{A:1, B:2, C:3}``.
+
+    A single argument may carry several assignments separated by whitespace, which is how
+    `ablate` expresses a COMBINED setting as one arm: components often only pay together
+    (a bigger per-round cut budget is only affordable once selection is filtering it), and
+    an ablation that can only flip one knob at a time cannot see that.
+    """
+    out: dict[str, str] = {}
+    for s in spec or []:
+        for part in s.split():
+            k, _, v = part.partition("=")
+            if k:
+                out[k] = v
+    return out
+
+
+def cmd_ablate(args) -> int:
+    corpus = load_corpus(args.tier, args.only, args.limit, opt_only=True)
+    knobs = args.knob or []
+    print(f"[ablate] {len(corpus)} instances x {len(knobs)} knobs, {args.secs}s each",
+          flush=True)
+    results = {"mode": "ablate", "secs": args.secs, "tier": args.tier,
+               "base": [], "knobs": {}}
+
+    def pass_over(env_extra, label):
+        rows = []
+        # Published into `results` BEFORE the pass runs, so the per-instance checkpoint
+        # below carries this arm's partial rows too. Appending the arm only on completion
+        # meant an interrupted sweep lost everything it had measured for the arm in flight
+        # — which is the arm you most want to look at when you interrupt it.
+        if label != "base":
+            results["knobs"][label] = rows
+        for j, inst in enumerate(corpus):
+            rows.append(closure_row(inst, args.secs, env_extra))
+            print(f"  [{label}] {j+1}/{len(corpus)} {inst['name']}", flush=True)
+            # Written every instance: a sweep this long WILL be interrupted, and a
+            # partial measurement you can still read beats a complete one you lost.
+            emit(args.out, results, quiet=True)
+        return rows
+
+    base = pass_over(None, "base")
+    results["base"] = base
+    base_by = {r["name"]: r for r in base}
+    summarise_closure(base)
+    for k in knobs:
+        env_extra = parse_knobs([k])
+        rows = pass_over(env_extra, k)
+        results["knobs"][k] = rows
+        deltas = []
+        for r in rows:
+            b = base_by.get(r["name"], {})
+            if r.get("closure") is not None and b.get("closure") is not None:
+                deltas.append((r["closure"] - b["closure"], r["name"]))
+        deltas.sort()
+        tot = sum(d for d, _ in deltas)
+        print(f"[ablate] {k}: sum_delta_closure={100*tot:+.2f}pp over {len(deltas)} "
+              f"instances", flush=True)
+        for d, n in deltas[:3]:
+            if abs(d) > 1e-9:
+                print(f"           worst {n}: {100*d:+.2f}pp")
+        for d, n in deltas[-3:]:
+            if abs(d) > 1e-9:
+                print(f"           best  {n}: {100*d:+.2f}pp")
+    emit(args.out, results)
+    return 0
+
+
+def cmd_gate(args) -> int:
+    corpus = load_corpus(args.tier, args.only, args.limit, opt_only=False)
+    print(f"[gate] {len(corpus)} instances, {args.secs}s each", flush=True)
+    env_extra = parse_knobs(args.knob)
+    rows, alarms = [], []
+    for i, inst in enumerate(corpus):
+        r = run_ay(inst, args.secs, env_extra, mode="solve")
+        ref, refst = inst.get("ref_obj"), inst.get("ref_status")
+        row = {"name": inst["name"], "ref_obj": ref, "ref_status": refst, **r}
+        # THE SOUNDNESS GATE. A proven OPTIMAL that disagrees with MIPLIB's
+        # reference value is the one event that is never a performance result.
+        if r.get("status") == "OPTIMAL" and refst == "opt" and ref is not None:
+            if not close_enough(r.get("obj"), ref, args.tol):
+                row["ALARM"] = f"OPTIMAL {r['obj']} vs reference {ref}"
+                alarms.append(row)
+        if r.get("status") == "INFEASIBLE" and refst in ("opt", "best"):
+            row["ALARM"] = "INFEASIBLE on an instance with a known solution"
+            alarms.append(row)
+        rows.append(row)
+        print(f"  {i+1:3d}/{len(corpus)} {inst['name']:26s} {r.get('status', '?'):10s} "
+              f"obj={r.get('obj')} t={r.get('t', 0):6.1f}s{'  ** ALARM **' if 'ALARM' in row else ''}",
+              flush=True)
+    solved = sum(1 for r in rows if r.get("status") == "OPTIMAL")
+    print(f"[gate] {solved}/{len(rows)} proved optimal; {len(alarms)} soundness alarms")
+    for a in alarms:
+        print(f"  !! {a['name']}: {a['ALARM']}")
+    emit(args.out, {"mode": "gate", "secs": args.secs, "tier": args.tier,
+                    "knobs": env_extra, "rows": rows,
+                    "solved": solved, "alarms": len(alarms)})
+    return 1 if alarms else 0
+
+
+def run_ay_lp(inst: dict, secs: float) -> dict:
+    """ay's root LP relaxation, alone (`AY_LP_ONLY=1` -> `diag_float_lp`)."""
+    env = dict(os.environ, AY_LP_ONLY="1")
+    env.pop("AY_ROOT_CLOSURE", None)
+    try:
+        r = subprocess.run([AY_BIN, inst["file"], str(secs)], capture_output=True,
+                           text=True, timeout=secs + 120, env=env)
+    except (subprocess.TimeoutExpired, OSError):
+        return {"status": "TIMEOUT", "t": secs + 120}
+    txt = (r.stderr or "")
+    m = re.search(r"diag_float_lp: status=(\w+).*?wall=([\d.]+)s", txt, re.S)
+    if not m:
+        return {"status": "NOPARSE", "t": None}
+    it = re.search(r"primal=(\d+).*?dual=(\d+)", txt, re.S)
+    return {"status": m.group(1), "t": float(m.group(2)),
+            "primal_iters": int(it.group(1)) if it else None,
+            "dual_iters": int(it.group(2)) if it else None}
+
+
+def run_gurobi_lp(inst: dict, secs: float) -> dict:
+    """Gurobi on the SAME LP: the model with integrality dropped."""
+    gp = gurobi()
+    if not gp:
+        return {"status": "SKIP"}
+    try:
+        env = gp.Env(params={"OutputFlag": 0})
+        m = gp.read(inst["file"], env=env).relax()
+        m.setParam("Threads", 1)
+        m.setParam("TimeLimit", secs)
+        t0 = time.monotonic()
+        m.optimize()
+        wall = time.monotonic() - t0
+        st = "Optimal" if m.Status == 2 else f"STATUS{m.Status}"
+        iters = None
+        try:
+            iters = int(m.IterCount)
+        except Exception:
+            iters = None
+        m.dispose()
+        return {"status": st, "t": wall, "iters": iters}
+    except Exception as e:
+        msg = str(e)
+        return {"status": "SKIP", "why": "size-limited" if "size-limited" in msg else msg[:120]}
+
+
+def cmd_lp(args) -> int:
+    """W5: the LP-throughput gap, measured rather than inferred.
+
+    The W1/W2 gate found that ay cannot afford a Gurobi-sized root cut pool because
+    every adopted row is carried by every LP of every node. That makes LP cost the
+    binding constraint on cut quality, and this is the number behind that claim: the
+    same LP relaxation, solved by ay's float lane and by Gurobi, single-threaded.
+    """
+    corpus = load_corpus(args.tier, args.only, args.limit, opt_only=False)
+    print(f"[lp] {len(corpus)} instances, {args.secs}s each", flush=True)
+    rows = []
+    for i, inst in enumerate(corpus):
+        a = run_ay_lp(inst, args.secs)
+        g = run_gurobi_lp(inst, args.secs)
+        row = {"name": inst["name"], "rows": inst.get("rows"), "cols": inst.get("cols"),
+               "ay": a, "gurobi": g}
+        ta, tg = a.get("t"), g.get("t")
+        if ta is not None and tg is not None and tg > 0:
+            row["ratio"] = ta / tg
+        rows.append(row)
+        rt = "" if row.get("ratio") is None else f"{row['ratio']:8.1f}x"
+        print(f"  {i+1:3d}/{len(corpus)} {inst['name']:26s} ay={ta if ta is None else f'{ta:7.3f}s'} "
+              f"grb={tg if tg is None else f'{tg:7.3f}s'} {rt}", flush=True)
+        emit(args.out, {"mode": "lp", "secs": args.secs, "rows": rows}, quiet=True)
+    emit(args.out, {"mode": "lp", "secs": args.secs, "rows": rows})
+    have = [r for r in rows if r.get("ratio")]
+    if have:
+        # GEOMETRIC mean: these are ratios spanning orders of magnitude, and an
+        # arithmetic mean of ratios is dominated by whichever instance is worst.
+        logs = sorted(math.log(r["ratio"]) for r in have)
+        geo = math.exp(sum(logs) / len(logs))
+        med = math.exp(logs[len(logs) // 2])
+        slower = sum(1 for r in have if r["ratio"] > 1.0)
+        print(f"\n[lp] ay/gurobi LP time over {len(have)}: geomean {geo:.1f}x, "
+              f"median {med:.1f}x, ay slower on {slower}")
+        worst = sorted(have, key=lambda r: -r["ratio"])[:8]
+        for r in worst:
+            print(f"   {r['name']:26s} {r['ratio']:8.1f}x  ({r['rows']}x{r['cols']})")
+    return 0
+
+
+def cmd_audit(args) -> int:
+    """Head-to-head against Gurobi, judged on correctness FIRST and speed second.
+
+    Two different claims live here and they must not be blurred:
+
+    CORRECTNESS. ay's OPTIMAL is an exact-rational optimum with a re-checkable
+    certificate; Gurobi's is an optimum *within its tolerances*. MIPLIB's reference
+    value is the independent judge. Gurobi is run twice — once at its shipped defaults
+    (which is what a user actually gets) and once at ``MIPGap=0``, so a disagreement is
+    attributed to the default gap rather than being passed off as an error. A
+    disagreement that survives ``MIPGap=0`` is a genuine numerical miss.
+
+    SPEED. Time-to-proof on the instances where both prove. Reported as a per-instance
+    win/loss, never as an average — an average over a corpus where one solver times out
+    is not a measurement of anything.
+    """
+    corpus = load_corpus(args.tier, args.only, args.limit, opt_only=True)
+    print(f"[audit] {len(corpus)} instances, {args.secs}s each", flush=True)
+    rows = []
+    for i, inst in enumerate(corpus):
+        ref = inst.get("ref_obj")
+        a = run_ay(inst, args.secs, parse_knobs(args.knob), mode="solve")
+        g = run_gurobi(inst, args.secs)
+        row = {"name": inst["name"], "ref_obj": ref, "ay": a, "gurobi": g}
+        # Only re-run Gurobi exactly when its default-tolerance answer disagrees; a
+        # second full solve on every instance would double the corpus cost for nothing.
+        if g.get("status") == "OPTIMAL" and not close_enough(g.get("obj"), ref, args.tol):
+            row["gurobi_exact"] = run_gurobi_tight(inst, args.secs)
+        rows.append(row)
+        verdict = classify(row, args.tol)
+        row["verdict"] = verdict
+        print(f"  {i+1:3d}/{len(corpus)} {inst['name']:26s} "
+              f"ay={a.get('status', '?'):9s} {a.get('t', 0):6.1f}s | "
+              f"grb={g.get('status', '?'):9s} {g.get('t', 0):6.1f}s | {verdict}", flush=True)
+    emit(args.out, {"mode": "audit", "secs": args.secs, "tier": args.tier,
+                    "knobs": parse_knobs(args.knob), "rows": rows})
+    summarise_audit(rows)
+    return 0
+
+
+def run_gurobi_tight(inst: dict, secs: float) -> dict:
+    gp = gurobi()
+    if not gp:
+        return {"status": "SKIP"}
+    try:
+        env = gp.Env(params={"OutputFlag": 0})
+        m = gp.read(inst["file"], env=env)
+        m.setParam("Threads", 1)
+        m.setParam("TimeLimit", secs)
+        m.setParam("MIPGap", 0.0)
+        m.setParam("MIPGapAbs", 0.0)
+        m.optimize()
+        st = "OPTIMAL" if m.Status == 2 else f"STATUS{m.Status}"
+        obj = m.ObjVal if m.SolCount > 0 else None
+        m.dispose()
+        return {"status": st, "obj": obj}
+    except Exception as e:
+        return {"status": "SKIP", "why": str(e)[:200]}
+
+
+def classify(row: dict, tol: float) -> str:
+    ref, a, g = row.get("ref_obj"), row["ay"], row["gurobi"]
+    ao, go = a.get("status"), g.get("status")
+    # Correctness first: a wrong proven optimum outranks every timing result there is.
+    if ao == "OPTIMAL" and not close_enough(a.get("obj"), ref, tol):
+        return "!! AY-WRONG"
+    if go == "OPTIMAL" and not close_enough(g.get("obj"), ref, tol):
+        tight = row.get("gurobi_exact", {})
+        if tight.get("status") == "OPTIMAL" and close_enough(tight.get("obj"), ref, tol):
+            return "grb-default-gap"   # its shipped tolerance, not a numerical error
+        return "!! GRB-WRONG"
+    if ao == "OPTIMAL" and go != "OPTIMAL":
+        return "AY-ONLY"
+    if go == "OPTIMAL" and ao != "OPTIMAL":
+        return "GRB-ONLY"
+    if ao == go == "OPTIMAL":
+        ta, tg = a.get("t") or 0.0, g.get("t") or 0.0
+        if ta < tg * 0.95:
+            return f"AY-FASTER {tg/max(ta,1e-9):.1f}x"
+        if tg < ta * 0.95:
+            return f"grb-faster {ta/max(tg,1e-9):.1f}x"
+        return "tie"
+    return "neither"
+
+
+def summarise_audit(rows: list[dict]) -> None:
+    tally: dict[str, int] = {}
+    for r in rows:
+        key = r["verdict"].split()[0]
+        tally[key] = tally.get(key, 0) + 1
+    print("\n[audit] " + ", ".join(f"{k}={v}" for k, v in sorted(tally.items())))
+    wrong = [r for r in rows if r["verdict"].startswith("!!")]
+    if wrong:
+        print("[audit] CORRECTNESS EVENTS:")
+        for r in wrong:
+            print(f"  {r['verdict']:14s} {r['name']:24s} ref={r['ref_obj']} "
+                  f"ay={r['ay'].get('obj')} grb={r['gurobi'].get('obj')}")
+    gap = [r for r in rows if r["verdict"] == "grb-default-gap"]
+    if gap:
+        print(f"[audit] {len(gap)} instances where Gurobi's DEFAULT tolerance returned a "
+              f"non-optimal value it labelled OPTIMAL:")
+        for r in gap:
+            print(f"  {r['name']:24s} ref={r['ref_obj']} grb={r['gurobi'].get('obj')} "
+                  f"ay={r['ay'].get('obj')}")
+    both = [r for r in rows if r["ay"].get("status") == "OPTIMAL"
+            and r["gurobi"].get("status") == "OPTIMAL"]
+    faster = [r for r in both if (r["ay"].get("t") or 0) < (r["gurobi"].get("t") or 0) * 0.95]
+    print(f"[audit] both prove on {len(both)}; ay faster on {len(faster)}")
+    for r in sorted(faster, key=lambda r: -(r["gurobi"]["t"] / max(r["ay"]["t"], 1e-9)))[:10]:
+        print(f"  {r['name']:24s} ay {r['ay']['t']:.2f}s vs grb {r['gurobi']['t']:.2f}s")
+
+
+def cmd_compare(args) -> int:
+    a = json.loads(pathlib.Path(args.base).read_text())
+    b = json.loads(pathlib.Path(args.head).read_text())
+    ar = {r["name"]: r for r in a["rows"]}
+    br = {r["name"]: r for r in b["rows"]}
+    names = sorted(set(ar) | set(br))
+    mode = a.get("mode")
+    if mode == "closure":
+        print(f"{'instance':26s} {'base':>9s} {'head':>9s} {'delta':>9s}")
+        tot = n = 0.0
+        for nm in names:
+            ca, cb = ar.get(nm, {}).get("closure"), br.get(nm, {}).get("closure")
+            if ca is None or cb is None:
+                continue
+            d = cb - ca
+            tot += d
+            n += 1
+            if abs(d) > 1e-9:
+                print(f"{nm:26s} {100*ca:8.2f}% {100*cb:8.2f}% {100*d:+8.2f}pp")
+        if n:
+            print(f"\nmean delta {100*tot/n:+.3f}pp over {int(n)} instances "
+                  f"(total {100*tot:+.2f}pp)")
+        return 0
+    # gate/solve comparison: verdict changes first, then wall.
+    #
+    # A verdict change is not one kind of event. FEASIBLE -> OPTIMAL is a proof gained;
+    # OPTIMAL -> FEASIBLE is a proof LOST; FEASIBLE -> UNKNOWN means the run stopped
+    # finding any incumbent at all, which is worse than either. Scoring them together as
+    # "changes" hides whether a build got better or worse, so they are tallied apart.
+    rank = {"OPTIMAL": 3, "INFEASIBLE": 3, "FEASIBLE": 2, "UNKNOWN": 1,
+            "HARDTIMEOUT": 0, "TIMEOUT": 0, "CRASH": 0, "NOOUTPUT": 0}
+    regressed = improved = 0
+    verdict_lost = verdict_gained = 0
+    for nm in names:
+        x, y = ar.get(nm, {}), br.get(nm, {})
+        sx, sy = x.get("status"), y.get("status")
+        if sx != sy:
+            dr = rank.get(sy, 1) - rank.get(sx, 1)
+            tag = "LOST   " if dr < 0 else ("gained " if dr > 0 else "changed")
+            if dr < 0:
+                verdict_lost += 1
+            elif dr > 0:
+                verdict_gained += 1
+            print(f"VERDICT {tag} {nm:24s} {sx} -> {sy}")
+        elif sx == "OPTIMAL" and not close_enough(x.get("obj"), y.get("obj")):
+            print(f"OBJECTIVE {nm:22s} {x.get('obj')} -> {y.get('obj')}   ** ALARM **")
+            verdict_lost += 1
+    for nm in names:
+        x, y = ar.get(nm, {}), br.get(nm, {})
+        if x.get("status") == y.get("status") == "OPTIMAL":
+            tx, ty = x.get("t"), y.get("t")
+            if tx and ty and abs(ty - tx) > 0.1 + 0.10 * tx:
+                tag = "SLOWER" if ty > tx else "faster"
+                if ty > tx:
+                    regressed += 1
+                else:
+                    improved += 1
+                print(f"{tag:8s} {nm:24s} {tx:7.2f}s -> {ty:7.2f}s  ({100*(ty-tx)/tx:+.0f}%)")
+    pa = sum(1 for r in a["rows"] if r.get("status") in ("OPTIMAL", "INFEASIBLE"))
+    pb = sum(1 for r in b["rows"] if r.get("status") in ("OPTIMAL", "INFEASIBLE"))
+    print(f"\nproved: {pa} -> {pb}   verdicts: {verdict_gained} gained, {verdict_lost} LOST"
+          f"   wall: {improved} faster, {regressed} slower")
+    # A build that loses a verdict or slows more instances than it speeds has not earned
+    # its default, whatever a leading indicator said about it.
+    return 1 if (verdict_lost or pb < pa) else 0
+
+
+def emit(path: str | None, payload: dict, quiet: bool = False) -> None:
+    if not path:
+        return
+    p = pathlib.Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(payload, indent=1))
+    if not quiet:
+        print(f"[out] {p}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    def common(p):
+        p.add_argument("--tier", default="gurobi",
+                       choices=["gurobi", "mid", "large", "all"])
+        p.add_argument("--only", nargs="*")
+        p.add_argument("--limit", type=int, default=0)
+        p.add_argument("--secs", type=float, default=30.0)
+        p.add_argument("--out")
+        p.add_argument("--knob", nargs="*", help="env knob(s), e.g. AY_MILP_NO_ZERO_HALF=1")
+
+    for name, fn in (("closure", cmd_closure), ("baseline", cmd_baseline),
+                     ("ablate", cmd_ablate), ("gate", cmd_gate), ("audit", cmd_audit),
+                     ("lp", cmd_lp)):
+        p = sub.add_parser(name)
+        common(p)
+        if name in ("gate", "audit"):
+            p.add_argument("--tol", type=float, default=REL_TOL)
+        if name == "closure":
+            p.add_argument("--with-gurobi", action="store_true",
+                           help="also measure Gurobi's root bound, head-to-head")
+        p.set_defaults(fn=fn)
+
+    c = sub.add_parser("compare")
+    c.add_argument("base")
+    c.add_argument("head")
+    c.set_defaults(fn=cmd_compare)
+
+    args = ap.parse_args()
+    if getattr(args, "tier", None) == "all":
+        args.tier = None
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

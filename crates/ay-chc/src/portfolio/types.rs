@@ -671,7 +671,7 @@ impl PortfolioConfig {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```rust
     /// use ay_chc::{PortfolioConfig, EngineType, BudgetPolicy};
     ///
     /// let config = PortfolioConfig::default()
@@ -779,7 +779,7 @@ impl PortfolioConfig {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```rust
     /// use ay_chc::{PortfolioConfig, EngineType};
     ///
     /// let config = PortfolioConfig::default()

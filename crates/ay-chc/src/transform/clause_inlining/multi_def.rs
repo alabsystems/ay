@@ -8,7 +8,7 @@
 //!
 //! Reference: Z3 `dl_mk_rule_inliner.cpp:plan_inlining()` + `transform_rules()`.
 
-use super::ClauseInliner;
+use super::{ClauseInliner, ClauseTrace, CompositionStep};
 use crate::{ChcExpr, ClauseBody, HornClause, PredicateId};
 use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 
@@ -17,7 +17,140 @@ use ay_core::kani_compat::{DetHashMap as FxHashMap, DetHashSet as FxHashSet};
 /// pathological N-in/1-out join cannot expand into thousands of clauses.
 const GRAPH_COLLAPSE_MAX_DEFS: usize = 64;
 
+struct MultiDefPlan {
+    candidates: FxHashSet<PredicateId>,
+    head_count: FxHashMap<PredicateId, usize>,
+    tail_count: FxHashMap<PredicateId, usize>,
+    def_indices: FxHashMap<PredicateId, Vec<usize>>,
+}
+
 impl ClauseInliner {
+    /// Compute the exact phase-2 candidate set before trace-shape filtering.
+    ///
+    /// Phase 1 uses this same plan to preserve only the immediate neighbours
+    /// that phase 2 can actually contract. Sharing the planner prevents a
+    /// conservative "all multi-defined predicates" approximation from
+    /// blocking unrelated unique-definition collapse.
+    fn plan_multi_def(&self, clauses: &[HornClause]) -> MultiDefPlan {
+        let mut head_count: FxHashMap<PredicateId, usize> = FxHashMap::default();
+        let mut tail_count: FxHashMap<PredicateId, usize> = FxHashMap::default();
+        let mut def_indices: FxHashMap<PredicateId, Vec<usize>> = FxHashMap::default();
+        let mut is_self_recursive: FxHashSet<PredicateId> = FxHashSet::default();
+
+        for (idx, clause) in clauses.iter().enumerate() {
+            if let Some(head_id) = clause.head.predicate_id() {
+                *head_count.entry(head_id).or_insert(0) += 1;
+                def_indices.entry(head_id).or_default().push(idx);
+                if clause.body.predicates.iter().any(|(id, _)| *id == head_id) {
+                    is_self_recursive.insert(head_id);
+                }
+            }
+            for (body_pred, _) in &clause.body.predicates {
+                *tail_count.entry(*body_pred).or_insert(0) += 1;
+            }
+        }
+
+        let mut candidates: FxHashSet<PredicateId> = FxHashSet::default();
+        let query_body_preds = if self.preserve_query_body_predicates {
+            Self::query_body_predicates(clauses)
+        } else {
+            FxHashSet::default()
+        };
+        for (&pred, &h_count) in &head_count {
+            if h_count < 2 || query_body_preds.contains(&pred) {
+                continue;
+            }
+            let t_count = tail_count.get(&pred).copied().unwrap_or(0);
+            if self.graph_collapse_node_rule {
+                if h_count > GRAPH_COLLAPSE_MAX_DEFS
+                    || h_count.saturating_mul(t_count) > h_count + t_count
+                {
+                    continue;
+                }
+                let defs_linear = def_indices[&pred]
+                    .iter()
+                    .all(|&idx| clauses[idx].body.predicates.len() <= 1);
+                if !defs_linear {
+                    continue;
+                }
+                let uses_linear = clauses.iter().all(|clause| {
+                    let occurrences = clause
+                        .body
+                        .predicates
+                        .iter()
+                        .filter(|(id, _)| *id == pred)
+                        .count();
+                    occurrences == 0 || (occurrences == 1 && clause.body.predicates.len() == 1)
+                });
+                if !uses_linear {
+                    continue;
+                }
+            } else if h_count > self.max_multi_defs || t_count > self.max_multi_tail_uses {
+                continue;
+            }
+            if is_self_recursive.contains(&pred) {
+                continue;
+            }
+            let all_within_limit = def_indices[&pred].iter().all(|&idx| {
+                clauses[idx]
+                    .body
+                    .constraint
+                    .as_ref()
+                    .map_or(0, Self::expr_size)
+                    <= self.constraint_size_limit
+            });
+            if all_within_limit {
+                candidates.insert(pred);
+            }
+        }
+
+        // Avoid cross-product expansion when multiple selected predicates
+        // occur in one clause.
+        let mut forbidden: FxHashSet<PredicateId> = FxHashSet::default();
+        for clause in clauses {
+            let body_candidates: Vec<PredicateId> = clause
+                .body
+                .predicates
+                .iter()
+                .filter_map(|(id, _)| {
+                    (candidates.contains(id) && !forbidden.contains(id)).then_some(*id)
+                })
+                .collect();
+            if body_candidates.len() > 1 {
+                let mut sorted = body_candidates;
+                sorted.sort_by_key(|pred| head_count.get(pred).copied().unwrap_or(0));
+                forbidden.extend(sorted[1..].iter().copied());
+            }
+        }
+        candidates.retain(|pred| !forbidden.contains(pred));
+
+        // A one-level rewrite may not remove a selected predicate whose
+        // definition introduces another selected predicate.
+        let mut dependency_forbidden: FxHashSet<PredicateId> = FxHashSet::default();
+        for &pred in &candidates {
+            for &idx in &def_indices[&pred] {
+                for (body_pred, _) in &clauses[idx].body.predicates {
+                    if candidates.contains(body_pred) {
+                        dependency_forbidden.insert(pred);
+                        dependency_forbidden.insert(*body_pred);
+                    }
+                }
+            }
+        }
+        candidates.retain(|pred| !dependency_forbidden.contains(pred));
+
+        MultiDefPlan {
+            candidates,
+            head_count,
+            tail_count,
+            def_indices,
+        }
+    }
+
+    pub(super) fn multi_def_candidates(&self, clauses: &[HornClause]) -> FxHashSet<PredicateId> {
+        self.plan_multi_def(clauses).candidates
+    }
+
     /// Multi-definition inlining phase (Z3-style eager inlining).
     ///
     /// Identifies predicates P with:
@@ -37,158 +170,34 @@ impl ClauseInliner {
         &self,
         clauses: &[HornClause],
         inlined_defs: &mut Vec<(PredicateId, HornClause)>,
+        traces: &mut Vec<ClauseTrace>,
     ) -> (Vec<HornClause>, bool) {
-        // Count head occurrences (definitions) and tail occurrences per predicate.
-        let mut head_count: FxHashMap<PredicateId, usize> = FxHashMap::default();
-        let mut tail_count: FxHashMap<PredicateId, usize> = FxHashMap::default();
-        let mut def_indices: FxHashMap<PredicateId, Vec<usize>> = FxHashMap::default();
-        let mut is_self_recursive: FxHashSet<PredicateId> = FxHashSet::default();
+        let MultiDefPlan {
+            mut candidates,
+            head_count,
+            tail_count,
+            def_indices,
+        } = self.plan_multi_def(clauses);
 
-        for (idx, clause) in clauses.iter().enumerate() {
-            if let Some(head_id) = clause.head.predicate_id() {
-                *head_count.entry(head_id).or_insert(0) += 1;
-                def_indices.entry(head_id).or_default().push(idx);
-
-                // Check self-recursion
-                if clause.body.predicates.iter().any(|(id, _)| *id == head_id) {
-                    is_self_recursive.insert(head_id);
-                }
-            }
-            for (body_pred, _) in &clause.body.predicates {
-                *tail_count.entry(*body_pred).or_insert(0) += 1;
-            }
-        }
-
-        // Identify candidate predicates for multi-def inlining.
-        let mut candidates: FxHashSet<PredicateId> = FxHashSet::default();
-        let query_body_preds = if self.preserve_query_body_predicates {
-            Self::query_body_predicates(clauses)
-        } else {
-            FxHashSet::default()
-        };
-        for (&pred, &h_count) in &head_count {
-            if h_count < 2 {
-                continue;
-            }
-            if query_body_preds.contains(&pred) {
-                continue;
-            }
-            let t_count = tail_count.get(&pred).copied().unwrap_or(0);
-            if self.graph_collapse_node_rule {
-                // Golem's SimpleNodeEliminator rule (NodeEliminator.cc):
-                // contract an internal vertex when |in|*|out| <= |in|+|out|,
-                // i.e. the def×use cross product never grows the clause
-                // count (N-in/1-out joins, 2-in/2-out diamonds; 1-in is
-                // already handled by unique-definition phase 1).
-                if h_count > GRAPH_COLLAPSE_MAX_DEFS {
-                    continue;
-                }
-                if h_count.saturating_mul(t_count) > h_count + t_count {
-                    continue;
-                }
-                // Mirror golem's linear-edge restriction: vertex contraction
-                // only composes simple (non-hyper) in/out edges. Requiring
-                // single-occurrence linear use clauses also guarantees the
-                // one-level expansion below replaces EVERY occurrence of the
-                // candidate.
-                let defs_linear = def_indices[&pred]
+        if crate::ground_derivation::ground_backtranslation_enabled() {
+            // The current trace format represents one composition layer. A
+            // multi-def expansion has exact source correspondence only when
+            // both its selected definition and every caller are still
+            // uncomposed. Keep any nested case explicit rather than discarding
+            // alignment for the entire inliner.
+            candidates.retain(|pred| {
+                def_indices[pred]
                     .iter()
-                    .all(|&idx| clauses[idx].body.predicates.len() <= 1);
-                if !defs_linear {
-                    continue;
-                }
-                let uses_linear = clauses.iter().all(|clause| {
-                    let occurrences = clause
-                        .body
-                        .predicates
-                        .iter()
-                        .filter(|(id, _)| *id == pred)
-                        .count();
-                    occurrences == 0 || (occurrences == 1 && clause.body.predicates.len() == 1)
-                });
-                if !uses_linear {
-                    continue;
-                }
-            } else {
-                if h_count > self.max_multi_defs {
-                    continue;
-                }
-                if t_count > self.max_multi_tail_uses {
-                    continue;
-                }
-            }
-            if is_self_recursive.contains(&pred) {
-                continue;
-            }
-            // Check constraint sizes of all definitions
-            let all_within_limit = def_indices[&pred].iter().all(|&idx| {
-                let constraint_size = clauses[idx]
-                    .body
-                    .constraint
-                    .as_ref()
-                    .map_or(0, Self::expr_size);
-                constraint_size <= self.constraint_size_limit
+                    .all(|index| traces.get(*index).is_some_and(ClauseTrace::is_uncomposed))
+                    && clauses.iter().enumerate().all(|(index, clause)| {
+                        let calls_pred = clause
+                            .body
+                            .predicates
+                            .iter()
+                            .any(|(body_pred, _)| body_pred == pred);
+                        !calls_pred || traces.get(index).is_some_and(ClauseTrace::is_uncomposed)
+                    })
             });
-            if !all_within_limit {
-                continue;
-            }
-            candidates.insert(pred);
-        }
-
-        if candidates.is_empty() {
-            return (clauses.to_vec(), false);
-        }
-
-        // Z3 multiplier prevention: don't inline two multi-def predicates in
-        // the same clause body (cross-product blowup). For each clause, check
-        // how many candidate predicates appear in its body. If >1, forbid all
-        // but the one with the fewest definitions to limit expansion.
-        let mut forbidden: FxHashSet<PredicateId> = FxHashSet::default();
-        for clause in clauses {
-            let body_candidates: Vec<PredicateId> = clause
-                .body
-                .predicates
-                .iter()
-                .filter_map(|(id, _)| {
-                    if candidates.contains(id) && !forbidden.contains(id) {
-                        Some(*id)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            if body_candidates.len() > 1 {
-                // Keep the one with fewest definitions, forbid the rest
-                let mut sorted = body_candidates;
-                sorted.sort_by_key(|p| head_count.get(p).copied().unwrap_or(0));
-                // Forbid all except the first (fewest definitions)
-                for &p in &sorted[1..] {
-                    forbidden.insert(p);
-                }
-            }
-        }
-        for p in &forbidden {
-            candidates.remove(p);
-        }
-
-        // #9604: This pass removes every selected candidate definition before
-        // expanding use sites. Since expansion is intentionally one-level, a
-        // selected definition must not introduce another selected predicate in
-        // its body; otherwise the introduced predicate has had all of its
-        // definitions removed and the transformed problem is underconstrained.
-        let mut dependency_forbidden: FxHashSet<PredicateId> = FxHashSet::default();
-        for &pred in &candidates {
-            for &idx in &def_indices[&pred] {
-                for (body_pred, _) in &clauses[idx].body.predicates {
-                    if candidates.contains(body_pred) {
-                        dependency_forbidden.insert(pred);
-                        dependency_forbidden.insert(*body_pred);
-                    }
-                }
-            }
-        }
-        for pred in &dependency_forbidden {
-            candidates.remove(pred);
         }
 
         if candidates.is_empty() {
@@ -215,12 +224,12 @@ impl ClauseInliner {
         }
 
         // Build the multi-definition map: predicate → list of defining clauses.
-        let multi_defs: FxHashMap<PredicateId, Vec<HornClause>> = candidates
+        let multi_defs: FxHashMap<PredicateId, Vec<(usize, HornClause)>> = candidates
             .iter()
             .map(|&pred| {
-                let defs: Vec<HornClause> = def_indices[&pred]
+                let defs: Vec<(usize, HornClause)> = def_indices[&pred]
                     .iter()
-                    .map(|&idx| clauses[idx].clone())
+                    .map(|&idx| (idx, clauses[idx].clone()))
                     .collect();
                 (pred, defs)
             })
@@ -230,7 +239,7 @@ impl ClauseInliner {
         // predicates, we create a disjunctive interpretation: the predicate
         // is true iff ANY of its defining clauses' bodies are satisfied.
         for (&pred_id, defs) in &multi_defs {
-            for def in defs {
+            for (_, def) in defs {
                 let normalized = Self::normalize_head_for_back_translation(def);
                 inlined_defs.push((pred_id, normalized));
             }
@@ -240,8 +249,10 @@ impl ClauseInliner {
         // body contains a candidate predicate, expand into N clauses.
         let candidate_heads: FxHashSet<PredicateId> = candidates.clone();
         let mut result: Vec<HornClause> = Vec::new();
+        let track_ground = crate::ground_derivation::ground_backtranslation_enabled();
+        let mut result_traces: Vec<ClauseTrace> = Vec::new();
 
-        for clause in clauses {
+        for (clause_index, clause) in clauses.iter().enumerate() {
             // Skip defining clauses of candidate predicates
             if let Some(head_id) = clause.head.predicate_id() {
                 if candidate_heads.contains(&head_id) {
@@ -268,13 +279,10 @@ impl ClauseInliner {
                 let defs = &multi_defs[&pred_id];
                 let call_args = &clause.body.predicates[body_idx].1;
 
-                for def_clause in defs {
-                    // Multi-def expansion drops the composition traces wholesale
-                    // (the clause list is rewritten), so the linking definitions
-                    // have nothing to attach to here.
+                for (def_index, def_clause) in defs {
                     let inlined = self.inline_clause(def_clause, call_args);
-                    let (inlined_preds, inlined_constraint) =
-                        (inlined.body_preds, inlined.constraint);
+                    let inlined_preds = inlined.body_preds.clone();
+                    let inlined_constraint = inlined.constraint.clone();
 
                     // Build new body: replace the inlined predicate with its body preds
                     let mut new_body_preds: Vec<(PredicateId, Vec<ChcExpr>)> = Vec::new();
@@ -306,15 +314,39 @@ impl ClauseInliner {
                         )
                     };
 
-                    result.push(HornClause::new(
+                    let expanded_clause = HornClause::new(
                         ClauseBody::new(new_body_preds, final_constraint),
                         clause.head.clone(),
-                    ));
+                    );
+                    if track_ground {
+                        let mut trace = traces[clause_index].clone();
+                        trace.original_clause = Some(clause.clone());
+                        trace.composite_clause = Some(expanded_clause.clone());
+                        trace.steps.insert(
+                            pred_id,
+                            CompositionStep {
+                                inlined_pred: pred_id,
+                                call_args: call_args.clone(),
+                                def_clause: def_clause.clone(),
+                                def_input_index: Some(traces[*def_index].c0_input_index),
+                                linking_defs: inlined.linking_defs,
+                                var_renames: inlined.var_renames,
+                            },
+                        );
+                        result_traces.push(trace);
+                    }
+                    result.push(expanded_clause);
                 }
             } else {
                 // No multi-def predicate in body — keep as-is
                 result.push(clause.clone());
+                if track_ground {
+                    result_traces.push(traces[clause_index].clone());
+                }
             }
+        }
+        if track_ground {
+            *traces = result_traces;
         }
 
         if self.verbose {
@@ -324,52 +356,6 @@ impl ClauseInliner {
                 result.len(),
                 candidates.len()
             );
-        }
-
-        // Run unique-def inlining again in case multi-def expansion exposed
-        // new unique-definition predicates. This is a light fixpoint.
-        // We don't recurse multi-def again to prevent exponential blowup.
-        let mut iteration = 0;
-        loop {
-            iteration += 1;
-            let unique_def_indices = self.find_unique_def_indices(&result);
-            if unique_def_indices.is_empty() {
-                break;
-            }
-            let final_def_indices = self.extract_acyclic_def_indices(&result, unique_def_indices);
-            if final_def_indices.is_empty() {
-                break;
-            }
-            let final_defs: FxHashMap<PredicateId, HornClause> = final_def_indices
-                .iter()
-                .map(|(&pred_id, &clause_idx)| (pred_id, result[clause_idx].clone()))
-                .collect();
-
-            if self.verbose {
-                safe_eprintln!(
-                    "CHC multi-def post-cleanup iteration {}: inlining {} more predicates",
-                    iteration,
-                    final_defs.len()
-                );
-            }
-
-            for (&pred_id, clause) in &final_defs {
-                let normalized = Self::normalize_head_for_back_translation(clause);
-                inlined_defs.push((pred_id, normalized));
-            }
-
-            let inlined_heads: FxHashSet<PredicateId> = final_defs.keys().copied().collect();
-            result.retain(|c| {
-                if let Some(head_id) = c.head.predicate_id() {
-                    !inlined_heads.contains(&head_id)
-                } else {
-                    true
-                }
-            });
-            result = result
-                .into_iter()
-                .map(|c| self.apply_defs(&c, &final_defs))
-                .collect();
         }
 
         (result, true)

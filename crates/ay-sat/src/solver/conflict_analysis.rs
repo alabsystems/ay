@@ -81,6 +81,34 @@ impl Solver {
             "BUG: conflict analysis called at decision level 0"
         );
 
+        // #unguarded-tvalid-lemmas STAGE 0 (replay counters, behavior-
+        // preserving): attribute this conflict for the incremental QF_LRA
+        // carryover diagnostic.
+        // (1) conflicts_from_prior_solve_clauses: the conflicting clause was
+        //     born before the current incremental solve began (birth-solve
+        //     stamp < incremental_solve_count; a missing stamp reads as
+        //     epoch 0). Nonzero values prove cross-solve clause reuse.
+        // (2) assumption_level_conflicts: the conflict fires within the
+        //     assumption prefix (scope selectors + user assumptions), so the
+        //     learned clause will resolve against assumption decisions and
+        //     inherit the scope-selector guard.
+        if self.cold.incremental_solve_count > 0 {
+            let birth = self
+                .cold
+                .clause_birth_solve
+                .get(conflict_ref.0 as usize)
+                .copied()
+                .unwrap_or(0);
+            if u64::from(birth) < self.cold.incremental_solve_count {
+                self.stats.conflicts_from_prior_solve_clauses += 1;
+            }
+        }
+        if self.cold.active_assumption_count > 0
+            && self.decision_level <= self.cold.active_assumption_count
+        {
+            self.stats.assumption_level_conflicts += 1;
+        }
+
         let mut counter = 0; // Literals at current decision level
                              // Ghost-literal proof guard (#8434 follow-up, 2026-07-02): the ghost
                              // skips below drop unassigned antecedent literals from the learned

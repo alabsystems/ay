@@ -117,6 +117,12 @@ impl LraSolver {
             self.max_row_width = row_width;
         }
         self.heap_stale = true; // #8782: new row → full heap rebuild needed
+                                // #warm-simplex: a new row creates a basic var (and may flip
+                                // status-None vars to NonBasic) outside the tracked chokepoints, and
+                                // breaks the last-feasible delta's row-consistency (the anchor
+                                // assignment predates this row). Invalidate all warm tracking; the
+                                // next full simplex scan re-arms it.
+        self.warm_invalidate();
 
         let new_row_ref = &self.rows[row_idx];
         for (pos, &(v, _)) in new_row_ref.coeffs.iter().enumerate() {

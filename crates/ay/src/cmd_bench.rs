@@ -107,6 +107,10 @@ pub(crate) enum BenchCommand {
     /// Compare AY against a competition's field under labeled run classes
     Compare(crate::cmd_bench_compare::BenchCompareArgs),
 
+    /// Plan or run the catalog-complete external-reviewer campaign.
+    #[cfg(feature = "bench")]
+    Campaign(crate::cmd_bench_campaign::CampaignArgs),
+
     /// Score existing results JSON.
     Score {
         /// Results JSON file
@@ -578,6 +582,7 @@ pub(crate) fn run(_command: BenchCommand) -> anyhow::Result<()> {
 pub(crate) fn run(command: BenchCommand) -> anyhow::Result<()> {
     match command {
         BenchCommand::Compare(args) => crate::cmd_bench_compare::run(args),
+        BenchCommand::Campaign(args) => crate::cmd_bench_campaign::run(args),
         BenchCommand::Run {
             eval_ids,
             all,
@@ -620,6 +625,8 @@ pub(crate) fn run(command: BenchCommand) -> anyhow::Result<()> {
                 sat_track,
                 sat_ai_class,
                 sat_variant,
+                resource_memory_cap_mib: None,
+                resource_core_cap: None,
             })?;
             Ok(())
         }

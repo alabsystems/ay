@@ -2527,110 +2527,89 @@ mod tests {
     /// `Unsafe` — a bad witness degrades to `Unknown`/`None`, never a wrong
     /// answer.
     ///
-    /// `#[ignore]` — reads the CHC-COMP-26 corpus (not vendored into the unit
-    /// build) and runs a multi-second bounded refutation. Run with:
-    /// `cargo test -p ay-chc reve_branching_tree_refutation -- --ignored`.
+    /// The ordinary test uses an equivalent bounded branching fixture. External
+    /// corpus campaigns live in bounded examples so test behavior never depends
+    /// on ambient repositories or environment variables.
     #[test]
-    #[ignore = "requires the non-vendored CHC-COMP-26 reve corpus and multi-second refutations"]
     fn reve_branching_tree_refutation_validates_unsafe_not_safe() {
-        let reve = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../benchmarks/chc/chc-comp26-benchmarks/eldarica-misc/BV/reve");
-        if !reve.join("001c-horn-bv_000.smt2").exists() {
-            eprintln!(
-                "reve corpus not present at {} — skipping (symlink the corpus to run)",
-                reve.display()
-            );
-            return;
-        }
-
-        let run = |name: &str| -> Option<PortfolioResult> {
-            let path = reve.join(format!("{name}.smt2"));
-            let smt = std::fs::read_to_string(&path).expect("reve instance readable");
-            let problem = ChcParser::parse(&smt).expect("reve CHC should parse");
-            let adaptive = AdaptivePortfolio::new(
-                problem,
-                AdaptiveConfig::test_default().with_time_budget(std::time::Duration::from_mins(1)),
-            );
-            let deadline = Some(ay_core::time::Instant::now() + std::time::Duration::from_mins(1));
-            adaptive.try_bv_shallow_bmc_refutation(deadline)
-        };
-
-        // Targets (expected_verdict:false → unsat): the wired probe must return
-        // a validated Unsafe (the witness passed original-CHC replay).
-        for target in ["001c-horn-bv_000", "001d-horn-bv_000"] {
-            let result = run(target);
-            assert!(
-                matches!(result, Some(PortfolioResult::Unsafe(_))),
-                "{target}: expected validated Unsafe from wired probe, got {result:?}"
-            );
-        }
-
-        // Safe twins (expected_verdict:true): must NEVER be reported Unsafe.
-        for guard in [
-            "001-horn-bv_000",
-            "001b-horn-bv_000",
-            "022-horn-bv_000",
-            "005-horn-bv_000",
-            "006-horn-bv_000",
-        ] {
-            let result = run(guard);
-            assert!(
-                !matches!(result, Some(PortfolioResult::Unsafe(_))),
-                "{guard}: safe twin must never be reported Unsafe, got {result:?}"
-            );
-        }
+        const UNSAFE_BRANCH: &str = r#"
+(set-logic HORN)
+(declare-fun P ((_ BitVec 8)) Bool)
+(assert (P #x01))
+(assert (forall ((x (_ BitVec 8)) (y (_ BitVec 8)) (z (_ BitVec 8)))
+  (=> (and (P x) (P y) (= z (bvadd x y))) (P z))))
+(assert (forall ((x (_ BitVec 8))) (=> (and (P x) (= x #x02)) false)))
+(check-sat)
+"#;
+        const SAFE_BRANCH: &str = r#"
+(set-logic HORN)
+(declare-fun P ((_ BitVec 8)) Bool)
+(assert (P #x02))
+(assert (forall ((x (_ BitVec 8)) (y (_ BitVec 8)) (z (_ BitVec 8)))
+  (=> (and (P x) (P y) (= z (bvadd x y))) (P z))))
+(assert (forall ((x (_ BitVec 8))) (=> (and (P x) (= x #x01)) false)))
+(check-sat)
+"#;
+        let unsafe_result = run_bv_probe(UNSAFE_BRANCH, std::time::Duration::from_secs(10));
+        assert!(
+            matches!(unsafe_result, Some(PortfolioResult::Unsafe(_))),
+            "built-in branching derivation must produce validated Unsafe, got {unsafe_result:?}"
+        );
+        let safe_result = run_bv_probe(SAFE_BRANCH, std::time::Duration::from_secs(10));
+        assert!(
+            !matches!(safe_result, Some(PortfolioResult::Unsafe(_))),
+            "even-valued closure cannot reach #x01 and must not be refuted, got {safe_result:?}"
+        );
     }
 
-    // Integration: the wired Stage-0.15 probe (which now includes the
-    // committed-chain lane) refutes the IntDualyzer BV programs and leaves
-    // their SAFE twins alone. `#[ignore]`d — reads the competition corpus.
-    fn intdualyzer_probe(name: &str) -> Option<PortfolioResult> {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join(format!(
-                "benchmarks/chc/chc-comp26-benchmarks/eldarica-misc/BV/IntDualyzer/{name}.smt2"
-            ));
-        let input = std::fs::read_to_string(&path).ok()?;
-        let problem = ChcParser::parse(&input).expect("benchmark should parse");
+    fn run_bv_probe(input: &str, budget: std::time::Duration) -> Option<PortfolioResult> {
+        let problem = ChcParser::parse(input).expect("benchmark should parse");
         let adaptive = AdaptivePortfolio::new(
             problem,
-            AdaptiveConfig::test_default().with_time_budget(std::time::Duration::from_secs(30)),
+            AdaptiveConfig::test_default().with_time_budget(budget),
         );
-        let deadline = Some(ay_core::time::Instant::now() + std::time::Duration::from_secs(30));
-        Some(
-            adaptive
-                .try_bv_shallow_bmc_refutation(deadline)
-                .unwrap_or(PortfolioResult::Unknown),
-        )
+        let deadline = Some(ay_core::time::Instant::now() + budget);
+        adaptive.try_bv_shallow_bmc_refutation(deadline)
     }
 
     #[test]
-    #[ignore = "requires the non-vendored CHC-COMP-26 IntDualyzer corpus"]
-    fn bv_probe_refutes_intdualyzer_unsafe_targets() {
-        for name in ["quicksort.c-bv_000", "SOR.c-bv_000", "LU.c-bv_000"] {
-            let Some(result) = intdualyzer_probe(name) else {
-                eprintln!("SKIP {name}: corpus not present");
-                continue;
-            };
-            assert!(
-                matches!(result, PortfolioResult::Unsafe(_)),
-                "{name} (expected_verdict:false) must be a VALIDATED Unsafe, got {result:?}"
-            );
-        }
+    fn bv_probe_refutes_bounded_committed_chain() {
+        const UNSAFE_CHAIN: &str = r#"
+(set-logic HORN)
+(declare-fun P0 ((_ BitVec 8)) Bool)
+(declare-fun P1 ((_ BitVec 8)) Bool)
+(declare-fun P2 ((_ BitVec 8)) Bool)
+(assert (P0 #x00))
+(assert (forall ((x (_ BitVec 8)) (y (_ BitVec 8)))
+  (=> (and (P0 x) (= y (bvadd x #x01))) (P1 y))))
+(assert (forall ((x (_ BitVec 8)) (y (_ BitVec 8)))
+  (=> (and (P1 x) (= y (bvadd x #x01))) (P2 y))))
+(assert (forall ((x (_ BitVec 8))) (=> (and (P2 x) (= x #x02)) false)))
+(check-sat)
+"#;
+        let result = run_bv_probe(UNSAFE_CHAIN, std::time::Duration::from_secs(10));
+        assert!(
+            matches!(result, Some(PortfolioResult::Unsafe(_))),
+            "built-in committed chain must produce validated Unsafe, got {result:?}"
+        );
     }
 
     #[test]
-    #[ignore = "requires the non-vendored CHC-COMP-26 IntDualyzer corpus"]
-    fn bv_probe_leaves_intdualyzer_safe_guards_not_unsafe() {
-        for name in ["mergesort.c-bv_000", "queens.c-bv_000"] {
-            let Some(result) = intdualyzer_probe(name) else {
-                eprintln!("SKIP {name}: corpus not present");
-                continue;
-            };
-            assert!(
-                !matches!(result, PortfolioResult::Unsafe(_)),
-                "{name} (expected_verdict:true) must NOT be refuted, got {result:?}"
-            );
-        }
+    fn bv_probe_leaves_one_step_unreachable_guard_not_unsafe() {
+        const SAFE_CHAIN: &str = r#"
+(set-logic HORN)
+(declare-fun P0 ((_ BitVec 8)) Bool)
+(declare-fun P1 ((_ BitVec 8)) Bool)
+(assert (P0 #x00))
+(assert (forall ((x (_ BitVec 8)) (y (_ BitVec 8)))
+  (=> (and (P0 x) (= y (bvadd x #x01))) (P1 y))))
+(assert (forall ((x (_ BitVec 8))) (=> (and (P1 x) (= x #x02)) false)))
+(check-sat)
+"#;
+        let result = run_bv_probe(SAFE_CHAIN, std::time::Duration::from_secs(10));
+        assert!(
+            !matches!(result, Some(PortfolioResult::Unsafe(_))),
+            "one-step chain reaches only #x01, not #x02; got {result:?}"
+        );
     }
 }

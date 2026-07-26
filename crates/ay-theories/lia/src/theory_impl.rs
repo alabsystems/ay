@@ -927,6 +927,24 @@ impl TheorySolver for LiaSolver<'_> {
         self.lra.suggest_phase(atom)
     }
 
+    fn suggest_decision_atom(&self) -> Option<(TermId, bool)> {
+        // Inc2 (eager-theory-propagation design 2026-07-20 §2): delegate to
+        // the inner LRA solver's LP-model-guided decision-atom suggestion
+        // (#8445, `LraSolver::suggest_decision_atom`). LRA has implemented
+        // this since #8445 but LiaSolver never forwarded it (git-verified
+        // never-wired), so arithmetic decision hints never reached the
+        // theory-suggested-decision rank in LIA-backed extension lanes.
+        //
+        // Env-gated DEFAULT OFF (`AY_UFLIA_ARITH_DECISIONS=1`): unset keeps
+        // the historical `None` and the byte-identical trajectory. The
+        // consumer's wander suppression (extension wander latch +
+        // relevancy_should_engage) sits upstream and is unaffected.
+        if !ay_core::debug_channel::uflia_arith_decisions_enabled() {
+            return None;
+        }
+        self.lra.suggest_decision_atom()
+    }
+
     fn phase_hint_epoch(&self) -> Option<u64> {
         // `suggest_phase` above is a pure delegate to the inner LRA solver,
         // so its epoch (bumped exactly when the phase-hint cache / feasible

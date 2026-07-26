@@ -122,7 +122,7 @@ fn integer_cols(model: &Model) -> Vec<usize> {
         .collect()
 }
 
-/// A deterministic batch of `count` independent single-column node subproblems:
+/// A deterministic batch of `count` single-column node subproblems:
 /// for integer column `j` alternately pin it to its lower bound (a "down" child)
 /// and one unit above (an "up" child), clamped into the box. Each is a genuine,
 /// distinct B&B node whose relaxation bound is a pure function of the box.
@@ -357,20 +357,19 @@ fn clone_cross_thread_bounds_match_serial() {
 }
 
 // ===========================================================================
-// (a)+(b)+(c)+(d) STRESS — air05 (wide, ~7195 cols) + mas74: many independent
-//   node solves across N threads under a few workload permutations. Confirms no
-//   panic/race, asserts concurrent == serial bounds, and MEASURES per-node LP
-//   throughput and the per-clone memory cost.
+// (a)+(b)+(c)+(d) BOUNDED CHARACTERIZATION — always exercises the in-repository
+//   model. An explicit AY_MILP_PARALLEL_STRESS setting additionally includes
+//   air05 (wide, ~7195 cols) and mas74 from AY_MILP_CORPUS.
 // ===========================================================================
 #[test]
-#[ignore = "Stage-0 optional throughput/memory characterization (corpus-dependent and \
-            potentially slow under the serial search's classic-cold policy); \
-            run explicitly with `cargo test --release -p ay-milp --test parallel_ready -- \
-            --ignored --nocapture`. The always-on `clone_cross_thread_bounds_match_serial` \
-            is the permanent cold-clone guard."]
-fn stress_concurrent_air05_mas74() {
+fn bounded_parallel_throughput_and_memory_characterization() {
+    let mut workloads = vec![("parallel-smoke", 12usize)];
+    if std::env::var_os("AY_MILP_PARALLEL_STRESS").is_some() {
+        workloads.extend([("air05", 48usize), ("mas74", 96usize)]);
+    }
+
     let mut ran_any = false;
-    for (name, batch) in [("air05", 48usize), ("mas74", 96usize)] {
+    for (name, batch) in workloads {
         let Some(model) = find_model(name) else {
             continue;
         };
@@ -378,13 +377,16 @@ fn stress_concurrent_air05_mas74() {
             eprintln!("[{name}] cannot be lowered — skipping");
             continue;
         };
-        ran_any = true;
         let n = root.num_cols();
 
         // --- (d) PER-CLONE MEMORY. Deterministic structural estimate + an
         // --- empirical RSS delta from holding 8 live clones.
         let per_clone = root.approx_bytes();
-        let n_hold = 8usize;
+        let n_hold = if name == "parallel-smoke" {
+            4usize
+        } else {
+            8usize
+        };
         let rss_before = rss_kib();
         let held: Vec<NodeLpProbe> = (0..n_hold).map(|_| root.clone()).collect();
         let rss_after = rss_kib();
@@ -411,7 +413,11 @@ fn stress_concurrent_air05_mas74() {
 
         let subs = gen_subs(&model, &root, batch);
         if subs.is_empty() {
-            eprintln!("[{name}] no integer columns — skipping solve stress");
+            assert_ne!(
+                name, "parallel-smoke",
+                "the in-repository smoke model must produce integer subproblems"
+            );
+            eprintln!("[{name}] no integer columns — skipping optional solve stress");
             continue;
         }
 
@@ -437,10 +443,20 @@ fn stress_concurrent_air05_mas74() {
         // --- (c) THROUGHPUT at 4T and 8T, across a few workload permutations
         // --- ("seeds": rotations of the batch, so different nodes land on
         // --- different workers). Every run re-asserts concurrent == serial.
-        for &nt in &[4usize, 8] {
+        let worker_counts: &[usize] = if name == "parallel-smoke" {
+            &[2, 4]
+        } else {
+            &[4, 8]
+        };
+        let rotations: &[usize] = if name == "parallel-smoke" {
+            &[0, 1]
+        } else {
+            &[0, 11]
+        };
+        for &nt in worker_counts {
             let mut best_ratio = 0.0f64;
             let mut par_solves_per_s = 0.0f64;
-            for rot in [0usize, 11] {
+            for &rot in rotations {
                 let mut rotated = subs.clone();
                 let len = rotated.len().max(1);
                 rotated.rotate_left(rot % len);
@@ -482,8 +498,10 @@ fn stress_concurrent_air05_mas74() {
             base2_keys, base_keys,
             "[{name}] serial baseline is non-deterministic"
         );
+        ran_any = true;
     }
-    if !ran_any {
-        eprintln!("NOTE: neither air05 nor mas74 available; stress test skipped.");
-    }
+    assert!(
+        ran_any,
+        "the in-repository parallel smoke workload must always run"
+    );
 }

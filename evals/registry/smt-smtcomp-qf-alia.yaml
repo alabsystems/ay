@@ -1,15 +1,15 @@
 # Andrew Yates <andrewyates.name@gmail.com>
-# Eval spec for the locally provisioned SMT-LIB QF_ALIA corpus
+# Eval spec for the published SMT-COMP 2025 QF_ALIA selection
 id: smt-smtcomp-qf-alia
-version: 1
+version: 2
 description: >
-  Every QF_ALIA benchmark provisioned under benchmarks/smtcomp/QF_ALIA from the
-  SMT-LIB 2024 archive (Zenodo record 11061097). This is a potentially long
-  full-corpus AY-vs-Z3 run, not a preselected sample. QF_ALIA is quantifier-free
-  arrays plus linear integer arithmetic and internally routes to QF_AUFLIA.
+  Every QF_ALIA benchmark in the published SMT-COMP 2025 single-query selection
+  archive (Zenodo record 16887742). This is a potentially long full-selection
+  AY-vs-Z3 run. QF_ALIA is quantifier-free arrays plus linear integer arithmetic
+  and internally routes to QF_AUFLIA.
 owner: andrewyates.name@gmail.com
 inputs:
-  benchmarks_dir: benchmarks/smtcomp/QF_ALIA
+  benchmarks_dir: benchmarks/smtcomp/2025/single-query/single_query/QF_ALIA
   reference_solver: z3
   timeout_sec: 30
   runs: 1
@@ -25,9 +25,9 @@ metrics:
 outputs:
   results_dir: evals/results/smt-smtcomp-qf-alia/{run_id}
 setup:
-  download: scripts/download_smtcomp_benchmarks.sh --logic QF_ALIA
+  download: ay corpus download smtcomp-2025-single-query
   note: >
-    Run scripts/download_smtcomp_benchmarks.sh --logic QF_ALIA first to populate
-    benchmarks/smtcomp/QF_ALIA/ from the Zenodo SMT-LIB 2024 release. Record the
-    exact corpus inventory, binary provenance, timeout, and enforced resource
-    envelope with any results you cite.
+    Download the pinned SMT-COMP 2025 single-query archive, then run all QF_ALIA
+    instances selected by the organizers. Record the exact corpus inventory,
+    binary provenance, timeout, and enforced resource envelope with any results
+    you cite.

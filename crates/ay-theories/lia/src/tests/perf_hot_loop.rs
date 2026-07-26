@@ -11,9 +11,10 @@
 //! Bool control block. The hot loop measures the eager-DPLL(T) per-decision
 //! pattern: `push(); assert a few atoms; check_during_propagate(); pop();`.
 //!
-//! `#[ignore]`d: run explicitly with
-//! `cargo test -p ay-lia --release bench2_loop_a -- --ignored --nocapture`.
-//! Iteration count can be overridden via `AY_LIA_HOT_LOOP_ITERS`.
+//! The always-on test uses at least eight iterations. Developers can extend
+//! the same deterministic workload via `AY_LIA_HOT_LOOP_ITERS`; the test
+//! clamps that request to 256 iterations so ambient configuration cannot turn
+//! a normal test run into an unbounded benchmark.
 
 use super::*;
 use ay_core::time::Instant;
@@ -147,7 +148,6 @@ fn percentile_ns(sorted: &[u128], pct: f64) -> u128 {
 }
 
 #[test]
-#[ignore = "Bench 2 Loop A perf microbenchmark; run explicitly with --ignored --nocapture"]
 fn bench2_loop_a_check_during_propagate_hot_loop() {
     let shape = build_dragon_shape();
     let mut solver = LiaSolver::new(&shape.terms);
@@ -158,15 +158,23 @@ fn bench2_loop_a_check_during_propagate_hot_loop() {
     }
     // Warm up: one full BCP-time check at scope 0.
     let warm = solver.check_during_propagate();
+    assert!(
+        !matches!(
+            warm,
+            TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)
+        ),
+        "bench shape must be satisfiable during warm-up, got {warm:?}"
+    );
     eprintln!(
         "[bench2-loop-a] base atoms={} warm result={warm:?}",
         shape.base_atoms.len()
     );
 
-    let iters: usize = std::env::var("AY_LIA_HOT_LOOP_ITERS")
+    let requested_iters = std::env::var("AY_LIA_HOT_LOOP_ITERS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1000);
+        .unwrap_or(8);
+    let iters = requested_iters.clamp(8usize, 256);
 
     solver.reset_timings();
     let mut samples_ns: Vec<u128> = Vec::with_capacity(iters);
@@ -183,7 +191,7 @@ fn bench2_loop_a_check_during_propagate_hot_loop() {
         let t0 = Instant::now();
         let result = solver.check_during_propagate();
         samples_ns.push(t0.elapsed().as_nanos());
-        debug_assert!(
+        assert!(
             !matches!(
                 result,
                 TheoryResult::Unsat(_) | TheoryResult::UnsatWithFarkas(_)

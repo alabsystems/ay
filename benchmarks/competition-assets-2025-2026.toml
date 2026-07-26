@@ -1,0 +1,1462 @@
+# Fail-closed acquisition and execution coverage for the 2025/2026 campaign.
+#
+# `corpus_status = "complete-public"` means only that the selected official
+# inputs are represented by pinned entries in `corpora_manifest`. Downloaded
+# assets are not, by themselves, an executable official replay: a format
+# adapter, checker/scorer, limits, and competitor packages are separate gates.
+#
+# No run on the current host is an official-hardware-equivalent result. An
+# envelope-fitting run is "same-host calibrated" only after the same pinned
+# limits and machine controls are used for AY and the pinned competitors.
+# Underpowered runs and deterministic subsets are directional evidence and
+# must never be promoted to retroactive official scores.
+
+schema_version = 1
+catalog = "benchmarks/continuous-2025-2026.toml"
+corpora_manifest = "benchmarks/corpora.toml"
+profiles_manifest = "benchmarks/competition-run-profiles.toml"
+scope = "exactly-one-event-per-catalog-competition-edition-pair"
+
+[[event]]
+id = "archcomp-2025"
+competition = "archcomp"
+edition = 2025
+track_ids = [
+  "archcomp-2025-piecewise-constant-dynamics-bmc",
+  "archcomp-2025-linear-continuous-dynamics",
+  "archcomp-2025-nonlinear-dynamics",
+  "archcomp-2025-ainncs",
+  "archcomp-2025-stochastic-models",
+  "archcomp-2025-hybrid-systems-theorem-proving",
+  "archcomp-2025-falsification",
+]
+corpus_status = "partial-public"
+corpora = ["archcomp-repository"]
+official_machine_status = "decentralized"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-until-category-selections-materialized"
+reason = "The official repository is pinned, including exact declared exceptions for two old 2023 NNV mode-160000 entries that lack .gitmodules mappings; ARCH-COMP is decentralized and unranked, exact runnable selections and limits remain category-specific, and AY has no adapters or pinned tool runners for these formats."
+
+[[event]]
+id = "casc-2025"
+competition = "casc"
+edition = 2025
+track_ids = [
+  "casc-2025-thf",
+  "casc-2025-tfa",
+  "casc-2025-tfn",
+  "casc-2025-fof",
+  "casc-2025-epr",
+  "casc-2025-ueq",
+  "casc-2025-slh",
+  "casc-2025-icu",
+  "casc-2025-demonstration",
+]
+corpus_status = "complete-public"
+corpora = ["casc-2025-problems", "casc-2025-axioms"]
+official_machine_status = "underpowered"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-unsupported-format"
+reason = "The public CASC-30 problems and axioms are pinned, but the host has less than the official 128 GB envelope and AY has no TPTP competition adapter, scorer, or pinned competitor runners."
+
+[[event]]
+id = "chccomp-2025"
+competition = "chccomp"
+edition = 2025
+track_ids = [
+  "chccomp-2025-lia-lin",
+  "chccomp-2025-lia-nonlin",
+  "chccomp-2025-lia-lin-arrays",
+  "chccomp-2025-lia-nonlin-arrays",
+  "chccomp-2025-adt-lia",
+  "chccomp-2025-adt-lia-arrays",
+  "chccomp-2025-lra",
+  "chccomp-2025-bv",
+  "chccomp-2025-model-validation-demo",
+]
+corpus_status = "complete-public"
+corpora = ["chc-comp-2025-benchmarks", "chc-comp-2025-runner"]
+official_machine_status = "envelope-fit-not-hardware-match"
+local_run_support = "partial"
+competitor_replay_status = "partial"
+subset_policy = "deterministic-stratified-directional-only"
+reason = "The full benchmark and runner repositories are pinned and all eight scored solver-category sets have AY proxy lanes checked against Z3 on the same host. Model-validation/checker parity and pinned builds of the leading submitted solvers are not yet wired, so these are not official replays."
+
+[[event]]
+id = "coco-2025"
+competition = "coco"
+edition = 2025
+track_ids = [
+  "coco-2025-csr",
+  "coco-2025-ctrs",
+  "coco-2025-inf",
+  "coco-2025-lctrs",
+  "coco-2025-trs",
+  "coco-2025-csr-yes",
+  "coco-2025-csr-no",
+  "coco-2025-ctrs-yes",
+  "coco-2025-ctrs-no",
+  "coco-2025-inf-yes",
+  "coco-2025-inf-no",
+  "coco-2025-lctrs-yes",
+  "coco-2025-lctrs-no",
+  "coco-2025-trs-yes",
+  "coco-2025-trs-no",
+  "coco-2025-certification",
+  "coco-2025-reliability",
+]
+corpus_status = "complete-public"
+corpora = ["coco-2025-csr", "coco-2025-ctrs", "coco-2025-inf", "coco-2025-lctrs", "coco-2025-trs"]
+official_machine_status = "underpowered"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-unsupported-format"
+reason = "All five public selections are pinned, but the host is below the official 128 GB envelope and AY has no confluence formats, certification pipeline, scorer, or pinned competitor runners."
+
+[[event]]
+id = "floc-modeling-2025"
+competition = "floc-modeling"
+edition = 2025
+track_ids = ["floc-modeling-2025-contest"]
+corpus_status = "partial-public"
+corpora = ["floc-modeling-2025-samples"]
+official_machine_status = "not-uniform-runtime-event"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "acquisition-smoke-only-no-score"
+reason = "The official sample/task repository is pinned, but the LP/CP programming contest is not a uniform solver-runtime event and its complete judging environment and competitor submissions are not reproducible here."
+
+[[event]]
+id = "hwmcc-2025"
+competition = "hwmcc"
+edition = 2025
+track_ids = [
+  "hwmcc-2025-bit-level-safety",
+  "hwmcc-2025-bit-level-liveness",
+  "hwmcc-2025-word-level-bit-vector",
+  "hwmcc-2025-word-level-arrays",
+]
+corpus_status = "complete-public"
+corpora = [
+  "hwmcc-2025-wordlevel-array",
+  "hwmcc-2025-wordlevel-bv",
+  "hwmcc-2025-bitlevel-safety",
+  "hwmcc-2025-bitlevel-live",
+  "hwmcc-2025-results-wordlevel-array",
+  "hwmcc-2025-results-wordlevel-bv",
+  "hwmcc-2025-results-bitlevel-safety",
+  "hwmcc-2025-results-bitlevel-live",
+  "hwmcc-2025-results-wordlevel-array-certified",
+  "hwmcc-2025-results-wordlevel-bv-certified",
+  "hwmcc-2025-results-bitlevel-safety-certified",
+  "hwmcc-2025-results-bitlevel-live-certified",
+  "hwmcc-2025-logfiles",
+]
+official_machine_status = "underpowered"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-unsupported-format"
+reason = "The four benchmark sets, result tables, and logs are pinned, but the host cannot provide the official 120 GB per-run envelope and AY has no AIGER/BTOR model-checking replay or pinned competitor runners."
+
+[[event]]
+id = "iccma-2025"
+competition = "iccma"
+edition = 2025
+track_ids = [
+  "iccma-2025-main-dc-co",
+  "iccma-2025-main-dc-st",
+  "iccma-2025-main-dc-sst",
+  "iccma-2025-main-ds-pr",
+  "iccma-2025-main-ds-st",
+  "iccma-2025-main-ds-sst",
+  "iccma-2025-main-se-pr",
+  "iccma-2025-main-se-st",
+  "iccma-2025-main-se-sst",
+  "iccma-2025-main-se-id",
+  "iccma-2025-heuristics-dc-co",
+  "iccma-2025-heuristics-dc-st",
+  "iccma-2025-heuristics-dc-sst",
+  "iccma-2025-heuristics-dc-id",
+  "iccma-2025-heuristics-ds-pr",
+  "iccma-2025-heuristics-ds-st",
+  "iccma-2025-heuristics-ds-sst",
+  "iccma-2025-dynamic-dc-co",
+  "iccma-2025-dynamic-dc-st",
+  "iccma-2025-dynamic-ds-pr",
+  "iccma-2025-dynamic-ds-st",
+  "iccma-2025-aba-dc-co",
+  "iccma-2025-aba-dc-st",
+  "iccma-2025-aba-ds-pr",
+  "iccma-2025-aba-ds-st",
+  "iccma-2025-aba-se-pr",
+  "iccma-2025-aba-se-st",
+]
+corpus_status = "complete-public"
+corpora = ["iccma-2025-instances", "iccma-2025-results"]
+official_machine_status = "unpublished"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-unsupported-format"
+reason = "The official instances and raw results are pinned, but the official CPU/RAM configuration is unpublished and AY has no argumentation adapter, task scorer, or pinned competitor packages."
+
+[[event]]
+id = "maxsat-2025"
+competition = "maxsat"
+edition = 2025
+track_ids = ["maxsat-2025-evaluation"]
+corpus_status = "not-applicable"
+corpora = []
+official_machine_status = "not-applicable"
+local_run_support = "not-applicable"
+competitor_replay_status = "not-applicable"
+subset_policy = "not-applicable"
+reason = "The 2025 MaxSAT Evaluation was cancelled, so there is no official event corpus or score to replay."
+
+[[event]]
+id = "mcc-2025"
+competition = "mcc"
+edition = 2025
+track_ids = [
+  "mcc-2025-track-1-mc",
+  "mcc-2025-track-1-mc-ranking-b",
+  "mcc-2025-track-1-mc-ranking-c",
+  "mcc-2025-track-2-wmc",
+  "mcc-2025-track-3-pmc",
+  "mcc-2025-track-3-pmc-ranking-b",
+  "mcc-2025-track-3-pmc-ranking-c",
+  "mcc-2025-track-4-pwmc",
+  "mcc-2025-track-4-pwmc-ranking-b",
+  "mcc-2025-track-4-pwmc-ranking-c",
+  "mcc-2025-track-5b-amc",
+  "mcc-2025-track-6b-bitvector",
+]
+corpus_status = "partial-public"
+corpora = ["mcc-2025-track1-public", "mcc-2025-track3-public", "mcc-2025-track4-public", "mcc-2025-track5b-public"]
+official_machine_status = "envelope-fit-cpu-unpublished"
+local_run_support = "partial"
+competitor_replay_status = "unavailable"
+subset_policy = "official-public-subsets-directional-only"
+reason = "Only the organizers' public track subsets are pinned; all nine published 2025 ranking views are normalized, but complete result fields and precision-adjusted scores are unavailable, one catalog format is unsupported, and neither an exact official CPU identity nor pinned leading competitors is available."
+
+[[event]]
+id = "mznc-2025"
+competition = "mznc"
+edition = 2025
+track_ids = [
+  "mznc-2025-fixed",
+  "mznc-2025-free",
+  "mznc-2025-parallel",
+  "mznc-2025-open",
+  "mznc-2025-local-search",
+]
+corpus_status = "complete-public"
+corpora = ["minizinc-challenge-2025", "minizinc-challenge-2025-results"]
+official_machine_status = "mixed-envelope-fit-and-underpowered"
+local_run_support = "partial"
+competitor_replay_status = "partial"
+subset_policy = "deterministic-stratified-directional-only"
+reason = "Problems and detailed results are pinned, but AY does not cover every MiniZinc track, the 64 GiB PAR/OPEN envelope exceeds this host, and leading solver packages and official Borda replay remain incomplete."
+
+[[event]]
+id = "pbcomp-2025"
+competition = "pbcomp"
+edition = 2025
+track_ids = [
+  "pbcomp-2025-dec-lin",
+  "pbcomp-2025-opt-lin",
+  "pbcomp-2025-dec-lin-cert",
+  "pbcomp-2025-opt-lin-cert",
+  "pbcomp-2025-dec-lin-cert-including-uncertified",
+  "pbcomp-2025-opt-lin-cert-including-uncertified",
+  "pbcomp-2025-partial-lin",
+  "pbcomp-2025-soft-lin",
+  "pbcomp-2025-dec-nlc",
+  "pbcomp-2025-opt-nlc",
+  "pbcomp-2025-parametric",
+]
+corpus_status = "complete-public"
+corpora = ["pb-comp-selected-pb25", "pb-comp-normalized-pb25"]
+official_machine_status = "envelope-fit-cpu-unpublished"
+local_run_support = "partial"
+competitor_replay_status = "partial"
+subset_policy = "deterministic-stratified-directional-only"
+reason = "The selected and normalized PB25 corpora are pinned and AY supports core OPB solving, but proof-aware and optimization variants, the exact official CPU identity, official scoring replay, and pinned top competitors are not all ready."
+
+[[event]]
+id = "qbfeval-2025"
+competition = "qbfeval"
+edition = 2025
+track_ids = ["qbfeval-2025-event"]
+corpus_status = "not-applicable"
+corpora = []
+official_machine_status = "not-applicable"
+local_run_support = "not-applicable"
+competitor_replay_status = "not-applicable"
+subset_policy = "not-applicable"
+reason = "No 2025 QBF evaluation was held, so no event corpus or score exists to replay."
+
+[[event]]
+id = "satcomp-2025"
+competition = "satcomp"
+edition = 2025
+track_ids = [
+  "satcomp-2025-main",
+  "satcomp-2025-parallel",
+  "satcomp-2025-main-sat",
+  "satcomp-2025-main-unsat",
+  "satcomp-2025-parallel-sat",
+  "satcomp-2025-parallel-unsat",
+  "satcomp-2025-cloud",
+]
+corpus_status = "complete-public"
+corpora = ["satcomp-2025-main-uri-list", "satcomp-2025-main"]
+competitor_corpora = [
+  "satcomp-2025-competitor-ae-kissat-mab",
+  "satcomp-2025-competitor-kissat-public",
+  "satcomp-2025-competitor-kissat-vsa",
+]
+official_machine_status = "mixed-envelope-fit-and-underpowered"
+local_run_support = "partial"
+competitor_replay_status = "partial"
+subset_policy = "deterministic-stratified-directional-only"
+reason = "The official 400-instance selection is materializable from its pinned URI list, but parallel replay exceeds the host, no local run is a hardware match, and official scorer/checker plus pinned top-solver replay are not complete."
+
+[[event]]
+id = "smtcomp-2025"
+competition = "smtcomp"
+edition = 2025
+track_ids = [
+  "smtcomp-2025-single-query",
+  "smtcomp-2025-incremental",
+  "smtcomp-2025-unsat-core",
+  "smtcomp-2025-model-validation",
+  "smtcomp-2025-parallel",
+  "smtcomp-2025-cloud",
+  "smtcomp-2025-incremental-arith-parallel",
+  "smtcomp-2025-incremental-arith-twentyfour",
+  "smtcomp-2025-single-query-arith-sequential",
+  "smtcomp-2025-single-query-arith-parallel",
+  "smtcomp-2025-single-query-arith-sat",
+  "smtcomp-2025-single-query-arith-unsat",
+  "smtcomp-2025-single-query-arith-twentyfour",
+  "smtcomp-2025-unsat-core-arith-sequential",
+  "smtcomp-2025-unsat-core-arith-parallel",
+  "smtcomp-2025-unsat-core-arith-unsat",
+  "smtcomp-2025-unsat-core-arith-twentyfour",
+  "smtcomp-2025-incremental-bitvec-parallel",
+  "smtcomp-2025-incremental-bitvec-twentyfour",
+  "smtcomp-2025-single-query-bitvec-sequential",
+  "smtcomp-2025-single-query-bitvec-parallel",
+  "smtcomp-2025-single-query-bitvec-sat",
+  "smtcomp-2025-single-query-bitvec-unsat",
+  "smtcomp-2025-single-query-bitvec-twentyfour",
+  "smtcomp-2025-unsat-core-bitvec-sequential",
+  "smtcomp-2025-unsat-core-bitvec-parallel",
+  "smtcomp-2025-unsat-core-bitvec-unsat",
+  "smtcomp-2025-unsat-core-bitvec-twentyfour",
+  "smtcomp-2025-incremental-equality-parallel",
+  "smtcomp-2025-incremental-equality-twentyfour",
+  "smtcomp-2025-single-query-equality-sequential",
+  "smtcomp-2025-single-query-equality-parallel",
+  "smtcomp-2025-single-query-equality-sat",
+  "smtcomp-2025-single-query-equality-unsat",
+  "smtcomp-2025-single-query-equality-twentyfour",
+  "smtcomp-2025-unsat-core-equality-sequential",
+  "smtcomp-2025-unsat-core-equality-parallel",
+  "smtcomp-2025-unsat-core-equality-unsat",
+  "smtcomp-2025-unsat-core-equality-twentyfour",
+  "smtcomp-2025-incremental-equality-lineararith-parallel",
+  "smtcomp-2025-incremental-equality-lineararith-twentyfour",
+  "smtcomp-2025-single-query-equality-lineararith-sequential",
+  "smtcomp-2025-single-query-equality-lineararith-parallel",
+  "smtcomp-2025-single-query-equality-lineararith-sat",
+  "smtcomp-2025-single-query-equality-lineararith-unsat",
+  "smtcomp-2025-single-query-equality-lineararith-twentyfour",
+  "smtcomp-2025-unsat-core-equality-lineararith-sequential",
+  "smtcomp-2025-unsat-core-equality-lineararith-parallel",
+  "smtcomp-2025-unsat-core-equality-lineararith-unsat",
+  "smtcomp-2025-unsat-core-equality-lineararith-twentyfour",
+  "smtcomp-2025-incremental-equality-machinearith-parallel",
+  "smtcomp-2025-incremental-equality-machinearith-twentyfour",
+  "smtcomp-2025-single-query-equality-machinearith-sequential",
+  "smtcomp-2025-single-query-equality-machinearith-parallel",
+  "smtcomp-2025-single-query-equality-machinearith-sat",
+  "smtcomp-2025-single-query-equality-machinearith-unsat",
+  "smtcomp-2025-single-query-equality-machinearith-twentyfour",
+  "smtcomp-2025-unsat-core-equality-machinearith-sequential",
+  "smtcomp-2025-unsat-core-equality-machinearith-parallel",
+  "smtcomp-2025-unsat-core-equality-machinearith-unsat",
+  "smtcomp-2025-unsat-core-equality-machinearith-twentyfour",
+  "smtcomp-2025-incremental-equality-nonlineararith-parallel",
+  "smtcomp-2025-incremental-equality-nonlineararith-twentyfour",
+  "smtcomp-2025-single-query-equality-nonlineararith-sequential",
+  "smtcomp-2025-single-query-equality-nonlineararith-parallel",
+  "smtcomp-2025-single-query-equality-nonlineararith-sat",
+  "smtcomp-2025-single-query-equality-nonlineararith-unsat",
+  "smtcomp-2025-single-query-equality-nonlineararith-twentyfour",
+  "smtcomp-2025-unsat-core-equality-nonlineararith-sequential",
+  "smtcomp-2025-unsat-core-equality-nonlineararith-parallel",
+  "smtcomp-2025-unsat-core-equality-nonlineararith-unsat",
+  "smtcomp-2025-unsat-core-equality-nonlineararith-twentyfour",
+  "smtcomp-2025-incremental-fparith-parallel",
+  "smtcomp-2025-incremental-fparith-twentyfour",
+  "smtcomp-2025-single-query-fparith-sequential",
+  "smtcomp-2025-single-query-fparith-parallel",
+  "smtcomp-2025-single-query-fparith-sat",
+  "smtcomp-2025-single-query-fparith-unsat",
+  "smtcomp-2025-single-query-fparith-twentyfour",
+  "smtcomp-2025-unsat-core-fparith-sequential",
+  "smtcomp-2025-unsat-core-fparith-parallel",
+  "smtcomp-2025-unsat-core-fparith-unsat",
+  "smtcomp-2025-unsat-core-fparith-twentyfour",
+  "smtcomp-2025-model-validation-qf-adt-bitvec-sequential",
+  "smtcomp-2025-model-validation-qf-adt-bitvec-parallel",
+  "smtcomp-2025-model-validation-qf-adt-bitvec-sat",
+  "smtcomp-2025-model-validation-qf-adt-bitvec-twentyfour",
+  "smtcomp-2025-model-validation-qf-adt-linarith-sequential",
+  "smtcomp-2025-model-validation-qf-adt-linarith-parallel",
+  "smtcomp-2025-model-validation-qf-adt-linarith-sat",
+  "smtcomp-2025-model-validation-qf-adt-linarith-twentyfour",
+  "smtcomp-2025-incremental-qf-bitvec-parallel",
+  "smtcomp-2025-incremental-qf-bitvec-twentyfour",
+  "smtcomp-2025-model-validation-qf-bitvec-sequential",
+  "smtcomp-2025-model-validation-qf-bitvec-parallel",
+  "smtcomp-2025-model-validation-qf-bitvec-sat",
+  "smtcomp-2025-model-validation-qf-bitvec-twentyfour",
+  "smtcomp-2025-parallel-qf-bitvec-parallel",
+  "smtcomp-2025-parallel-qf-bitvec-sat",
+  "smtcomp-2025-parallel-qf-bitvec-unsat",
+  "smtcomp-2025-parallel-qf-bitvec-twentyfour",
+  "smtcomp-2025-single-query-qf-bitvec-sequential",
+  "smtcomp-2025-single-query-qf-bitvec-parallel",
+  "smtcomp-2025-single-query-qf-bitvec-sat",
+  "smtcomp-2025-single-query-qf-bitvec-unsat",
+  "smtcomp-2025-single-query-qf-bitvec-twentyfour",
+  "smtcomp-2025-unsat-core-qf-bitvec-sequential",
+  "smtcomp-2025-unsat-core-qf-bitvec-parallel",
+  "smtcomp-2025-unsat-core-qf-bitvec-unsat",
+  "smtcomp-2025-unsat-core-qf-bitvec-twentyfour",
+  "smtcomp-2025-model-validation-qf-datatypes-sequential",
+  "smtcomp-2025-model-validation-qf-datatypes-parallel",
+  "smtcomp-2025-model-validation-qf-datatypes-sat",
+  "smtcomp-2025-model-validation-qf-datatypes-twentyfour",
+  "smtcomp-2025-single-query-qf-datatypes-sequential",
+  "smtcomp-2025-single-query-qf-datatypes-parallel",
+  "smtcomp-2025-single-query-qf-datatypes-sat",
+  "smtcomp-2025-single-query-qf-datatypes-unsat",
+  "smtcomp-2025-single-query-qf-datatypes-twentyfour",
+  "smtcomp-2025-unsat-core-qf-datatypes-sequential",
+  "smtcomp-2025-unsat-core-qf-datatypes-parallel",
+  "smtcomp-2025-unsat-core-qf-datatypes-unsat",
+  "smtcomp-2025-unsat-core-qf-datatypes-twentyfour",
+  "smtcomp-2025-incremental-qf-equality-parallel",
+  "smtcomp-2025-incremental-qf-equality-twentyfour",
+  "smtcomp-2025-model-validation-qf-equality-sequential",
+  "smtcomp-2025-model-validation-qf-equality-parallel",
+  "smtcomp-2025-model-validation-qf-equality-sat",
+  "smtcomp-2025-model-validation-qf-equality-twentyfour",
+  "smtcomp-2025-single-query-qf-equality-sequential",
+  "smtcomp-2025-single-query-qf-equality-parallel",
+  "smtcomp-2025-single-query-qf-equality-sat",
+  "smtcomp-2025-single-query-qf-equality-unsat",
+  "smtcomp-2025-single-query-qf-equality-twentyfour",
+  "smtcomp-2025-unsat-core-qf-equality-sequential",
+  "smtcomp-2025-unsat-core-qf-equality-parallel",
+  "smtcomp-2025-unsat-core-qf-equality-unsat",
+  "smtcomp-2025-unsat-core-qf-equality-twentyfour",
+  "smtcomp-2025-incremental-qf-equality-bitvec-parallel",
+  "smtcomp-2025-incremental-qf-equality-bitvec-twentyfour",
+  "smtcomp-2025-model-validation-qf-equality-bitvec-sequential",
+  "smtcomp-2025-model-validation-qf-equality-bitvec-parallel",
+  "smtcomp-2025-model-validation-qf-equality-bitvec-sat",
+  "smtcomp-2025-model-validation-qf-equality-bitvec-twentyfour",
+  "smtcomp-2025-parallel-qf-equality-bitvec-parallel",
+  "smtcomp-2025-parallel-qf-equality-bitvec-sat",
+  "smtcomp-2025-parallel-qf-equality-bitvec-unsat",
+  "smtcomp-2025-parallel-qf-equality-bitvec-twentyfour",
+  "smtcomp-2025-single-query-qf-equality-bitvec-sequential",
+  "smtcomp-2025-single-query-qf-equality-bitvec-parallel",
+  "smtcomp-2025-single-query-qf-equality-bitvec-sat",
+  "smtcomp-2025-single-query-qf-equality-bitvec-unsat",
+  "smtcomp-2025-single-query-qf-equality-bitvec-twentyfour",
+  "smtcomp-2025-unsat-core-qf-equality-bitvec-sequential",
+  "smtcomp-2025-unsat-core-qf-equality-bitvec-parallel",
+  "smtcomp-2025-unsat-core-qf-equality-bitvec-unsat",
+  "smtcomp-2025-unsat-core-qf-equality-bitvec-twentyfour",
+  "smtcomp-2025-incremental-qf-equality-bitvec-arith-parallel",
+  "smtcomp-2025-incremental-qf-equality-bitvec-arith-twentyfour",
+  "smtcomp-2025-incremental-qf-equality-lineararith-parallel",
+  "smtcomp-2025-incremental-qf-equality-lineararith-twentyfour",
+  "smtcomp-2025-model-validation-qf-equality-lineararith-sequential",
+  "smtcomp-2025-model-validation-qf-equality-lineararith-parallel",
+  "smtcomp-2025-model-validation-qf-equality-lineararith-sat",
+  "smtcomp-2025-model-validation-qf-equality-lineararith-twentyfour",
+  "smtcomp-2025-parallel-qf-equality-lineararith-parallel",
+  "smtcomp-2025-parallel-qf-equality-lineararith-sat",
+  "smtcomp-2025-parallel-qf-equality-lineararith-unsat",
+  "smtcomp-2025-parallel-qf-equality-lineararith-twentyfour",
+  "smtcomp-2025-single-query-qf-equality-lineararith-sequential",
+  "smtcomp-2025-single-query-qf-equality-lineararith-parallel",
+  "smtcomp-2025-single-query-qf-equality-lineararith-sat",
+  "smtcomp-2025-single-query-qf-equality-lineararith-unsat",
+  "smtcomp-2025-single-query-qf-equality-lineararith-twentyfour",
+  "smtcomp-2025-unsat-core-qf-equality-lineararith-sequential",
+  "smtcomp-2025-unsat-core-qf-equality-lineararith-parallel",
+  "smtcomp-2025-unsat-core-qf-equality-lineararith-unsat",
+  "smtcomp-2025-unsat-core-qf-equality-lineararith-twentyfour",
+  "smtcomp-2025-incremental-qf-equality-nonlineararith-parallel",
+  "smtcomp-2025-incremental-qf-equality-nonlineararith-twentyfour",
+  "smtcomp-2025-model-validation-qf-equality-nonlineararith-sequential",
+  "smtcomp-2025-model-validation-qf-equality-nonlineararith-parallel",
+  "smtcomp-2025-model-validation-qf-equality-nonlineararith-sat",
+  "smtcomp-2025-model-validation-qf-equality-nonlineararith-twentyfour",
+  "smtcomp-2025-single-query-qf-equality-nonlineararith-sequential",
+  "smtcomp-2025-single-query-qf-equality-nonlineararith-parallel",
+  "smtcomp-2025-single-query-qf-equality-nonlineararith-sat",
+  "smtcomp-2025-single-query-qf-equality-nonlineararith-unsat",
+  "smtcomp-2025-single-query-qf-equality-nonlineararith-twentyfour",
+  "smtcomp-2025-unsat-core-qf-equality-nonlineararith-sequential",
+  "smtcomp-2025-unsat-core-qf-equality-nonlineararith-parallel",
+  "smtcomp-2025-unsat-core-qf-equality-nonlineararith-unsat",
+  "smtcomp-2025-unsat-core-qf-equality-nonlineararith-twentyfour",
+  "smtcomp-2025-incremental-qf-fparith-parallel",
+  "smtcomp-2025-incremental-qf-fparith-twentyfour",
+  "smtcomp-2025-model-validation-qf-fparith-sequential",
+  "smtcomp-2025-model-validation-qf-fparith-parallel",
+  "smtcomp-2025-model-validation-qf-fparith-sat",
+  "smtcomp-2025-model-validation-qf-fparith-twentyfour",
+  "smtcomp-2025-single-query-qf-fparith-sequential",
+  "smtcomp-2025-single-query-qf-fparith-parallel",
+  "smtcomp-2025-single-query-qf-fparith-sat",
+  "smtcomp-2025-single-query-qf-fparith-unsat",
+  "smtcomp-2025-single-query-qf-fparith-twentyfour",
+  "smtcomp-2025-unsat-core-qf-fparith-sequential",
+  "smtcomp-2025-unsat-core-qf-fparith-parallel",
+  "smtcomp-2025-unsat-core-qf-fparith-unsat",
+  "smtcomp-2025-unsat-core-qf-fparith-twentyfour",
+  "smtcomp-2025-incremental-qf-linearintarith-parallel",
+  "smtcomp-2025-incremental-qf-linearintarith-twentyfour",
+  "smtcomp-2025-model-validation-qf-linearintarith-sequential",
+  "smtcomp-2025-model-validation-qf-linearintarith-parallel",
+  "smtcomp-2025-model-validation-qf-linearintarith-sat",
+  "smtcomp-2025-model-validation-qf-linearintarith-twentyfour",
+  "smtcomp-2025-parallel-qf-linearintarith-parallel",
+  "smtcomp-2025-parallel-qf-linearintarith-sat",
+  "smtcomp-2025-parallel-qf-linearintarith-unsat",
+  "smtcomp-2025-parallel-qf-linearintarith-twentyfour",
+  "smtcomp-2025-single-query-qf-linearintarith-sequential",
+  "smtcomp-2025-single-query-qf-linearintarith-parallel",
+  "smtcomp-2025-single-query-qf-linearintarith-sat",
+  "smtcomp-2025-single-query-qf-linearintarith-unsat",
+  "smtcomp-2025-single-query-qf-linearintarith-twentyfour",
+  "smtcomp-2025-unsat-core-qf-linearintarith-sequential",
+  "smtcomp-2025-unsat-core-qf-linearintarith-parallel",
+  "smtcomp-2025-unsat-core-qf-linearintarith-unsat",
+  "smtcomp-2025-unsat-core-qf-linearintarith-twentyfour",
+  "smtcomp-2025-incremental-qf-linearrealarith-parallel",
+  "smtcomp-2025-model-validation-qf-linearrealarith-sequential",
+  "smtcomp-2025-model-validation-qf-linearrealarith-parallel",
+  "smtcomp-2025-model-validation-qf-linearrealarith-sat",
+  "smtcomp-2025-model-validation-qf-linearrealarith-twentyfour",
+  "smtcomp-2025-parallel-qf-linearrealarith-parallel",
+  "smtcomp-2025-parallel-qf-linearrealarith-sat",
+  "smtcomp-2025-parallel-qf-linearrealarith-unsat",
+  "smtcomp-2025-parallel-qf-linearrealarith-twentyfour",
+  "smtcomp-2025-single-query-qf-linearrealarith-sequential",
+  "smtcomp-2025-single-query-qf-linearrealarith-parallel",
+  "smtcomp-2025-single-query-qf-linearrealarith-sat",
+  "smtcomp-2025-single-query-qf-linearrealarith-unsat",
+  "smtcomp-2025-single-query-qf-linearrealarith-twentyfour",
+  "smtcomp-2025-unsat-core-qf-linearrealarith-sequential",
+  "smtcomp-2025-unsat-core-qf-linearrealarith-parallel",
+  "smtcomp-2025-unsat-core-qf-linearrealarith-unsat",
+  "smtcomp-2025-unsat-core-qf-linearrealarith-twentyfour",
+  "smtcomp-2025-incremental-qf-nonlinearintarith-parallel",
+  "smtcomp-2025-incremental-qf-nonlinearintarith-twentyfour",
+  "smtcomp-2025-model-validation-qf-nonlinearintarith-sequential",
+  "smtcomp-2025-model-validation-qf-nonlinearintarith-parallel",
+  "smtcomp-2025-model-validation-qf-nonlinearintarith-sat",
+  "smtcomp-2025-model-validation-qf-nonlinearintarith-twentyfour",
+  "smtcomp-2025-parallel-qf-nonlinearintarith-parallel",
+  "smtcomp-2025-parallel-qf-nonlinearintarith-sat",
+  "smtcomp-2025-parallel-qf-nonlinearintarith-unsat",
+  "smtcomp-2025-parallel-qf-nonlinearintarith-twentyfour",
+  "smtcomp-2025-single-query-qf-nonlinearintarith-sequential",
+  "smtcomp-2025-single-query-qf-nonlinearintarith-parallel",
+  "smtcomp-2025-single-query-qf-nonlinearintarith-sat",
+  "smtcomp-2025-single-query-qf-nonlinearintarith-unsat",
+  "smtcomp-2025-single-query-qf-nonlinearintarith-twentyfour",
+  "smtcomp-2025-unsat-core-qf-nonlinearintarith-sequential",
+  "smtcomp-2025-unsat-core-qf-nonlinearintarith-parallel",
+  "smtcomp-2025-unsat-core-qf-nonlinearintarith-unsat",
+  "smtcomp-2025-unsat-core-qf-nonlinearintarith-twentyfour",
+  "smtcomp-2025-model-validation-qf-nonlinearrealarith-sequential",
+  "smtcomp-2025-model-validation-qf-nonlinearrealarith-parallel",
+  "smtcomp-2025-model-validation-qf-nonlinearrealarith-sat",
+  "smtcomp-2025-model-validation-qf-nonlinearrealarith-twentyfour",
+  "smtcomp-2025-parallel-qf-nonlinearrealarith-parallel",
+  "smtcomp-2025-parallel-qf-nonlinearrealarith-sat",
+  "smtcomp-2025-parallel-qf-nonlinearrealarith-unsat",
+  "smtcomp-2025-parallel-qf-nonlinearrealarith-twentyfour",
+  "smtcomp-2025-single-query-qf-nonlinearrealarith-sequential",
+  "smtcomp-2025-single-query-qf-nonlinearrealarith-parallel",
+  "smtcomp-2025-single-query-qf-nonlinearrealarith-sat",
+  "smtcomp-2025-single-query-qf-nonlinearrealarith-unsat",
+  "smtcomp-2025-single-query-qf-nonlinearrealarith-twentyfour",
+  "smtcomp-2025-unsat-core-qf-nonlinearrealarith-sequential",
+  "smtcomp-2025-unsat-core-qf-nonlinearrealarith-parallel",
+  "smtcomp-2025-unsat-core-qf-nonlinearrealarith-unsat",
+  "smtcomp-2025-unsat-core-qf-nonlinearrealarith-twentyfour",
+  "smtcomp-2025-single-query-qf-strings-sequential",
+  "smtcomp-2025-single-query-qf-strings-parallel",
+  "smtcomp-2025-single-query-qf-strings-sat",
+  "smtcomp-2025-single-query-qf-strings-unsat",
+  "smtcomp-2025-single-query-qf-strings-twentyfour",
+  "smtcomp-2025-incremental-best-overall-parallel",
+  "smtcomp-2025-incremental-best-overall-twentyfour",
+  "smtcomp-2025-model-validation-best-overall-sequential",
+  "smtcomp-2025-model-validation-best-overall-parallel",
+  "smtcomp-2025-model-validation-best-overall-sat",
+  "smtcomp-2025-model-validation-best-overall-twentyfour",
+  "smtcomp-2025-parallel-best-overall-parallel",
+  "smtcomp-2025-parallel-best-overall-sat",
+  "smtcomp-2025-parallel-best-overall-unsat",
+  "smtcomp-2025-parallel-best-overall-twentyfour",
+  "smtcomp-2025-single-query-best-overall-sequential",
+  "smtcomp-2025-single-query-best-overall-parallel",
+  "smtcomp-2025-single-query-best-overall-sat",
+  "smtcomp-2025-single-query-best-overall-unsat",
+  "smtcomp-2025-single-query-best-overall-twentyfour",
+  "smtcomp-2025-unsat-core-best-overall-sequential",
+  "smtcomp-2025-unsat-core-best-overall-parallel",
+  "smtcomp-2025-unsat-core-best-overall-unsat",
+  "smtcomp-2025-unsat-core-best-overall-twentyfour",
+  "smtcomp-2025-incremental-largest-contribution-parallel",
+  "smtcomp-2025-incremental-largest-contribution-twentyfour",
+  "smtcomp-2025-model-validation-largest-contribution-sequential",
+  "smtcomp-2025-model-validation-largest-contribution-parallel",
+  "smtcomp-2025-model-validation-largest-contribution-sat",
+  "smtcomp-2025-model-validation-largest-contribution-twentyfour",
+  "smtcomp-2025-parallel-largest-contribution-parallel",
+  "smtcomp-2025-parallel-largest-contribution-sat",
+  "smtcomp-2025-parallel-largest-contribution-unsat",
+  "smtcomp-2025-parallel-largest-contribution-twentyfour",
+  "smtcomp-2025-single-query-largest-contribution-sequential",
+  "smtcomp-2025-single-query-largest-contribution-parallel",
+  "smtcomp-2025-single-query-largest-contribution-sat",
+  "smtcomp-2025-single-query-largest-contribution-unsat",
+  "smtcomp-2025-single-query-largest-contribution-twentyfour",
+  "smtcomp-2025-unsat-core-largest-contribution-sequential",
+  "smtcomp-2025-unsat-core-largest-contribution-parallel",
+  "smtcomp-2025-unsat-core-largest-contribution-unsat",
+  "smtcomp-2025-unsat-core-largest-contribution-twentyfour",
+  "smtcomp-2025-incremental-biggest-lead-parallel",
+  "smtcomp-2025-incremental-biggest-lead-twentyfour",
+  "smtcomp-2025-model-validation-biggest-lead-sequential",
+  "smtcomp-2025-model-validation-biggest-lead-parallel",
+  "smtcomp-2025-model-validation-biggest-lead-sat",
+  "smtcomp-2025-model-validation-biggest-lead-twentyfour",
+  "smtcomp-2025-parallel-biggest-lead-parallel",
+  "smtcomp-2025-parallel-biggest-lead-sat",
+  "smtcomp-2025-parallel-biggest-lead-unsat",
+  "smtcomp-2025-parallel-biggest-lead-twentyfour",
+  "smtcomp-2025-single-query-biggest-lead-sequential",
+  "smtcomp-2025-single-query-biggest-lead-parallel",
+  "smtcomp-2025-single-query-biggest-lead-sat",
+  "smtcomp-2025-single-query-biggest-lead-unsat",
+  "smtcomp-2025-single-query-biggest-lead-twentyfour",
+  "smtcomp-2025-unsat-core-biggest-lead-sequential",
+  "smtcomp-2025-unsat-core-biggest-lead-parallel",
+  "smtcomp-2025-unsat-core-biggest-lead-unsat",
+  "smtcomp-2025-unsat-core-biggest-lead-twentyfour",
+]
+corpus_status = "complete-public"
+corpora = [
+  "smtcomp-2025-single-query",
+  "smtcomp-2025-incremental",
+  "smtcomp-2025-model-validation",
+  "smtcomp-2025-unsat-core",
+  "smtcomp-2025-parallel",
+  "smtcomp-2025-selection",
+  "smtcomp-2025-results-single-query",
+  "smtcomp-2025-results-incremental",
+  "smtcomp-2025-results-model-validation",
+  "smtcomp-2025-results-unsat-core",
+  "smtcomp-2025-results-parallel",
+]
+official_machine_status = "mixed-envelope-fit-and-underpowered"
+local_run_support = "partial"
+competitor_replay_status = "partial"
+subset_policy = "deterministic-stratified-directional-only"
+reason = "Official inputs, selection, and result artifacts are pinned, but AY supports only part of SMT-LIB, the parallel envelope exceeds this host, and complete checker/scorer plus pinned top-solver replay are not wired."
+
+[[event]]
+id = "svcomp-2025"
+competition = "svcomp"
+edition = 2025
+track_ids = [
+  "svcomp-2025-verification-reach-safety",
+  "svcomp-2025-verification-mem-safety",
+  "svcomp-2025-verification-concurrency-safety",
+  "svcomp-2025-verification-no-overflows",
+  "svcomp-2025-verification-termination",
+  "svcomp-2025-verification-software-systems",
+  "svcomp-2025-verification-falsification-overall",
+  "svcomp-2025-verification-overall",
+  "svcomp-2025-verification-java-overall",
+  "svcomp-2025-validation-correctness-v2-reach-safety",
+  "svcomp-2025-validation-correctness-v2-no-overflows",
+  "svcomp-2025-validation-correctness-v2-software-systems",
+  "svcomp-2025-validation-correctness-v2-validation-crafted",
+  "svcomp-2025-validation-correctness-v2-overall",
+  "svcomp-2025-validation-violation-v2-reach-safety",
+  "svcomp-2025-validation-violation-v2-mem-safety",
+  "svcomp-2025-validation-violation-v2-no-overflows",
+  "svcomp-2025-validation-violation-v2-software-systems",
+  "svcomp-2025-validation-violation-v2-validation-crafted",
+  "svcomp-2025-validation-violation-v2-overall",
+  "svcomp-2025-validation-correctness-v1-reach-safety",
+  "svcomp-2025-validation-correctness-v1-no-overflows",
+  "svcomp-2025-validation-correctness-v1-software-systems",
+  "svcomp-2025-validation-correctness-v1-overall",
+  "svcomp-2025-validation-violation-v1-reach-safety",
+  "svcomp-2025-validation-violation-v1-mem-safety",
+  "svcomp-2025-validation-violation-v1-concurrency-safety",
+  "svcomp-2025-validation-violation-v1-no-overflows",
+  "svcomp-2025-validation-violation-v1-termination",
+  "svcomp-2025-validation-violation-v1-software-systems",
+  "svcomp-2025-category-score-reachsafety-arrays",
+  "svcomp-2025-category-score-reachsafety-bitvectors",
+  "svcomp-2025-category-score-reachsafety-controlflow",
+  "svcomp-2025-category-score-reachsafety-eca",
+  "svcomp-2025-category-score-reachsafety-floats",
+  "svcomp-2025-category-score-reachsafety-heap",
+  "svcomp-2025-category-score-reachsafety-loops",
+  "svcomp-2025-category-score-reachsafety-productlines",
+  "svcomp-2025-category-score-reachsafety-recursive",
+  "svcomp-2025-category-score-reachsafety-sequentialized",
+  "svcomp-2025-category-score-reachsafety-xcsp",
+  "svcomp-2025-category-score-reachsafety-combinations",
+  "svcomp-2025-category-score-reachsafety-hardware",
+  "svcomp-2025-category-score-reachsafety-hardness",
+  "svcomp-2025-category-score-reachsafety-fuzzle",
+  "svcomp-2025-category-score-memsafety-arrays",
+  "svcomp-2025-category-score-memsafety-heap",
+  "svcomp-2025-category-score-memsafety-linkedlists",
+  "svcomp-2025-category-score-memsafety-other",
+  "svcomp-2025-category-score-memsafety-juliet",
+  "svcomp-2025-category-score-memsafety-memcleanup",
+  "svcomp-2025-category-score-concurrencysafety-main",
+  "svcomp-2025-category-score-concurrencysafety-memsafety",
+  "svcomp-2025-category-score-concurrencysafety-nooverflows",
+  "svcomp-2025-category-score-nodatarace-main",
+  "svcomp-2025-category-score-nooverflows-main",
+  "svcomp-2025-category-score-nooverflows-juliet",
+  "svcomp-2025-category-score-termination-bitvectors",
+  "svcomp-2025-category-score-termination-maincontrolflow",
+  "svcomp-2025-category-score-termination-mainheap",
+  "svcomp-2025-category-score-termination-other",
+  "svcomp-2025-category-score-softwaresystems-aws-c-common-reachsafety",
+  "svcomp-2025-category-score-softwaresystems-coreutils-memsafety",
+  "svcomp-2025-category-score-softwaresystems-coreutils-nooverflows",
+  "svcomp-2025-category-score-softwaresystems-busybox-nooverflows",
+  "svcomp-2025-category-score-softwaresystems-devicedriverslinux64-reachsafety",
+  "svcomp-2025-category-score-softwaresystems-devicedriverslinux64large-reachsafety",
+  "svcomp-2025-category-score-softwaresystems-devicedriverslinux64-memsafety",
+  "svcomp-2025-category-score-softwaresystems-intel-tdx-module-reachsafety",
+  "svcomp-2025-category-score-softwaresystems-other-reachsafety",
+  "svcomp-2025-category-score-softwaresystems-other-memsafety",
+  "svcomp-2025-category-score-softwaresystems-uthash-reachsafety",
+  "svcomp-2025-category-score-softwaresystems-uthash-memsafety",
+  "svcomp-2025-category-score-softwaresystems-uthash-nooverflows",
+  "svcomp-2025-category-score-softwaresystems-uthash-memcleanup",
+  "svcomp-2025-category-score-softwaresystems-devicedriverslinux64-termination",
+  "svcomp-2025-category-score-reachsafety-java",
+  "svcomp-2025-category-score-runtimeexception-java",
+]
+corpus_status = "complete-public"
+corpora = ["svcomp-2025-benchmarks", "svcomp-2025-definitions", "svcomp-2025-witnesses", "svcomp-2025-results-full"]
+official_machine_status = "envelope-fit-not-hardware-match"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-unsupported-format"
+reason = "Edition-pinned tasks, definitions, witnesses, and full results are represented, with the very large evidence archives kept outside the default refresh; AY still has no SV-COMP program-analysis, witness-validation, scoring, or competitor replay."
+
+[[event]]
+id = "syntcomp-2025"
+competition = "syntcomp"
+edition = 2025
+track_ids = [
+  "syntcomp-2025-parity-realizability",
+  "syntcomp-2025-ltl-realizability",
+  "syntcomp-2025-ltl-synthesis-coverage",
+  "syntcomp-2025-ltl-synthesis-quality",
+  "syntcomp-2025-ltlf-realizability",
+]
+corpus_status = "complete-public"
+corpora = ["syntcomp-2025-ltl", "syntcomp-2025-ltlf", "syntcomp-2025-parity", "syntcomp-2025-results-final"]
+official_machine_status = "unpublished"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-unsupported-format"
+reason = "The three official selections and final result archive are pinned, but machine limits are not fully published and AY has no synthesis adapters, validation/scoring pipeline, or pinned competitor runners."
+
+[[event]]
+id = "termcomp-2025"
+competition = "termcomp"
+edition = 2025
+track_ids = [
+  "termcomp-2025-trs-standard",
+  "termcomp-2025-srs-standard",
+  "termcomp-2025-trs-relative",
+  "termcomp-2025-srs-relative",
+  "termcomp-2025-trs-equational",
+  "termcomp-2025-trs-conditional-operational",
+  "termcomp-2025-trs-conditional",
+  "termcomp-2025-trs-context-sensitive",
+  "termcomp-2025-trs-innermost",
+  "termcomp-2025-trs-outermost",
+  "termcomp-2025-integer-trs-innermost",
+  "termcomp-2025-hrs-union-beta",
+  "termcomp-2025-ptrs-standard",
+  "termcomp-2025-ptrs-innermost",
+  "termcomp-2025-c",
+  "termcomp-2025-integer-transition-systems",
+  "termcomp-2025-java-bytecode",
+  "termcomp-2025-java-bytecode-recursive",
+  "termcomp-2025-logic-programming",
+  "termcomp-2025-logic-programming-cut",
+  "termcomp-2025-prolog",
+  "termcomp-2025-complexity-c",
+  "termcomp-2025-complexity-its",
+]
+corpus_status = "partial-public"
+corpora = ["termcomp-tpdb-11-5", "termcomp-runner-config", "termcomp-results"]
+official_machine_status = "envelope-fit-cpu-unpublished"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-until-edition-selection-materialized"
+reason = "TPDB 11.5, runner configuration, and the results site are pinned, but an immutable per-category 2025 selected-instance manifest is not yet materialized, the official CPU is unknown, and AY has no termination adapter, certifier/scorer, or competitor packages."
+
+[[event]]
+id = "testcomp-2025"
+competition = "testcomp"
+edition = 2025
+track_ids = [
+  "testcomp-2025-cover-error",
+  "testcomp-2025-cover-branches",
+  "testcomp-2025-overall",
+]
+corpus_status = "complete-public"
+corpora = ["testcomp-2025-benchmarks", "testcomp-2025-definitions", "testcomp-2025-results-full"]
+official_machine_status = "envelope-fit-not-hardware-match"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-unsupported-format"
+reason = "Edition-pinned tasks, definitions, and full results are represented, with the large result archive outside the default refresh; the host is not the official machine and AY has no test-generation adapter, validator, scorer, or competitor replay."
+
+[[event]]
+id = "vnncomp-2025"
+competition = "vnncomp"
+edition = 2025
+track_ids = [
+  "vnncomp-2025-regular",
+  "vnncomp-2025-extended",
+  "vnncomp-2025-regular-acasxu-2023",
+  "vnncomp-2025-regular-cersyve",
+  "vnncomp-2025-regular-cgan-2023",
+  "vnncomp-2025-regular-cifar100-2024",
+  "vnncomp-2025-regular-collins-rul-cnn-2022",
+  "vnncomp-2025-regular-cora-2024",
+  "vnncomp-2025-regular-dist-shift-2023",
+  "vnncomp-2025-regular-linearizenn-2024",
+  "vnncomp-2025-regular-malbeware",
+  "vnncomp-2025-regular-metaroom-2023",
+  "vnncomp-2025-regular-nn4sys",
+  "vnncomp-2025-regular-safenlp-2024",
+  "vnncomp-2025-regular-sat-relu",
+  "vnncomp-2025-regular-soundnessbench",
+  "vnncomp-2025-regular-tinyimagenet-2024",
+  "vnncomp-2025-regular-tllverifybench-2023",
+  "vnncomp-2025-extended-cctsdb-yolo-2023",
+  "vnncomp-2025-extended-collins-aerospace-benchmark",
+  "vnncomp-2025-extended-lsnc-relu",
+  "vnncomp-2025-extended-ml4acopf-2024",
+  "vnncomp-2025-extended-relusplitter",
+  "vnncomp-2025-extended-traffic-signs-recognition-2023",
+  "vnncomp-2025-extended-vggnet16-2022",
+  "vnncomp-2025-extended-vit-2023",
+  "vnncomp-2025-extended-yolo-2023",
+]
+corpus_status = "complete-public"
+corpora = ["vnncomp-2025-benchmarks", "vnncomp-2025-results"]
+official_machine_status = "underpowered"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-unsupported-format"
+reason = "The official benchmark and result repositories are pinned, and the crosswalk covers both overall views plus all 25 published category rank tables. The category tables are result surfaces, not claims of separate medals. The host lacks the official CPU/GPU envelopes and AY has no neural-network verification adapter, scoring integration, or competitor runners."
+
+[[event]]
+id = "xcsp3-2025"
+competition = "xcsp3"
+edition = 2025
+track_ids = [
+  "xcsp3-2025-main-csp",
+  "xcsp3-2025-main-cop",
+  "xcsp3-2025-fast-cop",
+  "xcsp3-2025-parallel-cop",
+  "xcsp3-2025-mini-csp",
+  "xcsp3-2025-mini-cop",
+  "xcsp3-2025-main-cop-without-optimality-proofs",
+  "xcsp3-2025-fast-cop-without-optimality-proofs",
+  "xcsp3-2025-parallel-cop-without-optimality-proofs",
+  "xcsp3-2025-mini-cop-without-optimality-proofs",
+]
+corpus_status = "complete-public"
+corpora = ["xcsp3-2025-instances", "xcsp3-2025-models", "xcsp3-2025-result-artifacts"]
+official_machine_status = "blocked-conflicting-public-limits"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-unsupported-format"
+reason = "The selected instances, models, and all pinned solver-result API responses are represented, but published sources conflict between a 32 GiB node and 64 GiB per run and AY has no XCSP3 adapter, proof checker/scorer, or competitor replay."
+
+[[event]]
+id = "archcomp-2026"
+competition = "archcomp"
+edition = 2026
+track_ids = [
+  "archcomp-2026-piecewise-constant-dynamics-bmc",
+  "archcomp-2026-linear-continuous-dynamics",
+  "archcomp-2026-nonlinear-dynamics",
+  "archcomp-2026-ainncs",
+  "archcomp-2026-hybrid-systems-theorem-proving",
+  "archcomp-2026-falsification",
+]
+corpus_status = "partial-public"
+corpora = ["archcomp-repository"]
+official_machine_status = "decentralized"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-until-category-selections-materialized"
+reason = "The official repository is pinned, including exact declared exceptions for two old 2023 NNV mode-160000 entries that lack .gitmodules mappings; ARCH-COMP is decentralized and unranked, exact runnable 2026 selections and limits remain category-specific, and AY has no adapters or pinned tool runners for these formats."
+
+[[event]]
+id = "casc-2026"
+competition = "casc"
+edition = 2026
+track_ids = [
+  "casc-2026-thf",
+  "casc-2026-fof",
+  "casc-2026-fnt",
+  "casc-2026-ueq",
+  "casc-2026-demonstration",
+]
+corpus_status = "unavailable"
+corpora = []
+official_machine_status = "underpowered"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-no-pinned-corpus"
+reason = "The 2026 corpus and results are still pending, the host is below the announced 128 GiB envelope, and AY has no TPTP competition replay or pinned competitors."
+
+[[event]]
+id = "chccomp-2026"
+competition = "chccomp"
+edition = 2026
+track_ids = [
+  "chccomp-2026-solver-lia-lin",
+  "chccomp-2026-solver-lia-nonlin",
+  "chccomp-2026-solver-lia-lin-arrays",
+  "chccomp-2026-solver-lia-nonlin-arrays",
+  "chccomp-2026-solver-adt-lia",
+  "chccomp-2026-solver-adt-lia-arrays",
+  "chccomp-2026-solver-lra-lin",
+  "chccomp-2026-solver-bv-lin",
+  "chccomp-2026-solver-bv-nonlin",
+  "chccomp-2026-model-lia-lin",
+  "chccomp-2026-model-lia-nonlin",
+  "chccomp-2026-model-lia-lin-arrays",
+  "chccomp-2026-model-lia-nonlin-arrays",
+  "chccomp-2026-model-adt-lia",
+  "chccomp-2026-model-adt-lia-arrays",
+  "chccomp-2026-model-lra-lin",
+  "chccomp-2026-model-bv-lin",
+  "chccomp-2026-model-bv-nonlin",
+  "chccomp-2026-solver-overall",
+  "chccomp-2026-model-overall",
+]
+corpus_status = "complete-public"
+corpora = ["chc-comp-2026-benchmarks", "chc-comp-2026-runner"]
+official_machine_status = "envelope-fit-not-hardware-match"
+local_run_support = "partial"
+competitor_replay_status = "partial"
+subset_policy = "deterministic-stratified-directional-only"
+reason = "The full benchmark and runner repositories are pinned and eight of nine solver-category sets have AY proxy lanes checked against Z3 on the same host. The organizer's BV-Lin.set contains 1,966 stale flattened paths absent from that pinned repository, so that lane fails closed; model-validation/checker parity and pinned submitted solvers also remain unwired."
+
+[[event]]
+id = "coco-2026"
+competition = "coco"
+edition = 2026
+track_ids = [
+  "coco-2026-com",
+  "coco-2026-csr",
+  "coco-2026-ctrs",
+  "coco-2026-gcr",
+  "coco-2026-inf",
+  "coco-2026-lctrs",
+  "coco-2026-nfp",
+  "coco-2026-srs",
+  "coco-2026-trs",
+  "coco-2026-unc",
+  "coco-2026-unr",
+  "coco-2026-secret-problem-award",
+  "coco-2026-progress-award",
+]
+corpus_status = "unavailable"
+corpora = []
+official_machine_status = "underpowered"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-no-pinned-corpus"
+reason = "The final 2026 selections and results are pending, the host is below the 128 GB envelope, and AY has no confluence adapters, certification/scoring pipeline, or competitor runners."
+
+[[event]]
+id = "floc-modeling-2026"
+competition = "floc-modeling"
+edition = 2026
+track_ids = ["floc-modeling-2026-contest"]
+corpus_status = "unavailable"
+corpora = []
+official_machine_status = "not-uniform-runtime-event"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-no-pinned-corpus"
+reason = "Public rules, tasks, and results remain pending for a family that is not a uniform runtime competition, and no judging environment or submission corpus is pinned."
+
+[[event]]
+id = "maxsat-2026"
+competition = "maxsat"
+edition = 2026
+track_ids = [
+  "maxsat-2026-exact-unweighted",
+  "maxsat-2026-exact-weighted",
+  "maxsat-2026-anytime-unweighted",
+  "maxsat-2026-anytime-weighted",
+  "maxsat-2026-incremental",
+  "maxsat-2026-anytime-unweighted-60s",
+  "maxsat-2026-anytime-unweighted-300s",
+  "maxsat-2026-anytime-unweighted-1707s",
+  "maxsat-2026-anytime-weighted-60s",
+  "maxsat-2026-anytime-weighted-300s",
+  "maxsat-2026-anytime-weighted-1707s",
+  "maxsat-2026-incremental-ipamiradaboost",
+  "maxsat-2026-incremental-ipamirextenf",
+  "maxsat-2026-incremental-ipamirbioptsat",
+  "maxsat-2026-incremental-ipamirwcnfi",
+  "maxsat-2026-incremental-ipamirsibyltrace",
+  "maxsat-2026-incremental-overall",
+]
+corpus_status = "complete-public"
+corpora = [
+  "maxsat-2026-exact-unweighted",
+  "maxsat-2026-exact-weighted",
+  "maxsat-2026-anytime-unweighted",
+  "maxsat-2026-anytime-weighted",
+  "maxsat-2026-incremental",
+  "maxsat-2026-results",
+  "maxsat-2026-benchmark-metadata",
+  "maxsat-2026-logs",
+  "maxsat-2026-incremental-logs",
+]
+competitor_corpora = [
+  "maxsat-2026-competitor-uwrmaxsat",
+  "maxsat-2026-competitor-uwrmaxsat-maxcdcl",
+  "maxsat-2026-competitor-wmaxcdcl",
+]
+official_machine_status = "envelope-fit-not-hardware-match"
+local_run_support = "partial"
+competitor_replay_status = "partial"
+subset_policy = "deterministic-stratified-directional-only"
+reason = "All five benchmark families, metadata, results, and logs are pinned and the per-run envelope fits, but AY covers only part of the event and official scoring plus pinned leading-solver replay are not complete."
+
+[[event]]
+id = "mcc-2026"
+competition = "mcc"
+edition = 2026
+track_ids = [
+  "mcc-2026-track-1-mc",
+  "mcc-2026-track-1f-mc-fast",
+  "mcc-2026-track-2b-wmc",
+  "mcc-2026-track-3-pmc",
+  "mcc-2026-track-4-pwmc",
+  "mcc-2026-track-5b-amc",
+]
+corpus_status = "partial-public"
+corpora = ["mcc-2026-track1-public", "mcc-2026-track2b-public", "mcc-2026-track3-public", "mcc-2026-track4-public", "mcc-2026-track5b-public"]
+official_machine_status = "envelope-fit-cpu-unpublished"
+local_run_support = "partial"
+competitor_replay_status = "unavailable"
+subset_policy = "official-public-subsets-directional-only"
+reason = "Only public track subsets are pinned and official 2026 results remain unpublished; the exact CPU, official scorer, full selected corpus, and pinned competitor builds are unavailable."
+
+[[event]]
+id = "mznc-2026"
+competition = "mznc"
+edition = 2026
+track_ids = [
+  "mznc-2026-fixed",
+  "mznc-2026-free",
+  "mznc-2026-parallel",
+  "mznc-2026-open",
+  "mznc-2026-local-search",
+]
+corpus_status = "complete-public"
+corpora = ["minizinc-challenge-2026", "minizinc-challenge-2026-results"]
+official_machine_status = "mixed-envelope-fit-and-underpowered"
+local_run_support = "partial"
+competitor_replay_status = "partial"
+subset_policy = "deterministic-stratified-directional-only"
+reason = "Problems and detailed results are pinned, but AY does not cover every MiniZinc track, the 64 GiB PAR/OPEN envelope exceeds this host, and leading solver packages and complete Borda replay remain incomplete."
+
+[[event]]
+id = "pbcomp-2026"
+competition = "pbcomp"
+edition = 2026
+track_ids = [
+  "pbcomp-2026-dec-lin",
+  "pbcomp-2026-opt-lin",
+  "pbcomp-2026-dec-lin-cert",
+  "pbcomp-2026-opt-lin-cert",
+  "pbcomp-2026-dec-lin-cert-including-uncertified",
+  "pbcomp-2026-opt-lin-cert-including-uncertified",
+  "pbcomp-2026-partial-lin",
+  "pbcomp-2026-soft-lin",
+  "pbcomp-2026-dec-nlc",
+  "pbcomp-2026-opt-nlc",
+]
+corpus_status = "complete-public"
+corpora = ["pb-comp-selected-pb26", "pb-comp-normalized-pb26"]
+official_machine_status = "envelope-fit-cpu-unpublished"
+local_run_support = "partial"
+competitor_replay_status = "partial"
+subset_policy = "deterministic-stratified-directional-only"
+reason = "The selected and normalized PB26 corpora are pinned and AY supports core OPB solving, but adapter verification, proof-aware and optimization variants, the exact CPU identity, official scoring, and pinned top competitors are not all ready."
+
+[[event]]
+id = "proover-2026"
+competition = "proover"
+edition = 2026
+track_ids = ["proover-2026-proof-verification"]
+corpus_status = "partial-public"
+corpora = ["proover-2026-examples", "proover-2026-samples"]
+official_machine_status = "pending"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "acquisition-smoke-only-no-score"
+reason = "Only examples and samples are public and pinned; the selected corpus, results, final machine envelope, AY proof-checking adapter, scorer, and competitor packages remain unavailable."
+
+[[event]]
+id = "qbfeval-2026"
+competition = "qbfeval"
+edition = 2026
+track_ids = [
+  "qbfeval-2026-pcnf-main",
+  "qbfeval-2026-crafted",
+  "qbfeval-2026-random",
+  "qbfeval-2026-2qbf",
+  "qbfeval-2026-prenex-non-cnf",
+  "qbfeval-2026-dqbf",
+  "qbfeval-2026-parallel",
+  "qbfeval-2026-certified",
+]
+corpus_status = "unavailable"
+corpora = []
+official_machine_status = "unpublished"
+local_run_support = "partial"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-no-pinned-corpus"
+reason = "The event is reported as run but its rules, selections, results, and machine configuration are not reliably public, and no pinned QBF corpus or competitor packages are available."
+
+[[event]]
+id = "satcomp-2026"
+competition = "satcomp"
+edition = 2026
+track_ids = [
+  "satcomp-2026-main",
+  "satcomp-2026-experimental",
+  "satcomp-2026-parallel",
+  "satcomp-2026-cloud",
+  "satcomp-2026-main-ai-generated",
+  "satcomp-2026-main-ai-tuned",
+  "satcomp-2026-experimental-ai-generated",
+  "satcomp-2026-experimental-ai-tuned",
+  "satcomp-2026-parallel-ai-generated",
+  "satcomp-2026-parallel-ai-tuned",
+  "satcomp-2026-cloud-ai-generated",
+  "satcomp-2026-cloud-ai-tuned",
+  "satcomp-2026-main-sat",
+  "satcomp-2026-main-unsat",
+  "satcomp-2026-parallel-sat",
+  "satcomp-2026-parallel-unsat",
+]
+corpus_status = "complete-public"
+corpora = [
+  "satcomp-2026-main-selection",
+  "satcomp-2026-main",
+  "satcomp-2026-scores",
+  "satcomp-2026-slides",
+  "satcomp-2026-benchmark-compilation",
+]
+competitor_corpora = [
+  "satcomp-2026-competitor-satsuma-iter-kissat",
+  "satcomp-2026-competitor-kissat-mab-hypre",
+  "satcomp-2026-competitor-eda-kissat-v2",
+  "satcomp-2026-competitor-biere-submissions",
+  "satcomp-2026-competitor-ding-submissions",
+  "satcomp-2026-competitor-faraja-llmg",
+  "satcomp-2026-competitor-gopalan-submissions",
+  "satcomp-2026-competitor-green-lymphosat",
+  "satcomp-2026-competitor-guo-kissat-ae",
+  "satcomp-2026-competitor-hangjiang-kissat-bva",
+  "satcomp-2026-competitor-liang-submissions",
+  "satcomp-2026-competitor-oertel-satsuma-lex",
+  "satcomp-2026-competitor-reeves-cadical-xlc-freeze",
+  "satcomp-2026-competitor-zhenwei-submissions",
+]
+official_machine_status = "mixed-envelope-fit-and-underpowered"
+local_run_support = "partial"
+competitor_replay_status = "partial"
+subset_policy = "full-corpus-plus-deterministic-proxies"
+reason = "The exact ordered 400-row selection and every GBD response are pinned and materializable. Final sequential scores, slides, and all 14 organizer-published Main Track author source archives are pinned; author eligibility and AI field splits remain incomplete, parallel/cloud hardware exceeds this host, and the acquired submissions still need build/checker replay adapters."
+
+[[event]]
+id = "smtcomp-2026"
+competition = "smtcomp"
+edition = 2026
+track_ids = [
+  "smtcomp-2026-single-query",
+  "smtcomp-2026-incremental",
+  "smtcomp-2026-unsat-core",
+  "smtcomp-2026-model-validation",
+  "smtcomp-2026-parallel",
+  "smtcomp-2026-cloud",
+]
+corpus_status = "partial-public"
+corpora = [
+  "smtcomp-2026-candidate-selection",
+  "smtcomp-2026-results-single-query-provisional",
+  "smtcomp-2026-results-incremental-provisional",
+  "smtcomp-2026-results-model-validation-provisional",
+  "smtcomp-2026-results-unsat-core-provisional",
+  "smtcomp-2026-results-parallel-provisional",
+  "smtcomp-2026-results-tooling",
+]
+official_machine_status = "mixed-envelope-fit-and-underpowered"
+local_run_support = "partial"
+competitor_replay_status = "partial"
+subset_policy = "blocked-until-corpus-materialized"
+reason = "The candidate inventory, all five provisional result blobs, and the exact organizer scorer/metadata tree are pinned, but final site publication and a frozen selected corpus remain pending; AY supports only part of SMT-LIB, parallel/cloud envelopes exceed this host, and competitor replay is incomplete."
+
+[[event]]
+id = "svcomp-2026"
+competition = "svcomp"
+edition = 2026
+track_ids = [
+  "svcomp-2026-verification-c-reach-safety",
+  "svcomp-2026-verification-c-mem-safety",
+  "svcomp-2026-verification-c-concurrency",
+  "svcomp-2026-verification-c-no-overflows",
+  "svcomp-2026-verification-c-termination",
+  "svcomp-2026-verification-c-software-systems",
+  "svcomp-2026-verification-c-overall",
+  "svcomp-2026-verification-c-false-overall",
+  "svcomp-2026-verification-c-true-overall",
+  "svcomp-2026-verification-java-overall",
+  "svcomp-2026-verification-c-huawei-concurrency-challenges",
+  "svcomp-2026-validation-correctness-v2-c-reach-safety",
+  "svcomp-2026-validation-correctness-v2-c-no-overflows",
+  "svcomp-2026-validation-correctness-v2-c-software-systems",
+  "svcomp-2026-validation-correctness-v2-c-validation-crafted",
+  "svcomp-2026-validation-correctness-v2-c-overall",
+  "svcomp-2026-validation-violation-v2-c-reach-safety",
+  "svcomp-2026-validation-violation-v2-c-mem-safety",
+  "svcomp-2026-validation-violation-v2-c-no-overflows",
+  "svcomp-2026-validation-violation-v2-c-termination",
+  "svcomp-2026-validation-violation-v2-c-software-systems",
+  "svcomp-2026-validation-violation-v2-c-validation-crafted",
+  "svcomp-2026-validation-violation-v2-c-overall",
+  "svcomp-2026-validation-violation-v1-c-reach-safety",
+  "svcomp-2026-validation-violation-v1-c-mem-safety",
+  "svcomp-2026-validation-violation-v1-c-concurrency",
+  "svcomp-2026-validation-violation-v1-c-termination",
+  "svcomp-2026-validation-violation-v1-c-software-systems",
+  "svcomp-2026-category-score-c-unreach-call-arrays",
+  "svcomp-2026-category-score-c-unreach-call-bitvectors",
+  "svcomp-2026-category-score-c-unreach-call-combinations",
+  "svcomp-2026-category-score-c-unreach-call-controlflow",
+  "svcomp-2026-category-score-c-unreach-call-eca",
+  "svcomp-2026-category-score-c-unreach-call-floats",
+  "svcomp-2026-category-score-c-unreach-call-hardness",
+  "svcomp-2026-category-score-c-unreach-call-hardware",
+  "svcomp-2026-category-score-c-unreach-call-heap",
+  "svcomp-2026-category-score-c-unreach-call-loops",
+  "svcomp-2026-category-score-c-unreach-call-productlines",
+  "svcomp-2026-category-score-c-unreach-call-recursive",
+  "svcomp-2026-category-score-c-unreach-call-sequentialized",
+  "svcomp-2026-category-score-c-unreach-call-xcsp",
+  "svcomp-2026-category-score-c-valid-memcleanup-main",
+  "svcomp-2026-category-score-c-valid-memsafety-arrays",
+  "svcomp-2026-category-score-c-valid-memsafety-heap",
+  "svcomp-2026-category-score-c-valid-memsafety-juliet",
+  "svcomp-2026-category-score-c-valid-memsafety-linkedlists",
+  "svcomp-2026-category-score-c-valid-memsafety-other",
+  "svcomp-2026-category-score-c-no-data-race-concurrency",
+  "svcomp-2026-category-score-c-no-overflow-concurrency",
+  "svcomp-2026-category-score-c-unreach-call-concurrency",
+  "svcomp-2026-category-score-c-valid-memsafety-concurrency",
+  "svcomp-2026-category-score-c-no-overflow-juliet",
+  "svcomp-2026-category-score-c-no-overflow-main",
+  "svcomp-2026-category-score-c-termination-bitvectors",
+  "svcomp-2026-category-score-c-termination-maincontrolflow",
+  "svcomp-2026-category-score-c-termination-mainheap",
+  "svcomp-2026-category-score-c-termination-other",
+  "svcomp-2026-category-score-c-no-overflow-softwaresystems-busybox",
+  "svcomp-2026-category-score-c-no-overflow-softwaresystems-coreutils",
+  "svcomp-2026-category-score-c-no-overflow-softwaresystems-uthash",
+  "svcomp-2026-category-score-c-termination-softwaresystems-devicedriverslinux64",
+  "svcomp-2026-category-score-c-termination-softwaresystems-uthash",
+  "svcomp-2026-category-score-c-unreach-call-softwaresystems-aws-c-common",
+  "svcomp-2026-category-score-c-unreach-call-softwaresystems-devicedriverslinux64",
+  "svcomp-2026-category-score-c-unreach-call-softwaresystems-devicedriverslinux64large",
+  "svcomp-2026-category-score-c-unreach-call-softwaresystems-intel-tdx-module",
+  "svcomp-2026-category-score-c-unreach-call-softwaresystems-other",
+  "svcomp-2026-category-score-c-unreach-call-softwaresystems-uthash",
+  "svcomp-2026-category-score-c-valid-memcleanup-softwaresystems-uthash",
+  "svcomp-2026-category-score-c-valid-memsafety-softwaresystems-coreutils",
+  "svcomp-2026-category-score-c-valid-memsafety-softwaresystems-devicedriverslinux64",
+  "svcomp-2026-category-score-c-valid-memsafety-softwaresystems-other",
+  "svcomp-2026-category-score-c-valid-memsafety-softwaresystems-uthash",
+  "svcomp-2026-category-score-c-no-data-race-huawei-concurrency-challenges",
+  "svcomp-2026-category-score-c-no-overflow-huawei-concurrency-challenges",
+  "svcomp-2026-category-score-c-unreach-call-huawei-concurrency-challenges",
+  "svcomp-2026-category-score-c-valid-memsafety-huawei-concurrency-challenges",
+  "svcomp-2026-category-score-java-no-runtime-exception-main",
+  "svcomp-2026-category-score-java-valid-assert-main",
+  "svcomp-2026-verification-sv-lib-overall-demo",
+  "svcomp-2026-category-score-sv-lib-correct-tags-coreverification",
+  "svcomp-2026-category-score-sv-lib-correct-tags-corevalidation",
+  "svcomp-2026-category-score-sv-lib-correct-tags-ctranslated",
+]
+corpus_status = "complete-public"
+corpora = ["svcomp-2026-benchmarks", "svcomp-2026-definitions", "svcomp-2026-witnesses", "svcomp-2026-results-full"]
+official_machine_status = "envelope-fit-not-hardware-match"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-unsupported-format"
+reason = "Edition-pinned tasks, definitions, witnesses, and full results are represented, with the very large evidence archives kept outside the default refresh; AY still has no SV-COMP program-analysis, witness-validation, scoring, or competitor replay."
+
+[[event]]
+id = "syntcomp-2026"
+competition = "syntcomp"
+edition = 2026
+track_ids = [
+  "syntcomp-2026-parity-realizability",
+  "syntcomp-2026-ltl-realizability",
+  "syntcomp-2026-ltl-synthesis-coverage",
+  "syntcomp-2026-ltl-synthesis-quality",
+  "syntcomp-2026-ltlf-realizability",
+]
+corpus_status = "complete-public"
+corpora = ["syntcomp-2026-ltl", "syntcomp-2026-ltlf", "syntcomp-2026-parity", "syntcomp-2026-results-first-snapshot"]
+official_machine_status = "unpublished"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-unsupported-format"
+reason = "The three selections and first result snapshot are pinned, but the result archive is preliminary, machine limits are not fully published, and AY has no synthesis, validation/scoring, or competitor replay."
+
+[[event]]
+id = "termcomp-2026"
+competition = "termcomp"
+edition = 2026
+track_ids = [
+  "termcomp-2026-trs-standard",
+  "termcomp-2026-integer-transition-systems",
+  "termcomp-2026-logic-programming",
+  "termcomp-2026-c",
+  "termcomp-2026-complexity-c",
+  "termcomp-2026-complexity-its",
+  "termcomp-2026-srs-relative",
+  "termcomp-2026-srs-standard",
+  "termcomp-2026-trs-conditional-operational",
+  "termcomp-2026-trs-conditional",
+  "termcomp-2026-trs-context-sensitive",
+  "termcomp-2026-trs-equational",
+  "termcomp-2026-trs-innermost",
+  "termcomp-2026-trs-relative",
+]
+corpus_status = "partial-public"
+corpora = ["termcomp-tpdb-11-5", "termcomp-runner-config", "termcomp-results", "termcomp-registration-2026"]
+official_machine_status = "envelope-fit-cpu-unpublished"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-until-edition-selection-materialized"
+reason = "TPDB 11.5, runner configuration, live results-site repository, and the 2026 registration branch are pinned. Fourteen category files have at least two registrations, but eleven remain conditional until the separate 40-example threshold and final results are published; the CPU identity is unknown, and AY has no termination adapter, certifier/scorer, or competitor packages."
+
+[[event]]
+id = "testcomp-2026"
+competition = "testcomp"
+edition = 2026
+track_ids = [
+  "testcomp-2026-c-cover-error",
+  "testcomp-2026-c-cover-branches",
+  "testcomp-2026-c-overall",
+]
+corpus_status = "complete-public"
+corpora = ["testcomp-2026-benchmarks", "testcomp-2026-definitions", "testcomp-2026-results-full"]
+official_machine_status = "envelope-fit-not-hardware-match"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-unsupported-format"
+reason = "Edition-pinned tasks, definitions, and full results are represented, with the large result archive outside the default refresh; the host is not the official machine and AY has no test-generation adapter, validator, scorer, or competitor replay."
+
+[[event]]
+id = "vnncomp-2026"
+competition = "vnncomp"
+edition = 2026
+track_ids = [
+  "vnncomp-2026-regular",
+  "vnncomp-2026-extended",
+]
+corpus_status = "partial-public"
+corpora = ["vnncomp-2026-benchmarks", "vnncomp-2026-results-tooling"]
+official_machine_status = "underpowered"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-until-final-selection-and-results"
+reason = "The 2026 benchmark and results-tooling repositories are pinned, but the official selection and results remain pending, the host lacks the required AWS CPU/GPU envelopes, and AY has no neural-network verification adapter or competitor runners."
+
+[[event]]
+id = "xcsp3-2026"
+competition = "xcsp3"
+edition = 2026
+track_ids = [
+  "xcsp3-2026-main-csp",
+  "xcsp3-2026-main-cop",
+  "xcsp3-2026-fast-cop",
+  "xcsp3-2026-parallel-cop",
+  "xcsp3-2026-mini-csp",
+  "xcsp3-2026-mini-cop",
+  "xcsp3-2026-main-cop-without-optimality-proofs",
+  "xcsp3-2026-fast-cop-without-optimality-proofs",
+  "xcsp3-2026-parallel-cop-without-optimality-proofs",
+  "xcsp3-2026-mini-cop-without-optimality-proofs",
+]
+corpus_status = "partial-public"
+corpora = ["xcsp3-2026-result-artifacts"]
+official_machine_status = "unpublished"
+local_run_support = "unsupported"
+competitor_replay_status = "unavailable"
+subset_policy = "blocked-no-pinned-corpus"
+reason = "All currently used solver-result API responses are pinned, but the official selected-corpus link returns 404 and no replacement instance archive is pinned; the machine memory limit is unpublished and AY has no XCSP3 adapter, proof checker/scorer, or competitor replay."

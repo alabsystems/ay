@@ -9,6 +9,7 @@ inputs:
   set_file: LIA-Lin.set
   timeout_sec: 30
   runs: 3
+  reference_solver: z3
 metrics:
   - passed
   - total

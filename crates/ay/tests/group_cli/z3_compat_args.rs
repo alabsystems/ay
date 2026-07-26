@@ -5,7 +5,7 @@
 //! Regression tests for Z3-compatible CLI aliases handled by `ay`.
 
 use ntest::timeout;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1067,25 +1067,51 @@ fn chc_spacer_compat_params_accept_horn_cli_path() {
 
 #[test]
 #[timeout(30_000)]
-#[ignore = "0.1.x: HORN (get-model) currently fails closed to `unknown` (the \
-theory-search model falsifies an assertion, so the soundness gate rejects it) \
-instead of emitting the Spacer-shaped invariant from the CHC certificate. This \
-is SOUND — never a wrong model — but incomplete. Tracked in LIMITATIONS.md; the \
-CHC invariant->get-model rendering is the fix."]
 fn horn_get_model_in_z3_mode_emits_spacer_model_not_ay_certificate() {
-    let input = format!("{}(get-model)\n", trivial_safe_horn_check_sat());
-    let output = run_ay_stdin_with_args(&["--z3-mode"], &input, true);
+    let mut child = Command::new(ay_binary())
+        .args(["--z3-mode", "-in"])
+        .env("AY_INTERNAL_PROVENANCE_CHILD", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn live HORN -in session");
+    let mut child_stdin = child.stdin.take().expect("piped stdin");
+    let mut child_stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut child_stderr = child.stderr.take().expect("piped stderr");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "HORN get-model should succeed in --z3-mode; stdout={stdout}, stderr={stderr}"
-    );
+    child_stdin
+        .write_all(trivial_safe_horn_check_sat().as_bytes())
+        .expect("write HORN problem through check-sat");
+    child_stdin.flush().expect("flush live check-sat");
+    let mut verdict = String::new();
+    child_stdout
+        .read_line(&mut verdict)
+        .expect("read verdict before closing stdin");
     assert_eq!(
-        stdout.lines().next(),
-        Some("sat"),
-        "expected SAT result before HORN model: {stdout}"
+        verdict.trim_end(),
+        "sat",
+        "live HORN check-sat must answer before the client sends get-model"
+    );
+
+    child_stdin
+        .write_all(b"(get-model)\n(exit)\n")
+        .expect("write get-model after verdict");
+    child_stdin.flush().expect("flush live get-model");
+    drop(child_stdin);
+
+    let mut stdout = String::new();
+    child_stdout
+        .read_to_string(&mut stdout)
+        .expect("read live HORN model");
+    let mut stderr = String::new();
+    child_stderr
+        .read_to_string(&mut stderr)
+        .expect("read live HORN stderr");
+    let status = child.wait().expect("wait for live HORN session");
+    assert!(
+        status.success(),
+        "HORN get-model should succeed in --z3-mode; stdout={stdout}, stderr={stderr}"
     );
     assert!(
         stdout.contains("(\n  (define-fun Inv"),
@@ -1098,6 +1124,82 @@ fn horn_get_model_in_z3_mode_emits_spacer_model_not_ay_certificate() {
     assert!(
         stderr.is_empty(),
         "--z3-mode HORN get-model should keep stderr clean: {stderr}"
+    );
+}
+
+#[test]
+#[timeout(30_000)]
+fn horn_problem_mutation_invalidates_live_model_until_recheck() {
+    let mut child = Command::new(ay_binary())
+        .args(["--z3-mode", "-in"])
+        .env("AY_INTERNAL_PROVENANCE_CHILD", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn live HORN -in session");
+    let mut child_stdin = child.stdin.take().expect("piped stdin");
+    let mut child_stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut child_stderr = child.stderr.take().expect("piped stderr");
+
+    child_stdin
+        .write_all(trivial_safe_horn_check_sat().as_bytes())
+        .expect("write initial HORN problem");
+    child_stdin.flush().expect("flush initial check-sat");
+    let mut line = String::new();
+    child_stdout
+        .read_line(&mut line)
+        .expect("read initial verdict");
+    assert_eq!(line.trim_end(), "sat");
+
+    child_stdin
+        .write_all(
+            b"(assert (forall ((x Int)) (=> (Inv x) (Inv x))))\n\
+              (get-model)\n",
+        )
+        .expect("mutate problem and request stale model");
+    child_stdin.flush().expect("flush mutation and get-model");
+    line.clear();
+    child_stdout
+        .read_line(&mut line)
+        .expect("read unavailable-model response");
+    assert_eq!(
+        line.trim_end(),
+        "(error \"model is not available\")",
+        "problem mutation must invalidate the prior certified model"
+    );
+
+    child_stdin
+        .write_all(b"(check-sat)\n(get-model)\n(exit)\n")
+        .expect("recheck and request fresh model");
+    child_stdin.flush().expect("flush recheck");
+    drop(child_stdin);
+
+    line.clear();
+    child_stdout
+        .read_line(&mut line)
+        .expect("read recheck verdict");
+    assert_eq!(line.trim_end(), "sat");
+    let mut stdout = String::new();
+    child_stdout
+        .read_to_string(&mut stdout)
+        .expect("read refreshed model");
+    let mut stderr = String::new();
+    child_stderr
+        .read_to_string(&mut stderr)
+        .expect("read live HORN stderr");
+    let status = child.wait().expect("wait for live HORN session");
+    assert!(
+        status.success(),
+        "fresh HORN model should succeed; stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("(\n  (define-fun Inv"),
+        "recheck must make a fresh Spacer-shaped model available: {stdout}"
+    );
+    assert!(
+        stderr.is_empty(),
+        "live HORN mutation/recheck should keep stderr clean: {stderr}"
     );
 }
 
@@ -4395,11 +4497,11 @@ fn unknown_set_logic_is_ignored_and_continues() {
 #[timeout(30_000)]
 fn z3_mode_get_info_version_is_consistent_z3_version() {
     // Regression (Phase 1 CLI drop-in): under explicit `--z3-mode` (full Z3
-    // impersonation, documented to match the cached Z3 4.15.4 baseline), the
+    // impersonation, documented to match the pinned Z3 5.0.0 baseline), the
     // identity triple must be internally consistent — `:name "Z3"` pairs with a
     // real Z3 version, not AY's 0.11.0. Plain `-in` keeps AY provenance (see
     // smt_get_info_version_keeps_ay_provenance_with_z3_record_shape).
     let output = run_ay_stdin_with_args(&["--z3-mode"], "(get-info :version)\n", true);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(stdout, "(:version \"4.15.4\")\n", "got: {stdout}");
+    assert_eq!(stdout, "(:version \"5.0.0\")\n", "got: {stdout}");
 }

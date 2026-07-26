@@ -119,6 +119,25 @@ fn spec_analyzes_int_indexed_array_arguments_only() {
 }
 
 #[test]
+fn spec_instruments_five_arrays_at_n1_but_skips_ten_slots_at_n2() {
+    let mut problem = ChcProblem::new();
+    let p = problem.declare_predicate("P", vec![int_array_sort(); 5]);
+
+    let one_pair = GhostPairSpec::analyze(&problem, 1);
+    assert_eq!(
+        one_pair.preds.get(&p).unwrap().array_positions,
+        vec![0, 1, 2, 3, 4],
+        "five-array invariants need one independently indexed value per array"
+    );
+
+    let two_pairs = GhostPairSpec::analyze(&problem, 2);
+    assert!(
+        !two_pairs.preds.contains_key(&p),
+        "ten ghost slots exceed the bounded abstraction budget"
+    );
+}
+
+#[test]
 fn transformer_extends_signatures_and_preserves_predicate_ids() {
     let problem = const_zero_array_problem();
     let original_pred = problem.predicates()[0].clone();
@@ -242,6 +261,61 @@ fn instantiation_tuples_cover_identity_diagonal_and_pairs() {
         instantiation_tuples(1, &[], &[], 4),
         vec![vec![ChcExpr::Int(0)]]
     );
+}
+
+#[test]
+fn false_query_uses_array_specific_cross_array_triggers() {
+    let mut problem = ChcProblem::new();
+    let p = problem.declare_predicate(
+        "P",
+        vec![int_array_sort(), int_array_sort(), int_array_sort()],
+    );
+    let a = var("a", int_array_sort());
+    let b = var("b", int_array_sort());
+    let c = var("c", int_array_sort());
+    let ia = var("ia", ChcSort::Int);
+    let ib = var("ib", ChcSort::Int);
+    let ic = var("ic", ChcSort::Int);
+    problem.add_clause(HornClause::query(ClauseBody::new(
+        vec![(p, vec![a.clone(), b.clone(), c.clone()])],
+        Some(ChcExpr::ne(
+            ChcExpr::select(c, ic.clone()),
+            ChcExpr::add(
+                ChcExpr::select(a, ia.clone()),
+                ChcExpr::select(b, ib.clone()),
+            ),
+        )),
+    )));
+
+    let transformed = Box::new(ArrayGhostPairTransformer::new(1)).transform(problem);
+    let (_, args) = &transformed.problem.clauses()[0].body.predicates[0];
+    assert_eq!(args[3], ia, "first array must use its own observed address");
+    assert_eq!(
+        args[5], ib,
+        "second array must use its own observed address"
+    );
+    assert_eq!(args[7], ic, "third array must use its own observed address");
+}
+
+#[test]
+fn false_query_n2_uses_two_observed_indices_of_one_array() {
+    let mut problem = ChcProblem::new();
+    let p = problem.declare_predicate("P", vec![int_array_sort()]);
+    let a = var("a", int_array_sort());
+    let k = var("k", ChcSort::Int);
+    let previous = ChcExpr::add(k.clone(), ChcExpr::Int(-1));
+    problem.add_clause(HornClause::query(ClauseBody::new(
+        vec![(p, vec![a.clone()])],
+        Some(ChcExpr::not(ChcExpr::le(
+            ChcExpr::select(a.clone(), previous.clone()),
+            ChcExpr::select(a, k.clone()),
+        ))),
+    )));
+
+    let transformed = Box::new(ArrayGhostPairTransformer::new(2)).transform(problem);
+    let (_, args) = &transformed.problem.clauses()[0].body.predicates[0];
+    assert_eq!(args[1], previous, "first pair must probe k - 1");
+    assert_eq!(args[3], k, "second pair must probe k");
 }
 
 #[test]

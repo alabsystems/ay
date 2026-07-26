@@ -21,6 +21,7 @@ mod jit_propagation;
 mod jit_snapshot_persistence;
 mod model_snapshot;
 mod optimality_certificate;
+mod warm_simplex_state;
 
 /// Helper: check() may return NeedModelEquality or NeedModelEqualities when
 /// `discover_model_value_equalities()` fires. In unit tests without a DPLL(T)

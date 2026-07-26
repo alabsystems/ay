@@ -258,7 +258,11 @@ impl LpParser {
             {
                 let idx = self.intern_var(&name);
                 self.problem.variables[idx].kind = kind;
-                if matches!(kind, VarKind::Binary) {
+                if matches!(kind, VarKind::Binary)
+                    && self.problem.variables[idx].lower == 0.0
+                    && self.problem.variables[idx].upper.is_infinite()
+                    && self.problem.variables[idx].upper.is_sign_positive()
+                {
                     self.problem.variables[idx].lower = 0.0;
                     self.problem.variables[idx].upper = 1.0;
                 }

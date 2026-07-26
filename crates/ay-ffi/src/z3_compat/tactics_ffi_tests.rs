@@ -76,7 +76,6 @@ fn test_tactic_shared_name_set_matches_z3() {
             c"qe-light".as_ptr(),
             c"nnf".as_ptr(),
             c"tseitin-cnf".as_ptr(),
-            c"cnf".as_ptr(),
             c"bit-blast".as_ptr(),
         ] {
             let t = Z3_mk_tactic(ctx, name);
@@ -90,6 +89,11 @@ fn test_tactic_shared_name_set_matches_z3() {
             bad.is_null(),
             "flatten-and is not a z3 tactic; must be NULL"
         );
+        assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
+
+        // `cnf` is not a Z3 5.0.0 tactic (the real name is `tseitin-cnf`).
+        let bad = Z3_mk_tactic(ctx, c"cnf".as_ptr());
+        assert!(bad.is_null(), "cnf is not a Z3 5.0.0 tactic");
         assert_eq!(Z3_get_error_code(ctx), Z3_INVALID_ARG);
 
         Z3_del_context(ctx);
@@ -1192,7 +1196,6 @@ fn test_tactic_get_descr() {
             c"elim-and".as_ptr(),
             c"bit-blast".as_ptr(),
             c"split-clause".as_ptr(),
-            c"cnf".as_ptr(), // ay documented alias (superset of libz3)
             // The transform batch (incl. the `cofactor-term-ite` alias).
             c"elim-term-ite".as_ptr(),
             c"blast-term-ite".as_ptr(),
@@ -1231,6 +1234,8 @@ fn test_tactic_get_descr() {
         // `lift-if` is not a z3 tactic; no description (honest NULL).
         let lift_if = Z3_tactic_get_descr(ctx, c"lift-if".as_ptr());
         assert!(lift_if.is_null(), "lift-if is not a z3 tactic");
+        let cnf = Z3_tactic_get_descr(ctx, c"cnf".as_ptr());
+        assert!(cnf.is_null(), "cnf is not a Z3 5.0.0 tactic");
 
         Z3_del_context(ctx);
     }

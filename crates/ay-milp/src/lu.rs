@@ -48,8 +48,9 @@
 //! factorization stays valid and the caller may keep solving with the stale
 //! basis (the "stale costs tightness, never soundness" doctrine of the
 //! surrounding simplex) or refactorize/repair as it sees fit. Nothing here
-//! panics on numerically bad input; panics are reserved for caller bugs
-//! (wrong lengths, out-of-range indices).
+//! panics on numerically bad input; `update` treats malformed caller-shaped
+//! arguments (wrong lengths, out-of-range leaving positions) as closed
+//! singular declines.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -965,7 +966,139 @@ impl LuEngine {
                 self.lrows[i].push(k);
             }
         }
+        #[cfg(any(test, debug_assertions))]
+        self.assert_well_formed();
         Ok(())
+    }
+
+    /// Debug/test-only validation of the representation invariants that the
+    /// checked and unchecked solve paths rely on. Release builds pay nothing;
+    /// tests and debug builds get a direct corruption tripwire at factor/update
+    /// boundaries.
+    #[cfg(any(test, debug_assertions))]
+    fn assert_well_formed(&self) {
+        let m = self.m;
+        assert_eq!(self.stage_row.len(), m, "stage_row length");
+        assert_eq!(self.row_stage.len(), m, "row_stage length");
+        assert_eq!(self.stage_pos.len(), m, "stage_pos length");
+        assert_eq!(self.pos_stage.len(), m, "pos_stage length");
+        assert_eq!(self.lcols.len(), m, "lcols length");
+        assert_eq!(self.udiag.len(), m, "udiag length");
+        assert_eq!(self.urows.len(), m, "urows length");
+        assert_eq!(self.ucols.len(), m, "ucols length");
+        assert_eq!(self.uorder.len(), m, "uorder length");
+        assert_eq!(self.upos.len(), m, "upos length");
+        assert_eq!(self.lrows.len(), m, "lrows length");
+        assert_eq!(self.scratch.len(), m, "scratch length");
+        assert_eq!(self.visit.len(), m, "visit length");
+
+        fn assert_inverse_perm(forward: &[usize], inverse: &[usize], what: &str) {
+            let m = forward.len();
+            assert_eq!(inverse.len(), m, "{what}: inverse length");
+            let mut seen = vec![false; m];
+            for (i, &v) in forward.iter().enumerate() {
+                assert!(v < m, "{what}: forward[{i}]={v} out of range");
+                assert!(!seen[v], "{what}: duplicate forward value {v}");
+                seen[v] = true;
+                assert_eq!(inverse[v], i, "{what}: inverse mismatch at {v}");
+            }
+            assert!(
+                seen.into_iter().all(|b| b),
+                "{what}: forward is not a permutation"
+            );
+        }
+
+        assert_inverse_perm(&self.stage_row, &self.row_stage, "row permutation");
+        assert_inverse_perm(&self.stage_pos, &self.pos_stage, "position permutation");
+        assert_inverse_perm(&self.uorder, &self.upos, "U pivot order");
+
+        let mut lnnz = 0usize;
+        let mut reconstructed_lrows = vec![Vec::new(); m];
+        let mut seen = vec![false; m];
+        for (k, col) in self.lcols.iter().enumerate() {
+            for &(i, lv) in col {
+                assert!(i < m, "L column {k}: row {i} out of range");
+                assert!(i > k, "L column {k}: row {i} is not below diagonal");
+                assert!(lv.is_finite(), "L column {k}: non-finite multiplier");
+                assert!(!seen[i], "L column {k}: duplicate row {i}");
+                seen[i] = true;
+                reconstructed_lrows[i].push(k);
+                lnnz += 1;
+            }
+            for &(i, _) in col {
+                seen[i] = false;
+            }
+        }
+        assert_eq!(self.lnnz, lnnz, "L nonzero counter");
+        assert_eq!(self.lrows, reconstructed_lrows, "L row pattern");
+
+        let mut unnz = 0usize;
+        for (k, row) in self.urows.iter().enumerate() {
+            assert!(
+                self.udiag[k].is_finite() && self.udiag[k].abs() > UPDATE_PIVOT_TOL,
+                "U diagonal {k} is invalid: {}",
+                self.udiag[k]
+            );
+            for &(c, uv) in row {
+                assert!(c < m, "U row {k}: column {c} out of range");
+                assert!(
+                    self.upos[k] < self.upos[c],
+                    "U row {k}: column {c} violates triangular order"
+                );
+                assert!(uv.is_finite(), "U row {k}: non-finite value");
+                assert!(!seen[c], "U row {k}: duplicate column {c}");
+                seen[c] = true;
+                assert!(
+                    self.ucols[c].contains(&k),
+                    "U column pattern for {c} misses actual row {k}"
+                );
+                unnz += 1;
+            }
+            for &(c, _) in row {
+                seen[c] = false;
+            }
+        }
+        assert_eq!(self.unnz, unnz, "U nonzero counter");
+        for (c, pat) in self.ucols.iter().enumerate() {
+            for &k in pat {
+                assert!(k < m, "U column pattern {c}: row {k} out of range");
+            }
+        }
+
+        let mut eta_nnz = 0usize;
+        for (idx, eta) in self.etas.iter().enumerate() {
+            assert!(eta.row < m, "eta {idx}: row {} out of range", eta.row);
+            for &(c, mu) in &eta.terms {
+                assert!(c < m, "eta {idx}: column {c} out of range");
+                assert!(mu.is_finite(), "eta {idx}: non-finite multiplier");
+                assert!(!seen[c], "eta {idx}: duplicate column {c}");
+                seen[c] = true;
+                eta_nnz += 1;
+            }
+            for &(c, _) in &eta.terms {
+                seen[c] = false;
+            }
+        }
+        assert_eq!(self.eta_nnz, eta_nnz, "eta nonzero counter");
+
+        assert!(
+            self.scratch.iter().all(|&v| v == 0.0),
+            "shared solve scratch must be clean between solves"
+        );
+        assert!(
+            self.u_res.iter().all(|&v| v == 0.0),
+            "update residual scratch must be clean between updates"
+        );
+        assert!(
+            self.u_inq.iter().all(|&b| !b),
+            "update heap-membership scratch must be clean between updates"
+        );
+        assert!(self.u_heap.is_empty(), "update heap must be clean");
+        assert!(self.stack.is_empty(), "DFS stack must be clean");
+        assert!(
+            self.sortbuf.iter().all(|&v| v == usize::MAX),
+            "count-sort scratch must be clean"
+        );
     }
 
     /// Solve `B x = b` in place: on entry `x` is the dense right-hand side
@@ -1484,9 +1617,6 @@ impl LuEngine {
         ftran_result: &[f64],
     ) -> Result<(), Singular> {
         let m = self.m;
-        assert!(leaving_pos < m, "update: position out of range");
-        assert_eq!(ftran_result.len(), m, "update: ftran length");
-        let t = self.pos_stage[leaving_pos];
         let _t0 = if lu_solve_stats() {
             Some(std::time::Instant::now())
         } else {
@@ -1502,9 +1632,23 @@ impl LuEngine {
             };
         }
 
+        if leaving_pos >= m || ftran_result.len() != m {
+            upd_stat!();
+            return Err(Singular {
+                position: leaving_pos,
+            });
+        }
+        let t = self.pos_stage[leaving_pos];
+
         // Early O(1) rejection via the FT pivot identity.
         let d_pred = self.udiag[t] * ftran_result[leaving_pos];
         if !d_pred.is_finite() || d_pred.abs() <= UPDATE_PIVOT_TOL {
+            upd_stat!();
+            return Err(Singular {
+                position: leaving_pos,
+            });
+        }
+        if ftran_result.iter().any(|v| !v.is_finite()) {
             upd_stat!();
             return Err(Singular {
                 position: leaving_pos,
@@ -1530,6 +1674,22 @@ impl LuEngine {
         res.resize(m, 0.0);
         inq.resize(m, false);
         q.clear();
+        macro_rules! reject_update {
+            () => {{
+                res.fill(0.0);
+                inq.fill(false);
+                q.clear();
+                self.u_w = w;
+                self.u_v = v;
+                self.u_res = res;
+                self.u_inq = inq;
+                self.u_heap = q;
+                upd_stat!();
+                return Err(Singular {
+                    position: leaving_pos,
+                });
+            }};
+        }
         let mut _tph = _t0.map(|_| std::time::Instant::now());
         if ft_fast_update() {
             // SAFETY: `stage_pos` is a permutation of `0..m`, so `stage_pos[k] < m`
@@ -1566,6 +1726,9 @@ impl LuEngine {
                 v[k] = s;
             }
         }
+        if v.iter().any(|vk| !vk.is_finite()) {
+            reject_update!();
+        }
 
         if let Some(t) = _tph.as_mut() {
             FT_SPIKE_NANOS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
@@ -1589,6 +1752,10 @@ impl LuEngine {
                 continue; // cancelled exactly — no eta term, no fill
             }
             let mu = val / self.udiag[c];
+            if !mu.is_finite() {
+                terms.push((c, mu));
+                continue;
+            }
             terms.push((c, mu));
             for &(c2, v2) in &self.urows[c] {
                 if !inq[c2] {
@@ -1597,6 +1764,9 @@ impl LuEngine {
                 }
                 res[c2] -= mu * v2;
             }
+        }
+        if terms.iter().any(|&(_, mu)| !mu.is_finite()) || res.iter().any(|v| !v.is_finite()) {
+            reject_update!();
         }
         // `res` (self-cleared on drain), `inq` (reset on pop) and the drained
         // `q` return to the pool clean; `w` is no longer read. `v` is still
@@ -1705,6 +1875,8 @@ impl LuEngine {
             FT_COMMIT_NANOS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
         }
         upd_stat!();
+        #[cfg(any(test, debug_assertions))]
+        self.assert_well_formed();
         Ok(())
     }
 }
@@ -2264,6 +2436,72 @@ mod tests {
             "btran changed by rejected update"
         );
     }
+
+    #[test]
+    fn nonfinite_update_input_is_transactional() {
+        let m = 6usize;
+        let ident: Vec<Vec<(usize, f64)>> = (0..m).map(|r| vec![(r, 1.0)]).collect();
+        let mut eng = LuEngine::new(m);
+        eng.factor(&refs(&ident)).expect("identity factors");
+        let probe: Vec<f64> = (0..m).map(|r| 0.25 + r as f64).collect();
+        let mut ftran_before = probe.clone();
+        eng.ftran(&mut ftran_before);
+        let mut btran_before = probe.clone();
+        eng.btran(&mut btran_before);
+        let (nnz0, upd0) = (eng.nnz(), eng.updates());
+
+        let mut alpha = vec![0.0f64; m];
+        alpha[0] = 1.0;
+        alpha[3] = f64::NAN;
+        assert_eq!(eng.update(0, &alpha), Err(Singular { position: 0 }));
+
+        assert_eq!(eng.nnz(), nnz0);
+        assert_eq!(eng.updates(), upd0);
+        eng.assert_well_formed();
+        let mut ftran_after = probe.clone();
+        eng.ftran(&mut ftran_after);
+        assert_eq!(
+            ftran_before, ftran_after,
+            "ftran changed by rejected non-finite update"
+        );
+        let mut btran_after = probe.clone();
+        eng.btran(&mut btran_after);
+        assert_eq!(
+            btran_before, btran_after,
+            "btran changed by rejected non-finite update"
+        );
+    }
+
+    #[test]
+    fn malformed_update_arguments_fail_closed_without_panicking() {
+        let m = 5usize;
+        let ident: Vec<Vec<(usize, f64)>> = (0..m).map(|r| vec![(r, 1.0)]).collect();
+        let mut eng = LuEngine::new(m);
+        eng.factor(&refs(&ident)).expect("identity factors");
+        let probe: Vec<f64> = (0..m).map(|r| 0.75 + r as f64).collect();
+        let mut before = probe.clone();
+        eng.ftran(&mut before);
+        let (nnz0, upd0) = (eng.nnz(), eng.updates());
+
+        assert_eq!(
+            eng.update(m, &[0.0; 5]),
+            Err(Singular { position: m }),
+            "out-of-range leaving position must be a closed failure"
+        );
+        assert_eq!(
+            eng.update(0, &[1.0, 0.0]),
+            Err(Singular { position: 0 }),
+            "wrong-length FTRAN result must be a closed failure"
+        );
+
+        assert_eq!(eng.nnz(), nnz0);
+        assert_eq!(eng.updates(), upd0);
+        eng.assert_well_formed();
+        let mut after = probe;
+        eng.ftran(&mut after);
+        assert_eq!(before, after, "malformed update arguments changed FTRAN");
+    }
+
     /// (g) The sparse solves must agree with the dense ones bit-for-bit on
     /// the support and leave the scratch clean outside it — through factor
     /// AND through absorbed updates (etas change both reachability closures).
@@ -2345,5 +2583,133 @@ mod tests {
             accepted += 1;
         }
         check(&mut eng, "post-updates", &mut rng);
+    }
+
+    /// A longer update chain aimed at the operational failure modes that are
+    /// easy to miss with one-shot factors: lazy `ucols` staleness, eta-order
+    /// mistakes, and scratch left dirty by sparse FTRAN/BTRAN. The dense
+    /// reference is rebuilt from the current basis after every checkpoint, so
+    /// this validates the accumulated update product, not just local pivots.
+    #[test]
+    fn long_update_chain_keeps_sparse_dense_and_reject_paths_consistent() {
+        let m = 48usize;
+        let mut rng = Rng::new(0x5eed_cafe);
+        let mut cols = random_sparse_basis(m, &mut rng);
+        let mut eng = LuEngine::new(m);
+        eng.factor(&refs(&cols)).expect("initial factor");
+
+        let check_all =
+            |eng: &mut LuEngine, cols: &[Vec<(usize, f64)>], rng: &mut Rng, label: &str| {
+                eng.assert_well_formed();
+                let dense = Dense::factor(m, cols).expect("reference factor");
+                for trial in 0..6 {
+                    let mut rhs = vec![0.0f64; m];
+                    let mut rhs_sparse = vec![0.0f64; m];
+                    let mut nz = Vec::new();
+                    for _ in 0..(1 + rng.below(5)) {
+                        let r = rng.below(m);
+                        if rhs[r] == 0.0 {
+                            let v = 0.25 + rng.f();
+                            rhs[r] = v;
+                            rhs_sparse[r] = v;
+                            nz.push(r);
+                        }
+                    }
+
+                    let mut got = rhs.clone();
+                    eng.ftran(&mut got);
+                    let mut got_sparse = rhs_sparse;
+                    eng.ftran_nz(&mut got_sparse, &mut nz);
+                    let want = dense.solve(&rhs);
+                    let tol = 1e-7 * scale_of(&want);
+                    assert!(
+                        max_diff(&got, &want) <= tol,
+                        "{label} trial {trial}: dense ftran drift"
+                    );
+                    assert!(
+                        max_diff(&got_sparse, &want) <= tol,
+                        "{label} trial {trial}: sparse ftran drift"
+                    );
+
+                    let mut cost = vec![0.0f64; m];
+                    let mut cnz = Vec::new();
+                    for _ in 0..(1 + rng.below(4)) {
+                        let p = rng.below(m);
+                        if cost[p] == 0.0 {
+                            cost[p] = 0.25 + rng.f();
+                            cnz.push(p);
+                        }
+                    }
+                    let mut got_t = cost.clone();
+                    eng.btran(&mut got_t);
+                    let mut got_t_sparse = cost.clone();
+                    eng.btran_nz(&mut got_t_sparse, &mut cnz);
+                    let want_t = dense.solve_t(&cost);
+                    let tol = 1e-7 * scale_of(&want_t);
+                    assert!(
+                        max_diff(&got_t, &want_t) <= tol,
+                        "{label} trial {trial}: dense btran drift"
+                    );
+                    assert!(
+                        max_diff(&got_t_sparse, &want_t) <= tol,
+                        "{label} trial {trial}: sparse btran drift"
+                    );
+
+                    eng.assert_well_formed();
+                }
+            };
+
+        check_all(&mut eng, &cols, &mut rng, "initial");
+        let mut accepted = 0usize;
+        while accepted < 80 {
+            let pos = rng.below(m);
+            let cand = random_sparse_col(m, &mut rng);
+            let mut trial_cols = cols.clone();
+            trial_cols[pos] = cand.clone();
+            if Dense::factor(m, &trial_cols).is_none() {
+                continue;
+            }
+
+            let mut alpha = vec![0.0f64; m];
+            for &(r, v) in &cand {
+                alpha[r] += v;
+            }
+            eng.ftran(&mut alpha);
+            if eng.update(pos, &alpha).is_err() {
+                continue;
+            }
+            cols = trial_cols;
+            accepted += 1;
+            if accepted % 10 == 0 {
+                check_all(
+                    &mut eng,
+                    &cols,
+                    &mut rng,
+                    &format!("after {accepted} updates"),
+                );
+            }
+        }
+
+        // After a long eta chain, a rejected singular replacement must remain
+        // fully transactional. `alpha = e_q` is the FTRAN result for reusing
+        // current basis column q; replacing p != q with it is rank-deficient
+        // and must not perturb any solve state.
+        let p = 0usize;
+        let q = 1usize;
+        let probe: Vec<f64> = (0..m).map(|i| 0.5 + i as f64 / 7.0).collect();
+        let mut ftran_before = probe.clone();
+        eng.ftran(&mut ftran_before);
+        let mut btran_before = probe.clone();
+        eng.btran(&mut btran_before);
+        let mut alpha = vec![0.0f64; m];
+        alpha[q] = 1.0;
+        assert_eq!(eng.update(p, &alpha), Err(Singular { position: p }));
+        eng.assert_well_formed();
+        let mut ftran_after = probe.clone();
+        eng.ftran(&mut ftran_after);
+        let mut btran_after = probe;
+        eng.btran(&mut btran_after);
+        assert_eq!(ftran_before, ftran_after, "rejected update changed FTRAN");
+        assert_eq!(btran_before, btran_after, "rejected update changed BTRAN");
     }
 }

@@ -1379,7 +1379,7 @@ impl Executor {
     /// predicates so they cannot certify an UNSAT ground arithmetic atom as
     /// "supported" and let the SAT shortcut accept it with an empty model
     /// (#quantifier_consumer-arith).
-    fn term_mentions_completable_uf(&self, term: TermId) -> bool {
+    pub(in crate::executor) fn term_mentions_completable_uf(&self, term: TermId) -> bool {
         use ay_core::kani_compat::DetHashSet as HashSet;
         let mut visited: HashSet<TermId> = HashSet::default();
         let mut stack = vec![term];
@@ -9506,12 +9506,15 @@ pub(in crate::executor) fn is_pure_arith_bool_symbol(name: &str) -> bool {
 }
 
 /// True when `name` is an interpreted BitVector operator (closed-form theory
-/// function). Used only by `body_is_pure_arith_bool` so a BV-only `forall`
-/// declines the UF-completion certificate. Kept separate from
-/// `is_pure_arith_bool_symbol` so the UF-detection sites that use that predicate
-/// are unaffected.
+/// function). The frontend's reserved-operator table supplies declaration
+/// identity for the `bv*` family: a user UF such as `bvtrap` must not become an
+/// interpreted operator merely because its spelling shares that prefix.
+///
+/// Kept separate from `is_pure_arith_bool_symbol` because the callers use this
+/// narrower classification for BV evaluation, UF-adoption, and conservative
+/// certificate gates.
 fn is_interpreted_bv_symbol(name: &str) -> bool {
-    name.starts_with("bv")
+    (name.starts_with("bv") && ay_frontend::is_reserved_op_name(name))
         || matches!(
             name,
             "concat"
@@ -9521,7 +9524,6 @@ fn is_interpreted_bv_symbol(name: &str) -> bool {
                 | "rotate_left"
                 | "rotate_right"
                 | "repeat"
-                | "bv2nat"
                 | "nat2bv"
                 | "int2bv"
                 | "ubv_to_int"
@@ -9620,6 +9622,29 @@ mod skipped_quantifier_gate_tests {
             SkippedQuantifierMbqiGate::ExhaustivelySatisfied,
             "both Boolean values exhaust the binder domain"
         );
+    }
+
+    #[test]
+    fn interpreted_bv_operator_classification_rejects_user_prefixes() {
+        for builtin in [
+            "bvadd",
+            "bvsdiv",
+            "bvredand",
+            "concat",
+            "extract",
+            "int_to_bv",
+        ] {
+            assert!(
+                is_interpreted_bv_symbol(builtin),
+                "recognized BV operator {builtin} must stay interpreted"
+            );
+        }
+        for user in ["bvtrap", "bvshadow", "bv", "bv_custom_solver_fn"] {
+            assert!(
+                !is_interpreted_bv_symbol(user),
+                "user UF spelling {user} must not fabricate BV semantics"
+            );
+        }
     }
 }
 

@@ -251,6 +251,70 @@ fn bv_pc_values_are_split() {
 // Refutation: split system refutes at a shallow depth cap
 // ========================================================================
 
+/// Ground witnesses need a separate back-translation from the legacy
+/// counterexample fields.  PcSplitter drops the pinned pc argument and folds
+/// its equality out of each split clause, so the translator must use the exact
+/// output→input clause map and complete those erased pc bindings before the
+/// original derivation can validate.
+#[test]
+#[ntest::timeout(120_000)]
+fn split_ground_derivation_restores_pc_and_validates_on_original() {
+    use crate::bmc::{BmcConfig, BmcSolver};
+    use crate::ground_derivation::validate_ground_derivation;
+    use crate::ChcEngineResult;
+
+    let original = parse(
+        r#"
+(set-logic HORN)
+(declare-fun P (Int Int) Bool)
+(assert (forall ((pc Int) (x Int))
+    (=> (and (= pc 0) (= x 0)) (P pc x))))
+(assert (forall ((pc Int) (pc2 Int) (x Int) (y Int))
+    (=> (and (P pc x) (= pc 0) (= pc2 1) (= y (+ x 1)))
+        (P pc2 y))))
+(assert (forall ((pc Int) (x Int))
+    (=> (and (P pc x) (= pc 1) (= x 1)) false)))
+(check-sat)
+"#,
+    );
+    let result = split(original.clone());
+    assert_eq!(
+        result.problem.predicates().len(),
+        2,
+        "P must split into pc=0 and pc=1 locations"
+    );
+
+    let config = BmcConfig::default()
+        .with_max_depth(4)
+        .with_time_budget(std::time::Duration::from_secs(30))
+        .with_per_depth_timeout(std::time::Duration::from_secs(30));
+    let ChcEngineResult::Unsafe(counterexample) =
+        BmcSolver::new(result.problem.clone(), config).solve()
+    else {
+        panic!("split two-location fixture must have a shallow refutation");
+    };
+    let transformed = counterexample
+        .ground_derivation
+        .as_ref()
+        .expect("BMC must attach a transformed ground derivation");
+    validate_ground_derivation(&result.problem, transformed)
+        .expect("BMC derivation must validate on the split problem");
+
+    let translated = result
+        .back_translator
+        .translate_ground_derivation(transformed)
+        .expect("pc-split must reconstruct its exact original derivation");
+    validate_ground_derivation(&original, &translated)
+        .expect("reconstructed derivation must validate on the original clauses");
+    assert!(
+        translated
+            .steps
+            .iter()
+            .any(|step| step.env.contains_key("pc") || step.env.contains_key("pc2")),
+        "input-clause completion must restore at least one erased pc binding"
+    );
+}
+
 /// The flat tower needs 11 derivation steps to reach the bug (P/Q are
 /// self-recursive with pc folded into the predicate, so inlining cannot
 /// shorten anything). After the split, the per-location predicates form an

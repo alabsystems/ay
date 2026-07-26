@@ -225,7 +225,7 @@ def test_tactic_solver_sat_model_is_valid():
 # z3py cross-check (4.15.4 if available), else skip gracefully.
 # ===========================================================================
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="z3py (real z3) not importable; cross-check skipped")
+@pytest.mark.usefixtures("required_reference_z3")
 @pytest.mark.parametrize("which,expected", [
     ("sat_bool", "sat"),
     ("sat_int", "sat"),
@@ -330,7 +330,7 @@ def test_qe_light_solver_matches_plain_solver(builder, expected):
     assert s.check() == base
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="z3py (real z3) not importable; cross-check skipped")
+@pytest.mark.usefixtures("required_reference_z3")
 @pytest.mark.parametrize("which,expected", [
     ("exists_sat", "sat"),
     ("exists_unsat", "unsat"),

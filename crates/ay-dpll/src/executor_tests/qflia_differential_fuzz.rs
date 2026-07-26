@@ -315,6 +315,27 @@ struct FuzzStats {
     unknown: usize,
 }
 
+/// Run an explicitly requested extended campaign.
+///
+/// The `qflia_differential_campaign` example is the non-test entry point; unit
+/// tests below keep their fixed, bounded seed sets.
+#[allow(dead_code)]
+pub(crate) fn run_campaign(
+    seeds: u64,
+    z3: Option<&std::path::Path>,
+    check_incremental: bool,
+) -> (usize, usize, usize) {
+    let mut stats = FuzzStats {
+        sat: 0,
+        unsat: 0,
+        unknown: 0,
+    };
+    for seed in 0..seeds {
+        run_seed(seed, z3, check_incremental, &mut stats);
+    }
+    (stats.sat, stats.unsat, stats.unknown)
+}
+
 fn run_seed(
     seed: u64,
     z3: Option<&std::path::Path>,
@@ -383,13 +404,6 @@ fn run_seed(
     }
 }
 
-fn find_z3() -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join("z3"))
-        .find(|candidate| candidate.is_file())
-}
-
 /// Default differential run: single-shot vs incremental vs brute-force
 /// witness oracle. Hermetic (no z3 dependency).
 #[test]
@@ -400,7 +414,8 @@ fn fuzz_qflia_single_shot_differential() {
         unknown: 0,
     };
     // Debug-build executor solves are ~0.2s each; keep the default run
-    // bounded. The heavy ignored tests cover thousands of seeds in release.
+    // bounded.  Additional deterministic strata below cover the historical
+    // failures outside this prefix.
     let seeds = 128u64;
     for seed in 0..seeds {
         run_seed(seed, None, true, &mut stats);
@@ -423,27 +438,24 @@ fn fuzz_qflia_single_shot_differential() {
     );
 }
 
-/// Heavy single-shot run: several thousand seeds, single-shot verdict vs the
-/// brute-force witness oracle vs z3 (when on PATH). This is the soundness
-/// evidence for the seed-236 false-UNSAT fix: the single-shot pipeline is
-/// what downstream proof-back (k-induction/IC3 SAFE confirmation) trusts.
-/// Run explicitly:
-/// `cargo test -p ay-dpll --release --lib fuzz_qflia_single_shot_heavy -- --ignored`
+/// A second, disjoint deterministic stratum for the single-shot pipeline.
+///
+/// Large randomized campaigns are useful performance/fuzzing jobs, but a unit
+/// test must be bounded and hermetic.  This range is always exercised and
+/// retains the independent brute-force witness oracle.
 #[test]
-#[ignore = "heavy: thousands of seeds + optional z3 cross-check"]
-fn fuzz_qflia_single_shot_heavy() {
-    let z3 = find_z3();
+fn fuzz_qflia_single_shot_bounded_stratum() {
     let mut stats = FuzzStats {
         sat: 0,
         unsat: 0,
         unknown: 0,
     };
-    let seeds = 5000u64;
-    for seed in 0..seeds {
-        run_seed(seed, z3.as_deref(), false, &mut stats);
+    let seeds = 32usize;
+    for seed in 128..128 + seeds as u64 {
+        run_seed(seed, None, false, &mut stats);
     }
     assert!(
-        stats.unknown * 100 <= seeds as usize,
+        stats.unknown * 100 <= seeds,
         "excessive unknown verdicts: {} of {seeds} (sat={}, unsat={})",
         stats.unknown,
         stats.sat,
@@ -451,8 +463,7 @@ fn fuzz_qflia_single_shot_heavy() {
     );
 }
 
-/// Heavy strict run: like the single-shot heavy run but ALSO requires
-/// single-shot/incremental agreement on every seed.
+/// Bounded strict strata requiring single-shot/incremental agreement.
 ///
 /// The seed-981 divergence this test was built to keep visible is FIXED:
 /// the push/pop incremental path returned a false UNSAT on a satisfiable
@@ -473,24 +484,26 @@ fn fuzz_qflia_single_shot_heavy() {
 /// tableau GCD conflict dropping fixed-slack equality reasons — see
 /// `regression_seed3167_tableau_gcd_unit_conflict`), also fixed.
 ///
-/// This run stays `#[ignore]` purely for runtime (thousands of release
-/// solves + optional z3 cross-checks), and must be green:
-/// `cargo test -p ay-dpll --release --lib fuzz_qflia_single_shot_differential_heavy -- --ignored`
+/// Rather than parking a thousands-seed campaign outside the default run, the
+/// always-on strata bracket both historical failures.  The exact failing
+/// seeds also remain as named witness regressions below.
 #[test]
-#[ignore = "heavy: thousands of seeds, strict single-shot/incremental agreement"]
-fn fuzz_qflia_single_shot_differential_heavy() {
-    let z3 = find_z3();
+fn fuzz_qflia_single_shot_incremental_bounded_strata() {
     let mut stats = FuzzStats {
         sat: 0,
         unsat: 0,
         unknown: 0,
     };
-    let seeds = 5000u64;
-    for seed in 0..seeds {
-        run_seed(seed, z3.as_deref(), true, &mut stats);
+    let strata = [976..986, 3162..3172];
+    let mut seeds = 0usize;
+    for range in strata {
+        for seed in range {
+            run_seed(seed, None, true, &mut stats);
+            seeds += 1;
+        }
     }
     assert!(
-        stats.unknown * 100 <= seeds as usize,
+        stats.unknown * 100 <= seeds,
         "excessive unknown verdicts: {} of {seeds} (sat={}, unsat={})",
         stats.unknown,
         stats.sat,
@@ -498,19 +511,78 @@ fn fuzz_qflia_single_shot_differential_heavy() {
     );
 }
 
-/// Diagnosis helper: print the generated script for a seed.
-/// `AY_FUZZ_DUMP_SEED=N cargo test -p ay-dpll --lib dump_qflia_fuzz_seed -- --ignored --nocapture`
+/// The generator itself is pinned: its current seed-236 script must remain
+/// stable, parse, and retain its explicit Boolean contradiction. The generated
+/// instance is NOT the minimized historical seed-236 SAT repro below: it
+/// contains both `b0` and `not b0`, so it is provably UNSAT and correctly has
+/// no box witness. Keeping that distinction explicit prevents the diagnostic
+/// seed label from being mistaken for a satisfiability contract.
 #[test]
-#[ignore = "diagnosis helper, requires AY_FUZZ_DUMP_SEED"]
-fn dump_qflia_fuzz_seed() {
-    let Some(seed) = std::env::var("AY_FUZZ_DUMP_SEED")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-    else {
-        return;
-    };
+fn generated_qflia_seed_236_is_stable_parseable_and_unsat() {
+    const EXPECTED_SCRIPT: &str = concat!(
+        "(set-logic QF_LIA)\n",
+        "(declare-const x0 Int)\n",
+        "(declare-const x1 Int)\n",
+        "(declare-const x2 Int)\n",
+        "(declare-const b0 Bool)\n",
+        "(declare-const b1 Bool)\n",
+        "(declare-const b2 Bool)\n",
+        "(assert (not (or (<= (+ (* -2 x0) (* 3 x1) (* 2 x0)) -1) ",
+        "(> (* -2 x1) -4) (not b1))))\n",
+        "(assert b1)\n",
+        "(assert (or (or (< (* 2 x2) 0) (> (* 1 x0) 2)) ",
+        "(and (not b1) (<= (* 2 x2) 5)) ",
+        "(or (< (+ (* 1 x2) (* -3 x1)) -1) b2 b0)))\n",
+        "(assert (not b0))\n",
+        "(assert b0)\n",
+        "(check-sat)\n",
+    );
+    let seed = 236;
     let assertions = gen_instance(seed);
-    println!("{}", instance_script(&assertions, false));
+    let script = instance_script(&assertions, false);
+    parse(&script).expect("seed-236 generated script must parse");
+    assert_eq!(
+        script, EXPECTED_SCRIPT,
+        "seed-236 generator output changed; review the pinned regression"
+    );
+    assert!(
+        script.contains("(assert b0)\n") && script.contains("(assert (not b0))\n"),
+        "generated seed-236 must retain its explicit b0 contradiction:\n{script}"
+    );
+    assert!(
+        box_witness(&assertions).is_none(),
+        "a syntactically contradictory instance cannot have a box witness"
+    );
+    assert_eq!(
+        solve_script(&script),
+        "unsat",
+        "generated seed-236 contradiction must be UNSAT"
+    );
+    assert!(
+        script.ends_with("(check-sat)\n"),
+        "generated single-shot script must issue check-sat"
+    );
+}
+
+/// A representative satisfiable generator output must parse and retain an
+/// independently checked satisfying witness.
+#[test]
+fn generated_qflia_seed_238_is_parseable_and_has_witness() {
+    let seed = 238;
+    let assertions = gen_instance(seed);
+    let script = instance_script(&assertions, false);
+    parse(&script).expect("seed-238 generated script must parse");
+    let (ints, bools) = ([-6, 1, -6], [false, false, false]);
+    assert!(
+        assertions
+            .iter()
+            .all(|assertion| eval_form(assertion, &ints, &bools)),
+        "seed-238 must retain its pinned satisfying witness"
+    );
+    assert!(
+        script.ends_with("(check-sat)\n"),
+        "generated single-shot script must issue check-sat"
+    );
 }
 
 /// Pinned regression: the exact seed-981 script whose PUSH/POP-WRAPPED solve

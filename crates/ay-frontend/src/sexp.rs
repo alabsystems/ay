@@ -352,7 +352,14 @@ impl<'a> SExprParser<'a> {
                     Token::Binary(b) => SExpr::Binary((*b).to_string()),
                     Token::String(s) => {
                         let contents = &s[1..s.len() - 1];
-                        SExpr::String(unescape_string_contents(contents))
+                        // Fail closed on a literal we cannot represent exactly.
+                        // Substituting a replacement character (or dropping the
+                        // escape) would change the string's length and silently
+                        // flip every str.len/membership verdict mentioning it.
+                        match unescape_string_contents(contents) {
+                            Ok(decoded) => SExpr::String(decoded),
+                            Err(err) => return Err(self.error_at_current(err.to_string())),
+                        }
                     }
                     Token::QuotedSymbol(s) => {
                         let inner = &s[1..s.len() - 1];

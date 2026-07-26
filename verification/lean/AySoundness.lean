@@ -8,6 +8,7 @@ import AySoundness.Datatype
 import AySoundness.BitVecThy
 import AySoundness.StringThy
 import AySoundness.SetThy
+import AySoundness.NiaProduct
 import AySoundness.Firewall
 import AySoundness.FpThy
 import AySoundness.FpUnderflow

@@ -5,10 +5,12 @@ and LRAT-checker tests on pushes and pull requests. These opt-in hooks provide
 earlier feedback and additional local soundness coverage; they supplement,
 rather than replace, the hosted CI checks.
 
-## `pre-push` — SMT soundness-differential gate
+## `pre-push` — zero-skip and SMT soundness gates
 
-When installed, the hook runs `scripts/ci/smt_soundness_gate.sh` before each
-push. It adds two complementary checks over the committed Tier-0 corpus:
+When installed, the hook first rejects active `pytest`/`unittest` skips and
+expected failures in tracked first-party Python, then runs
+`scripts/ci/smt_soundness_gate.sh`. The soundness gate adds two complementary
+checks over the committed Tier-0 corpus:
 
 1. **Hermetic declared-status regression check** — each `.smt2` is run through
    `libay_ffi` only and AY's verdict is compared to the file's declared
@@ -43,5 +45,6 @@ git push --no-verify
 ### Run the gate manually at any time
 
 ```sh
+python3 scripts/check_no_python_test_skips.py
 bash scripts/ci/smt_soundness_gate.sh
 ```

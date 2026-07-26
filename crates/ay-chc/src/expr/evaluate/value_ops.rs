@@ -364,8 +364,9 @@ fn big_rem_euclid(a: &BigInt, b: &BigInt) -> BigInt {
 /// `SmtValue::BigInt` model values), n-ary `Add`/`Sub`/`Mul`, `Neg`,
 /// `Div`/`Mod` with the same SMT-LIB total semantics (`(div x 0) = 0`,
 /// `(mod x 0) = x`, Euclidean), `Ite` (condition decided by
-/// [`evaluate_expr`]), and `Bv2Nat` (u128 → BigInt, always exact). Everything
-/// else abstains with `None` (fail-closed), same as the i128 lane.
+/// [`evaluate_expr`]), integer-valued array `Select`, and `Bv2Nat`
+/// (u128 → BigInt, always exact). Everything else abstains with `None`
+/// (fail-closed), same as the i128 lane.
 ///
 /// This folds the parser's Horner base-10^9 encodings of beyond-i128
 /// literals exactly, and lets beyond-i128 model witnesses be validated
@@ -439,6 +440,19 @@ pub(crate) fn eval_int_big(expr: &ChcExpr, model: &FxHashMap<String, SmtValue>) 
                 match evaluate_expr(&args[0], model)? {
                     SmtValue::Bool(true) => eval_int_big(&args[1], model),
                     SmtValue::Bool(false) => eval_int_big(&args[2], model),
+                    _ => None,
+                }
+            }
+            ChcExpr::Op(ChcOp::Select, args) if args.len() == 2 => {
+                // `evaluate_expr` already implements exact array lookup
+                // (including store chains and last-write-wins). Convert only
+                // a concrete integer result into this lane; other element
+                // sorts remain indeterminate. This is needed when the other
+                // side of a comparison overflows the i128 fast lane: a small
+                // integer select must still participate in the exact retry.
+                match evaluate_expr(expr, model)? {
+                    SmtValue::Int(n) => Some(BigInt::from(n)),
+                    SmtValue::BigInt(b) => Some(b.as_ref().clone()),
                     _ => None,
                 }
             }

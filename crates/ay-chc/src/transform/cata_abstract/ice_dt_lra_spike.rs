@@ -23,12 +23,10 @@
 use std::time::Duration;
 
 use ay_core::time::Instant;
-// The one workspace env choke point: serialized, restore-on-exit env mutation.
-use ay_test_support::env::{lock_env, ScopedEnvVar};
 
 use crate::{
-    ChcExpr, ChcParser, ChcProblem, ChcSort, ChcVar, ClauseBody, ClauseHead, HornClause,
-    InvariantModel, PdrConfig, PredicateId,
+    ChcExpr, ChcProblem, ChcSort, ChcVar, ClauseBody, ClauseHead, HornClause, InvariantModel,
+    PdrConfig, PredicateId,
 };
 
 /// Real literal `c/1`.
@@ -258,14 +256,9 @@ fn lra_ice_dt_never_false_safe_on_unsafe() {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// (D) SCALE experiment: the diagnosed case s3_srvr_4 (46-var single-pred Real
-//     TS, Boolean-rooted bad state). `#[ignore]`: reads a real benchmark whose
-//     absolute path is in `AY_LRA_TS`. Configurable atom set via `AY_LRA_BOOL_
-//     ONLY` (default 1: 3 Bool atoms only) and `AY_LRA_REAL_K` (# of leading
-//     Real columns to also cover with {0,1} bound atoms, default 0).
-//
-//     Run: AY_LRA_TS=<abs path> cargo test -p ay-chc --lib lra_ice_dt_s3_srvr
-//          -- --ignored --nocapture --test-threads=1
+// (D) SCALE-shape pin for the diagnosed s3_srvr_4 family. The ordinary test
+//     stays deterministic and built-in; external Real-TS campaigns run through
+//     the bounded corpus example.
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Build a bounded atom set for a raw single-pred TS: all Bool columns as 0/1
@@ -299,120 +292,27 @@ fn bounded_ts_atoms(pid: PredicateId, arg_sorts: &[ChcSort], real_k: usize) -> V
 }
 
 #[test]
-#[ignore = "manual scale experiment; requires an external benchmark in AY_LRA_TS"]
 fn lra_ice_dt_s3_srvr_4_scale() {
-    let path = match std::env::var("AY_LRA_TS") {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: set AY_LRA_TS to the absolute path of a single-pred Real .smt2 TS");
-            return;
-        }
-    };
-    let bool_only = std::env::var("AY_LRA_BOOL_ONLY")
-        .map(|v| v != "0")
-        .unwrap_or(true);
-    let real_k = if bool_only {
-        0
-    } else {
-        std::env::var("AY_LRA_REAL_K")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    };
-    let budget = Duration::from_secs(
-        std::env::var("AY_LRA_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(90),
-    );
-
-    let smt = std::fs::read_to_string(&path).expect("read TS benchmark");
-    let problem = ChcParser::parse(&smt).expect("benchmark CHC should parse");
-    let preds = problem.predicates();
-    eprintln!(
-        "\n=== s3_srvr scale: {} preds, {} clauses; atoms: bool_only={} real_k={} budget={:?} ===",
-        preds.len(),
-        problem.clauses().len(),
-        bool_only,
-        real_k,
-        budget
-    );
-    for p in preds {
-        let n_bool = p
-            .arg_sorts
-            .iter()
-            .filter(|s| matches!(s, ChcSort::Bool))
-            .count();
-        let n_real = p
-            .arg_sorts
-            .iter()
-            .filter(|s| matches!(s, ChcSort::Real))
-            .count();
-        eprintln!(
-            "  pred {} ({}): {} args ({} Bool, {} Real)",
-            p.id.index(),
-            p.name,
-            p.arg_sorts.len(),
-            n_bool,
-            n_real
-        );
-    }
-
-    // ── Direct executor probe: can AY's SMT decide the raw transition
-    //    relation at all? This isolates the SMT-core blocker from the learner.
-    {
-        use crate::smt::PdrExecutorBackend;
-        let mut backend = PdrExecutorBackend::new();
-        let probe_budget = Duration::from_secs(15);
-        for (ci, clause) in problem.clauses().iter().enumerate() {
-            let Some(c) = &clause.body.constraint else {
-                continue;
-            };
-            if clause.body.predicates.is_empty() {
-                continue; // fact clause — trivial
-            }
-            let t0 = Instant::now();
-            let res = backend.check_sat(c, probe_budget);
-            eprintln!(
-                "  [probe] clause {ci} raw body-constraint check_sat = {:?} in {:?}",
-                res,
-                t0.elapsed()
-            );
-        }
-    }
-
-    // Build one atom vec per predicate (index-aligned with predicate order).
-    let atoms: Vec<Vec<ChcExpr>> = preds
+    let (builtin, _) = monotone_counter();
+    let builtin_atoms: Vec<Vec<ChcExpr>> = builtin
+        .predicates()
         .iter()
-        .map(|p| bounded_ts_atoms(p.id, &p.arg_sorts, real_k))
+        .map(|p| bounded_ts_atoms(p.id, &p.arg_sorts, 1))
         .collect();
-    for (p, a) in preds.iter().zip(&atoms) {
-        eprintln!("  pred {} -> {} atoms", p.name, a.len());
-    }
-
-    let start = Instant::now();
-    let model = super::ice_dt::run_ice_dt_core(&problem, atoms, start + budget);
-    let wall = start.elapsed();
-
-    match &model {
-        Some(m) => {
-            eprintln!(
-                "[s3_srvr] DT core produced a candidate in {wall:?}:\n{}",
-                dump_model(&problem, m)
-            );
-            let ok = recert(&problem, m);
-            eprintln!(
-                "[s3_srvr] RE-SUBSTITUTION on ORIGINAL clauses: {}",
-                if ok { "PASS" } else { "FAIL" }
-            );
-            if ok {
-                eprintln!("[s3_srvr] *** SCALE WIN: DT invariant re-certifies s3_srvr_4 ***");
-            }
-        }
-        None => {
-            eprintln!("[s3_srvr] DT core returned None in {wall:?} (fail-closed: see AY_ICE_DT_TRACE for the exact reason)");
-        }
-    }
+    assert!(
+        builtin_atoms.iter().all(|atoms| !atoms.is_empty()),
+        "bounded Real columns must produce a finite atom set"
+    );
+    let builtin_model = super::ice_dt::run_ice_dt_core(
+        &builtin,
+        builtin_atoms,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .expect("bounded-atom DT core must solve the built-in Real counter");
+    assert!(
+        recert(&builtin, &builtin_model),
+        "bounded-atom model must re-certify on the original built-in clauses"
+    );
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -525,108 +425,21 @@ fn harvest_body_atoms(problem: &ChcProblem) -> Vec<Vec<ChcExpr>> {
 }
 
 #[test]
-#[ignore = "manual body-atom experiment; requires AY_LRA_TS and serial execution"]
 fn lra_ice_dt_s3_srvr_4_bodyatoms() {
-    let path = match std::env::var("AY_LRA_TS") {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: set AY_LRA_TS to the absolute path of a single-pred Real .smt2 TS");
-            return;
-        }
-    };
-    let budget = Duration::from_secs(
-        std::env::var("AY_LRA_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(120),
+    let (builtin, _) = monotone_counter();
+    let builtin_atoms = harvest_body_atoms(&builtin);
+    assert!(
+        builtin_atoms.iter().all(|atoms| !atoms.is_empty()),
+        "the built-in query guard must be harvested as a current-state atom"
     );
-    let atom_cap: usize = std::env::var("AY_LRA_ATOM_CAP")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(64);
-    // The raw-LRA guard harvest legitimately exceeds the cata default (40); let
-    // the core admit up to the u64 ceiling for this diagnostic run. Held for the
-    // rest of the test; serialized + restored on scope exit.
-    let _env_lock = lock_env();
-    let _max_atoms = ScopedEnvVar::set("AY_ICE_DT_MAX_ATOMS", &atom_cap.min(64).to_string());
-    let smt = std::fs::read_to_string(&path).expect("read TS benchmark");
-    let problem = ChcParser::parse(&smt).expect("benchmark CHC should parse");
-
-    let mut atoms = harvest_body_atoms(&problem);
-
-    // Optional column filter: AY_LRA_KEEP_COLS="0,1,2,14" keeps only atoms whose
-    // canonical vars all lie in the given column set (plus Bool columns, always).
-    // Empty ⇒ keep all. Lets the spike isolate which columns the invariant needs
-    // (e.g. bools + the program counter) from unbounded data columns whose guards
-    // generate endless non-reachable edges (the closure-stall divergence).
-    if let Ok(spec) = std::env::var("AY_LRA_KEEP_COLS") {
-        let keep: std::collections::HashSet<usize> = spec
-            .split(',')
-            .filter_map(|s| s.trim().parse().ok())
-            .collect();
-        for (pi, pred) in problem.predicates().iter().enumerate() {
-            let bool_cols: std::collections::HashSet<usize> = pred
-                .arg_sorts
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| matches!(s, ChcSort::Bool))
-                .map(|(i, _)| i)
-                .collect();
-            let pfx = format!("__cxd{}_", pred.id.index());
-            atoms[pi].retain(|atom| {
-                atom.vars().iter().all(|v| {
-                    v.name
-                        .strip_prefix(&pfx)
-                        .and_then(|s| s.parse::<usize>().ok())
-                        .is_some_and(|col| keep.contains(&col) || bool_cols.contains(&col))
-                })
-            });
-        }
-    }
-
-    for (p, a) in problem.predicates().iter().zip(&atoms) {
-        eprintln!(
-            "  pred {} -> {} harvested atoms (cap {})",
-            p.name,
-            a.len(),
-            atom_cap
-        );
-        for at in a.iter().take(70) {
-            eprintln!("      {}", InvariantModel::expr_to_smtlib(at));
-        }
-    }
-    // Trim to cap (keep first `atom_cap` — Bool cols first, then guards in
-    // clause order) so the u64 bitmask / MAX_ATOMS_PER_PRED hold.
-    for a in &mut atoms {
-        if a.len() > atom_cap {
-            a.truncate(atom_cap);
-        }
-    }
-
-    let start = Instant::now();
-    let model = super::ice_dt::run_ice_dt_core(&problem, atoms, start + budget);
-    let wall = start.elapsed();
-    match &model {
-        Some(m) => {
-            eprintln!(
-                "[bodyatoms] DT core produced a candidate in {wall:?}:\n{}",
-                dump_model(&problem, m)
-            );
-            let ok = recert(&problem, m);
-            eprintln!(
-                "[bodyatoms] RE-SUBSTITUTION on ORIGINAL clauses: {}",
-                if ok { "PASS" } else { "FAIL" }
-            );
-            if ok {
-                eprintln!(
-                    "[bodyatoms] *** SCALE WIN: body-harvested DT invariant re-certifies ***"
-                );
-            }
-        }
-        None => {
-            eprintln!(
-                "[bodyatoms] DT core returned None in {wall:?} (fail-closed: see AY_ICE_DT_TRACE)"
-            );
-        }
-    }
+    let builtin_model = super::ice_dt::run_ice_dt_core(
+        &builtin,
+        builtin_atoms,
+        Instant::now() + Duration::from_secs(10),
+    )
+    .expect("body-harvested DT core must solve the built-in Real counter");
+    assert!(
+        recert(&builtin, &builtin_model),
+        "body-harvested model must re-certify on the original built-in clauses"
+    );
 }

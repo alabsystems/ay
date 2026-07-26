@@ -96,7 +96,7 @@ const BODY_INSTANCE_CAP: usize = 8;
 const INDEX_TERM_CAP: usize = 6;
 
 /// Maximum ghost slots (index/value pairs) added to a single predicate.
-const MAX_SLOTS_PER_PREDICATE: usize = 4;
+const MAX_SLOTS_PER_PREDICATE: usize = 8;
 
 /// Ghost layout for one predicate.
 #[derive(Debug, Clone)]
@@ -325,6 +325,74 @@ pub(crate) fn instantiation_tuples(
     tuples
 }
 
+/// Build the trigger tuple that a false-head property clause actually
+/// observes for one body atom.
+///
+/// A diagonal tuple is insufficient for cross-array properties such as
+/// `c[bc + 4*i] = a[ba + 4*i] + b[bb + 4*i]`, and for `n=2` it misses
+/// adjacent-cell properties such as `a[k - 1] <= a[k]`. Trigger-based array
+/// encodings instantiate each array slot at the select/store terms that refer
+/// to that specific array argument. Repeating the sole observed index is a
+/// harmless fallback when a predicate requests multiple pairs but the clause
+/// observes only one cell.
+fn observed_access_tuple(
+    pred_spec: &GhostPredSpec,
+    n: usize,
+    atom_args: &[ChcExpr],
+    constraint: &ChcExpr,
+) -> Option<Vec<ChcExpr>> {
+    let mut tuple = Vec::with_capacity(pred_spec.slots(n));
+    for &array_position in &pred_spec.array_positions {
+        let array = atom_args.get(array_position)?;
+        let mut indices = Vec::new();
+        collect_access_indices_for_array(constraint, array, &mut indices, INDEX_TERM_CAP);
+        let first = indices.first()?.clone();
+        for slot in 0..n {
+            tuple.push(indices.get(slot).cloned().unwrap_or_else(|| first.clone()));
+        }
+    }
+    Some(tuple)
+}
+
+fn collect_access_indices_for_array(
+    expr: &ChcExpr,
+    array: &ChcExpr,
+    out: &mut Vec<ChcExpr>,
+    cap: usize,
+) {
+    crate::expr::maybe_grow_expr_stack(|| {
+        if out.len() >= cap {
+            return;
+        }
+        if let ChcExpr::Op(op, args) = expr {
+            if matches!(op, ChcOp::Select | ChcOp::Store)
+                && args
+                    .first()
+                    .is_some_and(|candidate| candidate.as_ref() == array)
+            {
+                if let Some(index) = args.get(1).map(|index| index.as_ref()) {
+                    if index.sort() == ChcSort::Int && !out.contains(index) {
+                        out.push(index.clone());
+                    }
+                }
+            }
+        }
+        match expr {
+            ChcExpr::Op(_, args)
+            | ChcExpr::PredicateApp(_, _, args)
+            | ChcExpr::FuncApp(_, _, args) => {
+                for arg in args {
+                    collect_access_indices_for_array(arg, array, out, cap);
+                }
+            }
+            ChcExpr::ConstArray(_, value) => {
+                collect_access_indices_for_array(value, array, out, cap);
+            }
+            _ => {}
+        }
+    });
+}
+
 /// Allocate one fresh variable of `sort` whose name collides with nothing in
 /// `used` (which is extended with the new name).
 fn fresh_var(prefix: &str, sort: ChcSort, used: &mut FxHashSet<String>) -> ChcVar {
@@ -434,16 +502,27 @@ impl ArrayGhostPairTransformer {
         for (pred_id, args) in &clause.body.predicates {
             match spec.preds.get(pred_id) {
                 Some(pred_spec) => {
-                    let tuples = instantiation_tuples(
-                        pred_spec.slots(spec.n),
-                        &fresh_exprs,
-                        &cands,
-                        BODY_INSTANCE_CAP,
-                    );
-                    // instantiation_tuples orders the pass-through tuple first
-                    // when available and never returns an empty set.
-                    if let Some(tuple) = tuples.first() {
-                        new_body_preds.push((*pred_id, spec.extend_args(*pred_id, args, tuple)));
+                    let observed = if matches!(&clause.head, ClauseHead::False) {
+                        clause.body.constraint.as_ref().and_then(|constraint| {
+                            observed_access_tuple(pred_spec, spec.n, args, constraint)
+                        })
+                    } else {
+                        None
+                    };
+                    let tuple = observed.or_else(|| {
+                        // instantiation_tuples orders the pass-through tuple
+                        // first when available and always has a fallback.
+                        instantiation_tuples(
+                            pred_spec.slots(spec.n),
+                            &fresh_exprs,
+                            &cands,
+                            BODY_INSTANCE_CAP,
+                        )
+                        .into_iter()
+                        .next()
+                    });
+                    if let Some(tuple) = tuple {
+                        new_body_preds.push((*pred_id, spec.extend_args(*pred_id, args, &tuple)));
                     }
                 }
                 None => new_body_preds.push((*pred_id, args.clone())),

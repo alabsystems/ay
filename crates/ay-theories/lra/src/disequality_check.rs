@@ -408,6 +408,8 @@ impl LraSolver {
         // (#inc-guard-chain).
         self.guard_clean_valid = false;
         self.guard_tracked_only = false;
+        // #warm-simplex: untracked value writes (and rollback below).
+        self.warm_invalidate();
         for (idx, &var) in vars.iter().enumerate() {
             if let Some(info) = self.vars.get_mut(var as usize) {
                 info.value = InfRational::from_rat(Rational::from(idx as i64));

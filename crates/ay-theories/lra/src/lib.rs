@@ -202,6 +202,7 @@ mod stats;
 mod tableau;
 mod theory_solver;
 mod types;
+mod warm_state;
 
 #[cfg(test)]
 mod rational_tests;
@@ -765,8 +766,14 @@ pub struct LraSolver {
     ///
     /// SOUNDNESS: every mutation that can create a new violation must set this
     /// false. Bounds only ever TIGHTEN inside a scope (both `assert_var_bound`
-    /// variants replace strictly-tighter only, so a pop restore is loosen-only
-    /// and cannot create a violation); values change only in `update_nonbasic`
+    /// variants replace strictly-tighter only). A pop is NOT loosen-only, despite
+    /// what this comment claimed before #8471: `retract_unjustified_var_bounds`
+    /// (farkas_collect.rs:798-802) `take()`s a live bound and trails it, so the pop
+    /// replay (lifecycle_scope.rs:47-56) can reinstate a bound where there is now
+    /// None — i.e. a pop CAN create a violation. That is safe because `pop_inner`
+    /// clears this memo on every path that replays the trail (lifecycle_scope.rs:304;
+    /// the `scopes`-empty early return at :36-38 replays nothing), not because of
+    /// any monotonicity; do not weaken that clear. Values change only in `update_nonbasic`
     /// (the single value chokepoint — simplex pivots route through it) plus the
     /// enumerated direct writers (`optimize_impl`, `round_integer_vars_*`,
     /// `try_repair_free_var_pair_disequalities`) and lifecycle resets — each of
@@ -936,6 +943,26 @@ pub struct LraSolver {
     implied_tighten_scratch: Vec<u8>,
     /// Dirty indices of `implied_tighten_scratch` (see above).
     implied_tighten_touched: Vec<u32>,
+    /// #cib-alloc: persistent per-call scratch buffers for
+    /// `compute_implied_bounds`, replacing the former per-call `Vec::new()`
+    /// allocations. The correct-mode profile on fisher_star.ind showed ~500
+    /// samples inside `compute_implied_bounds` in `finish_grow`/`grow_one`/
+    /// `RawVecInner` (Vec allocation + growth scaffolding), because the
+    /// function is re-entered many times per check (the run_post_simplex
+    /// fixpoint) and each entry freshly allocated these vectors. Each buffer is
+    /// `mem::take`n at entry and restored at exit; every use clears the buffer
+    /// before writing, so reuse is byte-identical (same derived bounds, order,
+    /// and verdicts) — it only avoids the per-call malloc/realloc.
+    ib_lb_contribs_scratch: Vec<(usize, Rational, bool)>,
+    ib_ub_contribs_scratch: Vec<(usize, Rational, bool)>,
+    ib_lb_contribs_f64_scratch: Vec<f64>,
+    ib_ub_contribs_f64_scratch: Vec<f64>,
+    ib_updates_scratch: Vec<(usize, Option<ImpliedBound>, Option<ImpliedBound>)>,
+    ib_row_indices_scratch: Vec<usize>,
+    ib_round_newly_bounded_scratch: Vec<u32>,
+    ib_cross_neg_updates_scratch: Vec<(usize, Option<ImpliedBound>, Option<ImpliedBound>)>,
+    ib_cascade_rows_scratch: Vec<usize>,
+    ib_fixed_vars_scratch: Vec<u32>,
     /// Cumulative implied-bound work (compute_implied_bounds calls + derivations)
     /// this solver lifetime. Bounded by `implied_work_budget` so the outer DPLL(T)
     /// re-entry oscillation terminates deterministically. NOT reset on pop (that is
@@ -1103,6 +1130,13 @@ pub struct LraSolver {
     /// Set to false after `rebuild_infeasible_heap()`. When false, incremental
     /// `track_var_feasibility()` calls keep the heap current (#8782).
     heap_stale: bool,
+    /// #warm-simplex (`AY_LRA_WARM_SIMPLEX_STATE`, default OFF): delta-only
+    /// simplex bookkeeping across pops — persistent infeasible-candidate
+    /// structures, a non-basic dirty set replacing the O(vars) SAT-exit scan,
+    /// and a last-feasible value delta for conflict recovery. See
+    /// `warm_state.rs` for the full invariant story. All reads are gated on
+    /// `warm.enabled`; flag OFF keeps today's code paths byte-identical.
+    pub(crate) warm: warm_state::WarmSimplexState,
     /// Speculative f64 simplex shadow state (Tier 0, #8184).
     #[allow(dead_code)]
     float_simplex: simplex::float_simplex::FloatSimplex,
@@ -1196,6 +1230,30 @@ pub struct LraSolver {
     /// #8599: Persistent buffer for all_newly_bounded in propagate_impl()
     /// fixpoint loop. Avoids per-propagation HashSet allocation.
     all_newly_bounded_buf: DenseU32Set,
+    /// reason-alloc-wip: reused DFS scratch for implied-bound reason collection.
+    ///
+    /// `collect_reasons_from_explanation` / `collect_row_reasons_dedup` /
+    /// `collect_single_row_reasons` / `make_eager_implied_propagation_reasons`
+    /// walk the implied-bound explanation graph and previously allocated a
+    /// fresh `HashSet::default()` for their `visited`/`on_stack`/`seen` working
+    /// sets on EVERY call — a hot per-propagation allocation (profiled as
+    /// HashMap-insert + reserve_rehash churn on the derivation hot path). These
+    /// three cells hold those sets across calls so the allocation is amortized.
+    ///
+    /// PURE SCRATCH, never solver state (excluded from snapshots / equality).
+    /// Behind `RefCell` because the reason-collection methods take `&self`
+    /// (callers hold live `&self.implied_bounds` borrows across the call, so
+    /// `&mut self` is unavailable). Borrowed via a `ReasonScratch` guard that
+    /// `mem::take`s the set out (momentary borrow only) and CLEARS on acquire.
+    /// Clearing before every traversal is load-bearing for byte-identity: a
+    /// stale membership entry would skip a graph node, drop a real antecedent,
+    /// and change the reason set (a potentially different/over-strong UNSAT
+    /// core). Taking the set out means accidental future re-entrancy cannot
+    /// panic on a double `borrow_mut` — a nested user gets the empty
+    /// placeholder and allocates, which stays correct.
+    scratch_reason_visited: std::cell::RefCell<HashSet<(u32, bool)>>,
+    scratch_reason_on_stack: std::cell::RefCell<HashSet<(u32, bool)>>,
+    scratch_reason_seen: std::cell::RefCell<HashSet<(TermId, bool)>>,
 }
 
 // SAFETY: LraSolver contains a `*const TermStore` raw pointer (`terms_ptr`)
@@ -1432,6 +1490,7 @@ impl LraSolver {
             heap_epoch: 1,
             in_infeasible_heap: Vec::new(),
             heap_stale: true,
+            warm: warm_state::WarmSimplexState::new(),
             float_simplex: simplex::float_simplex::FloatSimplex::new(),
             reason_seen_buf: HashSet::default(),
             not_inner_cache: HashMap::default(),
@@ -1461,6 +1520,11 @@ impl LraSolver {
             propagation_output_buf: Vec::new(),
             interval_reason_seen_buf: HashSet::default(),
             all_newly_bounded_buf: DenseU32Set::default(),
+            // reason-alloc-wip: reused reason-collection DFS scratch (pure
+            // scratch, cleared on each use — starts empty).
+            scratch_reason_visited: std::cell::RefCell::default(),
+            scratch_reason_on_stack: std::cell::RefCell::default(),
+            scratch_reason_seen: std::cell::RefCell::default(),
         }
     }
 }

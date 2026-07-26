@@ -2821,10 +2821,8 @@ fn test_bve_heavy_elimination_stress_8494() {
     }
 }
 
-/// Multi-round BVE with BCE interleaving: validates that suppress_prior_witness_entries
-/// correctly handles the case where BCE removes clauses for a variable, then BVE
-/// eliminates that variable in a later round. The reconstruction must handle
-/// the non-contiguous witness entries (BCE entries suppressed, BVE entries active).
+/// Multi-round BVE with BCE enabled validates that retained witness entries
+/// reconstruct every original clause when the passes interleave.
 ///
 /// Regression coverage for #8494 + #8179 interaction.
 #[test]
@@ -2834,19 +2832,10 @@ fn test_bve_bce_interleaved_reconstruction_8494() {
     // - Variable 10: BCE-blocked + BVE-eliminable
     // - Variable 11: BVE-eliminable (round 2, references var 10's core connections)
     //
-    // BCE removes clause (v10 | v0 | v1) because v10 is a blocking literal.
-    // BVE then eliminates v10 using (v10 | v2) and (!v10 | v3).
-    // The BCE entry for v10 must be suppressed so it doesn't double-flip v10
-    // during reconstruction.
     let num_vars = 12;
     let mut solver = Solver::new(num_vars);
 
     let mut original_clauses: Vec<Vec<Literal>> = Vec::new();
-
-    // BCE-eligible clause: (v10 | v0 | v1) — v10 blocks if all
-    // resolvents against !v10 clauses are tautological. We set up the
-    // formula so this may or may not get BCE'd depending on the solver's
-    // BCE heuristics. The test verifies correctness regardless.
 
     // BVE-eligible: v10 has low occurrence count.
     let c1 = vec![
@@ -2907,12 +2896,7 @@ fn test_bve_bce_interleaved_reconstruction_8494() {
                 );
             }
         }
-        _ => {
-            // UNSAT would indicate a solver bug since the formula is
-            // SAT by all-true, but Unknown is acceptable if reconstruction
-            // fails (the fail-closed path converts it to Unknown).
-            // We primarily care that no FINALIZE_SAT_FAIL occurs.
-        }
+        other => panic!("#8494: formula is SAT by all-true, got {other:?}"),
     }
 }
 

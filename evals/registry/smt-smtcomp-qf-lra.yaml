@@ -1,14 +1,14 @@
 # Andrew Yates <andrewyates.name@gmail.com>
-# Eval spec for the locally provisioned SMT-LIB QF_LRA corpus
+# Eval spec for the published SMT-COMP 2025 QF_LRA selection
 id: smt-smtcomp-qf-lra
-version: 1
+version: 2
 description: >
-  Every QF_LRA benchmark provisioned under benchmarks/smtcomp/QF_LRA from the
-  SMT-LIB 2024 archive (Zenodo record 11061097). This is a potentially long
-  full-corpus AY-vs-Z3 run, not a preselected sample.
+  Every QF_LRA benchmark in the published SMT-COMP 2025 single-query selection
+  archive (Zenodo record 16887742). This is a potentially long full-selection
+  AY-vs-Z3 run.
 owner: andrewyates.name@gmail.com
 inputs:
-  benchmarks_dir: benchmarks/smtcomp/QF_LRA
+  benchmarks_dir: benchmarks/smtcomp/2025/single-query/single_query/QF_LRA
   reference_solver: z3
   timeout_sec: 30
   runs: 1
@@ -24,9 +24,9 @@ metrics:
 outputs:
   results_dir: evals/results/smt-smtcomp-qf-lra/{run_id}
 setup:
-  download: scripts/download_smtcomp_benchmarks.sh --logic QF_LRA
+  download: ay corpus download smtcomp-2025-single-query
   note: >
-    Run scripts/download_smtcomp_benchmarks.sh --logic QF_LRA to populate
-    benchmarks/smtcomp/QF_LRA/ from the Zenodo SMT-LIB 2024 release. Record the
-    exact corpus inventory, binary provenance, timeout, and enforced resource
-    envelope with any results you cite.
+    Download the pinned SMT-COMP 2025 single-query archive, then run all QF_LRA
+    instances selected by the organizers. Record the exact corpus inventory,
+    binary provenance, timeout, and enforced resource envelope with any results
+    you cite.

@@ -22,6 +22,12 @@
 //! costs quality), but it is **never** higher than the true optimum (that would be
 //! catastrophic).
 //!
+//! For non-negative linear objectives with pairwise-disjoint unit-cover rows, we
+//! also derive the exact continuous floor by summing the cheapest required costs
+//! per disjoint support. The returned bound is the maximum of that independently
+//! sound floor and NS. This recovers an integer that NS can lose solely to its
+//! conservative f64 error subtraction.
+//!
 //! # Why NS is sound regardless of LP-solver accuracy
 //!
 //! The keystone is **LP weak duality**, which holds for *any* non-negative dual
@@ -161,6 +167,32 @@ const STALL_BEFORE_BLAND: usize = 8000;
 /// instead of grinding indefinitely. Bounds work, never soundness.
 const SIMPLEX_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Advisory simplex stop controls. Production uses a wall deadline plus the
+/// hard cap; regressions can omit the clock and use a fixed iteration count so
+/// scheduler delay cannot change whether a fixture converges.
+#[derive(Clone, Copy)]
+struct SimplexLimits {
+    deadline: Option<std::time::Instant>,
+    iterations_per_phase: usize,
+}
+
+impl SimplexLimits {
+    fn wall(budget: std::time::Duration) -> Self {
+        Self {
+            deadline: Some(std::time::Instant::now() + budget),
+            iterations_per_phase: MAX_SIMPLEX_ITERS,
+        }
+    }
+
+    #[cfg(test)]
+    const fn iterations(iterations_per_phase: usize) -> Self {
+        Self {
+            deadline: None,
+            iterations_per_phase,
+        }
+    }
+}
+
 /// Computes a **sound** NS lower bound for `min objective` subject to
 /// `constraints`, all variables Boolean. Returns `Some(lb)` with `lb <= IntOpt`
 /// guaranteed, or `None` (always safe) when it declines.
@@ -178,11 +210,90 @@ pub(crate) fn safe_lp_lower_bound(
     safe_lp_bound_and_point(objective, constraints, num_vars, should_stop).0
 }
 
+/// Exact combinatorial floor for pairwise-disjoint unit-cover rows.
+///
+/// For a row `sum_{v in S} x_v >= k` under a non-negative linear objective,
+/// every feasible assignment pays at least the sum of the `k` cheapest costs in
+/// `S`. Such floors add across disjoint supports. Duplicate rows are collapsed;
+/// any unsupported term shape declines the whole helper. This is independent of
+/// floating point and can recover the integer unit lost when NS subtracts its
+/// conservative f64 error envelope.
+fn disjoint_unit_cover_lower_bound(
+    objective: &PbObjective,
+    constraints: &[PbConstraint],
+    num_vars: u32,
+) -> Option<i128> {
+    let n = usize::try_from(num_vars).ok()?;
+    let mut costs = vec![0i128; n];
+    for term in &objective.terms {
+        let [lit] = term.lits.as_slice() else {
+            return None;
+        };
+        let variable = usize::try_from(lit.var).ok()?.checked_sub(1)?;
+        if lit.negated || variable >= n || term.coeff < 0 {
+            return None;
+        }
+        costs[variable] = costs[variable].checked_add(term.coeff)?;
+    }
+
+    let mut candidates: Vec<(Vec<usize>, i128)> = Vec::new();
+    for constraint in constraints {
+        if constraint.rel != PbRel::Ge || constraint.rhs <= 0 {
+            continue;
+        }
+        let required = usize::try_from(constraint.rhs).ok()?;
+        let mut support = Vec::with_capacity(constraint.terms.len());
+        for term in &constraint.terms {
+            let [lit] = term.lits.as_slice() else {
+                return None;
+            };
+            let variable = usize::try_from(lit.var).ok()?.checked_sub(1)?;
+            if lit.negated || variable >= n || term.coeff != 1 {
+                return None;
+            }
+            support.push(variable);
+        }
+        support.sort_unstable();
+        if support.windows(2).any(|pair| pair[0] == pair[1]) || required > support.len() {
+            return None;
+        }
+        let mut row_costs: Vec<i128> = support.iter().map(|&variable| costs[variable]).collect();
+        row_costs.sort_unstable();
+        let floor = row_costs
+            .into_iter()
+            .take(required)
+            .try_fold(0i128, |sum, cost| sum.checked_add(cost))?;
+        candidates.push((support, floor));
+    }
+    candidates.sort_by(|(left_support, left_floor), (right_support, right_floor)| {
+        right_floor
+            .cmp(left_floor)
+            .then_with(|| left_support.cmp(right_support))
+    });
+    candidates.dedup_by(|(left, _), (right, _)| left == right);
+
+    let mut used = vec![false; n];
+    let mut bound = 0i128;
+    let mut selected = false;
+    for (support, floor) in candidates {
+        if support.iter().any(|&variable| used[variable]) {
+            continue;
+        }
+        for &variable in &support {
+            used[variable] = true;
+        }
+        bound = bound.checked_add(floor)?;
+        selected = true;
+    }
+    selected.then_some(bound)
+}
+
 /// Like [`safe_lp_lower_bound`] but ALSO returns the LP relaxation's primal
 /// optimum point `x in [0,1]^n` (one entry per variable, index `v` = PB var
 /// `v + 1`) for **advisory** use by branch-and-bound (branching / incumbent
-/// rounding). The bound half is exactly as sound as [`safe_lp_lower_bound`]: it
-/// is the NS bound from the clamped dual, unaffected by the primal point.
+/// rounding). The bound half is exactly as sound as [`safe_lp_lower_bound`]: the
+/// maximum of the NS bound and the exact disjoint-unit-cover floor, both
+/// unaffected by the primal point.
 ///
 /// Returns `(Some(lb), Some(point))` on a successful solve, `(Some(lb), None)`
 /// when a bound was derivable but the primal point is unavailable/unusable, or
@@ -198,18 +309,58 @@ pub(crate) fn safe_lp_bound_and_point(
     num_vars: u32,
     should_stop: &dyn Fn() -> bool,
 ) -> (Option<i128>, Option<Vec<f64>>) {
+    safe_lp_bound_and_point_with_limits(
+        objective,
+        constraints,
+        num_vars,
+        SimplexLimits::wall(SIMPLEX_TIME_BUDGET),
+        should_stop,
+    )
+}
+
+#[cfg(test)]
+fn safe_lp_bound_and_point_with_iteration_budget(
+    objective: &PbObjective,
+    constraints: &[PbConstraint],
+    num_vars: u32,
+    iterations_per_phase: usize,
+    should_stop: &dyn Fn() -> bool,
+) -> (Option<i128>, Option<Vec<f64>>) {
+    safe_lp_bound_and_point_with_limits(
+        objective,
+        constraints,
+        num_vars,
+        SimplexLimits::iterations(iterations_per_phase),
+        should_stop,
+    )
+}
+
+fn safe_lp_bound_and_point_with_limits(
+    objective: &PbObjective,
+    constraints: &[PbConstraint],
+    num_vars: u32,
+    limits: SimplexLimits,
+    should_stop: &dyn Fn() -> bool,
+) -> (Option<i128>, Option<Vec<f64>>) {
     let Some(model) = LpF64::build(objective, constraints, num_vars) else {
         return (None, None);
     };
     // Approximate optimal dual `y >= 0` (one per row) AND the primal point.
     // Accuracy only affects tightness/branching; we clamp `y` to `>= 0` before
     // using it so NS validity holds regardless of the simplex's accuracy.
-    let solved = model.solve(should_stop);
+    let solved = bounded_simplex_solve_with_limits(&model, should_stop, None, limits);
     let y = match &solved {
         Some(SimplexResult { dual, .. }) if dual.len() == model.rows.len() => clamp_dual(dual),
         _ => vec![0.0; model.rows.len()],
     };
-    let bound = ns_safe_bound(&model, &y);
+    let bound = match (
+        ns_safe_bound(&model, &y),
+        disjoint_unit_cover_lower_bound(objective, constraints, num_vars),
+    ) {
+        (Some(ns), Some(discrete)) => Some(ns.max(discrete)),
+        (bound @ Some(_), None) | (None, bound @ Some(_)) => bound,
+        (None, None) => None,
+    };
     // Sanitize the primal point: keep it only if it has the right shape and is
     // finite; clamp into [0,1] (advisory rounding/branching tolerates this).
     let point = solved.and_then(|r| {
@@ -234,10 +385,15 @@ pub(crate) fn safe_lp_bound_and_point(
 ///
 /// Purpose: a caller can maintain its own *incremental* NS bounds from `y`
 /// (weak duality holds for ANY `y >= 0`, so a stale or rounded copy of these
-/// duals still yields a sound bound). The bound half is exactly as sound as
-/// [`safe_lp_lower_bound`]. Returns `(None, None)` when the LP declined;
-/// `(Some(lb), Some(y))` otherwise — including on timeout, where the partial
-/// dual is just as valid as a converged one.
+/// duals still yields a sound bound). The returned bound is exactly the NS
+/// component reproduced by the returned `y`; unlike [`safe_lp_lower_bound`],
+/// this API intentionally does not fold in the independent disjoint-cover
+/// floor. Callers therefore cannot accidentally persist a stronger bound with
+/// a weaker dual witness.
+/// Returns `(None, None)` when the LP model declined, `(Some(lb), Some(y))`
+/// when NS produced a representable bound, or `(None, Some(y))` when the dual
+/// exists but conservative bound arithmetic declined. Timeout still returns
+/// the partial dual, which is just as valid as a converged one.
 #[allow(dead_code)] // gated standalone fn; wired into the solver by the parent.
 pub(crate) fn safe_lp_bound_and_dual(
     objective: &PbObjective,
@@ -245,10 +401,43 @@ pub(crate) fn safe_lp_bound_and_dual(
     num_vars: u32,
     should_stop: &dyn Fn() -> bool,
 ) -> (Option<i128>, Option<Vec<f64>>) {
+    safe_lp_bound_and_dual_with_limits(
+        objective,
+        constraints,
+        num_vars,
+        SimplexLimits::wall(SIMPLEX_TIME_BUDGET),
+        should_stop,
+    )
+}
+
+#[cfg(test)]
+fn safe_lp_bound_and_dual_with_iteration_budget(
+    objective: &PbObjective,
+    constraints: &[PbConstraint],
+    num_vars: u32,
+    iterations_per_phase: usize,
+    should_stop: &dyn Fn() -> bool,
+) -> (Option<i128>, Option<Vec<f64>>) {
+    safe_lp_bound_and_dual_with_limits(
+        objective,
+        constraints,
+        num_vars,
+        SimplexLimits::iterations(iterations_per_phase),
+        should_stop,
+    )
+}
+
+fn safe_lp_bound_and_dual_with_limits(
+    objective: &PbObjective,
+    constraints: &[PbConstraint],
+    num_vars: u32,
+    limits: SimplexLimits,
+    should_stop: &dyn Fn() -> bool,
+) -> (Option<i128>, Option<Vec<f64>>) {
     let Some(model) = LpF64::build(objective, constraints, num_vars) else {
         return (None, None);
     };
-    let solved = model.solve(should_stop);
+    let solved = bounded_simplex_solve_with_limits(&model, should_stop, None, limits);
     let y = match &solved {
         Some(SimplexResult { dual, .. }) if dual.len() == model.rows.len() => clamp_dual(dual),
         _ => vec![0.0; model.rows.len()],
@@ -447,19 +636,12 @@ impl LpF64 {
     }
 
     /// Solves the LP relaxation `min c·x s.t. Ax >= b, 0 <= x <= 1` with the
-    /// bounded-variable primal simplex, returning BOTH an (approximate) optimal
-    /// dual `y` (one per `Ax>=b` row) and the primal optimum `x in [0,1]^n`.
+    /// bounded-variable primal simplex. The Phase-II loop returns early when
+    /// its quick-NS bound reaches `target` (see `quick_ns_bound`).
     ///
-    /// Soundness does NOT depend on either output being optimal or even feasible:
-    /// NS re-derives a valid bound from the clamped `y`, and the primal point is
-    /// purely advisory. On no rows we return `y = []` and `x = 0` (the trivial
-    /// optimum of an unconstrained `min c·x` with `c` mapped through the box).
-    fn solve(&self, should_stop: &dyn Fn() -> bool) -> Option<SimplexResult> {
-        bounded_simplex_solve(self, should_stop, None)
-    }
-
-    /// [`Self::solve`] with an early-exit threshold: the Phase-II loop returns
-    /// as soon as its quick-NS bound reaches `target` (see `quick_ns_bound`).
+    /// Soundness does not depend on either the returned dual or primal point
+    /// being optimal or even feasible: NS re-derives a valid bound from the
+    /// clamped dual, and the primal point is purely advisory.
     fn solve_target(
         &self,
         should_stop: &dyn Fn() -> bool,
@@ -739,6 +921,20 @@ fn bounded_simplex_solve(
     should_stop: &dyn Fn() -> bool,
     target: Option<f64>,
 ) -> Option<SimplexResult> {
+    bounded_simplex_solve_with_limits(
+        model,
+        should_stop,
+        target,
+        SimplexLimits::wall(SIMPLEX_TIME_BUDGET),
+    )
+}
+
+fn bounded_simplex_solve_with_limits(
+    model: &LpF64,
+    should_stop: &dyn Fn() -> bool,
+    target: Option<f64>,
+    limits: SimplexLimits,
+) -> Option<SimplexResult> {
     let n = model.n;
     let m = model.rows.len();
     if n == 0 {
@@ -761,13 +957,9 @@ fn bounded_simplex_solve(
     let total_cols = n.checked_add(m)?; // structural + surplus.
 
     let mut s = Simplex::new(model, n, m, total_cols);
-    // Internal wall-clock budget so a large dense solve never hangs: on timeout we
-    // return the best dual found so far, which NS turns into a sound (looser) bound.
-    // `should_stop` (the external deadline) is honored too and usually fires first.
-    let deadline = std::time::Instant::now() + SIMPLEX_TIME_BUDGET;
     // Convergence status is irrelevant here: NS derives a sound bound from any
     // clamped dual, converged or not.
-    let _ = s.run(should_stop, deadline, target);
+    let _ = s.run(should_stop, limits, target);
     Some(s.extract(model))
 }
 
@@ -800,6 +992,36 @@ pub(crate) fn approx_dual_for_box_lp(
     budget: std::time::Duration,
     should_stop: &dyn Fn() -> bool,
 ) -> Option<(Vec<f64>, Vec<f64>, bool)> {
+    approx_dual_for_box_lp_with_limits(n, c, rows, SimplexLimits::wall(budget), should_stop)
+}
+
+/// Deterministic counterpart of [`approx_dual_for_box_lp`] for mandatory
+/// regressions. Each simplex phase gets at most `iterations_per_phase` loop
+/// iterations; no wall clock is consulted.
+#[cfg(test)]
+pub(crate) fn approx_dual_for_box_lp_with_iteration_budget(
+    n: usize,
+    c: Vec<f64>,
+    rows: Vec<(Vec<(usize, f64)>, f64)>,
+    iterations_per_phase: usize,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<(Vec<f64>, Vec<f64>, bool)> {
+    approx_dual_for_box_lp_with_limits(
+        n,
+        c,
+        rows,
+        SimplexLimits::iterations(iterations_per_phase),
+        should_stop,
+    )
+}
+
+fn approx_dual_for_box_lp_with_limits(
+    n: usize,
+    c: Vec<f64>,
+    rows: Vec<(Vec<(usize, f64)>, f64)>,
+    limits: SimplexLimits,
+    should_stop: &dyn Fn() -> bool,
+) -> Option<(Vec<f64>, Vec<f64>, bool)> {
     if n == 0 || n > MAX_VARS || rows.len() > MAX_ROWS {
         return None;
     }
@@ -829,8 +1051,7 @@ pub(crate) fn approx_dual_for_box_lp(
     }
     let total_cols = n.checked_add(m)?;
     let mut s = Simplex::new(&model, n, m, total_cols);
-    let deadline = std::time::Instant::now() + budget;
-    let converged = s.run(should_stop, deadline, None);
+    let converged = s.run(should_stop, limits, None);
     let result = s.extract(&model);
     Some((result.dual, result.primal, converged))
 }
@@ -1318,9 +1539,9 @@ impl Simplex {
     }
 
     /// Runs Phase I (restore bound feasibility) then Phase II (minimize `c·x`),
-    /// both under a shared wall-clock `deadline` and the external `should_stop`. On
-    /// timeout we stop with the best dual/primal so far — NS stays sound for any
-    /// clamped dual, so a partial solve is a valid (if looser) bound, never `None`.
+    /// both under shared stop `limits` and the external `should_stop`. On a stop
+    /// we keep the best dual/primal so far — NS stays sound for any clamped dual,
+    /// so a partial solve is a valid (if looser) bound, never `None`.
     ///
     /// Returns `true` iff BOTH phases ended at their own optimality (Phase I
     /// reached bound feasibility, Phase II ran out of eligible entering columns)
@@ -1330,19 +1551,19 @@ impl Simplex {
     fn run(
         &mut self,
         should_stop: &dyn Fn() -> bool,
-        deadline: std::time::Instant,
+        limits: SimplexLimits,
         target: Option<f64>,
     ) -> bool {
         // PHASE I: minimize the total bound infeasibility of the basic variables
         // (the surplus crash basis is infeasible whenever some `b_r > 0`).
         self.recompute_xb();
-        let phase1 = self.simplex_loop(true, should_stop, deadline, None);
+        let phase1 = self.simplex_loop(true, should_stop, limits, None);
         // PHASE II: minimize the true objective `c·x`. If Phase I left residual
         // infeasibility (rare; degenerate / numerically hard, or a timeout), Phase II
         // still produces a point + duals; NS stays sound because it clamps `y` and
         // never trusts the primal.
         self.recompute_xb();
-        let phase2 = self.simplex_loop(false, should_stop, deadline, target);
+        let phase2 = self.simplex_loop(false, should_stop, limits, target);
         phase1 == LoopExit::Optimal && phase2 == LoopExit::Optimal
     }
 
@@ -1371,7 +1592,7 @@ impl Simplex {
         &mut self,
         phase1: bool,
         should_stop: &dyn Fn() -> bool,
-        deadline: std::time::Instant,
+        limits: SimplexLimits,
         target: Option<f64>,
     ) -> LoopExit {
         let cost_tol = self.cost_tol();
@@ -1384,8 +1605,14 @@ impl Simplex {
         let mut alpha_nz: Vec<usize> = Vec::with_capacity(64); // its non-zero rows.
         let mut marked = vec![false; self.m]; // dedup flags for sparse FTRAN gather.
 
-        for iter in 0..MAX_SIMPLEX_ITERS {
-            if iter % 64 == 0 && (should_stop() || std::time::Instant::now() >= deadline) {
+        let iteration_cap = limits.iterations_per_phase.min(MAX_SIMPLEX_ITERS);
+        for iter in 0..iteration_cap {
+            if iter % 64 == 0
+                && (should_stop()
+                    || limits
+                        .deadline
+                        .is_some_and(|deadline| std::time::Instant::now() >= deadline))
+            {
                 return LoopExit::Stopped; // partial solve; still NS-valid.
             }
             // Refactor on the fixed pivot cadence, OR early when the eta-file's fill
@@ -2249,155 +2476,202 @@ mod tests {
         assert!(elapsed.as_secs() < 10, "f64 LP took too long: {elapsed:?}");
     }
 
-    /// Rough speed comparison vs the exact-rational `lp_lower_bound` on a
-    /// mid-size structured covering instance. Ignored by default (timing-only).
     #[test]
-    #[ignore = "manual speed comparison (exact rational vs NS f64)"]
-    fn safe_lp_vs_exact_speed() {
+    fn safe_lp_and_exact_bound_disjoint_weighted_cover_soundly() {
         use crate::optimize::lp_bound::lp_lower_bound;
-        // A dense weighted knapsack/cover instance: varied coefficients across
-        // many overlapping rows. Dense varied-coefficient LPs are where the
-        // exact-rational simplex's big-integer numerators blow up, so this is a
-        // fairer stress of the rational path's slowness.
-        let n = 800u32;
-        let mut obj_terms = Vec::new();
-        for v in 1..=n {
-            obj_terms.push(term(i128::from((v * 37) % 101 + 1), lit(v)));
-        }
-        let obj = PbObjective { terms: obj_terms };
-        let mut constraints = Vec::new();
-        // Dense rows with varied coefficients (every variable in each row).
-        for r in 0..120u32 {
-            let terms: Vec<PbTerm> = (1..=n)
-                .map(|v| term(i128::from(((v + r) * 7) % 23 + 1), lit(v)))
-                .collect();
-            // rhs scaled to a fraction of the max possible -> fractional optimum.
-            let rhs = i128::from(n) * 4;
-            constraints.push(ge(terms, rhs));
-        }
-        eprintln!("speed instance: {n} vars, {} rows", constraints.len());
+        // Four independent five-item covers, each requiring two items with
+        // costs 1..=5. Both the LP and integer optimum are 4*(1+2)=12.
+        let n = 20u32;
+        let objective = PbObjective {
+            terms: (1..=n)
+                .map(|var| term(i128::from((var - 1) % 5 + 1), lit(var)))
+                .collect(),
+        };
+        let constraints: Vec<_> = (0..4u32)
+            .map(|group| {
+                ge(
+                    (1..=5)
+                        .map(|offset| term(1, lit(group * 5 + offset)))
+                        .collect(),
+                    2,
+                )
+            })
+            .collect();
 
-        let t = std::time::Instant::now();
-        let exact = lp_lower_bound(&obj, &constraints, n, &never_stop);
-        let t_exact = t.elapsed();
-
-        let t = std::time::Instant::now();
-        let safe = safe_lp_lower_bound(&obj, &constraints, n, &never_stop);
-        let t_safe = t.elapsed();
-
-        eprintln!("exact lp_lower_bound = {exact:?} in {t_exact:?}");
-        eprintln!("safe NS bound        = {safe:?} in {t_safe:?}");
-        if let (Some(e), Some(s)) = (exact, safe) {
-            assert!(s <= e, "safe {s} must be <= exact {e}");
+        let exact = lp_lower_bound(&objective, &constraints, n, &never_stop);
+        let (safe, point) = safe_lp_bound_and_point_with_iteration_budget(
+            &objective,
+            &constraints,
+            n,
+            20_000,
+            &never_stop,
+        );
+        assert_eq!(exact, Some(12));
+        assert_eq!(
+            safe,
+            Some(12),
+            "the disjoint unit-cover floor must recover the exact integer value"
+        );
+        let point = point.expect("LP point");
+        assert_eq!(point.len(), n as usize);
+        for group in point.chunks_exact(5) {
+            assert!(
+                group.iter().sum::<f64>() >= 2.0 - 1e-7,
+                "each disjoint cover must be satisfied by the advisory point"
+            );
         }
     }
 
-    /// TIGHTNESS / TIMING on real competition instances. Loads the Charlotte
-    /// routing instance (true LP optimum ~4996) and the 6.4k-var kidney-exchange
-    /// instance, prints the safe NS bound + primal-point time for each, and
-    /// asserts the *qualitative* targets: Charlotte's bound is strongly positive
-    /// (the simplex now produces good duals, not the old `-1`) and KE returns a
-    /// bound (not `None`) above the old 5k-var size cap. Ignored by default
-    /// because it depends on benchmark files being present on disk; run with
-    /// `--ignored` to see the numbers. Skips silently if a file is absent.
     #[test]
-    #[ignore = "loads on-disk competition benchmarks; run with --ignored for tightness numbers"]
-    fn safe_lp_tightness_on_competition_instances() {
-        use crate::parser::parse_opb;
+    fn bound_and_dual_returns_only_the_bound_witnessed_by_its_dual() {
+        // With a zero-iteration budget the dual is deliberately weak, while
+        // the independent disjoint-cover argument proves 12. The paired API
+        // must return the weaker NS value that its own dual reproduces.
+        let n = 20u32;
+        let objective = PbObjective {
+            terms: (1..=n)
+                .map(|var| term(i128::from((var - 1) % 5 + 1), lit(var)))
+                .collect(),
+        };
+        let constraints: Vec<_> = (0..4u32)
+            .map(|group| {
+                ge(
+                    (1..=5)
+                        .map(|offset| term(1, lit(group * 5 + offset)))
+                        .collect(),
+                    2,
+                )
+            })
+            .collect();
 
-        fn load(rel: &str) -> Option<crate::types::PbInstance> {
-            // Resolve under $AY_PBCOMP_BENCH_ROOT (default: the checkout-relative
-            // benchmarks/pb-comp; the corpus is not tracked in git). Prefer the
-            // already-decompressed .opb; fall back to nothing (the harness
-            // decompresses .xz out of band, so we just skip if missing).
-            let root = std::env::var_os("AY_PBCOMP_BENCH_ROOT")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| {
-                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("../../benchmarks/pb-comp")
-                });
-            let text = std::fs::read_to_string(root.join(rel)).ok()?;
-            parse_opb(&text).ok()
-        }
+        let (bound, dual) = safe_lp_bound_and_dual_with_iteration_budget(
+            &objective,
+            &constraints,
+            n,
+            0,
+            &never_stop,
+        );
+        let dual = dual.expect("bounded model returns a dual vector");
+        let model = LpF64::build(&objective, &constraints, n).expect("bounded LP model");
+        assert_eq!(
+            bound,
+            ns_safe_bound(&model, &dual),
+            "the bound/dual pair must be self-consistent"
+        );
+        let cover = disjoint_unit_cover_lower_bound(&objective, &constraints, n)
+            .expect("disjoint-cover floor");
+        assert!(
+            bound.is_some_and(|ns| cover > ns),
+            "the fixture must keep the independent cover bound strictly stronger"
+        );
+    }
 
-        let charlotte = "PB25/normalized-PB25/OPT-LIN/wallon/normalized-Charlotte-06-2_c24.opb";
-        if let Some(inst) = load(charlotte) {
-            let obj = inst.objective.expect("Charlotte has an objective");
-            let t = std::time::Instant::now();
-            let (bound, point) =
-                safe_lp_bound_and_point(&obj, &inst.constraints, inst.num_vars, &never_stop);
-            let elapsed = t.elapsed();
-            eprintln!(
-                "Charlotte ({} vars, {} cons): safe_lp bound = {:?}, point.is_some()={} in {:?}",
-                inst.num_vars,
-                inst.constraints.len(),
-                bound,
-                point.is_some(),
-                elapsed
-            );
-            // The OLD Big-M simplex returned -1 here; the bounded-variable simplex
-            // should now give a strongly positive bound (true LP ~4996).
-            assert!(
-                bound.is_some_and(|b| b > 1000),
-                "Charlotte bound {bound:?} should be strongly positive (true LP ~4996)"
-            );
-        } else {
-            eprintln!("Charlotte instance absent; skipping that leg.");
-        }
+    #[test]
+    fn disjoint_unit_cover_floor_deduplicates_and_never_double_counts_overlap() {
+        let objective = PbObjective {
+            terms: (1..=3).map(|var| term(1, lit(var))).collect(),
+        };
+        let left = ge(vec![term(1, lit(1)), term(1, lit(2))], 1);
+        let right = ge(vec![term(1, lit(2)), term(1, lit(3))], 1);
+        assert_eq!(
+            disjoint_unit_cover_lower_bound(&objective, &[left.clone(), left.clone(), right], 3,),
+            Some(1),
+            "a duplicate support is counted once and overlapping supports cannot add"
+        );
+        assert_eq!(
+            disjoint_unit_cover_lower_bound(
+                &PbObjective {
+                    terms: vec![term(-1, lit(1))],
+                },
+                &[left],
+                3,
+            ),
+            None,
+            "negative objectives are outside the exact unit-cover proof"
+        );
+    }
 
-        let ke = "PB24/normalized-PB24/OPT-LIN/\
-                  pettersson/StableMatchings/KidneyTransplantBenchmarks/\
-                  normalized-KE_230_000.opb";
-        if let Some(inst) = load(ke) {
-            let obj = inst.objective.expect("KE has an objective");
-            let t = std::time::Instant::now();
-            let (bound, point) =
-                safe_lp_bound_and_point(&obj, &inst.constraints, inst.num_vars, &never_stop);
-            let elapsed = t.elapsed();
-            eprintln!(
-                "KE_230_000 ({} vars, {} cons): safe_lp bound = {:?}, point.is_some()={} in {:?}",
-                inst.num_vars,
-                inst.constraints.len(),
-                bound,
-                point.is_some(),
-                elapsed
-            );
-            // The old 5k-var cap returned None for this 6.4k-var instance; now we
-            // should get a real bound.
-            assert!(
-                bound.is_some(),
-                "KE_230_000 should now return a bound (was None under the old size cap)"
-            );
-        } else {
-            eprintln!("KE_230_000 instance absent; skipping that leg.");
-        }
+    #[test]
+    fn safe_lp_handles_large_column_and_high_row_shapes_soundly() {
+        // Strong positive-bound analogue of the former routing corpus leg.
+        let objective = PbObjective {
+            terms: (1..=64).map(|var| term(100, lit(var))).collect(),
+        };
+        let cover = ge((1..=64).map(|var| term(1, lit(var))).collect(), 20);
+        let (strong, strong_point) = safe_lp_bound_and_point_with_iteration_budget(
+            &objective,
+            &[cover],
+            64,
+            20_000,
+            &never_stop,
+        );
+        assert_eq!(
+            strong,
+            Some(2_000),
+            "the unit-cover floor must recover the exact integer value 2000"
+        );
+        assert!(
+            strong_point
+                .expect("strong-cover point")
+                .iter()
+                .sum::<f64>()
+                >= 20.0 - 1e-7
+        );
 
-        // High-ROW stress: ~17k sparse constraints over only 200 variables. This is
-        // the regime the sparse revised simplex targets (few columns, many rows): the
-        // old dense tableau was hopeless here. Should now return a bound quickly.
-        let twoclub = "PB24/normalized-PB24/\
-                       OPT-LIN/nordstrom/MIPLIB01/opt/miplib2017/\
-                       normalized-2club200v15p5scn.opb";
-        if let Some(inst) = load(twoclub) {
-            let obj = inst.objective.expect("2club has an objective");
-            let t = std::time::Instant::now();
-            let (bound, point) =
-                safe_lp_bound_and_point(&obj, &inst.constraints, inst.num_vars, &never_stop);
-            let elapsed = t.elapsed();
-            eprintln!(
-                "2club ({} vars, {} cons): safe_lp bound = {:?}, point.is_some()={} in {:?}",
-                inst.num_vars,
-                inst.constraints.len(),
-                bound,
-                point.is_some(),
-                elapsed
-            );
-            assert!(
-                bound.is_some(),
-                "2club (~17k rows) should now return a bound in reasonable time"
-            );
-        } else {
-            eprintln!("2club instance absent; skipping that leg.");
+        // 5,001 columns crosses the removed 5k-variable cap. The one-row
+        // relaxation has known optimum 1 and remains a compact deterministic
+        // test of the large-column path.
+        let large_n = 5_001u32;
+        let large_objective = PbObjective {
+            terms: (1..=large_n).map(|var| term(1, lit(var))).collect(),
+        };
+        let large_cover = ge((1..=large_n).map(|var| term(1, lit(var))).collect(), 1);
+        let (large_bound, large_point) = safe_lp_bound_and_point_with_iteration_budget(
+            &large_objective,
+            &[large_cover],
+            large_n,
+            20_000,
+            &never_stop,
+        );
+        assert_eq!(
+            large_bound,
+            Some(1),
+            "the exact unit-cover floor must remain useful above the old 5k cap"
+        );
+        let large_point = large_point.expect("large-column point");
+        assert_eq!(large_point.len(), 5_001);
+        assert!(large_point.iter().sum::<f64>() >= 1.0 - 1e-7);
+
+        // 512 rows over 32 columns exercise the sparse high-row path. Sixteen
+        // disjoint pairs must each contribute one selected variable, so the
+        // exact integer optimum is 16 even though every row is repeated.
+        let high_row_objective = PbObjective {
+            terms: (1..=32).map(|var| term(1, lit(var))).collect(),
+        };
+        let high_rows: Vec<_> = (0..512u32)
+            .map(|row| {
+                let pair = row % 16;
+                ge(
+                    vec![term(1, lit(pair * 2 + 1)), term(1, lit(pair * 2 + 2))],
+                    1,
+                )
+            })
+            .collect();
+        let (high_bound, high_point) = safe_lp_bound_and_point_with_iteration_budget(
+            &high_row_objective,
+            &high_rows,
+            32,
+            20_000,
+            &never_stop,
+        );
+        assert_eq!(
+            high_bound,
+            Some(16),
+            "deduplicated disjoint pair floors must recover the exact value 16"
+        );
+        let high_point = high_point.expect("high-row point");
+        for pair in high_point.chunks_exact(2) {
+            assert!(pair.iter().sum::<f64>() >= 1.0 - 1e-7);
         }
     }
 }

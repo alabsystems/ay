@@ -1267,6 +1267,14 @@ pub struct PbCdclSolver {
     optimization_proof_pending: bool,
     suppress_optimization_intermediate_proof_steps: bool,
     proof_input_constraint_count: usize,
+    /// Whether every row of the ORIGINAL proof-mode instance was linear.
+    ///
+    /// `self.constraints` holds the propagator's normalized rows, and that
+    /// normalization silently DROPS product terms — a dropped positive product
+    /// term makes the stored row strictly stronger than the input row VeriPB
+    /// imported. Anything that replays VeriPB's view of the formula out of
+    /// `self.constraints` must therefore refuse to run unless this is set.
+    proof_input_rows_are_linear: bool,
     last_objective_bound_proof_id: Option<ConstraintId>,
     /// VeriPB witness text (`x1 ~x2 ...`) of the incumbent behind
     /// `last_objective_bound_proof_id`, kept for the `conclusion BOUNDS`
@@ -1738,6 +1746,7 @@ impl PbCdclSolver {
             optimization_proof_pending: false,
             suppress_optimization_intermediate_proof_steps: false,
             proof_input_constraint_count: 0,
+            proof_input_rows_are_linear: false,
             last_objective_bound_proof_id: None,
             last_objective_bound_witness: None,
             active_optimization_bound_range: None,
@@ -1843,6 +1852,7 @@ impl PbCdclSolver {
             build_imported_input_constraint_ids(instance)?
         };
         solver.proof_input_constraint_count = solver.constraint_ids.len();
+        solver.proof_input_rows_are_linear = instance_rows_are_linear(instance);
         Ok(solver)
     }
 
@@ -1868,6 +1878,7 @@ impl PbCdclSolver {
             build_imported_input_constraint_ids(instance)?
         };
         solver.proof_input_constraint_count = solver.constraint_ids.len();
+        solver.proof_input_rows_are_linear = instance_rows_are_linear(instance);
         Ok(solver)
     }
 
@@ -5233,6 +5244,15 @@ fn canonical_pb_terms(constraint: &PbConstraint) -> (Vec<(u32, bool, i128)>, i12
         .collect();
     terms.sort_by_key(|&(var, negated, _)| (var, negated));
     (terms, constraint.rhs)
+}
+
+/// Whether every constraint of `instance` is linear (each term over a single
+/// literal).
+fn instance_rows_are_linear(instance: &PbInstance) -> bool {
+    instance
+        .constraints
+        .iter()
+        .all(|constraint| constraint.terms.iter().all(|term| term.lits.len() == 1))
 }
 
 fn build_imported_input_constraint_ids(instance: &PbInstance) -> proof::Result<Vec<ConstraintId>> {

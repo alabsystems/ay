@@ -256,7 +256,18 @@ fn certify_decision_unsat_aux_free(
 /// exactly the instance's declared variables or is infeasible — the caller
 /// must never ship a witness it has not verified (belt), and the checker
 /// re-validates regardless (braces).
+///
+/// Also withheld when the instance carries an OBJECTIVE. `conclusion SAT` is
+/// a DECISION-only conclusion: VeriPB 3.0.2 rejects it outright against an OPB
+/// with a `min:` line ("The 'conclusion SAT' can only be used for decision
+/// instances, but the input problem contains an objective."). An optimization
+/// instance needs a `conclusion BOUNDS` with a *derived* lower bound, which
+/// this solution-only route cannot supply, so it fails closed rather than
+/// shipping a proof the checker will reject.
 pub fn solution_only_sat_proof(instance: &PbInstance, assignment: &[bool]) -> Option<String> {
+    if instance.objective.is_some() {
+        return None;
+    }
     if assignment.len() != instance.num_vars as usize {
         return None;
     }

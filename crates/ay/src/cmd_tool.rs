@@ -373,6 +373,36 @@ impl Tool {
                 if self.spec.is_some() {
                     bail!("source=cargo does not use `spec`");
                 }
+                // Pin-drift detectability. `cargo install` drops a bare binary
+                // in ~/.cargo/bin with no record of the revision that built it,
+                // and `pin_mismatch` can only interrogate an in-place git
+                // checkout — so for a commit-pinned cargo tool the version
+                // probe is the ONLY drift signal there is. Without a
+                // `verify_expect` naming the pin, an arbitrarily old binary
+                // reports `installed`, which for a proof CHECKER means audits
+                // silently replay against un-pinned rules. Require the probe to
+                // name the pin (a prefix of `commit`, i.e. the short hash a
+                // version banner prints). A tool whose `--version` cannot
+                // reveal its revision must be pinned by `tag` instead.
+                if let Some(commit) = self.commit.as_deref().filter(|c| !c.is_empty()) {
+                    let expect = self.verify_expect.as_deref().unwrap_or_default();
+                    if expect.is_empty() {
+                        bail!(
+                            "source=cargo with a `commit` pin requires `verify_expect` \
+                             (a prefix of the commit) so pin drift is detectable"
+                        );
+                    }
+                    if !commit.eq_ignore_ascii_case(expect)
+                        && !commit
+                            .to_ascii_lowercase()
+                            .starts_with(expect.to_ascii_lowercase().as_str())
+                    {
+                        bail!(
+                            "`verify_expect` ({expect}) must be a prefix of `commit` ({commit}) \
+                             so the version probe actually pins the revision"
+                        );
+                    }
+                }
             }
             SourceKind::Script => {
                 if self.script.is_none() {
@@ -1296,6 +1326,7 @@ url = "https://example.com/c"
 commit = "deadbeef"
 bin = "c"
 verify = ["c", "--version"]
+verify_expect = "deadbee"
 
 [[tool]]
 name = "s"
@@ -1351,6 +1382,72 @@ verify = ["s", "--version"]
         // veripb + carcara: pinned cargo installs.
         assert!(registry.find("veripb").unwrap().pinned());
         assert!(registry.find("carcara").unwrap().pinned());
+
+        // carcara is the SMT proof checker the z3-audit replays Alethe against,
+        // so its probe must name the pinned revision — otherwise an older
+        // ~/.cargo/bin/carcara reports `installed` and audits check against
+        // different rules than the repo pins (measured: the pre-pin 1.1.0
+        // a963237 build knows no `arrays_*` rule at all).
+        let carcara = registry.find("carcara").unwrap();
+        let commit = carcara.commit.as_deref().unwrap();
+        let expect = carcara.verify_expect.as_deref().unwrap();
+        assert!(!expect.is_empty());
+        assert!(
+            commit.starts_with(expect),
+            "carcara verify_expect ({expect}) must be a prefix of commit ({commit})"
+        );
+    }
+
+    /// A commit-pinned `cargo install` leaves no revision record on disk, so a
+    /// registry entry without a pin-naming probe is silently drift-blind.
+    #[test]
+    fn load_rejects_commit_pinned_cargo_tool_without_pin_naming_probe() {
+        let body = r#"
+schema_version = 1
+
+[[tool]]
+name = "c"
+kind = "checker"
+source = "cargo"
+url = "https://example.com/c"
+commit = "9a352eea6c935ad35cb8ec22e521a7620ec5d474"
+bin = "c"
+verify = ["c", "--version"]
+"#;
+        let msg = format!("{:#}", load_inline(body).unwrap_err());
+        assert!(msg.contains("verify_expect"), "{msg}");
+    }
+
+    #[test]
+    fn load_rejects_cargo_probe_that_does_not_name_the_pinned_commit() {
+        let body = r#"
+schema_version = 1
+
+[[tool]]
+name = "c"
+kind = "checker"
+source = "cargo"
+url = "https://example.com/c"
+commit = "9a352eea6c935ad35cb8ec22e521a7620ec5d474"
+bin = "c"
+verify = ["c", "--version"]
+verify_expect = "usage"
+"#;
+        let msg = format!("{:#}", load_inline(body).unwrap_err());
+        assert!(msg.contains("prefix of `commit`"), "{msg}");
+    }
+
+    /// The probe must be satisfied by the pinned revision's own banner and
+    /// rejected by any other build — this is the whole drift signal.
+    #[test]
+    fn cargo_pin_probe_accepts_only_the_pinned_revision_banner() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../reference/tools.toml");
+        let registry = Registry::load(&path).unwrap();
+        let carcara = registry.find("carcara").unwrap();
+        let expect = carcara.verify_expect.as_deref().unwrap();
+        // The banner the pinned build prints, and the one the stale build printed.
+        assert!(format!("carcara 1.1.0 [git master {expect}]").contains(expect));
+        assert!(!"carcara 1.1.0 [git master a963237]".contains(expect));
     }
 
     // ---------- validation ----------

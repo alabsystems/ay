@@ -104,8 +104,26 @@ impl LraSolver {
         // var in its column) — the guard's clean memo no longer holds. This is
         // the single value-mutation chokepoint for simplex/assert paths.
         self.guard_clean_valid = false;
+        // #warm-simplex: first-write-wins log of the pre-change values (this
+        // var + every basic var in its column, below) so the last-feasible
+        // assignment can be restored on conflict. No-op unless the flag is on
+        // and the delta log is armed (`warm_log_value` checks `delta_valid`).
+        let warm_log = self.warm.enabled && self.warm.delta_valid;
+        if warm_log {
+            self.warm_log_value(var);
+        }
         self.vars[var as usize].value = new_val;
         let vi = var as usize;
+        // #8471: the fallback below exists for the case where no column index has been
+        // built at all. When the index IS populated it lists every row containing a
+        // var (rows index all their coefficients on creation, atom_assertion.rs:128-134,
+        // resizing as needed), so an absent/empty entry means `var` occurs in no row and
+        // the all-rows scan provably finds nothing. `pivot` already takes exactly this
+        // view (its `else if use_col_index { Vec::new() }` arm, "column index exists but
+        // entering_var has no entry — no rows affected"); `update_nonbasic` instead used
+        // a per-column emptiness test and fell into an O(rows x width) scan plus a Vec
+        // allocation on every value write to a row-free variable.
+        let col_index_populated = !self.col_index.is_empty();
         if vi < self.col_index.len() && !self.col_index[vi].is_empty() {
             // Use column index: only visit rows containing `var`.
             let n = self.col_index[vi].len();
@@ -128,17 +146,38 @@ impl LraSolver {
                 let basic_var = self.rows[entry.row_idx].basic_var;
                 // #8406: i64 fast path — pure i128 multiply-add when Small.
                 if let Rational::Small(cn, cd) = coeff {
+                    let (cn, cd) = (*cn, *cd);
+                    if warm_log {
+                        self.warm_log_value(basic_var);
+                    }
                     self.vars[basic_var as usize]
                         .value
-                        .add_assign_mul_i64(&delta, *cn, *cd);
+                        .add_assign_mul_i64(&delta, cn, cd);
                 } else {
                     let adj = delta.mul_rat(coeff);
+                    if warm_log {
+                        self.warm_log_value(basic_var);
+                    }
                     self.vars[basic_var as usize].value += &adj;
                 }
                 self.track_var_feasibility(basic_var);
             }
+        } else if col_index_populated {
+            // #8471: index populated but `var` is in no row — nothing to propagate.
+            // Behaviour-identical to running the scan below, which would match no row.
+            // This is the ONLY branch that acts on "col_index[var] empty => var in no
+            // row", and the only other check of that invariant,
+            // `debug_assert_col_index_consistency` (simplex/debug.rs), runs from exactly
+            // one place — after a pivot (gated on `use_col_index`). A solver that repairs
+            // by non-basic snapping never pivots and would never check it. So assert at
+            // the point of use, size-bounded so the scan cannot re-impose on large debug
+            // runs the cost this edit removes.
+            debug_assert!(
+                self.rows.len() > 256 || !self.rows.iter().any(|row| row.coeff_ref(var).is_some()),
+                "BUG: col_index[{var}] empty but a row still carries the variable"
+            );
         } else {
-            // Fallback: scan all rows (column index not yet populated).
+            // Fallback: scan all rows (no column index has been built).
             let updates: Vec<(u32, InfRational)> = self
                 .rows
                 .iter()
@@ -153,11 +192,25 @@ impl LraSolver {
                 })
                 .collect();
             for &(basic_var, ref adj) in &updates {
+                if warm_log {
+                    self.warm_log_value(basic_var);
+                }
                 self.vars[basic_var as usize].value += adj;
             }
             for &(basic_var, _) in &updates {
                 self.track_var_feasibility(basic_var);
             }
+        }
+        // #warm-simplex: keep the non-basic candidate-set invariant — an
+        // update that leaves its target violated (possible only when the
+        // var's feasible interval is empty and the caller snapped it to one
+        // of two contradictory bounds) must stay discoverable without the
+        // O(vars) scan.
+        if self.warm.enabled
+            && matches!(self.vars[vi].status, Some(VarStatus::NonBasic))
+            && self.violates_bounds(var).is_some()
+        {
+            self.warm_mark_nonbasic_dirty(var);
         }
     }
 

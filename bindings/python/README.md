@@ -17,6 +17,41 @@ assert s.check() == sat
 print(s.model())          # e.g. [x = 1, y = 9]
 ```
 
+The same wheel also includes `aysearch`, a smaller API for applications that
+would otherwise need custom backtracking, branch-and-bound, or search code:
+
+```python
+from aysearch import Model
+
+m = Model("assignment")
+worker = m.choice("worker", ["cpu", "gpu"])
+cost = m.int("cost", 0, 20)
+m.table([worker, cost], [["cpu", 7], ["gpu", 3]])
+m.minimize(cost)
+
+result = m.solve()
+if result.status != "optimal":
+    raise RuntimeError(f"need a proved optimum, got {result.status}")
+print(result.require_solution()[worker])  # gpu
+```
+
+Equation strings passed to `Model.add()` use AY's restricted linear grammar;
+they remain data across the JSON ABI and are never passed to Python `eval`.
+`aysearch` has inline annotations plus a `py.typed` marker. Complete worked
+examples for Sudoku, an LLM token router, and Minesweeper live in
+`examples/search_*.py`.
+
+From the repository root, after `cargo build -p ay-ffi`:
+
+```bash
+PYTHONPATH=bindings/python python3 bindings/python/examples/search_sudoku.py
+PYTHONPATH=bindings/python python3 bindings/python/examples/search_token_router.py
+PYTHONPATH=bindings/python python3 bindings/python/examples/search_minesweeper.py
+```
+
+Enumeration is satisfaction-only: `enumerate()` rejects a model after
+`minimize()` or `maximize()` instead of silently changing the requested mode.
+
 ## Install
 
 The wheel **bundles the AY shared library** (`libay_ffi`) inside the package, so an installed `ayz3` is self-contained — it does not need the AY source tree at runtime.
@@ -48,6 +83,8 @@ print(s.model())
 3. The in-tree dev fallback: walk up to the Cargo workspace root and probe `target/release/` then `target/debug/`.
 
 So both workflows work: an installed wheel uses (2); a source checkout with `cargo build -p ay-ffi` uses (3).
+The `aysearch` loader follows the same bundled/source paths and additionally
+honors `AYSEARCH_LIB` before the shared `AYZ3_LIB` fallback.
 
 ## Scope
 
@@ -77,8 +114,8 @@ implemented C-ABI route raise `NotImplementedError` naming the gap.
 - **Misc:** `is_true`, `is_false`, `simplify`, `set_param`/`get_param`, `parse_smtlib2_string`/`parse_smtlib2_file`.
 
 The suite in `tests/` contains representative verdict and value cross-checks
-against z3py 4.15.4. It does not establish equivalence over every input in the
-operation domains above.
+against the required `z3-solver==5.0.0.0` oracle. It does not establish
+equivalence over every input in the operation domains above.
 
 ### Example applications
 

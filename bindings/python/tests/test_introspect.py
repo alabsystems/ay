@@ -167,7 +167,7 @@ def test_predicate_verdicts_are_honest(scope, label):
     assert got == AYZ3_EXPECTED[label], f"{label}: {got}"
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 @pytest.mark.parametrize("label", list(AYZ3_EXPECTED))
 def test_predicates_cross_check_z3py(scope, label):
     """Side-by-side vs z3py: exact match, or a documented CANON divergence."""
@@ -232,7 +232,7 @@ def test_acceptance_funcdecl(scope):
     assert app.decl().arity() == 2
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_acceptance_funcdecl_cross_check(scope):
     f = z.Function("f", z.IntSort(), z.RealSort(), z.BoolSort())
     zf = _z3.Function("f", _z3.IntSort(), _z3.RealSort(), _z3.BoolSort())
@@ -270,7 +270,7 @@ def test_numeral_decls(scope):
     assert z.BoolVal(False).decl().kind() == 257  # Z3_OP_FALSE
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_numeral_decls_cross_check(scope):
     for a, b in [
         (z.IntVal(7), _z3.IntVal(7)),
@@ -351,7 +351,7 @@ def test_canonicalization_ne_folds_to_not_eq(scope):
     assert z.is_eq(e.arg(0))
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 def test_canonicalization_divergences_are_real():
     # Confirm z3py genuinely classifies these differently, so the CANON handling
     # is compensating for a real, sound normal-form divergence (not dead code).
@@ -422,7 +422,7 @@ def test_broadened_corpus_self_contained(scope, label):
         assert z.is_app_of(e, 260)  # Z3_OP_ITE
 
 
-@pytest.mark.skipif(not HAVE_Z3PY, reason="real z3py not installed")
+@pytest.mark.usefixtures("required_reference_z3")
 @pytest.mark.parametrize("label", list(_PARITY_BUILDERS))
 def test_broadened_corpus_cross_check(scope, label):
     """Side-by-side vs z3py: decl kind + name + is_div/is_idiv all match, 0 DIFF."""

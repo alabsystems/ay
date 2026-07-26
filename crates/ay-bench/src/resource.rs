@@ -542,12 +542,18 @@ pub(crate) fn normalized_relative_id(path: &Path, corpus_root: &Path) -> Result<
 
 /// Persistable resource envelope returned by `_oom_guard.py plan`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub(crate) struct ResourcePlan {
+pub struct ResourcePlan {
+    /// Parallelism requested by the caller before host admission.
     pub requested_jobs: usize,
+    /// Parallelism admitted by the planner.
     pub jobs: usize,
+    /// Enforced process-group RSS budget for each child.
     pub memlimit_mb_per_child: usize,
+    /// Solver core budget exported as `NBCORE`.
     pub nbcore_per_child: usize,
+    /// Host-memory headroom reserved outside child budgets.
     pub headroom_mb: usize,
+    /// Repository-relative or absolute planner path used for admission.
     pub planner: String,
 }
 
@@ -564,7 +570,7 @@ impl ResourcePlan {
 /// Canonical persisted envelope for timing/throughput comparability. Numeric
 /// admission alone is insufficient: the exact enforcement mechanism and the
 /// normalized wall timeout are part of the execution envelope too.
-pub(crate) fn effective_execution_envelope(
+pub fn effective_execution_envelope(
     plan: &ResourcePlan,
     enforcement: &str,
     timeout_sec: f64,
@@ -1184,6 +1190,7 @@ impl SharedWatchdogServer {
             target_os = "android",
             target_os = "freebsd",
             target_os = "haiku",
+            target_os = "macos",
             all(target_os = "linux", not(target_env = "uclibc")),
         ),
     ))]
@@ -1352,7 +1359,8 @@ fn parse_watchdog_server_event(
 
 /// A planned envelope plus the executable planner used to enforce it.
 #[derive(Debug, Clone)]
-pub(crate) struct PlannedResources {
+pub struct PlannedResources {
+    /// Exact numeric resource plan admitted for this campaign.
     pub plan: ResourcePlan,
     guard_script: PathBuf,
     _aggregate_lease: Option<std::sync::Arc<GlobalHarnessLease>>,
@@ -1375,8 +1383,68 @@ pub(crate) struct GuardedChildOutcome {
     pub memout: bool,
 }
 
-const EXTERNAL_CAPTURE_LIMIT: usize = 1024 * 1024;
+/// Maximum input accepted by [`PlannedResources::run_external_transcript`].
+///
+/// Keeping this fixed makes the transcript runner safe to call with
+/// untrusted corpus entries without adding another user-facing resource knob.
+pub const GUARDED_TRANSCRIPT_INPUT_LIMIT: usize = 1024 * 1024;
+/// Maximum bytes retained from each transcript output stream.
+///
+/// Both pipes are still drained after reaching this limit so a verbose child
+/// cannot deadlock while its process group remains under supervision.
+pub const GUARDED_TRANSCRIPT_STREAM_LIMIT: usize = 1024 * 1024;
+const EXTERNAL_CAPTURE_LIMIT: usize = GUARDED_TRANSCRIPT_STREAM_LIMIT;
 const METADATA_CAPTURE_LIMIT: usize = 64 * 1024;
+
+/// Bounded output and exact termination state for one externally guarded
+/// process group.
+#[derive(Debug)]
+pub struct GuardedCapturedOutput {
+    /// Reaped leader status, absent only after forced cleanup where the host
+    /// could not recover a status.
+    pub status: Option<ExitStatus>,
+    /// Bounded stdout retained from the process group.
+    pub stdout: Vec<u8>,
+    /// Parent-observed wall time from spawn through cleanup and capture.
+    pub observed: Duration,
+    /// Whether the hard wall deadline was the first termination cause.
+    pub timed_out: bool,
+    /// Whether the RSS watchdog was the first termination cause.
+    pub memout: bool,
+    /// Whether stdout exceeded the fixed retained-byte limit.
+    pub output_truncated: bool,
+}
+
+/// Bounded input/output transcript and exact termination state for one
+/// externally guarded process group.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct GuardedTranscriptOutput {
+    /// Reaped leader status, absent only after forced cleanup where the host
+    /// could not recover a status.
+    pub status: Option<ExitStatus>,
+    /// Bounded stdout retained from the process group.
+    pub stdout: Vec<u8>,
+    /// Bounded stderr retained from the process group.
+    pub stderr: Vec<u8>,
+    /// Parent-observed wall time from spawn through cleanup and capture.
+    pub observed: Duration,
+    /// Whether the hard wall deadline was the first termination cause.
+    pub timed_out: bool,
+    /// Whether the RSS watchdog was the first termination cause.
+    pub memout: bool,
+    /// Whether the writer delivered the complete bounded transcript to the
+    /// child's stdin pipe.
+    ///
+    /// This is false when the child closed its input pipe before the writer
+    /// completed, including during timeout or memout cleanup. A true value
+    /// does not by itself prove that the child read or processed every byte.
+    pub stdin_complete: bool,
+    /// Whether stdout exceeded [`GUARDED_TRANSCRIPT_STREAM_LIMIT`].
+    pub stdout_truncated: bool,
+    /// Whether stderr exceeded [`GUARDED_TRANSCRIPT_STREAM_LIMIT`].
+    pub stderr_truncated: bool,
+}
 
 #[derive(Debug)]
 pub(crate) struct BoundedFileOutput {
@@ -1580,6 +1648,100 @@ impl BoundedPipeCapture {
             )));
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+struct BoundedBytesCapture {
+    receiver: std::sync::mpsc::Receiver<(Vec<u8>, bool, bool)>,
+}
+
+impl BoundedBytesCapture {
+    fn start<R>(mut reader: R) -> Self
+    where
+        R: std::io::Read + Send + 'static,
+    {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut kept = Vec::with_capacity(EXTERNAL_CAPTURE_LIMIT);
+            let mut truncated = false;
+            let mut read_failed = false;
+            let mut chunk = [0_u8; 8192];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        let remaining = EXTERNAL_CAPTURE_LIMIT.saturating_sub(kept.len());
+                        kept.extend_from_slice(&chunk[..read.min(remaining)]);
+                        truncated |= read > remaining;
+                    }
+                    Err(_) => {
+                        read_failed = true;
+                        break;
+                    }
+                }
+            }
+            let _ = sender.send((kept, truncated, read_failed));
+        });
+        Self { receiver }
+    }
+
+    fn finish(self, label: &str, stream: &str) -> Result<(Vec<u8>, bool)> {
+        let (bytes, truncated, read_failed) = self
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|_| {
+                BenchError::msg(format!("{label}: guarded {stream} capture did not finish"))
+            })?;
+        if read_failed {
+            return Err(BenchError::msg(format!(
+                "{label}: reading guarded {stream} failed"
+            )));
+        }
+        Ok((bytes, truncated))
+    }
+}
+
+struct BoundedStdinWriter {
+    receiver: std::sync::mpsc::Receiver<std::io::Result<()>>,
+}
+
+impl BoundedStdinWriter {
+    fn start<W>(mut writer: W, bytes: Vec<u8>) -> Self
+    where
+        W: std::io::Write + Send + 'static,
+    {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = writer.write_all(&bytes).and_then(|()| writer.flush());
+            let _ = sender.send(result);
+        });
+        Self { receiver }
+    }
+
+    fn finish(self, label: &str) -> Result<bool> {
+        match self.receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => Ok(true),
+            // Closing stdin before consuming the complete transcript is child
+            // behavior, not a harness failure. Its exit status and captured
+            // diagnostics remain available, while `stdin_complete` prevents a
+            // caller from mistaking the partial exchange for a full one.
+            Ok(Err(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                Ok(false)
+            }
+            Ok(Err(error)) => Err(BenchError::msg(format!(
+                "{label}: writing guarded stdin failed: {error}"
+            ))),
+            Err(_) => Err(BenchError::msg(format!(
+                "{label}: guarded stdin writer did not finish"
+            ))),
+        }
     }
 }
 
@@ -1847,10 +2009,35 @@ impl PlannedResources {
         })
     }
 
+    /// Reduce the planner-admitted per-child envelope for a campaign profile.
+    ///
+    /// The OOM guard remains the source of admission and aggregate exclusion;
+    /// profile caps may only make its plan stricter. The reduced values are
+    /// the ones exported to children, enforced by the watchdog, and persisted
+    /// in result packets.
+    pub(crate) fn apply_per_child_caps(
+        &mut self,
+        memory_mib: Option<usize>,
+        cores: Option<usize>,
+    ) -> Result<()> {
+        if memory_mib == Some(0) || cores == Some(0) {
+            return Err(BenchError::InvalidArgs {
+                reason: "resource profile caps must be positive".to_string(),
+            });
+        }
+        if let Some(memory_mib) = memory_mib {
+            self.plan.memlimit_mb_per_child = self.plan.memlimit_mb_per_child.min(memory_mib);
+        }
+        if let Some(cores) = cores {
+            self.plan.nbcore_per_child = self.plan.nbcore_per_child.min(cores);
+        }
+        Ok(())
+    }
+
     /// Spawn an external child suspended, arm `_oom_guard.rss_watchdog`, then
     /// let the child exec. This handshake eliminates the old attach-after-spawn
     /// window in which a fast allocator could run before its RSS limit existed.
-    pub fn external_command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
+    pub(crate) fn external_command(&self, program: impl AsRef<std::ffi::OsStr>) -> Command {
         let mut command = Command::new("python3");
         command
             .arg(&self.guard_script)
@@ -1862,7 +2049,7 @@ impl PlannedResources {
 
     /// Build a stopped-start command whose target inherits a hard regular-file
     /// size ceiling before it is resumed under the RSS watchdog.
-    pub fn external_command_with_file_limit(
+    pub(crate) fn external_command_with_file_limit(
         &self,
         program: impl AsRef<std::ffi::OsStr>,
         bytes: u64,
@@ -1881,7 +2068,7 @@ impl PlannedResources {
     /// Capture a short metadata command without unbounded parent-memory pipes.
     /// The child is handshake-guarded; output is spooled to anonymous files and
     /// rejected if either stream exceeds 1 MiB.
-    pub fn capture_external_output<I, S>(
+    pub(crate) fn capture_external_output<I, S>(
         &self,
         program: &Path,
         args: I,
@@ -1931,8 +2118,172 @@ impl PlannedResources {
         })
     }
 
+    /// Run one external command under the campaign's stopped-exec RSS
+    /// watchdog, retaining at most one MiB of stdout while draining the pipe
+    /// completely. The returned timeout and memout flags are mutually
+    /// exclusive and preserve the watchdog's timestamped first cause.
+    pub fn run_external_captured<I, S>(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+        args: I,
+        timeout: Duration,
+        label: &str,
+    ) -> Result<GuardedCapturedOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        let started = Instant::now();
+        let mut command = self.external_command(program);
+        command
+            .args(args)
+            .env("MEMLIMIT", self.plan.memlimit_mb_per_child.to_string())
+            .env("NBCORE", self.plan.nbcore_per_child.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let (mut child, watchdog) = self.spawn_external_child(&mut command, label)?;
+        let Some(stdout) = child.stdout.take() else {
+            terminate_guarded_child(&mut child, watchdog, label)?;
+            return Err(BenchError::msg(format!(
+                "{label}: guarded stdout pipe is missing"
+            )));
+        };
+        let capture = BoundedBytesCapture::start(stdout);
+        let outcome = wait_for_guarded_child(&mut child, watchdog, timeout, label);
+        let captured = capture.finish(label, "stdout");
+        let (outcome, (stdout, output_truncated)) = match (outcome, captured) {
+            (Ok(outcome), Ok(captured)) => (outcome, captured),
+            (Err(error), Ok(_)) | (Ok(_), Err(error)) => return Err(error),
+            (Err(wait_error), Err(capture_error)) => {
+                return Err(BenchError::msg(format!(
+                    "{wait_error}; stdout cleanup failed: {capture_error}"
+                )))
+            }
+        };
+        Ok(GuardedCapturedOutput {
+            status: outcome.status,
+            stdout,
+            observed: started.elapsed(),
+            timed_out: outcome.timed_out,
+            memout: outcome.memout,
+            output_truncated,
+        })
+    }
+
+    /// Run one byte transcript under the campaign's stopped-exec RSS
+    /// watchdog.
+    ///
+    /// Input larger than [`GUARDED_TRANSCRIPT_INPUT_LIMIT`] is rejected before
+    /// spawning. Stdout and stderr are drained concurrently and independently,
+    /// retaining at most [`GUARDED_TRANSCRIPT_STREAM_LIMIT`] bytes from each.
+    /// The returned first-cause timeout and memout flags come from the same
+    /// timestamped watchdog cleanup path as [`Self::run_external_captured`].
+    pub fn run_external_transcript<I, S>(
+        &self,
+        program: impl AsRef<std::ffi::OsStr>,
+        args: I,
+        stdin: &[u8],
+        timeout: Duration,
+        label: &str,
+    ) -> Result<GuardedTranscriptOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        if stdin.len() > GUARDED_TRANSCRIPT_INPUT_LIMIT {
+            return Err(BenchError::InvalidArgs {
+                reason: format!(
+                    "{label}: guarded stdin is {} bytes, exceeding the fixed {}-byte limit",
+                    stdin.len(),
+                    GUARDED_TRANSCRIPT_INPUT_LIMIT
+                ),
+            });
+        }
+
+        let started = Instant::now();
+        let mut command = self.external_command(program);
+        command
+            .args(args)
+            .env("MEMLIMIT", self.plan.memlimit_mb_per_child.to_string())
+            .env("NBCORE", self.plan.nbcore_per_child.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let (mut child, watchdog) = self.spawn_external_child(&mut command, label)?;
+        let (Some(child_stdin), Some(stdout), Some(stderr)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
+            terminate_guarded_child(&mut child, watchdog, label)?;
+            return Err(BenchError::msg(format!(
+                "{label}: guarded transcript pipe is missing"
+            )));
+        };
+
+        let stdin_writer = BoundedStdinWriter::start(child_stdin, stdin.to_vec());
+        let stdout_capture = BoundedBytesCapture::start(stdout);
+        let stderr_capture = BoundedBytesCapture::start(stderr);
+        let outcome = wait_for_guarded_child(&mut child, watchdog, timeout, label);
+        let stdin_result = stdin_writer.finish(label);
+        let stdout_result = stdout_capture.finish(label, "stdout");
+        let stderr_result = stderr_capture.finish(label, "stderr");
+
+        let mut failures = Vec::new();
+        let outcome = match outcome {
+            Ok(outcome) => Some(outcome),
+            Err(error) => {
+                failures.push(error.to_string());
+                None
+            }
+        };
+        let stdin_complete = match stdin_result {
+            Ok(stdin_complete) => Some(stdin_complete),
+            Err(error) => {
+                failures.push(error.to_string());
+                None
+            }
+        };
+        let stdout = match stdout_result {
+            Ok(stdout) => Some(stdout),
+            Err(error) => {
+                failures.push(error.to_string());
+                None
+            }
+        };
+        let stderr = match stderr_result {
+            Ok(stderr) => Some(stderr),
+            Err(error) => {
+                failures.push(error.to_string());
+                None
+            }
+        };
+        if !failures.is_empty() {
+            return Err(BenchError::msg(failures.join("; ")));
+        }
+
+        let outcome =
+            outcome.ok_or_else(|| BenchError::msg(format!("{label}: guarded outcome missing")))?;
+        let (stdout, stdout_truncated) =
+            stdout.ok_or_else(|| BenchError::msg(format!("{label}: guarded stdout missing")))?;
+        let (stderr, stderr_truncated) =
+            stderr.ok_or_else(|| BenchError::msg(format!("{label}: guarded stderr missing")))?;
+        let stdin_complete = stdin_complete
+            .ok_or_else(|| BenchError::msg(format!("{label}: guarded stdin outcome missing")))?;
+        Ok(GuardedTranscriptOutput {
+            status: outcome.status,
+            stdout,
+            stderr,
+            observed: started.elapsed(),
+            timed_out: outcome.timed_out,
+            memout: outcome.memout,
+            stdin_complete,
+            stdout_truncated,
+            stderr_truncated,
+        })
+    }
+
     #[cfg(unix)]
-    pub fn spawn_external_child(
+    pub(crate) fn spawn_external_child(
         &self,
         command: &mut Command,
         label: &str,
@@ -2035,7 +2386,7 @@ impl PlannedResources {
     }
 
     #[cfg(not(unix))]
-    pub fn spawn_external_child(
+    pub(crate) fn spawn_external_child(
         &self,
         _command: &mut Command,
         label: &str,
@@ -2071,6 +2422,7 @@ impl PlannedResources {
             target_os = "android",
             target_os = "freebsd",
             target_os = "haiku",
+            target_os = "macos",
             all(target_os = "linux", not(target_env = "uclibc")),
         ),
     ))]
@@ -2123,6 +2475,7 @@ enum UnreapedChildState {
     target_os = "android",
     target_os = "freebsd",
     target_os = "haiku",
+    target_os = "macos",
     all(target_os = "linux", not(target_env = "uclibc")),
 )))]
 const UNREAPED_CHILD_STATE_TYPE_WITNESS: [UnreapedChildState; 3] = [
@@ -2166,10 +2519,39 @@ fn observe_child_unreaped(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn observe_child_unreaped(
+    child: &Child,
+    include_stopped: bool,
+    label: &str,
+) -> Result<UnreapedChildState> {
+    use ay_sys::supervisor::UnreapedChildState as SystemChildState;
+
+    match ay_sys::supervisor::observe_child_unreaped(child, include_stopped) {
+        Ok(SystemChildState::Running) => Ok(UnreapedChildState::Running),
+        Ok(SystemChildState::Exited) => Ok(UnreapedChildState::Exited),
+        Ok(SystemChildState::Stopped(signal)) if include_stopped => {
+            let signal = nix::sys::signal::Signal::try_from(signal).map_err(|error| {
+                BenchError::msg(format!(
+                    "{label}: child stopped with invalid signal {signal}: {error}"
+                ))
+            })?;
+            Ok(UnreapedChildState::Stopped(signal))
+        }
+        Ok(SystemChildState::Stopped(signal)) => Err(BenchError::msg(format!(
+            "{label}: unexpectedly observed stopped child with signal {signal}"
+        ))),
+        Err(error) => Err(BenchError::msg(format!(
+            "{label}: observing child without reaping failed: {error}"
+        ))),
+    }
+}
+
 #[cfg(not(any(
     target_os = "android",
     target_os = "freebsd",
     target_os = "haiku",
+    target_os = "macos",
     all(target_os = "linux", not(target_env = "uclibc")),
 )))]
 fn observe_child_unreaped(
@@ -2190,6 +2572,7 @@ fn observe_child_unreaped(
         target_os = "android",
         target_os = "freebsd",
         target_os = "haiku",
+        target_os = "macos",
         all(target_os = "linux", not(target_env = "uclibc")),
     )),
 ))]
@@ -2347,6 +2730,10 @@ pub(crate) fn wait_for_guarded_child_with_limits(
                         }));
                     }
                 };
+                // Keep the exited leader unreaped until every residual
+                // descendant in its process group has been killed. Reaping
+                // first would permit an inherited stdout descriptor to keep
+                // the bounded reader alive indefinitely.
                 let status_result = kill_process_group_and_reap(child, label);
                 let watchdog_result = watchdog.finish_after_target_cleanup();
                 let (status, watchdog_outcome) = match (status_result, watchdog_result) {
@@ -2732,6 +3119,24 @@ mod tests {
     }
 
     #[test]
+    fn profile_caps_only_reduce_the_admitted_envelope() {
+        let mut resources = PlannedResources::for_test(Path::new("/tmp"), 4096);
+        resources.plan.nbcore_per_child = 8;
+        resources
+            .apply_per_child_caps(Some(2048), Some(2))
+            .expect("apply stricter profile caps");
+        assert_eq!(resources.plan.memlimit_mb_per_child, 2048);
+        assert_eq!(resources.plan.nbcore_per_child, 2);
+
+        resources
+            .apply_per_child_caps(Some(8192), Some(16))
+            .expect("larger caps must not expand the plan");
+        assert_eq!(resources.plan.memlimit_mb_per_child, 2048);
+        assert_eq!(resources.plan.nbcore_per_child, 2);
+        assert!(resources.apply_per_child_caps(Some(0), None).is_err());
+    }
+
+    #[test]
     fn normalized_ids_reject_escapes_and_preserve_directories() {
         assert_eq!(
             normalized_relative_id(Path::new("/corpus/a/case.smt2"), Path::new("/corpus")).unwrap(),
@@ -2851,6 +3256,7 @@ mod tests {
         target_os = "android",
         target_os = "freebsd",
         target_os = "haiku",
+        target_os = "macos",
         all(target_os = "linux", not(target_env = "uclibc"))
     ))]
     fn aggregate_lease_death_before_spawn_fails_closed() {
@@ -2886,6 +3292,7 @@ mod tests {
         target_os = "android",
         target_os = "freebsd",
         target_os = "haiku",
+        target_os = "macos",
         all(target_os = "linux", not(target_env = "uclibc"))
     ))]
     fn aggregate_lease_death_during_run_kills_guarded_child() {
@@ -2939,6 +3346,7 @@ mod tests {
         target_os = "android",
         target_os = "freebsd",
         target_os = "haiku",
+        target_os = "macos",
         all(target_os = "linux", not(target_env = "uclibc")),
     ))]
     #[test]
@@ -2998,6 +3406,7 @@ mod tests {
         target_os = "android",
         target_os = "freebsd",
         target_os = "haiku",
+        target_os = "macos",
         all(target_os = "linux", not(target_env = "uclibc"))
     ))]
     fn guarded_capture_arms_before_target_and_captures_bounded_output() {
@@ -3021,6 +3430,189 @@ mod tests {
         target_os = "android",
         target_os = "freebsd",
         target_os = "haiku",
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
+    fn guarded_capture_reaps_descendants_before_bounded_reader_completion() {
+        let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 10_000);
+        let script = r#"import os,sys,time
+pid=os.fork()
+if pid == 0:
+    print('descendant-ready', flush=True)
+    time.sleep(60)
+    os._exit(0)
+time.sleep(0.1)
+os._exit(0)
+"#;
+        let started = Instant::now();
+        let output = resources
+            .run_external_captured(
+                "python3",
+                ["-c", script],
+                Duration::from_secs(5),
+                "descendant stdout regression",
+            )
+            .expect("guarded descendant capture");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert!(!output.timed_out && !output.memout);
+        assert_eq!(output.stdout, b"descendant-ready\n");
+        assert!(!output.output_truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
+    fn guarded_capture_marks_stdout_over_fixed_parent_limit() {
+        let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 10_000);
+        let output = resources
+            .run_external_captured(
+                "python3",
+                ["-c", "import sys; sys.stdout.write('x' * 1100000)"],
+                Duration::from_secs(5),
+                "bounded stdout regression",
+            )
+            .expect("guarded oversized capture");
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert_eq!(output.stdout.len(), EXTERNAL_CAPTURE_LIMIT);
+        assert!(output.output_truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
+    fn guarded_transcript_writes_stdin_and_captures_both_streams() {
+        let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 10_000);
+        let script = concat!(
+            "import sys\n",
+            "data = sys.stdin.buffer.read()\n",
+            "sys.stdout.buffer.write(b'out:' + data)\n",
+            "sys.stderr.buffer.write(b'err:' + data)\n",
+        );
+        let output = resources
+            .run_external_transcript(
+                "python3",
+                ["-c", script],
+                b"(check-sat)\n",
+                Duration::from_secs(5),
+                "guarded transcript round trip",
+            )
+            .expect("guarded transcript");
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert!(!output.timed_out && !output.memout);
+        assert_eq!(output.stdout, b"out:(check-sat)\n");
+        assert_eq!(output.stderr, b"err:(check-sat)\n");
+        assert!(output.stdin_complete);
+        assert!(!output.stdout_truncated);
+        assert!(!output.stderr_truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
+    fn guarded_transcript_marks_each_truncated_stream() {
+        let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 10_000);
+        let script = concat!(
+            "import sys\n",
+            "sys.stdout.buffer.write(b'o' * 1100000)\n",
+            "sys.stderr.buffer.write(b'e' * 1100000)\n",
+        );
+        let output = resources
+            .run_external_transcript(
+                "python3",
+                ["-c", script],
+                b"",
+                Duration::from_secs(5),
+                "guarded transcript truncation",
+            )
+            .expect("guarded transcript");
+        assert!(output.status.is_some_and(|status| status.success()));
+        assert_eq!(output.stdout.len(), GUARDED_TRANSCRIPT_STREAM_LIMIT);
+        assert_eq!(output.stderr.len(), GUARDED_TRANSCRIPT_STREAM_LIMIT);
+        assert!(output.stdin_complete);
+        assert!(output.stdout_truncated);
+        assert!(output.stderr_truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        target_os = "macos",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
+    fn guarded_transcript_timeout_unblocks_full_stdin_writer() {
+        let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 10_000);
+        let script = concat!(
+            "import sys,time\n",
+            "sys.stdin.close()\n",
+            "print('stdout-ready', flush=True)\n",
+            "print('stderr-ready', file=sys.stderr, flush=True)\n",
+            "time.sleep(60)\n",
+        );
+        let stdin = vec![b'i'; GUARDED_TRANSCRIPT_INPUT_LIMIT];
+        let output = resources
+            .run_external_transcript(
+                "python3",
+                ["-c", script],
+                &stdin,
+                Duration::from_millis(200),
+                "guarded blocked-stdin timeout",
+            )
+            .expect("timeout must clean up all transcript workers");
+        assert!(output.timed_out);
+        assert!(!output.memout);
+        assert_eq!(output.stdout, b"stdout-ready\n");
+        assert_eq!(output.stderr, b"stderr-ready\n");
+        assert!(!output.stdin_complete);
+        assert!(!output.stdout_truncated);
+        assert!(!output.stderr_truncated);
+    }
+
+    #[test]
+    fn guarded_transcript_rejects_oversized_stdin_before_spawn() {
+        let resources = PlannedResources::for_test(&crate::runner::repo_root_public(), 10_000);
+        let stdin = vec![0; GUARDED_TRANSCRIPT_INPUT_LIMIT + 1];
+        let error = resources
+            .run_external_transcript(
+                "/definitely/missing/guarded-transcript-program",
+                std::iter::empty::<&str>(),
+                &stdin,
+                Duration::from_secs(5),
+                "oversized guarded transcript",
+            )
+            .expect_err("oversized stdin must fail before spawning");
+        assert!(error.to_string().contains("guarded stdin"));
+        assert!(error.to_string().contains("fixed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        target_os = "macos",
         all(target_os = "linux", not(target_env = "uclibc"))
     ))]
     fn concurrent_children_share_one_campaign_watchdog_server() {
@@ -3113,6 +3705,7 @@ mod tests {
         target_os = "android",
         target_os = "freebsd",
         target_os = "haiku",
+        target_os = "macos",
         all(target_os = "linux", not(target_env = "uclibc"))
     ))]
     fn missing_campaign_watchdog_heartbeat_kills_target() {
@@ -3218,6 +3811,7 @@ mod tests {
         target_os = "android",
         target_os = "freebsd",
         target_os = "haiku",
+        target_os = "macos",
         all(target_os = "linux", not(target_env = "uclibc"))
     ))]
     fn campaign_watchdog_preserves_zero_grace_memout_enforcement() {

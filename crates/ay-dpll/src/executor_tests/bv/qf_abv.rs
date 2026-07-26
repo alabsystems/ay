@@ -2096,3 +2096,115 @@ fn test_executor_qf_abv_no_init_multi_member_array_wrappers_delegate_11936() {
         exec.statistics()
     );
 }
+
+// BV/LIA bridge shift coverage. These cases exercise the pure-BV translation
+// used to justify integer bounds over `bv2nat`; the SAT cardinals ensure the
+// bridge never manufactures a false upper bound.
+
+#[test]
+fn test_executor_bv_lia_bridge_lshr_upper_bound_unsat() {
+    let input = r#"
+        (set-logic ALL)
+        (declare-const n Int)
+        (assert (>= n 0))
+        (assert (<= n 255))
+        (assert (> (bv2nat (bvlshr ((_ int2bv 8) n) ((_ int2bv 8) 1))) 127))
+        (check-sat)
+    "#;
+    let commands = parse(input).expect("parse bvlshr upper-bound input");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("execute bvlshr upper-bound input");
+    assert_eq!(outputs, vec!["unsat"]);
+}
+
+#[test]
+fn test_executor_bv_lia_bridge_ashr_unsigned_range_unsat() {
+    let input = r#"
+        (set-logic ALL)
+        (declare-const n Int)
+        (assert (>= n 0))
+        (assert (<= n 255))
+        (assert (> (bv2nat (bvashr ((_ int2bv 8) n) ((_ int2bv 8) 1))) 255))
+        (check-sat)
+    "#;
+    let commands = parse(input).expect("parse bvashr range input");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("execute bvashr range input");
+    assert_eq!(outputs, vec!["unsat"]);
+}
+
+#[test]
+fn test_executor_bv_lia_bridge_shl_mask_upper_bound_unsat() {
+    let input = r#"
+        (set-logic ALL)
+        (declare-const n Int)
+        (assert (>= n 0))
+        (assert (<= n 255))
+        (assert (> (bv2nat (bvand (bvshl ((_ int2bv 8) n) ((_ int2bv 8) 4)) #x0f)) 0))
+        (check-sat)
+    "#;
+    let commands = parse(input).expect("parse bvshl mask input");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("execute bvshl mask input");
+    assert_eq!(outputs, vec!["unsat"]);
+}
+
+#[test]
+fn test_executor_bv_lia_bridge_lshr64_probe_upper_bound_unsat() {
+    let input = r#"
+        (set-logic ALL)
+        (declare-const v Int)
+        (assert (>= v 0))
+        (assert (<= v 18446744073709551615))
+        (assert (> (bv2nat (bvlshr ((_ int2bv 64) v) ((_ int2bv 64) 32))) 4294967295))
+        (check-sat)
+    "#;
+    let commands = parse(input).expect("parse 64-bit bvlshr input");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("execute 64-bit bvlshr input");
+    assert_eq!(outputs, vec!["unsat"]);
+}
+
+#[test]
+fn test_executor_bv_lia_bridge_lshr_sat_bound_not_unsat() {
+    let input = r#"
+        (set-logic ALL)
+        (declare-const n Int)
+        (assert (>= n 0))
+        (assert (<= n 255))
+        (assert (> (bv2nat (bvlshr ((_ int2bv 8) n) ((_ int2bv 8) 1))) 50))
+        (check-sat)
+    "#;
+    let commands = parse(input).expect("parse satisfiable bvlshr input");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("execute satisfiable bvlshr input");
+    assert_ne!(outputs, vec!["unsat"]);
+}
+
+#[test]
+fn test_executor_bv_lia_bridge_lshr_exact_boundary_sat_not_unsat() {
+    let input = r#"
+        (set-logic ALL)
+        (declare-const n Int)
+        (assert (>= n 0))
+        (assert (<= n 255))
+        (assert (> (bv2nat (bvlshr ((_ int2bv 8) n) ((_ int2bv 8) 1))) 126))
+        (check-sat)
+    "#;
+    let commands = parse(input).expect("parse bvlshr boundary input");
+    let mut exec = Executor::new();
+    let outputs = exec
+        .execute_all(&commands)
+        .expect("execute bvlshr boundary input");
+    assert_ne!(outputs, vec!["unsat"]);
+}

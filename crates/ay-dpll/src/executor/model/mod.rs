@@ -60,6 +60,7 @@ pub(in crate::executor) mod uflia_witness;
 mod validation;
 
 pub(in crate::executor) use dt_egraph_values::DtEgraphAssignment;
+pub(in crate::executor) use eval_array::ArrayDefIndexCache;
 pub(crate) use validation::ValidationStats;
 
 /// Red zone size for `stacker::maybe_grow` in model evaluation (#4602).
@@ -181,6 +182,7 @@ mod eval_memo {
     }
 }
 
+pub(in crate::executor) use eval_guard::AssertionsFrozen;
 pub(crate) use eval_memo::EvalMemoSession;
 
 /// Evaluation re-entrancy guard (`#eval-cycle-guard`).
@@ -241,7 +243,16 @@ mod eval_guard {
         /// deterministic clock W4's search budget is measured against
         /// (`Executor::w4_work_deadline`).
         enters: u64,
+        /// Process-unique id of the current OUTERMOST evaluation frame
+        /// (assigned on every depth 0 -> 1 transition from the global
+        /// [`FRAME_GENERATION`] source). See [`top_frame_generation`].
+        top_generation: u64,
     }
+
+    /// Process-global frame-generation source. Monotonic across ALL threads,
+    /// so a generation is never reused — even when solves run on fresh
+    /// dedicated-stack threads whose thread-locals restart from scratch.
+    static FRAME_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     thread_local! {
         static STATE: RefCell<GuardState> = RefCell::new(GuardState {
@@ -250,7 +261,28 @@ mod eval_guard {
             min_reentry: u32::MAX,
             stop_poison: 0,
             enters: 0,
+            top_generation: 0,
         });
+    }
+
+    /// The process-unique id of the outermost `evaluate_term` frame currently
+    /// live on this thread, or `None` outside any evaluation.
+    ///
+    /// SOUNDNESS BASIS (borrow discipline, not convention): `evaluate_term`
+    /// takes `&self` on the executor and `ctx.assertions` /
+    /// `last_assumptions` are plain fields (no interior mutability), so for
+    /// the whole lifetime of one outermost frame no `&mut self` method can
+    /// run on this thread — the assertion set is FROZEN by the borrow
+    /// checker. A cache validated under generation G may therefore skip
+    /// re-validation for as long as `top_frame_generation()` still returns
+    /// G. (This is deliberately NOT keyed on eval-memo sessions: sessions
+    /// span `&mut self` regions that DO mutate assertions — the incremental
+    /// push/pop suite refuted that contract via the debug oracle.)
+    pub(in crate::executor) fn top_frame_generation() -> Option<u64> {
+        STATE.with(|s| {
+            let st = s.borrow();
+            (st.depth > 0).then_some(st.top_generation)
+        })
     }
 
     /// RAII token marking one term as under evaluation on this thread.
@@ -291,6 +323,11 @@ mod eval_guard {
                 None
             } else {
                 st.depth += 1;
+                if st.depth == 1 {
+                    // New outermost frame: mint its process-unique id.
+                    st.top_generation =
+                        1 + FRAME_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 let d = st.depth;
                 st.in_progress.insert(term, d);
                 Some(Entered { term })
@@ -333,6 +370,63 @@ mod eval_guard {
     /// This thread's memo-missing node-visit count (see `GuardState::enters`).
     pub(super) fn enters() -> u64 {
         STATE.with(|s| s.borrow().enters)
+    }
+
+    thread_local! {
+        /// Nesting depth of live [`AssertionsFrozen`] guards on this thread.
+        static FREEZE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// Process-unique id of the outermost live freeze region.
+        static FREEZE_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Process-global freeze-generation source (never reused across threads).
+    static FREEZE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// RAII marker for a lexical region that PROMISES not to mutate
+    /// `ctx.assertions` / `last_assumptions` — placed only around passes that
+    /// interleave model mutation with many top-level `evaluate_term` calls
+    /// (each of which is its own frame, so the frame-generation fast path
+    /// cannot amortize across them; the read-pin repair loop re-ran the
+    /// O(constraints) def-index snapshot compare once per pin because of
+    /// exactly this).
+    ///
+    /// UNLIKE the borrow-checker-backed frame generation, this is a stated
+    /// contract — so it is defended the same way the (refuted) eval-memo
+    /// session keying was caught: `array_def_candidates` re-runs the full
+    /// byte-exact snapshot compare on every freeze-keyed fast hit in debug
+    /// builds. A guard placed around a region that does mutate assertions
+    /// fails loudly across the test batteries instead of serving a stale
+    /// definition set.
+    pub(in crate::executor) struct AssertionsFrozen(());
+
+    impl AssertionsFrozen {
+        pub(in crate::executor) fn new() -> Self {
+            FREEZE_DEPTH.with(|d| {
+                let depth = d.get();
+                if depth == 0 {
+                    FREEZE_GEN.with(|g| {
+                        g.set(
+                            1 + FREEZE_GENERATION
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                        );
+                    });
+                }
+                d.set(depth + 1);
+            });
+            AssertionsFrozen(())
+        }
+    }
+
+    impl Drop for AssertionsFrozen {
+        fn drop(&mut self) {
+            FREEZE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+
+    /// The process-unique id of the outermost live assertions-freeze region on
+    /// this thread, or `None` when no guard is live.
+    pub(in crate::executor) fn assertions_freeze_generation() -> Option<u64> {
+        FREEZE_DEPTH.with(|d| (d.get() > 0).then(|| FREEZE_GEN.with(std::cell::Cell::get)))
     }
 
     pub(super) fn stop_poison() -> u64 {

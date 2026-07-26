@@ -13,8 +13,29 @@ use super::super::{
 use super::pigeonhole_core::EnumDiseqEdges;
 // #8529: Use deterministic hash maps in all builds.
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
-use ay_core::{Sort, TermData, TermId};
+use ay_core::{Sort, Symbol, TermData, TermId};
 use num_bigint::BigInt;
+
+const SINGLETON_CLOSURE_RESOURCE_POLL_INTERVAL: usize = 1024;
+
+/// Whether singleton-sort closure finished emitting its complete spanning set.
+///
+/// Callers must not dispatch a solver after `Aborted`: equalities emitted before
+/// the resource checkpoint are sound, but they may be only a prefix of the
+/// closure required for EUF congruence completeness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub(in crate::executor) enum SingletonSortClosureStatus {
+    Complete,
+    Aborted,
+}
+
+impl SingletonSortClosureStatus {
+    #[must_use]
+    pub(in crate::executor) const fn is_complete(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
 
 /// Boolean polarity of a sub-term occurrence, for soundly deciding whether a
 /// pointwise-forall holds as a PREMISE. `Positive` = under an even number of
@@ -320,28 +341,6 @@ impl Executor {
         }
     }
 
-    /// Soundness pass: when an array's ELEMENT sort has cardinality one, the
-    /// array sort `(Array I E)` has a single inhabitant, so any two arrays of
-    /// that sort are necessarily equal. For each top-level array disequality
-    /// `(assert (not (= a b)))` / `(assert (distinct a b ...))` whose element
-    /// sort is a provable singleton, assert the forced equality `(= a b)`. The
-    /// asserted disequality then becomes UNSAT, matching the theory. Positive
-    /// uses are unaffected (the equality is implied anyway). When the element
-    /// sort cardinality cannot be proven to be one, nothing is asserted (we
-    /// never guess Sat/Unsat for an undetermined cardinality).
-    pub(in crate::executor) fn add_singleton_array_sort_equalities(&mut self) {
-        let mut forced_equalities: Vec<(TermId, TermId)> = Vec::new();
-        let assertions = self.ctx.assertions.clone();
-        for &assertion in &assertions {
-            self.collect_singleton_array_forced_equalities(assertion, &mut forced_equalities);
-        }
-
-        for (lhs, rhs) in forced_equalities {
-            let eq = self.ctx.terms.mk_eq(lhs, rhs);
-            self.push_array_axiom_assertion_site(eq, "singleton_elem_array_eq");
-        }
-    }
-
     /// Soundness pass: two const-arrays `(as const T) d1` and `(as const T) d2`
     /// with provably-distinct defaults `d1 != d2` are EXTENSIONALLY distinct
     /// (they differ at every index), so assert `(not (= c1 c2))` for each such
@@ -424,71 +423,164 @@ impl Executor {
         }
     }
 
-    /// Soundness pass: for every equality atom `(= a b)` whose operand SORT is a
-    /// provable singleton, ASSERT `(= a b)` as a top-level fact. A singleton sort
-    /// has exactly one inhabitant, so `a` and `b` are necessarily equal in every
-    /// model and the fact removes no models. The solver then propagates `a = b`
-    /// by congruence, forcing the (shared) equality atom true wherever it
-    /// appears.
+    /// Soundness pass: ASSERT a linear spanning set of equalities between every
+    /// GROUND term of each provably-singleton sort reachable from `roots`.
     ///
-    /// This generalizes `add_singleton_array_sort_equalities` (which only forced
-    /// equality for TOP-LEVEL array disequalities) to positive and nested uses,
-    /// closing wrong-SAT where a positive equality over a singleton sort was
-    /// left as a free Boolean — e.g. `(= v (store v i c))` over `(Array Int D8)`
-    /// with `D8 = {c9}` a singleton, which is a store no-op.
+    /// A singleton sort has exactly one inhabitant, so every emitted equality
+    /// holds in every model and removes no models. Emitting `n - 1` equalities
+    /// from one representative (rather than all `n²` pairs) is sufficient for
+    /// EUF congruence and keeps the pass linear after term discovery.
+    ///
+    /// This must collect terms regardless of their surrounding syntax. Looking
+    /// only for existing equality atoms misses a singleton-sorted term used
+    /// exclusively as a UF argument: `a` and `b` may be the only arrays of sort
+    /// `(Array Int D1)`, with `D1 = {c}`, while `(distinct (f a) (f b))`
+    /// requires `a = b` to reach the UF congruence conflict.
     ///
     /// CRITICAL: it ASSERTS the equality rather than REWRITING the atom to
     /// `true`. Rewriting would also delete the atom from any DEFINITIONAL role —
     /// e.g. the `(= sk c0)` enum-skolem-coverage fact that links a Skolem
     /// constant to the sole constructor — and the EUF core (which does not
     /// independently know the sort is a singleton) would then float the Skolem
-    /// free, producing a spurious SAT (#bug10 regression). Asserting adds the
-    /// fact without removing any structure. Sound: only fires when the sort
-    /// cardinality is PROVABLY one (conservative under-approximation).
-    pub(in crate::executor) fn fold_singleton_sort_equalities(&mut self) {
-        let mut eq_pairs: Vec<(TermId, TermId)> = Vec::new();
-        let mut seen: HashSet<TermId> = HashSet::default();
-        let assertions = self.ctx.assertions.clone();
-        for &assertion in &assertions {
-            self.collect_singleton_sort_eq_atoms(assertion, &mut eq_pairs, &mut seen);
+    /// free, producing a spurious SAT (#bug10 regression). Asserting adds facts
+    /// without removing any structure.
+    ///
+    /// Quantifier and let bodies are deliberately opaque. Their variables are
+    /// locally scoped; hoisting an equality containing one into the ground
+    /// assertion set would be invalid. Quantifier preprocessing may separately
+    /// produce ground instances, which are ordinary roots and are covered.
+    ///
+    /// Sound: `sort_cardinality_is_one` is a conservative under-approximation,
+    /// and an unknown/non-singleton sort emits nothing.
+    pub(in crate::executor) fn add_ground_singleton_sort_equalities(
+        &mut self,
+        roots: &[TermId],
+    ) -> SingletonSortClosureStatus {
+        if self.should_abort_theory_loop() {
+            return SingletonSortClosureStatus::Aborted;
         }
-        for (lhs, rhs) in eq_pairs {
-            let eq = self.ctx.terms.mk_eq(lhs, rhs);
-            self.push_array_axiom_assertion_site(eq, "singleton_sort_eq_fact");
-        }
-    }
 
-    /// Collect `(lhs, rhs)` of equality atoms `(= a b)` (a != b) reachable from
-    /// `term` whose operand sort is a provable singleton, recursing through all
-    /// structure.
-    fn collect_singleton_sort_eq_atoms(
-        &self,
-        term: TermId,
-        out: &mut Vec<(TermId, TermId)>,
-        seen: &mut HashSet<TermId>,
-    ) {
-        if !seen.insert(term) {
-            return;
-        }
-        match self.ctx.terms.get(term).clone() {
-            TermData::App(sym, args) => {
-                if sym.name() == "=" && args.len() == 2 && args[0] != args[1] {
-                    let sort = self.ctx.terms.sort(args[0]).clone();
-                    if self.sort_cardinality_is_one(&sort) {
-                        out.push((args[0], args[1]));
+        let mut by_sort: HashMap<Sort, Vec<TermId>> = HashMap::default();
+        let mut cardinality_cache: HashMap<Sort, bool> = HashMap::default();
+        let mut seen: HashSet<TermId> = HashSet::default();
+        let mut stack: Vec<TermId> = roots.iter().rev().copied().collect();
+        let mut work_since_poll = 0usize;
+
+        while let Some(term) = stack.pop() {
+            work_since_poll += 1;
+            if work_since_poll >= SINGLETON_CLOSURE_RESOURCE_POLL_INTERVAL {
+                work_since_poll = 0;
+                if self.should_abort_theory_loop() {
+                    return SingletonSortClosureStatus::Aborted;
+                }
+            }
+            if !seen.insert(term) {
+                continue;
+            }
+
+            let data = self.ctx.terms.get(term).clone();
+            // Never lift a term whose meaning depends on a local binder.
+            if matches!(
+                data,
+                TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..)
+            ) {
+                continue;
+            }
+
+            let sort = self.ctx.terms.sort(term).clone();
+            let singleton = if let Some(&cached) = cardinality_cache.get(&sort) {
+                cached
+            } else {
+                let proved = self.sort_cardinality_is_one(&sort);
+                cardinality_cache.insert(sort.clone(), proved);
+                proved
+            };
+            if singleton {
+                by_sort.entry(sort).or_default().push(term);
+            }
+
+            match data {
+                TermData::Const(_) | TermData::Var(..) => {}
+                TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => {
+                    unreachable!("binder terms are filtered above")
+                }
+                TermData::App(_, args) => {
+                    for arg in args.into_iter().rev() {
+                        stack.push(arg);
                     }
                 }
-                for arg in args {
-                    self.collect_singleton_sort_eq_atoms(arg, out, seen);
+                TermData::Not(inner) => stack.push(inner),
+                TermData::Ite(c, t, e) => {
+                    stack.push(e);
+                    stack.push(t);
+                    stack.push(c);
+                }
+                // `TermData` is non-exhaustive. Unknown future structure stays
+                // opaque so this ground-only pass cannot cross a new binder.
+                _ => {}
+            }
+        }
+
+        let mut forced_equalities = Vec::new();
+        work_since_poll = 0;
+        for terms in by_sort.values_mut() {
+            terms.sort_unstable_by_key(|term| term.0);
+            if self.should_abort_theory_loop() {
+                return SingletonSortClosureStatus::Aborted;
+            }
+            terms.dedup();
+            if let Some((&representative, rest)) = terms.split_first() {
+                for &other in rest {
+                    work_since_poll += 1;
+                    if work_since_poll >= SINGLETON_CLOSURE_RESOURCE_POLL_INTERVAL {
+                        work_since_poll = 0;
+                        if self.should_abort_theory_loop() {
+                            return SingletonSortClosureStatus::Aborted;
+                        }
+                    }
+                    if other != representative {
+                        forced_equalities.push((representative, other));
+                    }
                 }
             }
-            TermData::Not(inner) => self.collect_singleton_sort_eq_atoms(inner, out, seen),
-            TermData::Ite(c, t, e) => {
-                self.collect_singleton_sort_eq_atoms(c, out, seen);
-                self.collect_singleton_sort_eq_atoms(t, out, seen);
-                self.collect_singleton_sort_eq_atoms(e, out, seen);
+        }
+        if self.should_abort_theory_loop() {
+            return SingletonSortClosureStatus::Aborted;
+        }
+        forced_equalities.sort_unstable_by_key(|&(lhs, rhs)| (lhs.0, rhs.0));
+        if self.should_abort_theory_loop() {
+            return SingletonSortClosureStatus::Aborted;
+        }
+
+        let mut already_present: HashSet<TermId> = self.ctx.assertions.iter().copied().collect();
+        already_present.extend(roots.iter().copied());
+        work_since_poll = 0;
+        for (lhs, rhs) in forced_equalities {
+            work_since_poll += 1;
+            if work_since_poll >= SINGLETON_CLOSURE_RESOURCE_POLL_INTERVAL {
+                work_since_poll = 0;
+                if self.should_abort_theory_loop() {
+                    return SingletonSortClosureStatus::Aborted;
+                }
             }
-            _ => {}
+            // Keep the equality STRUCTURAL. `TermStore::mk_eq` soundly rewrites
+            // `(= (store a i v) a)` to `(= (select a i) v)`, but that equivalent
+            // atom no longer merges the original array terms in EUF. This pass
+            // exists specifically to expose those congruence merges.
+            let (lhs, rhs) = if lhs < rhs { (lhs, rhs) } else { (rhs, lhs) };
+            let eq = self
+                .ctx
+                .terms
+                .mk_app(Symbol::named("="), vec![lhs, rhs], Sort::Bool);
+            if already_present.insert(eq) {
+                self.push_array_axiom_assertion_site(eq, "singleton_sort_eq_fact");
+            }
+        }
+
+        if self.should_abort_theory_loop() {
+            SingletonSortClosureStatus::Aborted
+        } else {
+            SingletonSortClosureStatus::Complete
         }
     }
 
@@ -1244,67 +1336,6 @@ impl Executor {
         self.sort_finite_cardinality(sort)
     }
 
-    /// True when `term`'s OWN sort is a provable singleton (datatype with one
-    /// nullary-or-all-singleton-field constructor, or an array whose element sort
-    /// is such). Any two terms of a singleton sort are necessarily equal.
-    fn term_sort_is_singleton(&self, term: TermId) -> bool {
-        let sort = self.ctx.terms.sort(term).clone();
-        self.sort_cardinality_is_one(&sort)
-    }
-
-    /// Collect `(lhs, rhs)` pairs that must be equal (because their SORT is a
-    /// provable singleton — a singleton datatype, or an array whose element sort
-    /// is one) but are asserted distinct. Walks top-level `and` conjuncts and
-    /// recognises both `(not (= a b))` and direct `(distinct a b ...)`. Generalized
-    /// from array-only to any singleton sort so the EXTENSIONALITY-EXPANDED element
-    /// disequality `(not (= (select a k) (select (store a i c) k)))` over a
-    /// singleton datatype element (e.g. `D8 = {c9}`) is forced equal — closing the
-    /// singleton-store / singleton-datatype wrong-sat.
-    fn collect_singleton_array_forced_equalities(
-        &self,
-        term: TermId,
-        out: &mut Vec<(TermId, TermId)>,
-    ) {
-        match self.ctx.terms.get(term) {
-            TermData::App(sym, args) if sym.name() == "and" => {
-                let args = args.clone();
-                for arg in args {
-                    self.collect_singleton_array_forced_equalities(arg, out);
-                }
-            }
-            // `(distinct a b ...)` over a singleton sort: every pair is forced
-            // equal, so asserting any of them distinct is a conflict.
-            TermData::App(sym, args) if sym.name() == "distinct" && args.len() >= 2 => {
-                let args = args.clone();
-                if !self.term_sort_is_singleton(args[0]) {
-                    return;
-                }
-                for i in 0..args.len() {
-                    for j in (i + 1)..args.len() {
-                        if args[i] != args[j] {
-                            out.push((args[i], args[j]));
-                        }
-                    }
-                }
-            }
-            TermData::Not(inner) => {
-                let TermData::App(sym, args) = self.ctx.terms.get(*inner) else {
-                    return;
-                };
-                if sym.name() == "=" && args.len() == 2 {
-                    let (lhs, rhs) = (args[0], args[1]);
-                    if lhs != rhs && self.term_sort_is_singleton(lhs) {
-                        out.push((lhs, rhs));
-                    }
-                } else if sym.name() == "distinct" && args.len() >= 2 {
-                    // `(not (distinct ...))` is a positive constraint, not a
-                    // disequality — nothing to force.
-                }
-            }
-            _ => {}
-        }
-    }
-
     /// Maximum number of distinct enum-sorted terms (graph nodes) over which the
     /// finite-enum pigeonhole conflict check runs a clique search. Beyond this we
     /// skip the check (staying SOUND — it never fires a false conflict, just may
@@ -1335,8 +1366,8 @@ impl Executor {
     ///
     /// AY otherwise reports SAT here by inventing fresh enum representatives
     /// (`@Col!0/1/2`), ignoring that an all-nullary datatype is a FINITE domain.
-    /// (`add_singleton_array_sort_equalities` / `fold_singleton_sort_equalities`
-    /// only handle the `k == 1` singleton case.)
+    /// (`add_ground_singleton_sort_equalities` handles only the `k == 1`
+    /// singleton case.)
     ///
     /// Method: collect the disequality edges that hold UNCONDITIONALLY (top-level
     /// asserted `(not (= a b))`, `(distinct ...)`, and conjuncts of a top-level
@@ -4046,6 +4077,154 @@ impl Executor {
             );
         }
         clauses > 0 && !truncated
+    }
+}
+
+#[cfg(test)]
+mod singleton_sort_closure_tests {
+    use super::*;
+    use crate::executor_types::UnknownReason;
+    use ay_core::time::Instant;
+    use ay_frontend::parse;
+    use std::time::Duration;
+
+    fn register_singleton_datatype(exec: &mut Executor) {
+        let commands = parse("(declare-datatype D1 ((c)))").expect("parse singleton datatype");
+        assert!(exec
+            .execute_all(&commands)
+            .expect("register singleton datatype")
+            .is_empty());
+    }
+
+    fn singleton_sort() -> Sort {
+        Sort::Uninterpreted("D1".to_string())
+    }
+
+    /// Three same-sort roots require exactly a two-edge star. Re-running the
+    /// pass must be idempotent rather than growing duplicate assertions.
+    #[test]
+    fn ground_singleton_closure_is_linear_deterministic_and_idempotent() {
+        let mut exec = Executor::new();
+        register_singleton_datatype(&mut exec);
+        let sort = singleton_sort();
+        let a = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("a"), vec![], sort.clone());
+        let b = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("b"), vec![], sort.clone());
+        let c = exec.ctx.terms.mk_app(Symbol::named("c2"), vec![], sort);
+        let roots = [a, b, c];
+
+        assert_eq!(
+            exec.add_ground_singleton_sort_equalities(&roots),
+            SingletonSortClosureStatus::Complete
+        );
+        assert_eq!(exec.ctx.assertions.len(), 2, "n roots need n - 1 facts");
+
+        let mut pairs = Vec::new();
+        for &assertion in &exec.ctx.assertions {
+            let TermData::App(sym, args) = exec.ctx.terms.get(assertion) else {
+                panic!("singleton closure emitted a non-application");
+            };
+            assert_eq!(sym.name(), "=");
+            assert_eq!(args.len(), 2);
+            pairs.push((args[0], args[1]));
+        }
+        pairs.sort_unstable_by_key(|&(lhs, rhs)| (lhs.0, rhs.0));
+        assert_eq!(pairs, vec![(a, b), (a, c)]);
+
+        assert_eq!(
+            exec.add_ground_singleton_sort_equalities(&roots),
+            SingletonSortClosureStatus::Complete
+        );
+        assert_eq!(
+            exec.ctx.assertions.len(),
+            2,
+            "repeated closure must not duplicate facts"
+        );
+    }
+
+    /// Bound variables must never escape into a generated ground equality.
+    #[test]
+    fn singleton_closure_does_not_descend_into_quantifiers() {
+        let mut exec = Executor::new();
+        register_singleton_datatype(&mut exec);
+        let sort = singleton_sort();
+        let bound = exec.ctx.terms.mk_var("x", sort.clone());
+        let ctor = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("c"), vec![], sort.clone());
+        let body = exec.ctx.terms.mk_eq(bound, ctor);
+        let quantified = exec
+            .ctx
+            .terms
+            .mk_forall(vec![("x".to_string(), sort)], body);
+
+        assert_eq!(
+            exec.add_ground_singleton_sort_equalities(&[quantified]),
+            SingletonSortClosureStatus::Complete
+        );
+        assert!(
+            exec.ctx.assertions.is_empty(),
+            "quantifier body equality was hoisted out of scope"
+        );
+    }
+
+    /// Let-bound variables are local too. Let nodes should normally be expanded
+    /// earlier, but the soundness pass must remain safe if one reaches it.
+    #[test]
+    fn singleton_closure_does_not_descend_into_let_bindings() {
+        let mut exec = Executor::new();
+        register_singleton_datatype(&mut exec);
+        let sort = singleton_sort();
+        let local = exec.ctx.terms.mk_var("x", sort.clone());
+        let ctor = exec.ctx.terms.mk_app(Symbol::named("c"), vec![], sort);
+        let body = exec.ctx.terms.mk_eq(local, ctor);
+        let let_term = exec.ctx.terms.mk_let(vec![("x".to_string(), ctor)], body);
+
+        assert_eq!(
+            exec.add_ground_singleton_sort_equalities(&[let_term]),
+            SingletonSortClosureStatus::Complete
+        );
+        assert!(
+            exec.ctx.assertions.is_empty(),
+            "let body equality was hoisted out of scope"
+        );
+    }
+
+    /// An expired solve budget must decline before emitting any subset of the
+    /// closure, leaving callers an explicit fail-closed status to consume.
+    #[test]
+    fn singleton_closure_aborts_on_expired_deadline_without_emitting_facts() {
+        let mut exec = Executor::new();
+        register_singleton_datatype(&mut exec);
+        let sort = singleton_sort();
+        let a = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("a"), vec![], sort.clone());
+        let b = exec.ctx.terms.mk_app(Symbol::named("b"), vec![], sort);
+        let assertion_count = exec.ctx.assertions.len();
+        let expired_deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("one millisecond must be representable");
+        exec.set_solve_controls(None, Some(expired_deadline));
+
+        assert_eq!(
+            exec.add_ground_singleton_sort_equalities(&[a, b]),
+            SingletonSortClosureStatus::Aborted
+        );
+        assert_eq!(
+            exec.ctx.assertions.len(),
+            assertion_count,
+            "an entry checkpoint must not emit a partial closure"
+        );
+        assert!(exec.last_result().is_some_and(|r| r.is_unknown()));
+        assert_eq!(exec.get_reason_unknown(), Some(UnknownReason::Timeout));
     }
 }
 

@@ -34,6 +34,9 @@ pub mod cdcl;
 pub mod clique_witness;
 mod cp_dense;
 mod cutting_planes;
+#[cfg(feature = "dev-tools")]
+#[doc(hidden)]
+pub mod dev_tools;
 mod encoding;
 mod eq_knapsack;
 mod eval;
@@ -52,6 +55,9 @@ mod solver;
 pub mod symmetry;
 mod types;
 pub mod verify;
+#[cfg(any(feature = "certified-proof-artifacts", feature = "dev-tools"))]
+#[doc(hidden)]
+pub mod veripb_runner;
 
 pub use cdcl::{PbCdclResult, PbCdclSolver, PbCdclStats};
 pub use clique_witness::{clique_arm_matches, try_clique_witness};

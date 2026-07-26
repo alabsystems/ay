@@ -13,8 +13,8 @@
 # binding gap that aborts the session) is INCOMPLETE -- recorded separately, NOT
 # a bug. Only a genuine sat-vs-unsat split is a finding.
 #
-# SKIPS gracefully if real z3py is not installed (a differential test is
-# meaningless without a reference solver).
+# The version-pinned real z3py oracle is a required dev dependency; conftest
+# fails collection clearly when it is unavailable.
 #
 # REGRESSION POLICY: historical array wrong-`unsat` seeds now fail closed with
 # `unknown`. The incremental `arrays` / `arr_lia` fragments are held to the same
@@ -24,14 +24,9 @@
 import os
 
 import pytest
+import z3
 
 from ayz3_fuzz import incremental
-
-z3 = pytest.importorskip(
-    "z3",
-    reason="real z3py not installed; incremental differential fuzz needs a "
-           "reference solver",
-)
 
 # Number of incremental sessions per fragment. Override with
 # AYZ3_INCR_FUZZ_COUNT for a heavier local run.

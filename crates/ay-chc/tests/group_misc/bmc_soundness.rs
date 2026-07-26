@@ -11,10 +11,7 @@
 //!
 //! These tests MUST fail (when run) if the bug exists.
 //!
-//! NOTE: Some benchmark-based tests in this module are ignored by default because they can be
-//! very slow and may block the org-wide cargo lock (see #390).
-//! - Run ignored tests only: `cargo test -p ay-chc --test bmc_soundness -- --ignored`
-//! - Run all tests: `cargo test -p ay-chc --test bmc_soundness -- --include-ignored`
+//! Every test uses a bounded built-in fixture and runs in the ordinary suite.
 
 use ay_chc::{testing, BmcConfig, ChcEngineResult};
 use ay_chc::{ChcExpr, ChcProblem, ChcSort, ChcVar, ClauseBody, ClauseHead, HornClause};

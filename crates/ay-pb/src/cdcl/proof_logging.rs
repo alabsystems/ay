@@ -184,6 +184,16 @@ impl PbCdclSolver {
         }
     }
 
+    /// Emits `rup >= 1 ;` — the claim that the current constraint database is
+    /// already contradictory by unit propagation.
+    ///
+    /// ONLY call this where that claim is actually derivable: after a real
+    /// refutation (UNSAT), or where a single database row is conflicting under
+    /// the empty assignment. VeriPB re-checks it and rejects the whole proof
+    /// otherwise. In particular it must NOT be used to paper over a
+    /// non-derivable objective lower bound — see [`Self::conclude_opt_proof`],
+    /// which fails closed with [`ProofError::UnprovableOptimizationLowerBound`]
+    /// instead.
     fn log_contradiction_proof_step(&mut self) -> Option<ConstraintId> {
         self.log_proof_step(ProofStep::Rup(format_constraint(&[], 1)))
     }

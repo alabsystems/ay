@@ -1991,6 +1991,250 @@ mod mixed_conflict_semantic_dispatch_tests {
     }
 }
 
+mod mixed_need_lemmas_verification_tests {
+    use super::dispatch::{
+        close_valid_lemma_clauses, verify_mixed_conflict_semantic, LemmaTrailClosure,
+    };
+    use super::*;
+    use crate::combined_solvers::combiner::TheoryCombiner;
+    use ay_core::{Sort, Symbol, TermStore, TheoryResult, TheorySolver};
+
+    fn first_auflia_result(
+        conflict: &[TheoryLit],
+        support_axioms: &[TheoryLit],
+        terms: &TermStore,
+    ) -> TheoryResult {
+        let mut combiner = TheoryCombiner::auf_lia(terms);
+        for lit in conflict.iter().chain(support_axioms.iter()) {
+            combiner.register_atom(lit.term);
+        }
+        for lit in conflict.iter().chain(support_axioms.iter()) {
+            combiner.assert_literal(lit.term, lit.value);
+        }
+        combiner.check()
+    }
+
+    #[test]
+    fn test_valid_lemma_closure_distinguishes_zero_one_and_multiple_live_literals() {
+        let a = TermId(1);
+        let b = TermId(2);
+        let c = TermId(3);
+
+        let mut zero_live = ay_core::kani_compat::det_hash_map_with_capacity(2);
+        zero_live.insert(a, true);
+        zero_live.insert(b, false);
+        assert_eq!(
+            close_valid_lemma_clauses(
+                &[vec![TheoryLit::new(a, false), TheoryLit::new(b, true)]],
+                &mut zero_live,
+            ),
+            LemmaTrailClosure::Contradiction,
+            "a fully falsified valid clause refutes the fixed context"
+        );
+
+        let mut one_live = ay_core::kani_compat::det_hash_map_with_capacity(1);
+        one_live.insert(a, true);
+        assert_eq!(
+            close_valid_lemma_clauses(
+                &[
+                    vec![TheoryLit::new(a, false), TheoryLit::new(b, true)],
+                    vec![TheoryLit::new(b, false), TheoryLit::new(c, true)],
+                ],
+                &mut one_live,
+            ),
+            LemmaTrailClosure::Complete(vec![TheoryLit::new(b, true), TheoryLit::new(c, true),]),
+            "unit closure must reach a fixed point across the entire batch"
+        );
+
+        let mut multiple_live = ay_core::kani_compat::det_hash_map_with_capacity(1);
+        multiple_live.insert(a, true);
+        assert_eq!(
+            close_valid_lemma_clauses(
+                &[vec![
+                    TheoryLit::new(a, false),
+                    TheoryLit::new(b, true),
+                    TheoryLit::new(c, true),
+                ]],
+                &mut multiple_live,
+            ),
+            LemmaTrailClosure::Inconclusive,
+            "the verifier must not choose a disjunct from a multi-live clause"
+        );
+    }
+
+    #[test]
+    fn test_mixed_verifier_materializes_row2_unit_before_rechecking() {
+        let mut terms = TermStore::new();
+        let array = terms.mk_var("a", Sort::array(Sort::Int, Sort::Int));
+        let i = terms.mk_var("i", Sort::Int);
+        let j = terms.mk_var("j", Sort::Int);
+        let ten = terms.mk_int(BigInt::from(10));
+        let twenty = terms.mk_int(BigInt::from(20));
+        let stored = terms.mk_store(array, i, ten);
+        let stored_read = terms.mk_select(stored, j);
+        let base_read = terms.mk_select(array, j);
+        // Intern the ROW2 equality atom without asserting it. With i != j,
+        // ROW2 makes this the one live disjunct of the emitted clause.
+        let _reads_equal = terms.mk_eq(stored_read, base_read);
+        let indices_equal = terms.mk_eq(i, j);
+        let stored_read_eq_ten = terms.mk_eq(stored_read, ten);
+        let base_read_eq_twenty = terms.mk_eq(base_read, twenty);
+        let conflict = vec![
+            TheoryLit::new(indices_equal, false),
+            TheoryLit::new(stored_read_eq_ten, true),
+            TheoryLit::new(base_read_eq_twenty, true),
+        ];
+
+        assert!(
+            matches!(
+                first_auflia_result(&conflict, &[], &terms),
+                TheoryResult::NeedLemmas(_)
+            ),
+            "the fresh combiner must expose the drained ROW2 lemma lifecycle"
+        );
+        assert!(
+            verify_mixed_conflict_semantic(&conflict, &terms, &[]).is_ok(),
+            "the ROW2 lemma's sole live equality is entailed and must drive the valid conflict to UNSAT"
+        );
+    }
+
+    #[test]
+    fn test_mixed_verifier_accepts_fully_falsified_row2_context() {
+        let mut terms = TermStore::new();
+        let array = terms.mk_var("a", Sort::array(Sort::Int, Sort::Int));
+        let i = terms.mk_var("i", Sort::Int);
+        let j = terms.mk_var("j", Sort::Int);
+        let value = terms.mk_var("v", Sort::Int);
+        let stored = terms.mk_store(array, i, value);
+        let stored_read = terms.mk_select(stored, j);
+        let base_read = terms.mk_select(array, j);
+        let indices_equal = terms.mk_eq(i, j);
+        let reads_equal = terms.mk_eq(stored_read, base_read);
+        let conflict = vec![
+            TheoryLit::new(indices_equal, false),
+            TheoryLit::new(reads_equal, false),
+        ];
+
+        assert!(
+            matches!(
+                first_auflia_result(&conflict, &[], &terms),
+                TheoryResult::NeedLemmas(_)
+                    | TheoryResult::Unsat(_)
+                    | TheoryResult::UnsatWithFarkas(_)
+            ),
+            "the fresh combiner must expose the ROW2 inconsistency either directly \
+             or as a permanent lemma; zero-live cardinality is pinned separately"
+        );
+        assert!(
+            verify_mixed_conflict_semantic(&conflict, &terms, &[]).is_ok(),
+            "a fully falsified valid ROW2 clause semantically refutes the fixed context"
+        );
+    }
+
+    #[test]
+    fn test_mixed_verifier_counts_support_axioms_in_row2_trail() {
+        let mut terms = TermStore::new();
+        let array = terms.mk_var("a", Sort::array(Sort::Int, Sort::Int));
+        let i = terms.mk_var("i", Sort::Int);
+        let j = terms.mk_var("j", Sort::Int);
+        let value = terms.mk_var("v", Sort::Int);
+        let stored = terms.mk_store(array, i, value);
+        let stored_read = terms.mk_select(stored, j);
+        let base_read = terms.mk_select(array, j);
+        let indices_equal = terms.mk_eq(i, j);
+        let reads_equal = terms.mk_eq(stored_read, base_read);
+        let conflict = vec![TheoryLit::new(reads_equal, false)];
+        let support_axioms = vec![TheoryLit::new(indices_equal, false)];
+
+        assert!(
+            matches!(
+                first_auflia_result(&conflict, &support_axioms, &terms),
+                TheoryResult::NeedLemmas(_)
+            ),
+            "the verifier fixture must reach the ROW2 lemma with one falsifying support literal"
+        );
+        assert!(
+            verify_mixed_conflict_semantic(&conflict, &terms, &support_axioms).is_ok(),
+            "support axioms are part of the fixed trail and fully falsify ROW2 with the conflict"
+        );
+    }
+
+    #[test]
+    fn test_mixed_verifier_accepts_conflict_opposed_by_support_axiom() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("x", Sort::Int);
+        let zero = terms.mk_int(BigInt::from(0));
+        let x_eq_zero = terms.mk_eq(x, zero);
+        let conflict = vec![TheoryLit::new(x_eq_zero, false)];
+        let support_axioms = vec![TheoryLit::new(x_eq_zero, true)];
+
+        assert!(
+            verify_mixed_conflict_semantic(&conflict, &terms, &support_axioms).is_ok(),
+            "opposite conflict/support polarities make the verification context immediately UNSAT"
+        );
+    }
+
+    #[test]
+    fn test_mixed_verifier_does_not_reject_support_only_string_length_bridge() {
+        let mut terms = TermStore::new();
+        let s = terms.mk_var("s", Sort::String);
+        let n = terms.mk_var("n", Sort::Int);
+        let zero = terms.mk_int(BigInt::from(0));
+        let n_lt_zero = terms.mk_lt(n, zero);
+        let len_s = terms.mk_app(Symbol::named("str.len"), vec![s], Sort::Int);
+        let n_eq_len_s = terms.mk_eq(n, len_s);
+        let conflict = vec![TheoryLit::new(n_lt_zero, true)];
+        let support_axioms = vec![TheoryLit::new(n_eq_len_s, true)];
+
+        assert!(
+            matches!(
+                verify_mixed_conflict_semantic(&conflict, &terms, &[]),
+                Err(VerificationError::ConflictIsSat)
+            ),
+            "n < 0 alone is satisfiable and should be rejected as a spurious conflict"
+        );
+        assert!(
+            verify_mixed_conflict_semantic(&conflict, &terms, &support_axioms).is_ok(),
+            "a support-only str.len bridge makes a fresh UF+LIA/SLIA Sat verdict \
+             untrustworthy and must not reject the valid n < 0, n = len(s) context"
+        );
+    }
+
+    #[test]
+    fn test_mixed_verifier_does_not_reject_support_only_to_real_bridge() {
+        let mut terms = TermStore::new();
+        let k = terms.mk_var("k", Sort::Int);
+        let r = terms.mk_var("r", Sort::Real);
+        let zero_i = terms.mk_int(BigInt::from(0));
+        let half = terms.mk_rational(num_rational::BigRational::new(
+            BigInt::from(1),
+            BigInt::from(2),
+        ));
+        let r_eq_half = terms.mk_eq(r, half);
+        let to_real_k = terms.mk_to_real(k);
+        let r_eq_to_real_k = terms.mk_eq(r, to_real_k);
+        let k_eq_zero = terms.mk_eq(k, zero_i);
+        let conflict = vec![TheoryLit::new(r_eq_half, true)];
+        let support_axioms = vec![
+            TheoryLit::new(r_eq_to_real_k, true),
+            TheoryLit::new(k_eq_zero, true),
+        ];
+
+        assert!(
+            matches!(
+                verify_mixed_conflict_semantic(&conflict, &terms, &[]),
+                Err(VerificationError::ConflictIsSat)
+            ),
+            "r = 1/2 alone is satisfiable and should be rejected as a spurious conflict"
+        );
+        assert!(
+            verify_mixed_conflict_semantic(&conflict, &terms, &support_axioms).is_ok(),
+            "a support-only Int-to-Real bridge is outside every single-sort \
+             verification combiner and must not reject the valid context"
+        );
+    }
+}
+
 mod bv_verification_tests {
     use super::*;
     use ay_core::{Sort, TermStore, TheoryPropagation};

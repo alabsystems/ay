@@ -292,6 +292,60 @@ pub fn lower_rational_atom(
     })
 }
 
+/// Fast-lane twin of [`lower_rational_atom`], producing [`crate::istar::IStar`]
+/// weights instead of [`crate::rstar::RStar`].
+///
+/// The table is IDENTICAL — same edge directions, same `ε` placement — because
+/// `IStar` is the same `ℚ[ε]` group with the rational part narrowed to `i128`.
+/// The only added behaviour is admission: any constant that is not an integer
+/// within [`crate::istar::FAST_LANE_LIMIT`] returns `None`, so the caller falls
+/// back to the exact lane rather than rounding. A differential test pins the two
+/// lowerings against each other so the tables cannot drift apart.
+pub fn lower_istar_atom(
+    atom: &DiffAtom<num_rational::BigRational>,
+    zero_var: usize,
+) -> Option<Vec<NormalizedConstraint<crate::istar::IStar>>> {
+    use crate::istar::IStar;
+    let x = atom.lhs;
+    let y = atom.rhs.unwrap_or(zero_var);
+    let c = IStar::fits_fast_lane(&atom.c)?;
+    let neg_c = c.checked_neg()?;
+    Some(match atom.op {
+        Op::Le => vec![NormalizedConstraint {
+            to: x,
+            from: y,
+            weight: IStar::finite(c),
+        }],
+        Op::Lt => vec![NormalizedConstraint {
+            to: x,
+            from: y,
+            weight: IStar::new(c, -1),
+        }],
+        Op::Ge => vec![NormalizedConstraint {
+            to: y,
+            from: x,
+            weight: IStar::finite(neg_c),
+        }],
+        Op::Gt => vec![NormalizedConstraint {
+            to: y,
+            from: x,
+            weight: IStar::new(neg_c, -1),
+        }],
+        Op::Eq => vec![
+            NormalizedConstraint {
+                to: x,
+                from: y,
+                weight: IStar::finite(c),
+            },
+            NormalizedConstraint {
+                to: y,
+                from: x,
+                weight: IStar::finite(neg_c),
+            },
+        ],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

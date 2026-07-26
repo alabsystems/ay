@@ -570,6 +570,65 @@ impl ChcProblem {
         self.clauses.len() != before
     }
 
+    /// Deterministic structural identity string for this problem.
+    ///
+    /// Used as the key of the acyclic-BMC certificate memo
+    /// ([`crate::acyclic_cert_cache`]) so the external-invariant validation
+    /// path can REUSE the exact acyclic-BMC safety proof the solve lane already
+    /// computed instead of recomputing it (count_zero/loop_with_old: ~8.5 s
+    /// proved twice → once).
+    ///
+    /// Two SEPARATELY parsed-then-stripped copies of the same CHC input MUST
+    /// render byte-for-byte identical, and two structurally different problems
+    /// MUST NOT — the memo's soundness rests on that. To guarantee it, this
+    /// serializes only order-stable state:
+    ///
+    /// - `predicates` and `clauses` are ordered `Vec`s and their `Debug` is
+    ///   fully structural (`Predicate` is `{id, name, Vec<ChcSort>}`;
+    ///   `HornClause`/`ClauseBody`/`ClauseHead`/`ChcExpr` contain no hash maps),
+    ///   so parsing + the deterministic dead-end strip reproduce them exactly.
+    ///   `strip_dead_end_cycle_predicates` removes clauses only (never renumbers
+    ///   predicates), so predicate ids stay stable across the strip.
+    /// - `datatype_defs` is the only hash-map-backed state whose meaning matters;
+    ///   it is emitted as one sorted `Debug` tuple vector. The tuple/vector
+    ///   delimiters and escaped string formatting make entry boundaries
+    ///   unambiguous even when public-API datatype names contain newlines or
+    ///   text resembling the surrounding identity format.
+    /// - The scalar / `Vec` metadata that changes the problem's meaning
+    ///   (`fixedpoint_format`, `pruned_false_queries`, `action_names`) is
+    ///   included so no two semantically-distinct problems can collide.
+    ///
+    /// This is a SUPERSET of the safety-relevant structure, so equal identities
+    /// denote the same problem and therefore the same verdict.
+    pub(crate) fn structural_identity(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(
+            out,
+            "fp={} pfq={} np={} nc={}",
+            self.fixedpoint_format,
+            self.pruned_false_queries,
+            self.predicates.len(),
+            self.clauses.len()
+        );
+        let _ = writeln!(out, "actions={:?}", self.action_names);
+        for predicate in &self.predicates {
+            let _ = writeln!(out, "p={predicate:?}");
+        }
+        for clause in &self.clauses {
+            let _ = writeln!(out, "c={clause:?}");
+        }
+        // `datatype_defs` is a hash map: sort by key so the identity is
+        // independent of insertion/rehash ordering, then render the complete
+        // registry as one Debug value. Rendering names individually with
+        // Display is not injective: a name containing "\nd ..." can imitate
+        // an entry boundary and alias a structurally different registry.
+        let mut datatypes: Vec<_> = self.datatype_defs.iter().collect();
+        datatypes.sort_by(|a, b| a.0.cmp(b.0));
+        let _ = writeln!(out, "datatypes={datatypes:?}");
+        out
+    }
+
     /// Return whether the predicate dependency graph contains a cycle.
     ///
     /// This is syntactic predicate-graph acyclicity: edges go from body

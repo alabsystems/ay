@@ -52,6 +52,12 @@ logs/
 
 # Benchmark outputs
 benchmarks/**/results/
+/ay-z3-bench.md
+/ay-z3-scoreboard.json
+/bench_canary_*.json
+/bench_canary_*.log
+/bench_canary_*.md
+/scoreboard_*.log
 
 # ay-bench persistent per-commit results store (see crates/ay-bench/src/db.rs)
 .ay-bench/
@@ -307,3 +313,31 @@ benchmarks/sat/satcomp2025/
 
 # All-divisions corpus fetched by fetch-all.sh / `ay-z3-parity fetch` (gitignored like smtlib-sample)
 benchmarks/smtlib-all/
+
+# Reproducible 2025/2026 competition campaign assets fetched by `ay corpus`.
+# Keep the small, pinned URI manifests in source control; downloaded archives,
+# extracted trees, Git checkouts, result bundles, and competitor source
+# packages must not make a reviewer's fresh checkout dirty.
+benchmarks/sat/satcomp2025-main/instances/
+benchmarks/sat/satcomp2026-main/instances/
+benchmarks/sat/satcomp2026/
+benchmarks/minizinc/challenge-2026/
+benchmarks/casc/
+benchmarks/coco/
+benchmarks/syntcomp/
+benchmarks/chc/chc-comp-2025-runner/
+benchmarks/chc/chc-comp-2026-runner/
+benchmarks/hwmcc/
+benchmarks/iccma/
+benchmarks/maxsat/mse26/
+benchmarks/mcc/
+benchmarks/proover/
+benchmarks/xcsp3/2025/
+benchmarks/xcsp3/2026/
+benchmarks/svcomp/
+benchmarks/testcomp/
+benchmarks/termcomp/
+benchmarks/vnncomp/
+benchmarks/archcomp/
+benchmarks/floc-modeling/
+reference/competition/

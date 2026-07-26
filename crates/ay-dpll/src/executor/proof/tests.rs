@@ -2847,6 +2847,56 @@ fn qf_ax_store_flat_refutation_self_certifies_from_authored_assertions() {
     );
 }
 
+#[test]
+fn nested_row_auxiliary_proof_stays_in_authored_problem_scope() {
+    // The private nested-row rescue folds the two authored array assertions to
+    // the array-free residue `false`. Its refutation is useful in default mode,
+    // but the folded premise must never escape as authored proof authority.
+    let input = r#"
+        (set-option :produce-proofs true)
+        (set-logic QF_AUFNIA)
+        (declare-const m0 (Array Int (Array Int Int)))
+        (declare-const m1 (Array Int (Array Int Int)))
+        (assert
+            (= m1
+               (store m0 0
+                      (store (select m0 0) 1 7))))
+        (assert (= (select (select m1 0) 1) 8))
+        (check-sat)
+    "#;
+    let commands = parse(input).unwrap();
+    let mut exec = Executor::new();
+    assert_eq!(exec.execute_all(&commands).unwrap(), vec!["unsat"]);
+
+    let proof = exec.last_proof.as_ref().expect("proof after UNSAT");
+    let scope = exec.proof_export_scope_assertions();
+    assert!(
+        ay_proof::validate_reachable_assumes_in_problem_scope(proof, &scope).is_ok(),
+        "the accepted auxiliary proof must not assume its folded residue"
+    );
+
+    let text = exec
+        .try_export_last_proof_alethe_for_problem_scope()
+        .expect("proof after UNSAT")
+        .expect("problem-scoped Alethe export");
+    assert!(
+        !text.contains(":rule trust"),
+        "reduced-only proof leaves must use attributed holes, not trust:\n{text}"
+    );
+    assert!(
+        text.contains(":rule hole"),
+        "the uncertified store-flat reduction must remain explicit:\n{text}"
+    );
+    assert!(
+        exec.last_lrat_certificate().is_none(),
+        "LRAT for the private reduced CNF must not escape"
+    );
+    assert!(
+        !exec.unsat_proof_self_certified(),
+        "a holey auxiliary refutation must remain fail-closed under self-check"
+    );
+}
+
 // ===========================================================================
 // Array extensionality diff-witness certification (#ext-diff-cert).
 //

@@ -53,13 +53,6 @@ reproducible results and independently checked evidence.
 
 ## Known limitations (0.1.0)
 
-- **HORN `(get-model)` under `--z3-mode`** returns a sound `unknown` rather
-  than the Spacer-shaped invariant. The CHC verdict (`sat`/`unsat`) is correct;
-  only the model rendering from the CHC certificate is not yet wired to
-  `(get-model)`, so the theory-search model is rejected by the independent
-  soundness gate. Use the emitted CHC certificate (`.chccert`) for the
-  invariant. Fix tracked for 0.1.x.
-
 - **Build time and running tests.** The workspace includes one very large crate
   (`ay-dpll`, ~430,000 lines), so a from-scratch build of the whole workspace is
   slow and is the dominant compile cost. To *use* AY, prefer the release binary

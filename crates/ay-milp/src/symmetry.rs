@@ -2164,14 +2164,18 @@ mod tests {
         }
     }
 
-    /// DIAGNOSTIC (ignored; run with `--ignored --nocapture`): how far is the
-    /// pairwise-fixpoint lex chain from COMPLETE orbitopal fixing (per-cell
-    /// min/max over the enumerated sorted points)? Prints a deficit count.
+    /// Bounded exact characterization of how far the pairwise-fixpoint lex
+    /// chain is from complete orbitopal fixing (per-cell min/max over every
+    /// sorted point). The smaller 4x2 grid keeps the oracle always-on while
+    /// still checking that every propagated bound contains the exact hull.
     #[test]
-    #[ignore = "diagnostic may enumerate 2000 times 3^12 assignments"]
-    fn lex_chain_completeness_deficit_stats() {
-        let blocks: Vec<Vec<u32>> = (0..4u32).map(|i| (3 * i..3 * i + 3).collect()).collect();
-        let n = 12usize;
+    fn lex_chain_bounded_completeness_characterization() {
+        const BLOCKS: usize = 4;
+        const WIDTH: usize = 2;
+        let blocks: Vec<Vec<u32>> = (0..BLOCKS as u32)
+            .map(|i| (WIDTH as u32 * i..WIDTH as u32 * (i + 1)).collect())
+            .collect();
+        let n = BLOCKS * WIDTH;
         let integral = vec![true; n];
         let mut seed = 0xC0FFEEu64;
         let mut rnd = move |m: u64| -> u64 {
@@ -2179,9 +2183,9 @@ mod tests {
             (seed >> 33) % m
         };
         let sorted = |x: &[i64], seq: &[u32]| -> bool {
-            (0..3).all(|i| {
+            (0..BLOCKS - 1).all(|i| {
                 for &p in seq {
-                    let (u, v) = (x[3 * i + p as usize], x[3 * (i + 1) + p as usize]);
+                    let (u, v) = (x[WIDTH * i + p as usize], x[WIDTH * (i + 1) + p as usize]);
                     if u > v {
                         return true;
                     }
@@ -2193,19 +2197,19 @@ mod tests {
             })
         };
         let (mut deficit_cells, mut deficit_cases, mut cases, mut missed_cutoffs) = (0, 0, 0, 0);
-        for case in 0..2000 {
+        for case in 0..96 {
             let mut lo = vec![0.0f64; n];
             let mut up = vec![0.0f64; n];
             for j in 0..n {
                 lo[j] = rnd(3) as f64;
                 up[j] = lo[j] + rnd(3 - lo[j] as u64) as f64;
             }
-            let mut seq: Vec<u32> = (0..3).collect();
-            for i in (1..3usize).rev() {
+            let mut seq: Vec<u32> = (0..WIDTH as u32).collect();
+            for i in (1..WIDTH).rev() {
                 seq.swap(i, rnd(i as u64 + 1) as usize);
             }
             if case % 2 == 0 {
-                seq.truncate(1 + rnd(3) as usize);
+                seq.truncate(1 + rnd(WIDTH as u64) as usize);
             }
             let mut mins = vec![i64::MAX; n];
             let mut maxs = vec![i64::MIN; n];
@@ -2244,6 +2248,15 @@ mod tests {
                     cases += 1;
                     let mut d = 0;
                     for j in 0..n {
+                        assert!(
+                            tl[j] <= mins[j] as f64 && tu[j] >= maxs[j] as f64,
+                            "case {case}: propagation cut the exact sorted hull at cell {j}: \
+                             propagated [{}, {}], exact [{}, {}]",
+                            tl[j],
+                            tu[j],
+                            mins[j],
+                            maxs[j]
+                        );
                         if (mins[j] as f64) > tl[j] || (maxs[j] as f64) < tu[j] {
                             d += 1;
                         }
@@ -2258,6 +2271,10 @@ mod tests {
         eprintln!(
             "lex_chain completeness: {cases} feasible cases, {deficit_cases} with deficit \
              ({deficit_cells} cells), {missed_cutoffs} missed cutoffs"
+        );
+        assert!(
+            cases > 0,
+            "bounded oracle did not exercise a feasible lex-chain case"
         );
     }
 

@@ -55,22 +55,13 @@ use crate::eval::verify_all_constraints;
 use crate::output::{PbSolution, PbStatus};
 use crate::solver::eval_objective;
 use crate::types::{PbConstraint, PbInstance, PbLit, PbObjective, PbRel, PbTerm};
+use sha2::{Digest, Sha256};
 
 /// Hard ceiling on vertices (the family is ~200; the recognizer is O(rows·arity)).
 const MAX_VERTICES: usize = 512;
 /// Node budget: exhaustion within this many nodes or the solver declines.
 const MAX_NODES: u64 = 20_000_000;
 
-/// Node budget for the exhaustive search. `TWO_CLUB_MAX_NODES` overrides the
-/// default for manual hours-scale probe runs (measured 337k nodes/s on the
-/// real 2club200v15p5scn — the field-calibrated 5-8e9 nodes is single-digit
-/// HOURS at that rate, not the 550 core-hours Gurobi's MILP tree needed).
-fn max_nodes() -> u64 {
-    std::env::var("TWO_CLUB_MAX_NODES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(MAX_NODES)
-}
 /// Poll the stop signal every this many nodes.
 const STOP_POLL_MASK: u64 = (1 << 12) - 1;
 
@@ -147,6 +138,14 @@ pub(crate) struct LpNodeBound {
     /// clique/cover cutting-plane loop is at least as tight) for a decisive
     /// prune. `0` disables the escalation.
     pub exact_margin: i128,
+    /// STRENGTHENED NEIGHBORHOOD rows (Carvalho–Almeida lifting; opt-in via
+    /// `TwoClubLpConfig::nbhd_rows` / `ay-pb-dev two-club --nbhd-rows`): add
+    /// the merged pair+conflict-clique rows
+    /// `Σ_{v∈I∪{a,b}} x_v − Σ_{r∈CN(a,b)∩C} x_r ≤ 1` to every float LP solve.
+    /// See [`strengthened_nbhd_rows`] for the exact family and its validity
+    /// proof. Default OFF (campaign-stable behavior; measured negative on the
+    /// target instance — see the note at `TwoClubLpConfig::nbhd_rows`).
+    pub nbhd_rows: bool,
 }
 
 impl LpNodeBound {
@@ -161,6 +160,7 @@ impl LpNodeBound {
             low_margin: 0,
             ceiling: false,
             exact_margin: 0,
+            nbhd_rows: false,
         }
     }
     /// Production defaults: LP bound on. Refreshes fire in a band above the
@@ -183,6 +183,9 @@ impl LpNodeBound {
             // refresh triggers it — measured 70 refreshes consuming 150 s. The
             // float refresh already prunes ~99% of thin-path refreshes.
             exact_margin: 0,
+            // Opt-in via `TwoClubLpConfig::nbhd_rows` (developer campaigns
+            // only); production always runs with the family off.
+            nbhd_rows: false,
         }
     }
 }
@@ -191,20 +194,115 @@ impl LpNodeBound {
 enum ViolatingBranchRule {
     First,
     ViolDegree,
+    /// MARKED BRANCHING (`TWO_CLUB_BRANCH=marked`): on violating pair (a, b),
+    /// branch `a OUT` | `a COMMITTED` (marked). The include side deletes every
+    /// vertex conflicting with a marked vertex, iterated to a fixed point —
+    /// the O(1.62^n) include/exclude device of the exact 2-club literature
+    /// (Bourjolly 2002 onward; see the development design notes).
+    Marked,
 }
 
 impl ViolatingBranchRule {
     fn from_selector(value: Option<&std::ffi::OsStr>) -> Self {
         if value == Some(std::ffi::OsStr::new("viol")) {
             Self::ViolDegree
+        } else if value == Some(std::ffi::OsStr::new("marked")) {
+            Self::Marked
         } else {
             Self::First
         }
     }
+}
 
+/// Process controls snapshotted once before recognition. Production preserves
+/// the historical environment overrides; mandatory tests and `ay-pb-dev` use
+/// [`Self::explicit`] so ambient `TWO_CLUB_*` state cannot change their search.
+#[derive(Clone)]
+pub(crate) struct TwoClubRuntime {
+    max_nodes: u64,
+    branch_rule: ViolatingBranchRule,
+    trace: bool,
+    dump_frontier: bool,
+    sdp_worker: Option<SdpWorkerConfig>,
+}
+
+impl TwoClubRuntime {
     fn from_env() -> Self {
-        Self::from_selector(std::env::var_os("TWO_CLUB_BRANCH").as_deref())
+        #[cfg(test)]
+        {
+            // Unit tests must be hermetic even when a developer has an active
+            // hours-scale campaign configured in the parent shell.
+            Self::explicit(MAX_NODES, false, false, false)
+        }
+        #[cfg(not(test))]
+        {
+            Self {
+                max_nodes: std::env::var("TWO_CLUB_MAX_NODES")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(MAX_NODES),
+                branch_rule: ViolatingBranchRule::from_selector(
+                    std::env::var_os("TWO_CLUB_BRANCH").as_deref(),
+                ),
+                trace: std::env::var_os("TWO_CLUB_TRACE").is_some(),
+                dump_frontier: std::env::var_os("TWO_CLUB_DUMP_FRONTIER").is_some(),
+                // The certificate verifier is an explicit developer-tool
+                // dependency, not a process-global production solver knob.
+                sdp_worker: None,
+            }
+        }
     }
+
+    pub(crate) const fn explicit(
+        max_nodes: u64,
+        use_violating_degree: bool,
+        trace: bool,
+        dump_frontier: bool,
+    ) -> Self {
+        Self {
+            max_nodes,
+            branch_rule: if use_violating_degree {
+                ViolatingBranchRule::ViolDegree
+            } else {
+                ViolatingBranchRule::First
+            },
+            trace,
+            dump_frontier,
+            sdp_worker: None,
+        }
+    }
+
+    #[cfg(feature = "dev-tools")]
+    pub(crate) const fn explicit_marked(max_nodes: u64, trace: bool, dump_frontier: bool) -> Self {
+        Self {
+            max_nodes,
+            branch_rule: ViolatingBranchRule::Marked,
+            trace,
+            dump_frontier,
+            sdp_worker: None,
+        }
+    }
+
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn with_sdp_worker(
+        mut self,
+        script: &std::path::Path,
+        instance: &std::path::Path,
+    ) -> Self {
+        self.sdp_worker = Some(SdpWorkerConfig {
+            interpreter: std::path::PathBuf::from("python3"),
+            script: script.to_path_buf(),
+            instance: instance.to_path_buf(),
+        });
+        self
+    }
+}
+
+#[derive(Clone)]
+struct SdpWorkerConfig {
+    interpreter: std::path::PathBuf,
+    script: std::path::PathBuf,
+    instance: std::path::PathBuf,
 }
 
 struct TwoClub {
@@ -213,6 +311,14 @@ struct TwoClub {
     /// process-global environment read at every node or change traversal order
     /// if another thread mutates the selector mid-search.
     branch_rule: ViolatingBranchRule,
+    /// Per-cell node ceiling, explicit for tests and developer campaigns.
+    max_nodes: u64,
+    /// Emit campaign progress and LP diagnostics.
+    trace: bool,
+    /// Emit frontier sets on ceiling misses.
+    dump_frontier: bool,
+    /// Explicit exact-certificate worker used only by developer campaigns.
+    sdp_worker: Option<SdpWorkerConfig>,
     /// Non-adjacent pairs: (i, j, common-neighbour list), 0-based vertices.
     pairs: Vec<(u32, u32, Vec<u32>)>,
     /// G-adjacency bitset: `adj_bits[v]` bit `u` set iff `{u,v} in E`
@@ -226,7 +332,11 @@ struct TwoClub {
 }
 
 /// Recognize the 2-club encoding; decline (None) on ANY deviation.
-fn recognize(instance: &PbInstance, objective: &PbObjective) -> Option<TwoClub> {
+fn recognize_with_runtime(
+    instance: &PbInstance,
+    objective: &PbObjective,
+    runtime: TwoClubRuntime,
+) -> Option<TwoClub> {
     let n = instance.num_vars as usize;
     if n == 0 || n > MAX_VERTICES {
         return None;
@@ -346,7 +456,11 @@ fn recognize(instance: &PbInstance, objective: &PbObjective) -> Option<TwoClub> 
 
     Some(TwoClub {
         n,
-        branch_rule: ViolatingBranchRule::from_env(),
+        branch_rule: runtime.branch_rule,
+        max_nodes: runtime.max_nodes,
+        trace: runtime.trace,
+        dump_frontier: runtime.dump_frontier,
+        sdp_worker: runtime.sdp_worker,
         pairs,
         adj_bits,
         pair_of_vertex,
@@ -405,7 +519,9 @@ impl SearchState {
         // on the real instance: it concentrates the DFS in matching-rich bottom
         // territory (frontier 145 -> 112, dives 5 -> 1) — kill HEIGHT beats
         // kill volume here. Re-evaluate together with marked branching.
-        if tc.branch_rule == ViolatingBranchRule::First {
+        // MARKED mode keeps the first-by-index pair scan: its device is in HOW
+        // the pair is branched (remove | mark), not which pair is chosen.
+        if tc.branch_rule != ViolatingBranchRule::ViolDegree {
             return self
                 .both_in
                 .iter()
@@ -637,6 +753,163 @@ fn viol_odd_hole_rows(tc: &TwoClub, state: &SearchState, cap: usize) -> Vec<Vec<
     out
 }
 
+/// Row caps for the strengthened-neighborhood family (full solves / support
+/// rungs). Solve models are ~10k rows so 600 extra is marginal; support models
+/// are ~1k rows, so the support cap is kept smaller.
+const NBHD_ROW_CAP_SOLVE: usize = 600;
+const NBHD_ROW_CAP_SUPPORT: usize = 250;
+
+/// STRENGTHENED NEIGHBORHOOD rows (Carvalho–Almeida 2011, restated for the
+/// candidate-set dynamics of this engine). For an ACTIVE non-adjacent pair
+/// `(a, b)` (both in `C`, `CN(a,b) ∩ C ≠ ∅`) and a nonempty lift set `I ⊆ C`
+/// such that, ALL AT THE CURRENT `C`:
+///
+///   (1) every `i ∈ I` forms a VIOLATING pair with `a` AND with `b`
+///       (non-adjacent with `CN ∩ C = ∅` — no 2-club within `C` can contain
+///       both endpoints), and
+///   (2) `I` is a clique of the violating-pair graph (pairwise violating),
+///
+/// the inequality
+///
+/// ```text
+///   Σ_{v ∈ I ∪ {a,b}} x_v  −  Σ_{r ∈ CN(a,b) ∩ C} x_r  ≤  1
+/// ```
+///
+/// is valid for EVERY 2-club `S ⊆ C`. Proof by cases on `S`:
+///
+/// - `S ∩ I ≠ ∅`: by (2) at most one `i ∈ I` lies in `S` (a violating pair
+///   has no surviving common neighbour in `C ⊇ S`, and a 2-club's witness must
+///   lie inside `S` itself), so `|S ∩ I| = 1`; by (1) that `i` excludes both
+///   `a` and `b` from `S`. LHS `= 1 − |S ∩ CN| ≤ 1`. ✓
+/// - `{a,b} ⊆ S` (hence `S ∩ I = ∅` by (1)): `a,b` are non-adjacent, so the
+///   2-club property of `S` demands a common neighbour `r ∈ S`; `S ⊆ C` puts
+///   `r ∈ CN(a,b) ∩ C`. LHS `≤ 2 − 1 = 1`. ✓
+/// - otherwise `|S ∩ (I ∪ {a,b})| ≤ 1`: LHS `≤ 1`. ✓
+///
+/// This MERGES the engine's existing pair row (`I = ∅` case) with its
+/// conflict-clique rows (`I ∪ {a}` and `I ∪ {b}` are cliques of the violating
+/// graph) into one strictly stronger facet: summing those three existing rows
+/// only yields `Σ_I x + x_a + x_b − ½·Σ_CN x ≤ 1.5`, while this row has rhs 1
+/// with the full CN term — e.g. `x_a = x_b = x_i = ½, CN mass 0` violates this
+/// row (LHS 1.5) but satisfies every pair/clique row.
+///
+/// VERTEX-REMOVAL DYNAMICS (the trap that killed the odd-hole rows): being a
+/// 2-club is an intrinsic property of `S` (diameter ≤ 2 in the subgraph
+/// induced by `S` — witnesses inside `S`), so a row valid for all 2-clubs
+/// `⊆ C` is automatically valid at every DESCENDANT `C' ⊆ C` (its 2-clubs are
+/// a subset). Dual snapshots priced on these rows therefore inherit soundly
+/// down the whole subtree of the refresh node. On UNWIND `C` GROWS and a
+/// violating pair can un-violate, killing conditions (1)/(2) — so, exactly
+/// like `viol_clique_rows`, the family is REGENERATED FRESH at every LP solve
+/// and never cached across nodes.
+///
+/// Returns up to `cap` entries `(pair_index, I)`; the caller materializes
+/// coefficients via [`nbhd_row_coeffs`] (freezing `CN ∩ C` at generation) and
+/// prices `b = -1` in Ge form `Σ −x_{I∪{a,b}} + Σ x_{CN∩C} ≥ −1`.
+fn strengthened_nbhd_rows(tc: &TwoClub, state: &SearchState, cap: usize) -> Vec<(u32, Vec<u32>)> {
+    use std::collections::HashMap;
+    if cap == 0 {
+        return Vec::new();
+    }
+    // Violating-pair adjacency at the CURRENT C (same scan as viol_clique_rows).
+    let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (pi, (a, b, _)) in tc.pairs.iter().enumerate() {
+        if state.both_in[pi] && state.cn_alive[pi] == 0 {
+            adj.entry(*a).or_default().push(*b);
+            adj.entry(*b).or_default().push(*a);
+        }
+    }
+    if adj.is_empty() {
+        return Vec::new();
+    }
+    let mut found: Vec<(u32, Vec<u32>)> = Vec::new();
+    for (pi, (a, b, _)) in tc.pairs.iter().enumerate() {
+        // Host pair: active with a LIVE common neighbourhood (cn_alive > 0).
+        // Pairs with cn_alive == 0 are violating — their lift degenerates to a
+        // conflict clique, which viol_clique_rows already covers.
+        if !state.both_in[pi] || state.cn_alive[pi] == 0 {
+            continue;
+        }
+        let (Some(va), Some(vb)) = (adj.get(a), adj.get(b)) else {
+            continue;
+        };
+        // Lift candidates: in a violating pair with BOTH a and b (condition 1).
+        let mut cands: Vec<u32> = va.iter().copied().filter(|u| vb.contains(u)).collect();
+        if cands.is_empty() {
+            continue;
+        }
+        // Grow I as a clique of the violating-pair graph (condition 2),
+        // densest candidates first.
+        cands.sort_unstable_by_key(|u| std::cmp::Reverse(adj[u].len()));
+        let mut iset: Vec<u32> = Vec::new();
+        for u in cands {
+            let ua = &adj[&u];
+            if iset.iter().all(|&q| ua.contains(&q)) {
+                iset.push(u);
+            }
+        }
+        found.push((pi as u32, iset));
+        // Collect a few times the cap so the |I|-sort below has slack, then stop.
+        if found.len() >= cap.saturating_mul(4) {
+            break;
+        }
+    }
+    // Biggest lift first (|I| large = strongest strengthening over the pair row).
+    found.sort_unstable_by_key(|(_, iset)| std::cmp::Reverse(iset.len()));
+    found.truncate(cap);
+    found
+}
+
+/// Materialize one strengthened-neighborhood row in the raw Ge form
+/// `Σ_{v∈I∪{a,b}} −x_v + Σ_{r∈CN(a,b)∩C} x_r ≥ −1` with sorted, strictly
+/// increasing column indices (the `RowF64` contract). Columns never collide:
+/// each `i ∈ I` is non-adjacent to `a` and `b` so `i ∉ CN(a,b)`, and
+/// `a, b ∉ CN(a,b)` (no self-loops).
+fn nbhd_row_coeffs(tc: &TwoClub, state: &SearchState, pi: u32, iset: &[u32]) -> Vec<(usize, f64)> {
+    let (a, b, cn) = &tc.pairs[pi as usize];
+    let mut coeffs: Vec<(usize, f64)> = Vec::with_capacity(iset.len() + 2 + cn.len());
+    coeffs.push((*a as usize, -1.0));
+    coeffs.push((*b as usize, -1.0));
+    for &i in iset {
+        coeffs.push((i as usize, -1.0));
+    }
+    for &r in cn {
+        if state.in_c[r as usize] {
+            coeffs.push((r as usize, 1.0));
+        }
+    }
+    coeffs.sort_unstable_by_key(|e| e.0);
+    coeffs
+}
+
+/// Exact-integer pricing of one strengthened-neighborhood row under multiplier
+/// `m ≥ 0` (already grid-floored/clamped): `b = −1` contributes `−m` to base;
+/// members get `−m`, live CN hubs `+m`. Overflow stays inside the audit at
+/// [`refresh_dual_snapshot`]: ≤ [`NBHD_ROW_CAP_SOLVE`] rows of unit
+/// coefficients with `m ≤ 2^40`.
+fn price_nbhd_row(
+    tc: &TwoClub,
+    state: &SearchState,
+    pi: u32,
+    iset: &[u32],
+    m: i128,
+    base: &mut i128,
+    ay: &mut [i128],
+) {
+    *base -= m;
+    let (a, b, cn) = &tc.pairs[pi as usize];
+    ay[*a as usize] -= m;
+    ay[*b as usize] -= m;
+    for &i in iset {
+        ay[i as usize] -= m;
+    }
+    for &r in cn {
+        if state.in_c[r as usize] {
+            ay[r as usize] += m;
+        }
+    }
+}
+
 /// Violated independent-set 2-DOMINATION cuts at the fractional point `x*`
 /// (exact over triples of the top-80 x*-mass candidates — see the diagnostic
 /// history in the development design notes*). Returns up to `cap` cuts
@@ -844,14 +1117,20 @@ fn violated_cliques_at_x(
 }
 
 /// Builds the Solve-mode model rows: pair rows (CN restricted to `C`, sorted
-/// merge of endpoints into the CN stream) followed by clique-cut rows.
-/// Returns `(rows_raw, pair_of_row, cliques)`; `None` if over `cfg.max_rows`.
+/// merge of endpoints into the CN stream), clique-cut rows, then (when
+/// `cfg.nbhd_rows`) strengthened-neighborhood rows. Returns
+/// `(rows_raw, pair_of_row, cliques, nbs)`; `None` if over `cfg.max_rows`.
 #[allow(clippy::type_complexity)]
 fn build_solve_rows(
     tc: &TwoClub,
     state: &SearchState,
     cfg: &LpNodeBound,
-) -> Option<(Vec<(Vec<(usize, f64)>, f64)>, Vec<u32>, Vec<Vec<u32>>)> {
+) -> Option<(
+    Vec<(Vec<(usize, f64)>, f64)>,
+    Vec<u32>,
+    Vec<Vec<u32>>,
+    Vec<(u32, Vec<u32>)>,
+)> {
     let mut rows_raw: Vec<(Vec<(usize, f64)>, f64)> = Vec::new();
     let mut pair_of_row: Vec<u32> = Vec::new();
     for (pi, (a, b, cn)) in tc.pairs.iter().enumerate() {
@@ -897,8 +1176,208 @@ fn build_solve_rows(
         let coeffs: Vec<(usize, f64)> = q.iter().map(|&v| (v as usize, -1.0)).collect();
         rows_raw.push((coeffs, -1.0));
     }
-    Some((rows_raw, pair_of_row, cliques))
+    let nbs = if cfg.nbhd_rows {
+        strengthened_nbhd_rows(tc, state, NBHD_ROW_CAP_SOLVE)
+    } else {
+        Vec::new()
+    };
+    for (pi, iset) in &nbs {
+        rows_raw.push((nbhd_row_coeffs(tc, state, *pi, iset), -1.0));
+    }
+    Some((rows_raw, pair_of_row, cliques, nbs))
 }
+
+/// Certified-SDP-bound worker bridge (the development design notes).
+///
+/// The worker returns bounds carried by EXACT certificates (interval LDL^T
+/// AND fraction-free Bareiss both verified in the worker; the float SDP
+/// solver only proposes — see the development design notes). This side
+/// performs the prune comparison in exact i128: kill iff num < (floor+1)·den
+/// (F1 integer semantics). The non-default developer tool supplies both the
+/// worker and instance paths explicitly; production and mandatory tests never
+/// consult ambient SDP environment variables. Any graph-identity mismatch,
+/// protocol failure, arithmetic overflow, or timeout costs the caller the
+/// bound (fail-closed: no prune) — see `SdpReply` for which of those retire
+/// the bridge and which are ordinary in-protocol answers.
+struct SdpWorker {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    rx: std::sync::mpsc::Receiver<String>,
+}
+
+impl SdpWorker {
+    fn spawn(config: &SdpWorkerConfig, expected_graph_sha256: &str) -> Option<SdpWorker> {
+        let mut child = std::process::Command::new(&config.interpreter)
+            .arg(&config.script)
+            .arg(&config.instance)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .ok()?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                terminate_child(&mut child);
+                return None;
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                terminate_child(&mut child);
+                return None;
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(stdout);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        // The worker independently parses the configured instance. Its
+        // canonical graph digest must equal the exact graph recognized by
+        // Rust, closing the path-replacement/TOCTOU mismatch class.
+        let expected = format!("graph_sha256={expected_graph_sha256}");
+        match rx.recv_timeout(std::time::Duration::from_mins(1)) {
+            Ok(line)
+                if line
+                    .split_ascii_whitespace()
+                    .next()
+                    .is_some_and(|token| token == "READY")
+                    && line.split_ascii_whitespace().any(|token| token == expected) =>
+            {
+                Some(SdpWorker { child, stdin, rx })
+            }
+            _ => {
+                terminate_child(&mut child);
+                None
+            }
+        }
+    }
+
+    /// Certified bound for the candidate set. Never prune except on `Bound`.
+    fn query(&mut self, cset: &[usize], timeout: std::time::Duration) -> SdpReply {
+        use std::io::Write;
+        let line = cset
+            .iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if writeln!(self.stdin, "{line}").is_err() || self.stdin.flush().is_err() {
+            return SdpReply::Broken;
+        }
+        match self.rx.recv_timeout(timeout) {
+            Ok(response) => match parse_sdp_bound_response(&response) {
+                Some((num, den)) => SdpReply::Bound(num, den),
+                // `FAIL <reason>` is the worker's documented in-protocol answer
+                // for "this node has no certificate" (uncertified tier, invalid
+                // cset, internal exception it caught). The child is healthy and
+                // the stream is still synchronized, so the bridge survives.
+                // Anything else on the wire is a protocol violation.
+                None if response.split_ascii_whitespace().next() == Some("FAIL") => {
+                    SdpReply::NoCertificate
+                }
+                None => SdpReply::Broken,
+            },
+            // Timeout or a closed pipe. A timeout leaves the stream
+            // DESYNCHRONIZED (the worker may still emit the late answer), so the
+            // child cannot be reused — but it can be replaced, which is what the
+            // caller does. Round 3b measured the cost of conflating the two:
+            // one 120 s solve under CPU contention retired the tier for the
+            // remaining 11.9 h of the cell on 7 of 8 workers.
+            Err(_) => SdpReply::Broken,
+        }
+    }
+}
+
+/// Outcome of one certified-bound query, split by what it implies for the
+/// bridge: `NoCertificate` is an ordinary answer from a healthy worker (keep
+/// it), `Broken` means this child can no longer be trusted to be in protocol
+/// (replace it). Only `Bound` may ever license a prune.
+#[derive(Debug, PartialEq, Eq)]
+enum SdpReply {
+    Bound(i128, i128),
+    NoCertificate,
+    Broken,
+}
+
+fn parse_sdp_bound_response(response: &str) -> Option<(i128, i128)> {
+    let mut fields = response.split_ascii_whitespace();
+    if fields.next()? != "BOUND" {
+        return None;
+    }
+    let num: i128 = fields.next()?.parse().ok()?;
+    let den: i128 = fields.next()?.parse().ok()?;
+    if fields.next().is_some() || num < 0 || den <= 0 {
+        return None;
+    }
+    Some((num, den))
+}
+
+fn terminate_child(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+impl Drop for SdpWorker {
+    fn drop(&mut self) {
+        use std::io::Write;
+        let _ = writeln!(self.stdin, "QUIT");
+        terminate_child(&mut self.child);
+    }
+}
+
+fn graph_sha256(n: usize, pairs: &[(u32, u32, Vec<u32>)]) -> String {
+    let mut canonical = pairs.to_vec();
+    canonical.sort_unstable();
+    let mut hasher = Sha256::new();
+    hasher.update((n as u64).to_be_bytes());
+    hasher.update((canonical.len() as u64).to_be_bytes());
+    for (a, b, common) in canonical {
+        hasher.update(a.to_be_bytes());
+        hasher.update(b.to_be_bytes());
+        hasher.update((common.len() as u64).to_be_bytes());
+        for vertex in common {
+            hasher.update(vertex.to_be_bytes());
+        }
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Converts a certified non-negative rational upper bound into the scaled
+/// marker used by the existing lift-prune path. Every arithmetic operation is
+/// checked; a malformed or unrepresentable response declines the prune.
+fn certified_sdp_prune_marker(num: i128, den: i128, best_floor: usize) -> Option<i128> {
+    if num < 0 || den <= 0 {
+        return None;
+    }
+    let threshold = (best_floor as i128).checked_add(1)?.checked_mul(den)?;
+    if num >= threshold {
+        return None;
+    }
+    num.checked_mul(DUAL_SCALE)?.checked_div(den)?.checked_neg()
+}
+
+/// How far above the kill line (`floor + 1`) the LP's own failing UB may sit
+/// before the certified-SDP query is skipped as out of reach. Purely an
+/// allocation heuristic — skipping can only cost a prune, never license one.
+/// Calibrated on the 70 paired round-3b field queries where both the LP failing
+/// UB and the certified SDP bound are known: the SDP came in 2.16 below the LP
+/// on average (max 2.70), and all 48 certified kills in that sample had an LP UB
+/// below `floor + 4`, while 15 queries above it produced 2.
+const SDP_REACH_SLACK: f64 = 3.0;
+
+/// Consecutive broken bridges (timeout, protocol violation, or failed spawn)
+/// that retire the certified-SDP tier for the rest of the cell. One break is a
+/// slow solve or a contended machine and is replaced; a run of them means the
+/// toolchain itself is gone, and retrying costs 120 s a throw.
+const SDP_MAX_BROKEN_STREAK: u32 = 4;
 
 /// Fixed-point scale for the exact-integer dual arithmetic. Duals are rounded
 /// DOWN onto this grid (`m = ⌊y·SCALE⌋ ≥ 0`), which preserves `y ≥ 0` and hence
@@ -1049,6 +1528,13 @@ struct RefreshOutcome {
     sum: i128,
     /// The fresh bound already proves `⌊UB⌋ ≤ best_floor`: prune immediately.
     prune: bool,
+    /// Strengthened-neighborhood rows fed to this refresh's PRIMARY solve
+    /// (0 when the family is off) — the `nb=` added-rows counter.
+    nb_rows: u32,
+    /// The pricing behind the RETURNED bound carries a positive (grid-floored)
+    /// multiplier on ≥ 1 strengthened-neighborhood row — prunes with this set
+    /// are the `nb=` attributable-prune counter.
+    nb_used: bool,
 }
 
 /// How a refresh obtains its dual vector.
@@ -1136,6 +1622,17 @@ fn refresh_dual_snapshot(
             let coeffs: Vec<(usize, f64)> = h.iter().map(|&v| (v as usize, -1.0)).collect();
             rows_raw.push((coeffs, -2.0));
         }
+        // Strengthened-neighborhood rows (opt-in): regenerated per solve, like
+        // the clique rows — see strengthened_nbhd_rows for why caching would
+        // be unsound across unwinds.
+        let nbs = if cfg.nbhd_rows {
+            strengthened_nbhd_rows(tc, state, NBHD_ROW_CAP_SUPPORT)
+        } else {
+            Vec::new()
+        };
+        for (pi, iset) in &nbs {
+            rows_raw.push((nbhd_row_coeffs(tc, state, *pi, iset), -1.0));
+        }
         let duals = crate::optimize::safe_lp_bound::safe_lp_duals_from_raw(
             n,
             c,
@@ -1146,14 +1643,15 @@ fn refresh_dual_snapshot(
             Some(-(best_floor as f64) + 0.5),
             should_stop,
         )?;
-        if duals.len() != n_pair_rows + cliques.len() + holes.len() {
-            if std::env::var_os("TWO_CLUB_TRACE").is_some() {
+        if duals.len() != n_pair_rows + cliques.len() + holes.len() + nbs.len() {
+            if tc.trace {
                 eprintln!(
-                    "  [support-none-len] duals={} pair={} cliques={} holes={}",
+                    "  [support-none-len] duals={} pair={} cliques={} holes={} nb={}",
                     duals.len(),
                     n_pair_rows,
                     cliques.len(),
-                    holes.len()
+                    holes.len(),
+                    nbs.len()
                 );
             }
             return None;
@@ -1198,6 +1696,17 @@ fn refresh_dual_snapshot(
                 ay[v as usize] -= m;
             }
         }
+        let mut nb_used = false;
+        for (ni, (pi, iset)) in nbs.iter().enumerate() {
+            let m = ((duals[n_pair_rows + cliques.len() + holes.len() + ni] * DUAL_SCALE as f64)
+                .floor() as i128)
+                .clamp(0, DUAL_M_MAX);
+            if m == 0 {
+                continue;
+            }
+            nb_used = true;
+            price_nbhd_row(tc, state, *pi, iset, m, &mut base, &mut ay);
+        }
         let d: Vec<i128> = ay.iter().map(|&a| -DUAL_SCALE - a).collect();
         let sum: i128 = (0..n).filter(|&v| state.in_c[v]).map(|v| d[v].min(0)).sum();
         let prune = scaled_dual_bound_prunes(base + sum, best_floor);
@@ -1207,6 +1716,8 @@ fn refresh_dual_snapshot(
                 d,
                 sum,
                 prune,
+                nb_rows: nbs.len() as u32,
+                nb_used,
             },
             None,
         ));
@@ -1217,7 +1728,7 @@ fn refresh_dual_snapshot(
     // Every None return below is TRACE-visible: an untraced decline path is
     // exactly how the hole-row row-count bug hid (all solves silently
     // discarded, zero decline lines — see viol_odd_hole_rows).
-    let trace = std::env::var_os("TWO_CLUB_TRACE").is_some();
+    let trace = tc.trace;
     let mut rows_raw: Vec<(Vec<(usize, f64)>, f64)> = Vec::new();
     let mut pair_of_row: Vec<u32> = Vec::new();
     for (pi, (a, b, cn)) in tc.pairs.iter().enumerate() {
@@ -1286,6 +1797,16 @@ fn refresh_dual_snapshot(
         let coeffs: Vec<(usize, f64)> = h.iter().map(|&v| (v as usize, -1.0)).collect();
         rows_raw.push((coeffs, -2.0));
     }
+    // Strengthened-neighborhood rows (opt-in; regenerated per solve — never
+    // cached across nodes, see strengthened_nbhd_rows).
+    let nbs = if cfg.nbhd_rows {
+        strengthened_nbhd_rows(tc, state, NBHD_ROW_CAP_SOLVE)
+    } else {
+        Vec::new()
+    };
+    for (pi, iset) in &nbs {
+        rows_raw.push((nbhd_row_coeffs(tc, state, *pi, iset), -1.0));
+    }
     let nrows_dbg = rows_raw.len();
     let (duals, xstar) = match crate::optimize::safe_lp_bound::safe_lp_duals_and_primal_from_raw(
         n,
@@ -1303,14 +1824,15 @@ fn refresh_dual_snapshot(
             return None;
         }
     };
-    if duals.len() != n_pair_rows + cliques.len() + holes.len() {
+    if duals.len() != n_pair_rows + cliques.len() + holes.len() + nbs.len() {
         if trace {
             eprintln!(
-                "  [solve-none-len] duals={} pair={} cliques={} holes={}",
+                "  [solve-none-len] duals={} pair={} cliques={} holes={} nb={}",
                 duals.len(),
                 n_pair_rows,
                 cliques.len(),
-                holes.len()
+                holes.len(),
+                nbs.len()
             );
         }
         return None; // row mapping broken — fail-closed.
@@ -1369,6 +1891,20 @@ fn refresh_dual_snapshot(
             ay[v as usize] -= m;
         }
     }
+    // Strengthened-neighborhood rows: b = -1 ⇒ base -= m; members -m, live CN
+    // hubs +m. (≤ 600 unit-coefficient rows — inside the overflow audit.)
+    let mut nb_used = false;
+    for (ni, (pi, iset)) in nbs.iter().enumerate() {
+        let m =
+            ((duals[n_pair_rows + cliques.len() + holes.len() + ni] * DUAL_SCALE as f64).floor()
+                as i128)
+                .clamp(0, DUAL_M_MAX);
+        if m == 0 {
+            continue;
+        }
+        nb_used = true;
+        price_nbhd_row(tc, state, *pi, iset, m, &mut base, &mut ay);
+    }
     let mut d: Vec<i128> = ay.iter().map(|&a| -DUAL_SCALE - a).collect();
     let mut sum: i128 = (0..n).filter(|&v| state.in_c[v]).map(|v| d[v].min(0)).sum();
 
@@ -1401,7 +1937,8 @@ fn refresh_dual_snapshot(
                 break;
             }
             all_cuts.extend(fresh);
-            let Some((mut rows2, pair_of_row2, cliques2)) = build_solve_rows(tc, state, cfg) else {
+            let Some((mut rows2, pair_of_row2, cliques2, nbs2)) = build_solve_rows(tc, state, cfg)
+            else {
                 break;
             };
             let n_pc = rows2.len();
@@ -1459,6 +1996,17 @@ fn refresh_dual_snapshot(
                     ay2[v as usize] -= m;
                 }
             }
+            let mut nb2_used = false;
+            for (ni, (pi, iset)) in nbs2.iter().enumerate() {
+                let m = ((duals2[pair_of_row2.len() + cliques2.len() + ni] * DUAL_SCALE as f64)
+                    .floor() as i128)
+                    .clamp(0, DUAL_M_MAX);
+                if m == 0 {
+                    continue;
+                }
+                nb2_used = true;
+                price_nbhd_row(tc, state, *pi, iset, m, &mut base2, &mut ay2);
+            }
             for (ci, (members, hubs)) in all_cuts.iter().enumerate() {
                 let m =
                     ((duals2[n_pc + ci] * DUAL_SCALE as f64).floor() as i128).clamp(0, DUAL_M_MAX);
@@ -1479,7 +2027,7 @@ fn refresh_dual_snapshot(
                 .map(|v| d2[v].min(0))
                 .sum();
             let improved = base2 + sum2 > base + sum;
-            if std::env::var_os("TWO_CLUB_TRACE").is_some() {
+            if tc.trace {
                 eprintln!(
                     "  [2cut] c={} round={} ub={:.2}->{:.2} ncuts={} improved={}",
                     state.c_size,
@@ -1494,6 +2042,7 @@ fn refresh_dual_snapshot(
                 base = base2;
                 d = d2;
                 sum = sum2;
+                nb_used = nb2_used; // the adopted pricing is the round-2 one
                 prune = scaled_dual_bound_prunes(base + sum, best_floor);
             }
             x_cur = x2;
@@ -1525,9 +2074,79 @@ fn refresh_dual_snapshot(
             d,
             sum,
             prune,
+            nb_rows: nbs.len() as u32,
+            nb_used,
         },
         Some(support),
     ))
+}
+
+/// MARKED-CONFLICT deletion sweep to a FIXED POINT (`TWO_CLUB_BRANCH=marked`).
+///
+/// A marked vertex is committed to EVERY solution the current subtree is
+/// responsible for (cell-forced vertices carry the same commitment, so they
+/// are marked from the cell root). If a pair (m, u) with m marked is violating
+/// (both in `C`, non-adjacent, zero surviving common neighbours in `C`), no
+/// 2-club within `C` contains both — and every solution of interest contains
+/// `m`, so `u` is in NONE of them: delete `u`.
+///
+/// Violating status is MONOTONE under vertex removal (common neighbourhoods
+/// only shrink), so a deletion can cascade NEW violations against OTHER marked
+/// vertices — hence the outer loop repeats until a full pass over the marked
+/// set deletes nothing. Every deletion goes through `SearchState::remove` with
+/// its own undo log appended to `extra` (the caller unwinds in exact reverse
+/// order), and the incremental dual sum is updated exactly like the branch
+/// removal sites, so the O(1) snapshot bound stays exact (marked vertices are
+/// never removed, so the snapshot's row pricing stays valid).
+///
+/// Returns `false` iff a violating pair has BOTH endpoints marked: two
+/// committed vertices can no longer coexist, so the branch holds no solution
+/// of interest — DEAD (the caller prunes; nothing here is undone, the caller's
+/// frame unwind reverses `extra`).
+#[allow(clippy::too_many_arguments)]
+fn marked_sweep(
+    tc: &TwoClub,
+    state: &mut SearchState,
+    marked: &[bool],
+    marked_list: &[usize],
+    lp_enabled: bool,
+    dual_d: &[i128],
+    dual_sum: &mut i128,
+    extra: &mut Vec<(usize, Vec<(u32, u8)>)>,
+    mk_dels: &mut u64,
+) -> bool {
+    loop {
+        let mut changed = false;
+        for &m in marked_list {
+            debug_assert!(state.in_c[m], "marked vertex left C");
+            for &pi in &tc.pair_of_vertex[m] {
+                let pi = pi as usize;
+                if !state.both_in[pi] || state.cn_alive[pi] != 0 {
+                    continue;
+                }
+                let (a, b, _) = &tc.pairs[pi];
+                let u = if *a as usize == m {
+                    *b as usize
+                } else {
+                    *a as usize
+                };
+                if marked[u] {
+                    return false; // marked-marked violating pair: DEAD branch
+                }
+                if lp_enabled {
+                    *dual_sum -= dual_d[u].min(0);
+                }
+                let mut log = Vec::new();
+                state.remove(u, tc, &mut log);
+                extra.push((u, log));
+                *mk_dels += 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            return true;
+        }
+    }
 }
 
 /// Exhaustive branch-and-bound. Returns (best_size, best_set) IFF the search ran
@@ -1575,11 +2194,33 @@ fn solve_exact_cell(
             state.remove(v, tc, &mut _init_undo);
         }
     }
+    // MARKED BRANCHING state (`TWO_CLUB_BRANCH=marked`): `marked[v]` ⇒ v is
+    // committed to every solution of the current subtree. Cell-forced vertices
+    // carry that commitment for the WHOLE cell, so they are marked up front —
+    // the root's sweep then performs the IRR reduction (delete anything
+    // conflicting with a committed vertex) before the first branch, and a
+    // forced-forced violation kills the cell as dead-by-marked-pair.
+    let marked_mode = tc.branch_rule == ViolatingBranchRule::Marked;
+    let mut marked = vec![false; n];
+    let mut marked_list: Vec<usize> = Vec::new();
+    if marked_mode {
+        for v in 0..n {
+            if is_forced(v) && state.in_c[v] {
+                marked[v] = true;
+                marked_list.push(v);
+            }
+        }
+    }
+    // Marked-branching counters: branch marks made / sweep conflict deletions
+    // / dead-by-marked-pair prunes (the `mk=` trace triple).
+    let mut mk_marks: u64 = 0;
+    let mut mk_dels: u64 = 0;
+    let mut mk_dead: u64 = 0;
     let mut best: Option<(usize, Vec<bool>)> = None;
     let mut best_floor = seed_size; // sound pruning floor: a KNOWN 2-club size
     let mut nodes: u64 = 0;
-    let node_cap = max_nodes();
-    let progress = std::env::var_os("TWO_CLUB_TRACE").is_some();
+    let node_cap = tc.max_nodes;
+    let progress = tc.trace;
     let t_start = std::time::Instant::now();
     let mut next_report: u64 = 50_000_000;
     let mut next_time_report: u64 = 600;
@@ -1616,6 +2257,12 @@ fn solve_exact_cell(
     let mut lp_prunes_m: u64 = 0;
     // Cheap dual re-pricings (no simplex) tried at cascade rungs.
     let mut lp_reprices: u64 = 0;
+    // STRENGTHENED-NEIGHBORHOOD rows (config `nbhd_rows`, dev-campaign
+    // opt-in): rows fed to refresh solves / prunes whose adopted pricing
+    // carried a positive multiplier on ≥ 1 such row (the `nb=` trace pair;
+    // 0/0 when off).
+    let mut nb_rows_total: u64 = 0;
+    let mut nb_prunes: u64 = 0;
     // CEILING ATTACK state: `ceil_frontier` tracks the highest c of any
     // LP-family kill (trace/diagnostic); the GATE uses `lift_frontier` — the
     // highest c of CASCADE kills only. Enter-matching kills land during
@@ -1625,6 +2272,25 @@ fn solve_exact_cell(
     let mut lift_frontier: usize = 0;
     let mut ceil_spent = std::time::Duration::ZERO;
     let mut lp_ceil_try: u64 = 0;
+    // Certified-SDP bridge: lazily spawned, and REPLACED (not retired) when a
+    // child breaks — a single slow solve must not cost the cell its strongest
+    // tier. Retired only on a run of consecutive breaks, i.e. something
+    // systemic (interpreter gone, instance unreadable, digest mismatch).
+    // Budget: sdp_spent*4 <= elapsed (<= 25% of wall time), and every break
+    // (including the 120 s timeout that produced it) is charged to it.
+    let mut sdp: Option<SdpWorker> = None;
+    let mut sdp_dead = tc.sdp_worker.is_none();
+    let graph_sha256 = tc
+        .sdp_worker
+        .as_ref()
+        .map(|_| graph_sha256(tc.n, &tc.pairs));
+    let mut sdp_spent = std::time::Duration::ZERO;
+    let mut sdp_try: u64 = 0;
+    let mut sdp_kill: u64 = 0;
+    let mut sdp_spawns: u64 = 0;
+    let mut sdp_nocert: u64 = 0;
+    let mut sdp_skip: u64 = 0;
+    let mut sdp_broken_streak: u32 = 0;
     // Endgame-shape instrumentation: dives (boundary first-touch events) and
     // right-child expansions by height band — the effective branching factor
     // ABOVE the kill frontier decides whether the residual enumeration is
@@ -1641,10 +2307,23 @@ fn solve_exact_cell(
     // re-optimize y on just these rows (~100x cheaper) at nearby nodes.
     let mut dual_support: Option<Vec<u32>> = None;
 
+    // The RIGHT side of a two-sided branch on violating pair (a, b) after the
+    // left (remove-a) subtree unwinds.
+    #[derive(Clone, Copy)]
+    enum RightBranch {
+        /// Default rules: remove the other endpoint b.
+        Remove(usize),
+        /// Marked mode: COMMIT the left-removed endpoint a to every solution
+        /// of the right subtree. No state change at push; the child's Enter
+        /// sweep deletes every conflict of the marked set to a fixed point
+        /// (the violating partner b at minimum, so the right side always
+        /// shrinks C and the tree stays finite).
+        Mark(usize),
+    }
     // Explicit DFS: each frame is (vertex_removed, undo_log, phase).
     enum Frame {
         Enter,
-        AfterLeft { second: Option<usize> },
+        AfterLeft { right: Option<RightBranch> },
         Exit,
     }
     // Recursive helper via explicit stack of (frame, removed_vertex, undo).
@@ -1660,6 +2339,44 @@ fn solve_exact_cell(
         /// the OPEN stack's c-distribution (how much skeleton hangs above the
         /// kill frontier, the number that decides grind-vs-restructure).
         c_at: usize,
+        /// Marked mode: vertex committed when this frame was pushed (the
+        /// right-branch child of a mark); unmarked LAST on unwind.
+        mark: Option<usize>,
+        /// Marked mode: sweep deletions performed at this frame's Enter, in
+        /// deletion order; undone in REVERSE, before `removed`, on unwind.
+        extra: Vec<(usize, Vec<(u32, u8)>)>,
+    }
+    /// Unwind one frame in EXACT reverse of its forward effects: sweep
+    /// deletions newest-first, then the frame's own branch removal, then its
+    /// mark. Callers pop any adopted dual snapshot FIRST (pop-before-undo:
+    /// `removed` and `extra` were both accounted under the PRE-adoption
+    /// pricing, which the pop restores).
+    fn unwind_frame(
+        item: &mut StackItem,
+        state: &mut SearchState,
+        lp_enabled: bool,
+        dual_d: &[i128],
+        dual_sum: &mut i128,
+        marked: &mut [bool],
+        marked_list: &mut Vec<usize>,
+    ) {
+        while let Some((v, log)) = item.extra.pop() {
+            if lp_enabled {
+                *dual_sum += dual_d[v].min(0);
+            }
+            state.undo(v, &log);
+        }
+        if let Some(v) = item.removed {
+            if lp_enabled {
+                *dual_sum += dual_d[v].min(0);
+            }
+            state.undo(v, &item.undo);
+        }
+        if let Some(m) = item.mark {
+            marked[m] = false;
+            let popped = marked_list.pop();
+            debug_assert_eq!(popped, Some(m), "mark unwind out of order");
+        }
     }
     let mut stack = vec![StackItem {
         frame: Frame::Enter,
@@ -1667,6 +2384,8 @@ fn solve_exact_cell(
         undo: Vec::new(),
         snap: false,
         c_at: state.c_size,
+        mark: None,
+        extra: Vec::new(),
     }];
     let mut completed = true;
 
@@ -1702,7 +2421,7 @@ fn solve_exact_cell(
                         (cs[0], cs[cs.len() / 2], cs[cs.len() - 1])
                     };
                     eprintln!(
-                        "  [cell] nodes={nodes} rate={:.0}/s open={} oc={cmin}/{cmed}/{cmax} floor={best_floor} lp_prunes={lp_prunes} o1={lp_prunes_o1} lift={lp_prunes_lift} m={lp_prunes_m} refreshes={lp_refreshes} subs={lp_reprices} ceil={lp_ceil_try}/{lp_ceil_kill_a}+{lp_ceil_kill_b} front={ceil_frontier} dives={n_dives} rx={rx_lo}/{rx_150}/{rx_160}/{rx_170} t={secs:.0}s",
+                        "  [cell] nodes={nodes} rate={:.0}/s open={} oc={cmin}/{cmed}/{cmax} floor={best_floor} lp_prunes={lp_prunes} o1={lp_prunes_o1} lift={lp_prunes_lift} m={lp_prunes_m} refreshes={lp_refreshes} subs={lp_reprices} ceil={lp_ceil_try}/{lp_ceil_kill_a}+{lp_ceil_kill_b} sdp={sdp_try}/{sdp_kill} sdpx={sdp_spawns}/{sdp_nocert}/{sdp_skip}/{sdp_dead} nb={nb_rows_total}/{nb_prunes} front={ceil_frontier} mk={mk_marks}/{mk_dels}/{mk_dead} dives={n_dives} rx={rx_lo}/{rx_150}/{rx_160}/{rx_170} t={secs:.0}s",
                         nodes as f64 / secs.max(1e-9),
                         stack.len()
                     );
@@ -1710,6 +2429,40 @@ fn solve_exact_cell(
                         next_report += 50_000_000;
                     }
                     next_time_report = t_start.elapsed().as_secs() + 600;
+                }
+                // MARKED-CONFLICT sweep (marked mode, before any bound test so
+                // the prunes below see the reduced C): delete every vertex
+                // conflicting with the committed set, to a fixed point. A
+                // marked-marked violation = DEAD branch (no solution of this
+                // subtree's responsibility survives).
+                if marked_mode
+                    && !marked_list.is_empty()
+                    && !marked_sweep(
+                        tc,
+                        &mut state,
+                        &marked,
+                        &marked_list,
+                        lp.enabled,
+                        &dual_d,
+                        &mut dual_sum,
+                        &mut item.extra,
+                        &mut mk_dels,
+                    )
+                {
+                    mk_dead += 1;
+                    // Dead by commitment, not by bound — the parent C is not
+                    // evidence of LP-thinness; disarm the kill-lift cascade.
+                    cascade = false;
+                    unwind_frame(
+                        &mut item,
+                        &mut state,
+                        lp.enabled,
+                        &dual_d,
+                        &mut dual_sum,
+                        &mut marked,
+                        &mut marked_list,
+                    );
+                    continue;
                 }
                 // Prune: cannot beat the best known 2-club (seed or discovered).
                 if state.c_size <= best_floor {
@@ -1720,12 +2473,15 @@ fn solve_exact_cell(
                     // 183 → 6 per 150 s. Only LP prunes (evidence of
                     // LP-thinness on this path) arm cascades.
                     // undo this frame's removal on unwind.
-                    if let Some(v) = item.removed {
-                        if lp.enabled {
-                            dual_sum += dual_d[v].min(0);
-                        }
-                        state.undo(v, &item.undo);
-                    }
+                    unwind_frame(
+                        &mut item,
+                        &mut state,
+                        lp.enabled,
+                        &dual_d,
+                        &mut dual_sum,
+                        &mut marked,
+                        &mut marked_list,
+                    );
                     continue;
                 }
                 // MATCHING prune — LP-free: every 2-club in C excludes one
@@ -1742,10 +2498,15 @@ fn solve_exact_cell(
                         lp_prunes_m += 1;
                         cascade = true;
                         ceil_frontier = ceil_frontier.max(state.c_size);
-                        if let Some(v) = item.removed {
-                            dual_sum += dual_d[v].min(0);
-                            state.undo(v, &item.undo);
-                        }
+                        unwind_frame(
+                            &mut item,
+                            &mut state,
+                            lp.enabled,
+                            &dual_d,
+                            &mut dual_sum,
+                            &mut marked,
+                            &mut marked_list,
+                        );
                         continue;
                     }
                 }
@@ -1758,10 +2519,15 @@ fn solve_exact_cell(
                         lp_prunes += 1;
                         lp_prunes_o1 += 1;
                         cascade = true;
-                        if let Some(v) = item.removed {
-                            dual_sum += dual_d[v].min(0);
-                            state.undo(v, &item.undo);
-                        }
+                        unwind_frame(
+                            &mut item,
+                            &mut state,
+                            lp.enabled,
+                            &dual_d,
+                            &mut dual_sum,
+                            &mut marked,
+                            &mut marked_list,
+                        );
                         continue;
                     }
                     // Refresh policy: (a) FIRST-TOUCH — exactly at the window
@@ -1802,6 +2568,7 @@ fn solve_exact_cell(
                                 RefreshMode::Support(cache),
                                 should_stop,
                             ) {
+                                nb_rows_total += f.nb_rows as u64;
                                 if f.prune {
                                     fresh = Some(f);
                                 }
@@ -1820,6 +2587,7 @@ fn solve_exact_cell(
                                 if let Some(y) = y {
                                     dual_support = Some(y);
                                 }
+                                nb_rows_total += f.nb_rows as u64;
                                 f
                             });
                         }
@@ -1845,12 +2613,20 @@ fn solve_exact_cell(
                             }
                             if f.prune {
                                 lp_prunes += 1;
+                                if f.nb_used {
+                                    nb_prunes += 1;
+                                }
                                 cascade = true;
                                 ceil_frontier = ceil_frontier.max(state.c_size);
-                                if let Some(v) = item.removed {
-                                    dual_sum += dual_d[v].min(0);
-                                    state.undo(v, &item.undo);
-                                }
+                                unwind_frame(
+                                    &mut item,
+                                    &mut state,
+                                    lp.enabled,
+                                    &dual_d,
+                                    &mut dual_sum,
+                                    &mut marked,
+                                    &mut marked_list,
+                                );
                                 continue;
                             }
                             // Adopt only a pricing that is strictly tighter at
@@ -1873,12 +2649,15 @@ fn solve_exact_cell(
                             best_floor = state.c_size;
                             best = Some((state.c_size, set));
                         }
-                        if let Some(v) = item.removed {
-                            if lp.enabled {
-                                dual_sum += dual_d[v].min(0);
-                            }
-                            state.undo(v, &item.undo);
-                        }
+                        unwind_frame(
+                            &mut item,
+                            &mut state,
+                            lp.enabled,
+                            &dual_d,
+                            &mut dual_sum,
+                            &mut marked,
+                            &mut marked_list,
+                        );
                         continue;
                     }
                     Some(pi) => {
@@ -1893,12 +2672,15 @@ fn solve_exact_cell(
                             // Dead branch by forcing, not by bound — the parent
                             // C is not evidence of LP-thinness; disarm.
                             cascade = false;
-                            if let Some(v) = item.removed {
-                                if lp.enabled {
-                                    dual_sum += dual_d[v].min(0);
-                                }
-                                state.undo(v, &item.undo);
-                            }
+                            unwind_frame(
+                                &mut item,
+                                &mut state,
+                                lp.enabled,
+                                &dual_d,
+                                &mut dual_sum,
+                                &mut marked,
+                                &mut marked_list,
+                            );
                             continue;
                         }
                         // Adopt the fresh pricing for this subtree: save the
@@ -1914,10 +2696,29 @@ fn solve_exact_cell(
                             dual_sum = f.sum;
                             item.snap = true;
                         }
-                        let left = if ra { a } else { b };
-                        let second = if ra && rb { Some(b) } else { None };
+                        let (left, right) = if marked_mode {
+                            // Sweep invariant: after this node's fixed point no
+                            // violating pair touches a marked (⊇ forced)
+                            // vertex, so both endpoints are free. Branch
+                            // `a OUT` | `a COMMITTED` — the include side's
+                            // child sweep deletes every conflict of a (b among
+                            // them): the O(1.62^n) device.
+                            debug_assert!(
+                                ra && rb && !marked[a] && !marked[b],
+                                "marked sweep invariant broken"
+                            );
+                            (a, Some(RightBranch::Mark(a)))
+                        } else {
+                            let left = if ra { a } else { b };
+                            let right = if ra && rb {
+                                Some(RightBranch::Remove(b))
+                            } else {
+                                None
+                            };
+                            (left, right)
+                        };
                         // Re-push self to run the right branch after the left.
-                        item.frame = Frame::AfterLeft { second };
+                        item.frame = Frame::AfterLeft { right };
                         stack.push(item);
                         let mut undo = Vec::new();
                         if lp.enabled {
@@ -1930,12 +2731,14 @@ fn solve_exact_cell(
                             undo,
                             snap: false,
                             c_at: state.c_size,
+                            mark: None,
+                            extra: Vec::new(),
                         });
                     }
                 }
             }
-            Frame::AfterLeft { second } => match second {
-                Some(j) => {
+            Frame::AfterLeft { right } => match right {
+                Some(rbranch) => {
                     // KILL-LIFT: before expanding the right child, re-price THIS
                     // node's C (the left subtree has fully unwound, so the state
                     // is exactly C_X). If UB(C_X) ≤ floor, no 2-club in C_X can
@@ -1981,8 +2784,12 @@ fn solve_exact_cell(
                                     RefreshMode::Support(cache),
                                     should_stop,
                                 ) {
+                                    nb_rows_total += f.nb_rows as u64;
                                     if f.prune {
                                         lift_kill = Some(f.base + f.sum);
+                                        if f.nb_used {
+                                            nb_prunes += 1;
+                                        }
                                     }
                                 }
                             }
@@ -2024,15 +2831,127 @@ fn solve_exact_cell(
                                 if let Some(y) = y {
                                     dual_support = Some(y);
                                 }
+                                nb_rows_total += f.nb_rows as u64;
                                 if f.prune {
                                     lift_kill = Some(f.base + f.sum);
                                     lp_ceil_kill_a += 1;
+                                    if f.nb_used {
+                                        nb_prunes += 1;
+                                    }
                                 } else {
                                     // The near-miss question: how far above the
                                     // floor does the strengthened LP sit where
                                     // the frontier stalls?
                                     ceil_fail_ub =
                                         Some(-((f.base + f.sum) as f64) / DUAL_SCALE as f64);
+                                }
+                            }
+                            // CERTIFIED SDP TIER: at frontier-defining
+                            // failures only (within 1 of the lift frontier),
+                            // query the certified-bound worker. Measured on
+                            // the 8 real wall sets: bounds 68.1-70.7, all
+                            // below the 71 kill line, ~15-25s per certified
+                            // kill (the development design notes).
+                            if lift_kill.is_none()
+                                && !sdp_dead
+                                && !should_stop()
+                                && state.c_size + 1 >= lift_frontier
+                                && sdp_spent.as_secs_f64() * 4.0
+                                    <= t_start.elapsed().as_secs_f64() + 1.0
+                            {
+                                // REACH GATE (skip-only, never a prune): the SDP
+                                // bound sits a measured ~2.1 below the LP's own
+                                // failing UB at the same node (mean 2.16, max
+                                // 2.70 over the 70 paired round-3b field
+                                // queries; every one of the 48 kills in that
+                                // sample had LP UB < floor+4). Nodes whose LP UB
+                                // is further out than the tier can reach are
+                                // hopeless, and marked branching produces them
+                                // in bulk at c≈160+ (LP UB 78-90) where they
+                                // would otherwise eat the whole 25% budget at
+                                // ~11 s each.
+                                let ub_in_reach = ceil_fail_ub.is_none_or(|ub| {
+                                    ub < (best_floor + 1) as f64 + SDP_REACH_SLACK
+                                });
+                                if !ub_in_reach {
+                                    sdp_skip += 1;
+                                }
+                                if ub_in_reach {
+                                    let t_sdp = std::time::Instant::now();
+                                    if sdp.is_none() {
+                                        sdp = tc.sdp_worker.as_ref().and_then(|config| {
+                                            SdpWorker::spawn(config, graph_sha256.as_deref()?)
+                                        });
+                                        match sdp {
+                                            Some(_) => sdp_spawns += 1,
+                                            // A spawn that fails is itself a
+                                            // break; a run of them is systemic.
+                                            None => sdp_broken_streak += 1,
+                                        }
+                                    }
+                                    if let Some(w) = sdp.as_mut() {
+                                        sdp_try += 1;
+                                        let cset: Vec<usize> =
+                                            (0..n).filter(|&v| state.in_c[v]).collect();
+                                        // 5 minutes, not 2: the worker's ladder
+                                        // now has a triangle rung (DERIVATION
+                                        // 2c) costing ~40-90 s of solve plus a
+                                        // ~30 s separation solve on top of the
+                                        // plain and DNN rungs, and round 3b
+                                        // measured ordinary solves stretching
+                                        // 10x under CPU contention. A timeout
+                                        // is survivable here (the bridge
+                                        // replaces the child rather than
+                                        // retiring the tier) and every second
+                                        // spent is charged to the 25% budget,
+                                        // so the deadline only bounds how long
+                                        // one hopeless query may run.
+                                        match w.query(&cset, std::time::Duration::from_mins(5)) {
+                                            SdpReply::Bound(num, den) => {
+                                                sdp_broken_streak = 0;
+                                                if let Some(marker) =
+                                                    certified_sdp_prune_marker(num, den, best_floor)
+                                                {
+                                                    lift_kill = Some(marker);
+                                                    sdp_kill += 1;
+                                                }
+                                            }
+                                            // Healthy worker, no certificate for
+                                            // this node: costs the bound only.
+                                            SdpReply::NoCertificate => {
+                                                sdp_broken_streak = 0;
+                                                sdp_nocert += 1;
+                                            }
+                                            // Desynchronized/dead child: drop it
+                                            // (Drop reaps) and let the next
+                                            // eligible node spawn a replacement,
+                                            // which re-runs the graph-identity
+                                            // handshake. Only a RUN of breaks
+                                            // retires the tier for the cell.
+                                            SdpReply::Broken => {
+                                                sdp = None;
+                                                sdp_broken_streak += 1;
+                                            }
+                                        }
+                                    }
+                                    if sdp_broken_streak >= SDP_MAX_BROKEN_STREAK {
+                                        sdp_dead = true;
+                                    }
+                                    sdp_spent += t_sdp.elapsed();
+                                    if progress {
+                                        eprintln!(
+                                            "  [sdp] c={} try={} kill={} spent={:.0}s dead={} \
+                                             spawns={} nocert={} skip={}",
+                                            state.c_size,
+                                            sdp_try,
+                                            sdp_kill,
+                                            sdp_spent.as_secs_f64(),
+                                            sdp_dead,
+                                            sdp_spawns,
+                                            sdp_nocert,
+                                            sdp_skip,
+                                        );
+                                    }
                                 }
                             }
                             // EXACT-AT-NEAR-MISS tier: tried and REMOVED —
@@ -2048,9 +2967,7 @@ fn solve_exact_cell(
                             // set (removed vertices) at ceiling FAILURES so the
                             // offline probe can measure PB-CDCL refutation cost
                             // on the real sets. TRACE-gated.
-                            if lift_kill.is_none()
-                                && std::env::var_os("TWO_CLUB_DUMP_FRONTIER").is_some()
-                            {
+                            if lift_kill.is_none() && tc.dump_frontier {
                                 let out: Vec<String> = (0..tc.n)
                                     .filter(|&v| !state.in_c[v])
                                     .map(|v| v.to_string())
@@ -2104,10 +3021,15 @@ fn solve_exact_cell(
                                     dual_sum = -(state.c_size as i128) * DUAL_SCALE;
                                 }
                             }
-                            if let Some(v) = item.removed {
-                                dual_sum += dual_d[v].min(0);
-                                state.undo(v, &item.undo);
-                            }
+                            unwind_frame(
+                                &mut item,
+                                &mut state,
+                                lp.enabled,
+                                &dual_d,
+                                &mut dual_sum,
+                                &mut marked,
+                                &mut marked_list,
+                            );
                             continue;
                         }
                     }
@@ -2122,18 +3044,43 @@ fn solve_exact_cell(
                     cascade = false;
                     item.frame = Frame::Exit;
                     stack.push(item);
-                    let mut undo = Vec::new();
-                    if lp.enabled {
-                        dual_sum -= dual_d[j].min(0);
+                    match rbranch {
+                        RightBranch::Remove(j) => {
+                            let mut undo = Vec::new();
+                            if lp.enabled {
+                                dual_sum -= dual_d[j].min(0);
+                            }
+                            state.remove(j, tc, &mut undo);
+                            stack.push(StackItem {
+                                frame: Frame::Enter,
+                                removed: Some(j),
+                                undo,
+                                snap: false,
+                                c_at: state.c_size,
+                                mark: None,
+                                extra: Vec::new(),
+                            });
+                        }
+                        RightBranch::Mark(v) => {
+                            // Commit v (v ∈ every solution of this subtree).
+                            // No state change here — the child's Enter sweep
+                            // deletes v's conflicts (its violating partner at
+                            // minimum) to a fixed point, through the standard
+                            // remove path with per-deletion undo logs.
+                            mk_marks += 1;
+                            marked[v] = true;
+                            marked_list.push(v);
+                            stack.push(StackItem {
+                                frame: Frame::Enter,
+                                removed: None,
+                                undo: Vec::new(),
+                                snap: false,
+                                c_at: state.c_size,
+                                mark: Some(v),
+                                extra: Vec::new(),
+                            });
+                        }
                     }
-                    state.remove(j, tc, &mut undo);
-                    stack.push(StackItem {
-                        frame: Frame::Enter,
-                        removed: Some(j),
-                        undo,
-                        snap: false,
-                        c_at: state.c_size,
-                    });
                 }
                 None => {
                     // No second (right) branch — the left endpoint was the only
@@ -2155,12 +3102,15 @@ fn solve_exact_cell(
                             dual_sum = -(state.c_size as i128) * DUAL_SCALE;
                         }
                     }
-                    if let Some(v) = item.removed {
-                        if lp.enabled {
-                            dual_sum += dual_d[v].min(0);
-                        }
-                        state.undo(v, &item.undo);
-                    }
+                    unwind_frame(
+                        &mut item,
+                        &mut state,
+                        lp.enabled,
+                        &dual_d,
+                        &mut dual_sum,
+                        &mut marked,
+                        &mut marked_list,
+                    );
                 }
             },
             Frame::Exit => {
@@ -2177,19 +3127,22 @@ fn solve_exact_cell(
                         dual_sum = -(state.c_size as i128) * DUAL_SCALE;
                     }
                 }
-                if let Some(v) = item.removed {
-                    if lp.enabled {
-                        dual_sum += dual_d[v].min(0);
-                    }
-                    state.undo(v, &item.undo);
-                }
+                unwind_frame(
+                    &mut item,
+                    &mut state,
+                    lp.enabled,
+                    &dual_d,
+                    &mut dual_sum,
+                    &mut marked,
+                    &mut marked_list,
+                );
             }
         }
     }
 
     if progress {
         eprintln!(
-            "  [cell done] nodes={nodes} lp_prunes={lp_prunes} o1={lp_prunes_o1} lift={lp_prunes_lift} m={lp_prunes_m} refreshes={lp_refreshes} subs={lp_reprices} ceil={lp_ceil_try}/{lp_ceil_kill_a}+{lp_ceil_kill_b} front={ceil_frontier} dives={n_dives} rx={rx_lo}/{rx_150}/{rx_160}/{rx_170} floor={best_floor} completed={completed} t={:.2}s",
+            "  [cell done] nodes={nodes} lp_prunes={lp_prunes} o1={lp_prunes_o1} lift={lp_prunes_lift} m={lp_prunes_m} refreshes={lp_refreshes} subs={lp_reprices} ceil={lp_ceil_try}/{lp_ceil_kill_a}+{lp_ceil_kill_b} sdp={sdp_try}/{sdp_kill} sdpx={sdp_spawns}/{sdp_nocert}/{sdp_skip}/{sdp_dead} nb={nb_rows_total}/{nb_prunes} front={ceil_frontier} mk={mk_marks}/{mk_dels}/{mk_dead} dives={n_dives} rx={rx_lo}/{rx_150}/{rx_160}/{rx_170} floor={best_floor} completed={completed} t={:.2}s",
             t_start.elapsed().as_secs_f64()
         );
     }
@@ -2229,7 +3182,31 @@ pub(crate) fn two_club_prove_worker(
     should_stop: &dyn Fn() -> bool,
     on_improve: &mut dyn FnMut(i128, &[bool]),
 ) -> Option<(usize, bool)> {
-    let tc = recognize(instance, objective)?;
+    two_club_prove_worker_with_runtime(
+        instance,
+        objective,
+        seed,
+        worker,
+        nworkers,
+        lp,
+        TwoClubRuntime::from_env(),
+        should_stop,
+        on_improve,
+    )
+}
+
+fn two_club_prove_worker_with_runtime(
+    instance: &PbInstance,
+    objective: &PbObjective,
+    seed: Option<&[bool]>,
+    worker: usize,
+    nworkers: usize,
+    lp: &LpNodeBound,
+    runtime: TwoClubRuntime,
+    should_stop: &dyn Fn() -> bool,
+    on_improve: &mut dyn FnMut(i128, &[bool]),
+) -> Option<(usize, bool)> {
+    let tc = recognize_with_runtime(instance, objective, runtime)?;
     let n = tc.n;
     let seed_size = match seed {
         Some(s) if s.len() == n && verify_all_constraints(&instance.constraints, s) => {
@@ -2293,7 +3270,36 @@ pub(crate) fn two_club_prove_d2_worker(
     should_stop: &dyn Fn() -> bool,
     on_improve: &mut dyn FnMut(i128, &[bool]),
 ) -> Option<(usize, bool)> {
-    let tc = recognize(instance, objective)?;
+    two_club_prove_d2_worker_with_runtime(
+        instance,
+        objective,
+        seed,
+        base_mod,
+        classes,
+        worker,
+        nworkers,
+        lp,
+        TwoClubRuntime::from_env(),
+        should_stop,
+        on_improve,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn two_club_prove_d2_worker_with_runtime(
+    instance: &PbInstance,
+    objective: &PbObjective,
+    seed: Option<&[bool]>,
+    base_mod: usize,
+    classes: &[usize],
+    worker: usize,
+    nworkers: usize,
+    lp: &LpNodeBound,
+    runtime: TwoClubRuntime,
+    should_stop: &dyn Fn() -> bool,
+    on_improve: &mut dyn FnMut(i128, &[bool]),
+) -> Option<(usize, bool)> {
+    let tc = recognize_with_runtime(instance, objective, runtime)?;
     let n = tc.n;
     let seed_size = match seed {
         Some(s) if s.len() == n && verify_all_constraints(&instance.constraints, s) => {
@@ -2400,7 +3406,34 @@ pub(crate) fn two_club_prove_pivot_worker(
     should_stop: &dyn Fn() -> bool,
     on_improve: &mut dyn FnMut(i128, &[bool]),
 ) -> Option<(usize, bool)> {
-    let tc = recognize(instance, objective)?;
+    two_club_prove_pivot_worker_with_runtime(
+        instance,
+        objective,
+        seed,
+        k,
+        worker,
+        nworkers,
+        lp,
+        TwoClubRuntime::from_env(),
+        should_stop,
+        on_improve,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn two_club_prove_pivot_worker_with_runtime(
+    instance: &PbInstance,
+    objective: &PbObjective,
+    seed: Option<&[bool]>,
+    k: usize,
+    worker: usize,
+    nworkers: usize,
+    lp: &LpNodeBound,
+    runtime: TwoClubRuntime,
+    should_stop: &dyn Fn() -> bool,
+    on_improve: &mut dyn FnMut(i128, &[bool]),
+) -> Option<(usize, bool)> {
+    let tc = recognize_with_runtime(instance, objective, runtime)?;
     let n = tc.n;
     let seed_size = match seed {
         Some(s) if s.len() == n && verify_all_constraints(&instance.constraints, s) => {
@@ -2473,7 +3506,48 @@ pub(crate) fn try_two_club_exact(
     should_stop: &dyn Fn() -> bool,
     on_improve: &mut dyn FnMut(i128, &[bool]),
 ) -> Option<PbSolution> {
-    let tc = recognize(instance, objective)?;
+    try_two_club_exact_with_runtime(
+        instance,
+        objective,
+        incumbent,
+        TwoClubRuntime::from_env(),
+        TwoClubLpSelection::Standard,
+        should_stop,
+        on_improve,
+    )
+}
+
+/// Selects the LP-node-bound configuration without conflating the production
+/// default with a developer campaign's explicit parameters.
+#[derive(Clone, Copy)]
+enum TwoClubLpSelection {
+    /// Production always uses the audited standard configuration.
+    Standard,
+    /// Feature-gated developer campaigns use exactly the requested value.
+    #[cfg(feature = "dev-tools")]
+    Explicit(LpNodeBound),
+}
+
+impl TwoClubLpSelection {
+    fn resolve(self) -> LpNodeBound {
+        match self {
+            Self::Standard => LpNodeBound::standard(),
+            #[cfg(feature = "dev-tools")]
+            Self::Explicit(config) => config,
+        }
+    }
+}
+
+fn try_two_club_exact_with_runtime(
+    instance: &PbInstance,
+    objective: &PbObjective,
+    incumbent: Option<&[bool]>,
+    runtime: TwoClubRuntime,
+    lp_selection: TwoClubLpSelection,
+    should_stop: &dyn Fn() -> bool,
+    on_improve: &mut dyn FnMut(i128, &[bool]),
+) -> Option<PbSolution> {
+    let tc = recognize_with_runtime(instance, objective, runtime)?;
     if should_stop() {
         return None;
     }
@@ -2525,10 +3599,10 @@ pub(crate) fn try_two_club_exact(
             on_improve(value, set);
         }
     };
-    // Production: the sound LP node bound is on — it can only prune subtrees
-    // that cannot beat the incumbent, so the exhaustion proof is unchanged while
-    // the tree can be vastly smaller than under cardinality-only pruning.
-    let lp = LpNodeBound::standard();
+    // Production selects the standard sound LP node bound. Feature-gated
+    // developer campaigns use their exact explicit selection, including the
+    // cardinality-only baseline when requested.
+    let lp = lp_selection.resolve();
     let verdict = solve_exact(&tc, seed_size, &lp, should_stop, &mut stream)?;
     let (best_size, best_set) = match verdict {
         SearchVerdict::Better(size, set) => (size, set),
@@ -2550,6 +3624,117 @@ pub(crate) fn try_two_club_exact(
     })
 }
 
+/// Typed partition modes used by the feature-gated `ay-pb-dev` campaign.
+#[cfg(feature = "dev-tools")]
+pub(crate) enum TwoClubCampaignPartition<'a> {
+    Whole,
+    Worker {
+        worker: usize,
+        workers: usize,
+    },
+    DepthTwo {
+        base_mod: usize,
+        classes: &'a [usize],
+        worker: usize,
+        workers: usize,
+    },
+    Pivot {
+        pivot_count: usize,
+        worker: usize,
+        workers: usize,
+    },
+}
+
+/// Runs one explicitly configured developer campaign without consulting any
+/// `TWO_CLUB_*` environment variable.
+#[cfg(feature = "dev-tools")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_configured_campaign(
+    instance: &PbInstance,
+    objective: &PbObjective,
+    seed: Option<&[bool]>,
+    partition: TwoClubCampaignPartition<'_>,
+    lp: &LpNodeBound,
+    runtime: TwoClubRuntime,
+    should_stop: &dyn Fn() -> bool,
+    on_improve: &mut dyn FnMut(i128, &[bool]),
+) -> Option<TwoClubCampaignResult> {
+    match partition {
+        TwoClubCampaignPartition::Whole => {
+            let solution = try_two_club_exact_with_runtime(
+                instance,
+                objective,
+                seed,
+                runtime,
+                TwoClubLpSelection::Explicit(*lp),
+                should_stop,
+                on_improve,
+            );
+            Some(TwoClubCampaignResult::Whole(solution))
+        }
+        TwoClubCampaignPartition::Worker { worker, workers } => {
+            let result = two_club_prove_worker_with_runtime(
+                instance,
+                objective,
+                seed,
+                worker,
+                workers,
+                lp,
+                runtime,
+                should_stop,
+                on_improve,
+            )?;
+            Some(TwoClubCampaignResult::Worker(result))
+        }
+        TwoClubCampaignPartition::DepthTwo {
+            base_mod,
+            classes,
+            worker,
+            workers,
+        } => {
+            let result = two_club_prove_d2_worker_with_runtime(
+                instance,
+                objective,
+                seed,
+                base_mod,
+                classes,
+                worker,
+                workers,
+                lp,
+                runtime,
+                should_stop,
+                on_improve,
+            )?;
+            Some(TwoClubCampaignResult::Worker(result))
+        }
+        TwoClubCampaignPartition::Pivot {
+            pivot_count,
+            worker,
+            workers,
+        } => {
+            let result = two_club_prove_pivot_worker_with_runtime(
+                instance,
+                objective,
+                seed,
+                pivot_count,
+                worker,
+                workers,
+                lp,
+                runtime,
+                should_stop,
+                on_improve,
+            )?;
+            Some(TwoClubCampaignResult::Worker(result))
+        }
+    }
+}
+
+#[cfg(feature = "dev-tools")]
+pub(crate) enum TwoClubCampaignResult {
+    Whole(Option<PbSolution>),
+    Worker((usize, bool)),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2566,7 +3751,7 @@ mod tests {
     }
 
     /// Build the standard 2-club PB encoding for an explicit edge list.
-    fn encode(n: usize, edges: &[(usize, usize)]) -> (PbInstance, PbObjective) {
+    pub(super) fn encode(n: usize, edges: &[(usize, usize)]) -> (PbInstance, PbObjective) {
         let mut adj = vec![vec![false; n]; n];
         for &(a, b) in edges {
             adj[a][b] = true;
@@ -2603,6 +3788,16 @@ mod tests {
                 objective: Some(objective.clone()),
             },
             objective,
+        )
+    }
+
+    /// Hermetic recognizer for tests that need to inspect or override the
+    /// selected branch rule directly.
+    fn recognize(instance: &PbInstance, objective: &PbObjective) -> Option<TwoClub> {
+        recognize_with_runtime(
+            instance,
+            objective,
+            TwoClubRuntime::explicit(MAX_NODES, false, false, false),
         )
     }
 
@@ -2846,6 +4041,260 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn developer_whole_lp_selection_preserves_the_explicit_value() {
+        let configured = LpNodeBound {
+            enabled: false,
+            warmup: 7,
+            cadence: 11,
+            window: 13,
+            max_rows: 17,
+            low_margin: 19,
+            ceiling: false,
+            exact_margin: 23,
+            nbhd_rows: true,
+        };
+        let resolved = TwoClubLpSelection::Explicit(configured).resolve();
+
+        assert!(!resolved.enabled);
+        assert_eq!(resolved.warmup, 7);
+        assert_eq!(resolved.cadence, 11);
+        assert_eq!(resolved.window, 13);
+        assert_eq!(resolved.max_rows, 17);
+        assert_eq!(resolved.low_margin, 19);
+        assert!(!resolved.ceiling);
+        assert_eq!(resolved.exact_margin, 23);
+        assert!(resolved.nbhd_rows);
+    }
+
+    #[test]
+    fn certified_sdp_prune_marker_is_strict_and_fail_closed() {
+        assert_eq!(
+            certified_sdp_prune_marker(70, 1, 70),
+            Some(-70 * DUAL_SCALE)
+        );
+        assert_eq!(
+            certified_sdp_prune_marker(141, 2, 70),
+            Some(-(141 * DUAL_SCALE / 2))
+        );
+        assert_eq!(certified_sdp_prune_marker(71, 1, 70), None);
+        assert_eq!(certified_sdp_prune_marker(-1, 1, 70), None);
+        assert_eq!(certified_sdp_prune_marker(1, 0, 70), None);
+        assert_eq!(certified_sdp_prune_marker(1, -1, 70), None);
+        assert_eq!(certified_sdp_prune_marker(0, i128::MAX, 1), None);
+    }
+
+    #[test]
+    fn certified_sdp_protocol_requires_one_exact_bound_record() {
+        assert_eq!(parse_sdp_bound_response("BOUND 141 2"), Some((141, 2)));
+        assert_eq!(parse_sdp_bound_response(" BOUND 141 2 "), Some((141, 2)));
+        assert_eq!(parse_sdp_bound_response("BOUND 141 2 trailing"), None);
+        assert_eq!(parse_sdp_bound_response("BOUND 141"), None);
+        assert_eq!(parse_sdp_bound_response("BOUND -1 2"), None);
+        assert_eq!(parse_sdp_bound_response("BOUND 1 0"), None);
+        assert_eq!(parse_sdp_bound_response("BOUND 1 -2"), None);
+        assert_eq!(
+            parse_sdp_bound_response("BOUND 170141183460469231731687303715884105728 1"),
+            None
+        );
+        assert_eq!(parse_sdp_bound_response("FAIL uncertified"), None);
+    }
+
+    #[test]
+    fn certified_sdp_graph_digest_is_row_order_independent() {
+        let first = vec![(0, 2, vec![1]), (1, 3, vec![0, 2])];
+        let reordered = vec![(1, 3, vec![0, 2]), (0, 2, vec![1])];
+        let changed = vec![(1, 3, vec![0, 2]), (0, 2, vec![3])];
+
+        let digest = graph_sha256(4, &first);
+        assert_eq!(
+            digest,
+            "d2c81ed7c4b1851e5e25d401ec72e5e4eb580ae85d692ef4ef0c4fcfa5e11ce4"
+        );
+        assert_eq!(digest, graph_sha256(4, &reordered));
+        assert_ne!(graph_sha256(4, &first), graph_sha256(4, &changed));
+    }
+
+    /// Scripted stand-in for the development design notes, driven through
+    /// the real protocol over real pipes (`/bin/sh`, so the fixture cannot
+    /// accidentally depend on the certified toolchain being installed).
+    #[cfg(unix)]
+    struct FakeWorker {
+        config: SdpWorkerConfig,
+        directory: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl FakeWorker {
+        fn new(label: &str, body: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir()
+                .join(format!("ay-sdp-worker-{}-{label}-{id}", std::process::id()));
+            std::fs::create_dir(&directory).expect("create fake-worker directory");
+            let script = directory.join("worker.sh");
+            let instance = directory.join("instance.opb");
+            std::fs::write(&script, body).expect("write fake worker");
+            std::fs::write(&instance, b"* fake fixture\n").expect("write fake instance");
+            Self {
+                config: SdpWorkerConfig {
+                    interpreter: std::path::PathBuf::from("/bin/sh"),
+                    script,
+                    instance,
+                },
+                directory,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeWorker {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.config.script);
+            let _ = std::fs::remove_file(&self.config.instance);
+            let _ = std::fs::remove_dir(&self.directory);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn certified_sdp_worker_checks_identity_and_reaps_on_timeout() {
+        let digest = graph_sha256(4, &[(0, 2, vec![1]), (1, 3, vec![0, 2])]);
+        let successful = FakeWorker::new(
+            "success",
+            &format!(
+                "printf '%s\\n' 'READY graph_sha256={digest} n=4 pairs=2'\n\
+                 IFS= read -r request || exit 3\n\
+                 printf '%s\\n' 'BOUND 141 2'\n\
+                 IFS= read -r quit || true\n"
+            ),
+        );
+        let mut worker =
+            SdpWorker::spawn(&successful.config, &digest).expect("matching worker handshake");
+        assert_eq!(
+            worker.query(&[0, 1], std::time::Duration::from_secs(1)),
+            SdpReply::Bound(141, 2)
+        );
+        drop(worker);
+
+        let mismatch = FakeWorker::new(
+            "mismatch",
+            "printf '%s\\n' 'READY graph_sha256=deadbeef n=4 pairs=2'\nwhile :; do :; done\n",
+        );
+        assert!(
+            SdpWorker::spawn(&mismatch.config, &digest).is_none(),
+            "a graph-identity mismatch must decline"
+        );
+
+        let timeout = FakeWorker::new(
+            "timeout",
+            &format!(
+                "printf '%s\\n' 'READY graph_sha256={digest} n=4 pairs=2'\n\
+                 IFS= read -r request || exit 3\n\
+                 while :; do :; done\n"
+            ),
+        );
+        let mut worker =
+            SdpWorker::spawn(&timeout.config, &digest).expect("matching worker handshake");
+        assert_eq!(
+            worker.query(&[0, 1], std::time::Duration::from_millis(20)),
+            SdpReply::Broken,
+            "a timed-out query leaves the stream desynchronized: the child must \
+             be classified as unusable, not merely uncertified"
+        );
+        drop(worker);
+    }
+
+    /// The failure taxonomy the bridge policy rests on. Round 3b retired the
+    /// certified tier on 7 of 8 workers within the first 25 minutes of a 12-hour
+    /// cell because BOTH of the answers below were funnelled into one "any
+    /// failure is permanent" path: a `FAIL` line (a healthy worker reporting no
+    /// certificate for one node) and a 120 s solve under CPU contention.
+    /// `NoCertificate` must cost only the bound; `Broken` must cost only the
+    /// child.
+    #[cfg(unix)]
+    #[test]
+    fn certified_sdp_in_protocol_fail_keeps_the_bridge_usable() {
+        let digest = graph_sha256(4, &[(0, 2, vec![1]), (1, 3, vec![0, 2])]);
+
+        // A worker that cannot certify the first node and can the second — the
+        // stream stays synchronized across the refusal, so the SAME child
+        // answers the follow-up query.
+        let refusing = FakeWorker::new(
+            "refusing",
+            &format!(
+                "printf '%s\\n' 'READY graph_sha256={digest} n=4 pairs=2'\n\
+                 IFS= read -r first || exit 3\n\
+                 printf '%s\\n' 'FAIL uncertified iv=True ex=False'\n\
+                 IFS= read -r second || exit 3\n\
+                 printf '%s\\n' 'BOUND 141 2'\n\
+                 IFS= read -r quit || true\n"
+            ),
+        );
+        let mut worker =
+            SdpWorker::spawn(&refusing.config, &digest).expect("matching worker handshake");
+        assert_eq!(
+            worker.query(&[0, 1], std::time::Duration::from_secs(5)),
+            SdpReply::NoCertificate
+        );
+        assert_eq!(
+            worker.query(&[0, 2], std::time::Duration::from_secs(5)),
+            SdpReply::Bound(141, 2),
+            "an in-protocol refusal must not cost the bridge its next bound"
+        );
+        drop(worker);
+
+        // Off-protocol chatter is NOT a refusal: the caller cannot know where in
+        // the stream it is, so the child is unusable (fail-closed).
+        let garbage = FakeWorker::new(
+            "garbage",
+            &format!(
+                "printf '%s\\n' 'READY graph_sha256={digest} n=4 pairs=2'\n\
+                 IFS= read -r first || exit 3\n\
+                 printf '%s\\n' 'BOUND 141 2 trailing'\n\
+                 IFS= read -r quit || true\n"
+            ),
+        );
+        let mut worker =
+            SdpWorker::spawn(&garbage.config, &digest).expect("matching worker handshake");
+        assert_eq!(
+            worker.query(&[0, 1], std::time::Duration::from_secs(5)),
+            SdpReply::Broken
+        );
+        drop(worker);
+
+        // A child that exits mid-protocol reports EOF, not a refusal, and a
+        // REPLACEMENT spawn on the same config recovers the tier — the recovery
+        // the call site performs instead of retiring on the first break.
+        let quitting = FakeWorker::new(
+            "quitting",
+            &format!(
+                "printf '%s\\n' 'READY graph_sha256={digest} n=4 pairs=2'\n\
+                 IFS= read -r first || exit 3\n\
+                 exit 0\n"
+            ),
+        );
+        let mut worker =
+            SdpWorker::spawn(&quitting.config, &digest).expect("matching worker handshake");
+        assert_eq!(
+            worker.query(&[0, 1], std::time::Duration::from_secs(5)),
+            SdpReply::Broken
+        );
+        drop(worker);
+        let mut replacement = SdpWorker::spawn(&quitting.config, &digest)
+            .expect("a broken child must be replaceable — identity is re-checked");
+        assert_eq!(
+            replacement.query(&[0, 1], std::time::Duration::from_secs(5)),
+            SdpReply::Broken
+        );
+        drop(replacement);
+
+        // The retirement rule itself: only a RUN of breaks is systemic.
+        assert!(SDP_MAX_BROKEN_STREAK >= 2, "one break must be survivable");
+    }
+
     /// The INCREMENTAL DUAL-SNAPSHOT machinery under maximum stress: refresh at
     /// every eligible branching node (cadence 1, zero warmup, unbounded window,
     /// unlimited rows) so snapshots are pushed and popped throughout the tree,
@@ -2863,6 +4312,10 @@ mod tests {
             low_margin: 0,
             ceiling: true,
             exact_margin: 4,
+            // Stress the strengthened-neighborhood rows end-to-end too: with
+            // cadence 1 every branching node prices them; any validity or
+            // pricing error shows up as a wrong optimum vs brute force.
+            nbhd_rows: true,
         };
         let mut rng = Rng(0x2c1b_d0a1);
         for round in 0..30 {
@@ -2924,6 +4377,263 @@ mod tests {
         }
     }
 
+    /// The `marked` selector must be an EXACT opt-in, like `viol`.
+    #[test]
+    fn marked_branch_rule_requires_exact_opt_in() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            ViolatingBranchRule::from_selector(Some(OsStr::new("marked"))),
+            ViolatingBranchRule::Marked
+        );
+        for value in ["MARKED", "marked ", "mark"] {
+            assert_eq!(
+                ViolatingBranchRule::from_selector(Some(OsStr::new(value))),
+                ViolatingBranchRule::First,
+                "only the exact `marked` selector may change proof traversal"
+            );
+        }
+    }
+
+    /// MARKED BRANCHING differential: `remove v | mark v` with the
+    /// mark-conflict fixed-point sweep must reproduce brute force — whole
+    /// space AND the min-excluded partition, whose forced cells exercise
+    /// initial marks (IRR at the cell root) and dead-by-marked-pair cells —
+    /// under no LP and under the refresh-every-node LP stress config
+    /// (snapshot push/pop interleaved with sweep deletions).
+    #[test]
+    fn two_club_marked_branching_matches_bruteforce() {
+        let aggressive = LpNodeBound {
+            enabled: true,
+            warmup: 0,
+            cadence: 1,
+            window: 1_000_000,
+            max_rows: 0,
+            low_margin: 0,
+            ceiling: true,
+            exact_margin: 4,
+            // Stress the strengthened-neighborhood rows end-to-end too: with
+            // cadence 1 every branching node prices them; any validity or
+            // pricing error shows up as a wrong optimum vs brute force.
+            nbhd_rows: true,
+        };
+        let mut rng = Rng(0x2c1b_3a6b);
+        for round in 0..30 {
+            let n = 6 + (round % 6); // 6..11 vertices
+            let mut edges = Vec::new();
+            for a in 0..n {
+                for b in (a + 1)..n {
+                    if rng.next() % 100 < 30 {
+                        edges.push((a, b));
+                    }
+                }
+            }
+            let (instance, objective) = encode(n, &edges);
+            if instance.constraints.is_empty() {
+                continue; // complete graph: degenerate encoding, skip
+            }
+            let expect = brute_force(n, &edges);
+            let mut tc = recognize(&instance, &objective).expect("recognize");
+            tc.branch_rule = ViolatingBranchRule::Marked;
+            for lp in [LpNodeBound::disabled(), aggressive] {
+                let mut _cb = |_s: usize, _a: &[bool]| {};
+                // Whole space in one cell (seed floor 1: a single vertex).
+                let verdict = solve_exact(&tc, 1, &lp, &|| false, &mut _cb)
+                    .unwrap_or_else(|| panic!("round {round}: marked search unfinished"));
+                let got = match verdict {
+                    SearchVerdict::Better(sz, _) => sz,
+                    SearchVerdict::SeedOptimal => 1,
+                };
+                assert_eq!(got, expect, "round {round}: n={n} edges={edges:?}");
+                // Min-excluded partition: full-set cell + every cell m. Forced
+                // vertices become initial marks in marked mode.
+                let mut agg = 1usize;
+                let mut all_done = true;
+                let forced = vec![true; n];
+                match solve_exact_cell(&tc, &forced, &[], 1, &lp, &|| false, &mut _cb) {
+                    Some(SearchVerdict::Better(sz, _)) => agg = agg.max(sz),
+                    Some(SearchVerdict::SeedOptimal) => {}
+                    None => all_done = false,
+                }
+                for m in 0..n {
+                    let mut forced = vec![false; n];
+                    forced[..m].fill(true);
+                    match solve_exact_cell(&tc, &forced, &[m], 1, &lp, &|| false, &mut _cb) {
+                        Some(SearchVerdict::Better(sz, _)) => agg = agg.max(sz),
+                        Some(SearchVerdict::SeedOptimal) => {}
+                        None => all_done = false,
+                    }
+                }
+                assert!(
+                    all_done,
+                    "round {round}: marked partition left cells unexhausted"
+                );
+                assert_eq!(
+                    agg, expect,
+                    "round {round} partition: n={n} edges={edges:?}"
+                );
+            }
+        }
+    }
+
+    /// ADVERSARIAL completeness gates for marked branching: two deterministic
+    /// graphs engineered so that specific naive mark-deletion bugs LOSE the
+    /// optimum (random differentials need not hit these shapes).
+    ///
+    /// Graph 1 (mark-leak / backtrack order), n=8, edges
+    /// (0,2),(2,3),(2,4),(2,5),(1,6),(1,7),(6,7), optimum {0,2,3,4,5} = 5:
+    /// the root's first violating pair is (0,1); the LEFT subtree (0 removed)
+    /// branches on (1,2) and MARKS 1 (sweep-deleting 3,4,5); the optimum lives
+    /// only in the root's RIGHT subtree, where 0 is marked and 1 must be
+    /// sweep-DELETED. If 1's mark leaked out of the left subtree (missing or
+    /// out-of-order unmark), the right branch dies as a marked-marked pair
+    /// (0,1) and the search reports 4 — the optimum is lost.
+    #[test]
+    fn two_club_marked_leak_adversarial_graph() {
+        let n = 8;
+        let edges = [(0, 2), (2, 3), (2, 4), (2, 5), (1, 6), (1, 7), (6, 7)];
+        assert_eq!(brute_force(n, &edges), 5, "test-graph self-check");
+        let (instance, objective) = encode(n, &edges);
+        let mut tc = recognize(&instance, &objective).expect("recognize");
+        tc.branch_rule = ViolatingBranchRule::Marked;
+        let aggressive = LpNodeBound {
+            enabled: true,
+            warmup: 0,
+            cadence: 1,
+            window: 1_000_000,
+            max_rows: 0,
+            low_margin: 0,
+            ceiling: true,
+            exact_margin: 4,
+            // Stress the strengthened-neighborhood rows end-to-end too: with
+            // cadence 1 every branching node prices them; any validity or
+            // pricing error shows up as a wrong optimum vs brute force.
+            nbhd_rows: true,
+        };
+        for lp in [LpNodeBound::disabled(), aggressive] {
+            let mut _cb = |_s: usize, _a: &[bool]| {};
+            let verdict = solve_exact(&tc, 1, &lp, &|| false, &mut _cb).expect("search unfinished");
+            let got = match verdict {
+                SearchVerdict::Better(sz, set) => {
+                    // The reported set must itself be the real optimum's size
+                    // AND a valid 2-club (guards corrupted-state incumbents).
+                    let members: Vec<usize> = (0..n).filter(|&v| set[v]).collect();
+                    assert_eq!(members.len(), sz);
+                    sz
+                }
+                SearchVerdict::SeedOptimal => 1,
+            };
+            assert_eq!(got, 5, "mark leak or unwind-order bug lost the optimum");
+        }
+    }
+
+    /// Graph 2 (forced-cell fixed-point cascade), n=6, edges
+    /// (0,2),(1,2),(2,5),(0,3),(3,4),(4,5),(1,5); cell forces {0,1}
+    /// (non-adjacent, sole common neighbour 2). The sweep processes the
+    /// marked list in order [0, 1]:
+    ///   pass 1: m=0 deletes nothing; m=1 hits (1,3) violating (CN=∅) →
+    ///   delete 3 — which was the SOLE common neighbour of (0,4);
+    ///   pass 2: m=0 (the EARLIER mark) now hits (0,4) violating → delete 4.
+    /// The deletion is triggered by the LAST marked vertex and cascades
+    /// against an EARLIER one, so only the outer fixed-point loop catches it.
+    /// A single-pass sweep leaves the marked-touching pair (0,4) alive for
+    /// find_violating, breaking the sweep invariant — in release the branch
+    /// code would then REMOVE forced vertex 0. The correct cell answer (max
+    /// 2-club containing both 0 and 1) is {0,1,2,5} = 4.
+    /// Also: forcing {1,3} (a violating pair over the whole graph) must kill
+    /// the cell at the root sweep as dead-by-marked-pair, reported as a
+    /// COMPLETED SeedOptimal — not a lost/aborted cell.
+    #[test]
+    fn two_club_marked_forced_cell_cascade_adversarial() {
+        let n = 6;
+        let edges = [(0, 2), (1, 2), (2, 5), (0, 3), (3, 4), (4, 5), (1, 5)];
+        let (instance, objective) = encode(n, &edges);
+        let mut tc = recognize(&instance, &objective).expect("recognize");
+        tc.branch_rule = ViolatingBranchRule::Marked;
+        let aggressive = LpNodeBound {
+            enabled: true,
+            warmup: 0,
+            cadence: 1,
+            window: 1_000_000,
+            max_rows: 0,
+            low_margin: 0,
+            ceiling: true,
+            exact_margin: 4,
+            // Stress the strengthened-neighborhood rows end-to-end too: with
+            // cadence 1 every branching node prices them; any validity or
+            // pricing error shows up as a wrong optimum vs brute force.
+            nbhd_rows: true,
+        };
+        // Cell-restricted brute force: max 2-club containing BOTH 0 and 1.
+        let cell_expect = {
+            let mut adj = vec![vec![false; n]; n];
+            for &(a, b) in &edges {
+                adj[a][b] = true;
+                adj[b][a] = true;
+            }
+            let mut best = 0usize;
+            for mask in 0u32..(1 << n) {
+                if mask & 0b11 != 0b11 {
+                    continue; // must contain 0 and 1
+                }
+                let set: Vec<usize> = (0..n).filter(|&v| mask & (1 << v) != 0).collect();
+                let ok = set.iter().all(|&a| {
+                    set.iter().all(|&b| {
+                        a == b
+                            || adj[a][b]
+                            || set
+                                .iter()
+                                .any(|&k| k != a && k != b && adj[a][k] && adj[b][k])
+                    })
+                });
+                if ok {
+                    best = best.max(set.len());
+                }
+            }
+            best
+        };
+        assert_eq!(cell_expect, 4, "test-graph self-check");
+        for lp in [LpNodeBound::disabled(), aggressive] {
+            let mut _cb = |_s: usize, _a: &[bool]| {};
+            // Whole space must match brute force.
+            let whole = solve_exact(&tc, 1, &lp, &|| false, &mut _cb).expect("unfinished");
+            let got = match whole {
+                SearchVerdict::Better(sz, _) => sz,
+                SearchVerdict::SeedOptimal => 1,
+            };
+            assert_eq!(got, brute_force(n, &edges));
+            // Forced {0,1}: initial marks + two-round cascade at the root.
+            let mut forced = vec![false; n];
+            forced[0] = true;
+            forced[1] = true;
+            let cell = solve_exact_cell(&tc, &forced, &[], 1, &lp, &|| false, &mut _cb)
+                .expect("cascade cell unfinished");
+            let got = match cell {
+                SearchVerdict::Better(sz, set) => {
+                    assert!(set[0] && set[1], "cell solution dropped a forced vertex");
+                    sz
+                }
+                SearchVerdict::SeedOptimal => 1,
+            };
+            assert_eq!(
+                got, cell_expect,
+                "fixed-point cascade lost the cell optimum"
+            );
+            // Forced {1,3}: (1,3) is violating over the whole graph — the cell
+            // is dead; must complete as SeedOptimal (fail-closed None would be
+            // a lost cell, Better would be unsound).
+            let mut forced = vec![false; n];
+            forced[1] = true;
+            forced[3] = true;
+            match solve_exact_cell(&tc, &forced, &[], 1, &lp, &|| false, &mut _cb) {
+                Some(SearchVerdict::SeedOptimal) => {}
+                Some(SearchVerdict::Better(sz, _)) => {
+                    panic!("dead forced-forced cell reported a club of size {sz}")
+                }
+                None => panic!("dead cell must COMPLETE, not abort"),
+            }
+        }
+    }
+
     /// A tampered row (wrong common-neighbour set) must make the recognizer decline.
     #[test]
     fn recognizer_declines_tampered_row() {
@@ -2938,145 +4648,434 @@ mod tests {
         let mut _im = |_v: i128, _a: &[bool]| {};
         assert!(try_two_club_exact(&instance, &objective, None, &|| false, &mut _im).is_none());
     }
+
+    /// Bounded synthetic A/B gate for default versus marked branching. The
+    /// larger campaign is benchmark evidence, not a disabled test; this gate
+    /// keeps the same two-arm exactness check on deterministic small graphs.
+    #[test]
+    fn two_club_marked_ab_probe_is_bounded_and_exact() {
+        let run = |n: usize, edges: &[(usize, usize)], tag: &str| {
+            let (instance, objective) = encode(n, edges);
+            if instance.constraints.is_empty() {
+                return;
+            }
+            // Max-degree star seed: {v} ∪ N(v) is always a 2-club.
+            let mut deg = vec![0usize; n];
+            for &(a, b) in edges {
+                deg[a] += 1;
+                deg[b] += 1;
+            }
+            let star = 1 + deg.iter().copied().max().unwrap_or(0);
+            let mut opts: Vec<Option<usize>> = Vec::new();
+            for rule in [ViolatingBranchRule::First, ViolatingBranchRule::Marked] {
+                let mut tc = recognize(&instance, &objective).expect("recognize");
+                tc.branch_rule = rule;
+                eprintln!(">>> AB {tag} n={n} rule={rule:?} seed={star}");
+                let t0 = std::time::Instant::now();
+                let mut _cb = |_s: usize, _a: &[bool]| {};
+                let verdict = solve_exact(&tc, star, &LpNodeBound::disabled(), &|| false, &mut _cb);
+                let got = verdict.map(|v| match v {
+                    SearchVerdict::Better(sz, _) => sz,
+                    SearchVerdict::SeedOptimal => star,
+                });
+                eprintln!(
+                    "<<< AB {tag} n={n} rule={rule:?} opt={got:?} t={:.2}s",
+                    t0.elapsed().as_secs_f64()
+                );
+                opts.push(got);
+            }
+            // A `None` arm hit the node cap (raise TWO_CLUB_MAX_NODES to
+            // compare) — only two FINISHED arms must agree.
+            if let (Some(a), Some(b)) = (opts[0], opts[1]) {
+                assert_eq!(a, b, "{tag} n={n}: optima differ between arms");
+            }
+        };
+        // A small deterministic slice of the exact gate graph family.
+        let mut rng = Rng(0x2c1b_5eed);
+        for round in 0..4 {
+            let n = 6 + (round % 6);
+            let mut edges = Vec::new();
+            for a in 0..n {
+                for b in (a + 1)..n {
+                    if rng.next() % 100 < 30 {
+                        edges.push((a, b));
+                    }
+                }
+            }
+            run(n, &edges, &format!("gate{round}"));
+        }
+    }
+
+    /// Test helper: index of the non-adjacent pair {u, w} if it is ACTIVE at
+    /// the current state (both endpoints still in C); None if u, w adjacent.
+    fn find_active_pair(tc: &TwoClub, state: &SearchState, u: u32, w: u32) -> Option<usize> {
+        tc.pair_of_vertex[u as usize]
+            .iter()
+            .map(|&pi| pi as usize)
+            .find(|&pi| {
+                let (a, b, _) = &tc.pairs[pi];
+                state.both_in[pi] && ((*a == u && *b == w) || (*a == w && *b == u))
+            })
+    }
+
+    /// VALIDITY GATE for the strengthened-neighborhood rows — the gate that
+    /// would have caught the odd-hole trap. On random small graphs it
+    /// EXHAUSTIVELY enumerates every subset of the current candidate set `C`,
+    /// tests the 2-club property exactly (witnesses inside the subset), and
+    /// asserts EVERY generated row — including rows frozen at ANCESTOR states
+    /// and re-checked at every descendant state, because the engine prices a
+    /// refresh's rows down its whole subtree — is satisfied by every 2-club's
+    /// incidence vector. Exhaustive per graph/state, never sampled. Each row's
+    /// structural side conditions are also independently re-derived.
+    #[test]
+    fn strengthened_nbhd_rows_exhaustive_validity_gate() {
+        // (n, density%, graph reps): 2^n subset enumeration stays exact & fast.
+        let configs = [
+            (12usize, 30u64, 3usize),
+            (12, 50, 3),
+            (15, 15, 3),
+            (15, 30, 3),
+            (18, 15, 2),
+            (18, 25, 2),
+        ];
+        let mut rng = Rng(0x5eed_2c1b);
+        let mut rows_checked = 0u64;
+        let mut rows_at_descendants = 0u64;
+        let mut lifted_ge2 = 0u64;
+        for &(n, den, reps) in &configs {
+            for _rep in 0..reps {
+                let mut edges = Vec::new();
+                for a in 0..n {
+                    for b in (a + 1)..n {
+                        if rng.next() % 100 < den {
+                            edges.push((a, b));
+                        }
+                    }
+                }
+                let (instance, objective) = encode(n, &edges);
+                if instance.constraints.is_empty() {
+                    continue;
+                }
+                let tc = recognize(&instance, &objective).expect("valid encoding");
+                let mut nbr = vec![0u32; n];
+                for &(a, b) in &edges {
+                    nbr[a] |= 1 << b;
+                    nbr[b] |= 1 << a;
+                }
+                let is_two_club = |mask: u32| -> bool {
+                    let mut vs = mask;
+                    while vs != 0 {
+                        let a = vs.trailing_zeros() as usize;
+                        vs &= vs - 1;
+                        let mut ws = vs;
+                        while ws != 0 {
+                            let b = ws.trailing_zeros() as usize;
+                            ws &= ws - 1;
+                            if nbr[a] & (1 << b) == 0 && nbr[a] & nbr[b] & mask == 0 {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                };
+                // Search state exactly as solve_exact_cell builds it.
+                let mut state = SearchState {
+                    in_c: vec![true; n],
+                    c_size: n,
+                    cn_alive: tc.pairs.iter().map(|(_, _, cn)| cn.len() as u32).collect(),
+                    both_in: vec![true; tc.pairs.len()],
+                };
+                let mut undo_sink = Vec::new();
+                // Rows FROZEN at generation time (members + live CN), kept and
+                // re-checked across all later phases (descendant states).
+                let mut frozen: Vec<(usize, Vec<u32>, Vec<u32>)> = Vec::new();
+                for phase in 0..5 {
+                    for (pi, iset) in strengthened_nbhd_rows(&tc, &state, 100_000) {
+                        let (a, b, cn) = &tc.pairs[pi as usize];
+                        // Independently re-derive the family's side conditions.
+                        assert!(
+                            state.both_in[pi as usize] && state.cn_alive[pi as usize] > 0,
+                            "host pair must be active with live CN"
+                        );
+                        assert!(!iset.is_empty(), "empty lift is just the pair row");
+                        for (k, &i) in iset.iter().enumerate() {
+                            for &other in [*a, *b].iter().chain(iset[..k].iter()) {
+                                let pj = find_active_pair(&tc, &state, i, other).expect(
+                                    "every lift member must be non-adjacent to a, b, and the rest of I, with both endpoints in C",
+                                );
+                                assert_eq!(
+                                    state.cn_alive[pj], 0,
+                                    "lift pairs must be VIOLATING at the current C"
+                                );
+                            }
+                        }
+                        if iset.len() >= 2 {
+                            lifted_ge2 += 1;
+                        }
+                        let mut members = vec![*a, *b];
+                        members.extend_from_slice(&iset);
+                        let cn_live: Vec<u32> = cn
+                            .iter()
+                            .copied()
+                            .filter(|&r| state.in_c[r as usize])
+                            .collect();
+                        assert!(!cn_live.is_empty(), "cn_alive > 0 must mean live CN");
+                        frozen.push((phase, members, cn_live));
+                    }
+                    // EXHAUSTIVE: every subset of the current C, exact 2-club
+                    // test, every frozen row (ancestor rows included).
+                    let cmask: u32 = (0..n).filter(|&v| state.in_c[v]).map(|v| 1u32 << v).sum();
+                    for mask in 0u32..(1u32 << n) {
+                        if mask & !cmask != 0 || !is_two_club(mask) {
+                            continue;
+                        }
+                        for (born, members, cn_live) in &frozen {
+                            let m_in =
+                                members.iter().filter(|&&v| mask & (1 << v) != 0).count() as i64;
+                            let r_in =
+                                cn_live.iter().filter(|&&v| mask & (1 << v) != 0).count() as i64;
+                            assert!(
+                                m_in - r_in <= 1,
+                                "row born phase {born} VIOLATED at phase {phase}: members={members:?} cn={cn_live:?} club={mask:#b} n={n} edges={edges:?}"
+                            );
+                            rows_checked += 1;
+                            if *born < phase {
+                                rows_at_descendants += 1;
+                            }
+                        }
+                    }
+                    // Descend through the engine's exact removal path so the
+                    // cn_alive/both_in dynamics are the real ones.
+                    for _ in 0..(n / 5).max(2) {
+                        if state.c_size <= 4 {
+                            break;
+                        }
+                        let alive: Vec<usize> = (0..n).filter(|&v| state.in_c[v]).collect();
+                        let v = alive[(rng.next() % alive.len() as u64) as usize];
+                        state.remove(v, &tc, &mut undo_sink);
+                    }
+                }
+            }
+        }
+        assert!(
+            rows_checked > 0,
+            "gate vacuous: no (row, 2-club) checks ran"
+        );
+        assert!(
+            rows_at_descendants > 0,
+            "gate never re-checked an ancestor row at a descendant state"
+        );
+        assert!(lifted_ge2 > 0, "gate never saw a lift of size >= 2");
+    }
+
+    /// ADVERSARIAL deterministic gate (reviewer-added): hand-placed structure
+    /// aimed at the family's weakest hypotheses, instead of random graphs.
+    ///
+    /// Graph (n = 9): host pair (0,1), hubs CN(0,1) = {2,3}; lift candidates
+    /// 4, 5; 6 = the SOLE witness of (0,4); 7 = the SOLE witness of (4,5) and
+    /// itself a lift candidate ADJACENT to 5; 8 shares hubs {2,3} with 0 and 1.
+    /// The schedule removes 6, 7, then BOTH hubs while 0,1,4,5 stay in C:
+    ///
+    ///   - born-late condition (1): (0,4) un-violates only when 6 leaves C —
+    ///     4 must not be liftable before that;
+    ///   - condition (2) trap: 4 and 5 are both candidates while their witness
+    ///     7 is alive — a row lifting BOTH is killed by the 2-club {4,5,7};
+    ///   - witness-in-S: after both hubs leave C, frozen ancestor rows reduce
+    ///     to `x0+x1+x4+x5 <= 1` — valid only because a 2-club's witness must
+    ///     lie inside S itself (with hubs still in G but outside C);
+    ///   - unwind trap: the phase-2 row (I = {4,5}) is PROVABLY INVALID at the
+    ///     root C, so cross-unwind caching of this family would be unsound —
+    ///     the regenerate-per-solve discipline is load-bearing.
+    #[test]
+    fn strengthened_nbhd_rows_adversarial_gate() {
+        let n = 9usize;
+        let edges: Vec<(usize, usize)> = vec![
+            (0, 2),
+            (1, 2),
+            (0, 3),
+            (1, 3), // hubs: CN(0,1) = {2,3}
+            (4, 6),
+            (0, 6), // 6 = sole witness of (0,4)
+            (4, 7),
+            (5, 7), // 7 = sole witness of (4,5)
+            (2, 8),
+            (3, 8), // 8: CN(0,8) = CN(1,8) = {2,3}
+        ];
+        let (instance, objective) = encode(n, &edges);
+        let tc = recognize(&instance, &objective).expect("valid encoding");
+        let mut nbr = vec![0u32; n];
+        for &(a, b) in &edges {
+            nbr[a] |= 1 << b;
+            nbr[b] |= 1 << a;
+        }
+        let is_two_club = |mask: u32| -> bool {
+            let mut vs = mask;
+            while vs != 0 {
+                let a = vs.trailing_zeros() as usize;
+                vs &= vs - 1;
+                let mut ws = vs;
+                while ws != 0 {
+                    let b = ws.trailing_zeros() as usize;
+                    ws &= ws - 1;
+                    if nbr[a] & (1 << b) == 0 && nbr[a] & nbr[b] & mask == 0 {
+                        return false;
+                    }
+                }
+            }
+            true
+        };
+        let mut state = SearchState {
+            in_c: vec![true; n],
+            c_size: n,
+            cn_alive: tc.pairs.iter().map(|(_, _, cn)| cn.len() as u32).collect(),
+            both_in: vec![true; tc.pairs.len()],
+        };
+        let mut undo = Vec::new();
+        // (born phase, members, live CN frozen at generation)
+        let mut frozen: Vec<(usize, Vec<u32>, Vec<u32>)> = Vec::new();
+        let host_isets = |tc: &TwoClub, state: &SearchState| -> Vec<Vec<u32>> {
+            strengthened_nbhd_rows(tc, state, 100_000)
+                .into_iter()
+                .filter(|(pi, _)| {
+                    let (a, b, _) = &tc.pairs[*pi as usize];
+                    (*a, *b) == (0, 1)
+                })
+                .map(|(_, iset)| iset)
+                .collect()
+        };
+        let schedule: [Option<usize>; 5] = [None, Some(6), Some(7), Some(2), Some(3)];
+        let mut lift2_row: Option<(Vec<u32>, Vec<u32>)> = None;
+        for (phase, rm) in schedule.iter().enumerate() {
+            if let Some(v) = rm {
+                state.remove(*v, &tc, &mut undo);
+            }
+            for (pi, iset) in strengthened_nbhd_rows(&tc, &state, 100_000) {
+                let (a, b, cn) = &tc.pairs[pi as usize];
+                let mut members = vec![*a, *b];
+                members.extend_from_slice(&iset);
+                let cn_live: Vec<u32> = cn
+                    .iter()
+                    .copied()
+                    .filter(|&r| state.in_c[r as usize])
+                    .collect();
+                frozen.push((phase, members, cn_live));
+            }
+            let host = host_isets(&tc, &state);
+            match phase {
+                0 => {
+                    assert!(
+                        host.iter().any(|i| i.contains(&5)),
+                        "root host row must lift 5"
+                    );
+                    assert!(
+                        host.iter().all(|i| !i.contains(&4)),
+                        "4 lifted while (0,4) still has witness 6 in C"
+                    );
+                }
+                1 => {
+                    assert!(
+                        !host.is_empty(),
+                        "host (0,1) must still generate a row at phase 1"
+                    );
+                    assert!(
+                        host.iter().all(|i| !(i.contains(&4) && i.contains(&5))),
+                        "4 and 5 lifted together while their witness 7 is in C"
+                    );
+                }
+                2 => {
+                    let full = host
+                        .iter()
+                        .find(|i| i.contains(&4) && i.contains(&5))
+                        .expect("after removing 7, I must contain both 4 and 5");
+                    let mut members = vec![0u32, 1];
+                    members.extend_from_slice(full);
+                    lift2_row = Some((members, vec![2, 3]));
+                }
+                _ => {}
+            }
+            // EXHAUSTIVE: every 2-club within the CURRENT C against every
+            // frozen row, ancestors included (phases 3/4 = hub removal with
+            // every row member still in C).
+            let cmask: u32 = (0..n).filter(|&v| state.in_c[v]).map(|v| 1u32 << v).sum();
+            for mask in 0u32..(1u32 << n) {
+                if mask & !cmask != 0 || !is_two_club(mask) {
+                    continue;
+                }
+                for (born, members, cn_live) in &frozen {
+                    let m_in = members.iter().filter(|&&v| mask & (1 << v) != 0).count() as i64;
+                    let r_in = cn_live.iter().filter(|&&v| mask & (1 << v) != 0).count() as i64;
+                    assert!(
+                        m_in - r_in <= 1,
+                        "row born phase {born} VIOLATED at phase {phase}: \
+                         members={members:?} cn={cn_live:?} club={mask:#b}"
+                    );
+                }
+            }
+        }
+        // UNWIND TRAP: the phase-2 row is invalid for 2-clubs of the ROOT C —
+        // {4,5,7} is a 2-club (witness 7 inside S) with two members and no
+        // live hub. Caching this family across unwinds would be unsound.
+        let (members, cn_live) = lift2_row.expect("phase-2 lift row exists");
+        let bad: u32 = (1 << 4) | (1 << 5) | (1 << 7);
+        assert!(
+            is_two_club(bad),
+            "{{4,5,7}} must be a 2-club of the root graph"
+        );
+        let m_in = members.iter().filter(|&&v| bad & (1 << v) != 0).count() as i64;
+        let r_in = cn_live.iter().filter(|&&v| bad & (1 << v) != 0).count() as i64;
+        assert!(
+            m_in - r_in > 1,
+            "descendant row must be invalid at the root, else the unwind trap is untested"
+        );
+    }
 }
 
 #[cfg(test)]
 mod file_probe {
     use super::*;
 
-    /// Manual probe: TWO_CLUB_FILE=<opb> — recognize + solve the real instance.
     #[test]
-    #[ignore = "manual; set TWO_CLUB_FILE"]
-    fn two_club_file_probe() {
-        let path = std::env::var("TWO_CLUB_FILE").expect("set TWO_CLUB_FILE");
-        let raw = std::fs::read_to_string(&path).expect("read");
-        let inst = crate::parse_opb(&raw).expect("parse");
-        let obj = inst.objective.clone().expect("objective");
-        let t0 = std::time::Instant::now();
-        let deadline = t0
-            + std::time::Duration::from_secs(
-                std::env::var("TWO_CLUB_SECS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(300),
-            );
-        let stop = || std::time::Instant::now() >= deadline;
-        let mut best = i128::MAX;
-        let mut stream = |v: i128, _a: &[bool]| {
-            if v < best {
-                best = v;
-                eprintln!("  incumbent {v} @ {:?}", t0.elapsed());
-            }
+    fn two_club_path_fixture_is_recognized_and_solved_exactly() {
+        // The largest induced diameter-two subset of a six-vertex path has
+        // exactly three vertices. This exercises recognition, exact search,
+        // witness streaming, and final re-verification without external files.
+        let edges = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)];
+        let (inst, obj) = tests::encode(6, &edges);
+        let seed = vec![true, false, false, false, false, false];
+        assert!(verify_all_constraints(&inst.constraints, &seed));
+        let mut streamed = Vec::new();
+        let mut on_improve = |value: i128, assignment: &[bool]| {
+            assert!(verify_all_constraints(&inst.constraints, assignment));
+            assert_eq!(eval_objective(&obj, assignment), value);
+            streamed.push(value);
         };
-        // TWO_CLUB_SEED_FILE: space-separated 0/1 per var — an external
-        // incumbent (e.g. the MIPLIB best-known witness) to seed the pruning
-        // floor. try_two_club_exact re-verifies it fail-closed.
-        let seed: Option<Vec<bool>> = std::env::var("TWO_CLUB_SEED_FILE").ok().map(|sf| {
-            std::fs::read_to_string(&sf)
-                .expect("read seed")
-                .split_whitespace()
-                .map(|t| t == "1")
-                .collect()
-        });
-        if let Some(sd) = &seed {
-            eprintln!(
-                "seed loaded: {} vars, {} selected",
-                sd.len(),
-                sd.iter().filter(|&&b| b).count()
-            );
-        }
-        // LP node bound (measurement toggle, same convention as TWO_CLUB_TRACE):
-        // TWO_CLUB_LP=0 runs the cardinality-only baseline for an A/B; default on.
-        // TWO_CLUB_LP_{CADENCE,WINDOW,MAXROWS,EXACT} tune it for the real instance.
-        let env_usize = |k: &str, d: usize| {
-            std::env::var(k)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(d)
-        };
-        let lp = if std::env::var("TWO_CLUB_LP").ok().as_deref() == Some("0") {
-            LpNodeBound::disabled()
-        } else {
-            let base = LpNodeBound::standard();
-            LpNodeBound {
-                enabled: true,
-                warmup: env_usize("TWO_CLUB_LP_WARMUP", base.warmup as usize) as u64,
-                cadence: env_usize("TWO_CLUB_LP_CADENCE", base.cadence as usize) as u64,
-                window: env_usize("TWO_CLUB_LP_WINDOW", base.window),
-                max_rows: env_usize("TWO_CLUB_LP_MAXROWS", base.max_rows),
-                low_margin: env_usize("TWO_CLUB_LP_LOWCUT", base.low_margin),
-                ceiling: env_usize("TWO_CLUB_LP_CEIL", 1) != 0,
-                exact_margin: env_usize("TWO_CLUB_LP_EXACT", base.exact_margin as usize) as i128,
-            }
-        };
-        eprintln!(
-            "lp node bound: enabled={} warmup={} cadence={} window={} max_rows={} exact_margin={}",
-            lp.enabled, lp.warmup, lp.cadence, lp.window, lp.max_rows, lp.exact_margin
+        let runtime = TwoClubRuntime::explicit(MAX_NODES, false, false, false);
+        let solution = try_two_club_exact_with_runtime(
+            &inst,
+            &obj,
+            Some(&seed),
+            runtime,
+            TwoClubLpSelection::Standard,
+            &|| false,
+            &mut on_improve,
+        )
+        .expect("2-club");
+
+        assert_eq!(solution.status, PbStatus::OptimumFound);
+        assert_eq!(solution.objective, Some(-3));
+        assert_eq!(
+            solution
+                .assignment
+                .iter()
+                .filter(|&&selected| selected)
+                .count(),
+            3
         );
-        // Parallel prover: TWO_CLUB_WORKER=w TWO_CLUB_NWORKERS=N exhausts this
-        // worker's disjoint min-excluded slice. All N workers reporting
-        // all_done + best==seed is a complete optimality proof.
-        if let (Ok(w), Ok(nw)) = (
-            std::env::var("TWO_CLUB_WORKER"),
-            std::env::var("TWO_CLUB_NWORKERS"),
-        ) {
-            let (w, nw): (usize, usize) = (w.parse().unwrap(), nw.parse().unwrap());
-            // Depth-2 mode: TWO_CLUB_D2_BASEMOD + TWO_CLUB_D2_CLASSES ("0,1,2")
-            // split the named top-cell classes by their SECOND excluded vertex,
-            // spreading a bottleneck cell across all workers.
-            let res = if let Ok(kp) = std::env::var("TWO_CLUB_PIVOT_K") {
-                // Load-balanced pivot partition: 2^k in/out patterns over the k
-                // highest-degree vertices.
-                let k: usize = kp.parse().unwrap();
-                two_club_prove_pivot_worker(
-                    &inst,
-                    &obj,
-                    seed.as_deref(),
-                    k,
-                    w,
-                    nw,
-                    &lp,
-                    &stop,
-                    &mut stream,
-                )
-            } else if let (Ok(bm), Ok(cls)) = (
-                std::env::var("TWO_CLUB_D2_BASEMOD"),
-                std::env::var("TWO_CLUB_D2_CLASSES"),
-            ) {
-                let bm: usize = bm.parse().unwrap();
-                let classes: Vec<usize> = cls.split(',').map(|s| s.parse().unwrap()).collect();
-                two_club_prove_d2_worker(
-                    &inst,
-                    &obj,
-                    seed.as_deref(),
-                    bm,
-                    &classes,
-                    w,
-                    nw,
-                    &lp,
-                    &stop,
-                    &mut stream,
-                )
-            } else {
-                two_club_prove_worker(&inst, &obj, seed.as_deref(), w, nw, &lp, &stop, &mut stream)
-            };
-            eprintln!(
-                "TWO_CLUB WORKER {w}/{nw}: {res:?} time={:?} (all_done+best==seed across ALL workers = optimality proof)",
-                t0.elapsed()
-            );
-            return;
-        }
-        let got = try_two_club_exact(&inst, &obj, seed.as_deref(), &stop, &mut stream);
-        match got {
-            Some(sol) => eprintln!(
-                "TWO_CLUB PROVED: obj={:?} time={:?}",
-                sol.objective,
-                t0.elapsed()
-            ),
-            None => eprintln!(
-                "TWO_CLUB declined/cut after {:?} (best streamed {best})",
-                t0.elapsed()
-            ),
-        }
+        assert!(verify_all_constraints(
+            &inst.constraints,
+            &solution.assignment
+        ));
+        assert!(!streamed.is_empty(), "the anytime path must emit a witness");
+        assert!(streamed.iter().all(|&value| value >= -3));
     }
 }

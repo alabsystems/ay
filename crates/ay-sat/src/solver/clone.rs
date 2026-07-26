@@ -303,6 +303,7 @@ impl cold::ColdState {
         Self {
             // Restart EMA state
             lbd_ema_fast: self.lbd_ema_fast,
+            theory_continue_polls: 0,
             lbd_ema_slow: self.lbd_ema_slow,
             lbd_ema_fast_biased: self.lbd_ema_fast_biased,
             lbd_ema_slow_biased: self.lbd_ema_slow_biased,
@@ -460,6 +461,7 @@ impl cold::ColdState {
             // LRAT/proof state (copied for clause ID consistency)
             clause_ids: self.clause_ids.clone(),
             bcp_learned_clause_birth_conflicts: self.bcp_learned_clause_birth_conflicts.clone(),
+            clause_birth_solve: self.clause_birth_solve.clone(),
             level0_proof_id: self.level0_proof_id.clone(),
             level0_proof_sign: self.level0_proof_sign.clone(),
             lrat_level0_unit_materialize_cursor: 0,
@@ -503,6 +505,7 @@ impl cold::ColdState {
             lifetime_propagations: self.lifetime_propagations,
             lifetime_restarts: self.lifetime_restarts,
             incremental_solve_count: self.incremental_solve_count,
+            active_assumption_count: 0, // per-solve state, reset in clone
             last_between_solve_reduce_conflicts: self.last_between_solve_reduce_conflicts,
 
             // Lazy theory reasons (per-solve, reset)
@@ -650,6 +653,7 @@ impl cold::ColdState {
             ic3_new_clauses_pending: false,
             ic3_mode: self.ic3_mode,
             inc_engine_reset_mode: self.inc_engine_reset_mode,
+            unguarded_theory_conflict_lemmas: self.unguarded_theory_conflict_lemmas,
             domain_bcp_min_vars: self.domain_bcp_min_vars,
             ic3_constrain_act: self.ic3_constrain_act,
             ic3_constrained_offsets: Vec::new(),

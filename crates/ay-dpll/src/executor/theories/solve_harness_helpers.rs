@@ -146,12 +146,26 @@ pub(super) fn substitute_store_flat_equalities(
             if store_eq_count.get(&var).copied().unwrap_or(0) > 1 {
                 continue;
             }
-            // Only take the first substitution for each variable, and do an
-            // occurs check to prevent cycles.
-            if !subst_map.contains_key(&var) && !term_contains(terms, store_expr, var) {
+            // Only take the first substitution for each variable. A
+            // transitive occurs check below removes mutual and longer cycles
+            // after the complete candidate graph is available.
+            if !subst_map.contains_key(&var) {
                 subst_map.insert(var, store_expr);
             }
         }
+    }
+
+    // A direct occurs check is insufficient for mutually recursive store-flat
+    // definitions such as `a = store(b, ...)`, `b = store(a, ...)`. Following
+    // that map in `apply_store_flat_subst` recurses forever because a cache
+    // entry cannot be installed until the replacement has been expanded.
+    //
+    // Find every key whose transitive expansion reaches itself, then remove
+    // exactly those cyclic keys. Independent acyclic definitions remain
+    // available, while references to a removed key stay as ordinary variables.
+    let cyclic_vars = cyclic_store_flat_substitution_vars(terms, &subst_map);
+    for var in cyclic_vars {
+        subst_map.remove(&var);
     }
 
     if subst_map.is_empty() {
@@ -331,35 +345,58 @@ fn is_store_term(terms: &TermStore, term: TermId) -> bool {
     )
 }
 
-/// Check if `term` contains `target` (occurs check for cycle prevention).
-fn term_contains(terms: &TermStore, term: TermId, target: TermId) -> bool {
-    if term == target {
-        return true;
+/// Return substitution keys whose transitive replacements reach themselves.
+fn cyclic_store_flat_substitution_vars(
+    terms: &TermStore,
+    subst_map: &HashMap<TermId, TermId>,
+) -> HashSet<TermId> {
+    let mut cyclic = HashSet::default();
+
+    for (&target, &replacement) in subst_map {
+        let mut pending = vec![replacement];
+        let mut visited = HashSet::default();
+
+        while let Some(term) = pending.pop() {
+            // Check before visited suppression: a mapped path may return to
+            // the target through a term already reached along another edge.
+            if term == target {
+                cyclic.insert(target);
+                break;
+            }
+            if !visited.insert(term) {
+                continue;
+            }
+
+            if let Some(&nested_replacement) = subst_map.get(&term) {
+                pending.push(nested_replacement);
+                continue;
+            }
+
+            match terms.get(term) {
+                TermData::Const(_) | TermData::Var(_, _) => {}
+                TermData::App(_, args) => pending.extend(args.iter().copied()),
+                TermData::Not(inner) => pending.push(*inner),
+                TermData::Ite(condition, then_term, else_term) => {
+                    pending.push(*condition);
+                    pending.push(*then_term);
+                    pending.push(*else_term);
+                }
+                TermData::Let(bindings, body) => {
+                    pending.extend(bindings.iter().map(|(_, value)| *value));
+                    pending.push(*body);
+                }
+                TermData::Forall(_, _, _) | TermData::Exists(_, _, _) => {
+                    // Match apply_store_flat_subst: quantified bodies are not
+                    // rewritten by this QF-only preprocessing pass.
+                }
+                other => unreachable!(
+                    "unhandled TermData variant in cyclic_store_flat_substitution_vars(): {other:?}"
+                ),
+            }
+        }
     }
-    match terms.get(term) {
-        TermData::Const(_) | TermData::Var(_, _) => false,
-        TermData::App(_, args) => args.iter().any(|&a| term_contains(terms, a, target)),
-        TermData::Not(inner) => term_contains(terms, *inner, target),
-        TermData::Ite(c, t, e) => {
-            term_contains(terms, *c, target)
-                || term_contains(terms, *t, target)
-                || term_contains(terms, *e, target)
-        }
-        TermData::Let(bindings, body) => {
-            bindings
-                .iter()
-                .any(|(_, t)| term_contains(terms, *t, target))
-                || term_contains(terms, *body, target)
-        }
-        TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
-            term_contains(terms, *body, target)
-                || triggers
-                    .iter()
-                    .flatten()
-                    .any(|&t| term_contains(terms, t, target))
-        }
-        other => unreachable!("unhandled TermData variant in term_contains(): {other:?}"),
-    }
+
+    cyclic
 }
 
 /// Recursively apply store-flat substitutions with caching.
@@ -609,5 +646,103 @@ fn collect_lia_substitution_sources_for_term(
         other => unreachable!(
             "unhandled TermData variant in collect_lia_substitution_sources_for_term(): {other:?}"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use num_bigint::BigInt;
+
+    fn int(terms: &mut TermStore, value: i64) -> TermId {
+        terms.mk_int(BigInt::from(value))
+    }
+
+    #[test]
+    fn store_flat_mutual_cycle_is_left_unchanged() {
+        let mut terms = TermStore::new();
+        let array_sort = Sort::array(Sort::Int, Sort::Int);
+        let a = terms.mk_var("a", array_sort.clone());
+        let b = terms.mk_var("b", array_sort);
+        let zero = int(&mut terms, 0);
+        let one = int(&mut terms, 1);
+        let ten = int(&mut terms, 10);
+        let twenty = int(&mut terms, 20);
+        let store_b = terms.mk_store(b, zero, ten);
+        let store_a = terms.mk_store(a, one, twenty);
+        let a_def = terms.mk_eq(a, store_b);
+        let b_def = terms.mk_eq(b, store_a);
+        let mut assertions = vec![a_def, b_def];
+        let original = assertions.clone();
+
+        substitute_store_flat_equalities(&mut terms, &mut assertions);
+
+        assert_eq!(
+            assertions, original,
+            "mutually recursive store definitions must fail closed"
+        );
+    }
+
+    #[test]
+    fn store_flat_three_node_cycle_is_left_unchanged() {
+        let mut terms = TermStore::new();
+        let array_sort = Sort::array(Sort::Int, Sort::Int);
+        let a = terms.mk_var("a", array_sort.clone());
+        let b = terms.mk_var("b", array_sort.clone());
+        let c = terms.mk_var("c", array_sort);
+        let zero = int(&mut terms, 0);
+        let one = int(&mut terms, 1);
+        let two = int(&mut terms, 2);
+        let ten = int(&mut terms, 10);
+        let twenty = int(&mut terms, 20);
+        let thirty = int(&mut terms, 30);
+        let store_b = terms.mk_store(b, zero, ten);
+        let store_c = terms.mk_store(c, one, twenty);
+        let store_a = terms.mk_store(a, two, thirty);
+        let a_def = terms.mk_eq(a, store_b);
+        let b_def = terms.mk_eq(b, store_c);
+        let c_def = terms.mk_eq(c, store_a);
+        let mut assertions = vec![a_def, b_def, c_def];
+        let original = assertions.clone();
+
+        substitute_store_flat_equalities(&mut terms, &mut assertions);
+
+        assert_eq!(
+            assertions, original,
+            "multi-node recursive store definitions must fail closed"
+        );
+    }
+
+    #[test]
+    fn store_flat_cycle_does_not_disable_independent_substitution() {
+        let mut terms = TermStore::new();
+        let array_sort = Sort::array(Sort::Int, Sort::Int);
+        let a = terms.mk_var("a", array_sort.clone());
+        let b = terms.mk_var("b", array_sort.clone());
+        let d = terms.mk_var("d", array_sort.clone());
+        let e = terms.mk_var("e", array_sort);
+        let zero = int(&mut terms, 0);
+        let one = int(&mut terms, 1);
+        let three = int(&mut terms, 3);
+        let ten = int(&mut terms, 10);
+        let twenty = int(&mut terms, 20);
+        let forty = int(&mut terms, 40);
+        let store_b = terms.mk_store(b, zero, ten);
+        let store_a = terms.mk_store(a, one, twenty);
+        let store_e = terms.mk_store(e, three, forty);
+        let a_def = terms.mk_eq(a, store_b);
+        let b_def = terms.mk_eq(b, store_a);
+        let d_def = terms.mk_eq(d, store_e);
+        let read_d = terms.mk_select(d, three);
+        let read_eq = terms.mk_eq(read_d, forty);
+        let mut assertions = vec![a_def, b_def, d_def, read_eq];
+
+        substitute_store_flat_equalities(&mut terms, &mut assertions);
+
+        assert_eq!(
+            assertions,
+            vec![a_def, b_def],
+            "only the cyclic component should be pruned"
+        );
     }
 }

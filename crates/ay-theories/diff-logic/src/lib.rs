@@ -46,11 +46,72 @@
 pub mod atom;
 pub mod builder;
 pub mod graph;
+pub mod incremental;
+pub mod istar;
 pub mod rstar;
 pub mod weight;
 
 pub use atom::{DiffAtom, Negate, Op};
 pub use builder::{solve_int_atoms, solve_rational_atoms, BuildResult};
 pub use graph::{DiffGraph, DiffResult, GraphEdge};
+pub use incremental::{AssertOutcome, Entailment, IncEdge, IncrementalDiffGraph};
+pub use istar::IStar;
 pub use rstar::RStar;
 pub use weight::{IntWeight, Weight};
+
+/// The weight types a difference-logic theory solver can run on.
+///
+/// Difference logic over the reals needs `ℚ[ε]`, but the SMT-LIB QF_RDL division
+/// only ever uses small integer constants, so paying `BigRational` allocation on
+/// every slack computation is pure overhead. This trait lets one solver body run
+/// on either representation: [`IStar`] (`i128` + ε, register arithmetic) when
+/// every constant is an integer in range, and [`rstar::RStar`] (exact rationals)
+/// otherwise. Lowering is part of the trait so the choice cannot silently change
+/// which problem is being decided — `lower` returns `None` rather than rounding.
+pub trait DlWeight: Weight + Negate + Clone {
+    /// Lower an atom to edges, or `None` if this representation cannot hold the
+    /// constant exactly.
+    fn lower(
+        atom: &DiffAtom<num_rational::BigRational>,
+        zero_var: usize,
+    ) -> Option<Vec<atom::NormalizedConstraint<Self>>>;
+
+    /// Split into `(rational part, ε-count)` for `δ` selection.
+    fn parts(&self) -> (num_rational::BigRational, i64);
+
+    /// Realize as a concrete rational by substituting `ε := delta`.
+    fn realize(&self, delta: &num_rational::BigRational) -> num_rational::BigRational;
+}
+
+impl DlWeight for RStar {
+    fn lower(
+        a: &DiffAtom<num_rational::BigRational>,
+        z: usize,
+    ) -> Option<Vec<atom::NormalizedConstraint<Self>>> {
+        atom::lower_rational_atom(a, z)
+    }
+    fn parts(&self) -> (num_rational::BigRational, i64) {
+        (self.q.clone(), self.eps)
+    }
+    fn realize(&self, delta: &num_rational::BigRational) -> num_rational::BigRational {
+        self.realize_with(delta)
+    }
+}
+
+impl DlWeight for IStar {
+    fn lower(
+        a: &DiffAtom<num_rational::BigRational>,
+        z: usize,
+    ) -> Option<Vec<atom::NormalizedConstraint<Self>>> {
+        atom::lower_istar_atom(a, z)
+    }
+    fn parts(&self) -> (num_rational::BigRational, i64) {
+        (
+            num_rational::BigRational::from_integer(self.q.into()),
+            self.eps,
+        )
+    }
+    fn realize(&self, delta: &num_rational::BigRational) -> num_rational::BigRational {
+        self.realize_with(delta)
+    }
+}

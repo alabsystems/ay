@@ -102,11 +102,53 @@ fn term_lower(dlo: f64, dhi: f64, lb: f64, ub: f64) -> Option<f64> {
 /// # Panics
 /// Panics when `obj.len() != num_cols` or `y.len() != num_rows`.
 pub(crate) fn rigorous_lower_bound(model: &Model, obj: &[f64], y: &[f64]) -> Option<f64> {
+    rigorous_lower_bound_impl(model, obj, y, None)
+}
+
+/// Test adapter for [`rigorous_lower_bound`] under an explicit
+/// structural-column box.
+///
+/// This exercises the same outward-rounded weak-duality calculation while
+/// replacing only the structural bounds used for the reduced-cost corner. Row
+/// bounds and every matrix coefficient still come from `model`. Production
+/// target-FSB scoring uses the full computational box through
+/// [`crate::bab::safe_bound`], whose one-sided-logical clamp matches the native
+/// branch-and-bound path.
+///
+/// # Panics
+/// Panics unless all four vectors have the model's corresponding arity.
+#[cfg(test)]
+pub(crate) fn rigorous_lower_bound_with_box(
+    model: &Model,
+    obj: &[f64],
+    y: &[f64],
+    lower: &[f64],
+    upper: &[f64],
+) -> Option<f64> {
+    rigorous_lower_bound_impl(model, obj, y, Some((lower, upper)))
+}
+
+fn rigorous_lower_bound_impl(
+    model: &Model,
+    obj: &[f64],
+    y: &[f64],
+    explicit_box: Option<(&[f64], &[f64])>,
+) -> Option<f64> {
     let n = model.num_cols();
     let m = model.num_rows();
     assert_eq!(obj.len(), n, "rigorous_lower_bound: objective arity");
     assert_eq!(y.len(), m, "rigorous_lower_bound: dual arity");
+    if let Some((lower, upper)) = explicit_box {
+        assert_eq!(lower.len(), n, "rigorous_lower_bound: lower arity");
+        assert_eq!(upper.len(), n, "rigorous_lower_bound: upper arity");
+    }
     if y.iter().chain(obj).any(|v| !v.is_finite()) {
+        return None;
+    }
+    if explicit_box.is_some_and(|(lower, upper)| {
+        lower.iter().chain(upper).any(|v| v.is_nan())
+            || lower.iter().zip(upper).any(|(&lb, &ub)| lb > ub)
+    }) {
         return None;
     }
     // Reduced-cost interval per structural column: d_j = obj_j − Σ_r a_rj·y_r,
@@ -124,7 +166,8 @@ pub(crate) fn rigorous_lower_bound(model: &Model, obj: &[f64], y: &[f64]) -> Opt
     }
     let mut total = 0.0_f64;
     for j in 0..n {
-        let (lb, ub) = model.col_bounds(Col(j as u32));
+        let (lb, ub) =
+            explicit_box.map_or_else(|| model.col_bounds(Col(j as u32)), |b| (b.0[j], b.1[j]));
         total = add_down(total, term_lower(lo[j], hi[j], lb, ub)?);
     }
     // Slack terms: d_{n+r} = y_r exactly (the `−I` column), boxed by the row.
@@ -174,6 +217,22 @@ mod tests {
             deadline: None,
             max_iters: 10_000,
         }
+    }
+
+    #[test]
+    fn explicit_box_bound_rejects_an_inverted_box() {
+        let mut model = Model::new();
+        model.add_col(0.0, 1.0);
+        let objective = [1.0];
+        let duals = [];
+
+        assert!(
+            rigorous_lower_bound_with_box(&model, &objective, &duals, &[1.0], &[0.0]).is_none(),
+            "an empty structural box must not be priced as a finite child"
+        );
+        let bound = rigorous_lower_bound_with_box(&model, &objective, &duals, &[0.5], &[0.75])
+            .expect("a finite narrowed box has a rigorous objective bound");
+        assert!((0.49..=0.5).contains(&bound));
     }
 
     /// A random small LP: finite column boxes (never unbounded below) and a

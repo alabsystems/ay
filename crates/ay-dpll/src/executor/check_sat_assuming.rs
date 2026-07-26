@@ -358,6 +358,11 @@ impl Executor {
         self.defer_counterexample_minimization = false;
         self.bypass_string_tautology_guard = false;
         self.slia_accepted_unknown = false;
+        // Result-authorization markers are scoped to one public solve. The
+        // assumption path and core-minimization subset re-solves share this
+        // reset and must earn both authorizations independently.
+        self.sat_validated_by_mod_div_or_branch = false;
+        self.nested_array_row_reduction_unsat = false;
         self.array_axiom_scope = None;
         self.row_seeded_terms.clear();
         self.proof_check_result = None;
@@ -458,6 +463,23 @@ impl Executor {
                 self.last_result = Some(SolveResult::Unknown);
                 return Ok(SolveResult::Unknown);
             }
+        }
+
+        // The direct assumption routes bypass check_sat.rs preprocessing.
+        // Replay the route-independent singleton-sort soundness pass over BOTH
+        // base assertions and assumptions, pushing its model-preserving facts
+        // into the scope-transient base. This is needed even for QfUf/QfAx:
+        // singleton-sorted terms may occur only as UF arguments, where an
+        // equality fact is what exposes the congruence conflict.
+        let mut singleton_roots = self.ctx.assertions.clone();
+        singleton_roots.extend_from_slice(assumptions);
+        if !self
+            .add_ground_singleton_sort_equalities(&singleton_roots)
+            .is_complete()
+        {
+            // The wrapper truncates any already-emitted scope-transient facts.
+            // Never route assumptions against only a prefix of the closure.
+            return Ok(SolveResult::Unknown);
         }
 
         // Use the base assertions from context, assumptions are passed separately
@@ -1270,5 +1292,22 @@ impl Executor {
         self.finalize_unknown_diagnostics();
         // Return reference-based clone from last_result since we just stored it.
         self.last_result.clone().expect("just stored")
+    }
+}
+
+#[cfg(test)]
+mod solve_session_reset_tests {
+    use super::*;
+
+    #[test]
+    fn solve_session_reset_revokes_result_authorization_markers() {
+        let mut exec = Executor::new();
+        exec.sat_validated_by_mod_div_or_branch = true;
+        exec.nested_array_row_reduction_unsat = true;
+
+        exec.reset_solve_session_state();
+
+        assert!(!exec.sat_validated_by_mod_div_or_branch);
+        assert!(!exec.nested_array_row_reduction_unsat);
     }
 }

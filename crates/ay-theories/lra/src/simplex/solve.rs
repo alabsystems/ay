@@ -574,9 +574,15 @@ impl LraSolver {
         // AY only tracks basic vars in the heap, so we use the tightened-vars list
         // as a targeted proxy for the non-basic check.
         //
+        // #warm-simplex: when the persistent non-basic candidate set has
+        // pending entries (e.g. from a value-restore or a self-marked snap),
+        // the tightened-vars list alone does not cover them — skip this fast
+        // path and let the main loop's targeted dirty-set exit handle them.
+        // Flag OFF: `!self.warm.enabled` short-circuits to today's condition.
         if !self.heap_stale
             && self.infeasible_heap.is_empty()
             && !self.vars_tightened_since_simplex.is_empty()
+            && (!self.warm.enabled || self.warm.nonbasic_dirty.is_empty())
         {
             // Copy to local buffer to release borrow on self before update_nonbasic.
             // Use std::mem::take to avoid heap allocation: swap with empty vec.
@@ -684,19 +690,59 @@ impl LraSolver {
                 // instead of flipping the variable between its two bounds until
                 // `max_iters` (a spurious Unknown).
                 let mut stuck_var: Option<u32> = None;
-                for i in 0..self.vars.len() {
-                    if !matches!(self.vars[i].status, Some(VarStatus::NonBasic)) {
-                        continue;
+                // #warm-simplex: when the persistent candidate set's coverage
+                // invariant holds, only the enqueued non-basic vars can be
+                // violated — scan O(dirty) instead of O(vars). The full scan
+                // below remains the fallback and is what re-arms the
+                // invariant on a clean pass.
+                let warm_targeted = self.warm.enabled && self.warm.nonbasic_valid;
+                if warm_targeted {
+                    // Process only the entries present at round start; a snap
+                    // that leaves its target violated re-enqueues it (via
+                    // update_nonbasic) past `n0`, and the `continue` below
+                    // re-enters this branch for the appended tail — with the
+                    // same-round stuck detection breaking #9061 oscillations.
+                    let n0 = self.warm.nonbasic_dirty.len();
+                    for k in 0..n0 {
+                        let var = self.warm.nonbasic_dirty[k];
+                        let vi = var as usize;
+                        if vi < self.warm.nonbasic_stamp.len() {
+                            self.warm.nonbasic_stamp[vi] = 0;
+                        }
+                        if vi >= self.vars.len() {
+                            continue;
+                        }
+                        if !matches!(self.vars[vi].status, Some(VarStatus::NonBasic)) {
+                            continue;
+                        }
+                        if let Some(violated_type) = self.violates_bounds(var) {
+                            saw_violation = true;
+                            let info = &self.vars[vi];
+                            if let Some(nv) = Self::choose_nonbasic_fix_value(info, violated_type) {
+                                self.update_nonbasic(var, nv);
+                                did_fix = true;
+                                if stuck_var.is_none() && self.violates_bounds(var).is_some() {
+                                    stuck_var = Some(var);
+                                }
+                            }
+                        }
                     }
-                    let var = i as u32;
-                    if let Some(violated_type) = self.violates_bounds(var) {
-                        saw_violation = true;
-                        let info = &self.vars[var as usize];
-                        if let Some(nv) = Self::choose_nonbasic_fix_value(info, violated_type) {
-                            self.update_nonbasic(var, nv);
-                            did_fix = true;
-                            if stuck_var.is_none() && self.violates_bounds(var).is_some() {
-                                stuck_var = Some(var);
+                    self.warm.nonbasic_dirty.drain(..n0);
+                } else {
+                    for i in 0..self.vars.len() {
+                        if !matches!(self.vars[i].status, Some(VarStatus::NonBasic)) {
+                            continue;
+                        }
+                        let var = i as u32;
+                        if let Some(violated_type) = self.violates_bounds(var) {
+                            saw_violation = true;
+                            let info = &self.vars[var as usize];
+                            if let Some(nv) = Self::choose_nonbasic_fix_value(info, violated_type) {
+                                self.update_nonbasic(var, nv);
+                                did_fix = true;
+                                if stuck_var.is_none() && self.violates_bounds(var).is_some() {
+                                    stuck_var = Some(var);
+                                }
                             }
                         }
                     }
@@ -713,6 +759,13 @@ impl LraSolver {
                 // can be retracted, stop with Unknown rather than spinning.
                 if let Some(var) = stuck_var {
                     if self.retract_unjustified_var_bounds(var) > 0 {
+                        // #warm-simplex: the retraction may leave the var
+                        // still violated on the remaining (justified) side —
+                        // keep it in the candidate set so the next targeted
+                        // round re-validates it.
+                        if self.warm.enabled {
+                            self.warm_mark_nonbasic_dirty(var);
+                        }
                         nonbasic_repair_rounds += 1;
                         continue;
                     }
@@ -758,6 +811,28 @@ impl LraSolver {
                         safe_eprintln!("[LRA]   var {} = {} ({})", i, info.value, status);
                     }
                 }
+                if warm_targeted {
+                    // #warm-simplex targeted exit: heap empty (all basic vars
+                    // feasible — the heap invariant is maintained at every
+                    // value write and repaired across pops) + candidate set
+                    // drained clean. This verified only the TRACKED non-basic
+                    // vars, so it may claim a verified Sat only under the
+                    // #inc-guard-chain (same rule as the pre-loop fast path);
+                    // final Sat verdicts are additionally re-validated by the
+                    // unconditional guard scan in check_impl.
+                    summarize(
+                        "sat",
+                        "warm_targeted_nonbasic",
+                        iterations_run,
+                        pivot_count,
+                        nonbasic_repair_rounds,
+                        leaving_fixups,
+                        self.rows.len(),
+                        self.vars.len(),
+                    );
+                    self.last_simplex_verified = self.guard_tracked_only;
+                    return TheoryResult::Sat;
+                }
                 summarize(
                     "sat",
                     "all_bounds_satisfied",
@@ -774,6 +849,12 @@ impl LraSolver {
                 // chain (#inc-guard-chain).
                 self.last_simplex_verified = true;
                 self.guard_tracked_only = true;
+                // #warm-simplex: a clean FULL non-basic scan re-arms the
+                // candidate-set coverage invariant (and empties the set).
+                if self.warm.enabled {
+                    self.warm_clear_nonbasic_dirty();
+                    self.warm.nonbasic_valid = true;
+                }
                 return TheoryResult::Sat;
             };
 
@@ -822,6 +903,17 @@ impl LraSolver {
                 };
 
             let Some((entering_var, new_val)) = chosen else {
+                // #warm-simplex: `pop_greatest_error` removed this basic var's
+                // heap membership on extraction. On the pivot path the
+                // subsequent `update_nonbasic`/`track_var_feasibility` calls
+                // re-establish it, but on this no-pivot path we return (or
+                // retract-and-continue) without a pivot — re-track it so the
+                // still-violated var stays in the persistent candidate heap
+                // across the conflict/pop cycle (heap coverage invariant).
+                if self.warm.enabled {
+                    let bv = self.rows[row_idx].basic_var;
+                    self.track_var_feasibility(bv);
+                }
                 let conflict = self.build_conflict_with_farkas(row_idx);
                 if conflict.literals.is_empty() {
                     // #A2: an empty conflict here means the explanation

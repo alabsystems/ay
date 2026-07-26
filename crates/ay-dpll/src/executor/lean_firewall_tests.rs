@@ -2728,18 +2728,186 @@ fn emits_array_storecomm_defexpanded_from_parsed() {
     assert!(emit_array_defexpanded_firewall_lean_from_parsed(&no_distinct, &defs).is_none());
 }
 
+// storeinv_sf_chain, in its `define-fun` form: `a1 = store(a,i,select(a,i))`,
+// `a2 = store(a1,j,select(a,j))`, `(not (= a2 a))`. Both writes put the base
+// array's own value back, so `a2 = a` in every model — the negated equality is
+// unsat. Expanding the macros exposes the write-back chain over base `a`.
+#[test]
+fn emits_array_writeback_chain_from_parsed() {
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let store = |a: PTerm, i: PTerm, v: PTerm| PTerm::App("store".to_string(), vec![a, i, v]);
+    let select = |a: PTerm, i: PTerm| PTerm::App("select".to_string(), vec![a, i]);
+
+    // (not (= a2 a)) with a1/a2 nullary define-fun write-backs over base a.
+    let target = PTerm::App(
+        "not".to_string(),
+        vec![PTerm::App("=".to_string(), vec![sym("a2"), sym("a")])],
+    );
+    let a1_body = store(sym("a"), sym("i"), select(sym("a"), sym("i")));
+    let a2_body = store(sym("a1"), sym("j"), select(sym("a"), sym("j")));
+    let defs = vec![("a1".to_string(), a1_body), ("a2".to_string(), a2_body)];
+
+    let lean = emit_array_writeback_chain_firewall_lean_from_parsed(&[target], &defs)
+        .expect("write-back identity chain should emit after define-fun expansion");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("namespace AySoundness.Emitted.ArrWriteBack_"));
+    assert!(lean.contains("abbrev Val := (Nat -> Nat) × (Nat -> Nat)"));
+    assert!(lean.contains("attribute [local instance] Classical.propDecidable"));
+    assert!(lean.contains("noncomputable def atomVal"));
+    // Two store levels → a two-deep by_cases cascade.
+    assert!(lean.contains("by_cases h1 : x = (m.2 0)"));
+    assert!(lean.contains("by_cases h2 : x = (m.2 1)"));
+    assert!(lean.contains("firewall_combined_unsat"));
+
+    // Same conflict already expanded (no macros): still recognized directly.
+    let expanded_chain = store(
+        store(sym("a"), sym("i"), select(sym("a"), sym("i"))),
+        sym("j"),
+        select(sym("a"), sym("j")),
+    );
+    let direct = PTerm::App(
+        "not".to_string(),
+        vec![PTerm::App("=".to_string(), vec![expanded_chain, sym("a")])],
+    );
+    assert!(emit_array_writeback_chain_firewall_lean_from_parsed(&[direct], &[]).is_some());
+}
+
+#[test]
+fn array_writeback_chain_declines_non_identity() {
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let store = |a: PTerm, i: PTerm, v: PTerm| PTerm::App("store".to_string(), vec![a, i, v]);
+    let select = |a: PTerm, i: PTerm| PTerm::App("select".to_string(), vec![a, i]);
+
+    // store(a, i, select(a, j)) with i ≠ j written index: NOT a write-back (the
+    // read index differs from the store index), so `= a` does NOT hold — decline.
+    let not_writeback = store(sym("a"), sym("i"), select(sym("a"), sym("j")));
+    let target = PTerm::App(
+        "not".to_string(),
+        vec![PTerm::App("=".to_string(), vec![not_writeback, sym("a")])],
+    );
+    assert!(emit_array_writeback_chain_firewall_lean_from_parsed(&[target], &[]).is_none());
+
+    // store(a, i, select(b, i)) — value reads a DIFFERENT array b, not the base a:
+    // decline (this is not the write-back identity).
+    let other_base = store(sym("a"), sym("i"), select(sym("b"), sym("i")));
+    let target2 = PTerm::App(
+        "not".to_string(),
+        vec![PTerm::App("=".to_string(), vec![other_base, sym("a")])],
+    );
+    assert!(emit_array_writeback_chain_firewall_lean_from_parsed(&[target2], &[]).is_none());
+}
+
+// storeinv_cross_1idx: `v0 = store(a2,i,select(a1,i))`, `v1 = store(a1,i,select(a2,i))`,
+// `(= v0 v1)`, `(not (= a1 a2))`. Equating the two index-`i` swaps forces `a1 = a2`
+// pointwise (array extensionality), contradicting `a1 ≠ a2`. Inlining the array-lets
+// exposes the swap equality.
+#[test]
+fn emits_array_storeinv_swap_from_parsed() {
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let store = |a: PTerm, i: PTerm, v: PTerm| PTerm::App("store".to_string(), vec![a, i, v]);
+    let select = |a: PTerm, i: PTerm| PTerm::App("select".to_string(), vec![a, i]);
+    let eq = |a: PTerm, b: PTerm| PTerm::App("=".to_string(), vec![a, b]);
+
+    let v0def = eq(
+        sym("v0"),
+        store(sym("a2"), sym("i"), select(sym("a1"), sym("i"))),
+    );
+    let v1def = eq(
+        sym("v1"),
+        store(sym("a1"), sym("i"), select(sym("a2"), sym("i"))),
+    );
+    let equate = eq(sym("v0"), sym("v1"));
+    let diseq = PTerm::App("not".to_string(), vec![eq(sym("a1"), sym("a2"))]);
+    let parsed = vec![v0def, v1def, equate, diseq];
+
+    let lean = emit_array_storeinv_swap_firewall_lean_from_parsed(&parsed, &[])
+        .expect("single-index store-inverse cross-swap should emit after inlining");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("namespace AySoundness.Emitted.ArrStoreInv1_"));
+    assert!(lean.contains("attribute [local instance] Classical.propDecidable"));
+    assert!(lean.contains("def lemmas   : List (Cid × Clause) := [(3, [-1, 2])]"));
+    assert!(lean.contains("firewall_combined_unsat"));
+}
+
+#[test]
+fn array_storeinv_swap_declines_without_disequality() {
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let store = |a: PTerm, i: PTerm, v: PTerm| PTerm::App("store".to_string(), vec![a, i, v]);
+    let select = |a: PTerm, i: PTerm| PTerm::App("select".to_string(), vec![a, i]);
+    let eq = |a: PTerm, b: PTerm| PTerm::App("=".to_string(), vec![a, b]);
+
+    // The swap equality WITHOUT the `a1 ≠ a2` premise is SAT (take a1 = a2) — must
+    // NOT emit a (false) refutation.
+    let swap = eq(
+        store(sym("a2"), sym("i"), select(sym("a1"), sym("i"))),
+        store(sym("a1"), sym("i"), select(sym("a2"), sym("i"))),
+    );
+    assert!(
+        emit_array_storeinv_swap_firewall_lean_from_parsed(std::slice::from_ref(&swap), &[])
+            .is_none()
+    );
+
+    // Non-swapped stores (same base both sides) with a1 ≠ a2 is NOT the store-inverse
+    // conflict — decline.
+    let non_swap = eq(
+        store(sym("a1"), sym("i"), select(sym("a1"), sym("i"))),
+        store(sym("a1"), sym("i"), select(sym("a2"), sym("i"))),
+    );
+    let diseq = PTerm::App("not".to_string(), vec![eq(sym("a1"), sym("a2"))]);
+    assert!(emit_array_storeinv_swap_firewall_lean_from_parsed(&[non_swap, diseq], &[]).is_none());
+}
+
+#[test]
+fn lia_firewall_declines_array_valued_define_fun() {
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let store = |a: PTerm, i: PTerm, v: PTerm| PTerm::App("store".to_string(), vec![a, i, v]);
+    let select = |a: PTerm, i: PTerm| PTerm::App("select".to_string(), vec![a, i]);
+    let context = cbr_typed_context(Sort::Int);
+
+    // storeinv_sf_chain's residual assertions after ay folds arrays away:
+    // `(not (= i j))` (integer) and `(not (= a2 a))` (ARRAY). The array
+    // disequality must NOT be reconstructed as a linear-integer atom.
+    let idx_diseq = PTerm::App(
+        "not".to_string(),
+        vec![PTerm::App("=".to_string(), vec![sym("i"), sym("j")])],
+    );
+    let arr_diseq = PTerm::App(
+        "not".to_string(),
+        vec![PTerm::App("=".to_string(), vec![sym("a2"), sym("a")])],
+    );
+    let a2_body = store(sym("a1"), sym("j"), select(sym("a"), sym("j")));
+    let defs = vec![("a2".to_string(), a2_body)];
+
+    // With the array-valued define-fun present, decline (this is not pure LIA).
+    assert!(emit_lia_firewall_lean_from_parsed(&[idx_diseq, arr_diseq], &defs, &context).is_none());
+    // A genuine linear-integer conflict `x > 5 ∧ x < 3` still emits: the gate only
+    // fires on array-valued macros, and here `defs` has none.
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let conflict = vec![
+        PTerm::App(">".to_string(), vec![sym("x"), num("5")]),
+        PTerm::App("<".to_string(), vec![sym("x"), num("3")]),
+    ];
+    assert!(emit_lia_firewall_lean_from_parsed(&conflict, &defs, &context).is_some());
+}
+
 // ==== APPENDED TESTS: lia ====
 #[test]
 fn emits_lia_linear_conflict_from_parsed() {
     use ay_frontend::command::{Constant as PConst, Term as PTerm};
     let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
     let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let context = cbr_typed_context(Sort::Int);
     // (> x 5) ∧ (< x 3): jointly integer-UNSAT bound conflict.
     let parsed = vec![
         PTerm::App(">".to_string(), vec![sym("x"), num("5")]),
         PTerm::App("<".to_string(), vec![sym("x"), num("3")]),
     ];
-    let lean = emit_lia_firewall_lean_from_parsed(&parsed)
+    let lean = emit_lia_firewall_lean_from_parsed(&parsed, &[], &context)
         .expect("linear integer bound conflict should emit");
     assert!(lean.contains("abbrev Val := Nat → Int"));
     assert!(lean.contains("firewall_combined_unsat"));
@@ -2756,7 +2924,7 @@ fn emits_lia_linear_conflict_from_parsed() {
         PTerm::App(">=".to_string(), vec![sym("a"), num("1")]),
         PTerm::App(">=".to_string(), vec![sym("b"), num("1")]),
     ];
-    let lean2 = emit_lia_firewall_lean_from_parsed(&multi)
+    let lean2 = emit_lia_firewall_lean_from_parsed(&multi, &[], &context)
         .expect("multi-variable linear conflict should emit");
     assert!(lean2.contains("(m 0)") && lean2.contains("(m 1)"));
 
@@ -2768,10 +2936,143 @@ fn emits_lia_linear_conflict_from_parsed() {
             num("7"),
         ],
     )];
-    assert!(emit_lia_firewall_lean_from_parsed(&nonlinear).is_none());
+    assert!(emit_lia_firewall_lean_from_parsed(&nonlinear, &[], &context).is_none());
     // Declines non-arithmetic propositional structure (`or`).
     let prop = vec![PTerm::App("or".to_string(), vec![sym("p"), sym("q")])];
-    assert!(emit_lia_firewall_lean_from_parsed(&prop).is_none());
+    assert!(emit_lia_firewall_lean_from_parsed(&prop, &[], &context).is_none());
+}
+
+#[test]
+fn lia_firewall_requires_unique_int_constants_but_keeps_signed_literals() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, args: Vec<PTerm>| PTerm::App(op.to_string(), args);
+
+    // SAT over Real at x=1/2. Numeral spelling does not make a Real variable Int.
+    let strict_real_gap = vec![
+        app(">", vec![sym("x"), num("0")]),
+        app("<", vec![sym("x"), num("1")]),
+    ];
+    let real_context = cbr_typed_context(Sort::Real);
+    assert!(
+        emit_lia_firewall_lean_from_parsed(&strict_real_gap, &[], &real_context).is_none(),
+        "numeral-only Real constraints must not be reinterpreted over Int"
+    );
+
+    let missing = ay_frontend::Context::new();
+    assert!(emit_lia_firewall_lean_from_parsed(&strict_real_gap, &[], &missing).is_none());
+
+    let mut ambiguous = cbr_typed_context(Sort::Int);
+    ambiguous
+        .register_native_function_alias(
+            "x".to_string(),
+            "__firewall_test_x_real".to_string(),
+            Vec::new(),
+            Sort::Real,
+        )
+        .expect("test constant overload should be valid");
+    assert!(
+        emit_lia_firewall_lean_from_parsed(&strict_real_gap, &[], &ambiguous).is_none(),
+        "surface overloads have no identity in ParsedTerm and must be declined"
+    );
+
+    // ay's parsed AST can preserve a signed literal as numeric symbol text.
+    // It remains an Int literal and needs no declaration in Context.
+    let int_context = cbr_typed_context(Sort::Int);
+    let signed_literal_conflict = vec![
+        app(">=", vec![sym("x"), num("0")]),
+        app(">", vec![app("*", vec![sym("-1"), sym("x")]), num("0")]),
+    ];
+    assert!(
+        emit_lia_firewall_lean_from_parsed(&signed_literal_conflict, &[], &int_context).is_some(),
+        "numeric-text signed literals must remain supported"
+    );
+}
+
+#[test]
+fn lia_firewall_declines_declared_quoted_numeric_real() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, args: Vec<PTerm>| PTerm::App(op.to_string(), args);
+
+    // Quoting is erased in ParsedTerm, but Context records the declaration.
+    // This source formula is SAT over Real at `|-1| = 1/2`; interpreting its
+    // surface text as the signed Int literal -1 would manufacture an UNSAT
+    // strict-gap firewall artifact.
+    let mut context = ay_frontend::Context::new();
+    register_firewall_test_constant(&mut context, "-1", Sort::Real);
+    let strict_real_gap = vec![
+        app(">", vec![sym("-1"), num("0")]),
+        app("<", vec![sym("-1"), num("1")]),
+    ];
+    assert!(
+        emit_lia_firewall_lean_from_parsed(&strict_real_gap, &[], &context).is_none(),
+        "declared `|-1| : Real` must win over signed-literal fallback"
+    );
+}
+
+#[test]
+fn lia_firewall_keeps_declared_positive_numeric_int_as_variable() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, args: Vec<PTerm>| PTerm::App(op.to_string(), args);
+
+    // A positive numeral token is `Const(Numeral)`, so `Symbol("1")` denotes
+    // the quoted declaration `|1|`. It must receive a model slot, not become
+    // the literal 1.
+    let mut context = ay_frontend::Context::new();
+    register_firewall_test_constant(&mut context, "1", Sort::Int);
+    let conflict = vec![
+        app(">", vec![sym("1"), num("5")]),
+        app("<", vec![sym("1"), num("3")]),
+    ];
+    let lean = emit_lia_firewall_lean_from_parsed(&conflict, &[], &context)
+        .expect("declared `|1| : Int` is inside the LIA fragment");
+    assert!(
+        lean.contains("(m 0)"),
+        "declared positive numeric-name constant must remain a variable"
+    );
+}
+
+#[test]
+fn lia_firewall_declines_nonconstant_or_ambiguous_numeric_symbol_declaration() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, args: Vec<PTerm>| PTerm::App(op.to_string(), args);
+    let parsed = vec![app(">", vec![sym("-1"), num("0")])];
+
+    let mut nonconstant = ay_frontend::Context::new();
+    nonconstant
+        .register_native_function_alias(
+            "-1".to_string(),
+            "__firewall_test_numeric_function".to_string(),
+            vec![Sort::Int],
+            Sort::Int,
+        )
+        .expect("test numeric-name function should be valid");
+    assert!(
+        emit_lia_firewall_lean_from_parsed(&parsed, &[], &nonconstant).is_none(),
+        "non-nullary `|-1|` declaration must not fall back to an Int literal"
+    );
+
+    let mut context = ay_frontend::Context::new();
+    register_firewall_test_constant(&mut context, "-1", Sort::Int);
+    context
+        .register_native_function_alias(
+            "-1".to_string(),
+            "__firewall_test_numeric_real".to_string(),
+            Vec::new(),
+            Sort::Real,
+        )
+        .expect("test numeric-name overload should be valid");
+    assert!(
+        emit_lia_firewall_lean_from_parsed(&parsed, &[], &context).is_none(),
+        "ambiguous `|-1|` declarations must not fall back to an Int literal"
+    );
 }
 
 // ==== APPENDED TESTS: euf_uflia ====
@@ -2781,6 +3082,7 @@ fn emits_euf_lia_congruence_from_parsed_assertions() {
     let sym = |s: &str| PTerm::Symbol(s.to_string());
     let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
     let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+    let int_context = cbr_typed_context(Sort::Int);
 
     // POSITIVE: a>=3, a<=3, b=3, f(a)=10, f(b)=20 -> a=b=3 forces f(a)=f(b), 10!=20.
     let parsed = vec![
@@ -2790,7 +3092,7 @@ fn emits_euf_lia_congruence_from_parsed_assertions() {
         app("=", vec![app("f", vec![sym("a")]), num("10")]),
         app("=", vec![app("f", vec![sym("b")]), num("20")]),
     ];
-    let lean = emit_euf_lia_congruence_firewall_lean_from_parsed(&parsed)
+    let lean = emit_euf_lia_congruence_firewall_lean_from_parsed(&parsed, &int_context)
         .expect("parsed EUF+LIA congruence conflict should emit");
     assert!(lean.contains("import AySoundness.Firewall"));
     assert!(lean.contains("firewall_combined_unsat"));
@@ -2822,7 +3124,20 @@ fn emits_euf_lia_congruence_from_parsed_assertions() {
             vec![app("=", vec![app("f", vec![sym("b")]), num("10")])],
         ),
     ];
-    assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&parsed3).is_some());
+    assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&parsed3, &int_context).is_some());
+
+    // Numeric-text signed literals are emitted by ay's lenient parsed surface
+    // for some inputs. Preserve them as literals in both LIA terms and UF values.
+    let signed_literals = vec![
+        app("=", vec![app("*", vec![sym("-1"), sym("a")]), num("0")]),
+        app("=", vec![sym("b"), num("0")]),
+        app("=", vec![app("f", vec![sym("a")]), sym("-1")]),
+        app("=", vec![app("f", vec![sym("b")]), num("0")]),
+    ];
+    assert!(
+        emit_euf_lia_congruence_firewall_lean_from_parsed(&signed_literals, &int_context).is_some(),
+        "numeric-text signed literals must remain supported"
+    );
 
     // NEGATIVE (no implied equality): a and b unconstrained, f(a)=10, f(b)=20 --
     // no LIA fact forces a=b, so no congruence conflict -> decline.
@@ -2830,7 +3145,7 @@ fn emits_euf_lia_congruence_from_parsed_assertions() {
         app("=", vec![app("f", vec![sym("a")]), num("10")]),
         app("=", vec![app("f", vec![sym("b")]), num("20")]),
     ];
-    assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&no_eq).is_none());
+    assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&no_eq, &int_context).is_none());
 
     // NEGATIVE (consistent values): a=b but f(a)=10, f(b)=10 -- no conflict.
     let consistent = vec![
@@ -2839,7 +3154,7 @@ fn emits_euf_lia_congruence_from_parsed_assertions() {
         app("=", vec![app("f", vec![sym("a")]), num("10")]),
         app("=", vec![app("f", vec![sym("b")]), num("10")]),
     ];
-    assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&consistent).is_none());
+    assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&consistent, &int_context).is_none());
 
     // NEGATIVE (Real / QF_UFLRA gate): decimal numerals are not Int -> decline.
     let real = vec![
@@ -2854,7 +3169,224 @@ fn emits_euf_lia_congruence_from_parsed_assertions() {
         app("=", vec![app("f", vec![sym("a")]), num("10")]),
         app("=", vec![app("f", vec![sym("b")]), num("20")]),
     ];
-    assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&real).is_none());
+    assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&real, &int_context).is_none());
+}
+
+#[test]
+fn euf_lia_firewall_does_not_literalize_declared_quoted_numeric_int() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, args: Vec<PTerm>| PTerm::App(op.to_string(), args);
+
+    // SAT: a=b and choose `|-1| = 0`, so both applications of f have value 0.
+    // Treating the declared constant's numeric-looking text as literal -1
+    // would invent a congruence conflict between f(a)=-1 and f(b)=0.
+    let mut context = cbr_typed_context(Sort::Int);
+    register_firewall_test_constant(&mut context, "-1", Sort::Int);
+    let parsed = vec![
+        app("=", vec![sym("a"), sym("b")]),
+        app("=", vec![app("f", vec![sym("a")]), sym("-1")]),
+        app("=", vec![app("f", vec![sym("b")]), num("0")]),
+    ];
+    assert!(
+        emit_euf_lia_congruence_firewall_lean_from_parsed(&parsed, &context).is_none(),
+        "declared `|-1| : Int` is a variable, not a UF-value literal"
+    );
+}
+
+#[test]
+fn euf_lia_firewall_keeps_declared_positive_numeric_int_as_variable() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, args: Vec<PTerm>| PTerm::App(op.to_string(), args);
+
+    // `|1| = b` makes the two UF arguments equal. Both normalization and Lean
+    // rendering must keep `|1|` as an Int variable; literalizing it would only
+    // pin b=1 and miss the congruence bridge.
+    let mut context = cbr_typed_context(Sort::Int);
+    register_firewall_test_constant(&mut context, "1", Sort::Int);
+    let parsed = vec![
+        app("=", vec![sym("1"), sym("b")]),
+        app("=", vec![app("f", vec![sym("1")]), num("10")]),
+        app("=", vec![app("f", vec![sym("b")]), num("20")]),
+    ];
+    let lean = emit_euf_lia_congruence_firewall_lean_from_parsed(&parsed, &context)
+        .expect("declared `|1| : Int` must participate in the congruence bridge");
+    assert!(lean.contains("x_1 : Int"));
+    assert!(lean.contains("m.x_1 = m.x_b"));
+}
+
+#[test]
+fn euf_lia_firewall_requires_unique_int_signatures() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, args: Vec<PTerm>| PTerm::App(op.to_string(), args);
+    let parsed = vec![
+        app(">=", vec![sym("a"), num("3")]),
+        app("<=", vec![sym("a"), num("3")]),
+        app("=", vec![sym("b"), num("3")]),
+        app("=", vec![app("f", vec![sym("a")]), num("10")]),
+        app("=", vec![app("f", vec![sym("b")]), num("20")]),
+    ];
+
+    let missing = ay_frontend::Context::new();
+    assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&parsed, &missing).is_none());
+
+    let mut missing_function = ay_frontend::Context::new();
+    for name in ["a", "b"] {
+        register_firewall_test_constant(&mut missing_function, name, Sort::Int);
+    }
+    assert!(
+        emit_euf_lia_congruence_firewall_lean_from_parsed(&parsed, &missing_function).is_none()
+    );
+
+    let mut wrong_function_sort = ay_frontend::Context::new();
+    for name in ["a", "b"] {
+        register_firewall_test_constant(&mut wrong_function_sort, name, Sort::Int);
+    }
+    wrong_function_sort
+        .register_native_function_alias(
+            "f".to_string(),
+            "__firewall_test_int_to_real_f".to_string(),
+            vec![Sort::Int],
+            Sort::Real,
+        )
+        .expect("test Int-to-Real UF declaration should be valid");
+    assert!(
+        emit_euf_lia_congruence_firewall_lean_from_parsed(&parsed, &wrong_function_sort).is_none()
+    );
+
+    let mut ambiguous_constant = cbr_typed_context(Sort::Int);
+    ambiguous_constant
+        .register_native_function_alias(
+            "a".to_string(),
+            "__firewall_test_a_real".to_string(),
+            Vec::new(),
+            Sort::Real,
+        )
+        .expect("test constant overload should be valid");
+    assert!(
+        emit_euf_lia_congruence_firewall_lean_from_parsed(&parsed, &ambiguous_constant).is_none()
+    );
+
+    let mut ambiguous_function = cbr_typed_context(Sort::Int);
+    ambiguous_function
+        .register_native_function_alias(
+            "f".to_string(),
+            "__firewall_test_f_real_int".to_string(),
+            vec![Sort::Real],
+            Sort::Int,
+        )
+        .expect("test function overload should be valid");
+    assert!(
+        emit_euf_lia_congruence_firewall_lean_from_parsed(&parsed, &ambiguous_function).is_none()
+    );
+}
+
+#[test]
+fn euf_lia_firewall_declines_numeral_only_real_congruence_gap() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, args: Vec<PTerm>| PTerm::App(op.to_string(), args);
+
+    let mut context = ay_frontend::Context::new();
+    for name in ["a", "b"] {
+        register_firewall_test_constant(&mut context, name, Sort::Real);
+    }
+    context
+        .register_native_function_alias(
+            "f".to_string(),
+            "__firewall_test_real_to_int_f".to_string(),
+            vec![Sort::Real],
+            Sort::Int,
+        )
+        .expect("test Real-to-Int UF declaration should be valid");
+
+    // SAT over Real: choose a=1/2 and b=1, so the two UF arguments differ.
+    // Reinterpreting a and b as Int would instead force a=b=1 and manufacture
+    // a false congruence conflict between the two distinct UF values.
+    let parsed = vec![
+        app(">", vec![sym("a"), num("0")]),
+        app("<=", vec![sym("a"), num("1")]),
+        app("=", vec![sym("b"), num("1")]),
+        app("=", vec![app("f", vec![sym("a")]), num("10")]),
+        app("=", vec![app("f", vec![sym("b")]), num("20")]),
+    ];
+    assert!(
+        emit_euf_lia_congruence_firewall_lean_from_parsed(&parsed, &context).is_none(),
+        "numeral-only Real constraints and a Real-to-Int UF must not be modelled as UFLIA"
+    );
+}
+
+#[test]
+fn euf_lia_firewall_checks_i64_normalization_bounds_and_pins() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, args: Vec<PTerm>| PTerm::App(op.to_string(), args);
+    let uf_values = || {
+        vec![
+            app("=", vec![app("f", vec![sym("a")]), num("10")]),
+            app("=", vec![app("f", vec![sym("b")]), num("20")]),
+        ]
+    };
+    let context = cbr_typed_context(Sort::Int);
+    let max = i64::MAX.to_string();
+    let min = i64::MIN.to_string();
+
+    // MAX+1 is valid unbounded SMT Int arithmetic but outside this recognizer's
+    // i64 analysis domain.
+    let mut normalization_overflow = vec![app(
+        "=",
+        vec![app("+", vec![sym("a"), num(&max), num("1")]), sym("b")],
+    )];
+    normalization_overflow.extend(uf_values());
+    assert!(
+        emit_euf_lia_congruence_firewall_lean_from_parsed(&normalization_overflow, &context,)
+            .is_none()
+    );
+
+    // `a + MIN > 0` has an inclusive integer lower bound above i64::MAX.
+    // The normal form fits, but bound extraction must decline exactly.
+    let mut bound_overflow = vec![app(
+        ">",
+        vec![app("+", vec![sym("a"), sym(&min)]), num("0")],
+    )];
+    bound_overflow.extend(uf_values());
+    assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&bound_overflow, &context).is_none());
+
+    // `a + MIN = 0` would pin a to 2^63, outside the analysis domain.
+    let mut pin_out_of_range = vec![app(
+        "=",
+        vec![app("+", vec![sym("a"), sym(&min)]), num("0")],
+    )];
+    pin_out_of_range.extend(uf_values());
+    assert!(
+        emit_euf_lia_congruence_firewall_lean_from_parsed(&pin_out_of_range, &context).is_none()
+    );
+
+    // The MIN/-1 pin shape used to panic while evaluating `-MIN / -1`.
+    // The bounded recognizer may conservatively decline it, but must never
+    // perform that overflowing i64 arithmetic or wrap into a false bridge.
+    let pin_min = |name: &str| {
+        app(
+            "=",
+            vec![
+                app("+", vec![app("*", vec![sym("-1"), sym(name)]), sym(&min)]),
+                num("0"),
+            ],
+        )
+    };
+    let mut exact_min_pins = vec![pin_min("a"), pin_min("b")];
+    exact_min_pins.extend(uf_values());
+    assert!(
+        emit_euf_lia_congruence_firewall_lean_from_parsed(&exact_min_pins, &context).is_none(),
+        "the MIN/-1 pin boundary must decline without panicking or wrapping"
+    );
 }
 
 #[test]
@@ -4728,4 +5260,1402 @@ fn str_indexof_substring_search_and_rendering_are_resource_bounded() {
         .is_err(),
         "caller source budget must be checked before collection/rendering"
     );
+}
+
+// ---------------------------------------------------------------------------
+// QF_AX extensionality / read-over-write / congruence firewall emitters.
+// ---------------------------------------------------------------------------
+
+fn ax_sym(s: &str) -> PTerm {
+    PTerm::Symbol(s.to_string())
+}
+fn ax_store(a: PTerm, i: PTerm, v: PTerm) -> PTerm {
+    PTerm::App("store".to_string(), vec![a, i, v])
+}
+fn ax_select(a: PTerm, i: PTerm) -> PTerm {
+    PTerm::App("select".to_string(), vec![a, i])
+}
+fn ax_eq(a: PTerm, b: PTerm) -> PTerm {
+    PTerm::App("=".to_string(), vec![a, b])
+}
+fn ax_neq(a: PTerm, b: PTerm) -> PTerm {
+    PTerm::App("not".to_string(), vec![ax_eq(a, b)])
+}
+
+#[test]
+fn emits_array_write_back_identity_from_parsed() {
+    // (not (= (store a i (select a i)) a)) — write_back_identity.smt2.
+    let inner = ax_store(
+        ax_sym("a"),
+        ax_sym("i"),
+        ax_select(ax_sym("a"), ax_sym("i")),
+    );
+    let parsed = vec![ax_neq(inner, ax_sym("a"))];
+    let lean = emit_array_write_back_identity_firewall_lean_from_parsed(&parsed)
+        .expect("write-back identity should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("theorem no_model"));
+    assert!(lean.contains("ArrayThy.ext_nonvacuous"));
+    assert!(lean.contains("(fun j => if j = m.i then m.a m.i else m.a j) = m.a"));
+    assert!(lean.contains("firewall_combined_unsat"));
+}
+
+#[test]
+fn array_write_back_declines_wrong_value() {
+    // (not (= (store a i (select a j)) a)) — stored value reads a DIFFERENT index,
+    // not the write-back identity; decline (fail-closed).
+    let inner = ax_store(
+        ax_sym("a"),
+        ax_sym("i"),
+        ax_select(ax_sym("a"), ax_sym("j")),
+    );
+    let parsed = vec![ax_neq(inner, ax_sym("a"))];
+    assert!(emit_array_write_back_identity_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+#[test]
+fn emits_array_store_eq_select_eq_from_parsed() {
+    // (= (store a i v) (store b i w)) ∧ (not (= v w)) — store_eq_implies_select_eq.
+    let eqn = ax_eq(
+        ax_store(ax_sym("a"), ax_sym("i"), ax_sym("v")),
+        ax_store(ax_sym("b"), ax_sym("i"), ax_sym("w")),
+    );
+    let parsed = vec![eqn, ax_neq(ax_sym("v"), ax_sym("w"))];
+    let lean = emit_array_store_eq_select_eq_firewall_lean_from_parsed(&parsed)
+        .expect("store-eq ⇒ value-eq should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("theorem no_model"));
+    assert!(lean.contains("ArrayThy.sel_upd_same"));
+    assert!(lean.contains("decide (m.v = m.w)"));
+    assert!(lean.contains("firewall_combined_unsat"));
+}
+
+#[test]
+fn array_store_eq_select_eq_declines_distinct_index() {
+    // (= (store a i v) (store b k w)) ∧ (not (= v w)) — different store indices, so
+    // v = w does NOT follow; decline (fail-closed).
+    let eqn = ax_eq(
+        ax_store(ax_sym("a"), ax_sym("i"), ax_sym("v")),
+        ax_store(ax_sym("b"), ax_sym("k"), ax_sym("w")),
+    );
+    let parsed = vec![eqn, ax_neq(ax_sym("v"), ax_sym("w"))];
+    assert!(emit_array_store_eq_select_eq_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+#[test]
+fn emits_array_store_eq_base_other_from_parsed() {
+    // (= (store a i v) (store b i w)), (not (= i j)),
+    // (not (= (select a j) (select b j))) — store_eq_implies_base_eq_at_other.
+    let eqn = ax_eq(
+        ax_store(ax_sym("a"), ax_sym("i"), ax_sym("v")),
+        ax_store(ax_sym("b"), ax_sym("i"), ax_sym("w")),
+    );
+    let sel_diseq = ax_neq(
+        ax_select(ax_sym("a"), ax_sym("j")),
+        ax_select(ax_sym("b"), ax_sym("j")),
+    );
+    let parsed = vec![eqn, ax_neq(ax_sym("i"), ax_sym("j")), sel_diseq];
+    let lean = emit_array_store_eq_base_other_firewall_lean_from_parsed(&parsed)
+        .expect("store-eq ⇒ base-eq at other should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("theorem no_model"));
+    assert!(lean.contains("ArrayThy.sel_upd_other"));
+    assert!(lean.contains("decide (m.a m.j = m.b m.j)"));
+    assert!(lean.contains("firewall_combined_unsat"));
+}
+
+#[test]
+fn array_store_eq_base_other_declines_without_index_diseq() {
+    // Missing the (not (= i j)) guard: select a j = select b j does NOT follow;
+    // decline (fail-closed).
+    let eqn = ax_eq(
+        ax_store(ax_sym("a"), ax_sym("i"), ax_sym("v")),
+        ax_store(ax_sym("b"), ax_sym("i"), ax_sym("w")),
+    );
+    let sel_diseq = ax_neq(
+        ax_select(ax_sym("a"), ax_sym("j")),
+        ax_select(ax_sym("b"), ax_sym("j")),
+    );
+    let parsed = vec![eqn, sel_diseq];
+    assert!(emit_array_store_eq_base_other_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+#[test]
+fn emits_array_eq_select_from_parsed() {
+    // (= a b) ∧ (not (= (select a i) (select b i))) — array_eq_select.smt2.
+    let parsed = vec![
+        ax_eq(ax_sym("a"), ax_sym("b")),
+        ax_neq(
+            ax_select(ax_sym("a"), ax_sym("i")),
+            ax_select(ax_sym("b"), ax_sym("i")),
+        ),
+    ];
+    let lean = emit_array_eq_select_firewall_lean_from_parsed(&parsed)
+        .expect("array-eq ⇒ select-eq should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("theorem no_model"));
+    assert!(lean.contains("decide (m.a m.i = m.b m.i)"));
+    assert!(lean.contains("firewall_combined_unsat"));
+}
+
+#[test]
+fn array_eq_select_declines_without_array_eq() {
+    // No (= a b): select a i ≠ select b i is SAT; must NOT emit a refutation.
+    let parsed = vec![ax_neq(
+        ax_select(ax_sym("a"), ax_sym("i")),
+        ax_select(ax_sym("b"), ax_sym("i")),
+    )];
+    assert!(emit_array_eq_select_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+#[test]
+fn emits_array_store_congruence_from_parsed() {
+    // (= a b) ∧ (not (= (store a i v) (store b i v))) — ext_congruence.smt2.
+    let parsed = vec![
+        ax_eq(ax_sym("a"), ax_sym("b")),
+        ax_neq(
+            ax_store(ax_sym("a"), ax_sym("i"), ax_sym("v")),
+            ax_store(ax_sym("b"), ax_sym("i"), ax_sym("v")),
+        ),
+    ];
+    let lean = emit_array_store_congruence_firewall_lean_from_parsed(&parsed)
+        .expect("array-eq ⇒ store-eq should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("theorem no_model"));
+    assert!(lean.contains("(fun j => if j = m.i then m.v else m.a j)"));
+    assert!(lean.contains("firewall_combined_unsat"));
+}
+
+#[test]
+fn array_store_congruence_declines_distinct_value() {
+    // (= a b) ∧ (not (= (store a i v) (store b i w))) with v ≠ w: store equality
+    // does NOT follow from a = b; decline (fail-closed).
+    let parsed = vec![
+        ax_eq(ax_sym("a"), ax_sym("b")),
+        ax_neq(
+            ax_store(ax_sym("a"), ax_sym("i"), ax_sym("v")),
+            ax_store(ax_sym("b"), ax_sym("i"), ax_sym("w")),
+        ),
+    ];
+    assert!(emit_array_store_congruence_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+#[test]
+fn emits_array_eq_chain_row1_from_parsed() {
+    // (= a b), (= b (store c i v)), (= c d), (not (= (select a i) v)) —
+    // eq_chain_four_arrays.smt2. The chain a = b = store(c,i,v) + ROW-1.
+    let parsed = vec![
+        ax_eq(ax_sym("a"), ax_sym("b")),
+        ax_eq(ax_sym("b"), ax_store(ax_sym("c"), ax_sym("i"), ax_sym("v"))),
+        ax_eq(ax_sym("c"), ax_sym("d")),
+        ax_neq(ax_select(ax_sym("a"), ax_sym("i")), ax_sym("v")),
+    ];
+    let lean = emit_array_eq_chain_row1_firewall_lean_from_parsed(&parsed)
+        .expect("equality-chain ⇒ ROW-1 should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("theorem no_model"));
+    assert!(lean.contains("ArrayThy.sel_upd_same"));
+    assert!(lean.contains(".trans"));
+    assert!(lean.contains("firewall_combined_unsat"));
+}
+
+#[test]
+fn array_eq_chain_row1_declines_without_chain() {
+    // (not (= (select a i) v)) alone — no equality chain to a store; decline.
+    let parsed = vec![ax_neq(ax_select(ax_sym("a"), ax_sym("i")), ax_sym("v"))];
+    assert!(emit_array_eq_chain_row1_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+// ---- store commutativity (storecomm_*): direct array and read-forwarded ----
+
+#[test]
+fn emits_array_store_commute_direct_from_parsed() {
+    // storecomm_minimal / storecomm_array_diseq (byte-identical):
+    // (not (= i j)),
+    // (not (= (store (store a i v) j w) (store (store a j w) i v))).
+    // Two orderings of the same two writes; equal by extensionality under i ≠ j.
+    let store_l = ax_store(
+        ax_store(ax_sym("a"), ax_sym("i"), ax_sym("v")),
+        ax_sym("j"),
+        ax_sym("w"),
+    );
+    let store_r = ax_store(
+        ax_store(ax_sym("a"), ax_sym("j"), ax_sym("w")),
+        ax_sym("i"),
+        ax_sym("v"),
+    );
+    let parsed = vec![ax_neq(ax_sym("i"), ax_sym("j")), ax_neq(store_l, store_r)];
+    let lean = emit_array_store_commute_firewall_lean_from_parsed(&parsed)
+        .expect("direct store-commutativity should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("namespace AySoundness.Emitted.ArrStoreComm_"));
+    assert!(lean.contains("theorem no_model"));
+    assert!(lean.contains("firewall_combined_unsat"));
+    // DIRECT form: function-equality atom (noncomputable via Classical) proved by
+    // funext, guarded by the single index coincidence.
+    assert!(lean.contains("attribute [local instance] Classical.propDecidable"));
+    assert!(lean.contains("noncomputable def atomVal"));
+    assert!(lean.contains("funext x"));
+    assert!(lean.contains("def lemmas   : List (Cid × Clause) := [(3, [1, 2])]"));
+}
+
+#[test]
+fn emits_array_store_commute_select_from_parsed() {
+    // storecomm_sf_minimal, define-funs already expanded:
+    // (not (= i1 i2)),
+    // (not (= (select (store (store a i1 v1) i2 v2) k)
+    //         (select (store (store a i2 v2) i1 v1) k))).
+    let l = ax_store(
+        ax_store(ax_sym("a"), ax_sym("i1"), ax_sym("v1")),
+        ax_sym("i2"),
+        ax_sym("v2"),
+    );
+    let r = ax_store(
+        ax_store(ax_sym("a"), ax_sym("i2"), ax_sym("v2")),
+        ax_sym("i1"),
+        ax_sym("v1"),
+    );
+    let parsed = vec![
+        ax_neq(ax_sym("i1"), ax_sym("i2")),
+        ax_neq(ax_select(l, ax_sym("k")), ax_select(r, ax_sym("k"))),
+    ];
+    let lean = emit_array_store_commute_firewall_lean_from_parsed(&parsed)
+        .expect("read-forwarded store-commutativity should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("namespace AySoundness.Emitted.ArrStoreComm_"));
+    assert!(lean.contains("firewall_combined_unsat"));
+    // SELECT form: values compared as Nat — computable atom (no Classical / funext).
+    assert!(!lean.contains("Classical.propDecidable"));
+    assert!(!lean.contains("noncomputable def atomVal"));
+    assert!(!lean.contains("funext"));
+    assert!(lean.contains("by_cases"));
+}
+
+#[test]
+fn emits_array_store_commute_select_3idx_from_parsed() {
+    // storecomm_sf_3idx (expanded): 1-2-3 vs 3-2-1 orderings, three pairwise
+    // index disequalities backing the guards, read forwarded at k.
+    let l = ax_store(
+        ax_store(
+            ax_store(ax_sym("a"), ax_sym("i1"), ax_sym("v1")),
+            ax_sym("i2"),
+            ax_sym("v2"),
+        ),
+        ax_sym("i3"),
+        ax_sym("v3"),
+    );
+    let r = ax_store(
+        ax_store(
+            ax_store(ax_sym("a"), ax_sym("i3"), ax_sym("v3")),
+            ax_sym("i2"),
+            ax_sym("v2"),
+        ),
+        ax_sym("i1"),
+        ax_sym("v1"),
+    );
+    let parsed = vec![
+        ax_neq(ax_sym("i1"), ax_sym("i2")),
+        ax_neq(ax_sym("i1"), ax_sym("i3")),
+        ax_neq(ax_sym("i2"), ax_sym("i3")),
+        ax_neq(ax_select(l, ax_sym("k")), ax_select(r, ax_sym("k"))),
+    ];
+    let lean = emit_array_store_commute_firewall_lean_from_parsed(&parsed)
+        .expect("3-index read-forwarded store-commutativity should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    // Three pairwise coincidences ⇒ guard atoms 2,3,4, lemma clause [1,2,3,4].
+    assert!(lean.contains("def lemmas   : List (Cid × Clause) := [(5, [1, 2, 3, 4])]"));
+    assert!(lean.contains("firewall_combined_unsat"));
+}
+
+#[test]
+fn emits_array_store_commute_defexpanded_from_parsed() {
+    // The REAL storecomm_sf_minimal shape: `lhs`/`rhs` are nullary define-fun
+    // macros whose bodies are opposite-order 2-store chains, and the target reads
+    // both at `k`. The nested emitter declines (the read index is unconstrained,
+    // so its unbacked guards do not close); the store-commute emitter in the
+    // define-fun-expansion chain grounds it.
+    let lbody = ax_store(
+        ax_store(ax_sym("a"), ax_sym("i1"), ax_sym("v1")),
+        ax_sym("i2"),
+        ax_sym("v2"),
+    );
+    let rbody = ax_store(
+        ax_store(ax_sym("a"), ax_sym("i2"), ax_sym("v2")),
+        ax_sym("i1"),
+        ax_sym("v1"),
+    );
+    let target = ax_neq(
+        ax_select(ax_sym("lhs"), ax_sym("k")),
+        ax_select(ax_sym("rhs"), ax_sym("k")),
+    );
+    let parsed = vec![ax_neq(ax_sym("i1"), ax_sym("i2")), target];
+    let defs = vec![("lhs".to_string(), lbody), ("rhs".to_string(), rbody)];
+    let lean = emit_array_defexpanded_firewall_lean_from_parsed(&parsed, &defs)
+        .expect("define-fun-expanded store-commutativity should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("namespace AySoundness.Emitted.ArrStoreComm_"));
+    assert!(lean.contains("firewall_combined_unsat"));
+    // Declines when no macro expands (empty defs — nothing to substitute).
+    assert!(emit_array_defexpanded_firewall_lean_from_parsed(&parsed, &[]).is_none());
+}
+
+#[test]
+fn array_store_commute_declines_without_index_diseq() {
+    // Same two store orderings but NO (not (= i j)): the guard is unbacked, so the
+    // arrays are NOT equal in general (i = j gives store a i w ≠ store a i v);
+    // decline (fail-closed).
+    let store_l = ax_store(
+        ax_store(ax_sym("a"), ax_sym("i"), ax_sym("v")),
+        ax_sym("j"),
+        ax_sym("w"),
+    );
+    let store_r = ax_store(
+        ax_store(ax_sym("a"), ax_sym("j"), ax_sym("w")),
+        ax_sym("i"),
+        ax_sym("v"),
+    );
+    let parsed = vec![ax_neq(store_l, store_r)];
+    assert!(emit_array_store_commute_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+#[test]
+fn array_store_commute_declines_non_permutation() {
+    // (not (= i j)) with (not (= (store (store a i v) j w) (store (store a j w) i v2)))
+    // — the two chains write DIFFERENT values at index i (v vs v2), so they are not
+    // the same array even under i ≠ j; decline (fail-closed).
+    let store_l = ax_store(
+        ax_store(ax_sym("a"), ax_sym("i"), ax_sym("v")),
+        ax_sym("j"),
+        ax_sym("w"),
+    );
+    let store_r = ax_store(
+        ax_store(ax_sym("a"), ax_sym("j"), ax_sym("w")),
+        ax_sym("i"),
+        ax_sym("v2"),
+    );
+    let parsed = vec![ax_neq(ax_sym("i"), ax_sym("j")), ax_neq(store_l, store_r)];
+    assert!(emit_array_store_commute_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+// ---- conflicting stores (conflicting_stores.smt2): ROW-1 through a variable ----
+
+#[test]
+fn emits_array_conflicting_stores_from_parsed() {
+    // (not (= e1 e2)), (= a (store b i e1)), (= a (store b i e2)).
+    let parsed = vec![
+        ax_neq(ax_sym("e1"), ax_sym("e2")),
+        ax_eq(
+            ax_sym("a"),
+            ax_store(ax_sym("b"), ax_sym("i"), ax_sym("e1")),
+        ),
+        ax_eq(
+            ax_sym("a"),
+            ax_store(ax_sym("b"), ax_sym("i"), ax_sym("e2")),
+        ),
+    ];
+    let lean = emit_array_conflicting_stores_firewall_lean_from_parsed(&parsed)
+        .expect("conflicting stores should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("namespace AySoundness.Emitted.ArrConflStores_"));
+    assert!(lean.contains("ArrayThy.sel_upd_same"));
+    assert!(lean.contains("decide (m.e1 = m.e2)"));
+    assert!(lean.contains("firewall_combined_unsat"));
+}
+
+#[test]
+fn array_conflicting_stores_declines_distinct_index() {
+    // Two stores bound to the same variable but at DIFFERENT indices: e1 = e2 does
+    // not follow; decline (fail-closed).
+    let parsed = vec![
+        ax_neq(ax_sym("e1"), ax_sym("e2")),
+        ax_eq(
+            ax_sym("a"),
+            ax_store(ax_sym("b"), ax_sym("i"), ax_sym("e1")),
+        ),
+        ax_eq(
+            ax_sym("a"),
+            ax_store(ax_sym("b"), ax_sym("k"), ax_sym("e2")),
+        ),
+    ];
+    assert!(emit_array_conflicting_stores_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+#[test]
+fn array_conflicting_stores_declines_without_value_diseq() {
+    // No (not (= e1 e2)): the two bindings are jointly satisfiable (e1 = e2);
+    // decline (fail-closed).
+    let parsed = vec![
+        ax_eq(
+            ax_sym("a"),
+            ax_store(ax_sym("b"), ax_sym("i"), ax_sym("e1")),
+        ),
+        ax_eq(
+            ax_sym("a"),
+            ax_store(ax_sym("b"), ax_sym("i"), ax_sym("e2")),
+        ),
+    ];
+    assert!(emit_array_conflicting_stores_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+// ---- diamond conflict (diamond_conflict.smt2): store-eq ⇒ ROW-1 vs ROW-2 ----
+
+#[test]
+fn emits_array_diamond_conflict_from_parsed() {
+    // (= b (store a i v)), (= c (store a j w)), (not (= i j)), (= b c),
+    // (not (= v (select a i))).
+    let parsed = vec![
+        ax_eq(ax_sym("b"), ax_store(ax_sym("a"), ax_sym("i"), ax_sym("v"))),
+        ax_eq(ax_sym("c"), ax_store(ax_sym("a"), ax_sym("j"), ax_sym("w"))),
+        ax_neq(ax_sym("i"), ax_sym("j")),
+        ax_eq(ax_sym("b"), ax_sym("c")),
+        ax_neq(ax_sym("v"), ax_select(ax_sym("a"), ax_sym("i"))),
+    ];
+    let lean = emit_array_diamond_conflict_firewall_lean_from_parsed(&parsed)
+        .expect("diamond conflict should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("namespace AySoundness.Emitted.ArrDiamond_"));
+    assert!(lean.contains("decide (m.v = m.a m.i)"));
+    assert!(lean.contains("firewall_combined_unsat"));
+}
+
+#[test]
+fn array_diamond_conflict_declines_without_index_diseq() {
+    // Missing (not (= i j)): under i = j the read-back need not hit the base at i,
+    // so v = select a i does not follow; decline (fail-closed).
+    let parsed = vec![
+        ax_eq(ax_sym("b"), ax_store(ax_sym("a"), ax_sym("i"), ax_sym("v"))),
+        ax_eq(ax_sym("c"), ax_store(ax_sym("a"), ax_sym("j"), ax_sym("w"))),
+        ax_eq(ax_sym("b"), ax_sym("c")),
+        ax_neq(ax_sym("v"), ax_select(ax_sym("a"), ax_sym("i"))),
+    ];
+    assert!(emit_array_diamond_conflict_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+#[test]
+fn array_diamond_conflict_declines_different_base() {
+    // The two stores are over DIFFERENT bases (a vs d): reading `store d j w` at i
+    // yields `d i`, not `a i`, so `v = select a i` does not follow; decline.
+    let parsed = vec![
+        ax_eq(ax_sym("b"), ax_store(ax_sym("a"), ax_sym("i"), ax_sym("v"))),
+        ax_eq(ax_sym("c"), ax_store(ax_sym("d"), ax_sym("j"), ax_sym("w"))),
+        ax_neq(ax_sym("i"), ax_sym("j")),
+        ax_eq(ax_sym("b"), ax_sym("c")),
+        ax_neq(ax_sym("v"), ax_select(ax_sym("a"), ax_sym("i"))),
+    ];
+    assert!(emit_array_diamond_conflict_firewall_lean_from_parsed(&parsed).is_none());
+}
+
+fn register_firewall_test_constant(context: &mut ay_frontend::Context, name: &str, sort: Sort) {
+    let term = context.terms.mk_var(name, sort.clone());
+    context.register_symbol(name.to_string(), term, sort);
+}
+
+fn cbr_typed_context(numeric_sort: Sort) -> ay_frontend::Context {
+    let mut context = ay_frontend::Context::new();
+    for name in ["a", "b", "c", "x", "y"] {
+        register_firewall_test_constant(&mut context, name, numeric_sort.clone());
+    }
+    register_firewall_test_constant(&mut context, "arr", Sort::array(Sort::Int, Sort::Int));
+    context
+        .register_native_function_alias(
+            "f".to_string(),
+            "__firewall_test_f".to_string(),
+            vec![numeric_sort.clone()],
+            numeric_sort,
+        )
+        .expect("test UF declaration should be valid");
+    context
+}
+
+fn c4_typed_context(element_sort: Sort) -> ay_frontend::Context {
+    let mut context = ay_frontend::Context::new();
+    let array_sort = Sort::array(Sort::Int, element_sort);
+    for name in ["a", "b"] {
+        register_firewall_test_constant(&mut context, name, array_sort.clone());
+    }
+    context
+}
+
+// ==== APPENDED TESTS: euf_cong_bridge (UF congruence closing an LIA system) ====
+#[test]
+fn emits_euf_cong_bridge_uf_in_bounds_from_parsed() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+    let context = cbr_typed_context(Sort::Int);
+
+    // a = b, f(a) < 0, f(b) >= 0 : congruence a=b => f(a)=f(b), then omega-unsat.
+    let parsed = vec![
+        app("=", vec![sym("a"), sym("b")]),
+        app("<", vec![app("f", vec![sym("a")]), num("0")]),
+        app(">=", vec![app("f", vec![sym("b")]), num("0")]),
+    ];
+    let lean = emit_euf_congruence_bridge_firewall_lean_from_parsed(&parsed, &context)
+        .expect("UF-in-bounds congruence conflict should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    for needle in [
+        "import AySoundness.Firewall",
+        "firewall_combined_unsat",
+        "f_f : Int -> Int",
+        "m.f_f (m.x_a) < (0 : Int)",
+        "m.f_f (m.x_b) >= (0 : Int)",
+        "have hbr0 : m.f_f (m.x_a) = m.f_f (m.x_b)",
+        "rw [he0]",
+        "omega",
+        "theorem no_model",
+    ] {
+        assert!(lean.contains(needle), "emitted Lean missing: {needle}");
+    }
+}
+
+#[test]
+fn emits_euf_cong_bridge_uf_diseq_drops_inert_store_from_parsed() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+    let context = cbr_typed_context(Sort::Int);
+
+    // (x+1)=(y+1), (store a (f x) 0)=(store a (f y) 0) [INERT, dropped], f(x)!=f(y).
+    // x=y => f(x)=f(y) by congruence, contradicting the disequality.
+    let parsed = vec![
+        app(
+            "=",
+            vec![
+                app("+", vec![sym("x"), num("1")]),
+                app("+", vec![sym("y"), num("1")]),
+            ],
+        ),
+        app(
+            "=",
+            vec![
+                app(
+                    "store",
+                    vec![sym("arr"), app("f", vec![sym("x")]), num("0")],
+                ),
+                app(
+                    "store",
+                    vec![sym("arr"), app("f", vec![sym("y")]), num("0")],
+                ),
+            ],
+        ),
+        app(
+            "not",
+            vec![app(
+                "=",
+                vec![app("f", vec![sym("x")]), app("f", vec![sym("y")])],
+            )],
+        ),
+    ];
+    let lean = emit_euf_congruence_bridge_firewall_lean_from_parsed(&parsed, &context)
+        .expect("UF-disequality congruence conflict should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    for needle in [
+        "firewall_combined_unsat",
+        "decide (m.f_f (m.x_x) = m.f_f (m.x_y))",
+        "have hbr0 : m.f_f (m.x_x) = m.f_f (m.x_y)",
+        "theorem no_model",
+    ] {
+        assert!(lean.contains(needle), "emitted Lean missing: {needle}");
+    }
+    // The inert array-store equality must NOT appear as a modelled atom (2 atoms).
+    assert!(
+        !lean.contains("store"),
+        "inert array-store assertion should have been dropped from the core"
+    );
+    assert!(
+        lean.contains("[(1, [1]), (2, [-2])]"),
+        "expected exactly two core atoms"
+    );
+}
+
+#[test]
+fn euf_cong_bridge_declines_without_congruence_conflict() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+    let int_context = cbr_typed_context(Sort::Int);
+    let real_context = cbr_typed_context(Sort::Real);
+
+    // (a) No implied equality: a, b unconstrained; f(a)<0, f(b)>=0 is SAT.
+    let no_eq = vec![
+        app("<", vec![app("f", vec![sym("a")]), num("0")]),
+        app(">=", vec![app("f", vec![sym("b")]), num("0")]),
+    ];
+    assert!(emit_euf_congruence_bridge_firewall_lean_from_parsed(&no_eq, &int_context).is_none());
+
+    // (b) Consistent under congruence: a=b, f(a)>=0, f(b)>=0 -- no conflict.
+    let consistent = vec![
+        app("=", vec![sym("a"), sym("b")]),
+        app(">=", vec![app("f", vec![sym("a")]), num("0")]),
+        app(">=", vec![app("f", vec![sym("b")]), num("0")]),
+    ];
+    assert!(
+        emit_euf_congruence_bridge_firewall_lean_from_parsed(&consistent, &int_context).is_none()
+    );
+
+    // (c) Pure-LIA conflict with NO uninterpreted function: x>=5, x<=3. Infeasible
+    // but no congruence bridge -> declined (left to the LIA emitter).
+    let pure_lia = vec![
+        app(">=", vec![sym("x"), num("5")]),
+        app("<=", vec![sym("x"), num("3")]),
+    ];
+    assert!(
+        emit_euf_congruence_bridge_firewall_lean_from_parsed(&pure_lia, &int_context).is_none()
+    );
+
+    // (d) Real / QF_UFLRA gate: decimal numerals are not Int -> decline.
+    let real = vec![
+        app("=", vec![sym("a"), sym("b")]),
+        app(
+            "<",
+            vec![
+                app("f", vec![sym("a")]),
+                PTerm::Const(PConst::Decimal("0.0".to_string())),
+            ],
+        ),
+        app(
+            ">=",
+            vec![
+                app("f", vec![sym("b")]),
+                PTerm::Const(PConst::Decimal("0.0".to_string())),
+            ],
+        ),
+    ];
+    assert!(emit_euf_congruence_bridge_firewall_lean_from_parsed(&real, &real_context).is_none());
+
+    // (e) Empty assertion list -> decline.
+    assert!(emit_euf_congruence_bridge_firewall_lean_from_parsed(&[], &int_context).is_none());
+}
+
+#[test]
+fn euf_cong_bridge_declines_numeral_only_real_strict_gap() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, args: Vec<PTerm>| PTerm::App(op.to_string(), args);
+    let context = cbr_typed_context(Sort::Real);
+
+    // SAT over Real: choose a=b and f(a)=f(b)=1/2. The former untyped emitter
+    // rounded >0/<1 to integer bounds 1/0 and emitted a false local conflict.
+    let parsed = vec![
+        app("=", vec![sym("a"), sym("b")]),
+        app(">", vec![app("f", vec![sym("a")]), num("0")]),
+        app("<", vec![app("f", vec![sym("b")]), num("1")]),
+    ];
+    assert!(
+        emit_euf_congruence_bridge_firewall_lean_from_parsed(&parsed, &context).is_none(),
+        "a numeral-spelled Real formula must not be reinterpreted over Int"
+    );
+}
+
+#[test]
+fn euf_cong_bridge_declines_missing_or_ambiguous_surface_types() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, args: Vec<PTerm>| PTerm::App(op.to_string(), args);
+    let parsed = vec![
+        app("=", vec![sym("a"), sym("b")]),
+        app("<", vec![app("f", vec![sym("a")]), num("0")]),
+        app(">=", vec![app("f", vec![sym("b")]), num("0")]),
+    ];
+
+    let missing = ay_frontend::Context::new();
+    assert!(emit_euf_congruence_bridge_firewall_lean_from_parsed(&parsed, &missing).is_none());
+
+    let mut ambiguous = cbr_typed_context(Sort::Int);
+    ambiguous
+        .register_native_function_alias(
+            "f".to_string(),
+            "__firewall_test_f_real".to_string(),
+            vec![Sort::Real],
+            Sort::Real,
+        )
+        .expect("test overload should be valid");
+    assert!(
+        emit_euf_congruence_bridge_firewall_lean_from_parsed(&parsed, &ambiguous).is_none(),
+        "surface overloads have no identity in ParsedTerm and must be declined"
+    );
+}
+
+#[test]
+fn euf_cong_bridge_declines_i64_analysis_overflow() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, args: Vec<PTerm>| PTerm::App(op.to_string(), args);
+    let context = cbr_typed_context(Sort::Int);
+    let max = i64::MAX.to_string();
+
+    // Legal unbounded SMT Int arithmetic, but MAX+1 is outside the recognizer's
+    // deliberately bounded i64 analysis domain. Decline; never panic or wrap.
+    let normalization_overflow = vec![
+        app("=", vec![sym("a"), sym("b")]),
+        app(
+            ">",
+            vec![
+                app("+", vec![app("f", vec![sym("a")]), num(&max), num("1")]),
+                num("0"),
+            ],
+        ),
+        app("<", vec![app("f", vec![sym("b")]), num("0")]),
+    ];
+    assert!(emit_euf_congruence_bridge_firewall_lean_from_parsed(
+        &normalization_overflow,
+        &context,
+    )
+    .is_none());
+
+    // This normalizes to coefficient 1 and constant MIN without overflowing;
+    // converting `x + MIN > 0` to an inclusive i64 lower bound would exceed MAX.
+    let bound_overflow = vec![
+        app("=", vec![sym("a"), sym("b")]),
+        app(
+            ">",
+            vec![
+                app(
+                    "+",
+                    vec![
+                        app("f", vec![sym("a")]),
+                        app("-", vec![num(&max)]),
+                        app("-", vec![num("1")]),
+                    ],
+                ),
+                num("0"),
+            ],
+        ),
+        app("<", vec![app("f", vec![sym("b")]), num("0")]),
+    ];
+    assert!(
+        emit_euf_congruence_bridge_firewall_lean_from_parsed(&bound_overflow, &context).is_none()
+    );
+}
+
+// ==== APPENDED TESTS: array_sum_bound (fused array-ROW + LIA) ====
+#[test]
+fn emits_array_sum_bound_from_parsed() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+    let sel = |a: &str, i: &str| app("select", vec![sym(a), num(i)]);
+    let store = |b: &str, i: &str, v: &str| app("store", vec![sym(b), num(i), num(v)]);
+    let context = c4_typed_context(Sort::Int);
+
+    // b=store(a,0,10), b=store(b,1,20), (select b 0)+(select b 1) > 31 : 30 !> 31.
+    let parsed = vec![
+        app("=", vec![sym("b"), store("a", "0", "10")]),
+        app("=", vec![sym("b"), store("b", "1", "20")]),
+        app(
+            ">",
+            vec![app("+", vec![sel("b", "0"), sel("b", "1")]), num("31")],
+        ),
+    ];
+    let lean = emit_array_sum_bound_firewall_lean_from_parsed(&parsed, &context)
+        .expect("fused array-ROW + LIA conflict should emit");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    for needle in [
+        "import AySoundness.Firewall",
+        "firewall_combined_unsat",
+        "Classical.propDecidable",
+        "a : Int -> Int",
+        "b : Int -> Int",
+        "(m.b (0 : Int) + m.b (1 : Int)) > (31 : Int)",
+        "have e_b_0 : m.b (0 : Int) = (10 : Int)",
+        "have e_b_1 : m.b (1 : Int) = (20 : Int)",
+        "congrFun h1",
+        "congrFun h2",
+        "omega",
+        "theorem no_model",
+    ] {
+        assert!(lean.contains(needle), "emitted Lean missing: {needle}");
+    }
+}
+
+#[test]
+fn array_sum_bound_declines_feasible_or_ungrounded() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+    let sel = |a: &str, i: &str| app("select", vec![sym(a), num(i)]);
+    let store = |b: &str, i: &str, v: &str| app("store", vec![sym(b), num(i), num(v)]);
+    let context = c4_typed_context(Sort::Int);
+
+    // (a) FEASIBLE: 10 + 20 = 30 > 29 holds -> no conflict -> decline.
+    let feasible = vec![
+        app("=", vec![sym("b"), store("a", "0", "10")]),
+        app("=", vec![sym("b"), store("b", "1", "20")]),
+        app(
+            ">",
+            vec![app("+", vec![sel("b", "0"), sel("b", "1")]), num("29")],
+        ),
+    ];
+    assert!(emit_array_sum_bound_firewall_lean_from_parsed(&feasible, &context).is_none());
+
+    // (b) NO store equality -> decline.
+    let no_store = vec![app(">", vec![sel("b", "0"), num("31")])];
+    assert!(emit_array_sum_bound_firewall_lean_from_parsed(&no_store, &context).is_none());
+
+    // (c) UNGROUNDABLE read: store writes index 5, read is at index 0 -> decline.
+    let ungrounded = vec![
+        app("=", vec![sym("b"), store("a", "5", "10")]),
+        app(">", vec![sel("b", "0"), num("31")]),
+    ];
+    assert!(emit_array_sum_bound_firewall_lean_from_parsed(&ungrounded, &context).is_none());
+
+    // (d) Empty -> decline.
+    assert!(emit_array_sum_bound_firewall_lean_from_parsed(&[], &context).is_none());
+}
+
+#[test]
+fn array_sum_bound_declines_non_int_missing_or_ambiguous_array_types() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, args: Vec<PTerm>| PTerm::App(op.to_string(), args);
+    let sel = |array: &str, index: &str| app("select", vec![sym(array), num(index)]);
+    let store = |base: &str, index: &str, value: &str| {
+        app("store", vec![sym(base), num(index), num(value)])
+    };
+    let parsed = vec![
+        app("=", vec![sym("b"), store("a", "0", "10")]),
+        app("=", vec![sym("b"), store("b", "1", "20")]),
+        app(
+            ">",
+            vec![app("+", vec![sel("b", "0"), sel("b", "1")]), num("31")],
+        ),
+    ];
+
+    let real_elements = c4_typed_context(Sort::Real);
+    assert!(
+        emit_array_sum_bound_firewall_lean_from_parsed(&parsed, &real_elements).is_none(),
+        "an Array Int Real formula must not be reinterpreted as Array Int Int"
+    );
+
+    let missing = ay_frontend::Context::new();
+    assert!(emit_array_sum_bound_firewall_lean_from_parsed(&parsed, &missing).is_none());
+
+    let mut ambiguous = c4_typed_context(Sort::Int);
+    ambiguous
+        .register_native_function_alias(
+            "b".to_string(),
+            "__firewall_test_b_real_array".to_string(),
+            Vec::new(),
+            Sort::array(Sort::Int, Sort::Real),
+        )
+        .expect("test array overload should be valid");
+    assert!(
+        emit_array_sum_bound_firewall_lean_from_parsed(&parsed, &ambiguous).is_none(),
+        "ambiguous surface array names must be declined"
+    );
+}
+
+#[test]
+fn array_sum_bound_declines_i64_grounding_overflow() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let app = |op: &str, args: Vec<PTerm>| PTerm::App(op.to_string(), args);
+    let context = c4_typed_context(Sort::Int);
+    let max = i64::MAX.to_string();
+
+    // Grounding the read produces MAX+1, outside the recognizer's i64 analysis
+    // domain. The SMT Int expression is legal; the diagnostic must just decline.
+    let parsed = vec![
+        app(
+            "=",
+            vec![sym("b"), app("store", vec![sym("a"), num("0"), num(&max)])],
+        ),
+        app(
+            ">",
+            vec![
+                app("+", vec![app("select", vec![sym("b"), num("0")]), num("1")]),
+                num("0"),
+            ],
+        ),
+    ];
+    assert!(emit_array_sum_bound_firewall_lean_from_parsed(&parsed, &context).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// LIA firewall: subset-refutation faithfulness + `first`-combinator hygiene.
+// ---------------------------------------------------------------------------
+
+/// Build the `la_generic` clause AY derives for
+/// `benchmarks/smt/QF_LIA/pigeonhole_3_2.smt2` — five negated comparisons over
+/// the six 0/1 variables. The six binary-domain assertions are NOT part of it:
+/// the emitted artifact refutes a strict SUBSET of the query's atoms.
+fn pigeonhole_3_2_la_generic(terms: &mut TermStore) -> Vec<TermId> {
+    let v: Vec<TermId> = ["p11", "p21", "p31", "p12", "p22", "p32"]
+        .iter()
+        .map(|n| terms.mk_var(*n, Sort::Int))
+        .collect();
+    let one = terms.mk_int(num_bigint::BigInt::from(1));
+    fn sum(terms: &mut TermStore, xs: Vec<TermId>) -> TermId {
+        terms.mk_app(Symbol::named("+"), xs, Sort::Int)
+    }
+    // Hole capacity bounds.
+    let hole1 = sum(terms, vec![v[0], v[1], v[2]]);
+    let hole2 = sum(terms, vec![v[3], v[4], v[5]]);
+    let c1 = cmp(terms, "<=", hole1, one);
+    let c2 = cmp(terms, "<=", hole2, one);
+    // "Exactly one hole" per pigeon, written `1 = pᵢ₂ + pᵢ₁` as AY renders it.
+    let p2 = sum(terms, vec![v[4], v[1]]);
+    let p1 = sum(terms, vec![v[3], v[0]]);
+    let p3 = sum(terms, vec![v[5], v[2]]);
+    let c3 = cmp(terms, "=", one, p2);
+    let c4 = cmp(terms, "=", one, p1);
+    let c5 = cmp(terms, "=", one, p3);
+    [c1, c2, c3, c4, c5]
+        .iter()
+        .map(|&c| terms.mk_not(c))
+        .collect()
+}
+
+#[test]
+fn lia_subset_refutation_is_faithful_to_the_query_atoms() {
+    // The emitted `original`/`atomVal` pair IS the refuted system. Witness that
+    // it renders exactly the lemma's comparisons, under an injective and total
+    // variable-to-index map, with one unit clause per atom.
+    let mut terms = TermStore::new();
+    let lits = pigeonhole_3_2_la_generic(&mut terms);
+    let lean = emit_lia_firewall_lean(&terms, &lits).expect("pigeonhole la_generic should emit");
+
+    // (a) Each atom is the faithful rendering of the corresponding literal, in
+    //     literal order, over SIX distinct valuation indices — one per query
+    //     variable, none conflated, none invented.
+    for arm in [
+        "| 1 => decide (((m 0) + (m 1) + (m 2)) ≤ (1 : Int))",
+        "| 2 => decide (((m 3) + (m 4) + (m 5)) ≤ (1 : Int))",
+        "| 3 => decide ((1 : Int) = ((m 4) + (m 1)))",
+        "| 4 => decide ((1 : Int) = ((m 3) + (m 0)))",
+        "| 5 => decide ((1 : Int) = ((m 5) + (m 2)))",
+    ] {
+        assert!(lean.contains(arm), "atom table missing/renamed: {arm}");
+    }
+    // The map is TOTAL over 0..5: every index occurs, none above.
+    for i in 0..6 {
+        assert!(lean.contains(&format!("(m {i})")), "variable {i} unmapped");
+    }
+    assert!(!lean.contains("(m 6)"), "index outside the variable map");
+
+    // (b) `original` is exactly one unit clause per atom, asserted with the
+    //     polarity OPPOSITE the lemma literal — the refuted system is the
+    //     rendered atoms and nothing else.
+    assert!(
+        lean.contains(
+            "def original : List (Cid × Clause) := [(1, [1]), (2, [2]), (3, [3]), (4, [4]), (5, [5])]"
+        ),
+        "original is not the per-atom unit-clause subset"
+    );
+    assert!(
+        lean.contains("def lemmas   : List (Cid × Clause) := [(6, [-1, -2, -3, -4, -5])]"),
+        "lemma clause does not negate exactly the asserted atoms"
+    );
+}
+
+#[test]
+fn lia_rejects_atoms_referencing_unmapped_valuation_indices() {
+    // The faithfulness side-condition itself: an atom mentioning an index the
+    // variable map never allocated must fail closed, never emit.
+    assert!(lia_atom_indices_are_in_range(["(m 0) ≤ (m 1)"], 2));
+    assert!(!lia_atom_indices_are_in_range(["(m 0) ≤ (m 2)"], 2));
+    assert!(!lia_atom_indices_are_in_range(["(m 0) ≤ (m )"], 2));
+    assert!(lia_atom_indices_are_in_range(["(1 : Int) ≤ (2 : Int)"], 0));
+}
+
+#[test]
+fn lia_lemma_tactic_keeps_the_case_split_first_while_it_is_affordable() {
+    // At or below the width bound the historical case-split product must stay
+    // the FIRST alternative, so every artifact that closes today keeps its proof
+    // term — and its axiom basis — unchanged.
+    let mut terms = TermStore::new();
+    let lits = pigeonhole_3_2_la_generic(&mut terms);
+    let lean = emit_lia_firewall_lean(&terms, &lits).expect("should emit");
+    let first_at = lean.find("first").expect("tactic must use `first`");
+    let case_at = lean[first_at..]
+        .find("by_cases h1")
+        .expect("case-split alternative missing");
+    let omega_at = lean[first_at..]
+        .find("Bool.or_eq_true")
+        .expect("linear alternative missing");
+    assert!(
+        case_at < omega_at,
+        "5 atoms is within MAX_CASE_SPLIT_FIRST_ATOMS; the case split must lead"
+    );
+    // The wall-clock guard on these input-amplifiable artifacts stays in force.
+    // Only the stack-depth guard is scaled, and it is never unbounded.
+    assert!(
+        !lean.contains("maxHeartbeats"),
+        "emitted artifacts must never touch maxHeartbeats"
+    );
+    assert!(lean.contains("set_option maxRecDepth "));
+}
+
+#[test]
+fn lia_lemma_tactic_leads_with_the_linear_script_on_wide_clauses() {
+    // Above the bound the case-split product cannot finish inside Lean's
+    // per-declaration heartbeat budget, and exhausting it aborts the whole
+    // declaration — `first` could never reach a later alternative. So the linear
+    // script must lead there.
+    let mut terms = TermStore::new();
+    let one = terms.mk_int(num_bigint::BigInt::from(1));
+    let mut lits = Vec::new();
+    for i in 0..=MAX_CASE_SPLIT_FIRST_ATOMS {
+        let x = terms.mk_var(format!("x{i}"), Sort::Int);
+        let le = cmp(&mut terms, "<=", x, one);
+        lits.push(terms.mk_not(le));
+    }
+    let lean = emit_lia_firewall_lean(&terms, &lits).expect("wide clause should emit");
+    let first_at = lean.find("first").expect("tactic must use `first`");
+    let case_at = lean[first_at..].find("by_cases h1").expect("case split");
+    let omega_at = lean[first_at..].find("Bool.or_eq_true").expect("linear");
+    assert!(
+        omega_at < case_at,
+        "wide clause must lead with the linear script"
+    );
+}
+
+#[test]
+fn scaled_max_rec_depth_is_bounded_and_monotone() {
+    // Input-amplifiable: the stack-depth guard grows with clause size but is
+    // clamped, so a hostile proof cannot ask for an unbounded elaboration stack.
+    assert_eq!(scaled_max_rec_depth(0), 4_096);
+    assert!(scaled_max_rec_depth(100) >= scaled_max_rec_depth(10));
+    assert_eq!(scaled_max_rec_depth(usize::MAX), 262_144);
+    assert!(scaled_max_rec_depth(647) <= 262_144);
+}
+
+// ==== APPENDED TESTS: nia_product ====
+
+/// Parse a list of assertion bodies with the real frontend parser.
+fn nia_parsed(asserts: &[&str]) -> Vec<ay_frontend::command::Term> {
+    asserts.iter().map(|s| parse_assertion(s)).collect()
+}
+
+/// `benchmarks/smt/QF_NIA/simple_product_unsat.smt2` — the headline target. On
+/// main this file emits NOTHING (`--emit-firewall-lean` exits 1 and publishes no
+/// verdict at all); the McCormick bridge is what makes it groundable.
+#[test]
+fn emits_nia_product_for_simple_product_unsat() {
+    let context = cbr_typed_context(Sort::Int);
+    let parsed = nia_parsed(&[
+        "(>= x 1)",
+        "(<= x 2)",
+        "(>= y 1)",
+        "(<= y 2)",
+        "(= (* x y) 7)",
+    ]);
+    let lean = emit_nia_product_firewall_lean_from_parsed(&parsed, &[], &context)
+        .expect("1 <= x,y <= 2 with x*y = 7 is a bilinear product conflict");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    // O4: the import header must be exactly the allow-listed pair, IN THE ORDER
+    // `crates/ay/src/firewall_verify.rs::ALLOWED_EMITTED_IMPORTS` strips them.
+    assert!(lean.starts_with("import AySoundness.Firewall\nimport AySoundness.NiaProduct\n"));
+    assert_eq!(lean.matches("\nimport ").count(), 1);
+    assert!(lean.contains("firewall_combined_unsat"));
+    assert!(lean.contains("decide (((m 0) * (m 1)) = (7 : Int))"));
+    // All four corners are available here (x and y are boxed on both sides).
+    for lemma in ["mul_lb_ll", "mul_lb_uu", "mul_ub_ul", "mul_ub_lu"] {
+        assert!(
+            lean.contains(&format!(
+                "AySoundness.NiaProduct.{lemma} (x := (m 0)) (y := (m 1))"
+            )),
+            "missing corner {lemma}"
+        );
+    }
+}
+
+/// **O1 REGRESSION.** `omega` atomises `x * y` and `y * x` as two INDEPENDENT
+/// unknowns. A recognizer that models both occurrences as one fresh product
+/// variable (as the Rust gate does) but renders them in surface order produces a
+/// gate/goal mismatch and an artifact the kernel REJECTS — while
+/// `--emit-firewall-lean` has already published `unsat` on the strength of it.
+///
+/// The emitter must therefore canonicalise the factor order. `x*y + y*x = 14`
+/// under `1 <= x,y <= 2` must render ONE product atom (folded to `2 * (x*y)`),
+/// and the commuted spelling must never appear.
+#[test]
+fn nia_product_canonicalizes_commuted_bilinear_factors() {
+    let context = cbr_typed_context(Sort::Int);
+    let parsed = nia_parsed(&[
+        "(>= x 1)",
+        "(<= x 2)",
+        "(>= y 1)",
+        "(<= y 2)",
+        "(= (+ (* x y) (* y x)) 14)",
+    ]);
+    let lean = emit_nia_product_firewall_lean_from_parsed(&parsed, &[], &context)
+        .expect("the commuted-duplicate product conflict must be groundable");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(
+        !lean.contains("((m 1) * (m 0))"),
+        "commuted factor order leaked into the emitted goal — omega would see two atoms"
+    );
+    assert!(lean.contains("decide (((2 : Int) * ((m 0) * (m 1))) = (14 : Int))"));
+    // The bridge is instantiated on the canonical factor order too.
+    assert!(lean.contains("(x := (m 0)) (y := (m 1))"));
+    assert!(!lean.contains("(x := (m 1)) (y := (m 0))"));
+}
+
+/// `benchmarks/smt/QF_NIA/sign_consistency.smt2` — LOWER bounds only. The full
+/// four-corner envelope is unavailable, so only `mul_lb_ll` may be injected; the
+/// emitter must not invent the missing upper bounds.
+#[test]
+fn emits_nia_product_with_lower_bounds_only() {
+    let context = cbr_typed_context(Sort::Int);
+    let parsed = nia_parsed(&["(> x 0)", "(> y 0)", "(< (* x y) 0)"]);
+    let lean = emit_nia_product_firewall_lean_from_parsed(&parsed, &[], &context)
+        .expect("x,y > 0 with x*y < 0 is refutable from the lower-lower corner alone");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("mul_lb_ll"));
+    for absent in ["mul_lb_uu", "mul_ub_ul", "mul_ub_lu"] {
+        assert!(
+            !lean.contains(absent),
+            "invented an absent bound for {absent}"
+        );
+    }
+    // `x > 0` over the integers tightens to `x >= 1`: the corner is instantiated
+    // at the INTEGER bound, matching what `omega` derives for the side goal.
+    assert!(lean.contains("(a := (1 : Int)) (c := (1 : Int))"));
+}
+
+/// A SQUARE `x * x` is the `i == j` case: both corner coefficients land on the
+/// same slot and no special casing is needed.
+#[test]
+fn emits_nia_product_for_square_conflict() {
+    let context = cbr_typed_context(Sort::Int);
+    let parsed = nia_parsed(&["(>= x (- 5))", "(<= x 5)", "(= (* x x) 30)"]);
+    let lean = emit_nia_product_firewall_lean_from_parsed(&parsed, &[], &context)
+        .expect("-5 <= x <= 5 bounds x*x <= 25, refuting x*x = 30");
+    eprintln!("----LEAN-BEGIN----\n{lean}\n----LEAN-END----");
+    assert!(lean.contains("decide (((m 0) * (m 0)) = (30 : Int))"));
+    assert!(lean.contains("(x := (m 0)) (y := (m 0))"));
+}
+
+/// A MIXED-SIGN box needs more than one corner: `x, y` in `[-2, 3]` bounds
+/// `x * y <= 6`, which only the upper corners see.
+#[test]
+fn emits_nia_product_for_mixed_sign_box() {
+    let context = cbr_typed_context(Sort::Int);
+    let parsed = nia_parsed(&[
+        "(>= x (- 2))",
+        "(<= x 3)",
+        "(>= y (- 2))",
+        "(<= y 3)",
+        "(= (* x y) 20)",
+    ]);
+    let lean = emit_nia_product_firewall_lean_from_parsed(&parsed, &[], &context)
+        .expect("mixed-sign box conflict should emit");
+    assert!(lean.contains("(a := (-2 : Int))"));
+    assert!(lean.contains("(b := (3 : Int))"));
+}
+
+/// **No misfire.** Every SATISFIABLE system must decline: `--emit-firewall-lean`
+/// turns an emission into a published verdict, so a fired emitter on a
+/// satisfiable reconstruction would be a kernel-failing artifact behind an
+/// `unsat`.
+#[test]
+fn nia_product_declines_satisfiable_systems() {
+    let context = cbr_typed_context(Sort::Int);
+    // benchmarks/smt/QF_NIA/simple_product_sat.smt2 shape: x*y = 4 in [1,4]^2.
+    let sat_product = nia_parsed(&[
+        "(>= x 1)",
+        "(<= x 4)",
+        "(>= y 1)",
+        "(<= y 4)",
+        "(= (* x y) 4)",
+    ]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&sat_product, &[], &context).is_none());
+    // benchmarks/smt/QF_NIA/square_bounds.smt2: x*x = 9 in [-5, 5] — SAT (x = 3).
+    let square_sat = nia_parsed(&["(>= x (- 5))", "(<= x 5)", "(= (* x x) 9)"]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&square_sat, &[], &context).is_none());
+    // benchmarks/smt/QF_NIA/tswift_pattern.smt2: SAT (width = height = 1).
+    let tswift = nia_parsed(&["(> x 0)", "(> y 0)", "(<= (* x y) 100)", "(>= (* x y) 1)"]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&tswift, &[], &context).is_none());
+    // The McCormick envelope is a RELAXATION: `x*y = 5` in [1,3]^2 is outside the
+    // integer solution set but INSIDE the envelope, so the gate cannot refute it
+    // and must decline rather than emit an omega-unclosable artifact.
+    let relaxation_gap = nia_parsed(&[
+        "(>= x 1)",
+        "(<= x 3)",
+        "(>= y 1)",
+        "(<= y 3)",
+        "(= (* x y) 5)",
+    ]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&relaxation_gap, &[], &context).is_none());
+}
+
+/// **O2 faithfulness gate.** A `store`-bodied `define-fun` makes the assertion an
+/// ARRAY atom; reconstructing it as two fresh integers would be an unsound
+/// abstraction. The `defs` parameter must not be dropped.
+#[test]
+fn nia_product_declines_array_valued_define_fun() {
+    use ay_frontend::command::Term as PTerm;
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let context = cbr_typed_context(Sort::Int);
+    let a2_body = PTerm::App(
+        "store".to_string(),
+        vec![
+            sym("arr"),
+            sym("x"),
+            PTerm::App("select".to_string(), vec![sym("arr"), sym("x")]),
+        ],
+    );
+    let defs = vec![("a2".to_string(), a2_body)];
+    let with_array = nia_parsed(&["(>= x 1)", "(<= x 2)", "(= (* x x) 7)", "(not (= a2 arr))"]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&with_array, &defs, &context).is_none());
+    // The gate fires only on assertions that MENTION the array macro: an
+    // otherwise identical query without it still emits.
+    let without_array = nia_parsed(&["(>= x 1)", "(<= x 2)", "(= (* x x) 7)"]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&without_array, &defs, &context).is_some());
+}
+
+/// Non-Int atoms must decline: `omega` is an INTEGER procedure and the McCormick
+/// corners are `Int` lemmas.
+#[test]
+fn nia_product_declines_non_int_and_unresolved_symbols() {
+    let real_context = cbr_typed_context(Sort::Real);
+    let parsed = nia_parsed(&[
+        "(>= x 1)",
+        "(<= x 2)",
+        "(>= y 1)",
+        "(<= y 2)",
+        "(= (* x y) 7)",
+    ]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&parsed, &[], &real_context).is_none());
+    // An undeclared variable is not an Int constant and is not a signed literal.
+    let missing = ay_frontend::Context::new();
+    assert!(emit_nia_product_firewall_lean_from_parsed(&parsed, &[], &missing).is_none());
+}
+
+/// Shapes outside the single-bilinear-product fragment decline.
+#[test]
+fn nia_product_declines_out_of_fragment_shapes() {
+    let context = cbr_typed_context(Sort::Int);
+    // A purely LINEAR conflict has no product: the LIA emitter owns it, and
+    // duplicating it here would only add a redundant artifact.
+    let linear = nia_parsed(&["(> x 5)", "(< x 3)"]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&linear, &[], &context).is_none());
+    // TWO distinct bilinear pairs — the model has one product slot only.
+    let two_products = nia_parsed(&[
+        "(>= x 1)",
+        "(<= x 2)",
+        "(>= y 1)",
+        "(<= y 2)",
+        "(>= a 1)",
+        "(<= a 2)",
+        "(= (+ (* x y) (* a y)) 99)",
+    ]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&two_products, &[], &context).is_none());
+    // DEGREE 3 (`x * x * x`) is not bilinear.
+    let cubic = nia_parsed(&["(>= x 1)", "(<= x 2)", "(< (* x (* x x)) 0)"]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&cubic, &[], &context).is_none());
+    // Propositional structure is not a comparison.
+    let disjunction = nia_parsed(&["(or (= (* x y) 7) (= x 1))"]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&disjunction, &[], &context).is_none());
+    // `mod`/`div` are outside the Fourier-Motzkin gate's domain.
+    let modular = nia_parsed(&["(>= x 1)", "(<= x 2)", "(= (mod (* x y) 3) 7)"]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&modular, &[], &context).is_none());
+    // An empty assertion list has nothing to reconstruct.
+    assert!(emit_nia_product_firewall_lean_from_parsed(&[], &[], &context).is_none());
+}
+
+/// `benchmarks/smt/QF_NIA/nia_negative_factor_falseprove.smt2` is the standing
+/// false-UNSAT regression (SAT witness `x = -4, y = -10`). Its assertions must
+/// NOT produce a refutation artifact — that would be a wrong verdict published
+/// with a proof attached.
+#[test]
+fn nia_product_declines_the_negative_factor_false_prove_regression() {
+    let context = cbr_typed_context(Sort::Int);
+    let parsed = nia_parsed(&[
+        "(>= (* x y) 6)",
+        "(>= y (- 10))",
+        "(<= y 3)",
+        "(<= x 10)",
+        "(< (* x (* x x)) 0)",
+    ]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&parsed, &[], &context).is_none());
+    // Even with the cubic assertion removed (leaving a bilinear-only system that
+    // the recognizer CAN model), the system is satisfiable and must decline.
+    let bilinear_only = nia_parsed(&["(>= (* x y) 6)", "(>= y (- 10))", "(<= y 3)", "(<= x 10)"]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&bilinear_only, &[], &context).is_none());
+}
+
+/// Disequality atoms carry no linear row, so they only ever WEAKEN the gate —
+/// they are still rendered and hypothesised, but can never make an otherwise
+/// feasible system look infeasible.
+#[test]
+fn nia_product_disequalities_do_not_strengthen_the_gate() {
+    let context = cbr_typed_context(Sort::Int);
+    // `x*y != 7` cannot be refuted by the (inequality-only) envelope: decline.
+    let diseq_only = nia_parsed(&[
+        "(>= x 1)",
+        "(<= x 2)",
+        "(>= y 1)",
+        "(<= y 2)",
+        "(not (= (* x y) 7))",
+    ]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&diseq_only, &[], &context).is_none());
+    // Adding a disequality to a genuinely infeasible system still emits, and the
+    // disequality is rendered faithfully as a hypothesis.
+    let with_diseq = nia_parsed(&[
+        "(>= x 1)",
+        "(<= x 2)",
+        "(>= y 1)",
+        "(<= y 2)",
+        "(= (* x y) 7)",
+        "(distinct x y)",
+    ]);
+    let lean = emit_nia_product_firewall_lean_from_parsed(&with_diseq, &[], &context)
+        .expect("the underlying product conflict is still refutable");
+    assert!(lean.contains("(m 0) ≠ (m 1)"));
+}
+
+/// SMT Int expressions are unbounded; the recognizer's `i64` analysis domain and
+/// the gate's `i128` elimination domain are not. Every arithmetic step is
+/// checked, so an out-of-domain query must DECLINE, never panic or wrap into a
+/// bogus infeasibility.
+#[test]
+fn nia_product_declines_out_of_domain_coefficients() {
+    let context = cbr_typed_context(Sort::Int);
+    let huge = i64::MAX.to_string();
+    let over = format!("{}0", i64::MAX); // one decimal digit past i64::MAX
+                                         // A coefficient beyond i64 in the product's own term.
+    let big_coeff = nia_parsed(&[
+        "(>= x 1)",
+        "(<= x 2)",
+        "(>= y 1)",
+        "(<= y 2)",
+        &format!("(= (* {over} (* x y)) 7)"),
+    ]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&big_coeff, &[], &context).is_none());
+    // Bounds at the i64 extreme make the corner constants (`p * q`) overflow.
+    let huge_box = nia_parsed(&[
+        &format!("(>= x {huge})"),
+        &format!("(<= x {huge})"),
+        &format!("(>= y {huge})"),
+        &format!("(<= y {huge})"),
+        "(= (* x y) 0)",
+    ]);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&huge_box, &[], &context).is_none());
+    // Too many distinct Int variables for the elimination budget.
+    let mut wide: Vec<String> = vec!["(= (* x y) 7)".to_string()];
+    for i in 0..12 {
+        wide.push(format!("(>= v{i} {i})"));
+    }
+    let mut wide_context = ay_frontend::Context::new();
+    for name in ["x", "y"] {
+        register_firewall_test_constant(&mut wide_context, name, Sort::Int);
+    }
+    for i in 0..12 {
+        register_firewall_test_constant(&mut wide_context, &format!("v{i}"), Sort::Int);
+    }
+    let wide_refs: Vec<&str> = wide.iter().map(String::as_str).collect();
+    let wide_parsed = nia_parsed(&wide_refs);
+    assert!(emit_nia_product_firewall_lean_from_parsed(&wide_parsed, &[], &wide_context).is_none());
 }

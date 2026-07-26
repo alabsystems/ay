@@ -1455,39 +1455,12 @@ fn test_fold_frame_constants_and_aliases_equivalence_shape() {
     );
 }
 
-/// Gap-attribution isolation diagnostic (task #27): time the EXACT checks the
-/// engines issue on a lustre gap instance, standalone, on the engine-style SMT
-/// path, and emit them as SMT-LIB for an external race vs z3 / full `ay solve`.
-/// Run manually: cargo test -p ay-chc --release --lib diag_gap_attr_synapse2 -- --ignored --nocapture
+/// Gap-attribution isolation pin (task #27): run the exact base, depth-one,
+/// and induction-step checks on a deterministic built-in transition system,
+/// and round-trip their standalone SMT-LIB exports in a temporary directory.
+/// External exports live in an explicitly bounded example.
 #[test]
-#[ignore = "diagnostic: reads the benchmark checkout; run with --ignored"]
-fn diag_gap_attr_synapse2_k1_check_isolation() {
-    // Reusable: AY_DIAG_INSTANCE overrides the instance under isolation.
-    let path = std::env::var("AY_DIAG_INSTANCE").unwrap_or_else(|_| {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../benchmarks/chc/chc-comp25-benchmarks/vmt-chc-benchmarks/lustre/SYNAPSE_2_e7_790_e8_1344_000.smt2")
-            .display()
-            .to_string()
-    });
-    let content = std::fs::read_to_string(&path).expect("benchmark checkout present");
-    let problem = crate::ChcParser::parse(&content).expect("parse");
-    let ts = TransitionSystem::from_chc_problem(&problem).expect("single-pred TS");
-
-    let checks: Vec<(&str, ChcExpr)> = vec![
-        (
-            "base_init_bad", // init(0) ∧ bad(0) — expected unsat on a safe instance
-            ChcExpr::and_all([ts.init_at(0), ts.query_at(0)]),
-        ),
-        (
-            "bmc_k1", // init(0) ∧ T(0,1) ∧ bad(1) — expected unsat
-            ChcExpr::and_all([ts.init_at(0), ts.transition_at(0), ts.query_at(1)]),
-        ),
-        (
-            "indstep_k1", // ¬bad(0) ∧ T(0,1) ∧ bad(1) — sat iff ¬bad not 1-inductive
-            ChcExpr::and_all([ts.neg_query_at(0), ts.transition_at(0), ts.query_at(1)]),
-        ),
-    ];
-
+fn gap_attr_k1_check_isolation_round_trips() {
     fn sort_str(s: &ChcSort) -> &'static str {
         match s {
             ChcSort::Bool => "Bool",
@@ -1497,47 +1470,74 @@ fn diag_gap_attr_synapse2_k1_check_isolation() {
         }
     }
 
-    for (name, formula) in &checks {
-        // (a) engine-style path: fresh SmtContext + executor fallback, as the
-        // engines experience it per check.
-        let mut ctx = crate::smt::SmtContext::new();
-        let t0 = ay_core::time::Instant::now();
-        let r = ctx
-            .check_sat_with_executor_fallback_timeout(formula, std::time::Duration::from_secs(30));
-        let verdict = if r.is_sat() {
-            "sat"
-        } else if r.is_unsat() {
-            "unsat"
-        } else {
-            "unknown"
-        };
-        let elapsed = t0.elapsed();
-        eprintln!(
-            "DIAG {name}: engine-style {verdict} in {:.3}s",
-            elapsed.as_secs_f64()
-        );
+    fn isolate_checks(
+        ts: &TransitionSystem,
+        output_dir: &std::path::Path,
+        assert_builtin_verdicts: bool,
+    ) {
+        let checks: Vec<(&str, ChcExpr, bool)> = vec![
+            (
+                "base_init_bad",
+                ChcExpr::and_all([ts.init_at(0), ts.query_at(0)]),
+                false,
+            ),
+            (
+                "bmc_k1",
+                ChcExpr::and_all([ts.init_at(0), ts.transition_at(0), ts.query_at(1)]),
+                false,
+            ),
+            (
+                "indstep_k1",
+                ChcExpr::and_all([ts.neg_query_at(0), ts.transition_at(0), ts.query_at(1)]),
+                true,
+            ),
+        ];
 
-        // (b) emit standalone SMT2 for the external race (z3, full `ay solve`).
-        let mut script = String::from("(set-logic QF_LIA)\n");
-        let mut seen = std::collections::BTreeSet::new();
-        for v in formula.vars() {
-            if seen.insert(v.name.clone()) {
+        for (name, formula, expect_sat) in &checks {
+            let mut ctx = crate::smt::SmtContext::new();
+            let result = ctx.check_sat_with_executor_fallback_timeout(
+                formula,
+                std::time::Duration::from_secs(10),
+            );
+            if assert_builtin_verdicts {
+                assert!(
+                    if *expect_sat {
+                        result.is_sat()
+                    } else {
+                        result.is_unsat()
+                    },
+                    "{name} returned an unexpected built-in verdict: {result:?}"
+                );
+            }
+
+            let mut script = String::from("(set-logic QF_LIA)\n");
+            let mut seen = std::collections::BTreeSet::new();
+            for v in formula.vars() {
+                if seen.insert(v.name.clone()) {
+                    script.push_str(&format!(
+                        "(declare-const |{}| {})\n",
+                        v.name,
+                        sort_str(&v.sort)
+                    ));
+                }
+            }
+            for conj in formula.conjuncts() {
                 script.push_str(&format!(
-                    "(declare-const |{}| {})\n",
-                    v.name,
-                    sort_str(&v.sort)
+                    "(assert {})\n",
+                    crate::InvariantModel::expr_to_smtlib(conj)
                 ));
             }
+            script.push_str("(check-sat)\n");
+            let out = output_dir.join(format!("diag_syn2_{name}.smt2"));
+            std::fs::write(&out, &script).expect("write isolated check");
+            assert_eq!(
+                std::fs::read_to_string(&out).expect("read isolated check"),
+                script,
+                "SMT-LIB export must round-trip byte-for-byte"
+            );
         }
-        for conj in formula.conjuncts() {
-            script.push_str(&format!(
-                "(assert {})\n",
-                crate::InvariantModel::expr_to_smtlib(conj)
-            ));
-        }
-        script.push_str("(check-sat)\n");
-        let out = format!("/tmp/diag_syn2_{name}.smt2");
-        std::fs::write(&out, script).unwrap();
-        eprintln!("DIAG {name}: wrote {out}");
     }
+
+    let builtin_dir = tempfile::tempdir().expect("temporary diagnostic directory");
+    isolate_checks(&make_test_system(), builtin_dir.path(), true);
 }

@@ -15,7 +15,8 @@ real 2025 field, using the official pairwise-Borda scoring.
   different hardware.
 - `run.py` — drives `minizinc --solver org.ay.ay --output-objective -s -t <ms>`
   over all 100 instances; emits a run vector `{status, objective, time_ms}`.
-- `setup.sh` — reconstitutes the toolchain + corpus on a fresh machine.
+- `setup.sh` — builds the Rust CLI and reconstitutes the toolchain + corpus on
+  a fresh machine through the size/SHA-pinned `ay corpus` manifest entries.
 
 ## The field & scoring
 42 solver-configs, 20 problems, 100 instances (5 each). Categories: **Fixed**
@@ -31,14 +32,16 @@ proved optimality, else 0.5); equal quality splits by whole-second time
 ## Usage
 ```sh
 bash scripts/mzn_challenge/setup.sh                       # one-time
-cargo build -p ay-pb --release  # (ay binary: target/release/ay)
+cargo build --release -p ay --features cli --bin ay
 python3 scripts/mzn_challenge/run.py 1200000 free 6       # full 1200s budget
 python3 scripts/mzn_challenge/score_ay.py \
     benchmarks/minizinc/challenge-2025/runs/ay-free-1200s.json free
 ```
 Short budgets (e.g. `60000`) give fast iteration signal; the official challenge
 budget is **1200000 ms**. Corpus + runs live in
-`benchmarks/minizinc/challenge-2025/` (gitignored).
+`benchmarks/minizinc/challenge-2025/` (gitignored); models and instances are in
+`mznc2025_probs/`, and the immutable official field snapshot is
+`results-2025.json`.
 
 ## Key finding (baseline)
 Because AY ships no MiniZinc globals library, every model flattens with the

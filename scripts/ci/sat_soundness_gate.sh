@@ -27,8 +27,8 @@ cd "$REPO_ROOT"
 
 OOM_GUARD="$REPO_ROOT/scripts/_oom_guard.py"
 PROOF_DIR=""
-LEASE_READ_FD=""
-LEASE_WRITE_FD=""
+LEASE_IPC_DIR=""
+LEASE_CONTROL_OPEN=0
 LEASE_PID=""
 
 cleanup() {
@@ -38,11 +38,9 @@ cleanup() {
     if [ -n "$PROOF_DIR" ]; then
         rm -rf -- "$PROOF_DIR"
     fi
-    if [ -n "$LEASE_WRITE_FD" ]; then
-        exec {LEASE_WRITE_FD}>&-
-    fi
-    if [ -n "$LEASE_READ_FD" ]; then
-        exec {LEASE_READ_FD}<&-
+    if [ "$LEASE_CONTROL_OPEN" -eq 1 ]; then
+        exec 9>&-
+        LEASE_CONTROL_OPEN=0
     fi
     if [ -n "$LEASE_PID" ]; then
         wait "$LEASE_PID" || lease_rc=$?
@@ -50,6 +48,9 @@ cleanup() {
             echo "FATAL: oom-guard lease sidecar exited with status $lease_rc" >&2
             rc=2
         fi
+    fi
+    if [ -n "$LEASE_IPC_DIR" ]; then
+        rm -rf -- "$LEASE_IPC_DIR"
     fi
     exit "$rc"
 }
@@ -121,19 +122,24 @@ elif [ -n "${AY_OOM_GUARD_PARENT_LEASE:-}" ]; then
     fatal "AY_OOM_GUARD_PARENT_LEASE must be 1 when set"
 else
     [ -f "$OOM_GUARD" ] || fatal "missing resource planner: $OOM_GUARD"
-    coproc SAT_OOM_LEASE {
-        python3 "$OOM_GUARD" lease --label "sat-soundness-gate"
-    }
-    LEASE_READ_FD="${SAT_OOM_LEASE[0]:-}"
-    LEASE_WRITE_FD="${SAT_OOM_LEASE[1]:-}"
-    LEASE_PID="${SAT_OOM_LEASE_PID:-}"
-    if [ -z "$LEASE_READ_FD" ] \
-        || [ -z "$LEASE_WRITE_FD" ] \
-        || [ -z "$LEASE_PID" ]; then
-        fatal "could not start oom-guard lease sidecar"
-    fi
+    # macOS still ships Bash 3.2, which has neither `coproc` nor dynamic
+    # `exec {fd}` descriptors. Use two private FIFOs and one script-owned
+    # descriptor instead: fd 9 keeps the sidecar's stdin open for the whole
+    # gate, while the readiness FIFO preserves the same fail-closed handshake.
+    LEASE_IPC_DIR="$(
+        mktemp -d "${TMPDIR:-/tmp}/ay-sat-soundness-lease.XXXXXX"
+    )" || fatal "could not create oom-guard lease IPC directory"
+    LEASE_CONTROL_FIFO="$LEASE_IPC_DIR/control"
+    LEASE_READY_FIFO="$LEASE_IPC_DIR/ready"
+    mkfifo "$LEASE_CONTROL_FIFO" "$LEASE_READY_FIFO" \
+        || fatal "could not create oom-guard lease FIFOs"
+    python3 "$OOM_GUARD" lease --label "sat-soundness-gate" \
+        <"$LEASE_CONTROL_FIFO" >"$LEASE_READY_FIFO" &
+    LEASE_PID=$!
+    exec 9>"$LEASE_CONTROL_FIFO"
+    LEASE_CONTROL_OPEN=1
     lease_ready=""
-    if ! IFS= read -r lease_ready <&"$LEASE_READ_FD"; then
+    if ! IFS= read -r lease_ready <"$LEASE_READY_FIFO"; then
         fatal "oom-guard lease sidecar exited before readiness"
     fi
     if [ "$lease_ready" != "AY_OOM_HARNESS_LEASE_READY_V1" ]; then

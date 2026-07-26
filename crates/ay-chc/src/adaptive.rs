@@ -34,11 +34,12 @@ use crate::pdr::{InvariantModel, PdrConfig, PdrResult, PdrSolver, PredicateInter
 use crate::portfolio::features::ChcFeatureExtractor;
 use crate::portfolio::selector::EngineSelector;
 use crate::portfolio::types::{BudgetPolicy, EngineType};
-use crate::portfolio::{PortfolioConfig, PortfolioResult, PortfolioSolver};
+use crate::portfolio::{PortfolioConfig, PortfolioResult, PortfolioSolver, PreprocessSummary};
+use crate::smt::SmtResult;
 use crate::synthesis::StructuralSynthesizer;
 use crate::transform::{
     BackTranslator, BvToIntAbstractor, CompositeBackTranslator, DeadParamEliminator, DtFlattener,
-    SolidityArrayDtProjectionRoute, SolidityArrayDtProjectionStats,
+    IntervalPropagator, SolidityArrayDtProjectionRoute, SolidityArrayDtProjectionStats,
     SolidityArrayDtProjectionTransformer, SolidityArrayDtProjector, TransformationPipeline,
     Transformer,
 };
@@ -104,11 +105,38 @@ const ARG_CONSTANT_INVARIANT_ROUTE_MIN_BUDGET: Duration = Duration::from_millis(
 const ARG_CONSTANT_INVARIANT_ROUTE_MAX_PREDICATES: usize = 256;
 const ARG_CONSTANT_INVARIANT_ROUTE_MAX_CLAUSES: usize = 2048;
 const ARG_CONSTANT_INVARIANT_ROUTE_ENV: &str = "AY_CHC_ENABLE_ARG_CONSTANT_INVARIANT";
+/// Cheap admission probe for an all-predicates-top candidate.
+///
+/// This only checks the transformed query constraints. Acceptance always
+/// requires back-translation and strict validation on the original problem.
+const TOP_MODEL_QUERY_CHECK_BUDGET: Duration = Duration::from_millis(500);
 const ARRAY_CONST_KEY_CEGAR_ROUTE_BUDGET: Duration = Duration::from_millis(750);
 const ARRAY_CONST_KEY_CEGAR_ROUTE_MIN_BUDGET: Duration = Duration::from_millis(50);
 const ARRAY_CONST_KEY_CEGAR_ROUTE_VALIDATION_RESERVE: Duration = Duration::from_millis(250);
 const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_CLAUSES: usize = 4096;
 const ARRAY_CONST_KEY_CEGAR_ROUTE_MAX_TRANSFORMED_ARITY: usize = 256;
+/// Early exact preprocessing lane for compiler-generated LIA-array systems.
+///
+/// Solidity ABI encodings in CHC-COMP commonly collapse from roughly
+/// 20 predicates / 30 clauses to a one-predicate, three-clause loop. Running
+/// array CEGAR, ghost pairs, and raw non-inlined PDR on the unreduced graph
+/// wastes most of a 30s competition budget. This lane only fires after the
+/// existing certified preprocessing stack demonstrates a major structural
+/// reduction. Every definitive result is still back-translated and validated
+/// against the original clauses.
+const REDUCED_LIA_ARRAY_ROUTE_DISABLE_ENV: &str = "AY_CHC_DISABLE_REDUCED_LIA_ARRAY_PREPROCESS";
+const REDUCED_LIA_ARRAY_ROUTE_MAX_ORIGINAL_CLAUSES: usize = 128;
+const REDUCED_LIA_ARRAY_ROUTE_MIN_ORIGINAL_PREDICATES: usize = 4;
+const REDUCED_LIA_ARRAY_ROUTE_MAX_PREDICATES: usize = 12;
+const REDUCED_LIA_ARRAY_ROUTE_MAX_CLAUSES: usize = 16;
+const REDUCED_LIA_ARRAY_ROUTE_MAX_ARITY: usize = 64;
+const REDUCED_LIA_ARRAY_ROUTE_BUDGET: Duration = Duration::from_secs(3);
+const REDUCED_LIA_ARRAY_ROUTE_MIN_BUDGET: Duration = Duration::from_millis(750);
+const REDUCED_LIA_ARRAY_INTERVAL_BUDGET: Duration = Duration::from_millis(500);
+const REDUCED_LIA_ARRAY_BMC_BUDGET: Duration = Duration::from_millis(1500);
+const REDUCED_LIA_ARRAY_BMC_MAX_DEPTH: usize = 16;
+const REDUCED_LIA_ARRAY_VALIDATION_RESERVE: Duration = Duration::from_millis(750);
+const REDUCED_LIA_ARRAY_FINAL_REPLAY_RESERVE: Duration = Duration::from_millis(250);
 const REAL_LRA_PROMOTION_ENV: &str = "AY_CHC_ENABLE_REAL_LRA_PROMOTION";
 
 /// FORALL-ARR ghost-pair lane (agenda #16): Eldarica-style ghost index/value
@@ -122,6 +150,12 @@ const ARRAY_GHOST_PAIR_ROUTE_BUDGET_CAP: Duration = Duration::from_secs(45);
 const ARRAY_GHOST_PAIR_ROUTE_MIN_BUDGET: Duration = Duration::from_millis(500);
 const ARRAY_GHOST_PAIR_ROUTE_MAX_CLAUSES: usize = 64;
 const ARRAY_GHOST_PAIR_ROUTE_MAX_PREDICATES: usize = 24;
+/// Preprocessing is used inside the ghost-pair lane only when it removes at
+/// least half of the predicates or clauses.  Otherwise the established raw
+/// ghost solve remains the fallback: reconstructing a nearly identical model
+/// through a long translator stack spends acceptance budget without buying a
+/// materially smaller PDR problem.
+const ARRAY_GHOST_PAIR_PREPROCESS_REDUCTION_FACTOR: usize = 2;
 /// Fraction of a lane's budget reserved for the original-clause quantified
 /// certification after the transformed-problem PDR solve.
 const ARRAY_GHOST_PAIR_CERTIFY_RESERVE_FRACTION: f64 = 0.25;
@@ -172,7 +206,12 @@ fn algebraic_prestage_budget(features: &ProblemFeatures, solve_budget: Duration)
     if !solve_budget.is_zero() {
         let half_budget = solve_budget.div_f64(2.0);
         if half_budget < budget {
-            budget = half_budget.max(ALGEBRAIC_PRESTAGE_BUDGET);
+            // Honour the half-budget cap. Re-raising to ALGEBRAIC_PRESTAGE_BUDGET
+            // here defeated the very cap being applied: at a 5s wall the 3s floor
+            // handed this pre-stage 63% of the budget before any engine ran. The
+            // floor only ever bound for solve budgets under 6s, so competition
+            // budgets are unaffected.
+            budget = half_budget;
         }
         budget = budget.min(solve_budget);
     }
@@ -2615,6 +2654,396 @@ impl AdaptivePortfolio {
         translated_safe.map(PortfolioResult::Safe)
     }
 
+    /// Try certified preprocessing before array-specific abstractions when it
+    /// collapses a large pure-LIA array graph to a tiny transition system.
+    ///
+    /// This is deliberately a narrow, bounded BMC/PDR lane rather than a
+    /// nested general portfolio. Definitive transformed results are
+    /// back-translated and checked against the original clauses.
+    fn try_reduced_lia_array_preprocessed_route(
+        &self,
+        deadline: Option<Instant>,
+    ) -> Option<(PortfolioResult, ValidationEvidence)> {
+        let route_start = Instant::now();
+        let original_predicates = self.problem.predicates().len();
+        let original_clauses = self.problem.clauses().len();
+        if std::env::var_os(REDUCED_LIA_ARRAY_ROUTE_DISABLE_ENV).is_some()
+            || !self.problem.has_array_sorts()
+            || self.problem.has_bv_sorts()
+            || self.problem.has_datatype_sorts()
+            || self.problem.has_real_sorts()
+            || original_predicates < REDUCED_LIA_ARRAY_ROUTE_MIN_ORIGINAL_PREDICATES
+            || original_clauses > REDUCED_LIA_ARRAY_ROUTE_MAX_ORIGINAL_CLAUSES
+            || self
+                .remaining_budget(deadline)
+                .is_some_and(|remaining| remaining < REDUCED_LIA_ARRAY_ROUTE_MIN_BUDGET)
+        {
+            return None;
+        }
+        let route_deadline = deadline
+            .unwrap_or(route_start + REDUCED_LIA_ARRAY_ROUTE_BUDGET)
+            .min(route_start + REDUCED_LIA_ARRAY_ROUTE_BUDGET);
+
+        let summary = PreprocessSummary::build(self.problem.clone(), self.config.verbose);
+        let transformed_predicates = summary.transformed_problem.predicates().len();
+        let transformed_clauses = summary.transformed_problem.clauses().len();
+        let transformed_max_arity = summary
+            .transformed_problem
+            .predicates()
+            .iter()
+            .map(|predicate| predicate.arity())
+            .max()
+            .unwrap_or(0);
+        let predicate_shrink =
+            original_predicates >= transformed_predicates.max(1).saturating_mul(2);
+        let clause_shrink = original_clauses >= transformed_clauses.max(1).saturating_mul(2);
+        let major_reduction = (predicate_shrink || clause_shrink)
+            && transformed_predicates <= REDUCED_LIA_ARRAY_ROUTE_MAX_PREDICATES
+            && transformed_clauses <= REDUCED_LIA_ARRAY_ROUTE_MAX_CLAUSES
+            && transformed_max_arity <= REDUCED_LIA_ARRAY_ROUTE_MAX_ARITY;
+        if !major_reduction {
+            return None;
+        }
+        let acceptance_reserve = REDUCED_LIA_ARRAY_VALIDATION_RESERVE
+            .saturating_add(REDUCED_LIA_ARRAY_FINAL_REPLAY_RESERVE);
+
+        // Certified preprocessing can either remove the query entirely or
+        // inline a raw nullary error predicate into an explicitly
+        // contradictory query constraint. In both cases the reduced problem
+        // admits the all-true interpretation. The transformed query check is
+        // only an admission filter: back-translate through the entire
+        // preprocessing stack and strictly validate the unchanged ORIGINAL
+        // clauses before accepting Safe.
+        let transformed_query_count = summary.transformed_problem.queries().count();
+        let top_query_budget = TOP_MODEL_QUERY_CHECK_BUDGET.min(
+            route_deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(
+                    REDUCED_LIA_ARRAY_VALIDATION_RESERVE
+                        .saturating_add(REDUCED_LIA_ARRAY_FINAL_REPLAY_RESERVE),
+                ),
+        );
+        if let Some(transformed_model) = Self::try_top_model_query_infeasibility_candidate(
+            &summary.transformed_problem,
+            top_query_budget,
+        ) {
+            let translated = summary
+                .back_translator
+                .translate_validity(transformed_model);
+            let validation_budget = route_deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(REDUCED_LIA_ARRAY_FINAL_REPLAY_RESERVE)
+                .min(REDUCED_LIA_ARRAY_VALIDATION_RESERVE);
+            let original_validation =
+                self.validate_lia_farkas_safe_model_on_original(&translated, validation_budget);
+            self.decision_log.log_decision_with_details(
+                DecisionEntry {
+                    stage: "reduced_lia_array_top_model",
+                    gate_result: true,
+                    gate_reason: format!(
+                        "certified reduction: {original_predicates}p/{original_clauses}c -> \
+                         {transformed_predicates}p/{transformed_clauses}c, \
+                         max_arity={transformed_max_arity}; \
+                         {transformed_query_count} transformed query constraints UNSAT under top"
+                    ),
+                    budget_secs: route_deadline
+                        .saturating_duration_since(route_start)
+                        .as_secs_f64(),
+                    elapsed_secs: route_start.elapsed().as_secs_f64(),
+                    result: if original_validation {
+                        "safe"
+                    } else {
+                        "unknown"
+                    },
+                    lemmas_learned: 0,
+                    max_frame: 0,
+                },
+                serde_json::json!({
+                    "original_validation": original_validation,
+                    "transformed_query_count": transformed_query_count,
+                    "query_check_budget_secs": top_query_budget.as_secs_f64(),
+                    "transform_memory": summary.transform_memory.diagnostic_summary(),
+                }),
+            );
+            if original_validation {
+                return Some((
+                    PortfolioResult::Safe(translated),
+                    ValidationEvidence::FullVerification,
+                ));
+            }
+        }
+
+        // A reduced compiler graph can retain a small scalar loop whose query
+        // is feasible under the all-true interpretation but infeasible under
+        // its inductive argument bounds. Reuse the verified interval
+        // transformer as candidate generation:
+        //
+        //  1. infer and per-clause prove interval bounds on the CERTIFIED
+        //     preprocessed problem,
+        //  2. strengthen transformed query bodies with those proven bounds,
+        //  3. admit an all-true candidate only when every strengthened query
+        //     constraint is UNSAT,
+        //  4. translate the interval atoms and the preprocessing model back
+        //     through both stacks, and
+        //  5. strictly validate every unchanged ORIGINAL clause.
+        //
+        // Any imprecise interval, timeout, translation gap, or invalid model
+        // therefore falls through; the interval analysis is never a verdict.
+        let scalar_query_constraints = summary
+            .transformed_problem
+            .queries()
+            .map(|query| {
+                query
+                    .body
+                    .constraint
+                    .as_ref()
+                    .map_or(true, |constraint| !constraint.contains_array_ops())
+            })
+            .reduce(|left, right| left && right)
+            .unwrap_or(false);
+        let interval_remaining = route_deadline.saturating_duration_since(Instant::now());
+        let interval_reserve = acceptance_reserve.saturating_add(TOP_MODEL_QUERY_CHECK_BUDGET);
+        if scalar_query_constraints && interval_remaining > interval_reserve {
+            let interval_budget = REDUCED_LIA_ARRAY_INTERVAL_BUDGET
+                .min(interval_remaining.saturating_sub(interval_reserve));
+            let interval_result = Box::new(
+                IntervalPropagator::new()
+                    .with_verbose(self.config.verbose)
+                    .with_pass_budget(interval_budget),
+            )
+            .transform(summary.transformed_problem.clone());
+            let interval_transform_memory = interval_result.back_translator.transform_memory();
+            let post_interval_remaining = route_deadline.saturating_duration_since(Instant::now());
+            let interval_query_budget = TOP_MODEL_QUERY_CHECK_BUDGET
+                .min(post_interval_remaining.saturating_sub(acceptance_reserve));
+            let interval_candidate = Self::try_top_model_query_infeasibility_candidate(
+                &interval_result.problem,
+                interval_query_budget,
+            );
+            let interval_candidate_generated = interval_candidate.is_some();
+            let mut original_validation = false;
+            if let Some(interval_top_model) = interval_candidate {
+                let preprocessed_model = interval_result
+                    .back_translator
+                    .translate_validity(interval_top_model);
+                let translated = summary
+                    .back_translator
+                    .translate_validity(preprocessed_model);
+                let validation_budget = route_deadline
+                    .saturating_duration_since(Instant::now())
+                    .saturating_sub(REDUCED_LIA_ARRAY_FINAL_REPLAY_RESERVE)
+                    .min(REDUCED_LIA_ARRAY_VALIDATION_RESERVE);
+                original_validation =
+                    self.validate_lia_farkas_safe_model_on_original(&translated, validation_budget);
+                if original_validation {
+                    self.decision_log.log_decision_with_details(
+                        DecisionEntry {
+                            stage: "reduced_lia_array_interval_model",
+                            gate_result: true,
+                            gate_reason: format!(
+                                "certified reduction: {original_predicates}p/{original_clauses}c \
+                                 -> {transformed_predicates}p/{transformed_clauses}c, \
+                                 max_arity={transformed_max_arity}; verified interval bounds make \
+                                 transformed queries infeasible under top"
+                            ),
+                            budget_secs: route_deadline
+                                .saturating_duration_since(route_start)
+                                .as_secs_f64(),
+                            elapsed_secs: route_start.elapsed().as_secs_f64(),
+                            result: "safe",
+                            lemmas_learned: 0,
+                            max_frame: 0,
+                        },
+                        serde_json::json!({
+                            "interval_budget_secs": interval_budget.as_secs_f64(),
+                            "query_check_budget_secs": interval_query_budget.as_secs_f64(),
+                            "interval_transform_memory":
+                                interval_transform_memory.diagnostic_summary(),
+                            "preprocess_transform_memory":
+                                summary.transform_memory.diagnostic_summary(),
+                            "original_validation": true,
+                        }),
+                    );
+                    return Some((
+                        PortfolioResult::Safe(translated),
+                        ValidationEvidence::FullVerification,
+                    ));
+                }
+            }
+            self.decision_log.log_decision_with_details(
+                DecisionEntry {
+                    stage: "reduced_lia_array_interval_model",
+                    gate_result: true,
+                    gate_reason: "verified interval candidate did not produce an \
+                                  original-valid Safe model"
+                        .to_string(),
+                    budget_secs: interval_budget.as_secs_f64(),
+                    elapsed_secs: route_start.elapsed().as_secs_f64(),
+                    result: "unknown",
+                    lemmas_learned: 0,
+                    max_frame: 0,
+                },
+                serde_json::json!({
+                    "interval_candidate": interval_candidate_generated,
+                    "interval_transform_memory":
+                        interval_transform_memory.diagnostic_summary(),
+                    "original_validation": original_validation,
+                }),
+            );
+        }
+
+        let remaining = route_deadline.saturating_duration_since(Instant::now());
+        if remaining < REDUCED_LIA_ARRAY_ROUTE_MIN_BUDGET || remaining <= acceptance_reserve {
+            return None;
+        }
+        let route_budget = route_deadline.saturating_duration_since(route_start);
+        let bmc_budget =
+            REDUCED_LIA_ARRAY_BMC_BUDGET.min(remaining.saturating_sub(acceptance_reserve));
+
+        // The LIA-array shard's short refutations require up to thirteen Horn
+        // steps after preprocessing. Keep the probe bounded above that depth;
+        // the lane-level deadline still prevents a hard instance from
+        // consuming the later PDR/acceptance budget.
+        let bmc_cancel = self.cancellation_token.child();
+        let _bmc_timeout_guard = bmc_cancel.cancel_after(bmc_budget);
+        let bmc = crate::bmc::BmcConfig::default()
+            .with_max_depth(REDUCED_LIA_ARRAY_BMC_MAX_DEPTH)
+            .with_time_budget(bmc_budget)
+            .with_per_depth_timeout(bmc_budget)
+            .with_verbose(self.config.verbose)
+            .with_cancellation(bmc_cancel);
+        let bmc_result =
+            crate::bmc::BmcSolver::new(summary.transformed_problem.clone(), bmc).solve();
+        let bmc_result_name = Self::result_to_str(&bmc_result);
+
+        if let PortfolioResult::Unsafe(cex) = bmc_result {
+            let translated = crate::portfolio::backtranslate_counterexample_with_ground_evidence(
+                summary.back_translator.as_ref(),
+                &self.problem,
+                &cex,
+            );
+            let validation_budget = route_deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(REDUCED_LIA_ARRAY_FINAL_REPLAY_RESERVE)
+                .min(REDUCED_LIA_ARRAY_VALIDATION_RESERVE);
+            let original_replay =
+                self.validate_final_unsafe_result(&translated, Some(validation_budget));
+            if original_replay {
+                self.decision_log.log_decision_with_details(
+                    DecisionEntry {
+                        stage: "reduced_lia_array_preprocess",
+                        gate_result: true,
+                        gate_reason: format!(
+                            "certified reduction: {original_predicates}p/{original_clauses}c -> \
+                             {transformed_predicates}p/{transformed_clauses}c, \
+                             max_arity={transformed_max_arity}; shallow BMC replayed"
+                        ),
+                        budget_secs: route_budget.as_secs_f64(),
+                        elapsed_secs: route_start.elapsed().as_secs_f64(),
+                        result: "unsafe",
+                        lemmas_learned: 0,
+                        max_frame: 0,
+                    },
+                    serde_json::json!({
+                        "bmc_result": bmc_result_name,
+                        "bmc_budget_secs": bmc_budget.as_secs_f64(),
+                        "original_trace_replay": true,
+                        "transform_memory": summary.transform_memory.diagnostic_summary(),
+                    }),
+                );
+                return Some((
+                    PortfolioResult::Unsafe(translated),
+                    ValidationEvidence::CounterexampleVerification,
+                ));
+            }
+        }
+
+        let remaining = route_deadline.saturating_duration_since(Instant::now());
+        let pdr_budget = remaining.saturating_sub(acceptance_reserve);
+        if pdr_budget < Duration::from_millis(250) {
+            return None;
+        }
+        let pdr_cancel = self.cancellation_token.child();
+        let _pdr_timeout_guard = pdr_cancel.cancel_after(pdr_budget);
+        let mut pdr = PdrConfig::lia_farkas_profile(self.config.verbose);
+        pdr.solve_timeout = Some(pdr_budget);
+        pdr.strict_proofs = true;
+        pdr.cancellation_token = Some(pdr_cancel);
+        self.apply_user_hints(&mut pdr);
+        let result_with_stats =
+            PdrSolver::solve_problem_with_stats(&summary.transformed_problem, pdr);
+        self.accumulate_stats(&result_with_stats.stats);
+        let pdr_result_name = Self::pdr_result_to_str(&result_with_stats.result);
+        let mut original_validation = false;
+        let result = match result_with_stats.result {
+            PdrResult::Safe(model) => {
+                let translated = summary.back_translator.translate_validity(model);
+                let validation_budget = route_deadline
+                    .saturating_duration_since(Instant::now())
+                    .saturating_sub(REDUCED_LIA_ARRAY_FINAL_REPLAY_RESERVE)
+                    .min(REDUCED_LIA_ARRAY_VALIDATION_RESERVE);
+                original_validation =
+                    self.validate_lia_farkas_safe_model_on_original(&translated, validation_budget);
+                original_validation.then_some((
+                    PortfolioResult::Safe(translated),
+                    ValidationEvidence::FullVerification,
+                ))
+            }
+            PdrResult::Unsafe(cex) => {
+                let translated =
+                    crate::portfolio::backtranslate_counterexample_with_ground_evidence(
+                        summary.back_translator.as_ref(),
+                        &self.problem,
+                        &cex,
+                    );
+                let validation_budget = route_deadline
+                    .saturating_duration_since(Instant::now())
+                    .saturating_sub(REDUCED_LIA_ARRAY_FINAL_REPLAY_RESERVE)
+                    .min(REDUCED_LIA_ARRAY_VALIDATION_RESERVE);
+                original_validation =
+                    self.validate_final_unsafe_result(&translated, Some(validation_budget));
+                original_validation.then_some((
+                    PortfolioResult::Unsafe(translated),
+                    ValidationEvidence::CounterexampleVerification,
+                ))
+            }
+            PdrResult::Unknown | PdrResult::NotApplicable => None,
+        };
+        self.decision_log.log_decision_with_details(
+            DecisionEntry {
+                stage: "reduced_lia_array_preprocess",
+                gate_result: true,
+                gate_reason: format!(
+                    "certified reduction: {original_predicates}p/{original_clauses}c -> \
+                     {transformed_predicates}p/{transformed_clauses}c, \
+                     max_arity={transformed_max_arity}"
+                ),
+                budget_secs: route_budget.as_secs_f64(),
+                elapsed_secs: route_start.elapsed().as_secs_f64(),
+                result: result
+                    .as_ref()
+                    .map_or(pdr_result_name, |(result, _)| Self::result_to_str(result)),
+                lemmas_learned: result_with_stats.stats.lemmas_learned,
+                max_frame: result_with_stats.stats.max_frame,
+            },
+            serde_json::json!({
+                "original_predicates": original_predicates,
+                "original_clauses": original_clauses,
+                "transformed_predicates": transformed_predicates,
+                "transformed_clauses": transformed_clauses,
+                "transformed_max_arity": transformed_max_arity,
+                "bmc_budget_secs": bmc_budget.as_secs_f64(),
+                "pdr_budget_secs": pdr_budget.as_secs_f64(),
+                "bmc_result": bmc_result_name,
+                "pdr_result": pdr_result_name,
+                "transform_memory": summary.transform_memory.diagnostic_summary(),
+                "original_validation": original_validation,
+            }),
+        );
+
+        result
+    }
+
     fn try_array_const_key_cegar_route(
         &self,
         deadline: Option<Instant>,
@@ -2901,14 +3330,55 @@ impl AdaptivePortfolio {
             }
             let transform_result =
                 Box::new(ArrayGhostPairTransformer::new(n)).transform(self.problem.clone());
-            let transformed_problem = transform_result.problem;
-            let back_translator = transform_result.back_translator;
+            let raw_ghost_problem = transform_result.problem;
+            let ghost_back_translator = transform_result.back_translator;
 
-            let certify_reserve = lane_budget
+            // Compiler-generated CHCs frequently contain long chains of
+            // wrapper predicates around the array loop.  Ghosting first is
+            // important: preprocessing then preserves the expanded signature
+            // in its compaction/inlining traces, so translate_validity can
+            // reconstruct a model for every RAW ghost predicate.  That raw
+            // model is exactly what GhostPairCertificate consumes.
+            //
+            // Preprocessing is only a solve-shape optimization.  If it does
+            // not produce a major reduction, retain the established direct
+            // raw-ghost PDR path.
+            let raw_ghost_predicates = raw_ghost_problem.predicates().len();
+            let raw_ghost_clauses = raw_ghost_problem.clauses().len();
+            let preprocess_candidate =
+                PreprocessSummary::build(raw_ghost_problem.clone(), self.config.verbose);
+            let preprocessed_predicates =
+                preprocess_candidate.transformed_problem.predicates().len();
+            let preprocessed_clauses = preprocess_candidate.transformed_problem.clauses().len();
+            let predicate_reduction = raw_ghost_predicates
+                >= preprocessed_predicates
+                    .max(1)
+                    .saturating_mul(ARRAY_GHOST_PAIR_PREPROCESS_REDUCTION_FACTOR);
+            let clause_reduction = raw_ghost_clauses
+                >= preprocessed_clauses
+                    .max(1)
+                    .saturating_mul(ARRAY_GHOST_PAIR_PREPROCESS_REDUCTION_FACTOR);
+            let preprocess_summary =
+                (predicate_reduction || clause_reduction).then_some(preprocess_candidate);
+            let solve_problem = preprocess_summary
+                .as_ref()
+                .map_or(&raw_ghost_problem, |summary| &summary.transformed_problem);
+            let solve_shape = if preprocess_summary.is_some() {
+                "preprocessed"
+            } else {
+                "raw"
+            };
+
+            // Transformation time belongs to this lane.  Recompute the
+            // available envelope before starting PDR so preprocessing cannot
+            // consume the time reserved for certificate/replay acceptance.
+            let available =
+                lane_budget.min(route_deadline.saturating_duration_since(Instant::now()));
+            let certify_reserve = available
                 .mul_f64(ARRAY_GHOST_PAIR_CERTIFY_RESERVE_FRACTION)
                 .max(Duration::from_millis(250))
-                .min(lane_budget);
-            let solve_budget = lane_budget.saturating_sub(certify_reserve);
+                .min(available);
+            let solve_budget = available.saturating_sub(certify_reserve);
             if solve_budget < ARRAY_GHOST_PAIR_ROUTE_MIN_BUDGET {
                 continue;
             }
@@ -2926,8 +3396,7 @@ impl AdaptivePortfolio {
             pdr_config.solve_timeout = Some(solve_budget);
             pdr_config.strict_proofs = true;
             self.apply_user_hints(&mut pdr_config);
-            let result_with_stats =
-                PdrSolver::solve_problem_with_stats(&transformed_problem, pdr_config);
+            let result_with_stats = PdrSolver::solve_problem_with_stats(solve_problem, pdr_config);
             self.accumulate_stats(&result_with_stats.stats);
             let lemmas_learned = result_with_stats.learned_lemmas.len();
             let max_frame = result_with_stats.stats.max_frame;
@@ -2935,6 +3404,16 @@ impl AdaptivePortfolio {
 
             match result_with_stats.result {
                 PdrResult::Safe(model) => {
+                    // Preprocessing may compact surviving PredicateIds and
+                    // inline definitions.  Reconstruct those interpretations
+                    // in the RAW ghost vocabulary before sealing.  Deliberately
+                    // do not call the ghost transform's validity translator:
+                    // the denoted original invariant is quantified and that
+                    // translator therefore returns an empty QF model.
+                    let raw_ghost_model = match &preprocess_summary {
+                        Some(summary) => summary.back_translator.translate_validity(model),
+                        None => model,
+                    };
                     // Seal the quantified certificate: the FULL per-rule
                     // discharge on the ORIGINAL clauses is the only way to
                     // construct it (fail-closed on any undischarged clause).
@@ -2948,14 +3427,18 @@ impl AdaptivePortfolio {
                     let sealed = GhostPairCertificate::certify_and_seal(
                         &self.problem,
                         spec,
-                        model,
+                        raw_ghost_model,
                         Some(certify_budget),
                     );
                     self.decision_log.log_decision(DecisionEntry {
                         stage: "array_ghost_pairs",
                         gate_result: true,
                         gate_reason: format!(
-                            "n={n}; transformed PDR safe; quantified certification {}",
+                            "n={n}; solve_shape={solve_shape}; raw \
+                             {raw_ghost_predicates}p/{raw_ghost_clauses}c -> solve \
+                             {}p/{}c; transformed PDR safe; quantified certification {}",
+                            solve_problem.predicates().len(),
+                            solve_problem.clauses().len(),
                             if sealed.is_some() { "passed" } else { "failed" }
                         ),
                         budget_secs: route_budget.as_secs_f64(),
@@ -2974,17 +3457,38 @@ impl AdaptivePortfolio {
                     }
                 }
                 PdrResult::Unsafe(cex) => {
-                    // Equisatisfiability makes a transformed refutation a real
-                    // one, but only a trace that REPLAYS on the original
-                    // clauses may be surfaced (fail-closed otherwise).
-                    let translated = back_translator.translate_invalidity(cex);
+                    // Translate in the reverse transformation order.  The
+                    // ground-evidence helper validates (or clears) a ground
+                    // derivation at each boundary, preventing compacted clause
+                    // indices from leaking into the raw ghost or original
+                    // problem.  A final original replay remains mandatory.
+                    let raw_ghost_cex = match &preprocess_summary {
+                        Some(summary) => {
+                            crate::portfolio::backtranslate_counterexample_with_ground_evidence(
+                                summary.back_translator.as_ref(),
+                                &raw_ghost_problem,
+                                &cex,
+                            )
+                        }
+                        None => cex,
+                    };
+                    let translated =
+                        crate::portfolio::backtranslate_counterexample_with_ground_evidence(
+                            ghost_back_translator.as_ref(),
+                            &self.problem,
+                            &raw_ghost_cex,
+                        );
                     let replayed = self
                         .validate_final_unsafe_result(&translated, self.remaining_budget(deadline));
                     self.decision_log.log_decision(DecisionEntry {
                         stage: "array_ghost_pairs",
                         gate_result: true,
                         gate_reason: format!(
-                            "n={n}; transformed PDR unsafe; original replay {}",
+                            "n={n}; solve_shape={solve_shape}; raw \
+                             {raw_ghost_predicates}p/{raw_ghost_clauses}c -> solve \
+                             {}p/{}c; transformed PDR unsafe; original replay {}",
+                            solve_problem.predicates().len(),
+                            solve_problem.clauses().len(),
                             if replayed { "passed" } else { "failed" }
                         ),
                         budget_secs: route_budget.as_secs_f64(),
@@ -3004,7 +3508,13 @@ impl AdaptivePortfolio {
                     self.decision_log.log_decision(DecisionEntry {
                         stage: "array_ghost_pairs",
                         gate_result: true,
-                        gate_reason: format!("n={n}; transformed PDR inconclusive"),
+                        gate_reason: format!(
+                            "n={n}; solve_shape={solve_shape}; raw \
+                             {raw_ghost_predicates}p/{raw_ghost_clauses}c -> solve \
+                             {}p/{}c; transformed PDR inconclusive",
+                            solve_problem.predicates().len(),
+                            solve_problem.clauses().len(),
+                        ),
                         budget_secs: route_budget.as_secs_f64(),
                         elapsed_secs: route_start.elapsed().as_secs_f64(),
                         result: transformed_result,
@@ -3518,6 +4028,70 @@ impl AdaptivePortfolio {
         Some(PortfolioResult::Safe(completed))
     }
 
+    /// Construct the universal (all-predicates-`true`) candidate for `problem`.
+    ///
+    /// Under that interpretation every predicate-headed clause is immediate:
+    /// its head is `true`. A query clause reduces exactly to its pure body
+    /// constraint, so the candidate is viable iff every such constraint is
+    /// unsatisfiable. This helper is deliberately only an admission filter:
+    /// callers MUST back-translate the candidate and strictly validate every
+    /// unchanged original clause before accepting `Safe`.
+    ///
+    /// Raw compiler encodings often end in a nullary `error -> false` query,
+    /// for which the top interpretation is correctly rejected. Certified
+    /// preprocessing can inline that control predicate and expose the actual
+    /// contradictory query constraint; the reduced LIA-array route invokes
+    /// this helper on precisely that transformed problem.
+    fn try_top_model_query_infeasibility_candidate(
+        problem: &ChcProblem,
+        query_budget: Duration,
+    ) -> Option<InvariantModel> {
+        let queries: Vec<&HornClause> = problem.queries().collect();
+        if !queries.is_empty() && query_budget.is_zero() {
+            return None;
+        }
+
+        if !queries.is_empty() {
+            let mut smt = problem.make_smt_context();
+            smt.set_global_solve_deadline(Some(Instant::now() + query_budget));
+            for query in &queries {
+                let constraint = query
+                    .body
+                    .constraint
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or(ChcExpr::Bool(true));
+                smt.reset();
+                if !matches!(
+                    smt.check_sat(&constraint),
+                    SmtResult::Unsat | SmtResult::UnsatWithCore(_) | SmtResult::UnsatWithFarkas(_)
+                ) {
+                    return None;
+                }
+            }
+        }
+
+        let mut model = InvariantModel::new();
+        for predicate in problem.predicates() {
+            let vars = predicate
+                .arg_sorts
+                .iter()
+                .enumerate()
+                .map(|(index, sort)| {
+                    ChcVar::new(
+                        format!("__p{}_a{index}", predicate.id.index()),
+                        sort.clone(),
+                    )
+                })
+                .collect();
+            model.set(
+                predicate.id,
+                PredicateInterpretation::new(vars, ChcExpr::Bool(true)),
+            );
+        }
+        Some(model)
+    }
+
     fn solve_internal(&self, deadline: Option<Instant>) -> (PortfolioResult, ValidationEvidence) {
         // Trace mode: single PDR with TLA trace, validated through the
         // same pipeline as normal results. Part of #5811.
@@ -3631,6 +4205,10 @@ impl AdaptivePortfolio {
                 PortfolioResult::Unknown,
                 ValidationEvidence::FullVerification,
             );
+        }
+
+        if let Some(result) = self.try_reduced_lia_array_preprocessed_route(deadline) {
+            return result;
         }
 
         if let Some(result) = self.try_adt_array_nullary_unsafe_prepass(deadline) {
@@ -4404,7 +4982,17 @@ impl AdaptivePortfolio {
             None => nominal,
             Some(remaining) => {
                 let scaled = remaining.mul_f64(f64::from(percent) / 100.0);
-                nominal.max(scaled.min(cap)).min(remaining)
+                // `nominal` is a floor for GENEROUS budgets only. When the entire
+                // remaining budget is smaller than one lane's nominal, the floor
+                // wins the `max` and the trailing `.min(remaining)` silently hands
+                // that lane 100% of the wall — the documented percent-share never
+                // applies. At a 5s budget an 8s nominal consumed everything.
+                let floor = if remaining < nominal {
+                    Duration::ZERO
+                } else {
+                    nominal
+                };
+                floor.max(scaled.min(cap)).min(remaining)
             }
         }
     }

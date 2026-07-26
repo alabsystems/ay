@@ -3063,21 +3063,49 @@ impl Executor {
             None
             | Some((_, QuantifiedModelCheck::Confirmed))
             | Some((_, QuantifiedModelCheck::Deferred)) => {
-                self.last_statistics.set_string(
-                    "model_check_gate.quantified",
-                    if deferred_any {
-                        // Every checked conjunct passed, but at least one was
-                        // DEFERRED: the emitted witness cannot falsify it (no
-                        // printed function interpretation, or a closed
-                        // model-independent sentence) — the `sat` rests on
-                        // the machinery that minted it exactly as before this
-                        // gate (refutation paths still ran and found nothing).
-                        "deferred"
-                    } else {
-                        "confirmed"
-                    },
-                );
-                result
+                if deferred_any && self.self_check {
+                    // FAIL-CLOSED under --self-check (#quantified-deferred-selfcheck).
+                    // The self-check contract emits `sat` ONLY when the evaluator
+                    // CONFIRMS every authored assertion; anything unverifiable is
+                    // `unknown`. A DEFERRED quantified conjunct was NOT confirmed —
+                    // the emitted witness pins no interpretation for its functions,
+                    // so the `sat` rests on the solving machinery alone, which is
+                    // exactly the unsound component on quantified fragments (found
+                    // 2026-07-23: 20 UFBV + 1 UFNIRA wintersteiger `fixpoint`
+                    // wrong-SATs passing --self-check, while z3, cvc5, and each
+                    // file's own `(set-info :status unsat)` all say UNSAT). An
+                    // unverified quantifier must degrade to `unknown` here. Default
+                    // mode is unchanged: it keeps the completeness-favoring
+                    // deferred-`sat` (documented not-sound trade), so this can only
+                    // ADD unknowns to the fail-closed mode, never a wrong answer.
+                    self.last_statistics.set_string(
+                        "model_check_gate.quantified",
+                        "deferred-selfcheck-failclosed",
+                    );
+                    self.downgrade_sat_after_gate(
+                        "self-check: a quantified assertion could not be confirmed \
+                         against the emitted model (deferred: the witness pins no \
+                         interpretation for its functions) — failing closed rather \
+                         than trusting the solver's unchecked `sat`",
+                    );
+                    SolveResult::Unknown
+                } else {
+                    self.last_statistics.set_string(
+                        "model_check_gate.quantified",
+                        if deferred_any {
+                            // Every checked conjunct passed, but at least one was
+                            // DEFERRED: the emitted witness cannot falsify it (no
+                            // printed function interpretation, or a closed
+                            // model-independent sentence) — the `sat` rests on
+                            // the machinery that minted it exactly as before this
+                            // gate (refutation paths still ran and found nothing).
+                            "deferred"
+                        } else {
+                            "confirmed"
+                        },
+                    );
+                    result
+                }
             }
             Some((conjunct, QuantifiedModelCheck::Refuted { clean })) => {
                 let term = self.format_term(conjunct);

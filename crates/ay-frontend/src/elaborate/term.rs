@@ -235,26 +235,48 @@ impl Context {
                 self.elaborate_qualified_app(name, sort, args, env)
             }
             ParsedTerm::Let(bindings, body) => {
-                // Merge of two independent `let` optimizations:
-                //  (1) origin/main's DEAD-BINDING ELIMINATION (#arr_lia561): only
-                //      elaborate/intern bindings whose name is transitively used
-                //      by the body. Interning a dead `(select A i)` value lets the
-                //      lazy array combiner scan it and drive a spurious UNSAT.
+                // `let` BINDS IN PARALLEL (SMT-LIB 2.6 §3.6.1): every binding's
+                // value is elaborated in the environment as it stood BEFORE its
+                // own level, so a binding CANNOT see its siblings. `let*` must be
+                // written as nested `let`s.
+                //
+                // This used to bind sequentially, which was a wrong-verdict
+                // (soundness) defect in the core language — theory-independent and
+                // able to flip a verdict in EITHER direction:
+                //   (let ((a 0)) (let ((a 1) (b a)) (= b 0)))   is a TAUTOLOGY
+                //     (`b` is the OUTER `a`), but bound sequentially `b` became 1
+                //     and ay answered `unsat` where z3 answers `sat`.
+                //   (let ((a false)) (let ((a true) (b a)) b))  is UNSATISFIABLE,
+                //     but ay answered `sat`.
+                // It also leaked scope: `(let ((a #b1) (b a)) …)` with nothing
+                // named `a` in scope was accepted instead of rejected, which is
+                // direct evidence the env was extended before siblings were
+                // elaborated. Sibling-referencing multi-binding `let` is what term
+                // printers and Tseitin/CSE encoders emit but no random benchmark
+                // generator produces, which is why it survived the corpus.
+                //
+                // Two optimizations are preserved, both now level-aware:
+                //  (1) DEAD-BINDING ELIMINATION (#arr_lia561): only elaborate and
+                //      intern bindings the body transitively needs. Interning a
+                //      dead `(select A i)` lets the lazy array combiner scan it and
+                //      drive a spurious UNSAT.
                 //  (2) let-CHAIN FLATTEN: clone the env HashMap ONCE for a whole
                 //      body-position chain rather than once per level — the
                 //      per-level clone was O(N^2) memory on ~8000-deep let-chains
-                //      (QF_LRA k-induction) and OOMed during elaboration.
-                // Both are semantics-preserving (an unused binding cannot affect
-                // the body; live bindings are elaborated in the same accumulated
-                // env, sequentially). Kill switch AY_ELAB_LET_CHAIN=0 falls back
-                // to the per-level form (still with dead-binding elimination).
+                //      (QF_LRA k-induction) and OOMed during elaboration. The chain
+                //      is still walked LEVEL BY LEVEL; only the clone is hoisted.
+                //      Collapsing the levels into one ordered list is what made the
+                //      flatten unsound, and is exactly what is no longer done.
+                // Kill switch AY_ELAB_LET_CHAIN=0 falls back to the per-level clone
+                // (identical semantics, one clone per level).
                 if elab_let_chain_enabled() {
-                    // Flatten the body-position chain into one ordered list.
-                    let mut all_bindings: Vec<&(String, ParsedTerm)> = Vec::new();
-                    let mut cur_bindings: &Vec<(String, ParsedTerm)> = bindings;
+                    // Collect the body-position chain as LEVELS. Level boundaries
+                    // are semantically load-bearing and must not be merged.
+                    let mut levels: Vec<&Vec<(String, ParsedTerm)>> = Vec::new();
                     let mut final_body: &ParsedTerm = body;
+                    let mut cur_bindings: &Vec<(String, ParsedTerm)> = bindings;
                     loop {
-                        all_bindings.extend(cur_bindings.iter());
+                        levels.push(cur_bindings);
                         match final_body {
                             ParsedTerm::Let(inner_bindings, inner_body) => {
                                 cur_bindings = inner_bindings;
@@ -263,39 +285,66 @@ impl Context {
                             _ => break,
                         }
                     }
-                    // Liveness from the final body, propagated backwards so a used
-                    // binding pulls in the names of its value (sequential let).
+                    // Liveness, innermost level outwards. For a PARALLEL binder the
+                    // requirement surviving a level is the free-variable rule
+                    //   used_outer = (used \ bound(level)) ∪ names(values of live)
+                    // — a sibling reference resolves OUTWARD, so it must keep the
+                    // outer binding of that name alive.
                     let mut used: HashSet<String> = HashSet::default();
                     collect_term_names(final_body, &mut used);
-                    for b in all_bindings.iter().rev() {
-                        if used.contains(&b.0) {
-                            collect_term_names(&b.1, &mut used);
+                    let mut live: Vec<Vec<bool>> = Vec::with_capacity(levels.len());
+                    for level in levels.iter().rev() {
+                        let mut flags: Vec<bool> = Vec::with_capacity(level.len());
+                        let mut value_names: HashSet<String> = HashSet::default();
+                        for (name, value) in level.iter() {
+                            let is_live = used.contains(name);
+                            flags.push(is_live);
+                            if is_live {
+                                collect_term_names(value, &mut value_names);
+                            }
                         }
+                        for (name, _) in level.iter() {
+                            used.remove(name);
+                        }
+                        used.extend(value_names);
+                        live.push(flags);
                     }
+                    live.reverse();
+
                     let mut new_env = env.clone();
-                    for b in &all_bindings {
-                        if !used.contains(&b.0) {
-                            continue; // dead binding: do not elaborate / intern
+                    let mut level_values: Vec<(String, TermId)> = Vec::new();
+                    for (level, flags) in levels.iter().zip(live.iter()) {
+                        // Elaborate EVERY value of this level first, reading only
+                        // the pre-level env, and publish them together afterwards.
+                        level_values.clear();
+                        for ((name, value), &is_live) in level.iter().zip(flags.iter()) {
+                            if !is_live {
+                                continue; // dead binding: do not elaborate / intern
+                            }
+                            let value_id = self.elaborate_term(value, &new_env)?;
+                            level_values.push((name.clone(), value_id));
                         }
-                        let value_id = self.elaborate_term(&b.1, &new_env)?;
-                        new_env.insert(b.0.clone(), value_id);
+                        for (name, value_id) in level_values.drain(..) {
+                            new_env.insert(name, value_id);
+                        }
                     }
                     self.elaborate_term(final_body, &new_env)
                 } else {
+                    // Single level; nested `let`s recurse through elaborate_term.
                     let mut used: HashSet<String> = HashSet::default();
                     collect_term_names(body, &mut used);
-                    for (name, value) in bindings.iter().rev() {
-                        if used.contains(name) {
-                            collect_term_names(value, &mut used);
-                        }
-                    }
-                    let mut new_env = env.clone();
+                    let mut level_values: Vec<(String, TermId)> = Vec::new();
                     for (name, value) in bindings {
                         if !used.contains(name) {
                             continue; // dead binding: do not elaborate / intern
                         }
-                        let value_id = self.elaborate_term(value, &new_env)?;
-                        new_env.insert(name.clone(), value_id);
+                        // `env`, not the extended one: siblings are not in scope.
+                        let value_id = self.elaborate_term(value, env)?;
+                        level_values.push((name.clone(), value_id));
+                    }
+                    let mut new_env = env.clone();
+                    for (name, value_id) in level_values {
+                        new_env.insert(name, value_id);
                     }
                     self.elaborate_term(body, &new_env)
                 }

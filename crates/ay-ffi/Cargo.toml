@@ -22,6 +22,7 @@ ay-core.workspace = true
 ay-dpll.workspace = true
 ay-frontend.workspace = true
 ay-nra.workspace = true
+ay-search.workspace = true
 # Real cube-and-conquer lookahead cubes for `Z3_solver_cube` (the propositional
 # engine behind the Tseitin-skeleton bridge in `z3_compat/propagate.rs`).
 ay-sat.workspace = true
@@ -29,6 +30,7 @@ num-bigint.workspace = true
 num-rational.workspace = true
 num-traits.workspace = true
 libc.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

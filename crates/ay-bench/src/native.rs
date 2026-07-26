@@ -8,7 +8,7 @@
 //! and produces results.json compatible with scoring.rs.
 
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,6 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use crate::error::{BenchError, Result, WithContext};
-use std::collections::BTreeMap;
 
 // ===================================================================
 // Temp file cleanup guard
@@ -84,8 +83,12 @@ pub(crate) struct ComparisonItem {
     pub solver_input_hash: String,
     pub ay_result: String,
     pub ay_time_sec: f64,
+    pub ay_cpu_time_sec: f64,
+    pub ay_cpu_time_source: String,
     pub ref_result: String,
     pub ref_time_sec: f64,
+    pub ref_cpu_time_sec: f64,
+    pub ref_cpu_time_source: String,
     pub agreement: &'static str,
     pub reference_runs: Vec<ReferenceRunEvidence>,
 }
@@ -94,6 +97,8 @@ pub(crate) struct ComparisonItem {
 pub(crate) struct ReferenceRunEvidence {
     pub result: String,
     pub time_sec: f64,
+    pub cpu_time_sec: f64,
+    pub cpu_time_source: String,
     pub exit_code: Option<i32>,
     pub solver_input_path: String,
     pub solver_input_hash: String,
@@ -140,6 +145,11 @@ pub(crate) struct ComparisonSummary {
     pub ref_faster: u32,
     pub ay_total_time: f64,
     pub ref_total_time: f64,
+    pub cpu_comparable: u32,
+    pub ay_cpu_faster: u32,
+    pub ref_cpu_faster: u32,
+    pub ay_total_cpu_time: f64,
+    pub ref_total_cpu_time: f64,
 }
 
 /// Host fingerprint recorded beside a stamped `run_class` so a stamped
@@ -514,6 +524,7 @@ struct DecompressedInput {
 
 fn decompress_to_temp(
     path: &Path,
+    private_input_dir: &Path,
     resources: Option<&crate::resource::PlannedResources>,
     timeout_sec: f64,
 ) -> Result<DecompressedInput> {
@@ -534,7 +545,8 @@ fn decompress_to_temp(
     let resources = resources.ok_or_else(|| {
         BenchError::msg("compressed benchmarks require a planned resource envelope")
     })?;
-    let (temp_path, output_file) = create_decompression_target(decompressed_name)?;
+    let (temp_path, output_file) =
+        create_private_input_target(private_input_dir, decompressed_name)?;
 
     let mut command = resources.external_command(decompress_cmd);
     command
@@ -654,11 +666,107 @@ fn decompress_to_temp(
     })
 }
 
-fn create_decompression_target(decompressed_name: &str) -> Result<(PathBuf, std::fs::File)> {
-    // Do not create or trust a fixed world-writable `/tmp/ay-bench-decompress`
-    // directory. `tempfile` creates a randomized mode-0600 file atomically in
-    // the OS temp directory, so a pre-planted symlink cannot redirect output.
-    let safe_name: String = decompressed_name
+fn validate_private_directory(path: &Path, purpose: &str) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(BenchError::InvalidArgs {
+            reason: format!("{purpose} must be absolute: {}", path.display()),
+        });
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .with_bench_context(|| format!("inspecting {purpose} {}", path.display()))?;
+    if !metadata.file_type().is_dir() {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "{purpose} must be a non-symlink directory: {}",
+                path.display()
+            ),
+        });
+    }
+    let canonical = std::fs::canonicalize(path)
+        .with_bench_context(|| format!("canonicalizing {purpose} {}", path.display()))?;
+    let canonical_metadata = std::fs::symlink_metadata(&canonical)
+        .with_bench_context(|| format!("inspecting canonical {purpose} {}", canonical.display()))?;
+    if !canonical_metadata.file_type().is_dir() {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "canonical {purpose} must be a non-symlink directory: {}",
+                canonical.display()
+            ),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        if (metadata.dev(), metadata.ino()) != (canonical_metadata.dev(), canonical_metadata.ino())
+        {
+            return Err(BenchError::InvalidArgs {
+                reason: format!("{purpose} changed while resolving it: {}", path.display()),
+            });
+        }
+        let effective_uid = nix::unistd::geteuid().as_raw();
+        if canonical_metadata.uid() != effective_uid {
+            return Err(BenchError::InvalidArgs {
+                reason: format!(
+                    "{purpose} must be owned by effective uid {effective_uid}: {}",
+                    canonical.display()
+                ),
+            });
+        }
+        if canonical_metadata.permissions().mode() & 0o777 != 0o700 {
+            return Err(BenchError::InvalidArgs {
+                reason: format!("{purpose} must have mode 0700: {}", canonical.display()),
+            });
+        }
+    }
+    // macOS intentionally exposes the per-user temporary tree through `/var`,
+    // which resolves to `/private/var`. Resolve such stable ancestor aliases
+    // once, authenticate the resulting directory above, and return only the
+    // resolved path so subsequent creation never traverses the alias again.
+    Ok(canonical)
+}
+
+pub(crate) fn reserve_private_input_directory(output_dir: &Path) -> Result<tempfile::TempDir> {
+    let canonical_output_dir =
+        validate_private_directory(output_dir, "native run output directory")?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".ay-input-stage-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let directory = builder
+        .tempdir_in(&canonical_output_dir)
+        .with_bench_context(|| {
+            format!(
+                "reserving private input staging directory in {}",
+                canonical_output_dir.display()
+            )
+        })?;
+    let canonical_directory =
+        validate_private_directory(directory.path(), "private input staging directory")?;
+    if canonical_directory != directory.path() {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "reserved private input staging directory was not canonical: {}",
+                directory.path().display()
+            ),
+        });
+    }
+    Ok(directory)
+}
+
+fn create_private_input_target(
+    private_input_dir: &Path,
+    input_name: &str,
+) -> Result<(PathBuf, std::fs::File)> {
+    let canonical_private_input_dir =
+        validate_private_directory(private_input_dir, "private input staging directory")?;
+    // The staging directory is a randomized mode-0700 child of the native
+    // run directory. `tempfile_in` then creates each randomized mode-0600
+    // snapshot atomically inside the launcher's trusted results tree.
+    let safe_name: String = input_name
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
@@ -673,7 +781,7 @@ fn create_decompression_target(decompressed_name: &str) -> Result<(PathBuf, std:
     let target = tempfile::Builder::new()
         .prefix("ay-bench-")
         .suffix(&suffix)
-        .tempfile()?;
+        .tempfile_in(canonical_private_input_dir)?;
     target
         .keep()
         .map(|(file, path)| (path, file))
@@ -692,6 +800,7 @@ pub(crate) struct PreparedBenchmark {
 pub(crate) fn prepare_benchmark(
     original: &Path,
     benchmark_id: &str,
+    private_input_dir: &Path,
     resources: &crate::resource::PlannedResources,
     timeout_sec: f64,
 ) -> Result<PreparedBenchmark> {
@@ -727,7 +836,8 @@ pub(crate) fn prepare_benchmark(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| BenchError::msg("benchmark filename is not valid UTF-8"))?;
-    let (pinned_source_path, mut pinned_source) = create_decompression_target(source_name)?;
+    let (pinned_source_path, mut pinned_source) =
+        create_private_input_target(private_input_dir, source_name)?;
     let source_guard = TempFileGuard(Some(pinned_source_path.clone()));
     let mut hasher = Sha256::new();
     let mut copied = 0_u64;
@@ -773,8 +883,12 @@ pub(crate) fn prepare_benchmark(
     let source_hash = format!("sha256:{:x}", hasher.finalize());
     let decompressed = needs_decompression(original);
     let (solver_path, solver_guard, solver_input_bytes, solver_input_hash) = if decompressed {
-        let decompressed_input =
-            decompress_to_temp(&pinned_source_path, Some(resources), timeout_sec)?;
+        let decompressed_input = decompress_to_temp(
+            &pinned_source_path,
+            private_input_dir,
+            Some(resources),
+            timeout_sec,
+        )?;
         let DecompressedInput {
             path,
             bytes,
@@ -813,6 +927,84 @@ pub(crate) fn prepare_benchmark(
         },
         _solver_guard: solver_guard,
     })
+}
+
+/// Hash the current organizer/source bytes for campaign evidence without
+/// following links or trusting a pathname that changes during the read.
+pub(crate) fn current_benchmark_source_identity(path: &Path) -> Result<(String, u64)> {
+    use sha2::{Digest as _, Sha256};
+
+    let path_before = std::fs::symlink_metadata(path)
+        .with_bench_context(|| format!("inspecting benchmark source {}", path.display()))?;
+    if !path_before.file_type().is_file() {
+        return Err(BenchError::msg(format!(
+            "benchmark source is not a non-symlink regular file: {}",
+            path.display()
+        )));
+    }
+    if path_before.len() > DECOMPRESSED_FILE_LIMIT_BYTES {
+        return Err(BenchError::msg(format!(
+            "benchmark {} exceeds the fixed {}-byte source identity cap",
+            path.display(),
+            DECOMPRESSED_FILE_LIMIT_BYTES
+        )));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
+    }
+    let mut source = options
+        .open(path)
+        .with_bench_context(|| format!("opening benchmark source {}", path.display()))?;
+    let before = source.metadata()?;
+    if !before.file_type().is_file()
+        || !same_file_identity_without_link_count(&path_before, &before)
+    {
+        return Err(BenchError::msg(format!(
+            "benchmark source changed while opening it: {}",
+            path.display()
+        )));
+    }
+
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .with_bench_context(|| format!("hashing benchmark source {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        size_bytes = size_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| BenchError::msg("benchmark source size overflow"))?;
+        if size_bytes > DECOMPRESSED_FILE_LIMIT_BYTES {
+            return Err(BenchError::msg(format!(
+                "benchmark {} exceeds the fixed {}-byte source identity cap",
+                path.display(),
+                DECOMPRESSED_FILE_LIMIT_BYTES
+            )));
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    let after = source.metadata()?;
+    let path_after = std::fs::symlink_metadata(path)?;
+    if size_bytes != after.len()
+        || !same_file_identity_without_link_count(&before, &after)
+        || !same_file_identity_without_link_count(&after, &path_after)
+    {
+        return Err(BenchError::msg(format!(
+            "benchmark source changed while hashing it: {}",
+            path.display()
+        )));
+    }
+    Ok((format!("sha256:{:x}", hasher.finalize()), size_bytes))
 }
 
 fn same_file_identity_without_link_count(
@@ -862,6 +1054,23 @@ pub(crate) fn discover_benchmarks(dir: &Path, domain: &str) -> Result<Vec<PathBu
         crate::resource::MAX_DISCOVERED_BENCHMARKS,
     )?;
     files.sort();
+    let compressed_files = files
+        .iter()
+        .filter(|path| needs_decompression(path))
+        .filter_map(|path| {
+            let mut plain = path.clone();
+            plain.set_extension("");
+            plain.to_str().map(ToOwned::to_owned)
+        })
+        .collect::<BTreeSet<_>>();
+    files.retain(|path| {
+        if needs_decompression(path) {
+            return true;
+        }
+        !path
+            .to_str()
+            .is_some_and(|plain| compressed_files.contains(plain))
+    });
     Ok(files)
 }
 
@@ -936,11 +1145,31 @@ fn benchmark_identifier(path: &Path, corpus_root: &Path) -> Result<String> {
 // CPU time measurement via /usr/bin/time
 // ===================================================================
 
+const CPU_TIMING_NONCE_ENV: &str = "AY_BENCH_CPU_TIMING_NONCE";
+const REQUIRE_SANDBOX_CPU_TIMING_ENV: &str = "AY_BENCH_REQUIRE_SANDBOX_CPU_TIME_V1";
+const SANDBOX_CPU_TIMING_PREFIX: &str = "AY_BENCH_CPU_TIME_V1";
+
 /// Check whether `/usr/bin/time` is available (cached after first call).
 fn has_usr_bin_time() -> bool {
     use std::sync::OnceLock;
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| Path::new("/usr/bin/time").exists())
+    *AVAILABLE.get_or_init(|| {
+        let Ok(metadata) = std::fs::symlink_metadata("/usr/bin/time") else {
+            return false;
+        };
+        if !metadata.file_type().is_file() {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            metadata.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    })
 }
 
 /// Parse POSIX-format time output (`-p` flag) to extract user+sys CPU seconds.
@@ -980,6 +1209,68 @@ fn parse_posix_time_output(stderr: &str) -> Option<f64> {
         (Some(u), Some(s)) if u.is_finite() && s.is_finite() && u >= 0.0 && s >= 0.0 => Some(u + s),
         _ => None,
     }
+}
+
+/// Parse the nonce-bound timing footer emitted by the trusted continuous
+/// benchmark launcher. The launcher places `/usr/bin/time` *inside*
+/// bubblewrap, immediately around `/solver/ay`, because timing the outer
+/// bubblewrap supervisor does not include the sandboxed solver's CPU usage.
+///
+/// Exactly one nonce-bound record is required. Ambiguous output fails closed
+/// instead of choosing a candidate-controlled lookalike.
+fn parse_sandbox_cpu_time_output(stderr: &str, nonce: &str) -> Option<f64> {
+    let expected_prefix = format!("{SANDBOX_CPU_TIMING_PREFIX} {nonce} ");
+    let mut measured = None;
+    for line in stderr.lines() {
+        let Some(rest) = line.trim().strip_prefix(&expected_prefix) else {
+            continue;
+        };
+        if measured.is_some() {
+            return None;
+        }
+        let mut fields = rest.split_whitespace();
+        let user = fields.next()?.parse::<f64>().ok()?;
+        let system = fields.next()?.parse::<f64>().ok()?;
+        if fields.next().is_some()
+            || !user.is_finite()
+            || !system.is_finite()
+            || user < 0.0
+            || system < 0.0
+        {
+            return None;
+        }
+        measured = Some(user + system);
+    }
+    measured
+}
+
+fn timing_nonce_for_output(output: &tempfile::NamedTempFile) -> Option<String> {
+    let value = output.path().file_name()?.to_str()?;
+    (!value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte)))
+    .then(|| value.to_string())
+}
+
+fn exact_cpu_time_source(source: &str) -> bool {
+    matches!(
+        source,
+        "posix-time-user+sys" | "sandbox-posix-time-user+sys-v1"
+    )
+}
+
+fn is_definitive_verdict(verdict: &str) -> bool {
+    matches!(verdict, "sat" | "unsat")
+}
+
+fn append_harness_error(existing: &mut Option<String>, detail: &str) {
+    let combined = match existing.take() {
+        Some(previous) => format!("{previous}; {detail}"),
+        None => detail.to_string(),
+    };
+    *existing = Some(bounded_output_excerpt(&combined));
 }
 
 // ===================================================================
@@ -1139,18 +1430,30 @@ fn run_solver(
 
     let start = Instant::now();
     let timeout = Duration::from_secs_f64(timeout_sec);
+    let require_sandbox_timing =
+        std::env::var(REQUIRE_SANDBOX_CPU_TIMING_ENV).as_deref() == Ok("1");
 
-    // When /usr/bin/time is available, wrap the solver command to get true
-    // child-process CPU time (user + sys). This avoids unsafe code while
-    // providing accurate CPU time for competition scoring (PAR-2, SMT-COMP).
-    let timing_output = has_usr_bin_time()
+    // Direct solver paths are timed by this outer wrapper. The continuous
+    // benchmark launcher additionally recognizes the nonce below and emits a
+    // trusted timing footer from an inner `/usr/bin/time` immediately around
+    // `/solver/ay`. Continuous runs require that inner path and deliberately
+    // do not time the outer bubblewrap supervisor.
+    let timing_output = (require_sandbox_timing || has_usr_bin_time())
         .then(|| tempfile::Builder::new().prefix("ay-time-").tempfile())
         .transpose()
         .ok()
         .flatten();
-    let use_time_wrapper = timing_output.is_some();
+    let use_outer_time_wrapper =
+        timing_output.is_some() && has_usr_bin_time() && !require_sandbox_timing;
+    // The nonce is a private contract with the trusted continuous-benchmark
+    // launcher. Never expose it to an ordinary candidate process: otherwise
+    // that process could forge a sandbox timing footer and override the
+    // independent outer `/usr/bin/time` measurement.
+    let cpu_timing_nonce = require_sandbox_timing
+        .then(|| timing_output.as_ref().and_then(timing_nonce_for_output))
+        .flatten();
 
-    let mut cmd = if use_time_wrapper {
+    let mut cmd = if use_outer_time_wrapper {
         let mut c = if artifact_plan.is_some() {
             resources.external_command_with_file_limit("/usr/bin/time", PROOF_ARTIFACT_LIMIT_BYTES)
         } else {
@@ -1174,6 +1477,9 @@ fn run_solver(
     cmd.args(&command_args);
     cmd.env_clear();
     cmd.envs(solver_env);
+    if let Some(nonce) = cpu_timing_nonce.as_deref() {
+        cmd.env(CPU_TIMING_NONCE_ENV, nonce);
+    }
     cmd.arg("--");
     cmd.arg(actual_path);
     cmd.stdout(Stdio::piped());
@@ -1231,7 +1537,7 @@ fn run_solver(
         .map(PipeCapture::finish)
         .unwrap_or_else(CapturedPipe::missing);
     let capture_incomplete = stdout.incomplete() || stderr_output.incomplete();
-    let (result, sat_run, exit_code, harness_error) = match outcome {
+    let (mut result, sat_run, exit_code, mut harness_error) = match outcome {
         Err(error) => (
             "error".to_string(),
             None,
@@ -1264,8 +1570,10 @@ fn run_solver(
         },
     };
 
-    // Extract CPU time from /usr/bin/time output, fall back to wall time.
-    let measured_cpu = if use_time_wrapper {
+    let sandbox_cpu = cpu_timing_nonce
+        .as_deref()
+        .and_then(|nonce| parse_sandbox_cpu_time_output(&stderr_output.text, nonce));
+    let outer_cpu = if use_outer_time_wrapper {
         timing_output
             .as_ref()
             .and_then(|output| {
@@ -1276,11 +1584,25 @@ fn run_solver(
     } else {
         None
     };
-    let (cpu_time, cpu_time_source) = match (use_time_wrapper, measured_cpu) {
-        (true, Some(cpu_time)) => (cpu_time, "posix-time-user+sys"),
-        (true, None) => (elapsed, "wall-fallback-malformed-posix-time"),
-        (false, _) => (elapsed, "wall-no-posix-time"),
+    let (cpu_time, cpu_time_source) = match (sandbox_cpu, outer_cpu, require_sandbox_timing) {
+        (Some(cpu_time), _, _) => (cpu_time, "sandbox-posix-time-user+sys-v1"),
+        (None, Some(cpu_time), false) => (cpu_time, "posix-time-user+sys"),
+        (None, _, true) => (0.0, "unavailable-required-sandbox-timing"),
+        (None, _, false) if use_outer_time_wrapper => {
+            (elapsed, "wall-fallback-malformed-posix-time")
+        }
+        (None, _, false) => (elapsed, "wall-no-posix-time"),
     };
+    if require_sandbox_timing
+        && is_definitive_verdict(&result)
+        && !exact_cpu_time_source(cpu_time_source)
+    {
+        result = "error".to_string();
+        append_harness_error(
+            &mut harness_error,
+            "definitive solver verdict lacks exact child CPU timing",
+        );
+    }
 
     prepare_solver_run_artifacts(
         NativeResultItem {
@@ -1410,6 +1732,8 @@ fn failed_reference_evidence(
     ReferenceRunEvidence {
         result: "error".to_string(),
         time_sec: 0.0,
+        cpu_time_sec: 0.0,
+        cpu_time_source: "unavailable".to_string(),
         exit_code: None,
         solver_input_path: benchmark.display().to_string(),
         solver_input_hash: solver_input_hash.to_string(),
@@ -1436,6 +1760,8 @@ fn run_external_solver(
 ) -> ReferenceRunEvidence {
     let start = Instant::now();
     let timeout = Duration::from_secs_f64(timeout_sec);
+    let require_exact_cpu_timing =
+        std::env::var(REQUIRE_SANDBOX_CPU_TIMING_ENV).as_deref() == Ok("1");
 
     let mut solver_env = BTreeMap::new();
     solver_env.insert("LC_ALL".to_string(), "C".to_string());
@@ -1469,7 +1795,24 @@ fn run_external_solver(
     solver_argv.push(solver_path.display().to_string());
     solver_argv.extend(args.iter().map(|arg| arg.to_string_lossy().into_owned()));
 
-    let mut cmd = resources.external_command(solver_path);
+    let timing_output = has_usr_bin_time()
+        .then(|| tempfile::Builder::new().prefix("ay-ref-time-").tempfile())
+        .transpose()
+        .ok()
+        .flatten();
+    let use_time_wrapper = timing_output.is_some();
+    let mut cmd = if use_time_wrapper {
+        let mut command = resources.external_command("/usr/bin/time");
+        command.arg("-p");
+        command.arg("-o");
+        if let Some(output) = timing_output.as_ref() {
+            command.arg(output.path());
+        }
+        command.arg(solver_path);
+        command
+    } else {
+        resources.external_command(solver_path)
+    };
     cmd.args(&args);
     // ay-pb consumes these directly; other reference solvers remain under the
     // exact zero-grace RSS watchdog while receiving the planned CPU budget as
@@ -1508,7 +1851,7 @@ fn run_external_solver(
     let stderr = stderr_capture
         .map(PipeCapture::finish)
         .unwrap_or_else(CapturedPipe::missing);
-    let (result, recorded_time, exit_code, harness_error) = match outcome {
+    let (mut result, recorded_time, exit_code, mut harness_error) = match outcome {
         Err(error) => ("error".to_string(), elapsed, None, Some(error.to_string())),
         Ok(outcome) if outcome.memout => ("memout".to_string(), elapsed, None, None),
         Ok(outcome) if outcome.timed_out => ("timeout".to_string(), timeout_sec, None, None),
@@ -1533,9 +1876,41 @@ fn run_external_solver(
             ),
         },
     };
+    let measured_cpu = if use_time_wrapper {
+        timing_output
+            .as_ref()
+            .and_then(|output| {
+                crate::resource::read_bounded_text(
+                    output.path(),
+                    64 * 1024,
+                    "reference CPU timing output",
+                )
+                .ok()
+            })
+            .and_then(|output| parse_posix_time_output(&output))
+    } else {
+        None
+    };
+    let (cpu_time, cpu_time_source) = match (use_time_wrapper, measured_cpu) {
+        (true, Some(cpu_time)) => (cpu_time, "posix-time-user+sys"),
+        (true, None) => (elapsed, "wall-fallback-malformed-posix-time"),
+        (false, _) => (elapsed, "wall-no-posix-time"),
+    };
+    if require_exact_cpu_timing
+        && is_definitive_verdict(&result)
+        && !exact_cpu_time_source(cpu_time_source)
+    {
+        result = "error".to_string();
+        append_harness_error(
+            &mut harness_error,
+            "definitive reference verdict lacks exact child CPU timing",
+        );
+    }
     ReferenceRunEvidence {
         result,
         time_sec: round6(recorded_time),
+        cpu_time_sec: round6(cpu_time),
+        cpu_time_source: cpu_time_source.to_string(),
         exit_code,
         solver_input_path: benchmark.display().to_string(),
         solver_input_hash: solver_input_hash.to_string(),
@@ -1568,8 +1943,7 @@ fn round6(x: f64) -> f64 {
 }
 
 fn classify_agreement(ay: &str, reference: &str) -> &'static str {
-    let definitive = |s: &str| s == "sat" || s == "unsat";
-    match (definitive(ay), definitive(reference)) {
+    match (is_definitive_verdict(ay), is_definitive_verdict(reference)) {
         (true, true) => {
             if ay == reference {
                 "agree"
@@ -2359,6 +2733,8 @@ fn parse_sat_applied_run_metadata(stderr: &str) -> Option<SatAppliedRunMetadata>
 pub(crate) struct NativeRunArgs<'a> {
     pub ay: &'a Path,
     pub benchmarks_dir: &'a Path,
+    /// Canonical mode-0700 staging directory owned by this native run.
+    pub private_input_dir: &'a Path,
     pub timeout_sec: f64,
     pub domain: &'a str,
     pub quiet: bool,
@@ -2512,8 +2888,12 @@ fn select_prepared_representative(mut runs: Vec<NativeSolverRun>) -> Result<Nati
     Ok(finalize_selected_artifacts(selected))
 }
 
-fn preflight_native_benchmarks(args: &NativeRunArgs<'_>) -> Result<(PathBuf, Vec<PathBuf>)> {
-    if let Some(file_list) = args.file_list.as_ref() {
+pub(crate) fn preflight_benchmark_paths(
+    benchmarks_dir: &Path,
+    domain: &str,
+    file_list: Option<&[PathBuf]>,
+) -> Result<(PathBuf, Vec<PathBuf>)> {
+    if let Some(file_list) = file_list {
         if file_list.len() > crate::resource::MAX_DISCOVERED_BENCHMARKS {
             return Err(BenchError::InvalidArgs {
                 reason: format!(
@@ -2524,17 +2904,14 @@ fn preflight_native_benchmarks(args: &NativeRunArgs<'_>) -> Result<(PathBuf, Vec
         }
     }
     let discovered_storage;
-    let discovered: &[PathBuf] = if let Some(file_list) = args.file_list.as_ref() {
+    let discovered: &[PathBuf] = if let Some(file_list) = file_list {
         file_list
     } else {
-        discovered_storage = discover_benchmarks(args.benchmarks_dir, args.domain)?;
+        discovered_storage = discover_benchmarks(benchmarks_dir, domain)?;
         &discovered_storage
     };
-    let corpus_root = std::fs::canonicalize(args.benchmarks_dir).with_bench_context(|| {
-        format!(
-            "canonicalizing corpus root {}",
-            args.benchmarks_dir.display()
-        )
+    let corpus_root = std::fs::canonicalize(benchmarks_dir).with_bench_context(|| {
+        format!("canonicalizing corpus root {}", benchmarks_dir.display())
     })?;
     if discovered.is_empty() {
         return Ok((corpus_root, Vec::new()));
@@ -2781,6 +3158,63 @@ pub(crate) fn run_native(args: &NativeRunArgs<'_>) -> Result<NativeResults> {
             ),
         });
     }
+    if let Some(argument) = args.solver_args.iter().find(|argument| {
+        let value = argument.as_str();
+        value == "--"
+            || value.starts_with("--competition=")
+            || value.starts_with("--timeout=")
+            || value == "-t"
+            || value == "-T"
+            || value.starts_with("-t:")
+            || value.starts_with("-T:")
+            || value.starts_with("-t=")
+            || value.starts_with("timeout=")
+            || value.strip_prefix("-t").is_some_and(|suffix| {
+                let digits = suffix.strip_prefix('+').unwrap_or(suffix);
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    }) {
+        return Err(BenchError::InvalidArgs {
+            reason: format!(
+                "solver argument {argument:?} is an alternate timeout/competition control or \
+                 argument delimiter; native benchmarks require canonical split controls"
+            ),
+        });
+    }
+    let has_competition_control = args
+        .solver_args
+        .iter()
+        .any(|argument| argument == "--competition");
+    let has_timeout_control = args
+        .solver_args
+        .iter()
+        .any(|argument| argument == "--timeout");
+    if has_competition_control || has_timeout_control {
+        let expected_timeout_ms = ((args.timeout_sec * 1000.0).round() as u64)
+            .max(1)
+            .to_string();
+        let canonical = args.domain == "chc"
+            && args.solver_args.len() == 3
+            && args.solver_args[0] == "--competition"
+            && args.solver_args[1] == "--timeout";
+        if !canonical {
+            return Err(BenchError::InvalidArgs {
+                reason: format!(
+                    "competition solver controls must be exactly \
+                     [\"--competition\", \"--timeout\", \"{expected_timeout_ms}\"] \
+                     for a CHC benchmark"
+                ),
+            });
+        }
+        if args.solver_args[2] != expected_timeout_ms {
+            return Err(BenchError::InvalidArgs {
+                reason: format!(
+                    "solver --timeout must match the parent benchmark envelope \
+                     ({expected_timeout_ms} ms)"
+                ),
+            });
+        }
+    }
     if args
         .run_class
         .as_deref()
@@ -2793,7 +3227,10 @@ pub(crate) fn run_native(args: &NativeRunArgs<'_>) -> Result<NativeResults> {
             ),
         });
     }
-    let (corpus_root, benchmarks) = preflight_native_benchmarks(args)?;
+    let private_input_dir =
+        validate_private_directory(args.private_input_dir, "private input staging directory")?;
+    let (corpus_root, benchmarks) =
+        preflight_benchmark_paths(args.benchmarks_dir, args.domain, args.file_list.as_deref())?;
     if benchmarks.is_empty() {
         return Err(BenchError::msg(format!(
             "no {} benchmarks found in {}",
@@ -2918,7 +3355,13 @@ pub(crate) fn run_native(args: &NativeRunArgs<'_>) -> Result<NativeResults> {
     let mut preprocessing = Vec::with_capacity(total);
     for (idx, benchmark) in benchmarks.iter().enumerate() {
         let benchmark_id = benchmark_identifier(benchmark, &corpus_root)?;
-        let prepared = prepare_benchmark(benchmark, &benchmark_id, resources, args.timeout_sec)?;
+        let prepared = prepare_benchmark(
+            benchmark,
+            &benchmark_id,
+            &private_input_dir,
+            resources,
+            args.timeout_sec,
+        )?;
         let mut extracted_features = args
             .with_features
             .then(|| crate::features::extract_from_file(&prepared.solver_path))
@@ -3129,6 +3572,11 @@ struct ReferenceCampaign {
     ref_faster: u32,
     ay_total: f64,
     ref_total: f64,
+    cpu_comparable: u32,
+    ay_cpu_faster: u32,
+    ref_cpu_faster: u32,
+    ay_total_cpu: f64,
+    ref_total_cpu: f64,
 }
 
 impl ReferenceCampaign {
@@ -3156,6 +3604,11 @@ impl ReferenceCampaign {
             ref_faster: 0,
             ay_total: 0.0,
             ref_total: 0.0,
+            cpu_comparable: 0,
+            ay_cpu_faster: 0,
+            ref_cpu_faster: 0,
+            ay_total_cpu: 0.0,
+            ref_total_cpu: 0.0,
         })
     }
 
@@ -3189,6 +3642,8 @@ impl ReferenceCampaign {
         let representative = &outcomes[(outcomes.len() - 1) / 2];
         let mut ref_result = representative.result.clone();
         let ref_time = representative.time_sec;
+        let ref_cpu_time = representative.cpu_time_sec;
+        let ref_cpu_time_source = representative.cpu_time_source.clone();
         if !consistent {
             ref_result = "error".to_string();
         }
@@ -3204,6 +3659,18 @@ impl ReferenceCampaign {
                 } else if ay_item.time_sec > ref_time {
                     self.ref_faster += 1;
                 }
+                if exact_cpu_time_source(&ay_item.cpu_time_source)
+                    && exact_cpu_time_source(&ref_cpu_time_source)
+                {
+                    self.cpu_comparable += 1;
+                    self.ay_total_cpu += ay_item.cpu_time_sec;
+                    self.ref_total_cpu += ref_cpu_time;
+                    if ay_item.cpu_time_sec < ref_cpu_time {
+                        self.ay_cpu_faster += 1;
+                    } else if ay_item.cpu_time_sec > ref_cpu_time {
+                        self.ref_cpu_faster += 1;
+                    }
+                }
             }
             "disagree" => self.disagree += 1,
             "ay_only" => self.ay_only += 1,
@@ -3215,8 +3682,12 @@ impl ReferenceCampaign {
             solver_input_hash: solver_input_hash.to_string(),
             ay_result: ay_item.result.clone(),
             ay_time_sec: ay_item.time_sec,
+            ay_cpu_time_sec: ay_item.cpu_time_sec,
+            ay_cpu_time_source: ay_item.cpu_time_source.clone(),
             ref_result,
             ref_time_sec: ref_time,
+            ref_cpu_time_sec: ref_cpu_time,
+            ref_cpu_time_source,
             agreement,
             reference_runs,
         });
@@ -3256,6 +3727,11 @@ impl ReferenceCampaign {
             ref_faster: self.ref_faster,
             ay_total_time: round6(self.ay_total),
             ref_total_time: round6(self.ref_total),
+            cpu_comparable: self.cpu_comparable,
+            ay_cpu_faster: self.ay_cpu_faster,
+            ref_cpu_faster: self.ref_cpu_faster,
+            ay_total_cpu_time: round6(self.ay_total_cpu),
+            ref_total_cpu_time: round6(self.ref_total_cpu),
         };
         Ok((summary, self.items))
     }
@@ -3270,8 +3746,17 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn secure_test_directory(path: &Path) -> &Path {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .expect("secure test directory");
+        }
+        path
+    }
 
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     fn tree_contains_file(root: &Path, expected: &[u8]) -> bool {
         let Ok(entries) = std::fs::read_dir(root) else {
             return false;
@@ -3289,7 +3774,6 @@ mod tests {
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-
     fn artifact_test_item(time_sec: f64, result: &str) -> NativeResultItem {
         NativeResultItem {
             file: "case.cnf".to_string(),
@@ -3338,31 +3822,9 @@ mod tests {
         let second = temp.path().join("b.smt2");
         std::fs::write(&first, "(check-sat)\n").expect("first");
         std::fs::write(&second, "(check-sat)\n").expect("second");
-        let make_args = |file_list| NativeRunArgs {
-            ay: Path::new("unused"),
-            benchmarks_dir: temp.path(),
-            timeout_sec: 1.0,
-            domain: "smt",
-            quiet: true,
-            with_features: false,
-            file_list: Some(file_list),
-            shard: None,
-            runs: 1,
-            reference_solvers: Vec::new(),
-            run_class: None,
-            solver_args: Vec::new(),
-            sat_track: None,
-            sat_ai_class: None,
-            sat_variant: None,
-            environment: None,
-            pinned_ay: None,
-            artifact_output_dir: None,
-            resources: Some(test_resources()),
-        };
-
+        let requested = vec![second.clone(), first.clone()];
         let (_, sorted) =
-            preflight_native_benchmarks(&make_args(vec![second.clone(), first.clone()]))
-                .expect("preflight");
+            preflight_benchmark_paths(temp.path(), "smt", Some(&requested)).expect("preflight");
         assert_eq!(
             sorted,
             vec![
@@ -3370,7 +3832,8 @@ mod tests {
                 second.canonicalize().expect("canonical second benchmark"),
             ]
         );
-        let error = preflight_native_benchmarks(&make_args(vec![first.clone(), first]))
+        let duplicate = vec![first.clone(), first];
+        let error = preflight_benchmark_paths(temp.path(), "smt", Some(&duplicate))
             .expect_err("duplicate IDs must fail");
         assert!(error.to_string().contains("duplicate native benchmark ID"));
     }
@@ -3726,6 +4189,107 @@ mod tests {
         assert_eq!(strings[4], benchmark.display().to_string());
     }
 
+    #[test]
+    fn test_chc_solver_args_receive_competition_timeout_contract() {
+        let args = solver_command_args(
+            "chc",
+            &[
+                "--competition".to_string(),
+                "--timeout".to_string(),
+                "30000".to_string(),
+                "--verbose".to_string(),
+                "--decision-log".to_string(),
+            ],
+        );
+        assert_eq!(
+            args,
+            [
+                "--chc",
+                "--competition",
+                "--timeout",
+                "30000",
+                "--verbose",
+                "--decision-log",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_chc_dev_solver_args_only_receive_chc_mode() {
+        assert_eq!(solver_command_args("chc", &[]), ["--chc"]);
+    }
+
+    #[test]
+    fn test_non_chc_solver_args_do_not_gain_chc_contract() {
+        let args = solver_command_args("smt", &["--verbose".to_string()]);
+        assert_eq!(args, ["--verbose"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
+    fn test_run_native_records_chc_competition_timeout_contract() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let argv_file = tmp.path().join("ay-argv.txt");
+        let ay = write_arg_capture_solver_script(&tmp, "fake-ay.sh", &argv_file);
+        let benchmark = tmp.path().join("sample.smt2");
+        std::fs::write(&benchmark, "(set-logic HORN)\n(check-sat)\n").expect("write benchmark");
+
+        let results = run_native(&NativeRunArgs {
+            ay: &ay,
+            benchmarks_dir: tmp.path(),
+            private_input_dir: secure_test_directory(tmp.path()),
+            timeout_sec: 2.5,
+            domain: "chc",
+            quiet: true,
+            with_features: false,
+            file_list: Some(vec![benchmark]),
+            shard: None,
+            runs: 1,
+            reference_solvers: Vec::new(),
+            run_class: None,
+            solver_args: vec![
+                "--competition".to_string(),
+                "--timeout".to_string(),
+                "2500".to_string(),
+            ],
+            sat_track: None,
+            sat_ai_class: None,
+            sat_variant: None,
+            environment: None,
+            pinned_ay: None,
+            artifact_output_dir: None,
+            resources: Some(test_resources()),
+        })
+        .expect("run native");
+
+        let item = results.items.first().expect("result item");
+        let solver_input = item
+            .solver_input_path
+            .as_deref()
+            .expect("private solver input");
+        assert_eq!(
+            &item.solver_argv[1..],
+            [
+                "--chc",
+                "--competition",
+                "--timeout",
+                "2500",
+                "--memory",
+                "10000",
+                "--",
+                solver_input,
+            ]
+        );
+        let observed = std::fs::read_to_string(argv_file).expect("read solver argv");
+        assert_eq!(observed.lines().collect::<Vec<_>>(), item.solver_argv[1..]);
+    }
+
     #[cfg(unix)]
     fn write_signaled_reference_solver_script(dir: &TempDir) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -3976,9 +4540,11 @@ mod tests {
     #[test]
     fn native_run_rejects_unrepresentable_timeout_before_spawning() {
         let resources = test_resources();
+        let private_input_dir = tempfile::tempdir().expect("private input dir");
         let error = run_native(&NativeRunArgs {
             ay: Path::new("definitely-not-a-solver"),
             benchmarks_dir: Path::new("."),
+            private_input_dir: secure_test_directory(private_input_dir.path()),
             timeout_sec: f64::MAX,
             domain: "smt",
             quiet: true,
@@ -4021,6 +4587,7 @@ mod tests {
         let results = run_native(&NativeRunArgs {
             ay: &solver,
             benchmarks_dir: temp.path(),
+            private_input_dir: secure_test_directory(temp.path()),
             timeout_sec: 1.0,
             domain: "smt",
             quiet: true,
@@ -4061,6 +4628,7 @@ mod tests {
         let results = run_native(&NativeRunArgs {
             ay: &solver,
             benchmarks_dir: temp.path(),
+            private_input_dir: secure_test_directory(temp.path()),
             timeout_sec: 1.0,
             domain: "smt",
             quiet: true,
@@ -4111,6 +4679,26 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_discovery_prefers_pinned_compressed_file_over_plain_sibling() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("both.cnf"), "p cnf 0 0\n").expect("plain");
+        std::fs::write(temp.path().join("both.cnf.xz"), b"not read by discovery")
+            .expect("compressed");
+        std::fs::write(
+            temp.path().join("compressed-only.cnf.xz"),
+            b"not read by discovery",
+        )
+        .expect("compressed-only");
+
+        let files = discover_benchmarks(temp.path(), "sat").expect("discover");
+        let names = files
+            .iter()
+            .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["both.cnf.xz", "compressed-only.cnf.xz"]);
+    }
+
+    #[test]
     fn benchmark_discovery_rejects_file_count_overflow() {
         let temp = tempfile::tempdir().expect("tempdir");
         for name in ["a.cnf", "b.cnf", "c.cnf"] {
@@ -4135,17 +4723,22 @@ mod tests {
 
     #[test]
     fn decompression_targets_are_unique_and_created_exclusively() {
-        let (first, first_file) = create_decompression_target("case.cnf").expect("first target");
-        let (second, second_file) = create_decompression_target("case.cnf").expect("second target");
+        let output = tempfile::tempdir().expect("output dir");
+        let private_input_dir =
+            reserve_private_input_directory(secure_test_directory(output.path()))
+                .expect("private input dir");
+        let (first, first_file) = create_private_input_target(private_input_dir.path(), "case.cnf")
+            .expect("first target");
+        let (second, second_file) =
+            create_private_input_target(private_input_dir.path(), "case.cnf")
+                .expect("second target");
         drop((first_file, second_file));
 
         assert_ne!(first, second);
         assert!(first.is_file());
         assert!(second.is_file());
-        assert_ne!(
-            first.parent().and_then(Path::file_name),
-            Some(std::ffi::OsStr::new("ay-bench-decompress"))
-        );
+        assert_eq!(first.parent(), Some(private_input_dir.path()));
+        assert_eq!(second.parent(), Some(private_input_dir.path()));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -4160,6 +4753,188 @@ mod tests {
         }
         std::fs::remove_file(first).expect("remove first");
         std::fs::remove_file(second).expect("remove second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_validation_rejects_insecure_mode_without_repairing_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let output = tempfile::tempdir().expect("output dir");
+        std::fs::set_permissions(output.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("set insecure test mode");
+
+        let error = reserve_private_input_directory(output.path())
+            .expect_err("an insecure native output directory must be rejected");
+
+        assert!(error.to_string().contains("mode 0700"));
+        assert_eq!(
+            std::fs::metadata(output.path())
+                .expect("output metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "validation must not mutate an untrusted directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_directory_validation_resolves_ancestor_alias_but_rejects_final_symlink() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let root = tempfile::tempdir().expect("root");
+        secure_test_directory(root.path());
+        let real_parent = root.path().join("real");
+        std::fs::create_dir(&real_parent).expect("real parent");
+        std::fs::set_permissions(&real_parent, std::fs::Permissions::from_mode(0o700))
+            .expect("secure real parent");
+        let private = real_parent.join("private");
+        std::fs::create_dir(&private).expect("private directory");
+        std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+            .expect("secure private directory");
+
+        let alias_parent = root.path().join("alias");
+        symlink(&real_parent, &alias_parent).expect("ancestor alias");
+        let aliased_private = alias_parent.join("private");
+        let canonical_private =
+            validate_private_directory(&aliased_private, "test private directory")
+                .expect("stable ancestor aliases are resolved before use");
+        assert_eq!(
+            canonical_private,
+            private.canonicalize().expect("canonical private directory")
+        );
+
+        let (target, file) = create_private_input_target(&aliased_private, "case.cnf")
+            .expect("create through resolved directory");
+        drop(file);
+        assert_eq!(target.parent(), Some(canonical_private.as_path()));
+        std::fs::remove_file(target).expect("remove target");
+
+        let final_alias = root.path().join("final-alias");
+        symlink(&private, &final_alias).expect("final alias");
+        let error = validate_private_directory(&final_alias, "test private directory")
+            .expect_err("the final path component must remain a real directory");
+        assert!(error.to_string().contains("non-symlink directory"));
+    }
+
+    #[test]
+    fn uncompressed_benchmark_is_staged_in_private_run_directory() {
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let source = source_dir.path().join("case.cnf");
+        std::fs::write(&source, b"p cnf 1 1\n1 0\n").expect("write source");
+        let output = tempfile::tempdir().expect("output dir");
+        let private_input_dir =
+            reserve_private_input_directory(secure_test_directory(output.path()))
+                .expect("private input dir");
+
+        let prepared = prepare_benchmark(
+            &source,
+            "sat/case.cnf",
+            private_input_dir.path(),
+            &test_resources(),
+            5.0,
+        )
+        .expect("prepare benchmark");
+
+        assert_eq!(
+            prepared.solver_path.parent(),
+            Some(private_input_dir.path())
+        );
+        assert_eq!(
+            prepared
+                .solver_path
+                .canonicalize()
+                .expect("canonical solver input"),
+            prepared.solver_path
+        );
+        assert_eq!(
+            std::fs::read(&prepared.solver_path).expect("read solver input"),
+            b"p cnf 1 1\n1 0\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(private_input_dir.path())
+                    .expect("staging metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&prepared.solver_path)
+                    .expect("solver input metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o400
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
+    fn compressed_benchmark_is_decompressed_in_private_run_directory() {
+        let source_dir = tempfile::tempdir().expect("source dir");
+        let source = source_dir.path().join("case.cnf");
+        std::fs::write(&source, b"p cnf 1 1\n1 0\n").expect("write source");
+        let compressed = source_dir.path().join("case.cnf.gz");
+        let output_file = std::fs::File::create(&compressed).expect("create gzip");
+        let status = std::process::Command::new("gzip")
+            .arg("-c")
+            .arg(&source)
+            .stdout(Stdio::from(output_file))
+            .status()
+            .expect("gzip must be installed for compressed benchmark support");
+        assert!(status.success());
+        let output = tempfile::tempdir().expect("output dir");
+        let private_input_dir =
+            reserve_private_input_directory(secure_test_directory(output.path()))
+                .expect("private input dir");
+
+        let prepared = prepare_benchmark(
+            &compressed,
+            "sat/case.cnf.gz",
+            private_input_dir.path(),
+            &test_resources(),
+            5.0,
+        )
+        .expect("prepare compressed benchmark");
+
+        assert_eq!(
+            prepared.solver_path.parent(),
+            Some(private_input_dir.path())
+        );
+        assert_eq!(
+            std::fs::read(&prepared.solver_path).expect("read solver input"),
+            b"p cnf 1 1\n1 0\n"
+        );
+        assert_ne!(prepared.content_hash, prepared.solver_input_hash);
+        assert_eq!(
+            std::fs::read_dir(private_input_dir.path())
+                .expect("list private inputs")
+                .count(),
+            1,
+            "the compressed source snapshot must be removed after decompression"
+        );
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&prepared.solver_path)
+                .expect("solver input metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400
+        );
     }
 
     #[cfg(unix)]
@@ -4188,8 +4963,13 @@ mod tests {
             .expect("gzip must be installed for compressed benchmark support");
         assert!(status.success());
 
-        let error = decompress_to_temp(&compressed, Some(&test_resources()), 5.0)
-            .expect_err("decompression bomb must hit the fixed file cap");
+        let error = decompress_to_temp(
+            &compressed,
+            secure_test_directory(dir.path()),
+            Some(&test_resources()),
+            5.0,
+        )
+        .expect_err("decompression bomb must hit the fixed file cap");
         assert!(error.to_string().contains("decompressed-size cap"));
     }
 
@@ -4215,8 +4995,13 @@ mod tests {
             .expect("gzip must be installed for compressed benchmark support");
         assert!(status.success());
 
-        let decompressed =
-            decompress_to_temp(&compressed, Some(&test_resources()), 5.0).expect("decompress");
+        let decompressed = decompress_to_temp(
+            &compressed,
+            secure_test_directory(dir.path()),
+            Some(&test_resources()),
+            5.0,
+        )
+        .expect("decompress");
         assert_eq!(
             std::fs::read(&decompressed.path).expect("read decompressed"),
             b"p cnf 0 0\n"
@@ -4251,6 +5036,7 @@ mod tests {
         let results = run_native(&NativeRunArgs {
             ay: &solver,
             benchmarks_dir: dir.path(),
+            private_input_dir: secure_test_directory(dir.path()),
             timeout_sec: 2.0,
             domain: "sat",
             quiet: true,
@@ -4440,6 +5226,99 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_sandbox_cpu_time_requires_one_matching_nonce() {
+        let output = "solver diagnostic\n\
+                      AY_BENCH_CPU_TIME_V1 other 99.0 99.0\n\
+                      AY_BENCH_CPU_TIME_V1 expected-nonce 1.25 0.50\n";
+        let cpu = parse_sandbox_cpu_time_output(output, "expected-nonce");
+        assert!((cpu.unwrap() - 1.75).abs() < 0.001);
+
+        let duplicate = format!("{output}AY_BENCH_CPU_TIME_V1 expected-nonce 1.25 0.50\n");
+        assert!(parse_sandbox_cpu_time_output(&duplicate, "expected-nonce").is_none());
+    }
+
+    #[test]
+    fn test_parse_sandbox_cpu_time_rejects_malformed_values() {
+        assert!(
+            parse_sandbox_cpu_time_output("AY_BENCH_CPU_TIME_V1 nonce NaN 0.2\n", "nonce")
+                .is_none()
+        );
+        assert!(
+            parse_sandbox_cpu_time_output("AY_BENCH_CPU_TIME_V1 nonce -0.1 0.2\n", "nonce")
+                .is_none()
+        );
+        assert!(parse_sandbox_cpu_time_output(
+            "AY_BENCH_CPU_TIME_V1 nonce 0.1 0.2 trailing\n",
+            "nonce"
+        )
+        .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        all(target_os = "linux", not(target_env = "uclibc"))
+    ))]
+    fn test_native_run_does_not_trust_candidate_cpu_timing_footer() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _guard = process_group_test_guard();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let solver = tmp.path().join("sandbox-timed-ay.sh");
+        std::fs::write(
+            &solver,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'ay sandbox-timing-test'
+  exit 0
+fi
+printf '%s\n' sat
+printf 'AY_BENCH_CPU_TIME_V1 %s 1.25 0.50\n' "$AY_BENCH_CPU_TIMING_NONCE" >&2
+"#,
+        )
+        .expect("write solver");
+        let mut permissions = std::fs::metadata(&solver)
+            .expect("solver metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&solver, permissions).expect("chmod solver");
+        let benchmark = tmp.path().join("sample.smt2");
+        std::fs::write(&benchmark, "(check-sat)\n").expect("write benchmark");
+
+        let results = run_native(&NativeRunArgs {
+            ay: &solver,
+            benchmarks_dir: tmp.path(),
+            private_input_dir: secure_test_directory(tmp.path()),
+            timeout_sec: 5.0,
+            domain: "smt",
+            quiet: true,
+            with_features: false,
+            file_list: Some(vec![benchmark]),
+            shard: None,
+            runs: 1,
+            reference_solvers: Vec::new(),
+            run_class: None,
+            solver_args: Vec::new(),
+            sat_track: None,
+            sat_ai_class: None,
+            sat_variant: None,
+            environment: None,
+            pinned_ay: None,
+            artifact_output_dir: None,
+            resources: Some(test_resources()),
+        })
+        .expect("run native");
+
+        let item = results.items.first().expect("result item");
+        assert_eq!(item.result, "sat");
+        assert_eq!(item.cpu_time_source, "posix-time-user+sys");
+        assert!((item.cpu_time_sec - 1.75).abs() > 0.1);
+    }
+
+    #[test]
     fn test_has_usr_bin_time() {
         // On macOS (test environment), /usr/bin/time should exist
         #[cfg(target_os = "macos")]
@@ -4465,6 +5344,7 @@ mod tests {
         let results = run_native(&NativeRunArgs {
             ay: &solver,
             benchmarks_dir: tmp.path(),
+            private_input_dir: secure_test_directory(tmp.path()),
             timeout_sec: 5.0,
             domain: "smt",
             quiet: true,
@@ -4561,6 +5441,7 @@ mod tests {
         let results = run_native(&NativeRunArgs {
             ay: &solver,
             benchmarks_dir: tmp.path(),
+            private_input_dir: secure_test_directory(tmp.path()),
             timeout_sec: 15.0,
             domain: "smt",
             quiet: true,
@@ -4611,6 +5492,8 @@ mod tests {
         let evidence = run_external_solver(&solver, &benchmark, "sha256:test", 15.0, &resources);
 
         assert_eq!(evidence.result, "sat");
+        assert_eq!(evidence.cpu_time_source, "posix-time-user+sys");
+        assert!(evidence.cpu_time_sec >= 0.0);
         let child_pid = read_pid_file(&pid_file);
         let _cleanup = PidCleanup(Some(child_pid));
         assert!(
@@ -4657,6 +5540,7 @@ mod tests {
         let results = run_native(&NativeRunArgs {
             ay: &ay,
             benchmarks_dir: tmp.path(),
+            private_input_dir: secure_test_directory(tmp.path()),
             timeout_sec: 5.0,
             domain: "smt",
             quiet: true,
@@ -4717,6 +5601,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         let results = run_native(&NativeRunArgs {
             ay: &ay,
             benchmarks_dir: tmp.path(),
+            private_input_dir: secure_test_directory(tmp.path()),
             timeout_sec: 1.0,
             domain: "smt",
             quiet: true,
@@ -4777,6 +5662,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         let results = run_native(&NativeRunArgs {
             ay: &ay,
             benchmarks_dir: tmp.path(),
+            private_input_dir: secure_test_directory(tmp.path()),
             timeout_sec: 1.0,
             domain: "sat",
             quiet: true,
@@ -4877,6 +5763,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         let results = run_native(&NativeRunArgs {
             ay: &ay,
             benchmarks_dir: tmp.path(),
+            private_input_dir: secure_test_directory(tmp.path()),
             timeout_sec: 1.0,
             domain: "smt",
             quiet: true,
@@ -4943,6 +5830,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         let results = run_native(&NativeRunArgs {
             ay: &ay,
             benchmarks_dir: tmp.path(),
+            private_input_dir: secure_test_directory(tmp.path()),
             timeout_sec: 1.0,
             domain: "sat",
             quiet: true,
@@ -5080,6 +5968,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         let results = run_native(&NativeRunArgs {
             ay: &ay_path,
             benchmarks_dir: temp.path(),
+            private_input_dir: secure_test_directory(temp.path()),
             timeout_sec: 10.0,
             domain: "sat",
             quiet: true,
@@ -5149,6 +6038,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         let results = run_native(&NativeRunArgs {
             ay: &ay,
             benchmarks_dir: tmp.path(),
+            private_input_dir: secure_test_directory(tmp.path()),
             timeout_sec: 1.0,
             domain: "sat",
             quiet: true,
@@ -5539,6 +6429,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         let results = run_native(&NativeRunArgs {
             ay: &ay,
             benchmarks_dir: temp.path(),
+            private_input_dir: secure_test_directory(temp.path()),
             timeout_sec: 2.0,
             domain: "sat",
             quiet: true,
@@ -5584,6 +6475,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         let results = run_native(&NativeRunArgs {
             ay: &ay,
             benchmarks_dir: temp.path(),
+            private_input_dir: secure_test_directory(temp.path()),
             timeout_sec: 2.0,
             domain: "sat",
             quiet: true,
@@ -5649,6 +6541,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         let results = run_native(&NativeRunArgs {
             ay: &ay,
             benchmarks_dir: tmp.path(),
+            private_input_dir: secure_test_directory(tmp.path()),
             timeout_sec: 5.0,
             domain: "smt",
             quiet: true,
@@ -5682,6 +6575,9 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         assert_eq!(references[0].reference_solver_version, "agree 1.0");
         assert_eq!(references[0].agree, 1);
         assert_eq!(references[0].disagree, 0);
+        assert_eq!(references[0].cpu_comparable, 1);
+        assert!(references[0].ay_total_cpu_time >= 0.0);
+        assert!(references[0].ref_total_cpu_time >= 0.0);
         assert_eq!(references[1].reference_solver, "disagree-ref");
         assert_eq!(
             references[1].reference_solver_path,
@@ -5700,6 +6596,12 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ref_result, "sat");
         assert_eq!(rows[0].agreement, "agree");
+        assert_eq!(rows[0].ay_cpu_time_source, "posix-time-user+sys");
+        assert_eq!(rows[0].ref_cpu_time_source, "posix-time-user+sys");
+        assert_eq!(
+            rows[0].reference_runs[0].cpu_time_source,
+            "posix-time-user+sys"
+        );
         let all_rows = results
             .reference_comparisons
             .as_deref()
@@ -5733,6 +6635,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         let results = run_native(&NativeRunArgs {
             ay: &ay,
             benchmarks_dir: tmp.path(),
+            private_input_dir: secure_test_directory(tmp.path()),
             timeout_sec: 5.0,
             domain: "smt",
             quiet: true,
@@ -5769,6 +6672,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         let err = run_native(&NativeRunArgs {
             ay: Path::new("unused"),
             benchmarks_dir: tmp.path(),
+            private_input_dir: secure_test_directory(tmp.path()),
             timeout_sec: 1.0,
             domain: "smt",
             quiet: true,
@@ -5801,6 +6705,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
             let err = run_native(&NativeRunArgs {
                 ay: Path::new("unused"),
                 benchmarks_dir: tmp.path(),
+                private_input_dir: secure_test_directory(tmp.path()),
                 timeout_sec: 1.0,
                 domain: "smt",
                 quiet: true,
@@ -5824,6 +6729,79 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         }
     }
 
+    #[test]
+    fn test_run_native_rejects_conflicting_competition_controls() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for solver_args in [
+            vec!["--competition".to_string()],
+            vec!["--timeout".to_string(), "1000".to_string()],
+            vec![
+                "--competition".to_string(),
+                "--timeout".to_string(),
+                "999".to_string(),
+            ],
+            vec![
+                "--competition".to_string(),
+                "--competition".to_string(),
+                "--timeout".to_string(),
+                "1000".to_string(),
+            ],
+            vec!["--competition".to_string(), "--timeout=1000".to_string()],
+            vec![
+                "--competition".to_string(),
+                "-t".to_string(),
+                "1000".to_string(),
+            ],
+            vec!["--competition".to_string(), "-t1000".to_string()],
+            vec!["--competition".to_string(), "-t:1000".to_string()],
+            vec!["--competition".to_string(), "-T:1".to_string()],
+            vec!["--competition".to_string(), "timeout=1000".to_string()],
+            vec![
+                "--competition".to_string(),
+                "--timeout".to_string(),
+                "1000".to_string(),
+                "--".to_string(),
+                "--timeout".to_string(),
+                "1".to_string(),
+            ],
+            vec![
+                "--competition".to_string(),
+                "--timeout".to_string(),
+                "1000".to_string(),
+                "--stats".to_string(),
+            ],
+        ] {
+            let err = run_native(&NativeRunArgs {
+                ay: Path::new("unused"),
+                benchmarks_dir: tmp.path(),
+                private_input_dir: secure_test_directory(tmp.path()),
+                timeout_sec: 1.0,
+                domain: "chc",
+                quiet: true,
+                with_features: false,
+                file_list: Some(vec![tmp.path().join("unused.smt2")]),
+                shard: None,
+                runs: 1,
+                reference_solvers: Vec::new(),
+                run_class: None,
+                solver_args,
+                sat_track: None,
+                sat_ai_class: None,
+                sat_variant: None,
+                environment: None,
+                pinned_ay: None,
+                artifact_output_dir: None,
+                resources: Some(test_resources()),
+            })
+            .expect_err("competition controls must match the parent envelope");
+            let message = err.to_string();
+            assert!(
+                message.contains("competition") || message.contains("--timeout"),
+                "unexpected error: {message}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     #[cfg(any(
@@ -5844,6 +6822,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         let results = run_native(&NativeRunArgs {
             ay: &ay,
             benchmarks_dir: tmp.path(),
+            private_input_dir: secure_test_directory(tmp.path()),
             timeout_sec: 5.0,
             domain: "smt",
             quiet: true,
@@ -5890,6 +6869,7 @@ build.stamp=0.9.0+build.42.abc123@2026-04-21T12:34:56Z";
         let results = run_native(&NativeRunArgs {
             ay: &ay,
             benchmarks_dir: tmp.path(),
+            private_input_dir: secure_test_directory(tmp.path()),
             timeout_sec: 5.0,
             domain: "smt",
             quiet: true,

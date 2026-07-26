@@ -29,6 +29,8 @@ mod array_check_sat_assuming_6736;
 mod array_cross_theory_prover_4665;
 #[path = "group_arrays/array_drain_prefix_6340.rs"]
 mod array_drain_prefix_6340;
+#[path = "group_arrays/array_interface_read_prune.rs"]
+mod array_interface_read_prune;
 #[path = "group_arrays/array_map_8533.rs"]
 mod array_map_8533;
 #[path = "group_arrays/array_model_store_chain_witness.rs"]

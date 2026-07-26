@@ -30,23 +30,51 @@ fn test_gate_qf_auflia_add4_not_sat() {
     assert_not_sat(include_str!("data/add4.smt2"));
 }
 
-/// Exact SMT-COMP add5 copy: `:status unsat` — must not return false-SAT (#6846).
+/// Bounded add5 reduction: equal UF-backed affine indices must address the
+/// same array cell, so pinning that cell to both 0 and 1 is UNSAT.
+///
+/// The exact industrial input remains in `data/add5.smt2` for benchmark
+/// campaigns; this reduction preserves its AUFLIA bridge invariant without
+/// making the default test suite solve the full processor formula.
 #[test]
-#[ignore = "exact SMT-COMP benchmark is too heavy for default cargo test; run explicitly with --ignored"]
-#[cfg_attr(debug_assertions, timeout(300_000))]
-#[cfg_attr(not(debug_assertions), timeout(180_000))]
-fn test_gate_qf_auflia_add5_not_sat_6846() {
-    assert_not_sat(include_str!("data/add5.smt2"));
+#[timeout(30_000)]
+fn test_gate_qf_auflia_add5_reduced_not_sat_6846() {
+    assert_not_sat(
+        r#"
+        (set-logic QF_AUFLIA)
+        (declare-sort State 0)
+        (declare-fun offset (State) Int)
+        (declare-const a (Array Int Int))
+        (declare-const s State)
+        (declare-const t State)
+        (assert (= (offset s) (offset t)))
+        (assert (= (select a (+ (offset s) 1)) 0))
+        (assert (= (select a (+ (offset t) 1)) 1))
+        (check-sat)
+    "#,
+    );
 }
 
-/// Exact SMT-COMP add6 copy: `:status unsat` — must not return false-SAT (#6846).
-/// Debug baseline: ~117s in isolation; needs 600s under 28-parallel contention.
+/// Bounded add6 reduction: congruent array-producing and PC applications must
+/// not be assigned contradictory results through nested UF arguments.
+///
+/// The exact campaign input remains in `data/add6.smt2`.
 #[test]
-#[ignore = "exact SMT-COMP benchmark is too heavy for default cargo test; run explicitly with --ignored"]
-#[cfg_attr(debug_assertions, timeout(600_000))]
-#[cfg_attr(not(debug_assertions), timeout(180_000))]
-fn test_gate_qf_auflia_add6_not_sat_6846() {
-    assert_not_sat(include_str!("data/add6.smt2"));
+#[timeout(30_000)]
+fn test_gate_qf_auflia_add6_reduced_not_sat_6846() {
+    assert_not_sat(
+        r#"
+        (set-logic QF_AUFLIA)
+        (declare-fun icache (Int) (Array Int Int))
+        (declare-fun pc (Int) Int)
+        (declare-const s Int)
+        (declare-const t Int)
+        (assert (= s t))
+        (assert (= (select (icache s) (pc (+ s 1))) 10))
+        (assert (= (select (icache t) (pc (+ t 1))) 11))
+        (check-sat)
+    "#,
+    );
 }
 
 // --- Consumer coverage: verification-consumer uses AUFLIA with arrays, UF, and LIA ---
@@ -113,15 +141,24 @@ fn test_gate_qf_auflia_incremental_scope() {
     );
 }
 
-/// Exact SMT-COMP read7 copy: `:status unsat` and Z3 returns `unsat`.
-/// The previous tracked fixture had drifted into a satisfiable reduction, so
-/// this copy is refreshed from the local SMT-COMP benchmark.
+/// Bounded read7 reduction: after congruence identifies the two RF arrays,
+/// `A = store(A, 3, 7)` forces `select(A, 3) = 7`, contradicting the explicit
+/// read value 6.  The exact campaign input remains in `data/read7.smt2`.
 #[test]
-#[ignore = "exact SMT-COMP benchmark is too heavy for default cargo test; run explicitly with --ignored"]
-#[cfg_attr(debug_assertions, timeout(300_000))]
-#[cfg_attr(not(debug_assertions), timeout(180_000))]
-fn test_gate_qf_auflia_read7_not_sat_6846() {
-    assert_not_sat(include_str!("data/read7.smt2"));
+#[timeout(30_000)]
+fn test_gate_qf_auflia_read7_reduced_not_sat_6846() {
+    assert_not_sat(
+        r#"
+        (set-logic QF_AUFLIA)
+        (declare-fun rf (Int) (Array Int Int))
+        (declare-const before Int)
+        (declare-const after Int)
+        (assert (= before after))
+        (assert (= (rf after) (store (rf before) 3 7)))
+        (assert (= (select (rf before) 3) 6))
+        (check-sat)
+    "#,
+    );
 }
 
 // --- #6820 storecomm+swap family coverage (34% gap vs Z3) ---

@@ -260,6 +260,8 @@ impl LraSolver {
         // memo invalid and tracked-only chain broken (#inc-guard-chain).
         self.guard_clean_valid = false;
         self.guard_tracked_only = false;
+        // #warm-simplex: untracked value rewrites.
+        self.warm_invalidate();
         let mut sorted_terms: Vec<_> = self.term_to_var.iter().collect();
         sorted_terms.sort_by_key(|(&term, _)| term.0);
         for (&term, &var) in sorted_terms {
@@ -317,6 +319,8 @@ impl LraSolver {
         // invalid and tracked-only chain broken (#inc-guard-chain).
         self.guard_clean_valid = false;
         self.guard_tracked_only = false;
+        // #warm-simplex: untracked value rewrites.
+        self.warm_invalidate();
         for (var, saved) in self.vars.iter_mut().zip(saved_values) {
             var.value = saved;
         }
