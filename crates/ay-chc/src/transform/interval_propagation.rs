@@ -10,7 +10,10 @@
 //! casts, this pass
 //!
 //! 1. runs a FORWARD interval fixpoint across clauses (per-predicate-argument
-//!    `[lo, hi]` bounds, widening after [`WIDENING_THRESHOLD`] unstable joins),
+//!    `[lo, hi]` bounds, widening after [`WIDENING_THRESHOLD`] unstable joins;
+//!    each clause is read with Boolean guard propagation so the guarded-CNF
+//!    encodings that compiler front ends emit are not opaque — see
+//!    [`MAX_GUARD_ROUNDS`]),
 //! 2. verifies the resulting candidate interval invariant INDUCTIVELY with an
 //!    SMT check per clause (fail-closed: bounds that do not verify are
 //!    dropped),
@@ -71,7 +74,8 @@ use super::{
 };
 
 /// Widening threshold: after this many unstable joins on one bound of one
-/// predicate argument, that bound is widened to ±∞ (Eldarica default).
+/// predicate argument, that bound is widened (Eldarica default) — up the
+/// landmark ladder of [`widen_up`] first, and to ±∞ once it is exhausted.
 const WIDENING_THRESHOLD: u32 = 5;
 
 /// Cap on forward fixpoint rounds (safety net; widening guarantees fast
@@ -107,6 +111,21 @@ const MAX_CLAUSES: usize = 300;
 /// Iterations of the collect-check-rewrite loop per clause (nested mods
 /// become dischargeable only after their inner casts are discharged).
 const MAX_REWRITE_ROUNDS: usize = 3;
+
+/// Rounds of Boolean guard propagation over one clause constraint.
+///
+/// Compiler front ends (SeaHorn, and CHC-COMP's `svcomp` families generally)
+/// emit guarded CNF: every arithmetic fact sits under guard literals, as in
+/// `(or (not g) (= x 0))`, and loop conditions are reified
+/// (`(not (= (<= 6 h) g))`). A literal decided in one round unlocks unit
+/// propagation in the next — `(or (not d) (and e d))` decides `e` only once
+/// `d` is known — so several rounds are needed. A fixed constant (rather than
+/// a fixpoint) keeps the pass a bounded analysis.
+const MAX_GUARD_ROUNDS: usize = 6;
+
+/// Cap on the widening landmark ladder (see [`widen_up`]); above this the pass
+/// falls back to widening straight to ±∞.
+const MAX_WIDENING_LANDMARKS: usize = 32;
 
 /// Shared, monotonically decreasing budget for every phase of one pass.
 struct PassBudget {
@@ -329,6 +348,9 @@ fn const_bigint(expr: &ChcExpr) -> Option<BigInt> {
 type VarEnv = FxHashMap<ChcVar, Interval>;
 type PredState = FxHashMap<PredicateId, Vec<Interval>>;
 
+/// Boolean guard literals decided while reading one clause constraint.
+type BoolAssign = FxHashMap<ChcVar, bool>;
+
 fn env_interval(env: &VarEnv, v: &ChcVar) -> Interval {
     env.get(v).cloned().unwrap_or_else(Interval::top)
 }
@@ -460,19 +482,172 @@ fn apply_atom(atom: &ChcExpr, env: &mut VarEnv, budget: &mut PassBudget) -> Opti
     Some(())
 }
 
-/// Apply top-level conjunction atoms without first flattening the entire
-/// expression into an unbudgeted temporary vector.
-fn apply_constraint_atoms(expr: &ChcExpr, env: &mut VarEnv, budget: &mut PassBudget) -> Option<()> {
+/// Feed a comparison atom to [`apply_atom`] at the requested polarity.
+///
+/// Under a negative polarity the operator is negated first. `Eq` negates to
+/// `Ne`, which is deliberately dropped: `x != c` bounds nothing, so there is
+/// no interval fact to record. BV comparisons are dropped for the same reason
+/// ([`apply_atom`] only understands the LIA order relations).
+fn apply_polar_atom(
+    atom: &ChcExpr,
+    polarity: bool,
+    env: &mut VarEnv,
+    budget: &mut PassBudget,
+) -> Option<()> {
+    budget.checkpoint()?;
+    if polarity {
+        return apply_atom(atom, env, budget);
+    }
+    let ChcExpr::Op(op, args) = atom else {
+        return Some(());
+    };
+    let negated = match op.negate_comparison() {
+        Some(negated @ (ChcOp::Lt | ChcOp::Le | ChcOp::Gt | ChcOp::Ge)) => negated,
+        _ => return Some(()),
+    };
+    apply_atom(&ChcExpr::Op(negated, args.clone()), env, budget)
+}
+
+/// Three-valued truth of a Boolean formula under the decided guard literals.
+///
+/// The inner `Option` is `None` for "not determined", which is the answer for
+/// EVERY node that is not a Boolean connective or a decided Boolean variable.
+/// This must stay conservative: a guessed truth value would let
+/// [`assert_unit`] enter a disjunct the clause does not imply, and the derived
+/// bound would then be merely plausible rather than valid.
+fn truth(expr: &ChcExpr, assign: &BoolAssign, budget: &mut PassBudget) -> Option<Option<bool>> {
     budget.checkpoint()?;
     crate::expr::maybe_grow_expr_stack(|| {
-        if let ChcExpr::Op(ChcOp::And, args) = expr {
-            for arg in args {
-                apply_constraint_atoms(arg, env, budget)?;
+        let value = match expr {
+            ChcExpr::Bool(b) => Some(*b),
+            ChcExpr::Var(v) if v.sort == ChcSort::Bool => assign.get(v).copied(),
+            ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => {
+                truth(&args[0], assign, budget)?.map(|b| !b)
             }
-            Some(())
-        } else {
-            apply_atom(expr, env, budget)
+            ChcExpr::Op(ChcOp::And, args) => {
+                let mut all_true = true;
+                for arg in args {
+                    match truth(arg, assign, budget)? {
+                        Some(false) => return Some(Some(false)),
+                        Some(true) => {}
+                        None => all_true = false,
+                    }
+                }
+                all_true.then_some(true)
+            }
+            ChcExpr::Op(ChcOp::Or, args) => {
+                let mut all_false = true;
+                for arg in args {
+                    match truth(arg, assign, budget)? {
+                        Some(true) => return Some(Some(true)),
+                        Some(false) => {}
+                        None => all_false = false,
+                    }
+                }
+                all_false.then_some(false)
+            }
+            _ => None,
+        };
+        Some(value)
+    })
+}
+
+/// Unit propagation over the arguments of a disjunction (or of a negated
+/// conjunction): when every argument but one is `falsifying`, the remaining
+/// one is implied at `!falsifying`.
+///
+/// Bails without asserting anything as soon as the clause is discharged (some
+/// argument already satisfies it) or more than one argument is undetermined.
+fn assert_unit(
+    args: &[std::sync::Arc<ChcExpr>],
+    falsifying: bool,
+    assign: &mut BoolAssign,
+    env: &mut VarEnv,
+    budget: &mut PassBudget,
+) -> Option<()> {
+    let mut undetermined: Option<&std::sync::Arc<ChcExpr>> = None;
+    for arg in args {
+        budget.checkpoint()?;
+        match truth(arg, assign, budget)? {
+            // Already satisfied: nothing is implied about the other args.
+            Some(value) if value != falsifying => return Some(()),
+            Some(_) => {}
+            None if undetermined.is_some() => return Some(()),
+            None => undetermined = Some(arg),
         }
+    }
+    match undetermined {
+        Some(unit) => assert_formula(unit, !falsifying, assign, env, budget),
+        // Every argument falsified: the clause context is contradictory. The
+        // SMT gate is the source of truth for that, so record nothing.
+        None => Some(()),
+    }
+}
+
+/// Assert that `expr` holds at `polarity` in the clause context: record
+/// decided Boolean guard literals in `assign` and refine `env` with every
+/// comparison atom the context implies.
+///
+/// Only implied facts are recorded. Disjunctions are entered exclusively when
+/// unit, reified comparisons exclusively when their Boolean side is decided,
+/// and `ite` exclusively when its condition is decided — so nothing here
+/// weakens what [`verify_invariant`] must later prove.
+fn assert_formula(
+    expr: &ChcExpr,
+    polarity: bool,
+    assign: &mut BoolAssign,
+    env: &mut VarEnv,
+    budget: &mut PassBudget,
+) -> Option<()> {
+    budget.checkpoint()?;
+    crate::expr::maybe_grow_expr_stack(|| {
+        match expr {
+            ChcExpr::Var(v) if v.sort == ChcSort::Bool => {
+                assign.insert(v.clone(), polarity);
+            }
+            ChcExpr::Op(ChcOp::Not, args) if args.len() == 1 => {
+                assert_formula(&args[0], !polarity, assign, env, budget)?;
+            }
+            // `and` under a positive polarity / `or` under a negative one:
+            // every argument is implied.
+            ChcExpr::Op(ChcOp::And, args) if polarity => {
+                for arg in args {
+                    assert_formula(arg, true, assign, env, budget)?;
+                }
+            }
+            ChcExpr::Op(ChcOp::Or, args) if !polarity => {
+                for arg in args {
+                    assert_formula(arg, false, assign, env, budget)?;
+                }
+            }
+            // The dual cases are clauses: unit-propagate them.
+            ChcExpr::Op(ChcOp::Or, args) => assert_unit(args, false, assign, env, budget)?,
+            ChcExpr::Op(ChcOp::And, args) => assert_unit(args, true, assign, env, budget)?,
+            // Reified comparison, e.g. the SeaHorn shape
+            // `(not (= (<= 6 h) g))` with `g` a decided guard literal: with
+            // one side determined the other is forced. Restricted to
+            // Boolean-sorted operands so `(= i j)` over Ints stays an
+            // interval atom.
+            ChcExpr::Op(ChcOp::Eq, args)
+                if args.len() == 2
+                    && args[0].sort() == ChcSort::Bool
+                    && args[1].sort() == ChcSort::Bool =>
+            {
+                if let Some(known) = truth(&args[0], assign, budget)? {
+                    assert_formula(&args[1], known == polarity, assign, env, budget)?;
+                } else if let Some(known) = truth(&args[1], assign, budget)? {
+                    assert_formula(&args[0], known == polarity, assign, env, budget)?;
+                }
+            }
+            ChcExpr::Op(ChcOp::Ite, args) if args.len() == 3 => {
+                if let Some(condition) = truth(&args[0], assign, budget)? {
+                    let taken = if condition { &args[1] } else { &args[2] };
+                    assert_formula(taken, polarity, assign, env, budget)?;
+                }
+            }
+            _ => apply_polar_atom(expr, polarity, env, budget)?,
+        }
+        Some(())
     })
 }
 
@@ -496,9 +671,17 @@ fn clause_env(clause: &HornClause, state: &PredState, budget: &mut PassBudget) -
         }
     }
     if let Some(constraint) = &clause.body.constraint {
-        // Two passes so bounds derived late feed atoms seen early.
-        for _ in 0..2 {
-            apply_constraint_atoms(constraint, &mut env, budget)?;
+        // Repeated rounds so guard literals and bounds derived late feed
+        // atoms seen early; stops as soon as a round adds nothing.
+        let mut assign = BoolAssign::default();
+        for _ in 0..MAX_GUARD_ROUNDS {
+            budget.checkpoint()?;
+            let previous_env = env.clone();
+            let previous_assign = assign.clone();
+            assert_formula(constraint, true, &mut assign, &mut env, budget)?;
+            if env == previous_env && assign == previous_assign {
+                break;
+            }
         }
     }
     Some(env)
@@ -584,6 +767,14 @@ impl Transformer for IntervalPropagator {
         if narrow_fixpoint(&problem, &mut candidates, &mut budget).is_none() {
             return identity(problem);
         }
+        // Only now drop the predicates that carry no information. Narrowing
+        // treats "absent from the state" as "not reached" (bottom semantics
+        // inherited from the forward pass), so filtering earlier would hide
+        // every clause whose body mentions an all-top predicate and turn the
+        // abstract image into an under-approximation.
+        if retain_informative(&mut candidates, &mut budget).is_none() {
+            return identity(problem);
+        }
 
         // Phase 2: verify the candidate invariant inductively; fail-closed.
         let Some(verified) = verify_invariant(&problem, candidates, &mut budget, self.verbose)
@@ -629,6 +820,102 @@ fn identity(problem: ChcProblem) -> TransformationResult {
     }
 }
 
+/// A sorted, deduped ladder of the integer constants occurring in a problem,
+/// abandoned wholesale once it would exceed [`MAX_WIDENING_LANDMARKS`].
+#[derive(Default)]
+struct Landmarks {
+    values: Vec<BigInt>,
+    overflowed: bool,
+}
+
+impl Landmarks {
+    fn insert(&mut self, value: BigInt) {
+        if self.overflowed {
+            return;
+        }
+        if let Err(at) = self.values.binary_search(&value) {
+            if self.values.len() >= MAX_WIDENING_LANDMARKS {
+                // Too many distinct constants for this to stay a cheap,
+                // bounded ladder: fall back to widening straight to ±∞.
+                self.overflowed = true;
+                self.values.clear();
+                return;
+            }
+            self.values.insert(at, value);
+        }
+    }
+}
+
+/// Collect the integer constants occurring in `problem` into a widening
+/// landmark ladder (see [`widen_up`]).
+fn widening_landmarks(problem: &ChcProblem, budget: &mut PassBudget) -> Option<Vec<BigInt>> {
+    fn collect(expr: &ChcExpr, out: &mut Landmarks, budget: &mut PassBudget) -> Option<()> {
+        budget.checkpoint()?;
+        crate::expr::maybe_grow_expr_stack(|| {
+            match expr {
+                ChcExpr::Int(v) => out.insert(BigInt::from(*v)),
+                ChcExpr::Op(_, args)
+                | ChcExpr::PredicateApp(_, _, args)
+                | ChcExpr::FuncApp(_, _, args) => {
+                    for arg in args {
+                        collect(arg, out, budget)?;
+                    }
+                }
+                ChcExpr::ConstArray(_, val) => collect(val, out, budget)?,
+                _ => {}
+            }
+            Some(())
+        })
+    }
+
+    let mut landmarks = Landmarks::default();
+    for clause in problem.clauses() {
+        budget.checkpoint()?;
+        if let Some(constraint) = &clause.body.constraint {
+            collect(constraint, &mut landmarks, budget)?;
+        }
+        for (_, args) in &clause.body.predicates {
+            for arg in args {
+                collect(arg, &mut landmarks, budget)?;
+            }
+        }
+        if let ClauseHead::Predicate(_, head_args) = &clause.head {
+            for arg in head_args {
+                collect(arg, &mut landmarks, budget)?;
+            }
+        }
+    }
+    Some(landmarks.values)
+}
+
+/// Widen an upper bound to the next landmark at or above it.
+///
+/// Widening to ±∞ on the [`WIDENING_THRESHOLD`]th move forgets the bound of
+/// every guarded counting loop just before it converges (`for (i = 0; i < 6;
+/// i++)` needs six moves). Climbing the ladder of constants that actually
+/// occur in the problem keeps such bounds.
+///
+/// Termination is unaffected. A bound is only widened when it strictly moved,
+/// so the result is strictly above the previous bound and therefore a strictly
+/// higher rung; the ladder holds at most [`MAX_WIDENING_LANDMARKS`] rungs, and
+/// past its top the bound goes to +∞ exactly as before. Worst case that is
+/// [`WIDENING_THRESHOLD`] + [`MAX_WIDENING_LANDMARKS`] + 1 moves per bound,
+/// well inside [`MAX_FIXPOINT_ROUNDS`].
+fn widen_up(hi: Option<BigInt>, landmarks: &[BigInt]) -> Option<BigInt> {
+    let hi = hi?;
+    landmarks.iter().find(|landmark| **landmark >= hi).cloned()
+}
+
+/// Mirror of [`widen_up`] for a lower bound: the greatest landmark at or below.
+fn widen_down(lo: Option<BigInt>, landmarks: &[BigInt]) -> Option<BigInt> {
+    let lo = lo?;
+    landmarks
+        .iter()
+        .rev()
+        .find(|landmark| **landmark <= lo)
+        .cloned()
+}
+
 /// Forward interval analysis: per-predicate-argument `[lo, hi]` candidates.
 fn forward_fixpoint_budgeted(problem: &ChcProblem, budget: &mut PassBudget) -> Option<PredState> {
     budget.checkpoint()?;
@@ -636,6 +923,7 @@ fn forward_fixpoint_budgeted(problem: &ChcProblem, budget: &mut PassBudget) -> O
     // Per (pred, arg): how often each bound moved (for widening).
     let mut lo_moves: FxHashMap<(PredicateId, usize), u32> = FxHashMap::default();
     let mut hi_moves: FxHashMap<(PredicateId, usize), u32> = FxHashMap::default();
+    let landmarks = widening_landmarks(problem, budget)?;
 
     for _round in 0..MAX_FIXPOINT_ROUNDS {
         budget.checkpoint()?;
@@ -686,14 +974,14 @@ fn forward_fixpoint_budgeted(problem: &ChcProblem, budget: &mut PassBudget) -> O
                                 let n = lo_moves.entry((*pid, i)).or_insert(0);
                                 *n += 1;
                                 if *n >= WIDENING_THRESHOLD {
-                                    widened.lo = None;
+                                    widened.lo = widen_down(widened.lo, &landmarks);
                                 }
                             }
                             if widened.hi != cur.hi {
                                 let n = hi_moves.entry((*pid, i)).or_insert(0);
                                 *n += 1;
                                 if *n >= WIDENING_THRESHOLD {
-                                    widened.hi = None;
+                                    widened.hi = widen_up(widened.hi, &landmarks);
                                 }
                             }
                             if widened != *cur {
@@ -710,26 +998,49 @@ fn forward_fixpoint_budgeted(problem: &ChcProblem, budget: &mut PassBudget) -> O
         }
     }
 
-    // Keep only informative entries.
-    let mut informative = PredState::default();
-    for (pid, intervals) in state {
+    Some(state)
+}
+
+/// Drop the predicates whose every argument is `top`.
+///
+/// Run only once the abstract analysis is finished: while the fixpoint and the
+/// narrowing are running, membership in the state means "reached", so removing
+/// an entry would silently disable every clause whose body mentions it.
+fn retain_informative(state: &mut PredState, budget: &mut PassBudget) -> Option<()> {
+    budget.checkpoint()?;
+    let mut uninformative = Vec::new();
+    for (pid, intervals) in state.iter() {
         budget.checkpoint()?;
         let mut keep = false;
-        for interval in &intervals {
+        for interval in intervals {
             budget.checkpoint()?;
             keep |= !interval.is_top();
         }
-        if keep {
-            informative.insert(pid, intervals);
+        if !keep {
+            uninformative.push(*pid);
         }
     }
-    Some(informative)
+    for pid in uninformative {
+        budget.checkpoint()?;
+        state.remove(&pid);
+    }
+    Some(())
 }
 
 #[cfg(test)]
 fn forward_fixpoint(problem: &ChcProblem) -> PredState {
     let mut budget = PassBudget::new(Instant::now() + Duration::from_secs(1), PASS_WORK_BUDGET);
     forward_fixpoint_budgeted(problem, &mut budget).unwrap_or_default()
+}
+
+/// The complete abstract analysis (forward fixpoint + narrowing), exactly as
+/// [`IntervalPropagator::transform`] runs it before the informative filter.
+#[cfg(test)]
+fn narrowed_fixpoint(problem: &ChcProblem) -> PredState {
+    let mut budget = PassBudget::new(Instant::now() + Duration::from_secs(1), PASS_WORK_BUDGET);
+    let mut state = forward_fixpoint_budgeted(problem, &mut budget).unwrap_or_default();
+    narrow_fixpoint(problem, &mut state, &mut budget).expect("narrowing fits the test budget");
+    state
 }
 
 /// Refine a widened interval post-fixpoint by standard abstract narrowing.

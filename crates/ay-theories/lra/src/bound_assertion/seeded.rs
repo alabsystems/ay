@@ -226,11 +226,39 @@ impl LraSolver {
             // under push/pop scopes. `pop()` restores bounds but not the current
             // simplex basis/values, so rebuild a feasible model for the original
             // scope before returning to DPLL.
+            //
+            // #restore-budget: this restore is MANDATORY RECOVERY, not search.
+            // The probe solves above (up to one per seeded literal) are charged to
+            // the same per-check pivot budget, so the restore could arrive with the
+            // budget already spent, return `Unknown`, and leave the basis/values
+            // infeasible — after which the SAT guard
+            // (`propagation/solver_hooks.rs`, "current assignment violates an active
+            // bound") demotes an ALREADY-PROVEN Sat to Unknown. Charging recovery
+            // work against the search budget is the bug; give the restore a fresh
+            // allowance so it is bounded but not starved.
+            let spent = self.stats.check_pivot_count;
+            self.stats.check_pivot_count = 0;
             let restore = self.dual_simplex();
+            self.stats.check_pivot_count = spent.saturating_add(self.stats.check_pivot_count);
             debug_assert!(
                 matches!(restore, TheoryResult::Sat),
                 "BUG: model-seeded propagation restore failed: {restore:?}"
             );
+            if !matches!(restore, TheoryResult::Sat) {
+                // Release-mode fail-safe: the result used to be DISCARDED here
+                // (the assert compiles out), leaving an infeasible assignment for
+                // the guard to trip over later. Force the next simplex through the
+                // full rebuild path instead, mirroring the guard's own recovery, so
+                // the inconsistency is resolved deliberately rather than by accident.
+                self.dirty = true;
+                self.bounds_tightened_since_simplex = true;
+                self.last_simplex_feasible = false;
+                self.discard_lra_basis_region_candidate();
+                if self.warm.enabled {
+                    self.heap_stale = true;
+                    self.warm_invalidate();
+                }
+            }
         }
 
         self.pending_bound_refinements = saved_pending_bound_refinements;

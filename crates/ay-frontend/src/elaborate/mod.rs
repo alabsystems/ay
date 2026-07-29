@@ -444,6 +444,14 @@ pub enum ElaborateError {
     /// Recursion depth exceeded during define-fun-rec expansion
     #[error("recursion depth limit ({0}) exceeded during function expansion")]
     RecursionDepthExceeded(usize),
+    /// A sort symbol that is not in the signature: neither a builtin, nor a
+    /// `declare-sort`/`define-sort`/`declare-datatype(s)` name that is still in
+    /// scope. Previously such a name was silently accepted as a fresh
+    /// uninterpreted sort, which accepted every mistyped sort name and let a
+    /// sort declared inside a `push` outlive its `pop` (with the datatype's
+    /// interpretation, and its finite domain, silently lost).
+    #[error("unknown sort '{0}'")]
+    UnknownSort(String),
     /// A pre-rendered ill-sorted-application error whose payload is the exact
     /// z3 4.15.4 message text (e.g. the `ite` argument-#1 sort mismatch:
     /// `Sort mismatch at argument #1 for function (declare-fun ite (Bool T T)
@@ -668,6 +676,14 @@ pub struct Context {
     soft_constraints: Vec<SoftAssertion>,
     /// Scope stack for push/pop
     scopes: Vec<ScopeFrame>,
+    /// Whether this session ever processed a `push`, `pop`, or
+    /// `check-sat-assuming` command. Distinct from `scopes.is_empty()`, which a
+    /// matched `push`/`pop` pair restores to `true`. See
+    /// [`Self::is_single_shot_query`].
+    scope_commands_used: bool,
+    /// Number of `check-sat` / `check-sat-assuming` commands processed. See
+    /// [`Self::is_single_shot_query`].
+    check_sat_commands: u32,
     /// Internal one-command override for native solver declarations whose
     /// handles outlive SMT-LIB assertion scopes. Kept separate from the public
     /// global-declarations option so native calls never mutate session options.
@@ -877,6 +893,8 @@ impl Context {
             objectives: Vec::new(),
             soft_constraints: Vec::new(),
             scopes: Vec::new(),
+            scope_commands_used: false,
+            check_sat_commands: 0,
             native_global_declaration: false,
             options,
             named_terms: HashMap::default(),
@@ -933,6 +951,25 @@ impl Context {
         self.scopes.len()
     }
 
+    /// Whether this session is a SINGLE-SHOT query: no `push`/`pop` command was
+    /// ever processed and at most one `check-sat` has run.
+    ///
+    /// This is the precondition a diagnostic consumer needs before treating
+    /// [`Self::assertions_parsed`] as "the assertion set of the check-sat whose
+    /// verdict I am accompanying". With scopes or repeated check-sats, that
+    /// identification needs per-check-sat bookkeeping the surface-syntax export
+    /// does not carry, and getting it wrong means certifying a set that is not
+    /// the query — e.g. an assertion made inside a `push` that was popped before
+    /// the check-sat being reported. Consumers must DECLINE when this is false.
+    ///
+    /// Deliberately conservative: it counts the check-sat currently being
+    /// answered, so it is `true` for the ordinary
+    /// `assert*; check-sat` file and `false` from the second check-sat onwards.
+    #[must_use]
+    pub const fn is_single_shot_query(&self) -> bool {
+        !self.scope_commands_used && self.check_sat_commands <= 1
+    }
+
     /// Set the logic for this context.
     pub fn set_logic(&mut self, logic: String) {
         self.logic = Some(logic);
@@ -958,6 +995,62 @@ impl Context {
             .filter(|(_, (params, _, _))| params.is_empty())
             .map(|(name, (_, _, body))| (name.clone(), body.clone()))
             .collect()
+    }
+
+    /// The floating-point format of every NULLARY symbol — both
+    /// `declare-const`/`declare-fun` constants and parameter-less `define-fun`
+    /// macros. `Some((eb, sb))` for a floating-point sort, `None` for any
+    /// other sort.
+    ///
+    /// [`Context::assertions_parsed`] hands consumers the ORIGINAL surface
+    /// syntax, in which [`ParsedTerm::Symbol`] carries no sort at all. A
+    /// proof/lean-export consumer whose soundness depends on the format (e.g.
+    /// a binary64-only forward-error certificate: the SAME parsed assertion
+    /// terms are UNSAT at `Float64` and SATISFIABLE at `Float32`) cannot
+    /// recover it from the terms and must consult this table.
+    ///
+    /// The format is read off the ELABORATED [`ay_core::Sort::FloatingPoint`],
+    /// never off a sort NAME: `Float64`, `(_ FloatingPoint 11 53)` and a
+    /// `define-sort` synonym of either all resolve to the same `(11, 53)`
+    /// pair, while a user-declared sort cannot masquerade as one (the
+    /// theory-sort names are reserved by `ensure_sort_name_available`).
+    ///
+    /// A name is OMITTED ENTIRELY whenever its format is not unambiguous — an
+    /// overloaded surface name, or a name whose constant and macro entries
+    /// disagree. "Absent" and "present with `None`" are therefore different
+    /// answers: absent means UNKNOWN, and a consumer that requires a specific
+    /// format must decline on it, exactly as it declines on a wrong format.
+    ///
+    /// This is a diagnostic export surface; it does not affect the solver's own
+    /// (already fully-elaborated) reasoning.
+    pub fn nullary_fp_formats(&self) -> Vec<(String, Option<(u32, u32)>)> {
+        let fp_of = |sort: &Sort| match *sort {
+            Sort::FloatingPoint(eb, sb) => Some((eb, sb)),
+            _ => None,
+        };
+        let mut out: Vec<(String, Option<(u32, u32)>)> = Vec::new();
+        for (name, info) in self.symbol_iter() {
+            if !info.arg_sorts.is_empty() || self.overloaded_symbols.contains_key(name) {
+                continue;
+            }
+            out.push((name.clone(), fp_of(&info.sort)));
+        }
+        for (name, (params, ret, _)) in &self.fun_defs {
+            if params.is_empty() {
+                out.push((name.clone(), fp_of(ret)));
+            }
+        }
+        out.sort();
+        out.dedup();
+        // Drop every name that survived with two DIFFERENT answers: the surface
+        // name does not determine one, so no consumer may pick.
+        let ambiguous: Vec<String> = out
+            .windows(2)
+            .filter(|w| w[0].0 == w[1].0)
+            .map(|w| w[0].0.clone())
+            .collect();
+        out.retain(|(name, _)| !ambiguous.contains(name));
+        out
     }
 
     /// Re-elaborate a parsed (surface-syntax) subterm into the term store.

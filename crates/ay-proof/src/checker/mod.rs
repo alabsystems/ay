@@ -4,7 +4,10 @@
 
 //! Proof structure validation for premise linkage, resolution, DRUP, and terminal empty-clause derivation.
 mod array_axiom;
-pub(crate) use array_axiom::{array_select_store_printer_terms, ArraySelectStorePrinterTerms};
+pub(crate) use array_axiom::{
+    array_row_chain_printer_terms, array_select_store_printer_terms, ArrayRowChainPrinterTerms,
+    ArraySelectStorePrinterTerms, RowChainEnd, RowChainPath,
+};
 pub use array_axiom::{
     recognize_array_extensionality, recognize_array_extensionality_chain,
     recognize_array_select_store, recognize_array_theory_lemma,
@@ -950,6 +953,9 @@ fn validate_generic_step(
         }
         AletheRule::LaDisequality if strict => {
             lia::validate_la_disequality(terms, step_id, clause, premises.len(), args)?;
+        }
+        AletheRule::ForallInst if strict => {
+            quantifier::validate_forall_inst(terms, step_id, clause, premises.len(), args)?;
         }
         AletheRule::Skolem if strict => {
             quantifier::validate_sko_forall(terms, step_id, clause, premises.len(), args)?;

@@ -2231,3 +2231,203 @@ fn submission_preflight_python_wrapper_delegates_to_rust_cli() {
     assert_eq!(payload["validation_mode"], "local-stub-archive");
     assert!(report_path.is_file());
 }
+
+/// The generated SMT wrappers must RUN, not merely exist.
+///
+/// `run_solver_incr.sh` used to forward the benchmark as `"$@"` alongside `-in`.
+/// `-in` maps to `--incremental`, which reads the command stream from stdin, and
+/// ay deliberately rejects FILE + `--incremental` (main.rs:4956) rather than
+/// silently ignoring the FILE. So the wrapper exited 1 on every benchmark — a
+/// zero score for the entire Incremental track — while the package tests, which
+/// only asserted the file existed, stayed green.
+///
+/// This executes each wrapper the way the competition does (benchmark as an
+/// ARGUMENT) and asserts real verdicts come back.
+#[test]
+#[cfg(unix)]
+fn generated_smt_wrappers_actually_solve_a_benchmark() {
+    let temp = tempdir().expect("temp dir");
+    let dir = temp.path();
+    let ay_bin = env!("CARGO_BIN_EXE_ay");
+    fs::copy(ay_bin, dir.join("ay")).expect("stage ay binary");
+    fs::set_permissions(dir.join("ay"), fs::Permissions::from_mode(0o755)).expect("chmod ay");
+
+    let out_dir = temp.path().join("gen");
+    let output = Command::new(ay_bin)
+        .args(["submission", "generate", "smt", "--output"])
+        .arg(&out_dir)
+        .output()
+        .expect("run ay submission generator");
+    assert_command_success(&output, "generator");
+
+    // Three check-sats across a push/pop so an incremental wrapper that only
+    // answers the first one is distinguishable from a correct one.
+    let bench = dir.join("bench.smt2");
+    fs::write(
+        &bench,
+        "(set-logic QF_LRA)\n(declare-fun x () Real)\n(assert (> x 1))\n(check-sat)\n\
+         (push 1)\n(assert (< x 0))\n(check-sat)\n(pop 1)\n(check-sat)\n",
+    )
+    .expect("write benchmark");
+
+    for (wrapper, expected) in [
+        ("run_solver.sh", vec!["sat", "unsat", "sat"]),
+        ("run_solver_incr.sh", vec!["sat", "unsat", "sat"]),
+    ] {
+        let src = out_dir.join(wrapper);
+        let staged = dir.join(wrapper);
+        fs::copy(&src, &staged).unwrap_or_else(|e| panic!("stage {wrapper}: {e}"));
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("chmod wrapper");
+
+        let run = Command::new(&staged)
+            .arg(&bench)
+            .env("STAREXEC_WALLCLOCK_LIMIT", "1200")
+            .output()
+            .unwrap_or_else(|e| panic!("run {wrapper}: {e}"));
+
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            run.status.success(),
+            "{wrapper} must exit 0 when given the benchmark as an argument \
+             (this is exactly how the competition invokes it); stderr: {stderr}"
+        );
+        let verdicts: Vec<&str> = stdout
+            .lines()
+            .map(str::trim)
+            .filter(|l| matches!(*l, "sat" | "unsat" | "unknown"))
+            .collect();
+        assert_eq!(
+            verdicts, expected,
+            "{wrapper} verdicts; stdout: {stdout}; stderr: {stderr}"
+        );
+    }
+}
+
+/// The Model Validation wrapper must produce a MODEL, not just `sat`.
+///
+/// MV scores a `sat` answer only if the accompanying model validates, so an
+/// invocation that answers correctly but emits no `define-fun` scores zero just
+/// as surely as one that fails to start. `run_solver_mv.sh` is currently
+/// byte-identical to `run_solver.sh`; this pins that it actually behaves like an
+/// MV solver rather than merely existing.
+#[test]
+#[cfg(unix)]
+fn generated_mv_wrapper_emits_a_model() {
+    let temp = tempdir().expect("temp dir");
+    let dir = temp.path();
+    let ay_bin = env!("CARGO_BIN_EXE_ay");
+    fs::copy(ay_bin, dir.join("ay")).expect("stage ay binary");
+    fs::set_permissions(dir.join("ay"), fs::Permissions::from_mode(0o755)).expect("chmod ay");
+
+    let out_dir = temp.path().join("gen");
+    let output = Command::new(ay_bin)
+        .args(["submission", "generate", "smt", "--output"])
+        .arg(&out_dir)
+        .output()
+        .expect("run ay submission generator");
+    assert_command_success(&output, "generator");
+
+    let bench = dir.join("mv.smt2");
+    fs::write(
+        &bench,
+        "(set-option :produce-models true)\n(set-logic QF_LRA)\n\
+         (declare-fun x () Real)\n(assert (> x 1))\n(check-sat)\n(get-model)\n",
+    )
+    .expect("write benchmark");
+
+    let staged = dir.join("run_solver_mv.sh");
+    fs::copy(out_dir.join("run_solver_mv.sh"), &staged).expect("stage mv wrapper");
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("chmod wrapper");
+
+    let run = Command::new(&staged)
+        .arg(&bench)
+        .env("STAREXEC_WALLCLOCK_LIMIT", "1200")
+        .output()
+        .expect("run run_solver_mv.sh");
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run.status.success(),
+        "run_solver_mv.sh must exit 0 with the benchmark as an argument; stderr: {stderr}"
+    );
+    assert!(
+        stdout.lines().any(|l| l.trim() == "sat"),
+        "run_solver_mv.sh must answer sat; stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("define-fun"),
+        "run_solver_mv.sh must emit a model for the sat answer, else MV scores it zero; \
+         stdout: {stdout}"
+    );
+}
+
+/// The Unsat Core track runs through `run_solver.sh` — there is no separate UC
+/// wrapper — so the claimed UC division wins depend on that wrapper emitting a
+/// core, and a MINIMAL one: UC scores `asserts - core_size`, so a solver that
+/// returns every named assertion scores nothing on an instance it solved
+/// correctly. Pinned here through the generated wrapper rather than the library.
+#[test]
+#[cfg(unix)]
+fn generated_wrapper_emits_a_minimal_unsat_core() {
+    let temp = tempdir().expect("temp dir");
+    let dir = temp.path();
+    let ay_bin = env!("CARGO_BIN_EXE_ay");
+    fs::copy(ay_bin, dir.join("ay")).expect("stage ay binary");
+    fs::set_permissions(dir.join("ay"), fs::Permissions::from_mode(0o755)).expect("chmod ay");
+
+    let out_dir = temp.path().join("gen");
+    let output = Command::new(ay_bin)
+        .args(["submission", "generate", "smt", "--output"])
+        .arg(&out_dir)
+        .output()
+        .expect("run ay submission generator");
+    assert_command_success(&output, "generator");
+
+    // a2 /\ a3 is already unsat (x < 0 and x > 5), so a1 must NOT appear.
+    let bench = dir.join("uc.smt2");
+    fs::write(
+        &bench,
+        "(set-option :produce-unsat-cores true)\n(set-logic QF_LRA)\n\
+         (declare-fun x () Real)\n(assert (! (> x 1) :named a1))\n\
+         (assert (! (< x 0) :named a2))\n(assert (! (> x 5) :named a3))\n\
+         (check-sat)\n(get-unsat-core)\n",
+    )
+    .expect("write benchmark");
+
+    let staged = dir.join("run_solver.sh");
+    fs::copy(out_dir.join("run_solver.sh"), &staged).expect("stage wrapper");
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).expect("chmod wrapper");
+
+    let run = Command::new(&staged)
+        .arg(&bench)
+        .env("STAREXEC_WALLCLOCK_LIMIT", "1200")
+        .output()
+        .expect("run run_solver.sh");
+
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        run.status.success(),
+        "run_solver.sh must exit 0 on a UC benchmark; stderr: {stderr}"
+    );
+    assert!(
+        stdout.lines().any(|l| l.trim() == "unsat"),
+        "UC path must answer unsat; stdout: {stdout}"
+    );
+    let core = stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with('('))
+        .unwrap_or_else(|| panic!("no core emitted; stdout: {stdout}"));
+    assert!(
+        core.contains("a2") && core.contains("a3"),
+        "core must contain the contradictory pair; got {core}"
+    );
+    assert!(
+        !core.contains("a1"),
+        "core must be minimal — a1 is not needed for the contradiction, and UC scores \
+         asserts-minus-core-size, so padding scores zero; got {core}"
+    );
+}

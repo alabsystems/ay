@@ -167,7 +167,8 @@ impl CoreSolver {
         t: TermId,
         explanation: &mut Vec<TheoryLit>,
     ) {
-        Self::add_arg_resolution_explanations_recursive(terms, state, t, explanation, 0);
+        let mut visited = HashSet::default();
+        Self::add_arg_resolution_explanations_recursive(terms, state, t, explanation, &mut visited);
     }
 
     /// Recursively explain why each argument of a term resolved to its concrete
@@ -180,14 +181,43 @@ impl CoreSolver {
     /// produce blocking clauses that are too strong (e.g., blocking
     /// `str.to_int(a++a) = 0` universally when the conflict only holds under
     /// `a = ""`), causing false UNSAT.
+    ///
+    /// # Why this walk is unconditional and un-capped
+    ///
+    /// Explanations are asymmetric in their failure modes. Every literal added
+    /// here is one that HOLDS in the current assignment, so adding a literal the
+    /// resolver did not actually need only makes the blocking clause less
+    /// general — sound, merely weaker pruning. OMITTING a literal the resolver
+    /// did rely on makes the clause claim something that is not implied, which
+    /// forbids the atom unconditionally instead of branch-locally: a wrong
+    /// UNSAT. Over-explaining is safe; under-explaining is not.
+    ///
+    /// This walk therefore descends into EVERY `App` argument rather than a
+    /// hand-maintained list of resolver symbols, and carries no depth cap:
+    ///
+    /// * A symbol whitelist has to mirror the resolver's descent set exactly,
+    ///   and silently produces wrong UNSATs the moment it drifts. That drift is
+    ///   not hypothetical — it caused #4057 and #str-isdigit-fromint, each
+    ///   fixed by appending another name. Descending unconditionally makes the
+    ///   class unrepresentable instead of re-fixable.
+    /// * A depth cap is a silent truncation, i.e. exactly the unsound
+    ///   direction. The resolvers keep their `MAX_RESOLVE_DEPTH` budget because
+    ///   they fail CLOSED there (`None` ⇒ unresolved ⇒ no conflict at all);
+    ///   an explainer has no such safe direction to fail in.
+    ///
+    /// Termination and cost come from `visited` instead: the term store is a
+    /// hash-consed DAG, so a visited set alone guarantees termination and makes
+    /// the walk linear in distinct subterms — strictly better than the previous
+    /// code, which could re-traverse a shared subterm once per path to it.
     pub(super) fn add_arg_resolution_explanations_recursive(
         terms: &TermStore,
         state: &SolverState,
         t: TermId,
         explanation: &mut Vec<TheoryLit>,
-        depth: usize,
+        visited: &mut HashSet<TermId>,
     ) {
-        if depth > Self::MAX_RESOLVE_DEPTH {
+        if !visited.insert(t) {
+            // Already fully explained via another path; its literals are in.
             return;
         }
         let TermData::App(_, args) = terms.get(t) else {
@@ -203,38 +233,20 @@ impl CoreSolver {
                     explanation.extend(state.explain(arg, const_id));
                 }
             }
-            // Recurse into the compound terms that `resolve_string_term` /
-            // `resolve_int_term` descend through during evaluation, to capture
-            // every sub-argument EQC merge reason — NOT just the top-level arg.
-            //
-            // This MUST include the integer-valued string functions
-            // (`str.to_int`, `str.to_code`, `str.len`, `str.indexof`) and the
-            // string functions whose argument is integer-valued (`str.from_int`,
-            // `str.from_code`). Otherwise the chain
-            // `str.is_digit(str.from_int(str.to_int s))` resolves to a concrete
-            // value via `s`'s EQC constant (e.g. `s = ""` ⇒ value `""`), but the
-            // explanation stops at the int-sorted `str.to_int s` node and never
-            // reaches `s = ""`. The blocking clause then forbids the predicate
-            // UNCONDITIONALLY (`¬is_digit(...)`) instead of branch-locally,
-            // producing a wrong UNSAT (#str-isdigit-fromint). The recursion no
-            // longer gates on the argument's SORT: it descends through int-valued
-            // string functions exactly as the resolver does.
-            if let TermData::App(sym, _) = terms.get(arg) {
-                match sym.name() {
-                    "str.++" | "str.replace" | "str.replace_all" | "str.replace_re"
-                    | "str.replace_re_all" | "str.at" | "str.substr" | "str.from_int"
-                    | "int.to.str" | "str.from_code" | "str.to_lower" | "str.to_upper"
-                    | "str.to_int" | "str.to.int" | "str.to_code" | "str.len" | "str.indexof" => {
-                        Self::add_arg_resolution_explanations_recursive(
-                            terms,
-                            state,
-                            arg,
-                            explanation,
-                            depth + 1,
-                        );
-                    }
-                    _ => {}
-                }
+            // Descend into every compound argument, not just the ones the
+            // resolver is currently known to descend through. See the doc
+            // comment: matching the resolver's symbol set by hand is what
+            // produced #4057 and #str-isdigit-fromint, and an argument the
+            // resolver does NOT descend into costs only a few redundant
+            // literals here, never soundness.
+            if matches!(terms.get(arg), TermData::App(..)) {
+                Self::add_arg_resolution_explanations_recursive(
+                    terms,
+                    state,
+                    arg,
+                    explanation,
+                    visited,
+                );
             }
         }
     }
@@ -262,8 +274,15 @@ impl CoreSolver {
         let TermData::App(_, args) = terms.get(t) else {
             return;
         };
+        let mut visited = HashSet::default();
         for &arg in args {
-            self.add_effort1_resolution_explanation_recursive(terms, state, arg, explanation, 0);
+            self.add_effort1_resolution_explanation_recursive(
+                terms,
+                state,
+                arg,
+                explanation,
+                &mut visited,
+            );
         }
     }
 
@@ -281,15 +300,19 @@ impl CoreSolver {
     /// yields a wrong UNSAT. Recursing here captures the `y = ""` dependency so
     /// the conflict is branch-local (matching the non-effort-1
     /// `add_arg_resolution_explanations_recursive`).
+    ///
+    /// Unconditional and un-capped for the same reason as
+    /// `add_arg_resolution_explanations_recursive` — see that doc comment for
+    /// why over-explaining is sound and truncation is not.
     pub(super) fn add_effort1_resolution_explanation_recursive(
         &self,
         terms: &TermStore,
         state: &SolverState,
         arg: TermId,
         explanation: &mut Vec<TheoryLit>,
-        depth: usize,
+        visited: &mut HashSet<TermId>,
     ) {
-        if depth > Self::MAX_RESOLVE_DEPTH {
+        if !visited.insert(arg) {
             return;
         }
         // Basic EQC-level explanations (arg -> rep, arg -> constant).
@@ -317,49 +340,24 @@ impl CoreSolver {
                 }
             }
         }
-        // Recurse into the compound terms that the resolver descends through so
-        // that nested component resolutions (e.g. the `y` inside `str.++("ab", y)`,
-        // or the `s` inside `str.from_int(str.to_int s)`) are explained.
-        // `resolve_string_term_effort1` / `resolve_int_term_effort1` descend into
-        // these recursively — including the integer-valued string functions
-        // (`str.to_int`, `str.to_code`, `str.len`, `str.indexof`) and the string
-        // functions with integer arguments (`str.from_int`, `str.from_code`) — so
-        // the explanation must too. Without descending through the int-valued
-        // nodes, a `str.from_int(str.to_int s)` value derived from `s = ""` omits
-        // the `s = ""` dependency and the blocking clause forbids the predicate
-        // unconditionally (wrong UNSAT, #str-isdigit-fromint). The recursion no
-        // longer gates on the argument SORT.
-        if let TermData::App(sym, sub_args) = terms.get(arg) {
-            if matches!(
-                sym.name(),
-                "str.++"
-                    | "str.replace"
-                    | "str.replace_all"
-                    | "str.replace_re"
-                    | "str.replace_re_all"
-                    | "str.at"
-                    | "str.substr"
-                    | "str.from_int"
-                    | "int.to.str"
-                    | "str.from_code"
-                    | "str.to_lower"
-                    | "str.to_upper"
-                    | "str.to_int"
-                    | "str.to.int"
-                    | "str.to_code"
-                    | "str.len"
-                    | "str.indexof"
-            ) {
-                let sub_args: Vec<TermId> = sub_args.clone();
-                for sub in sub_args {
-                    self.add_effort1_resolution_explanation_recursive(
-                        terms,
-                        state,
-                        sub,
-                        explanation,
-                        depth + 1,
-                    );
-                }
+        // Recurse into every compound argument so nested component resolutions
+        // (the `y` inside `str.++("ab", y)`, the `s` inside
+        // `str.from_int(str.to_int s)`) are explained. This deliberately does
+        // NOT try to mirror which symbols `resolve_string_term_effort1` /
+        // `resolve_int_term_effort1` descend through: omitting one that they do
+        // descend through drops a real dependency and forbids the predicate
+        // unconditionally (wrong UNSAT, #str-isdigit-fromint), while including
+        // one they do not costs a redundant literal and nothing else.
+        if let TermData::App(_, sub_args) = terms.get(arg) {
+            let sub_args: Vec<TermId> = sub_args.clone();
+            for sub in sub_args {
+                self.add_effort1_resolution_explanation_recursive(
+                    terms,
+                    state,
+                    sub,
+                    explanation,
+                    visited,
+                );
             }
         }
     }

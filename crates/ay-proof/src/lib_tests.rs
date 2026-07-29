@@ -1437,6 +1437,191 @@ fn test_array_row2_uses_checked_arrays_row_subproof() {
     assert!(!output.contains("read_over_write_neg"), "{output}");
 }
 
+/// Sub-schema (A) of `ArrayRowChain`: the walk over
+/// `(select (store (store (store a i1 e1) i2 e2) i3 e3) i1)` must lower to one
+/// `arrays_row` per SKIPPED store plus a terminating `arrays_idx`, all inside a
+/// subproof whose assumptions are the negations of the clause's own index
+/// guards — never the unknown `read_over_write_chain` rule name.
+#[test]
+fn test_array_row_chain_eval_lowers_to_arrays_row_and_idx() {
+    use ay_core::{ArraySort, Symbol, TheoryLemmaKind};
+
+    let mut terms = TermStore::new();
+    let array = terms.mk_var(
+        "a",
+        Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Int))),
+    );
+    let i1 = terms.mk_var("i1", Sort::Int);
+    let i2 = terms.mk_var("i2", Sort::Int);
+    let i3 = terms.mk_var("i3", Sort::Int);
+    let e1 = terms.mk_var("e1", Sort::Int);
+    let e2 = terms.mk_var("e2", Sort::Int);
+    let e3 = terms.mk_var("e3", Sort::Int);
+    let s1 = terms.mk_store(array, i1, e1);
+    let s2 = terms.mk_store(s1, i2, e2);
+    let s3 = terms.mk_store(s2, i3, e3);
+    let select = terms.mk_app(Symbol::named("select"), [s3, i1], Sort::Int);
+    let row = terms.mk_app(Symbol::named("="), [select, e1], Sort::Bool);
+    let g2 = terms.mk_app(Symbol::named("="), [i1, i2], Sort::Bool);
+    let g3 = terms.mk_app(Symbol::named("="), [i1, i3], Sort::Bool);
+
+    let mut proof = Proof::new();
+    proof.add_theory_lemma_with_kind("array", vec![g2, g3, row], TheoryLemmaKind::ArrayRowChain);
+    let output = try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[], None)
+        .expect("row-chain evaluation has a checked external derivation");
+
+    assert!(!output.contains("read_over_write_chain"), "{output}");
+    assert!(output.contains("(anchor :step t0.sp)"), "{output}");
+    // The outermost store is skipped first, so its guard is assumed first.
+    assert!(
+        output.contains("(assume t0.h0 (not (= i1 i3)))"),
+        "{output}"
+    );
+    assert!(
+        output.contains("(assume t0.h1 (not (= i1 i2)))"),
+        "{output}"
+    );
+    // `arrays_row` demands `(not (= store_index read_index))`, the mirror of
+    // the clause's own `(= i1 i3)` spelling: bridged with `not_symm`.
+    assert!(
+        output.contains("(step t0.s0 (cl (not (= i3 i1))) :rule not_symm :premises (t0.h0))"),
+        "{output}"
+    );
+    assert!(
+        output.contains(
+            "(step t0.p0 (cl (= (select (store (store (store a i1 e1) i2 e2) i3 e3) i1) \
+             (select (store (store a i1 e1) i2 e2) i1))) :rule arrays_row :premises (t0.s0))"
+        ),
+        "{output}"
+    );
+    assert!(
+        output.contains("(step t0.pidx (cl (= (select (store a i1 e1) i1) e1)) :rule arrays_idx)"),
+        "{output}"
+    );
+    assert!(
+        output.contains(":rule trans :premises (t0.p0 t0.p1 t0.pidx)"),
+        "{output}"
+    );
+    // The closing resolution reproduces the ORIGINAL clause byte-for-byte, so
+    // every downstream premise reference is unaffected.
+    assert!(
+        output.contains(
+            "(step t0 (cl (= i1 i2) (= i1 i3) \
+             (= (select (store (store (store a i1 e1) i2 e2) i3 e3) i1) e1)) \
+             :rule resolution :premises (t0.sp t0.nn0 t0.nn1))"
+        ),
+        "{output}"
+    );
+}
+
+/// Sub-schema (B) of `ArrayRowChain`: the two walks are transported across the
+/// assumed array equality with `cong`, and the packed unit `or` is restored
+/// with one `or_neg` per disjunct.
+#[test]
+fn test_array_row_chain_under_array_equality_uses_cong() {
+    use ay_core::{ArraySort, Symbol, TheoryLemmaKind};
+
+    let mut terms = TermStore::new();
+    let sort = Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Int)));
+    let a = terms.mk_var("a", sort.clone());
+    let b = terms.mk_var("b", sort);
+    let i = terms.mk_var("i", Sort::Int);
+    let v = terms.mk_var("v", Sort::Int);
+    let store = terms.mk_store(b, i, v);
+    let array_eq = terms.mk_app(Symbol::named("="), [a, store], Sort::Bool);
+    let premise = terms.mk_not_raw(array_eq);
+    let select = terms.mk_app(Symbol::named("select"), [a, i], Sort::Int);
+    let row = terms.mk_app(Symbol::named("="), [v, select], Sort::Bool);
+    let packed = terms.mk_app(Symbol::named("or"), [premise, row], Sort::Bool);
+
+    let mut proof = Proof::new();
+    proof.add_theory_lemma_with_kind("array", vec![packed], TheoryLemmaKind::ArrayRowChain);
+    let output = try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[], None)
+        .expect("row chain under an array equality has a checked external derivation");
+
+    assert!(!output.contains("read_over_write_chain"), "{output}");
+    assert!(
+        output.contains("(assume t0.h0 (= a (store b i v)))"),
+        "{output}"
+    );
+    assert!(
+        output.contains(
+            "(step t0.cong (cl (= (select a i) (select (store b i v) i))) \
+             :rule cong :premises (t0.h0))"
+        ),
+        "{output}"
+    );
+    assert!(
+        output.contains("(step t0.ridx (cl (= (select (store b i v) i) v)) :rule arrays_idx)"),
+        "{output}"
+    );
+    // No guards to discharge: `resolution` would have a single premise, so the
+    // subproof clause is re-ordered into the original literal order instead.
+    assert!(
+        output.contains(
+            "(step t0.flat (cl (not (= a (store b i v))) (= v (select a i))) \
+             :rule reordering :premises (t0.sp))"
+        ),
+        "{output}"
+    );
+    assert!(
+        output.contains(
+            "(step t0.o0 (cl (or (not (= a (store b i v))) (= v (select a i))) \
+             (not (not (= a (store b i v))))) :rule or_neg :args (0))"
+        ),
+        "{output}"
+    );
+    assert!(
+        output.contains(
+            "(step t0 (cl (or (not (= a (store b i v))) (= v (select a i)))) \
+             :rule resolution :premises (t0.flat t0.o0 t0.o1))"
+        ),
+        "{output}"
+    );
+}
+
+/// Fail-closed: when a surface override re-spells the `store` node so the
+/// printed text is no longer the compositional rendering of the certified
+/// term, the printer must NOT reconstruct a derivation from those strings. It
+/// keeps the honest (externally uncheckable) `read_over_write_chain` name.
+#[test]
+fn test_array_row_chain_non_compositional_surface_falls_back() {
+    use ay_core::kani_compat::DetHashMap;
+    use ay_core::{ArraySort, Symbol, TheoryLemmaKind};
+
+    let mut terms = TermStore::new();
+    let array = terms.mk_var(
+        "a",
+        Sort::Array(Box::new(ArraySort::new(Sort::Int, Sort::Int))),
+    );
+    let i1 = terms.mk_var("i1", Sort::Int);
+    let i2 = terms.mk_var("i2", Sort::Int);
+    let e1 = terms.mk_var("e1", Sort::Int);
+    let e2 = terms.mk_var("e2", Sort::Int);
+    let s1 = terms.mk_store(array, i1, e1);
+    let s2 = terms.mk_store(s1, i2, e2);
+    let select = terms.mk_app(Symbol::named("select"), [s2, i1], Sort::Int);
+    let row = terms.mk_app(Symbol::named("="), [select, e1], Sort::Bool);
+    let guard = terms.mk_app(Symbol::named("="), [i1, i2], Sort::Bool);
+
+    let mut proof = Proof::new();
+    proof.add_theory_lemma_with_kind("array", vec![guard, row], TheoryLemmaKind::ArrayRowChain);
+
+    // The inner store prints under a `let` abbreviation, so `(store …)` at the
+    // outer node no longer splits into the separately printed inner array.
+    let mut overrides: DetHashMap<TermId, String> = DetHashMap::default();
+    overrides.insert(
+        s2,
+        "(let ((?v_0 (store a i1 e1))) (store ?v_0 i2 e2))".to_string(),
+    );
+    let output =
+        try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &[], Some(&overrides))
+            .expect("fallback emission still produces a document");
+    assert!(output.contains(":rule read_over_write_chain"), "{output}");
+    assert!(!output.contains("arrays_row"), "{output}");
+    assert!(!output.contains("arrays_idx"), "{output}");
+}
+
 /// #A2b synthesized-default emission budget: an exhausted work budget must
 /// surface as a typed `EmissionBudgetExhausted` error (the caller degrades to
 /// the honest "no proof certificate emitted" warning), while `None` keeps
@@ -1484,4 +1669,113 @@ fn test_emission_work_budget_exhaustion_and_unbudgeted_parity() {
     .expect("generous budget export");
     assert_eq!(unbudgeted, generous);
     assert!(unbudgeted.contains("(assume t0 x)"));
+}
+
+// ---------------------------------------------------------------------------
+// #A9 — ad-hoc overloading must make the emitter DECLINE, never abort.
+//
+// SMT-LIB 2.6 §4.2.3 lets independent datatypes reuse a constructor name and
+// §3.6.4 `(as f σ)` disambiguates the overload, so
+// `(declare-datatypes ((A 0) (B 0)) (((e) (f)) ((e) (g))))` is well-formed
+// input that AY solves. The proof-variable collector used to enforce
+// one-sort-per-SURFACE-NAME with a `debug_assert_eq!`, aborting the process
+// (exit 101) AFTER the correct verdict had been printed. Alethe preambles are
+// a flat, non-overloaded `(declare-fun <name> () <sort>)` namespace, so the
+// right behaviour is a typed refusal that leaves the verdict intact.
+// ---------------------------------------------------------------------------
+
+/// Two same-named symbols at different sorts, as ad-hoc overloading produces.
+fn overloaded_symbol_proof() -> (Proof, TermStore, Vec<TermId>) {
+    let mut terms = TermStore::new();
+    let sort_a = Sort::Uninterpreted("A".to_string());
+    let sort_b = Sort::Uninterpreted("B".to_string());
+    // `(as e A)` / `(as e B)`: one surface name, two sorts.
+    let e_a = terms.mk_fresh_named_var("e", sort_a.clone());
+    let f_a = terms.mk_fresh_named_var("f", sort_a);
+    let e_b = terms.mk_fresh_named_var("e", sort_b.clone());
+    let g_b = terms.mk_fresh_named_var("g", sort_b);
+    let eq_a = terms.mk_eq(e_a, f_a);
+    let eq_b = terms.mk_eq(e_b, g_b);
+
+    let mut proof = Proof::new();
+    let h1 = proof.add_assume(eq_a, None);
+    let h2 = proof.add_assume(eq_b, None);
+    proof.add_rule_step(AletheRule::Resolution, vec![], vec![h1, h2], vec![eq_a]);
+    (proof, terms, vec![eq_a, eq_b])
+}
+
+#[test]
+fn overloaded_symbol_declines_instead_of_panicking_plain_export() {
+    let (proof, terms, _) = overloaded_symbol_proof();
+
+    let err = try_export_alethe(&proof, &terms)
+        .expect_err("a symbol at two sorts has no faithful Alethe preamble");
+    match err {
+        AlethePrintError::AmbiguousSymbolSort {
+            ref name,
+            ref first,
+            ref second,
+        } => {
+            assert_eq!(name, "e");
+            assert_ne!(first, second, "the reported sorts must differ");
+        }
+        other => panic!("expected AmbiguousSymbolSort, got {other:?}"),
+    }
+
+    // The infallible wrapper must degrade loudly, not abort the process.
+    let rendered = export_alethe(&proof, &terms);
+    assert!(
+        rendered.contains("UNVERIFIABLE PROOF"),
+        "infallible export must emit the loud degrade marker: {rendered}"
+    );
+}
+
+#[test]
+fn overloaded_symbol_declines_instead_of_panicking_problem_scope_export() {
+    // This is the exact path that aborted with exit 101: the auxiliary
+    // declaration collector walks BOTH the proof roots and the problem
+    // assertions through `collect_free_vars_in_term`.
+    let (proof, terms, assertions) = overloaded_symbol_proof();
+
+    let err = try_export_alethe_with_problem_scope_and_overrides(&proof, &terms, &assertions, None)
+        .expect_err("problem-scope export must decline on an overloaded symbol");
+    assert!(
+        matches!(err, AlethePrintError::AmbiguousSymbolSort { .. }),
+        "expected AmbiguousSymbolSort, got {err:?}"
+    );
+
+    let rendered = export_alethe_with_problem_scope(&proof, &terms, &assertions);
+    assert!(
+        rendered.contains("UNVERIFIABLE PROOF"),
+        "infallible problem-scope export must degrade loudly: {rendered}"
+    );
+}
+
+#[test]
+fn distinct_symbols_at_distinct_sorts_still_export() {
+    // The refusal must key on a NAME CLASH, not on the mere presence of
+    // several sorts: differently-named symbols at different sorts, and the
+    // same symbol repeated at the SAME sort, both remain exportable.
+    let mut terms = TermStore::new();
+    let sort_a = Sort::Uninterpreted("A".to_string());
+    let sort_b = Sort::Uninterpreted("B".to_string());
+    let p = terms.mk_fresh_named_var("p", sort_a.clone());
+    let q = terms.mk_fresh_named_var("q", sort_a);
+    let r = terms.mk_fresh_named_var("r", sort_b.clone());
+    let s = terms.mk_fresh_named_var("s", sort_b);
+    let eq_a = terms.mk_eq(p, q);
+    let eq_b = terms.mk_eq(r, s);
+    // Same name, SAME sort — legal and unambiguous.
+    let p_again = terms.mk_fresh_named_var("p", Sort::Uninterpreted("A".to_string()));
+    let eq_again = terms.mk_eq(p_again, q);
+
+    let mut proof = Proof::new();
+    let h1 = proof.add_assume(eq_a, None);
+    let h2 = proof.add_assume(eq_b, None);
+    let h3 = proof.add_assume(eq_again, None);
+    proof.add_rule_step(AletheRule::Resolution, vec![], vec![h1, h2, h3], vec![eq_a]);
+
+    let output = try_export_alethe(&proof, &terms).expect("no name clash — must export");
+    assert!(output.contains("(declare-fun p () A)"), "{output}");
+    assert!(output.contains("(declare-fun r () B)"), "{output}");
 }

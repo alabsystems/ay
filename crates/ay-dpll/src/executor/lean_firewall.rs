@@ -7801,18 +7801,303 @@ end AySoundness.Emitted.FpRemNotNegative_{hash}
 // Floating-point RNE dot-product forward-error firewall authority gate.
 // ---------------------------------------------------------------------------
 
+/// The IEEE-754 `binary64` format as `(eb, sb)`: 11 exponent bits, 53
+/// significand bits INCLUDING the hidden bit. This is the SMT-LIB `Float64` /
+/// `(_ FloatingPoint 11 53)` sort, and the only format the `FpBridge`
+/// forward-error theorems are proved for.
+const BINARY64_FORMAT: (u32, u32) = (11, 53);
+
+/// The SMT-LIB `RoundingMode` constants, spelled out EXACTLY.
+///
+/// A rounding mode occupies the first argument slot of the arithmetic
+/// `fp.*` operators, where every OTHER argument is floating-point sorted. This
+/// table exists so that slot can be skipped by exact name and never by a
+/// prefix or shape guess: `RNEx`, `RN`, `rne` and `roundy` are all legal
+/// user-declarable symbols, and any of them mistaken for a rounding mode would
+/// silently drop a real floating-point operand out of the format check.
+const SMTLIB_ROUNDING_MODES: [&str; 10] = [
+    "RNE",
+    "RNA",
+    "RTP",
+    "RTN",
+    "RTZ",
+    "roundNearestTiesToEven",
+    "roundNearestTiesToAway",
+    "roundTowardPositive",
+    "roundTowardNegative",
+    "roundTowardZero",
+];
+
+/// The SMT-LIB `FloatingPoint` operators whose non-`RoundingMode` arguments are
+/// all floating-point sorted, spelled out EXACTLY.
+///
+/// Deliberately a closed table and not a `starts_with("fp.")` test: `fp.to_ubv`
+/// / `fp.to_sbv` are indexed (`(_ fp.to_ubv m)`) and `to_fp` mixes source
+/// sorts, so a prefix rule would both over- and under-approximate. An operator
+/// missing from this table simply contributes no operands — which can only make
+/// the format check MORE conservative if the caller also requires that at least
+/// one operand was found.
+const FP_SAME_SORT_OPERATORS: [&str; 25] = [
+    "fp.abs",
+    "fp.neg",
+    "fp.add",
+    "fp.sub",
+    "fp.mul",
+    "fp.div",
+    "fp.fma",
+    "fp.sqrt",
+    "fp.rem",
+    "fp.roundToIntegral",
+    "fp.min",
+    "fp.max",
+    "fp.leq",
+    "fp.lt",
+    "fp.geq",
+    "fp.gt",
+    "fp.eq",
+    "fp.isNormal",
+    "fp.isSubnormal",
+    "fp.isZero",
+    "fp.isInfinite",
+    "fp.isNaN",
+    "fp.isNegative",
+    "fp.isPositive",
+    "fp.to_real",
+];
+
+/// Collect every SYMBOL occurring anywhere in `t`, and reject outright any
+/// construct that could introduce a floating-point format this walk cannot
+/// account for.
+///
+/// Returns `false` when the term cannot be analysed, in which case the
+/// collected list is meaningless and the caller must decline. That happens for
+/// every BINDING form — `let`, `forall`, `exists`, `lambda`, `match` — because
+/// a bound occurrence of a name is NOT the declared symbol of that name, so
+/// looking the name up in the declaration table would read the wrong sort. It
+/// also happens past a depth cap, so a pathological term cannot overflow the
+/// stack inside a soundness gate.
+///
+/// COLLECTION IS UNRESTRICTED BY POSITION. An earlier version pushed a symbol
+/// only when it stood in DIRECT operand position of a recognized same-sort
+/// `fp.*` application, which let non-`binary64` values reach the formula
+/// uncollected and made the caller's `all(...)` pass VACUOUSLY. Four shapes
+/// were demonstrated to slip through: a `Float32` symbol reachable only under
+/// `=`; `binary32` arithmetic behind `(_ to_fp 8 24)`; `Float32` operands under
+/// `ite`; and a `binary32` `(fp #b0 #b00000001 …)` literal operand. A gate that
+/// answers "the vocabulary is binary64" must range over the WHOLE term, so
+/// every symbol is collected here and the format decision is left to the
+/// caller, which checks the entire declared vocabulary rather than a subset.
+fn collect_fp_operand_symbols(
+    t: &PTerm,
+    depth: u32,
+    all: &mut Vec<String>,
+    operands: &mut Vec<String>,
+) -> bool {
+    /// Deep enough for any realistic assertion; a term nested deeper than this
+    /// is refused rather than recursed into.
+    const MAX_DEPTH: u32 = 512;
+    if depth >= MAX_DEPTH {
+        return false;
+    }
+    match t {
+        PTerm::Const(_) => true,
+        PTerm::Symbol(s) => {
+            if !SMTLIB_ROUNDING_MODES.contains(&s.as_str()) {
+                all.push(s.clone());
+            }
+            true
+        }
+        PTerm::App(op, args) => {
+            // `(fp <sign> <exp> <sig>)` builds a literal of whatever format its
+            // bit-vector widths imply. The surface syntax does not carry the
+            // sort, and a `binary32` literal is indistinguishable here from a
+            // `binary64` one without re-deriving both widths, so decline.
+            if op == "fp" {
+                return false;
+            }
+            if FP_SAME_SORT_OPERATORS.contains(&op.as_str()) {
+                for arg in args {
+                    if let PTerm::Symbol(s) = arg {
+                        if !SMTLIB_ROUNDING_MODES.contains(&s.as_str()) {
+                            operands.push(s.clone());
+                        }
+                    }
+                }
+            }
+            args.iter()
+                .all(|arg| collect_fp_operand_symbols(arg, depth + 1, all, operands))
+        }
+        PTerm::IndexedApp(op, indices, args) => {
+            // `((_ to_fp eb sb) …)` and friends NAME their result format in the
+            // indices. Any format other than binary64 introduces a value this
+            // gate must not vouch for.
+            if op.starts_with("to_fp") {
+                let names_binary64 = indices.len() == 2
+                    && matches!(&indices[0], PIndex::Numeral(n) if n.parse::<u32>() == Ok(BINARY64_FORMAT.0))
+                    && matches!(&indices[1], PIndex::Numeral(n) if n.parse::<u32>() == Ok(BINARY64_FORMAT.1));
+                if !names_binary64 {
+                    return false;
+                }
+            }
+            args.iter()
+                .all(|arg| collect_fp_operand_symbols(arg, depth + 1, all, operands))
+        }
+        PTerm::QualifiedApp(_, _, args) => args
+            .iter()
+            .all(|arg| collect_fp_operand_symbols(arg, depth + 1, all, operands)),
+        PTerm::Annotated(inner, _) => collect_fp_operand_symbols(inner, depth + 1, all, operands),
+        // Binding forms: a bound name shadows the declaration table.
+        PTerm::Let(..)
+        | PTerm::Forall(..)
+        | PTerm::Exists(..)
+        | PTerm::Lambda(..)
+        | PTerm::Match(..) => false,
+        // `Term` is `#[non_exhaustive]`: an unrecognized future variant is
+        // unanalysable by construction, so decline rather than ignore it.
+        _ => false,
+    }
+}
+
+/// Whether the floating-point vocabulary of this parsed formula is EXACTLY
+/// IEEE-754 `binary64`.
+///
+/// WHY THIS GATE EXISTS. [`Context::assertions_parsed`] hands emitters the
+/// original surface syntax, in which `Term::Symbol` carries NO sort. The
+/// `guard_claim_guard2.smt2` benchmark and its `Float32` clone
+/// (`guard_claim_guard2_float32.smt2`) have BYTE-IDENTICAL parsed assertion
+/// terms — yet the `Float64` original is `unsat` (binary64 half-ULP forward
+/// error `<= 17/64 < 2`) and the `Float32` clone is SATISFIABLE
+/// (`guard_claim_guard2_float32_witness.smt2` pins a model with error
+/// `16777214 >= 2`). An error-bound emitter that classifies by term shape alone
+/// would emit a `no_model` certificate for a satisfiable formula. Reading the
+/// format is therefore a SOUNDNESS prerequisite, not a refinement.
+///
+/// `fp_formats` is [`Context::nullary_fp_formats`], which lists EVERY nullary
+/// symbol with its floating-point format, or `None` when the symbol is not
+/// floating-point. The gate is fail-closed in every direction:
+///
+/// - the term walk refuses binding forms, `fp` bit-pattern literals, a
+///   `to_fp` family index pair other than `(11, 53)`, excessive depth, and any
+///   unrecognized `Term` variant;
+/// - a symbol occurring in the formula but ABSENT from the table (unknown or
+///   ambiguous sort) declines;
+/// - ANY declared floating-point symbol of a format other than `(11, 53)`
+///   declines, whether or not it occurs in this formula;
+/// - a formula containing no `binary64` symbol at all declines — there is
+///   nothing to certify.
+///
+/// THE THIRD RULE IS DELIBERATELY WHOLE-VOCABULARY, NOT PER-OCCURRENCE. An
+/// earlier version asked only whether the symbols it had collected were
+/// binary64, and collected only those in direct operand position of a
+/// recognized same-sort `fp.*` application. Non-binary64 values reachable any
+/// other way — under `=`, under `ite`, as an `(_ to_fp 8 24)` argument, or as
+/// an `(fp …)` literal — were never collected, so the check passed VACUOUSLY on
+/// formulas whose vocabulary was NOT binary64. Since the whole point of this
+/// gate is that `Term::Symbol` carries no sort and a `Float32` clone of the
+/// target benchmark parses IDENTICALLY while being satisfiable, a subset check
+/// is worth nothing. Refusing a formula merely because some unrelated
+/// non-binary64 symbol is declared elsewhere in the session is the conservative
+/// direction, and conservative is the only acceptable direction here.
+pub(crate) fn parsed_fp_vocabulary_is_binary64(
+    parsed: &[PTerm],
+    defined: &[(String, PTerm)],
+    fp_formats: &[(String, Option<(u32, u32)>)],
+) -> bool {
+    // No floating-point symbol of any other format may exist anywhere.
+    if fp_formats
+        .iter()
+        .any(|(_, fmt)| fmt.is_some_and(|f| f != BINARY64_FORMAT))
+    {
+        return false;
+    }
+
+    let mut symbols: Vec<String> = Vec::new();
+    let mut operands: Vec<String> = Vec::new();
+    for t in parsed {
+        if !collect_fp_operand_symbols(t, 0, &mut symbols, &mut operands) {
+            return false;
+        }
+    }
+    for (_, body) in defined {
+        if !collect_fp_operand_symbols(body, 0, &mut symbols, &mut operands) {
+            return false;
+        }
+    }
+    symbols.sort();
+    symbols.dedup();
+    operands.sort();
+    operands.dedup();
+
+    let format_of = |name: &String| fp_formats.iter().find(|(n, _)| n == name).map(|(_, f)| *f);
+
+    // Every symbol the formula mentions must be one this table knows about, or
+    // its sort — and hence its format — is simply unknown to us. Non-floating
+    // -point symbols are fine here: a `guard_claim` formula legitimately names
+    // Bool and Real constants alongside its binary64 values.
+    if !symbols.iter().all(|name| format_of(name).is_some()) {
+        return false;
+    }
+
+    // Anything standing in floating-point OPERAND position must be a declared
+    // binary64 value. A symbol used as an `fp.*` operand but declared with a
+    // non-floating-point sort is an inconsistency the gate must not paper over.
+    if !operands
+        .iter()
+        .all(|name| format_of(name) == Some(Some(BINARY64_FORMAT)))
+    {
+        return false;
+    }
+
+    // And at least one binary64 value must actually occur.
+    operands
+        .iter()
+        .any(|name| format_of(name) == Some(Some(BINARY64_FORMAT)))
+}
+
 /// Deliberately decline every parsed floating-point dot-error proof request.
 ///
-/// The Lean `qround` lemmas prove bounds inside fixed-spacing rational models,
-/// but no theorem currently connects the recognized IEEE-754 operations,
-/// intermediate values, and magnitude hypotheses to either model. Emitting a
-/// proof for the parsed formula would therefore overstate what Lean checked.
-/// Keep this production hook fail-closed until that semantic bridge exists and
-/// has been reviewed.
+/// TWO gates stand in the way, and BOTH must be cleared before this hook may
+/// ever return `Some`.
+///
+/// 1. FORMAT (implemented, live). See [`parsed_fp_vocabulary_is_binary64`]: the
+///    parsed assertion terms of the `Float64` benchmark and of its SATISFIABLE
+///    `Float32` clone are byte-identical, so an emitter that cannot read the
+///    declared format cannot be sound. This gate now reads it and declines on
+///    anything that is not `binary64`.
+///
+/// 2. SEMANTIC BRIDGE (open). `AySoundness.FpBridge` now proves, in the kernel,
+///    the whole rational side of the argument: `rne_step` (a nearest-value
+///    rounding hypothesis yields the half-ULP bound AND the magnitude cap),
+///    `isF64_representable` (every `IsF64` point really is a finite binary64
+///    bit pattern under the independent `FpUnderflow.decodeFin` model),
+///    `guard_claim_intermediates_finite` (all six intermediates stay `<= 2^51`,
+///    so none is `±∞`/NaN and `fp.to_real` is specified on all of them) and
+///    `guard_claim_no_model` (the composed conflict, certified bound `17/64`).
+///    What NO theorem discharges is the identification of SMT-LIB
+///    `fp.mul RNE` / `fp.add RNE`, read through `fp.to_real`, with
+///    `FpBridge.NearestF64`. That identification is hand-argued, it lives
+///    OUTSIDE the kernel, and it is categorically larger than the `Int`↔`Int`
+///    identifications the other emitters make, because ay's floating-point
+///    verdicts come from a BIT-BLASTER rather than from a nearest-value
+///    definition. Firing here would make the firewall depend on exactly the
+///    semantics it exists to check independently, so it stays closed.
 pub(crate) fn emit_fp_dot_error_bound_firewall_lean_from_parsed(
-    _parsed: &[PTerm],
-    _defined: &[(String, PTerm)],
+    parsed: &[PTerm],
+    defined: &[(String, PTerm)],
+    fp_formats: &[(String, Option<(u32, u32)>)],
 ) -> Option<String> {
+    // PREREQUISITE GATE (soundness, see `parsed_fp_vocabulary_is_binary64`).
+    // Everything downstream is proved only for binary64.
+    if !parsed_fp_vocabulary_is_binary64(parsed, defined, fp_formats) {
+        return None;
+    }
+    // AUTHORITY GATE (still closed). See the doc comment above: the residual
+    // identification of SMT-LIB `fp.mul`/`fp.add` RNE — read through
+    // `fp.to_real` — with `AySoundness.FpBridge.NearestF64` is a hand-argued
+    // specification identification that no Lean theorem discharges. ay's FP
+    // verdicts come from a BIT-BLASTER, not from a nearest-value definition, so
+    // firing here would make the firewall depend on the very semantics it
+    // exists to check independently. Decline.
     None
 }
 
@@ -13681,6 +13966,9 @@ pub(crate) fn emit_euf_lia_congruence_firewall_lean_from_parsed(
     if !has_conflict {
         return None;
     }
+    if atoms.iter().any(|a| atom_prop_defeats_closure(&a.prop)) {
+        return None;
+    }
 
     Some(render_euf_lia_congruence_lean(
         &atoms,
@@ -13688,6 +13976,51 @@ pub(crate) fn emit_euf_lia_congruence_firewall_lean_from_parsed(
         &uf_funcs,
         &bridges.into_iter().collect::<Vec<_>>(),
     ))
+}
+
+/// Whether an atom's rendered `Prop` defeats the nested-`by_cases` closing
+/// tactic `simp [clauseSat, litSat, atomVal, hᵢ]`, so the emitter must DECLINE
+/// rather than write an artifact that will not compile.
+///
+/// Two shapes do, both found by fuzzing the emitters and both producing a file
+/// that fails `lake env lean` and reports `sorryAx` — worse than declining, and
+/// a regression against the previous behaviour of declining these inputs
+/// outright:
+///
+/// 1. A SYNTACTICALLY REFLEXIVE equality, `t = t`, from e.g. `(assert (= z z))`,
+///    `(assert (= 5.0 5.0))`, `(assert (= (f x) (f x)))`, or `(assert (= 5 5.0))`
+///    where both sides render alike. `simp`'s `eq_self` rewrites the atom to
+///    `True` before the branch hypothesis `hᵢ : ¬(t = t)` can be used — Lean's
+///    own linter flags the argument as unused — so the goal survives. Adding
+///    `(assert (= x x))` to an otherwise-clean benchmark was enough to turn a
+///    checking artifact into a `sorryAx` one.
+/// 2. A disequality whose sides stand in an OCCURS relation, e.g.
+///    `(assert (not (= y (g y))))`. The closing branch hands `h : y = g y` to
+///    `simp` as a rewrite rule, which loops until "maximum recursion depth".
+///
+/// Declining is the conservative direction and matches what these emitters did
+/// before the shapes were reachable. Widening coverage means FIXING the closing
+/// tactic (a reflexive branch is vacuous and closes by `absurd rfl hᵢ`), not
+/// relaxing this gate.
+fn atom_prop_defeats_closure(prop: &str) -> bool {
+    let Some((lhs, rhs)) = prop.split_once(" = ") else {
+        return false;
+    };
+    let (lhs, rhs) = (lhs.trim(), rhs.trim());
+    if lhs == rhs {
+        return true; // reflexive: `simp` rewrites it away before hᵢ applies
+    }
+    // Occurs relation. For a single-token side, require a whole-token match so
+    // `m.x_a` does not spuriously "occur in" `m.x_ab`.
+    let occurs = |small: &str, big: &str| -> bool {
+        if small.contains(' ') {
+            big.contains(small)
+        } else {
+            big.split(|c: char| c.is_whitespace() || c == '(' || c == ')')
+                .any(|tok| tok == small)
+        }
+    };
+    occurs(lhs, rhs) || occurs(rhs, lhs)
 }
 
 /// Render the fused EUF+LIA congruence-value firewall file. The lemma clause is
@@ -13888,6 +14221,726 @@ fn euf_lia_emit_block(
         lines.extend(bulletize(&cont));
     }
     lines
+}
+
+// ===========================================================================
+// EUF + ORDERED-FIELD (SMT-LIB `Real`) fused congruence-value firewall
+// (bucket "euf_uflra").
+// ===========================================================================
+//
+// FAITHFULNESS. Lean core has no ℝ, so a `no_model` over `Int`/`Rat` would
+// certify something STRICTLY WEAKER than a Real-sorted `unsat`. This emitter
+// instead parameterises the model by an ARBITRARY linearly ordered field
+// `F : AySoundness.OrdField`, so the theorem reads "no model in ANY linearly
+// ordered field", which DOES entail "no real model". See
+// `verification/lean/AySoundness/OrdField.lean`.
+//
+// SEPARATION FROM THE Int PATH (a §0 obligation, not a style choice). Nothing
+// here calls `cbr_lin_of`, `euf_lia_lin_of`, `cbr_is_int_constant` or
+// `cbr_is_int_unary_function`, and none of those is modified: the Int emitters
+// keep their `Sort::Int` gates verbatim, so a Real file can never reach an
+// `omega`/Int render, and this emitter's `Sort::Real` gates mean an Int file can
+// never reach the ordered-field render. The distinction is load-bearing because
+// INTEGER reasoning is UNSOUND over ℝ: `x > 5 ∧ x < 7` pins `x = 6` over `Int`
+// but leaves `x` free over ℝ. Accordingly the pin analysis below accepts ONLY
+// non-strict bounds with a coincident low and high, which is exactly
+// `OrdField.le_antisymm` and holds in every ordered field.
+//
+// ARITHMETIC IS DELIBERATELY OUT OF SCOPE. Atoms are rendered DIRECTLY (a
+// variable, a numeral, or a single UF application); no linear normal form is
+// ever built, so the "a normalized negative coefficient has no `F.ofNat`
+// representation" hazard cannot arise. Any `+`/`-`/`*`/`/` inside an atom
+// declines.
+
+/// One side of a recognized Real atom.
+#[derive(Clone, PartialEq, Eq)]
+enum OrdFieldTerm {
+    /// A declared 0-ary `Real` constant.
+    Var(String),
+    /// A non-negative integer-valued Real literal, rendered `F.ofNat k`.
+    Num(u64),
+    /// A single application `(g x)` of a declared `Real -> Real` function to a
+    /// declared 0-ary `Real` constant.
+    UfApp(String, String),
+}
+
+/// The largest numeral this emitter will render. `F.ofNat` is a successor-style
+/// recursive definition; the emitted proofs never unfold it, but an unbounded
+/// literal still has no place in a diagnostic artifact, and the bound keeps the
+/// `by decide` on `m ≠ n` cheap.
+const ORDFIELD_MAX_NUMERAL: u64 = 1_000_000;
+
+fn ordfield_is_real_constant(context: &ay_frontend::Context, name: &str) -> bool {
+    firewall_unique_symbol_info(context, name)
+        .is_some_and(|info| info.arg_sorts.is_empty() && info.sort == Sort::Real)
+}
+
+fn ordfield_is_real_unary_function(context: &ay_frontend::Context, name: &str) -> bool {
+    firewall_unique_symbol_info(context, name).is_some_and(|info| {
+        matches!(info.arg_sorts.as_slice(), [Sort::Real]) && info.sort == Sort::Real
+    })
+}
+
+/// A non-negative integer-valued Real literal, as a `Nat`.
+///
+/// Accepts `5` (`Numeral`) and `5.0` / `5.000` (`Decimal` with an all-zero
+/// fractional part). Declines a genuinely fractional decimal (`2.5`), a negative
+/// value, anything above `ORDFIELD_MAX_NUMERAL`, and — unlike the Int
+/// recognizers — ANY `Symbol`: there is no lenient signed-literal fallback here,
+/// so a declared symbol whose surface text merely looks numeric can never be
+/// reinterpreted as a constant.
+fn ordfield_nat_literal(t: &PTerm) -> Option<u64> {
+    let text = match t {
+        PTerm::Const(PConst::Numeral(n)) => n.as_str(),
+        PTerm::Const(PConst::Decimal(d)) => d.as_str(),
+        _ => return None,
+    };
+    let (int_part, frac_part) = text.split_once('.').unwrap_or((text, ""));
+    if !frac_part.chars().all(|c| c == '0') {
+        return None;
+    }
+    if int_part.is_empty() || !int_part.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let value = int_part.parse::<u64>().ok()?;
+    (value <= ORDFIELD_MAX_NUMERAL).then_some(value)
+}
+
+/// Classify one side of an atom, declining every shape outside the scope above.
+fn ordfield_term_of(t: &PTerm, context: &ay_frontend::Context) -> Option<OrdFieldTerm> {
+    if let Some(k) = ordfield_nat_literal(t) {
+        return Some(OrdFieldTerm::Num(k));
+    }
+    match t {
+        PTerm::Symbol(v) if ordfield_is_real_constant(context, v) => {
+            Some(OrdFieldTerm::Var(v.clone()))
+        }
+        PTerm::App(g, args) if args.len() == 1 && !cbr_is_builtin_op(g) => {
+            let PTerm::Symbol(arg) = &args[0] else {
+                return None;
+            };
+            (ordfield_is_real_unary_function(context, g) && ordfield_is_real_constant(context, arg))
+                .then(|| OrdFieldTerm::UfApp(g.clone(), arg.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Render a classified term as a Lean expression over the `Val F` model.
+fn ordfield_render(t: &OrdFieldTerm) -> String {
+    match t {
+        OrdFieldTerm::Var(v) => format!("m.x_{}", euf_lia_san(v)),
+        OrdFieldTerm::Num(k) => format!("F.ofNat {k}"),
+        OrdFieldTerm::UfApp(g, a) => format!("m.f_{} (m.x_{})", euf_lia_san(g), euf_lia_san(a)),
+    }
+}
+
+/// One asserted Real atom: its rendered Lean `Prop` and its asserted polarity.
+struct OrdFieldAtom {
+    prop: String,
+    cv: bool,
+}
+
+/// Equality-proof-graph node for a Real variable. Numerals are nodes too
+/// (`ordfield_num_node`), because a pinned variable is proved equal to
+/// `F.ofNat k` and two variables pinned to the SAME numeral are thereby equal.
+/// U+0001 cannot occur in an SMT symbol, so the two namespaces never collide.
+fn ordfield_var_node(v: &str) -> String {
+    format!("v\u{1}{v}")
+}
+
+fn ordfield_num_node(k: u64) -> String {
+    format!("n\u{1}{k}")
+}
+
+type OrdFieldEdges = std::collections::BTreeMap<String, Vec<(String, String)>>;
+
+/// Record `a = b` with `proof : a = b` and `proof_sym : b = a`.
+fn ordfield_add_edge(edges: &mut OrdFieldEdges, a: &str, b: &str, proof: String, sym: String) {
+    edges
+        .entry(a.to_string())
+        .or_default()
+        .push((b.to_string(), proof));
+    edges
+        .entry(b.to_string())
+        .or_default()
+        .push((a.to_string(), sym));
+}
+
+/// Shortest equality-proof path `a = b` over the graph, as a Lean term, or
+/// `None` when the two variables are not provably equal from the recorded
+/// hypotheses (in which case the caller declines rather than guessing).
+fn ordfield_eq_proof(edges: &OrdFieldEdges, a: &str, b: &str) -> Option<String> {
+    use std::collections::{BTreeSet, HashMap, VecDeque};
+    let (start, goal) = (ordfield_var_node(a), ordfield_var_node(b));
+    if start == goal {
+        return Some("rfl".to_string());
+    }
+    let mut prev: HashMap<String, (String, String)> = HashMap::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut queue: VecDeque<String> = VecDeque::new();
+    seen.insert(start.clone());
+    queue.push_back(start.clone());
+    while let Some(cur) = queue.pop_front() {
+        if cur == goal {
+            break;
+        }
+        for (next, proof) in edges.get(&cur).into_iter().flatten() {
+            if seen.insert(next.clone()) {
+                prev.insert(next.clone(), (cur.clone(), proof.clone()));
+                queue.push_back(next.clone());
+            }
+        }
+    }
+    if !seen.contains(&goal) {
+        return None;
+    }
+    let mut steps: Vec<String> = Vec::new();
+    let mut cur = goal;
+    while cur != start {
+        let (p, proof) = prev.get(&cur)?.clone();
+        steps.push(proof);
+        cur = p;
+    }
+    steps.reverse();
+    let mut acc = steps.first()?.clone();
+    for step in &steps[1..] {
+        acc = format!("({acc}.trans {step})");
+    }
+    Some(acc)
+}
+
+/// Emit a verified-firewall Lean proof for an EUF + ORDERED-FIELD fused
+/// congruence-value conflict among the PARSED (frontend) assertions — bucket
+/// "euf_uflra".
+///
+/// Recognized shape: every assertion is a (possibly `not`-wrapped) binary
+/// `=`/`>=`/`<=`/`>`/`<` whose sides are a declared `Real` constant, a
+/// non-negative integer-valued Real literal, or a single application of a
+/// declared `Real -> Real` function to a declared `Real` constant; and some pair
+/// of same-function UF value atoms has ordered-field-implied-equal arguments but
+/// contradictory asserted values.
+///
+/// Fail-closed on everything else: any arithmetic operator, any non-Real sort,
+/// any fractional or negative literal, any symbol collision after sanitization,
+/// any missing equality-proof path.
+pub(crate) fn emit_euf_ordfield_congruence_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    context: &ay_frontend::Context,
+) -> Option<String> {
+    use std::collections::{BTreeSet, HashMap};
+
+    if parsed.is_empty() {
+        return None;
+    }
+
+    let mut atoms: Vec<OrdFieldAtom> = Vec::new();
+    let mut real_vars: BTreeSet<String> = BTreeSet::new();
+    let mut uf_funcs: BTreeSet<String> = BTreeSet::new();
+    // (func, arg, value, asserted-positive, 0-based atom index)
+    let mut uf_values: Vec<(String, String, u64, bool, usize)> = Vec::new();
+    // Non-strict bounds per variable: (bound, index of the atom proving it).
+    // Deliberately separate from `bound_*` below so a STRICT bound can never
+    // leak into the pin analysis, where it would be unsound over ℝ.
+    let mut lower: HashMap<String, (u64, usize)> = HashMap::new();
+    let mut upper: HashMap<String, (u64, usize)> = HashMap::new();
+    // Strongest bound of EITHER kind per variable, for the one-variable
+    // bound-contradiction refutation: (bound, atom index, strict?).
+    let mut bound_lo: HashMap<String, (u64, usize, bool)> = HashMap::new();
+    let mut bound_hi: HashMap<String, (u64, usize, bool)> = HashMap::new();
+    let mut edges: OrdFieldEdges = OrdFieldEdges::new();
+
+    for asrt in parsed {
+        let (inner, positive) = match asrt {
+            PTerm::App(op, a) if op == "not" && a.len() == 1 => (&a[0], false),
+            other => (other, true),
+        };
+        let PTerm::App(op, args) = inner else {
+            return None;
+        };
+        if args.len() != 2 {
+            return None;
+        }
+        let lhs = ordfield_term_of(&args[0], context)?;
+        let rhs = ordfield_term_of(&args[1], context)?;
+        for side in [&lhs, &rhs] {
+            match side {
+                OrdFieldTerm::Var(v) => {
+                    real_vars.insert(v.clone());
+                }
+                OrdFieldTerm::UfApp(g, a) => {
+                    uf_funcs.insert(g.clone());
+                    real_vars.insert(a.clone());
+                }
+                OrdFieldTerm::Num(_) => {}
+            }
+        }
+        let idx = atoms.len();
+
+        match op.as_str() {
+            "=" => {
+                let hyp = format!("h{}", idx + 1);
+                // A UF value atom, normalized to `f x = numeral` (equality is
+                // symmetric, so the flipped source orientation renders the same).
+                let uf_value = match (&lhs, &rhs) {
+                    (OrdFieldTerm::UfApp(g, a), OrdFieldTerm::Num(k))
+                    | (OrdFieldTerm::Num(k), OrdFieldTerm::UfApp(g, a)) => {
+                        Some((g.clone(), a.clone(), *k))
+                    }
+                    _ => None,
+                };
+                if let Some((g, a, k)) = uf_value {
+                    atoms.push(OrdFieldAtom {
+                        prop: format!(
+                            "m.f_{} (m.x_{}) = F.ofNat {k}",
+                            euf_lia_san(&g),
+                            euf_lia_san(&a)
+                        ),
+                        cv: positive,
+                    });
+                    uf_values.push((g, a, k, positive, idx));
+                    continue;
+                }
+                atoms.push(OrdFieldAtom {
+                    prop: format!("{} = {}", ordfield_render(&lhs), ordfield_render(&rhs)),
+                    cv: positive,
+                });
+                if positive {
+                    let node = |t: &OrdFieldTerm| match t {
+                        OrdFieldTerm::Var(v) => Some(ordfield_var_node(v)),
+                        OrdFieldTerm::Num(k) => Some(ordfield_num_node(*k)),
+                        OrdFieldTerm::UfApp(_, _) => None,
+                    };
+                    if let (Some(na), Some(nb)) = (node(&lhs), node(&rhs)) {
+                        ordfield_add_edge(&mut edges, &na, &nb, hyp.clone(), format!("{hyp}.symm"));
+                    }
+                }
+            }
+            ">=" | "<=" | ">" | "<" => {
+                // `a >= b` renders `F.le b a`; `a > b` renders `F.lt b a`.
+                let (low, high) = if matches!(op.as_str(), ">=" | ">") {
+                    (&rhs, &lhs)
+                } else {
+                    (&lhs, &rhs)
+                };
+                let strict = matches!(op.as_str(), ">" | "<");
+                let rel = if strict { "F.lt" } else { "F.le" };
+                atoms.push(OrdFieldAtom {
+                    prop: format!(
+                        "{rel} ({}) ({})",
+                        ordfield_render(low),
+                        ordfield_render(high)
+                    ),
+                    cv: positive,
+                });
+                // ONLY non-strict, positively asserted bounds pin. A strict bound
+                // pins nothing in an ordered field, unlike over `Int`.
+                if positive {
+                    match (low, high) {
+                        (OrdFieldTerm::Num(k), OrdFieldTerm::Var(v)) => {
+                            if !strict {
+                                let e = lower.entry(v.clone()).or_insert((*k, idx));
+                                if *k >= e.0 {
+                                    *e = (*k, idx);
+                                }
+                            }
+                            let e = bound_lo.entry(v.clone()).or_insert((*k, idx, strict));
+                            if (*k, strict) >= (e.0, e.2) {
+                                *e = (*k, idx, strict);
+                            }
+                        }
+                        (OrdFieldTerm::Var(v), OrdFieldTerm::Num(k)) => {
+                            if !strict {
+                                let e = upper.entry(v.clone()).or_insert((*k, idx));
+                                if *k <= e.0 {
+                                    *e = (*k, idx);
+                                }
+                            }
+                            let e = bound_hi.entry(v.clone()).or_insert((*k, idx, strict));
+                            if (*k, !strict) <= (e.0, !e.2) {
+                                *e = (*k, idx, strict);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    // A `Val` structure with no fields is not valid Lean, and an assertion set
+    // with no Real variable carries no refutable content here anyway.
+    if real_vars.is_empty() {
+        return None;
+    }
+
+    // O3 — symbol-mangling injectivity. Two distinct SMT symbols collapsing onto
+    // one `Val` field would silently FORCE an equality, so the theorem would
+    // prove a MORE-CONSTRAINED formula, which does NOT entail unsat of the
+    // original. Decline instead.
+    {
+        let mut seen: HashMap<String, String> = HashMap::new();
+        for v in &real_vars {
+            if let Some(prev) = seen.insert(euf_lia_san(v), v.clone()) {
+                if &prev != v {
+                    return None;
+                }
+            }
+        }
+        let mut seen_f: HashMap<String, String> = HashMap::new();
+        for g in &uf_funcs {
+            if let Some(prev) = seen_f.insert(euf_lia_san(g), g.clone()) {
+                if &prev != g {
+                    return None;
+                }
+            }
+        }
+    }
+
+    // Pins from coincident non-strict bounds: `ofNat k <= v` and `v <= ofNat k`
+    // give `v = ofNat k` by `OrdField.le_antisymm`.
+    let mut pin_lines: Vec<String> = Vec::new();
+    for v in &real_vars {
+        let (Some(&(l, li)), Some(&(u, ui))) = (lower.get(v), upper.get(v)) else {
+            continue;
+        };
+        if l != u {
+            continue;
+        }
+        let sv = euf_lia_san(v);
+        let name = format!("hpin_{sv}");
+        pin_lines.push(format!(
+            "have {name} : m.x_{sv} = F.ofNat {l} := F.le_antisymm _ _ h{} h{}",
+            ui + 1,
+            li + 1
+        ));
+        ordfield_add_edge(
+            &mut edges,
+            &ordfield_var_node(v),
+            &ordfield_num_node(l),
+            name.clone(),
+            format!("{name}.symm"),
+        );
+    }
+
+    // Congruence conflict: same function, ordered-field-implied-equal arguments,
+    // contradictory asserted values.
+    let mut conflict_lines: Option<Vec<String>> = None;
+    'outer: for i in 0..uf_values.len() {
+        for j in (i + 1)..uf_values.len() {
+            let (gi, ai, vi, pi, hi_at) = &uf_values[i];
+            let (gj, aj, vj, pj, hj_at) = &uf_values[j];
+            if gi != gj {
+                continue;
+            }
+            let contradictory = match (pi, pj) {
+                (true, true) => vi != vj,
+                (true, false) | (false, true) => vi == vj,
+                (false, false) => false,
+            };
+            if !contradictory {
+                continue;
+            }
+            let Some(arg_eq) = ordfield_eq_proof(&edges, ai, aj) else {
+                continue;
+            };
+            let gs = euf_lia_san(gi);
+            let (si, sj) = (euf_lia_san(ai), euf_lia_san(aj));
+            let mut lines: Vec<String> = Vec::new();
+            if ai == aj {
+                lines.push(format!(
+                    "have hbr : m.f_{gs} (m.x_{si}) = m.f_{gs} (m.x_{sj}) := rfl"
+                ));
+            } else {
+                lines.push(format!("have harg : m.x_{si} = m.x_{sj} := {arg_eq}"));
+                lines.push(format!(
+                    "have hbr : m.f_{gs} (m.x_{si}) = m.f_{gs} (m.x_{sj}) := by rw [harg]"
+                ));
+            }
+            let (hi_name, hj_name) = (format!("h{}", hi_at + 1), format!("h{}", hj_at + 1));
+            match (pi, pj) {
+                (true, true) => {
+                    lines.push(format!(
+                        "have hnum : (F.ofNat {vi} : F.carrier) = F.ofNat {vj} := \
+                         (({hi_name}.symm).trans hbr).trans {hj_name}"
+                    ));
+                    lines.push("exact F.ofNat_ne (by decide) hnum".to_string());
+                }
+                (true, false) => {
+                    lines.push(format!("exact {hj_name} ((hbr.symm).trans {hi_name})"))
+                }
+                (false, true) => {
+                    lines.push(format!("exact {hi_name} (hbr.trans ({hj_name}.symm))"))
+                }
+                (false, false) => continue,
+            }
+            conflict_lines = Some(lines);
+            break 'outer;
+        }
+    }
+    // Fallback: a ONE-VARIABLE bound contradiction, e.g. `x >= 10 && x <= 5`,
+    // `x > 5 && x < 5`, `x > 1 && x < 1`. Both bounds are collapsed onto the
+    // numerals by `le_trans` and closed by `OrdField.lt_le_absurd`. This is a
+    // pure ordered-field argument: it never divides, never counts integers, and
+    // never treats a strict bound as if it pinned a value.
+    let bound_conflict = || -> Option<Vec<String>> {
+        for v in &real_vars {
+            let (Some(&(l, li, l_strict)), Some(&(u, ui, u_strict))) =
+                (bound_lo.get(v), bound_hi.get(v))
+            else {
+                continue;
+            };
+            if l < u || (l == u && !l_strict && !u_strict) {
+                continue; // the interval is non-empty in an ordered field
+            }
+            let sv = euf_lia_san(v);
+            let (hl, hu) = (format!("h{}", li + 1), format!("h{}", ui + 1));
+            // A strict bound `a < b` yields the weak `a ≤ b` as its first
+            // conjunct, so both kinds reduce to `F.le` here.
+            let weak_lo = if l_strict {
+                format!("{hl}.1")
+            } else {
+                hl.clone()
+            };
+            let weak_up = if u_strict {
+                format!("{hu}.1")
+            } else {
+                hu.clone()
+            };
+            let lines = if l > u {
+                vec![
+                    format!("have hlo : F.le (F.ofNat {l}) (m.x_{sv}) := {weak_lo}"),
+                    format!("have hup : F.le (m.x_{sv}) (F.ofNat {u}) := {weak_up}"),
+                    format!(
+                        "have hcross : F.le (F.ofNat {l}) (F.ofNat {u}) := F.le_trans _ _ _ hlo hup"
+                    ),
+                    format!(
+                        "have hlt : F.lt (F.ofNat {u}) (F.ofNat {l}) := F.ofNat_lt_of_lt (by decide)"
+                    ),
+                    "exact F.lt_le_absurd hlt hcross".to_string(),
+                ]
+            } else if l_strict {
+                // `ofNat l < x` together with `x ≤ ofNat l`.
+                vec![
+                    format!("have hup : F.le (m.x_{sv}) (F.ofNat {u}) := {weak_up}"),
+                    format!("exact F.lt_le_absurd {hl} hup"),
+                ]
+            } else {
+                // `x < ofNat u` together with `ofNat u ≤ x`.
+                vec![
+                    format!("have hlo : F.le (F.ofNat {l}) (m.x_{sv}) := {weak_lo}"),
+                    format!("exact F.lt_le_absurd {hu} hlo"),
+                ]
+            };
+            return Some(lines);
+        }
+        None
+    };
+
+    // The pins are premises of the congruence bridge only; the bound refutation
+    // does not use them, so it does not carry them.
+    let mut leaf: Vec<String> = vec!["exfalso".to_string()];
+    if let Some(lines) = conflict_lines {
+        leaf.extend(pin_lines);
+        leaf.extend(lines);
+    } else {
+        leaf.extend(bound_conflict()?);
+    }
+
+    if atoms.iter().any(|a| atom_prop_defeats_closure(&a.prop)) {
+        return None;
+    }
+
+    Some(render_euf_ordfield_congruence_lean(
+        &atoms, &real_vars, &uf_funcs, &leaf,
+    ))
+}
+
+/// Recursively emit the nested `by_cases` block for the fused conflict clause.
+/// Mirrors `euf_lia_emit_block`, except the leaf is supplied by the caller (the
+/// ordered-field refutation) instead of being a fixed `omega`.
+fn ordfield_emit_block(
+    atoms: &[OrdFieldAtom],
+    idx: usize,
+    indent: &str,
+    leaf: &[String],
+) -> Vec<String> {
+    if idx == atoms.len() {
+        return leaf.iter().map(|l| format!("{indent}{l}")).collect();
+    }
+    let a = &atoms[idx];
+    let hyp = format!("h{}", idx + 1);
+    let child = format!("{indent}  ");
+    let cont = ordfield_emit_block(atoms, idx + 1, &child, leaf);
+    let close = vec![format!("{child}simp [clauseSat, litSat, atomVal, {hyp}]")];
+    let bulletize = |sub: &[String]| -> Vec<String> {
+        sub.iter()
+            .enumerate()
+            .map(|(k, line)| {
+                if k == 0 {
+                    let content = line
+                        .strip_prefix(child.as_str())
+                        .unwrap_or(line.trim_start());
+                    format!("{indent}· {content}")
+                } else {
+                    line.clone()
+                }
+            })
+            .collect()
+    };
+    let mut lines = vec![format!("{indent}by_cases {hyp} : ({})", a.prop)];
+    // Lean `by_cases h : P` yields the `P` (true) branch first, then `¬P`.
+    if a.cv {
+        lines.extend(bulletize(&cont));
+        lines.extend(bulletize(&close));
+    } else {
+        lines.extend(bulletize(&close));
+        lines.extend(bulletize(&cont));
+    }
+    lines
+}
+
+/// Render the fused EUF + ordered-field congruence firewall file.
+fn render_euf_ordfield_congruence_lean(
+    atoms: &[OrdFieldAtom],
+    real_vars: &std::collections::BTreeSet<String>,
+    uf_funcs: &std::collections::BTreeSet<String>,
+    leaf: &[String],
+) -> String {
+    let n = atoms.len();
+    let lemma_id = n + 1;
+    let proof_id = n + 2;
+
+    let fields = {
+        let mut f: Vec<String> = real_vars
+            .iter()
+            .map(|v| format!("  x_{} : F.carrier", euf_lia_san(v)))
+            .collect();
+        f.extend(
+            uf_funcs
+                .iter()
+                .map(|g| format!("  f_{} : F.carrier -> F.carrier", euf_lia_san(g))),
+        );
+        f.join("\n")
+    };
+    let arms = atoms
+        .iter()
+        .enumerate()
+        .map(|(i, a)| format!("  | {} => decide ({})", i + 1, a.prop))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let orig = atoms
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let lit = if a.cv {
+                format!("{}", i + 1)
+            } else {
+                format!("-{}", i + 1)
+            };
+            format!("({}, [{lit}])", i + 1)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let lemma_lits = atoms
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if a.cv {
+                format!("-{}", i + 1)
+            } else {
+                format!("{}", i + 1)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let proof_hints = (1..=lemma_id)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let proof_body = ordfield_emit_block(atoms, 0, "  ", leaf).join("\n");
+
+    let hash = fnv_hex(
+        &atoms
+            .iter()
+            .map(|a| format!("{}:{}", a.cv, a.prop))
+            .collect::<Vec<_>>()
+            .join("\u{1}"),
+    );
+
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.OrdField
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — REAL-SORTED EUF + LINEARLY-ORDERED-
+  FIELD fused congruence-value conflict, grounded in the verified
+  `firewall_combined_unsat`.
+
+  FAITHFULNESS. The sort is `Real`. Lean core has no ℝ, and a `no_model` over
+  `Int`/`Rat` would certify "no INTEGER/RATIONAL model" — strictly weaker than
+  the CLI's `unsat` over ℝ. Instead the model type is parameterised by an
+  ARBITRARY linearly ordered field `F : AySoundness.OrdField`, so the theorem
+  below reads "no model in ANY linearly ordered field", which DOES entail "no
+  real model" (ℝ is a linearly ordered field). `AySoundness.ordField_nonvacuous`
+  exhibits `Rat` as an instance, so the quantification is not vacuous.
+
+  The refutation is purely EQUATIONAL + CONGRUENCE, so no field-specific decision
+  procedure is needed: the Int emitter's `omega` steps are replaced by
+    * bound pinning      `x >= k` and `x <= k` give `x = k`  — `le_antisymm`
+    * numeral conflict   `c1 != c2`                          — `OrdField.ofNat_ne`
+  and the congruence bridge `f x = f y` stays a plain `rw`. NO integer reasoning
+  appears anywhere: strict bounds pin nothing, because `x > 5 && x < 7` leaves
+  `x` free in an ordered field. Atoms are Props over an abstract carrier, so they
+  are decided classically (`Classical.propDecidable`, hence a `noncomputable`
+  `atomVal`), exactly as the existing array emitters already do. All tactics are
+  Lean 4 core (no Mathlib). axioms ⊆ {{propext, Classical.choice, Quot.sound}}.
+-/
+namespace AySoundness.Emitted.EufOrdFieldCong_{hash}
+open AySoundness
+
+attribute [local instance] Classical.propDecidable
+
+/-- Model: an arbitrary linearly ordered field `F`, a valuation of the Real
+    constants, and the uninterpreted `Real -> Real` functions. -/
+structure Val (F : OrdField) where
+{fields}
+
+/-- Atoms (one per asserted frontend atom, in assertion order). -/
+noncomputable def atomVal (F : OrdField) (m : Val F) (n : Nat) : Bool :=
+  match n with
+{arms}
+  | _ => false
+
+def original : List (Cid × Clause) := [{orig}]
+def lemmas   : List (Cid × Clause) := [({lemma_id}, [{lemma_lits}])]
+def proof    : List (Cid × Clause × List Int) := [({proof_id}, [], [{proof_hints}])]
+
+/-- The fused conflict clause is valid in EVERY ordered-field model: any
+    deviation from the asserted polarities satisfies the clause; the
+    all-consistent case is refuted through the congruence bridge. -/
+theorem euf_ordfield_lemma_valid (F : OrdField) (m : Val F) :
+    clauseSat (atomVal F m) [{lemma_lits}] = true := by
+{proof_body}
+
+theorem lemmas_valid (F : OrdField) :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val F, clauseSat (atomVal F m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact euf_ordfield_lemma_valid F m
+
+/-- **No model in ANY linearly ordered field** — in particular none over ℝ —
+    satisfies the asserted conjunction. Via the verified firewall. -/
+theorem no_model (F : OrdField) : ∀ m : Val F, ¬ Sat (atomVal F m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    (atomVal F) (by decide) (by decide) (lemmas_valid F) (by decide)
+
+end AySoundness.Emitted.EufOrdFieldCong_{hash}
+"#,
+    )
 }
 
 /// Reserved separator: an SMT symbol cannot contain U+0001, so a UF-application
@@ -15850,6 +16903,731 @@ theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
 
 end AySoundness.Emitted.NiaProd_{hash}
 "#
+    )
+}
+
+// ---------------------------------------------------------------------------
+// `str.in_re` LENGTH-INVARIANT firewall emitter.
+//
+// Grounded in the verified `AySoundness.RegexThy` membership length invariants
+// (`mem_len_dvd` / `mem_minLen_le` / `mem_maxLen_ge` and their conflict
+// corollaries). Closes the shape
+//
+//     (assert (str.in_re X R))          -- X a declared String symbol
+//     (assert (= (str.len X) C))        -- or <=, <, >=, >
+//
+// when the structural length abstraction of `R` is incompatible with the pin.
+//
+// AUTHORITY BOUNDARY (do not overstate this). The Lean side establishes exactly
+// one thing: that no `List Nat` string is simultaneously in `L(re1)` and of the
+// pinned length. Everything else is this emitter's obligation and is NOT
+// discharged by any kernel check:
+//
+//   * that `re1` faithfully renders the SMT-LIB regex `R` (see
+//     `parse_regex_ast`, which DECLINES on every constructor it cannot render
+//     exactly or one-sidedly);
+//   * that the string literals were decoded with SMT-LIB 2.6 semantics — they
+//     come pre-decoded by `ay_core::unescape_string_contents` through
+//     `ay_frontend::sexp`, which is the same decoder the solver itself used, so
+//     the emitter cannot disagree with the solver about a literal's length;
+//   * that both rendered assertions are IN SCOPE at the `check-sat` whose
+//     verdict the artifact accompanies — enforced by declining outright on any
+//     query that used `push`/`pop` or reached a second `check-sat`.
+//
+// "The emitted file kernel-checks with clean axioms" is NOT a soundness
+// criterion for any of those three; a front-end misclassification produces a
+// file that kernel-checks and certifies the WRONG query.
+// ---------------------------------------------------------------------------
+
+/// Every SMT-LIB operator name this emitter interprets STRUCTURALLY.
+///
+/// Each is checked against [`ay_frontend::is_reserved_op_name`] before any
+/// rendering happens, so a future edit that makes one of them user-declarable
+/// fails closed instead of conflating a user function with the builtin. Names
+/// are matched EXACTLY — never by prefix: `re.x`, `str.lenient` and `bvf` are
+/// all legal user symbols under the SMT-LIB simple-symbol grammar.
+const REGEX_LEN_INTERPRETED_OPS: &[&str] = &[
+    "str.in_re",
+    "str.in.re",
+    "str.len",
+    "str.to_re",
+    "str.to.re",
+    "re.++",
+    "re.union",
+    "re.inter",
+    "re.*",
+    "re.+",
+    "re.opt",
+    "re.range",
+    "re.none",
+    "re.all",
+    "re.allchar",
+];
+
+/// Regex constructors this emitter explicitly DECLINES, with the reason. Kept
+/// as data so the decline is a deliberate, testable decision rather than an
+/// accident of the matcher's shape (`re.loop` / `re.^` in particular reach the
+/// parser as `IndexedApp`, so a `_ => None` arm would decline them by luck).
+const REGEX_LEN_DECLINED_OPS: &[(&str, &str)] = &[
+    // No sound one-sided length rule: the complement/difference of a language
+    // with a length invariant has none.
+    ("re.comp", "complement has no structural length bound"),
+    ("re.diff", "difference has no structural length bound"),
+    // Bounded repetition: `AySoundness.RegexThy` proves no kdvd/minLen/maxLen
+    // extension for it, and the `n > m` case denotes the EMPTY language, which
+    // a naive `cat`-unrolling would get wrong.
+    (
+        "re.loop",
+        "bounded repetition is unproven in AySoundness.RegexThy",
+    ),
+    (
+        "re.^",
+        "bounded repetition is unproven in AySoundness.RegexThy",
+    ),
+];
+
+/// The largest regex node count and total literal length the emitter renders.
+/// Both bound the KERNEL's work: the emitted file discharges `kdvd`/`minLen`/
+/// `maxLen` by `decide`, which reduces the structure inside the kernel.
+const REGEX_LEN_MAX_NODES: usize = 128;
+const REGEX_LEN_MAX_LITERAL_CHARS: usize = 2048;
+
+/// The SMT-LIB alphabet is code points `0 .. 0x2FFFF` (SMT-LIB 2.6 Unicode
+/// strings). A literal carrying anything outside it is not a well-formed
+/// string literal, so the emitter declines rather than render a code point the
+/// model does not describe.
+const SMTLIB_MAX_CODE_POINT: u32 = 0x0002_FFFF;
+
+/// A regular expression, mirroring `AySoundness.RegexThy.Re` constructor for
+/// constructor. Every derived SMT-LIB form (`re.+`, `re.opt`, n-ary `re.++`)
+/// is desugared here EXACTLY as the Lean `plus` / `opt` abbreviations do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReAst {
+    /// `re.none` — the empty language.
+    Empty,
+    /// `str.to_re w` — the singleton `{w}`, as code points.
+    Lit(Vec<u32>),
+    /// `re.allchar`, and the one-sided over-approximation of `re.range`.
+    AnyChar,
+    Cat(Box<ReAst>, Box<ReAst>),
+    Union(Box<ReAst>, Box<ReAst>),
+    Inter(Box<ReAst>, Box<ReAst>),
+    Star(Box<ReAst>),
+}
+
+impl ReAst {
+    /// Render as a Lean `AySoundness.RegexThy.Re` expression.
+    fn render(&self, out: &mut String) {
+        match self {
+            Self::Empty => out.push_str("RegexThy.Re.none"),
+            Self::Lit(w) => {
+                out.push_str("(RegexThy.Re.lit [");
+                for (i, c) in w.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&c.to_string());
+                }
+                out.push_str("])");
+            }
+            Self::AnyChar => out.push_str("RegexThy.Re.anyChar"),
+            Self::Cat(a, b) | Self::Union(a, b) | Self::Inter(a, b) => {
+                let head = match self {
+                    Self::Cat(_, _) => "cat",
+                    Self::Union(_, _) => "union",
+                    _ => "inter",
+                };
+                out.push_str("(RegexThy.Re.");
+                out.push_str(head);
+                out.push(' ');
+                a.render(out);
+                out.push(' ');
+                b.render(out);
+                out.push(')');
+            }
+            Self::Star(a) => {
+                out.push_str("(RegexThy.Re.star ");
+                a.render(out);
+                out.push(')');
+            }
+        }
+    }
+
+    /// Mirror of `AySoundness.RegexThy.kdvd`. The Lean side re-checks this by
+    /// `decide`, so a disagreement makes the artifact fail to compile (fail
+    /// closed) rather than certify anything.
+    fn kdvd(&self, k: u64) -> bool {
+        match self {
+            Self::Empty => true,
+            Self::Lit(w) => divides(k, w.len() as u64),
+            Self::AnyChar => divides(k, 1),
+            Self::Cat(a, b) | Self::Union(a, b) => a.kdvd(k) && b.kdvd(k),
+            Self::Inter(a, b) => a.kdvd(k) || b.kdvd(k),
+            Self::Star(a) => a.kdvd(k),
+        }
+    }
+
+    /// A modulus `k` for which `kdvd k self` holds, chosen as large (i.e. as
+    /// constraining) as the structural rule allows. `0` means "every member is
+    /// empty" and is the strongest value, so it absorbs in the `gcd`.
+    fn modulus(&self) -> u64 {
+        match self {
+            Self::Empty => 0,
+            Self::Lit(w) => w.len() as u64,
+            Self::AnyChar => 1,
+            Self::Cat(a, b) | Self::Union(a, b) => gcd(a.modulus(), b.modulus()),
+            // `kdvd` is one-sided (`||`) here, so either operand's modulus is
+            // admissible; `0` (all-empty) is strictly the most constraining,
+            // otherwise take the larger.
+            Self::Inter(a, b) => {
+                let (x, y) = (a.modulus(), b.modulus());
+                if x == 0 || y == 0 {
+                    0
+                } else {
+                    x.max(y)
+                }
+            }
+            Self::Star(a) => a.modulus(),
+        }
+    }
+
+    /// Mirror of `AySoundness.RegexThy.minLen`. `None` on arithmetic overflow.
+    fn min_len(&self) -> Option<u64> {
+        match self {
+            Self::Empty | Self::Star(_) => Some(0),
+            Self::Lit(w) => Some(w.len() as u64),
+            Self::AnyChar => Some(1),
+            Self::Cat(a, b) => a.min_len()?.checked_add(b.min_len()?),
+            Self::Union(a, b) => Some(a.min_len()?.min(b.min_len()?)),
+            Self::Inter(a, b) => Some(a.min_len()?.max(b.min_len()?)),
+        }
+    }
+
+    /// Mirror of `AySoundness.RegexThy.maxLen`: `Some(n)` certifies the
+    /// language is length-bounded by `n`, `None` gives up (fail-closed).
+    fn max_len(&self) -> Option<u64> {
+        match self {
+            Self::Empty => Some(0),
+            Self::Lit(w) => Some(w.len() as u64),
+            Self::AnyChar => Some(1),
+            Self::Cat(a, b) => a.max_len()?.checked_add(b.max_len()?),
+            Self::Union(a, b) => Some(a.max_len()?.max(b.max_len()?)),
+            Self::Inter(a, b) => match (a.max_len(), b.max_len()) {
+                (Some(x), Some(y)) => Some(x.min(y)),
+                (Some(x), None) => Some(x),
+                (None, Some(y)) => Some(y),
+                (None, None) => None,
+            },
+            // Only a language whose sole member is `ε` iterates to a bounded
+            // language; anything else stars to an unbounded one.
+            Self::Star(a) => match a.max_len() {
+                Some(0) => Some(0),
+                _ => None,
+            },
+        }
+    }
+
+    fn node_count(&self) -> usize {
+        match self {
+            Self::Empty | Self::Lit(_) | Self::AnyChar => 1,
+            Self::Cat(a, b) | Self::Union(a, b) | Self::Inter(a, b) => {
+                1 + a.node_count() + b.node_count()
+            }
+            Self::Star(a) => 1 + a.node_count(),
+        }
+    }
+
+    fn literal_chars(&self) -> usize {
+        match self {
+            Self::Empty | Self::AnyChar => 0,
+            Self::Lit(w) => w.len(),
+            Self::Cat(a, b) | Self::Union(a, b) | Self::Inter(a, b) => {
+                a.literal_chars() + b.literal_chars()
+            }
+            Self::Star(a) => a.literal_chars(),
+        }
+    }
+}
+
+/// `k ∣ n` with Lean's `Nat.dvd` convention: `0 ∣ n` holds only for `n = 0`.
+///
+/// `u64::is_multiple_of` already agrees at `k = 0` (it answers `n == 0` rather
+/// than dividing), which is the case the emitter relies on for a regex whose
+/// every member is the empty string.
+fn divides(k: u64, n: u64) -> bool {
+    n.is_multiple_of(k)
+}
+
+const fn gcd(a: u64, b: u64) -> u64 {
+    let (mut a, mut b) = (a, b);
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+/// The asserted bound on `str.len X`, normalised to the three shapes the Lean
+/// corollaries take. `<` and `>` are normalised to `Le`/`Ge` by the `± 1` that
+/// is exact over the non-negative integers `str.len` ranges over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LenPin {
+    /// `str.len X = c`.
+    Eq(u64),
+    /// `str.len X ≤ b`.
+    Le(u64),
+    /// `b ≤ str.len X`.
+    Ge(u64),
+}
+
+/// Which verified conflict corollary closes this (regex, pin) pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegexLenTier {
+    /// `regex_len_mod_conflict` with modulus `k`.
+    Mod(u64),
+    /// `regex_len_min_conflict` (equality pin below `minLen`).
+    Min,
+    /// `regex_len_max_conflict` with bound `n` (equality pin above `maxLen`).
+    Max(u64),
+    /// `regex_len_min_conflict_le` (upper-bound pin below `minLen`).
+    MinLe,
+    /// `regex_len_max_conflict_ge` with bound `n` (lower-bound pin above it).
+    MaxGe(u64),
+}
+
+/// Pick the verified corollary that refutes `(re, pin)`, or `None`.
+///
+/// NOTE the deliberate absence of a modular tier for the inequality pins:
+/// `k ∣ len s` is compatible with every open interval that contains a multiple
+/// of `k`, and `AySoundness.RegexThy` proves no inequality form of
+/// `mem_len_dvd`. Firing `Mod` on an inequality would be unsound.
+fn regex_len_tier(re: &ReAst, pin: LenPin) -> Option<RegexLenTier> {
+    match pin {
+        LenPin::Eq(c) => {
+            if re.min_len()? > c {
+                return Some(RegexLenTier::Min);
+            }
+            if let Some(n) = re.max_len() {
+                if n < c {
+                    return Some(RegexLenTier::Max(n));
+                }
+            }
+            let k = re.modulus();
+            (re.kdvd(k) && !divides(k, c)).then_some(RegexLenTier::Mod(k))
+        }
+        LenPin::Le(b) => (re.min_len()? > b).then_some(RegexLenTier::MinLe),
+        LenPin::Ge(b) => re.max_len().filter(|n| *n < b).map(RegexLenTier::MaxGe),
+    }
+}
+
+/// Decode a `str.to_re` literal into SMT-LIB code points.
+///
+/// The literal arrives ALREADY decoded: `ay_frontend::sexp` runs
+/// `ay_core::unescape_string_contents` (exact 1-5 hex digits, value ≤ 0x2FFFF,
+/// non-escapes literal, surrogates rejected) on every string token, and fails
+/// the whole parse on a literal it cannot represent. So this cannot disagree
+/// with the solver's own reading of the literal — there is no second decoder
+/// here to get out of step. The only remaining check is that every code point
+/// is inside the SMT-LIB alphabet the `Re` model describes.
+fn regex_literal_code_points(lit: &str) -> Option<Vec<u32>> {
+    let mut out = Vec::new();
+    for ch in lit.chars() {
+        let cp = ch as u32;
+        if cp > SMTLIB_MAX_CODE_POINT || out.len() >= REGEX_LEN_MAX_LITERAL_CHARS {
+            return None;
+        }
+        out.push(cp);
+    }
+    Some(out)
+}
+
+/// Parse an SMT-LIB regular expression into [`ReAst`], or `None` to decline.
+///
+/// Declines (never guesses) on: `re.comp` / `re.diff` / `re.loop` / `re.^`
+/// (see [`REGEX_LEN_DECLINED_OPS`]), any operator not in
+/// [`REGEX_LEN_INTERPRETED_OPS`], any non-literal `str.to_re` operand, and any
+/// nesting past `depth`.
+fn parse_regex_ast(t: &PTerm, depth: u32) -> Option<ReAst> {
+    if depth == 0 {
+        return None;
+    }
+    match t {
+        // Nullary regex constants also reach the parser as bare symbols. They
+        // are reserved names, so a bare `re.none` cannot be a user constant.
+        PTerm::Symbol(name) => nullary_regex(name),
+        PTerm::App(op, args) => {
+            if REGEX_LEN_DECLINED_OPS.iter().any(|(name, _)| name == op) {
+                return None;
+            }
+            if args.is_empty() {
+                return nullary_regex(op);
+            }
+            match op.as_str() {
+                "str.to_re" | "str.to.re" if args.len() == 1 => match &args[0] {
+                    PTerm::Const(PConst::String(lit)) => {
+                        regex_literal_code_points(lit).map(ReAst::Lit)
+                    }
+                    _ => None,
+                },
+                // n-ary, min arity 1 — exactly the frontend's arity rule. Fold
+                // RIGHT so `(re.++ a b c)` is `cat a (cat b c)`; both foldings
+                // denote the same language and `Re` is binary.
+                "re.++" | "re.union" | "re.inter" => {
+                    let mut acc = parse_regex_ast(args.last()?, depth - 1)?;
+                    for arg in args[..args.len() - 1].iter().rev() {
+                        let head = parse_regex_ast(arg, depth - 1)?;
+                        acc = bounded(match op.as_str() {
+                            "re.++" => ReAst::Cat(Box::new(head), Box::new(acc)),
+                            "re.union" => ReAst::Union(Box::new(head), Box::new(acc)),
+                            _ => ReAst::Inter(Box::new(head), Box::new(acc)),
+                        })?;
+                    }
+                    Some(acc)
+                }
+                "re.*" if args.len() == 1 => {
+                    bounded(ReAst::Star(Box::new(parse_regex_ast(&args[0], depth - 1)?)))
+                }
+                // `AySoundness.RegexThy.plus r = cat r (star r)` — exact. This
+                // is the one arm that DUPLICATES its operand, so nested `re.+`
+                // doubles the node count per level; `bounded` is what keeps
+                // `(re.+ (re.+ … ))` from allocating `2^depth` nodes before the
+                // caller's size check ever runs.
+                "re.+" if args.len() == 1 => {
+                    let inner = parse_regex_ast(&args[0], depth - 1)?;
+                    bounded(ReAst::Cat(
+                        Box::new(inner.clone()),
+                        Box::new(ReAst::Star(Box::new(inner))),
+                    ))
+                }
+                // `AySoundness.RegexThy.opt r = union (lit []) r` — exact.
+                "re.opt" if args.len() == 1 => bounded(ReAst::Union(
+                    Box::new(ReAst::Lit(Vec::new())),
+                    Box::new(parse_regex_ast(&args[0], depth - 1)?),
+                )),
+                // ONE-SIDED: `L(re.range l u) ⊆ Σ¹ = L(anyChar)` for every
+                // `l`, `u` (an ill-formed or inverted range denotes ∅ ⊆ Σ¹).
+                // Weakening an asserted atom is sound for a REFUTATION — the
+                // real assertion implies the rendered one — but it does mean
+                // the emitted atom is not a byte-mirror of the source, which
+                // the artifact header states explicitly.
+                "re.range" if args.len() == 2 => Some(ReAst::AnyChar),
+                _ => None,
+            }
+        }
+        // `((_ re.loop n m) r)` and `((_ re.^ n) r)`.
+        PTerm::IndexedApp(_, _, _) => None,
+        _ => None,
+    }
+}
+
+/// Enforce the size caps at EVERY construction point, not just on the finished
+/// tree: the `re.+` desugaring duplicates its operand, so a deep nest would
+/// otherwise allocate exponentially before any post-hoc check could reject it.
+/// Bailing here caps live allocation at roughly twice the node budget.
+fn bounded(re: ReAst) -> Option<ReAst> {
+    (re.node_count() <= REGEX_LEN_MAX_NODES && re.literal_chars() <= REGEX_LEN_MAX_LITERAL_CHARS)
+        .then_some(re)
+}
+
+/// `re.none` / `re.all` / `re.allchar`, in either the bare-symbol or the
+/// zero-argument application form.
+fn nullary_regex(name: &str) -> Option<ReAst> {
+    match name {
+        "re.none" => Some(ReAst::Empty),
+        // `L(re.all) = Σ*` is exactly `L(star anyChar)`.
+        "re.all" => Some(ReAst::Star(Box::new(ReAst::AnyChar))),
+        "re.allchar" => Some(ReAst::AnyChar),
+        _ => None,
+    }
+}
+
+/// `(str.in_re X R)` with `X` a bare symbol → `(X, R)`.
+fn parsed_str_in_re(t: &PTerm) -> Option<(&str, &PTerm)> {
+    match t {
+        PTerm::App(op, args) if (op == "str.in_re" || op == "str.in.re") && args.len() == 2 => {
+            match &args[0] {
+                PTerm::Symbol(s) => Some((s.as_str(), &args[1])),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// A top-level length pin on some symbol: `(OP (str.len X) N)` or the flipped
+/// `(OP N (str.len X))`, normalised to [`LenPin`].
+fn parsed_len_pin(t: &PTerm) -> Option<(String, LenPin)> {
+    let PTerm::App(op, args) = t else {
+        return None;
+    };
+    if args.len() != 2 {
+        return None;
+    }
+    let left_len = parsed_str_len_arg(&args[0]);
+    let right_len = parsed_str_len_arg(&args[1]);
+    // `str.len` on BOTH sides is a relation between two lengths, not a pin.
+    let (sym, bound, len_on_left) = match (left_len, right_len) {
+        (Some(s), None) => (s, parsed_numeral(&args[1])?, true),
+        (None, Some(s)) => (s, parsed_numeral(&args[0])?, false),
+        _ => return None,
+    };
+    let bound = u64::try_from(bound).ok()?;
+    let pin = match (op.as_str(), len_on_left) {
+        ("=", _) => LenPin::Eq(bound),
+        ("<=", true) | (">=", false) => LenPin::Le(bound),
+        (">=", true) | ("<=", false) => LenPin::Ge(bound),
+        // `len < b` ⟺ `len ≤ b - 1`; `b = 0` makes the assertion `len < 0`,
+        // which the `Nat` model cannot express, so decline.
+        ("<", true) | (">", false) => LenPin::Le(bound.checked_sub(1)?),
+        // `len > b` ⟺ `b + 1 ≤ len`.
+        (">", true) | ("<", false) => LenPin::Ge(bound.checked_add(1)?),
+        _ => return None,
+    };
+    Some((sym, pin))
+}
+
+/// Neutralise text spliced into an emitted Lean block comment: a `/-` opens a
+/// NESTED comment and a `-/` closes the header early, either of which breaks
+/// the file. Non-printable and non-ASCII characters are replaced so the header
+/// cannot smuggle in a directive or an unbalanced delimiter.
+fn lean_comment_safe(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_slash = false;
+    let mut prev_dash = false;
+    for ch in s.chars() {
+        let c = if ch.is_ascii_graphic() || ch == ' ' {
+            ch
+        } else {
+            '?'
+        };
+        if (prev_slash && c == '-') || (prev_dash && c == '/') {
+            out.push(' ');
+        }
+        out.push(c);
+        prev_slash = c == '/';
+        prev_dash = c == '-';
+    }
+    out
+}
+
+/// Emit a verified-firewall Lean proof for a `str.in_re` + `str.len` conflict
+/// found among the PARSED (frontend) assertions.
+///
+/// `single_shot_query` must be the frontend's
+/// [`ay_frontend::Context::is_single_shot_query`]: the emitter DECLINES unless
+/// the query used no `push`/`pop` and reached exactly one `check-sat`. Without
+/// that, a membership asserted inside a scope that was later popped could be
+/// rendered into a certificate for a `check-sat` at which it is not asserted —
+/// an artifact that kernel-checks while certifying a query that is `sat`.
+pub(crate) fn emit_str_in_re_len_firewall_lean_from_parsed(
+    parsed: &[PTerm],
+    single_shot_query: bool,
+) -> Option<String> {
+    if !single_shot_query {
+        return None;
+    }
+    // Fail closed if any name this emitter interprets structurally has become
+    // user-declarable: matching it would then conflate a user function with the
+    // builtin (the `bvf`/`bv` prefix-classification defect, one table over).
+    if !REGEX_LEN_INTERPRETED_OPS
+        .iter()
+        .all(|name| ay_frontend::is_reserved_op_name(name))
+    {
+        return None;
+    }
+
+    let mut pins: Vec<(String, LenPin)> = Vec::new();
+    for asrt in parsed {
+        if let Some(pin) = parsed_len_pin(asrt) {
+            pins.push(pin);
+        }
+    }
+    if pins.is_empty() {
+        return None;
+    }
+
+    for asrt in parsed {
+        let Some((sym, re_term)) = parsed_str_in_re(asrt) else {
+            continue;
+        };
+        let Some(re) = parse_regex_ast(re_term, 32) else {
+            continue;
+        };
+        if re.node_count() > REGEX_LEN_MAX_NODES || re.literal_chars() > REGEX_LEN_MAX_LITERAL_CHARS
+        {
+            continue;
+        }
+        for (pin_sym, pin) in &pins {
+            if pin_sym != sym {
+                continue;
+            }
+            if let Some(tier) = regex_len_tier(&re, *pin) {
+                return Some(render_str_in_re_len_lean(sym, &re, *pin, tier));
+            }
+        }
+    }
+    None
+}
+
+/// The Lean `Prop` for the length pin, and the human-readable SMT form.
+fn len_pin_lean(pin: LenPin) -> (String, String) {
+    match pin {
+        LenPin::Eq(c) => (
+            format!("StringThy.len m = {c}"),
+            format!("(= (str.len X) {c})"),
+        ),
+        LenPin::Le(b) => (
+            format!("StringThy.len m ≤ {b}"),
+            format!("(<= (str.len X) {b})"),
+        ),
+        LenPin::Ge(b) => (
+            format!("{b} ≤ StringThy.len m"),
+            format!("(>= (str.len X) {b})"),
+        ),
+    }
+}
+
+/// The `False`-producing term for the chosen tier, given `hm : Mem re1 m` and
+/// `h` : the length pin.
+fn regex_len_conflict_term(tier: RegexLenTier) -> String {
+    match tier {
+        RegexLenTier::Mod(k) => {
+            format!("RegexThy.regex_len_mod_conflict (k := {k}) (by decide) hm h (by decide)")
+        }
+        RegexLenTier::Min => "RegexThy.regex_len_min_conflict hm h (by decide)".to_string(),
+        RegexLenTier::Max(n) => {
+            format!("RegexThy.regex_len_max_conflict (n := {n}) (by decide) hm h (by decide)")
+        }
+        RegexLenTier::MinLe => "RegexThy.regex_len_min_conflict_le hm h (by decide)".to_string(),
+        RegexLenTier::MaxGe(n) => {
+            format!("RegexThy.regex_len_max_conflict_ge (n := {n}) (by decide) hm h (by decide)")
+        }
+    }
+}
+
+/// A one-line description of the verified invariant the artifact rests on.
+fn regex_len_tier_note(tier: RegexLenTier) -> String {
+    match tier {
+        RegexLenTier::Mod(k) => format!(
+            "MODULAR (`mem_len_dvd`): every member of the regex has length divisible \
+             by {k}, and the pinned length is not."
+        ),
+        RegexLenTier::Min | RegexLenTier::MinLe => {
+            "TOO SHORT (`mem_minLen_le`): the pinned length is below the regex's \
+             structural minimum member length."
+                .to_string()
+        }
+        RegexLenTier::Max(n) | RegexLenTier::MaxGe(n) => format!(
+            "TOO LONG (`mem_maxLen_ge`): the regex denotes a FINITE language whose \
+             members are at most {n} characters, and the pinned length exceeds that."
+        ),
+    }
+}
+
+/// Render the `str.in_re` length-invariant firewall Lean artifact.
+fn render_str_in_re_len_lean(sym: &str, re: &ReAst, pin: LenPin, tier: RegexLenTier) -> String {
+    let mut re_lean = String::new();
+    re.render(&mut re_lean);
+    let hash = fnv_hex(&format!("strinrelen:{sym}:{re_lean}:{pin:?}:{tier:?}"));
+    // One `Re` constructor per code point, so elaboration depth tracks the
+    // rendered term's size. Reuses the shared scaler (clamped, never disabled).
+    let rec_depth = scaled_max_rec_depth(re_lean.len());
+    let (pin_prop, pin_smt) = len_pin_lean(pin);
+    let conflict = regex_len_conflict_term(tier);
+    let note = regex_len_tier_note(tier);
+    let sym_note = lean_comment_safe(sym);
+    let approx = if re_lean.contains("anyChar") {
+        "\n  ONE-SIDED RENDERING: `re.range` / `re.allchar` are rendered as `anyChar`, an\n  \
+         OVER-approximation of the asserted language. The source assertion IMPLIES the\n  \
+         rendered atom, so refuting the rendered set refutes the source set; the atom is\n  \
+         not a byte-mirror of the source text."
+    } else {
+        ""
+    };
+    format!(
+        r#"import AySoundness.Firewall
+import AySoundness.StringThy
+import AySoundness.RegexThy
+/-
+  AUTO-EMITTED by ay (lean_firewall.rs) — SYMBOLIC `str.in_re` LENGTH-INVARIANT
+  conflict, grounded in the verified `firewall_combined_unsat` and the verified
+  regex length invariants of `AySoundness.RegexThy`.
+
+  Reconstructed from the frontend parsed ASSERTIONS for the String symbol
+  `{sym_note}`:
+
+    (assert (str.in_re X R))
+    (assert {pin_smt})
+
+  {note}
+
+  Model: `Val = StringThy.Str` — a string is the free monoid `List Nat` of code
+  points, `str.len` is `List.length`. The certificate quantifies over ALL
+  strings, so it holds for whatever `{sym_note}` denotes.{approx}
+
+  The artifact certifies exactly this two-assertion subset of the query. A
+  subset with no model makes the whole query unsatisfiable; it does not by
+  itself replay ay's refutation. Pure Lean 4 core; axioms ⊆ {{propext,
+  Classical.choice, Quot.sound}} (`Classical.choice` enters only through the
+  opaque `Decidable (Mem r s)` instance the `Bool`-valued atom needs).
+-/
+-- Lean's default `maxRecDepth` (512) is sized for hand-written proofs. The
+-- rendered `Re` is one constructor per code point, so `decide`/`simp` recurse
+-- once per character and a literal past ~120 code points overflowed the stack:
+-- the artifact then failed to compile and reported `sorryAx`, which is worse
+-- than declining. Scaled with the rendered term, never disabled — proof size is
+-- attacker-amplifiable, so the guard moves with the input rather than off.
+set_option maxRecDepth {rec_depth}
+namespace AySoundness.Emitted.StrInReLen_{hash}
+open AySoundness
+
+abbrev Val := StringThy.Str
+
+/-- The asserted regular expression, rendered constructor-for-constructor. -/
+def re1 : RegexThy.Re :=
+  {re_lean}
+
+/-- Atom `1 ↦ X ∈ L(re1)`; atom `2 ↦ the asserted length pin`. -/
+noncomputable def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide (RegexThy.Mem re1 m)
+  | 2 => decide ({pin_prop})
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1]), (2, [2])]
+def lemmas   : List (Cid × Clause) := [(3, [-1, -2])]
+def proof    : List (Cid × Clause × List Int) := [(4, [], [1, 2, 3])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1, -2] = true := by
+  by_cases hm : RegexThy.Mem re1 m
+  · have hpin : ¬ ({pin_prop}) := fun h =>
+      {conflict}
+    have ha : atomVal m 2 = false := by
+      simp only [atomVal, decide_eq_false_iff_not]
+      exact hpin
+    simp [clauseSat, litSat, List.any_cons, List.any_nil, ha]
+  · have ha : atomVal m 1 = false := by
+      simp only [atomVal, decide_eq_false_iff_not]
+      exact hm
+    simp [clauseSat, litSat, List.any_cons, List.any_nil, ha]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+/-- No string is both a member of the asserted regex and of the pinned length —
+    via the firewall. -/
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.StrInReLen_{hash}
+"#,
     )
 }
 

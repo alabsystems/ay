@@ -8,19 +8,51 @@
 # a silently forfeited CERT instance (historically the difference between
 # 12 and 147-class answer counts).
 #
-# Checker resolution order: $VERIPB_BIN, `veripb` on PATH, cached build under
-# ~/.cache/ay-veripb (cloned from the official GitLab and built once).
+# WHAT "VERIFIED" MEANS HERE. The gate does not ask "did the checker print
+# something starting with `s VERIFIED`". That test passed a SATISFIABLE
+# instance whose proof concluded NOTHING (`s VERIFIED NO CONCLUSION` has that
+# prefix) and would equally have passed a proof establishing the OPPOSITE of
+# what AY answered. Every class now names the conclusion its status entails,
+# the gate cross-checks that the named conclusion really is the one the status
+# entails (including that an OPTIMUM's bounds are the `o` value AY printed),
+# and the checker must confirm EXACTLY that conclusion, with exit code 0, via
+# scripts/lib/veripb_verdict.sh. `NO CONCLUSION` is a rejection.
+#
+# WHICH CHECKER. Resolution order mirrors the ONE shared Rust resolver in
+# crates/ay-test-support/src/veripb.rs: $VERIPB_BIN / $AY_PB26_VERIPB_BIN /
+# $VERIPB, `veripb` on PATH, known local build locations, and finally a cached
+# build under ~/.cache/ay-veripb (cloned from the official GitLab and built
+# once). Whatever is resolved must then PASS THE SELF-TEST BATTERY before any
+# of its verdicts is believed: a binary that cannot be shown to check proofs
+# fails the gate rather than silently rubber-stamping it. A checker is never
+# optional here.
 # Stage 2 (tracked in the campaign plan): add the CakePB verified backend via
 # `veripb --elaborate` once proofs at scale enter CI.
 set -eu
 
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+. "$REPO/scripts/lib/veripb_verdict.sh"
+
 BIN=${AY_PB_BIN:-"$REPO/target/release/ay-pb"}
 [ -x "$BIN" ] || { echo "ERROR: solver binary missing: $BIN (cargo build -p ay-pb --release)" >&2; exit 2; }
 
-VERIPB=${VERIPB_BIN:-}
+VERIPB=${VERIPB_BIN:-${AY_PB26_VERIPB_BIN:-${VERIPB:-}}}
+if [ -n "$VERIPB" ] && [ ! -x "$VERIPB" ]; then
+    echo "ERROR: VERIPB_BIN/AY_PB26_VERIPB_BIN/VERIPB names '$VERIPB', which is not executable" >&2
+    exit 2
+fi
 if [ -z "$VERIPB" ] && command -v veripb >/dev/null 2>&1; then
     VERIPB=$(command -v veripb)
+fi
+if [ -z "$VERIPB" ]; then
+    for candidate in \
+        /tmp/veripb-3/bin/veripb \
+        "$HOME/.cargo/bin/veripb"
+    do
+        [ -x "$candidate" ] || continue
+        VERIPB=$candidate
+        break
+    done
 fi
 if [ -z "$VERIPB" ]; then
     CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/ay-veripb"
@@ -35,17 +67,39 @@ if [ -z "$VERIPB" ]; then
 fi
 echo "checker: $("$VERIPB" --version 2>&1 | head -1 || echo "$VERIPB")"
 
+# Prove the binary is a proof checker before believing a single verdict.
+veripb_require_self_test "$VERIPB"
+
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/ay-cert-ci.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
 fail=0
+
+# check_class LABEL INSTANCE EXPECT_STATUS EXPECT_CONCLUSION [ENV_EXTRA]
+#
+# EXPECT_CONCLUSION is the checker conclusion that EXPECT_STATUS entails. The
+# gate re-derives that relationship rather than trusting the table:
+#
+#   s SATISFIABLE      -> SATISFIABLE
+#   s UNSATISFIABLE    -> UNSATISFIABLE, or BOUNDS INF <= obj <= INF when the
+#                         instance has an objective (infeasible optimisation)
+#   s OPTIMUM FOUND    -> BOUNDS v <= obj <= v, where v is the objective value
+#                         AY itself printed on its last `o ` line
+#
+# so a row cannot silently declare a conclusion that does not match the answer
+# being certified.
 check_class() {
-    label=$1; instance=$2; expect_status=$3; env_extra=${4:-}
+    label=$1; instance=$2; expect_status=$3; expect_conclusion=$4; env_extra=${5:-}
     proof="$WORK/$label.veripb"
-    got=$(env $env_extra "$BIN" pb solve --timeout 15000 --proof "$proof" \
-        "$instance" | grep '^s ' | head -1)
+    solver_out="$WORK/$label.stdout"
+
+    env $env_extra "$BIN" pb solve --timeout 15000 --proof "$proof" \
+        "$instance" > "$solver_out" 2>/dev/null || true
+    got=$(grep '^s ' "$solver_out" | head -1 || true)
+    objective=$(grep '^o ' "$solver_out" | tail -1 | sed 's/^o //' || true)
+
     if [ "$got" != "$expect_status" ]; then
-        echo "FAIL [$label]: solver said '$got', expected '$expect_status'" >&2
+        echo "FAIL [$label]: solver said '${got:-<no s line>}', expected '$expect_status'" >&2
         fail=1
         return
     fi
@@ -54,11 +108,25 @@ check_class() {
         fail=1
         return
     fi
-    if verdict=$("$VERIPB" "$instance" "$proof" 2>&1 | grep '^s ' | head -1) \
-        && case "$verdict" in "s VERIFIED"*) true;; *) false;; esac; then
-        echo "  OK [$label]: $got -> $verdict"
+
+    # The status/conclusion consistency check. This is the part that makes
+    # "the checker agreed" mean "the checker agreed WITH AY".
+    if ! entailed=$(veripb_entailed_conclusion "$expect_status" "$instance" "$objective"); then
+        echo "FAIL [$label]: cannot certify this answer" >&2
+        fail=1
+        return
+    fi
+    if [ "$expect_conclusion" != "$entailed" ]; then
+        echo "FAIL [$label]: the declared conclusion is not the one '$expect_status' entails" >&2
+        echo "     declared: $expect_conclusion" >&2
+        echo "     entailed: $entailed" >&2
+        fail=1
+        return
+    fi
+
+    if veripb_require_conclusion "$VERIPB" "$instance" "$proof" "$expect_conclusion" "$label"; then
+        echo "  OK [$label]: $got -> s VERIFIED $expect_conclusion"
     else
-        echo "FAIL [$label]: checker rejected the proof: $verdict" >&2
         fail=1
     fi
 }
@@ -87,22 +155,24 @@ min: +1 x1 +1 x2 +1 x3 +1 x4 ;
 +1 x1 +1 x2 >= 1 ;
 EOF
 
-check_class native-optimum   "$WORK/opt.opb"       "s OPTIMUM FOUND"
-check_class decision-unsat   "$WORK/unsat.opb"     "s UNSATISFIABLE"
-check_class opt-unsat-infinf "$WORK/opt-unsat.opb" "s UNSATISFIABLE"
-check_class cardinality-opt  "$WORK/card.opb"      "s OPTIMUM FOUND"
+check_class native-optimum   "$WORK/opt.opb"       "s OPTIMUM FOUND"  "BOUNDS 2 <= obj <= 2"
+check_class decision-unsat   "$WORK/unsat.opb"     "s UNSATISFIABLE"  "UNSATISFIABLE"
+check_class opt-unsat-infinf "$WORK/opt-unsat.opb" "s UNSATISFIABLE"  "BOUNDS INF <= obj <= INF"
+check_class cardinality-opt  "$WORK/card.opb"      "s OPTIMUM FOUND"  "BOUNDS 2 <= obj <= 2"
 # The certify-after-solve fallback pipeline (portfolio finds, helpers certify).
-check_class fallback-certified "$WORK/opt.opb"     "s OPTIMUM FOUND" "AY_PB_CERT_NATIVE_CAP_MS=0"
+check_class fallback-certified "$WORK/opt.opb"     "s OPTIMUM FOUND"  "BOUNDS 2 <= obj <= 2" \
+    "AY_PB_CERT_NATIVE_CAP_MS=0"
 cat > "$WORK/dec-sat.opb" <<'EOF2'
 * #variable= 3 #constraint= 2
 +1 x1 +1 x2 >= 1 ;
 +1 x2 +1 x3 >= 1 ;
 EOF2
 # Decision-SAT via the solution-only proof (plain-speed phase, checker-validated model).
-check_class decision-sat-fallback "$WORK/dec-sat.opb" "s SATISFIABLE" "AY_PB_CERT_NATIVE_CAP_MS=0"
+check_class decision-sat-fallback "$WORK/dec-sat.opb" "s SATISFIABLE" "SATISFIABLE" \
+    "AY_PB_CERT_NATIVE_CAP_MS=0"
 
 if [ "$fail" -ne 0 ]; then
     echo "CERT CI: FAILED" >&2
     exit 1
 fi
-echo "CERT CI: all proof classes verified by the official checker"
+echo "CERT CI: every proof class checked, and every conclusion matched AY's own answer"

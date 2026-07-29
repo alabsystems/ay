@@ -46,11 +46,41 @@ impl EufSolver<'_> {
         self.init_func_apps();
 
         // Create ENodes for all terms + cache Bool-sortedness (static per term).
+        //
+        // #L2 (GROUP_E_FINDINGS.md §6b): `verify_euf_conflict` builds a FRESH
+        // scoped solver on EVERY theory conflict (no sampling, unlike the
+        // propagation path), and this loop is the O(|TermStore|) term of that
+        // cost — measured at 596x over-scan (terms_touched 639,543,480 vs
+        // scope_sum 1,072,517). `func_app_scope` is already honoured by
+        // `init_func_apps`, but was never applied here.
+        //
+        // The `bool_sorted` table is a pure CACHE: both read sites
+        // (`bool_atoms.rs:47` and `:208`) already fall back to
+        // `self.terms.sort(term) == &Sort::Bool` for any index past its end,
+        // and that fallback computes the identical value — the table is
+        // populated from exactly that expression. So for a verification-scoped
+        // solver we skip building it and let every lookup take the fallback:
+        // BEHAVIOUR-IDENTICAL by construction, and cheap because a scoped
+        // solver's `assigns` holds only the conflict's own literals rather than
+        // a whole solve's trail.
+        //
+        // `enodes` is NOT skippable the same way — it is a DENSE Vec indexed by
+        // term id (`self.enodes[arg as usize]`), so omitting entries would shift
+        // every index and corrupt the e-graph. It stays full-length; `ENode::new`
+        // is a trivial constructor, and the `sort()` lookup was the expensive
+        // half being removed here.
+        let scoped = self.func_app_scope.is_some();
         self.enodes.clear();
         self.bool_sorted.clear();
+        self.enodes.reserve(self.terms.len());
+        if !scoped {
+            self.bool_sorted.reserve(self.terms.len());
+        }
         for term_id in self.terms.term_ids() {
-            self.bool_sorted
-                .push(self.terms.sort(term_id) == &ay_core::Sort::Bool);
+            if !scoped {
+                self.bool_sorted
+                    .push(self.terms.sort(term_id) == &ay_core::Sort::Bool);
+            }
             self.enodes.push(ENode::new(term_id.0));
         }
 
@@ -132,6 +162,17 @@ impl EufSolver<'_> {
             }
         }
         curr
+    }
+
+    /// Bool-arg app pairs that the most recent `bool_arg_model_is_congruent`
+    /// call found FORCED equal by congruence under the candidate model.
+    ///
+    /// Non-empty only after that guard has run. Intended for a caller that sees
+    /// the guard downgrade `Sat` -> `Unknown` and wants to repair the model by
+    /// injecting `(/\ a_i = b_i) -> f(a) = f(b)` for exactly these pairs and
+    /// re-solving, instead of surrendering the check-sat. Read-only diagnostic.
+    pub fn last_bool_arg_forced_edges(&self) -> &[(TermId, TermId)] {
+        &self.last_bool_arg_forced_edges
     }
 
     /// Check if two terms are in the same equivalence class.
@@ -339,16 +380,64 @@ impl EufSolver<'_> {
         // Uses pre-indexed ITE term list to avoid O(|terms|) scan (#5575).
         self.init_ite_terms();
         let mut ite_merge_count = 0usize;
-        // Iterate by index to avoid cloning ite_terms (#5575).
-        let n_ite = self.ite_terms.len();
+        // #euf-ite-worklist: scan only the ITE terms an assignment could have
+        // unblocked, not all of them.
+        //
+        // The body below fires only when the condition has a value, so the ONLY
+        // ITE terms worth visiting are those whose condition was assigned since
+        // the last sweep — `pending_ite`, maintained at assert time via the
+        // `ite_by_cond` index. The old code rescanned every ITE term on every
+        // rebuild: 1,471,446,450 iterations producing 300,988 merges (0.02%
+        // useful), and `rebuild_closure` still measures 21% of self time on
+        // hwbench instances after the clone fix.
+        //
+        // `ite_sweep_full_needed` is the escape hatch, set on exactly the events
+        // that set `egraph_requeue_needed` (pop / reset / soft_reset / unwind).
+        // After those, merges have been discarded or unwound, so a previously
+        // "already merged" ITE may need re-merging and the worklist can no longer
+        // be trusted — fall back to the full scan. This mirrors the same fix
+        // already applied to the merge queue three blocks above, whose comment
+        // records the identical bug costing "80s of an 81s hwbench solve".
+        let sweep: Vec<u32> = if self.ite_sweep_full_needed {
+            self.ite_sweep_full_needed = false;
+            self.pending_ite.clear();
+            self.ite_terms.clone()
+        } else {
+            std::mem::take(&mut self.pending_ite)
+        };
+        let n_ite = sweep.len();
         for ite_i in 0..n_ite {
-            let idx = self.ite_terms[ite_i];
+            let idx = sweep[ite_i];
             let term_id = TermId(idx);
-            if let TermData::Ite(cond, then_t, else_t) = self.terms.get(term_id).clone() {
-                let cond_val = match self.terms.get(cond) {
-                    TermData::Not(inner) => self.assigns.get(inner).map(|&v| !v),
-                    _ => self.assigns.get(&cond).copied(),
-                };
+            // #euf-ite-sweep: this loop runs on EVERY rebuild over EVERY ITE
+            // term — profiled at 1,471,446,450 iterations producing 300,988
+            // merges (0.02% useful) on firewire_tree.5, inside a
+            // `rebuild_closure` that is 40% of AY self time.
+            //
+            // Two fixes here, both semantics-preserving (same merges, same
+            // order):
+            //   1. Read `cond`/`then`/`else` by REFERENCE. The old code did
+            //      `self.terms.get(term_id).clone()` just to destructure —
+            //      cloning a `TermData` per iteration, ~1.5e9 times. That clone
+            //      and its matching drop are what showed up as
+            //      `drop_in_place<TermData>` (4.7% of self time).
+            //   2. Test the condition's assignment FIRST and `continue` when it
+            //      is unassigned, which is the overwhelmingly common case. The
+            //      body below only ever fires when `cond_val` is `Some`, so
+            //      skipping earlier changes nothing except the work done to get
+            //      there.
+            let (cond, then_t, else_t) = match self.terms.get(term_id) {
+                TermData::Ite(c, t, e) => (*c, *t, *e),
+                _ => continue,
+            };
+            let cond_val = match self.terms.get(cond) {
+                TermData::Not(inner) => {
+                    let inner = *inner;
+                    self.assigns.get(&inner).map(|&v| !v)
+                }
+                _ => self.assigns.get(&cond).copied(),
+            };
+            {
                 if let Some(val) = cond_val {
                     let branch = if val { then_t } else { else_t };
                     self.ensure_enodes_size(term_id.0);

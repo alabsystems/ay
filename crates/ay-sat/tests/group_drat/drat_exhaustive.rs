@@ -29,8 +29,6 @@ use ay_drat_check::drat_parser::parse_drat;
 use ay_sat::{parse_dimacs, ProofOutput, SatResult, Solver};
 use ntest::timeout;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 // ===========================================================================
@@ -110,21 +108,14 @@ fn solve_and_verify_native_with_timeout(dimacs_text: &str, label: &str, timeout_
         solver.add_clause(clause.clone());
     }
 
-    let flag = Arc::new(AtomicBool::new(false));
-    let flag_clone = flag.clone();
-    solver.set_interrupt(flag.clone());
-
-    let timer = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(timeout_secs));
-        flag_clone.store(true, Ordering::Relaxed);
-    });
+    let timer =
+        super::common::SolverInterruptTimer::start(&mut solver, Duration::from_secs(timeout_secs));
 
     let result = solver
-        .solve_interruptible(|| flag.load(Ordering::Relaxed))
+        .solve_interruptible(|| timer.is_interrupted())
         .into_inner();
 
-    flag.store(true, Ordering::Relaxed);
-    let _ = timer.join();
+    timer.cancel_and_join();
 
     match result {
         SatResult::Sat(_) => {
@@ -173,6 +164,19 @@ fn solve_and_verify_native_with_timeout(dimacs_text: &str, label: &str, timeout_
         steps.len()
     );
     true
+}
+
+#[test]
+#[timeout(5_000)]
+fn drat_timeout_timer_cancels_after_fast_unsat_solve() {
+    // The deadline is intentionally much longer than this test's outer bound.
+    // The old unconditional sleep/join implementation therefore timed out,
+    // while the cancellation-aware timer returns as soon as the proof checks.
+    assert!(solve_and_verify_native_with_timeout(
+        "p cnf 1 2\n1 0\n-1 0\n",
+        "timer_cancel_fast_unsat",
+        60,
+    ));
 }
 
 /// Load a benchmark file relative to the workspace root and run

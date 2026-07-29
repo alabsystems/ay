@@ -103,6 +103,41 @@ fn test_bce_blocked_no_negation() {
     assert!(bce.is_blocked(0, lit(0, true), &clauses));
 }
 
+/// `BCEStats::pure_blocked` must count ONLY the trivially-blocked arm (the
+/// blocking literal's negation occurs nowhere), never the
+/// tautological-resolvent arm. MaxSAT's one-shot gate uses the split to tell a
+/// free reduction from one that deletes live implications, so a
+/// miscount there silently changes solver configuration.
+#[test]
+fn test_bce_pure_blocked_counts_only_the_trivial_arm() {
+    // PURE: nothing contains ~x0, so C0 is blocked with no resolution at all.
+    let mut bce = BCE::new(5);
+    let mut clauses = ClauseArena::new();
+    clauses.add(&[lit(0, true), lit(1, true)], false);
+    clauses.add(&[lit(2, true), lit(3, true)], false);
+    bce.rebuild(&clauses);
+    assert!(bce.is_blocked(0, lit(0, true), &clauses));
+    assert_eq!(
+        bce.stats().pure_blocked,
+        1,
+        "trivially-blocked (no ~L anywhere) must increment pure_blocked",
+    );
+
+    // NON-PURE: ~x0 DOES occur, and the single resolvent is a tautology (it
+    // carries both x1 and ~x1), so the clause is blocked via the resolvent arm.
+    let mut bce2 = BCE::new(5);
+    let mut clauses2 = ClauseArena::new();
+    clauses2.add(&[lit(0, true), lit(1, true)], false);
+    clauses2.add(&[lit(0, false), lit(1, false)], false);
+    bce2.rebuild(&clauses2);
+    let blocked = bce2.is_blocked(0, lit(0, true), &clauses2);
+    assert_eq!(
+        bce2.stats().pure_blocked,
+        0,
+        "resolvent-arm blocking (blocked={blocked}) must NOT increment pure_blocked",
+    );
+}
+
 #[test]
 fn test_bce_find_blocking_literal() {
     let mut bce = BCE::new(5);

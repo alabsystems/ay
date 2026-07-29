@@ -275,6 +275,129 @@ fn checked_replay_admits_bmc_acyclic_exhaustion_safe() {
 }
 
 #[test]
+fn checked_replay_admits_acyclic_query_cone_with_dead_end_cycle() {
+    // The Dead self-loop is cyclic but cannot reach the query. Proof solving,
+    // validation, and replay all apply the same deterministic dead-end strip.
+    // Query enumeration and digest binding must nevertheless stay on the
+    // original four-clause input.
+    let problem = parse_problem(
+        r#"(set-logic HORN)
+(declare-fun A (Int) Bool)
+(declare-fun B (Int) Bool)
+(declare-fun Dead (Int) Bool)
+(assert (forall ((x Int)) (=> (= x 0) (A x))))
+(assert (forall ((x Int) (y Int)) (=> (and (A x) (= y (+ x 1))) (B y))))
+(assert (forall ((x Int) (xp Int))
+  (=> (and (Dead x) (> x 0) (= xp (- x 1))) (Dead xp))))
+(assert (forall ((y Int)) (=> (and (B y) (> y 5)) false)))
+(check-sat)
+"#,
+    );
+    let run = engines::solve_pdr_proof(problem.clone(), PdrConfig::default())
+        .expect("dead-end-cycle proof run should not error");
+    assert!(
+        run.accepted_as_proof(),
+        "acyclic query cone should prove safe"
+    );
+    let VerifiedChcResult::Safe(inv) = &run.result else {
+        panic!("dead-end-cycle fixture should be Safe");
+    };
+    assert!(
+        inv.model().is_empty(),
+        "fixture should exercise acyclic-exhaustion replay"
+    );
+
+    let raw_obligations = acyclic_exhaustion_replay_obligations(&problem)
+        .expect("dead-end-cycle replay synthesis should succeed");
+    assert_eq!(raw_obligations.len(), 1);
+    assert_eq!(
+        raw_obligations[0].clause_index, 3,
+        "query index must stay on the original, unstripped clause vector"
+    );
+    assert!(
+        raw_obligations[0]
+            .smtlib
+            .contains(&run.metadata.normalized_input_sha256),
+        "replay obligation must retain the original normalized-input binding"
+    );
+
+    let checked = run
+        .run_checked_replay(&problem, REPLAY_TEST_BUDGET)
+        .expect("strict replay should reproduce the dead-end strip");
+    assert_checked_run_invariants(&checked);
+    assert_eq!(checked.summary.obligations.len(), 1);
+    let obligation = &checked.summary.obligations[0];
+    assert!(
+        obligation.strict_cert.is_some(),
+        "the stripped expansion must still receive a strict UNSAT certificate"
+    );
+}
+
+#[test]
+fn acyclic_replay_does_not_strip_cycle_that_reaches_query() {
+    let problem = parse_problem(
+        r#"(set-logic HORN)
+(declare-fun Loop (Int) Bool)
+(assert (forall ((x Int) (xp Int))
+  (=> (and (Loop x) (> x 0) (= xp (- x 1))) (Loop xp))))
+(assert (forall ((x Int)) (=> (and (Loop x) (< x 0)) false)))
+(check-sat)
+"#,
+    );
+
+    let error = acyclic_exhaustion_replay_obligations(&problem)
+        .expect_err("a cycle in the query cone must remain ineligible");
+    assert!(
+        error
+            .to_string()
+            .contains("requires an acyclic clause system"),
+        "cycle-in-cone rejection should be explicit: {error}"
+    );
+}
+
+#[test]
+fn dead_end_strip_does_not_hide_reachable_error() {
+    let problem = parse_problem(
+        r#"(set-logic HORN)
+(declare-fun A (Int) Bool)
+(declare-fun B (Int) Bool)
+(declare-fun Dead (Int) Bool)
+(assert (forall ((x Int)) (=> (= x 0) (A x))))
+(assert (forall ((x Int) (y Int)) (=> (and (A x) (= y x)) (B y))))
+(assert (forall ((x Int) (xp Int))
+  (=> (and (Dead x) (> x 0) (= xp (- x 1))) (Dead xp))))
+(assert (forall ((y Int)) (=> (and (B y) (= y 0)) false)))
+(check-sat)
+"#,
+    );
+    let obligations =
+        acyclic_exhaustion_replay_obligations(&problem).expect("dead-end strip should succeed");
+    assert_eq!(obligations.len(), 1);
+    assert_eq!(
+        crate::smt::executor_adapter::smtlib_first_verdict_via_executor(
+            &obligations[0].smtlib,
+            Some(Duration::from_secs(20)),
+        )
+        .as_deref(),
+        Some("sat"),
+        "the original reachable error must remain visible after stripping"
+    );
+
+    // Even a forged empty-model Safe marker stays non-admissible: strict replay
+    // observes SAT and refuses to produce an UNSAT certificate.
+    let result = VerifiedChcResult::from_validated(
+        ChcEngineResult::Safe(InvariantModel::default()),
+        ValidationEvidence::ScalarAcyclicBmcExhaustive { max_depth: 3 },
+    );
+    let run = ChcPdrProofRun::new(&problem, result, "bmc");
+    assert!(
+        run.run_checked_replay(&problem, REPLAY_TEST_BUDGET)
+            .is_err(),
+        "reachable error must fail the strict checked-replay gate"
+    );
+}
+
+#[test]
 fn checked_replay_validates_unsafe_trace() {
     let problem = parse_problem(
         r#"(set-logic HORN)

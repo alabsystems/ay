@@ -132,6 +132,21 @@ pub enum UnknownReason {
     Interrupted,
     /// Logic requires unimplemented features
     Incomplete,
+    /// **A computed verdict was REFUTED by AY's own fail-closed checker.**
+    ///
+    /// This is categorically different from every other variant here. The rest
+    /// mean "AY never reached an answer". This one means AY *did* reach `sat`
+    /// or `unsat`, its own model evaluator or strict refutation checker refused
+    /// to certify it, and `--self-check` therefore withheld it. Each occurrence
+    /// is a LATENT WRONG ANSWER that default mode would have emitted.
+    ///
+    /// It exists because these were previously reported as [`Self::Incomplete`],
+    /// making a caught soundness bug indistinguishable from an unsupported
+    /// logic. A 2026-07-25 corpus run found 13 wrong answers that way — 12 UFBV
+    /// wrong-SATs and one AUFLIA wrong-UNSAT — every one of which `--self-check`
+    /// had already caught and reported as a bland "incomplete", so nobody
+    /// noticed. Never fold this back into `Incomplete`.
+    SelfCheckRejected,
     /// E-matching round budget or per-round instantiation limit exhausted.
     /// The solver could not explore all possible instantiations within budget.
     QuantifierRoundLimit,
@@ -186,6 +201,7 @@ impl UnknownReason {
             Self::MemoryLimit => "memory_limit",
             Self::Interrupted => "interrupted",
             Self::Incomplete => "incomplete",
+            Self::SelfCheckRejected => "self_check_rejected",
             Self::QuantifierRoundLimit => "quantifier_round_limit",
             Self::QuantifierDeferred => "quantifier_deferred",
             Self::QuantifierUnhandled => "quantifier_unhandled",
@@ -210,6 +226,7 @@ impl UnknownReason {
             Self::MemoryLimit => "Memory limit",
             Self::Interrupted => "Interrupted",
             Self::Incomplete => "Incomplete",
+            Self::SelfCheckRejected => "Self-check REJECTED a computed verdict",
             Self::QuantifierRoundLimit => "Quantifier round limit",
             Self::QuantifierDeferred => "Quantifier deferred",
             Self::QuantifierUnhandled => "Quantifier unhandled",
@@ -248,6 +265,10 @@ impl std::fmt::Display for UnknownReason {
             Self::MemoryLimit => write!(f, "memout"),
             Self::Interrupted => write!(f, "interrupted"),
             Self::Incomplete => write!(f, "incomplete"),
+            // NOT plain "incomplete": this one means a computed verdict was
+            // refuted by AY's own checker, i.e. a caught wrong answer. It must
+            // be greppable and must never be mistaken for an unsupported logic.
+            Self::SelfCheckRejected => write!(f, "(incomplete self-check-rejected)"),
             Self::QuantifierRoundLimit => write!(f, "(incomplete quantifier-round-limit)"),
             Self::QuantifierDeferred => write!(f, "(incomplete quantifier-deferred)"),
             Self::QuantifierUnhandled => write!(f, "(incomplete quantifier-unhandled)"),

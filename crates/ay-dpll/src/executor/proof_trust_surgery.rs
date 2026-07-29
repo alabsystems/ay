@@ -3835,7 +3835,8 @@ impl Executor {
                 }
             };
             if assume_count == 0 && wiring_ok {
-                return self.rebuild_consumed_equalities_collapse(proof, originals);
+                return self.rebuild_consumed_equalities_collapse(proof, originals)
+                    || self.rebuild_congruence_collapse(proof, originals);
             }
             return false;
         }
@@ -4397,6 +4398,169 @@ impl Executor {
         // Record that exact source term so the final exporter accepts the
         // rebuilt Assume without granting authority to any generated leaf.
         self.record_rebuilt_authored_proof_premise(x);
+        true
+    }
+
+    /// Consumed-assertions collapse whose contradiction is pure EUF
+    /// CONGRUENCE (`(= a b)` together with `(not (= (f .. a ..) (f .. b ..)))`):
+    /// the preprocessor rewrote one side into the other, folded the result,
+    /// and the exported proof is the bare `(cl false) :rule trust`.
+    ///
+    /// Re-prove it from the ORIGINAL assertions with a single `cong` step —
+    /// a first-class Alethe rule that AY's own strict checker validates
+    /// (`validate_cong`) and that Carcara checks natively — closed by one
+    /// resolution against the assumed disequality:
+    ///
+    /// ```text
+    /// (assume h0 (= a b))
+    /// (assume h1 (not (= (f .. a ..) (f .. b ..))))
+    /// (step  c  (cl (= (f .. a ..) (f .. b ..))) :rule cong :premises (h0))
+    /// (step  r  (cl) :rule resolution :premises (c h1))
+    /// ```
+    ///
+    /// FAIL-CLOSED CONDITIONS (any one keeps the honest `trust` step):
+    ///  - the assertion set is not exactly one disequality plus one or more
+    ///    equalities (an unused original could be the one that mattered, and
+    ///    the rebuilt proof must not claim a refutation it did not use);
+    ///  - the two disequality sides are not applications of the SAME symbol
+    ///    with the same arity;
+    ///  - some differing argument position has no equality original for
+    ///    exactly that unordered pair, or some equality original is left
+    ///    over (`cong` requires every premise to be consumed);
+    ///  - re-interning any reconstructed term does not reproduce it RAW (a
+    ///    folding interner would make the derivation not match the premise).
+    ///
+    /// This is congruence over the ORIGINAL assertions only. It never appeals
+    /// to array extensionality, so `(= a b)` between arrays is used exactly
+    /// as the congruence premise for a shared argument position — the same
+    /// obligation Carcara's `cong` checks.
+    fn rebuild_congruence_collapse(
+        &mut self,
+        proof: &mut Proof,
+        originals: &[(TermId, FrontendTerm)],
+    ) -> bool {
+        if originals.len() < 2 {
+            return false;
+        }
+        // Partition the originals: exactly one disequality conclusion, every
+        // other one an equality that must end up used as a `cong` premise.
+        let mut disequality: Option<(TermId, TermId)> = None;
+        let mut equalities: Vec<(TermId, TermId)> = Vec::with_capacity(originals.len());
+        for (_, parsed) in originals {
+            let stripped = strip_frontend_annotations(parsed);
+            let FrontendTerm::App(head, operands) = stripped else {
+                return false;
+            };
+            let (is_disequality, sides) = match (head.as_str(), operands.len()) {
+                ("=", 2) => (false, &operands[..]),
+                ("distinct", 2) => (true, &operands[..]),
+                ("not", 1) => match strip_frontend_annotations(&operands[0]) {
+                    FrontendTerm::App(inner_head, inner_operands)
+                        if inner_head == "=" && inner_operands.len() == 2 =>
+                    {
+                        (true, &inner_operands[..])
+                    }
+                    _ => return false,
+                },
+                _ => return false,
+            };
+            let (Some(lhs), Some(rhs)) = (
+                self.ctx.elaborate_surface_subterm(&sides[0]),
+                self.ctx.elaborate_surface_subterm(&sides[1]),
+            ) else {
+                return false;
+            };
+            if self.ctx.terms.sort(lhs) != self.ctx.terms.sort(rhs) {
+                return false;
+            }
+            if is_disequality {
+                if disequality.is_some() {
+                    return false;
+                }
+                disequality = Some((lhs, rhs));
+            } else {
+                equalities.push((lhs, rhs));
+            }
+        }
+        let (Some((conc_lhs, conc_rhs)), false) = (disequality, equalities.is_empty()) else {
+            return false;
+        };
+
+        // The two sides must be the same application, differing only at
+        // positions an original equality covers — and every equality must be
+        // consumed, which is exactly what `validate_cong` re-checks.
+        let (TermData::App(lhs_sym, lhs_args), TermData::App(rhs_sym, rhs_args)) = (
+            self.ctx.terms.get(conc_lhs).clone(),
+            self.ctx.terms.get(conc_rhs).clone(),
+        ) else {
+            return false;
+        };
+        if lhs_sym != rhs_sym || lhs_args.len() != rhs_args.len() {
+            return false;
+        }
+        let mut used = vec![false; equalities.len()];
+        for (left, right) in lhs_args.iter().zip(rhs_args.iter()) {
+            if left == right {
+                continue;
+            }
+            let Some(position) = equalities.iter().enumerate().position(|(k, &(a, b))| {
+                !used[k] && ((a == *left && b == *right) || (a == *right && b == *left))
+            }) else {
+                return false;
+            };
+            used[position] = true;
+        }
+        if used.iter().any(|consumed| !consumed) {
+            return false;
+        }
+
+        // Re-intern every premise RAW; a folding interner would leave the
+        // derivation referring to terms the printed premises do not carry.
+        let mut premises: Vec<TermId> = Vec::with_capacity(equalities.len());
+        for &(lhs, rhs) in &equalities {
+            let eq = self
+                .ctx
+                .terms
+                .mk_app(Symbol::named("="), [lhs, rhs], Sort::Bool);
+            if !matches!(
+                self.ctx.terms.get(eq),
+                TermData::App(Symbol::Named(op), a)
+                    if op == "=" && a.len() == 2 && a[0] == lhs && a[1] == rhs
+            ) {
+                return false;
+            }
+            premises.push(eq);
+        }
+        let conclusion =
+            self.ctx
+                .terms
+                .mk_app(Symbol::named("="), [conc_lhs, conc_rhs], Sort::Bool);
+        if !matches!(
+            self.ctx.terms.get(conclusion),
+            TermData::App(Symbol::Named(op), a)
+                if op == "=" && a.len() == 2 && a[0] == conc_lhs && a[1] == conc_rhs
+        ) {
+            return false;
+        }
+        let negated = self.ctx.terms.mk_not_raw(conclusion);
+        if negated == conclusion {
+            return false;
+        }
+
+        let mut new_proof = Proof::new();
+        let mut premise_ids: Vec<ProofId> = Vec::with_capacity(premises.len());
+        for &eq in &premises {
+            premise_ids.push(new_proof.add_assume(eq, None));
+        }
+        let negated_id = new_proof.add_assume(negated, None);
+        let cong =
+            new_proof.add_rule_step(AletheRule::Cong, vec![conclusion], premise_ids, Vec::new());
+        new_proof.add_resolution(Vec::new(), conclusion, cong, negated_id);
+        *proof = new_proof;
+        for &eq in &premises {
+            self.record_rebuilt_authored_proof_premise(eq);
+        }
+        self.record_rebuilt_authored_proof_premise(negated);
         true
     }
 

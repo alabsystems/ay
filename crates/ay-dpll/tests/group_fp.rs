@@ -11,6 +11,8 @@ mod common;
 
 #[path = "group_fp/fp_arithmetic_correctness.rs"]
 mod fp_arithmetic_correctness;
+#[path = "group_fp/fp_congruence.rs"]
+mod fp_congruence;
 #[path = "group_fp/fp_conversions.rs"]
 mod fp_conversions;
 #[path = "group_fp/fp_forward_error.rs"]

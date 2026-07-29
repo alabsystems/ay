@@ -1024,7 +1024,7 @@ impl LraSolver {
             // Per-check pivot budget: if the current check() has consumed too
             // many pivots, bail out early with Unknown. This prevents a single
             // check() call on a dense LP from burning unbounded CPU time (#8003).
-            if self.stats.check_pivot_count >= CHECK_PIVOT_BUDGET {
+            if self.stats.check_pivot_count >= self.check_pivot_budget() {
                 self.stats.check_pivot_budget_exhaustions += 1;
                 summarize(
                     "unknown",
@@ -1123,5 +1123,47 @@ impl LraSolver {
             self.vars.len(),
         );
         TheoryResult::Unknown
+    }
+}
+
+impl LraSolver {
+    /// Per-check pivot budget (#uc-lia-unknown).
+    ///
+    /// The historical value was a FIXED 10,000 (`CHECK_PIVOT_BUDGET`), justified by
+    /// "let the DPLL(T) loop try different theory-variable assignments instead". That
+    /// premise holds on the plain check-sat path, where an early `Unknown` is recoverable.
+    /// **It fails in the assumption lane**, where a theory `Unknown` is TERMINAL: the
+    /// assume-arm split loop breaks immediately
+    /// (`pipeline_incremental_split_assume_macros.rs:378-382`), the caller falls back to a
+    /// conjoined re-solve, and in the UnsatCore track that fallback destroys assumption
+    /// provenance — emitting a 100%-of-assertions core worth zero reduction on instances
+    /// AY can otherwise answer.
+    ///
+    /// Measured 2026-07-27 on UC/QF_LinearIntArith `RwMutex-PT-r0010w1000/RF-10`
+    /// (25,091 assertions): the first assumption-lane check exhausts the fixed budget and
+    /// returns `Unknown` after ~8 s of a 1200 s budget, while the conjoined re-solve of the
+    /// identical formula returns `UnsatWithFarkas` immediately.
+    ///
+    /// So scale the budget with the problem: this file's own documentation notes dense LPs
+    /// need 10K-100K pivots per call. Bounded above so a pathological instance still cannot
+    /// burn unbounded CPU — the wall-clock deadline remains the outer guard.
+    #[inline]
+    pub(crate) fn check_pivot_budget(&self) -> u32 {
+        const MAX_CHECK_PIVOT_BUDGET: u64 = 1_000_000;
+        // This is consulted on EVERY pivot, so the env override is read once per
+        // process, never per iteration.
+        static OVERRIDE: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        if let Some(n) = *OVERRIDE.get_or_init(|| {
+            std::env::var("AY_LRA_CHECK_PIVOT_BUDGET")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+        }) {
+            return n;
+        }
+        let scaled = (self.rows.len() as u64)
+            .saturating_mul(4)
+            .max(CHECK_PIVOT_BUDGET as u64)
+            .min(MAX_CHECK_PIVOT_BUDGET);
+        scaled as u32
     }
 }

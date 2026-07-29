@@ -130,24 +130,101 @@ fn test_ieee_bv_float16_one() {
 }
 
 // ========== NaN shape tests ==========
+//
+// A `(_ FloatingPoint eb sb)` sort has exactly ONE NaN element but IEEE 754
+// has many NaN bit-patterns for it, so `fp.to_ieee_bv` leaves the returned
+// pattern UNSPECIFIED on NaN. Unspecified is not non-functional: SMT-LIB 2.6
+// §5.2 makes every function symbol denote a total function and `=` denote
+// identity, so equal arguments must give equal results. These tests pin both
+// halves of that — free choice of pattern, single-valued per argument — rather
+// than any one encoding.
 
-/// NaN literal: fp.to_ieee_bv must produce a valid NaN BV encoding.
-/// Canonical quiet NaN for Float32 = 0x7fc00000 (sign=0, exp=0xFF, sig=0x400000).
+/// Every NaN-typed argument gets the SAME bitvector: `fp.to_ieee_bv` is a
+/// function, and `(fp.neg NaN)` denotes the very same element as `NaN`
+/// (its raw sign bit flips, but that is an encoding detail, not a value).
 #[test]
 #[timeout(30_000)]
-fn test_ieee_bv_nan_literal_float32() {
-    // Use a NaN literal (sign=0, exp=all-ones, sig MSB=1, rest=0) and verify
-    // fp.to_ieee_bv produces the expected BV. This is UNSAT if the bit-blast
-    // correctly maps the NaN literal to its IEEE 754 encoding.
+fn test_ieee_bv_nan_is_functional_across_neg() {
     let smt = r#"
         (set-logic QF_BVFP)
-        (assert (not (= (fp.to_ieee_bv (fp #b0 #b11111111 #b10000000000000000000000)) #x7fc00000)))
+        (assert (not (= (fp.to_ieee_bv (_ NaN 8 24))
+                        (fp.to_ieee_bv (fp.neg (_ NaN 8 24))))))
         (check-sat)
     "#;
     assert_eq!(
         crate::common::solve_vec(smt),
         vec!["unsat"],
-        "fp.to_ieee_bv(quiet NaN literal) should be 0x7fc00000"
+        "fp.to_ieee_bv must be single-valued on the one NaN element"
+    );
+}
+
+/// The same obligation with the NaN reached through a variable and through
+/// two different spellings of the constant.
+#[test]
+#[timeout(30_000)]
+fn test_ieee_bv_nan_is_functional_across_spellings() {
+    let smt = r#"
+        (set-logic QF_BVFP)
+        (declare-const x (_ FloatingPoint 8 24))
+        (assert (= x (fp #b1 #b11111111 #b00000000000000000000001)))
+        (assert (not (= (fp.to_ieee_bv x) (fp.to_ieee_bv (_ NaN 8 24)))))
+        (check-sat)
+    "#;
+    assert_eq!(
+        crate::common::solve_vec(smt),
+        vec!["unsat"],
+        "all NaN encodings denote one element, so all give one fp.to_ieee_bv result"
+    );
+}
+
+/// Which NaN pattern comes back is unspecified — a sign-set quiet NaN is an
+/// admissible answer, so demanding it must NOT be refuted.
+#[test]
+#[timeout(30_000)]
+fn test_ieee_bv_nan_pattern_is_unspecified() {
+    let smt = r#"
+        (set-logic QF_BVFP)
+        (assert (= (fp.to_ieee_bv (_ NaN 8 24)) #xffc00000))
+        (check-sat)
+    "#;
+    assert_eq!(
+        crate::common::solve_vec(smt),
+        vec!["sat"],
+        "no particular NaN encoding may be forced on fp.to_ieee_bv"
+    );
+}
+
+/// Unspecified among NaN *encodings* only: the result still has to be one,
+/// or reinterpreting it back could not recover NaN.
+#[test]
+#[timeout(30_000)]
+fn test_ieee_bv_nan_result_is_a_nan_encoding() {
+    let smt = r#"
+        (set-logic QF_BVFP)
+        (assert (= (fp.to_ieee_bv (_ NaN 8 24)) #x00000000))
+        (check-sat)
+    "#;
+    assert_eq!(
+        crate::common::solve_vec(smt),
+        vec!["unsat"],
+        "fp.to_ieee_bv(NaN) is a NaN encoding, never +zero's"
+    );
+}
+
+/// The unspecified NaN case must not leak into ordinary values: `fp.neg` is
+/// still a plain sign flip on everything else.
+#[test]
+#[timeout(30_000)]
+fn test_ieee_bv_neg_is_exact_on_non_nan() {
+    let smt = r#"
+        (set-logic QF_BVFP)
+        (assert (not (= (fp.to_ieee_bv (fp.neg (_ +zero 8 24))) #x80000000)))
+        (check-sat)
+    "#;
+    assert_eq!(
+        crate::common::solve_vec(smt),
+        vec!["unsat"],
+        "fp.to_ieee_bv(fp.neg +zero) is exactly 0x80000000"
     );
 }
 

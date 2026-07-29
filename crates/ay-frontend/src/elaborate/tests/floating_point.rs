@@ -187,3 +187,127 @@ fn single_arg_fp_comparison_is_rejected() {
     }
     assert!(saw_err, "single-arg fp.leq must be rejected");
 }
+
+// ---------------------------------------------------------------------------
+// `nullary_fp_formats`: the declared-format export a firewall emitter needs.
+// ---------------------------------------------------------------------------
+
+/// Elaborate a whole script and return the exported nullary format table.
+fn formats_of_script(input: &str) -> Vec<(String, Option<(u32, u32)>)> {
+    let commands = parse(input).expect("script parses");
+    let mut ctx = Context::new();
+    for command in &commands {
+        ctx.process_command(command).expect("script elaborates");
+    }
+    ctx.nullary_fp_formats()
+}
+
+fn lookup(table: &[(String, Option<(u32, u32)>)], name: &str) -> Option<Option<(u32, u32)>> {
+    table.iter().find(|(n, _)| n == name).map(|(_, f)| *f)
+}
+
+#[test]
+fn nullary_fp_formats_reports_declared_constants_and_nullary_macros() {
+    // The `guard_claim_guard2.smt2` vocabulary: Float64 constants, Float64
+    // nullary `define-fun` intermediates, Real macros.
+    let table = formats_of_script(
+        r#"
+            (set-logic QF_FPLRA)
+            (declare-const nx Float64) (declare-const px Float64)
+            (define-fun B () Real 281474976710656.0)
+            (define-fun t1 () Float64 (fp.mul RNE nx px))
+            (define-fun rreal () Real (* (fp.to_real nx) (fp.to_real px)))
+        "#,
+    );
+    assert_eq!(lookup(&table, "nx"), Some(Some((11, 53))));
+    assert_eq!(lookup(&table, "px"), Some(Some((11, 53))));
+    assert_eq!(lookup(&table, "t1"), Some(Some((11, 53))));
+    assert_eq!(lookup(&table, "B"), Some(None));
+    assert_eq!(lookup(&table, "rreal"), Some(None));
+    // Never invented for a symbol that was never declared.
+    assert_eq!(lookup(&table, "nowhere"), None);
+}
+
+#[test]
+fn nullary_fp_formats_separates_float64_from_its_float32_clone() {
+    // THE SOUNDNESS POINT. `benchmarks/smt/QF_FPLRA/guard_claim_guard2.smt2`
+    // and `guard_claim_guard2_float32.smt2` have byte-identical parsed
+    // ASSERTION terms; only the declarations differ, and only this table sees
+    // that. The Float64 script is UNSAT; the Float32 one is SATISFIABLE
+    // (`guard_claim_guard2_float32_witness.smt2` pins a model with forward
+    // error 16777214 >= 2).
+    let script = |sort: &str| {
+        format!(
+            r#"
+                (set-logic QF_FPLRA)
+                (declare-const nx {sort}) (declare-const px {sort})
+                (define-fun t1 () {sort} (fp.mul RNE nx px))
+                (assert (fp.isNormal t1))
+            "#
+        )
+    };
+    for (sort, expected) in [
+        ("Float16", (5u32, 11u32)),
+        ("Float32", (8, 24)),
+        ("Float64", (11, 53)),
+        ("Float128", (15, 113)),
+        ("(_ FloatingPoint 11 53)", (11, 53)),
+        ("(_ FloatingPoint 8 24)", (8, 24)),
+    ] {
+        let table = formats_of_script(&script(sort));
+        for name in ["nx", "px", "t1"] {
+            assert_eq!(
+                lookup(&table, name),
+                Some(Some(expected)),
+                "sort {sort} symbol {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nullary_fp_formats_resolves_a_define_sort_synonym() {
+    // The format is read off the ELABORATED sort, so a synonym is not a hole.
+    let table = formats_of_script(
+        r#"
+            (set-logic QF_FPLRA)
+            (define-sort MyFloat () Float32)
+            (declare-const x MyFloat)
+        "#,
+    );
+    assert_eq!(lookup(&table, "x"), Some(Some((8, 24))));
+}
+
+#[test]
+fn nullary_fp_formats_omits_arity_bearing_names() {
+    let table = formats_of_script(
+        r#"
+            (set-logic QF_FPLRA)
+            (declare-fun g (Float64) Float64)
+            (define-fun h ((a Float64)) Float64 a)
+            (declare-const c Float64)
+        "#,
+    );
+    // Only the NULLARY constant is exported; a function's result sort says
+    // nothing about the sort of a bare occurrence of its name.
+    assert_eq!(lookup(&table, "c"), Some(Some((11, 53))));
+    assert_eq!(lookup(&table, "g"), None);
+    assert_eq!(lookup(&table, "h"), None);
+}
+
+#[test]
+fn float_theory_sort_names_cannot_be_redeclared_as_uninterpreted() {
+    // The table maps `Float64` to (11, 53) unconditionally, which is only safe
+    // because the theory sort names are reserved. Pin that.
+    for name in ["Float16", "Float32", "Float64", "Float128", "RoundingMode"] {
+        let commands = parse(&format!("(declare-sort {name} 0)")).expect("parses");
+        let mut ctx = Context::new();
+        assert!(
+            commands
+                .iter()
+                .try_for_each(|c| ctx.process_command(c).map(|_| ()))
+                .is_err(),
+            "(declare-sort {name} 0) must be rejected"
+        );
+    }
+}

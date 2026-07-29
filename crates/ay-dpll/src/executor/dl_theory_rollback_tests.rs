@@ -79,20 +79,6 @@ fn is_unknown(r: &TheoryResult) -> bool {
     matches!(r, TheoryResult::Unknown)
 }
 
-/// The disequality a split request names, accepting either shape.
-///
-/// The theory emits `NeedExpressionSplits` (batched): every request costs a full
-/// solve restart, and these instances carry hundreds of equalities apiece, which
-/// is the cost the batch variant exists to avoid (#8707). The singular form is
-/// still accepted so the helper keeps working if a caller emits one.
-fn split_term(r: &TheoryResult) -> Option<TermId> {
-    match r {
-        TheoryResult::NeedExpressionSplit(s) => Some(s.disequality_term),
-        TheoryResult::NeedExpressionSplits(v) => v.first().map(|s| s.disequality_term),
-        _ => None,
-    }
-}
-
 /// Short label for a verdict, so equivalence assertions report what differed.
 fn label(r: &TheoryResult) -> String {
     match r {

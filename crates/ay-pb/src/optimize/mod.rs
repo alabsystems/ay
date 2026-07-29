@@ -37,7 +37,7 @@ pub(crate) mod native_oll;
 pub(crate) mod pigeonhole;
 pub(crate) mod safe_lp_bound;
 pub(crate) mod score;
-pub(crate) mod shared_bounds;
+pub mod shared_bounds;
 pub(crate) mod sls;
 #[cfg(test)]
 mod sls_sweep;

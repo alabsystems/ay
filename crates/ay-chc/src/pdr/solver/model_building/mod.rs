@@ -131,6 +131,32 @@ impl PdrSolver {
                 .cloned()
                 .unwrap_or_default();
 
+            // Complete the candidate model's nullary query slice explicitly.
+            //
+            // PDR can prove a chain such as
+            // `State(x) /\ bad(x) => error_p0 => error => false` unreachable
+            // while carrying no ordinary state variables for `error_p0` or
+            // `error`. Defaulting those missing frame formulas to `true`
+            // produces a model that contradicts the very query PDR blocked.
+            // A nullary predicate in the backward query slice is therefore
+            // seeded as `false`. This includes structural facts: a
+            // constraint-only defining clause may itself be UNSAT, so syntax
+            // alone cannot decide whether the predicate must be true.
+            //
+            // This is only candidate completion, not proof authority: mark the
+            // model as filtered so frame convergence cannot bypass full model
+            // verification. Exact original-clause validation must establish
+            // that every defining body is unreachable; otherwise the Safe
+            // candidate is rejected.
+            if pred.arg_sorts.is_empty() && query_relevant_predicates.contains(&pred.id) {
+                model.set(
+                    pred.id,
+                    PredicateInterpretation::new(vars, ChcExpr::Bool(false)),
+                );
+                filtered_any = true;
+                continue;
+            }
+
             // Predicates outside the forward reachability slice from facts are
             // unreachable, so false is a valid interpretation for them. This
             // covers nullary query predicates with no defining clauses.

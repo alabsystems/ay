@@ -11,6 +11,7 @@
 
 mod bitblast;
 mod blocking;
+mod congruence;
 mod forward_error;
 mod pin_reals;
 mod rm_expand;
@@ -126,6 +127,7 @@ impl Executor {
         // (fp.eq, fp.lt, fp.isNaN, etc.) gets a Tseitin variable that must
         // be linked to the FP bit-blast result.
         let mut linking_pairs: Vec<(i32, i32)> = Vec::new();
+        let mut congruence_plan_clauses: Vec<Vec<congruence::PlanLit>> = Vec::new();
         for (&tseitin_var, &term) in &tseitin_result.var_to_term {
             match self.bitblast_fp_predicate(&mut fp_solver, term) {
                 FpPredicateResult::Bitblasted(fp_lit) => {
@@ -141,13 +143,63 @@ impl Executor {
             }
         }
 
-        // Check for encoding gaps: ITE conditions that couldn't be resolved
-        // as FP predicates or linked via Tseitin map. An unconstrained condition
-        // variable would make the SAT result unsound (false-SAT risk).
-        if fp_solver.has_encoding_gap() {
+        // --- Phase 2b: congruence for symbols this path does not interpret ---
+        // A user-declared `f` or an array read over an FP index is only a
+        // Tseitin atom here, so without these Ackermann clauses `(= x y)`
+        // would not force `(= (f x) (f y))` and the relaxation reports a
+        // wrong `sat` (SMT-LIB 2.6 §5.2: `=` is identity and every function
+        // symbol is total). Anything the scan could not encode sets
+        // `congruence_incomplete`, which fails a later `sat` closed — `unsat`
+        // stays valid because the encoding only ever relaxes the input.
+        // Snapshot the gap flag BEFORE the congruence pre-pass so the two causes
+        // stay distinguishable — see the split check below.
+        let gap_before_congruence = fp_solver.has_encoding_gap();
+
+        let foreign = congruence::scan_foreign(&self.ctx.terms, &self.ctx.assertions);
+        let mut congruence_incomplete = if foreign.is_empty() {
+            false
+        } else {
+            let plan = congruence::plan_congruence(
+                &self.ctx.terms,
+                &mut fp_solver,
+                &tseitin_result,
+                &foreign,
+            );
+            congruence_plan_clauses = plan.clauses;
+            // `solve_fp` owns the whole formula, so a sort it cannot represent
+            // anywhere is as disqualifying as an unencodable congruence pair.
+            foreign.unencodable || plan.incomplete
+        };
+
+        // Encoding gaps: an ITE condition that could not be resolved as an FP
+        // predicate or linked via the Tseitin map. The two possible causes carry
+        // DIFFERENT consequences and must not be conflated.
+        if gap_before_congruence {
+            // The BASE encoding is holed: a condition variable is unconstrained
+            // in the formula the solver will actually see, which makes a `sat`
+            // unsound. Fail closed, as this path always has.
             tracing::warn!("FP encoding has unresolvable ITE condition — returning Unknown");
             self.last_unknown_reason = Some(UnknownReason::Incomplete);
             return Ok(SolveResult::Unknown);
+        }
+        if fp_solver.has_encoding_gap() {
+            // The gap was introduced by the congruence pre-pass itself, which
+            // touches argument terms the base encoder never bit-blasted. That is
+            // only a failure to add congruence clauses, i.e. a RELAXATION: fewer
+            // constraints than the input, so an `unsat` on it still entails
+            // `unsat` of the input, and a `sat` is already downgraded below by
+            // `congruence_incomplete`.
+            //
+            // Returning Unknown here instead DESTROYED correct refutations that
+            // the base encoding found on its own — measured on an FP-sorted
+            // `ite` beneath an uninterpreted application, where this path went
+            // unsat (correct, and z3 agrees) to unknown purely because adding
+            // congruence tripped the check.
+            tracing::debug!(
+                "FP congruence pre-pass could not encode every pair; keeping the \
+                 relaxation and downgrading a later `sat`"
+            );
+            congruence_incomplete = true;
         }
 
         let fp_clauses = fp_solver.take_clauses();
@@ -173,6 +225,19 @@ impl Executor {
             let fp_lit_offset = offset_cnf_lit(fp_lit, var_offset);
             all_clauses.push(CnfClause::binary(-tseitin_lit, fp_lit_offset));
             all_clauses.push(CnfClause::binary(tseitin_lit, -fp_lit_offset));
+        }
+
+        // Add the congruence clauses planned above, resolving each literal's
+        // namespace now that the FP offset is known.
+        for clause in congruence_plan_clauses {
+            let lits: Vec<i32> = clause
+                .into_iter()
+                .map(|lit| match lit {
+                    congruence::PlanLit::Fp(fp_lit) => offset_cnf_lit(fp_lit, var_offset),
+                    congruence::PlanLit::Tseitin(tseitin_lit) => tseitin_lit,
+                })
+                .collect();
+            all_clauses.push(CnfClause::new(lits));
         }
 
         // Add ITE condition linking clauses (#3586): connect FP proxy variables
@@ -212,6 +277,17 @@ impl Executor {
         let result = solver.solve_interruptible(should_stop).into_inner();
 
         collect_sat_stats!(self, &solver);
+
+        // A model of an encoding that dropped structure is not a model of the
+        // input: fail the `sat` closed. `unsat` is untouched — the encoding is
+        // a relaxation, so its refutation refutes the input too.
+        if congruence_incomplete && matches!(result, SatResult::Sat(_)) {
+            tracing::warn!(
+                "FP path could not encode all uninterpreted structure — degrading sat to unknown"
+            );
+            self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            return Ok(SolveResult::Unknown);
+        }
 
         // Extract FP and BV models from SAT assignment before storing
         let (fp_model, bv_model) = if let SatResult::Sat(ref sat_model) = result {

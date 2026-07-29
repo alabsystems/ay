@@ -21,6 +21,7 @@
 //! variables are withheld.
 
 pub mod env;
+pub mod veripb;
 
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};

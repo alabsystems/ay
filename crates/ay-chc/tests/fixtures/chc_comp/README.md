@@ -84,29 +84,58 @@ re-copy every fixture listed above, so the pin and the fixtures cannot drift.
 
 ### Staged, not yet wired
 
-`hcai/svcomp/O0/O0_lu.cmp_true-unreach-call_000.smt2` and both
-`solidity/abi_encode*_array_slice.sol_0_no_adts_000.smt2` were vendored on
-2026-07-25 to de-`#[ignore]` two regressions:
+`solidity/abi_encode_array_slice.sol_0_no_adts_000.smt2` and
+`solidity/abi_encode_packed_array_slice.sol_0_no_adts_000.smt2` were vendored on
+2026-07-25 to de-`#[ignore]`
+`crates/ay-chc/src/bmc/tests.rs::nested_select_candidate_refutes_both_chccomp25_array_slice_targets`.
 
-- `crates/ay-chc/src/adaptive_tests.rs::test_reduced_lia_array_interval_model_solves_hcai_lu_cmp`
-- `crates/ay-chc/src/bmc/tests.rs::nested_select_candidate_refutes_both_chccomp25_array_slice_targets`
-
-**Both tests fail when actually run against these benchmarks**, so the wiring
-was not landed. They currently read the corpus from `benchmarks/` and return
+**That test fails when actually run against these benchmarks**, so the wiring
+was not landed. It currently reads the corpus from `benchmarks/` and returns
 early when it is absent — and `benchmarks/chc/chc-comp25-benchmarks/` is
-gitignored — so they assert nothing on any checkout that lacks the 1.2 GB
-corpus, and are `#[ignore]`d on those that have it.
+gitignored — so it asserts nothing on any checkout that lacks the 1.2 GB
+corpus, and is `#[ignore]`d on those that have it.
 
 Observed against the fixtures above (identical to upstream at the pinned commit,
 verified byte-for-byte):
 
 | Test | Expected | Actual |
 |---|---|---|
-| `..._solves_hcai_lu_cmp` | `Safe` + `FullVerification` from the reduced LIA-array interval route | route returns `None` |
 | `nested_select_candidate_refutes_...` | replay-validated `Unsafe` | `Unknown` |
 
-Not a budget effect: both still fail with the budgets raised to 120 s and BMC
-depth raised to 64 (they conclude in ~2 s at the committed budgets). Once the
-underlying capability holds, swap each test to `include_str!` on the fixture
-above and delete its `#[ignore]` and early-return — that clears two of the three
-`ay-quality-gate` disabled-test violations.
+Not a budget effect: it still fails with the budgets raised to 120 s and BMC
+depth raised to 64 (it concludes in ~2 s at the committed budgets). Once the
+underlying capability holds, swap the test to `include_str!` on the fixtures
+above and delete its `#[ignore]` and early-return.
+
+`hcai/svcomp/O0/O0_lu.cmp_true-unreach-call_000.smt2` is also staged, for
+`crates/ay-chc/src/adaptive_tests.rs::test_reduced_lia_array_interval_model_solves_hcai_lu_cmp`
+— but for the opposite reason: **the capability now works and the test is still
+not wired, because it cannot be made to pass reliably.**
+
+The root cause was that `IntervalPropagator` had no Boolean reasoning at all, so
+on SeaHorn-style guarded CNF (`(or (not g) (= x 0))` plus reified loop guards
+like `(not (= (<= 6 h) g))`) it derived no bound whatsoever and the reduced
+LIA-array route returned `None`. That is fixed — see
+`crates/ay-chc/src/transform/interval_propagation.rs`. Unloaded, the route now
+derives `main@_bb2 arg1 in [0,6]` / `main@_bb arg1 in [0,7]` and returns
+`Safe` / `FullVerification` in ~0.5 s, and the model passes independent
+original-clause validation under `strict_proofs`.
+
+It is a **wall-clock race**, not a capability gap. `IntervalPropagator`'s pass
+budget is `PassBudget::new(Instant::now() + Duration::from_secs(1),
+PASS_WORK_BUDGET)` — a hardcoded one-second wall deadline alongside a
+1,000,000-unit fuel cap — and
+`REDUCED_LIA_ARRAY_ROUTE_BUDGET` clamps the route to 3 s no matter what the
+caller passes. Under CPU contention the pass blows the wall deadline before it
+exhausts its fuel, fails closed to identity, and the route declines. Reproduced
+standalone against 24 busy cores: the route declines in 2.06 s, and raising the
+*caller's* budget to 60 s does not help because of the clamp. It also failed
+inside `cargo test -p ay-chc`'s own parallelism while passing in isolation.
+
+Wiring it would therefore add a test that fails on any loaded machine. The
+fix belongs in the pass: make it bounded by its deterministic fuel cap rather
+than by wall-clock, which is also what the repo's own measurement discipline
+asks for. That change alters solver behaviour on every problem and needs a
+corpus differential before landing, so it is left as follow-up. Once the pass is
+deterministic, wire this test the same way as the others and delete its
+`#[ignore]`.

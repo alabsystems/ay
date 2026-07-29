@@ -7,11 +7,20 @@
 //   2. the full MIP feasibility solve (BabSession::check).
 //
 // The LU / Forrest-Tomlin engine is env-gated by AY_MILP_LU=1 at simplex.rs:473,
-// exercised by both sessions. Run: milp_profile <file.milp> <seconds> [lp|mip|both]
+// exercised by both sessions. Run:
+//   milp_profile <file.milp> <seconds> [lp|mip|both|shared|proof|family]
+// `shared` / `proof` / `family` read AY_MILP_PREFIX_COLS as comma-separated
+// column indices. `shared` is the staged one-root serial native frontier;
+// `proof` prepares its prefix LPs on AY_MILP_PREFIX_WORKERS owned workers;
+// `family` is the old cloned-session control under one common wall deadline.
 
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
-use ay_milp::{BabSession, LpSession, Model, Outcome, Sense, SolveOpts};
+use ay_milp::{
+    nodes_explored, reset_nodes_explored, BabSession, Col, LpSession, Model, Outcome, Sense,
+    SolveOpts,
+};
 use num_traits::ToPrimitive;
 
 fn parse_hex_f64(t: &str) -> f64 {
@@ -160,10 +169,7 @@ fn pow2_geometric_scales(cols: &[ColSpec], rows: &[RowSpec]) -> (Vec<f64>, Vec<f
 // set the model is built in the scaled frame (x_j = C_j·x'_j); the reported
 // optimum VALUE is unchanged (column scaling preserves the objective), only the
 // solution vector is in scaled coordinates.
-fn build_model(
-    text: &str,
-    relax: bool,
-) -> (Model, usize, usize, usize, Vec<(usize, ay_milp::Col, f64)>) {
+fn build_model(text: &str, relax: bool) -> (Model, usize, usize, usize, Vec<(usize, Col, f64)>) {
     let (colspecs, rowspecs) = parse_specs(text);
     let ncols = colspecs.len();
     let equilibrate = std::env::var_os("MILP_EQUILIBRATE").is_some();
@@ -189,8 +195,8 @@ fn build_model(
     let mut model = Model::new();
     let mut bins = 0usize;
     let mut pinned = 0usize;
-    let mut cols: Vec<ay_milp::Col> = Vec::with_capacity(ncols);
-    let mut objective: Vec<(usize, ay_milp::Col, f64)> = Vec::new();
+    let mut cols: Vec<Col> = Vec::with_capacity(ncols);
+    let mut objective: Vec<(usize, Col, f64)> = Vec::new();
     for (i, c) in colspecs.iter().enumerate() {
         // x_j = C_j·x'_j, so the scaled box is [lb/C_j, ub/C_j] (C_j=1 for integer cols).
         let cj = cscale[i];
@@ -226,7 +232,7 @@ fn build_model(
 
     for (i, r) in rowspecs.iter().enumerate() {
         let ri = rscale[i];
-        let coeffs: Vec<(ay_milp::Col, f64)> = r
+        let coeffs: Vec<(Col, f64)> = r
             .coeffs
             .iter()
             .map(|&(idx, w)| (cols[idx], w * ri * cscale[idx]))
@@ -354,6 +360,113 @@ fn main() {
         );
     }
 
+    if mode == "shared" || mode == "proof" || mode == "family" {
+        let prefix_text = std::env::var("AY_MILP_PREFIX_COLS")
+            .expect("shared/proof/family mode requires AY_MILP_PREFIX_COLS=i,j,...");
+        let prefix_idx: Vec<usize> = prefix_text
+            .split(',')
+            .map(|part| part.trim().parse().expect("integer prefix column"))
+            .collect();
+        let (model, _nc, _nr, _bins, _obj) = build_model(&text, false);
+        let prefix: Vec<Col> = prefix_idx
+            .iter()
+            .map(|&index| model.col_at(index).expect("prefix column in range"))
+            .collect();
+        reset_nodes_explored();
+        let started = Instant::now();
+
+        if mode == "shared" || mode == "proof" {
+            let shared_opts = opts.clone().with_tree_cert_leaves(0);
+            let mut session = BabSession::new(model, &shared_opts).expect("shared session setup");
+            let out = if mode == "proof" {
+                let workers = std::env::var("AY_MILP_PREFIX_WORKERS")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .and_then(NonZeroUsize::new)
+                    .unwrap_or(NonZeroUsize::new(8).expect("eight is nonzero"));
+                session.check_shared_binary_prefix_proof_first(&prefix, workers)
+            } else {
+                session.check_shared_binary_prefix(&prefix)
+            };
+            let tag = match &out {
+                Ok(Outcome::Optimal { value, .. }) => {
+                    format!("OPTIMAL value={:.6}", value.to_f64().unwrap_or(f64::NAN))
+                }
+                Ok(Outcome::Feasible {
+                    incumbent_only,
+                    dual_bound,
+                    ..
+                }) => format!(
+                    "FEASIBLE incumbent_only={incumbent_only} dual_bound={}",
+                    dual_bound
+                        .as_ref()
+                        .and_then(ToPrimitive::to_f64)
+                        .map_or_else(|| "none".to_owned(), |value| format!("{value:.6}"))
+                ),
+                Ok(Outcome::Infeasible { tree_cert, .. }) => format!(
+                    "INFEASIBLE tree_cert_leaves={}",
+                    tree_cert.as_ref().map_or(0, |tree| tree.num_leaves())
+                ),
+                Ok(Outcome::Unknown { reason }) => format!("UNKNOWN({reason:?})"),
+                Ok(other) => format!("OTHER({other:?})"),
+                Err(error) => format!("ERROR({error:?})"),
+            };
+            println!(
+                "{} {tag} prefix={prefix_idx:?} nodes={} wall={:.3}s",
+                if mode == "proof" { "PROOF" } else { "SHARED" },
+                nodes_explored(),
+                started.elapsed().as_secs_f64()
+            );
+            return;
+        }
+
+        // CONTROL ONLY: reproduce the old architecture's one independently
+        // prepared BabSession per assignment. Every child shares one absolute
+        // wall deadline here so its root-preparation/LP-call total is directly
+        // comparable to `shared`; certificates are intentionally not composed.
+        let deadline = Instant::now() + Duration::from_secs_f64(secs);
+        let leaf_count = 1usize << prefix.len();
+        let mut infeasible = 0usize;
+        let mut unknown = 0usize;
+        let mut feasible = false;
+        let mut roots_attempted = 0usize;
+        for assignment in 0..leaf_count {
+            if Instant::now() >= deadline {
+                unknown += leaf_count - assignment;
+                break;
+            }
+            let mut child = model.clone();
+            for (level, &col) in prefix.iter().enumerate() {
+                let bit = prefix.len() - level - 1;
+                child.fix_col(col, f64::from(((assignment >> bit) & 1) as u8));
+            }
+            let child_opts = SolveOpts::new()
+                .with_deadline(deadline)
+                .with_tree_cert_leaves(0);
+            let mut session = BabSession::new(child, &child_opts).expect("family child session");
+            roots_attempted += 1;
+            match session.check().expect("family child solve") {
+                Outcome::Optimal { .. } | Outcome::Feasible { .. } => {
+                    feasible = true;
+                    break;
+                }
+                Outcome::Infeasible { .. } => infeasible += 1,
+                Outcome::Unknown { .. } | Outcome::Bound { .. } | Outcome::Unbounded => {
+                    unknown += 1
+                }
+                _ => unknown += 1,
+            }
+        }
+        println!(
+            "FAMILY feasible={feasible} infeasible={infeasible}/{leaf_count} \
+             unknown={unknown} prefix={prefix_idx:?} roots_attempted={} nodes={} wall={:.3}s",
+            roots_attempted,
+            nodes_explored(),
+            started.elapsed().as_secs_f64()
+        );
+        return;
+    }
+
     if mode == "dumproot" {
         // MEASUREMENT: cold root LP -> dump the optimal basis (AY_BASIS_FILE).
         let (model, _nc, _nr, _bins, _obj) = build_model(&text, false);
@@ -445,8 +558,7 @@ fn main() {
             "OPT objective: {} nonzero col(s), minimizing",
             objective.len()
         );
-        let obj_terms: Vec<(ay_milp::Col, f64)> =
-            objective.iter().map(|(_, c, w)| (*c, *w)).collect();
+        let obj_terms: Vec<(Col, f64)> = objective.iter().map(|(_, c, w)| (*c, *w)).collect();
         model.set_objective(&obj_terms, Sense::Minimize);
         let t = Instant::now();
         let mut s = match BabSession::new(model.clone(), &opts) {
@@ -522,7 +634,7 @@ fn main() {
             .lines()
             .filter_map(|l| l.trim().parse().ok())
             .collect();
-        let cols: Vec<ay_milp::Col> = idxs
+        let cols: Vec<Col> = idxs
             .iter()
             .map(|&i| model.col_at(i).expect("obbt col in range"))
             .collect();

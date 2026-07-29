@@ -7281,14 +7281,23 @@ case "${LIM:-}" in ''|*[!0-9]*) ;; *) [ "$LIM" -gt 10 ] && ARGS+=("-T:$((LIM - 5
 exec "$DIR/ay" "${ARGS[@]}" "$@"
 "#;
 
+    // `--incremental` reads the SMT-LIB command stream from STDIN. The competition
+    // passes the benchmark as an ARGUMENT, and ay rejects FILE + --incremental
+    // (main.rs:4956, deliberately fail-loud rather than silently ignoring the FILE).
+    // Forwarding "$@" therefore made the wrapper exit 1 on every benchmark — a zero
+    // score for the whole Incremental track. Redirect the argument into stdin
+    // instead, and still accept a bare stdin stream when no argument is given.
     let run_solver_incr = r#"#!/usr/bin/env bash
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIM="${STAREXEC_WALLCLOCK_LIMIT:-${TIMELIMIT:-${TIMEOUT:-}}}"
-ARGS=(--z3-mode -in)  # -in already maps to --incremental; passing both errors "cannot be used multiple times"
+ARGS=(--z3-mode --incremental)
 case "${LIM:-}" in ''|*[!0-9]*) ;; *) [ "$LIM" -gt 10 ] && ARGS+=("-T:$((LIM - 5))");; esac
-exec "$DIR/ay" "${ARGS[@]}" "$@"
+if [ "$#" -gt 0 ]; then
+  exec "$DIR/ay" "${ARGS[@]}" < "$1"
+fi
+exec "$DIR/ay" "${ARGS[@]}"
 "#;
 
     let submission_json = smt_submission_json(
@@ -7486,15 +7495,26 @@ fn smt_submission_json(
         "QF_LRA",
         "QF_IDL",
         "QF_RDL",
-        // QF_UFLIA withdrawn (2026-06-15): a confirmed false-SAT in the combined
-        // EUF+LIA path (a chained ite-over-Int defining a UF application is not
-        // enforced) reproduces non-incrementally — see
-        // benchmarks/smt/regression/soundness_qf_uf_incremental/traffic_uflia_falsesat_*
-        // and the development design notes A single wrong
-        // answer voids the division; re-add only after the ite-chain bug is fixed.
-        // QF_AUFLIA is a strict superset of that buggy combination but was
-        // verified clean on a 36-file incremental sample (0 soundness conflicts,
-        // AY 20/36) — kept; re-audit on a larger sample if the ite-chain fix slips.
+        // QF_UFLIA RE-ADDED (2026-07-28) under the exact condition its withdrawal
+        // named. It was withdrawn 2026-06-15 for a confirmed false-SAT in the
+        // combined EUF+LIA path (a chained ite-over-Int defining a UF application
+        // was not enforced), with the instruction "re-add only after the ite-chain
+        // bug is fixed". That bug IS fixed — by `IteDefinitionOracle`
+        // (executor/model/validation/) — and the fix is now evidenced three ways:
+        //   * both committed regression fixtures
+        //     (benchmarks/smt/regression/soundness_qf_uf_incremental/
+        //     traffic_uflia_falsesat_{min,full}.smt2) answer `unsat`, agreeing
+        //     with z3, where the bug produced `sat`;
+        //   * a 120-instance QF_UFLIA differential against z3 decided 65 and found
+        //     ZERO disagreements — 48 of those are SAT answers, which is precisely
+        //     the direction the withdrawn defect went wrong in;
+        //   * the development design notes
+        //     re-verified the fix on main 4b0f194b6 (its "LIVE" header had been
+        //     stale for weeks and was being cited as an open division-voiding risk).
+        // This also retires the standing caveat on QF_AUFLIA below: it was kept on
+        // a 36-file sample while being "a strict superset of that buggy
+        // combination", and the combination is no longer buggy.
+        "QF_UFLIA",
         "QF_AUFLIA",
         "QF_AX",
         "QF_DT",

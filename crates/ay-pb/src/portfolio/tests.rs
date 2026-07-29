@@ -3523,7 +3523,7 @@ fn test_backfill_activates_tail_arms_on_huge_instance_end_to_end() {
     }
 
     let term_flag = AtomicBool::new(false);
-    let (outcome, labels) = run_parallel_optimization_traced(
+    let (outcome, labels, _reported_dual) = run_parallel_optimization_traced(
         &Arc::new(instance.clone()),
         &objective,
         Some(Duration::from_millis(1500)),

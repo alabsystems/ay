@@ -32,8 +32,6 @@
 #![allow(clippy::panic)]
 
 use ay_sat::{parse_dimacs, Literal, SatResult, SatUnknownReason};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Per-benchmark timeout. Short because we run many benchmarks and only need
@@ -46,20 +44,14 @@ fn solve_benchmark(dimacs: &str, timeout_secs: u64) -> (SatResult, Option<SatUnk
     let formula = parse_dimacs(dimacs).expect("DIMACS parse failed");
     let mut solver = formula.into_solver();
 
-    let flag = Arc::new(AtomicBool::new(false));
-    let flag_clone = flag.clone();
-    solver.set_interrupt(flag.clone());
-    let handle = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(timeout_secs));
-        flag_clone.store(true, Ordering::Relaxed);
-    });
+    let timer =
+        super::common::SolverInterruptTimer::start(&mut solver, Duration::from_secs(timeout_secs));
 
     let result = solver
-        .solve_interruptible(|| flag.load(Ordering::Relaxed))
+        .solve_interruptible(|| timer.is_interrupted())
         .into_inner();
 
-    flag.store(true, Ordering::Relaxed);
-    let _ = handle.join();
+    timer.cancel_and_join();
 
     let reason = solver.last_unknown_reason();
     (result, reason)

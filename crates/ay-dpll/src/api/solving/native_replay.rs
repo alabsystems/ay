@@ -248,13 +248,60 @@ impl Solver {
     pub fn replay_native_replay_artifact(
         artifact: &NativeReplayArtifact,
     ) -> Result<crate::api::types::SolveDetails, SolverError> {
+        Self::replay_native_replay_artifact_impl(artifact, None, false)
+    }
+
+    /// Replay an exported native artifact with a caller-bounded, strict proof
+    /// check for any UNSAT result.
+    ///
+    /// The effective wall-clock bound is the smaller of `timeout` and the
+    /// artifact's recorded timeout (when present). An `Ok` UNSAT result is
+    /// therefore an authority-bearing result: strict proof checking ran, a
+    /// complete non-empty proof artifact exists, every proof step was checked,
+    /// and the checker recorded no failures, holes, or trust fallbacks. Missing
+    /// or partial evidence returns an error instead of exposing plain UNSAT.
+    /// SAT and Unknown remain diagnostic `SolveDetails`.
+    ///
+    /// The ordinary [`Self::replay_native_replay_artifact`] entrypoint remains
+    /// unchanged and does not opt into proof production.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed replay artifacts, option setup failures,
+    /// or an UNSAT result that does not meet the strict proof-authority
+    /// postcondition.
+    pub fn replay_native_replay_artifact_with_proofs(
+        artifact: &NativeReplayArtifact,
+        timeout: Duration,
+    ) -> Result<crate::api::types::SolveDetails, SolverError> {
+        let details = Self::replay_native_replay_artifact_impl(artifact, Some(timeout), true)?;
+        Self::require_native_replay_proof_authority(details)
+    }
+
+    fn replay_native_replay_artifact_impl(
+        artifact: &NativeReplayArtifact,
+        caller_timeout: Option<Duration>,
+        require_proofs: bool,
+    ) -> Result<crate::api::types::SolveDetails, SolverError> {
         let logic = Logic::from_str(artifact.logic.as_deref().unwrap_or("ALL"))?;
         validate_native_replay_identity_tables(artifact)?;
         let mut solver = Self::try_new(logic)?;
-        if let Some(timeout_ms) = artifact.timeout_ms {
-            solver.set_timeout(Some(Duration::from_millis(
-                timeout_ms.min(u128::from(u64::MAX)) as u64,
-            )));
+
+        if require_proofs {
+            solver.set_produce_proofs(true);
+            solver.try_set_option(":check-proofs-strict", "true")?;
+        }
+
+        let artifact_timeout = artifact
+            .timeout_ms
+            .map(|timeout_ms| Duration::from_millis(timeout_ms.min(u128::from(u64::MAX)) as u64));
+        let effective_timeout = match (caller_timeout, artifact_timeout) {
+            (Some(caller), Some(recorded)) => Some(caller.min(recorded)),
+            (Some(caller), None) => Some(caller),
+            (None, recorded) => recorded,
+        };
+        if let Some(timeout) = effective_timeout {
+            solver.set_timeout(Some(timeout));
         }
 
         for datatype in datatype_declarations_from_events(&artifact.events) {
@@ -315,6 +362,55 @@ impl Solver {
         }
     }
 
+    fn require_native_replay_proof_authority(
+        details: crate::api::types::SolveDetails,
+    ) -> Result<crate::api::types::SolveDetails, SolverError> {
+        if !details.result.is_unsat() {
+            return Ok(details);
+        }
+
+        let stats = &details.statistics;
+        let checker_failures = stats.get_int("proof_checker_failures");
+        let checked_steps = stats.get_int("proof_checker_checked_steps");
+        let total_steps = stats.get_int("proof_checker_total_steps");
+        let skipped_holes = stats.get_int("proof_checker_skipped_hole_steps");
+        let trust_fallbacks = stats.get_int("proof_trust");
+        let proof_checking_active =
+            cfg!(feature = "proof-checker") && details.verification_level.has_proof_checking();
+        let all_steps_checked = matches!(
+            (checked_steps, total_steps),
+            (Some(checked), Some(total)) if total > 0 && checked == total
+        );
+        let accepted = proof_checking_active
+            && details.verification.unsat_proof_available
+            && details.verification.unsat_proof_checker_failures == 0
+            && checker_failures == Some(0)
+            && stats.proof_complete
+            && trust_fallbacks == Some(0)
+            && skipped_holes == Some(0)
+            && all_steps_checked;
+
+        if accepted {
+            return Ok(details);
+        }
+
+        Err(SolverError::InvalidArgument {
+            operation: "native_replay_with_proofs",
+            message: format!(
+                "UNSAT replay lacks strict proof authority \
+                 (checker_active={proof_checking_active}, \
+                 artifact_available={}, summary_checker_failures={}, \
+                 raw_checker_failures={checker_failures:?}, \
+                 proof_complete={}, proof_trust={trust_fallbacks:?}, \
+                 checked_steps={checked_steps:?}, total_steps={total_steps:?}, \
+                 skipped_holes={skipped_holes:?})",
+                details.verification.unsat_proof_available,
+                details.verification.unsat_proof_checker_failures,
+                stats.proof_complete,
+            ),
+        })
+    }
+
     /// Parse and replay an exported native replay JSON document.
     ///
     /// # Errors
@@ -326,6 +422,110 @@ impl Solver {
     ) -> Result<crate::api::types::SolveDetails, SolverError> {
         let artifact = NativeReplayArtifact::from_json_str(json)?;
         Self::replay_native_replay_artifact(&artifact)
+    }
+}
+
+#[cfg(test)]
+mod proof_required_authority_tests {
+    use super::*;
+    use crate::api::{Logic, Sort};
+
+    fn strict_boolean_unsat_details() -> crate::api::types::SolveDetails {
+        let mut solver = Solver::try_new(Logic::QfUf).expect("solver");
+        solver.set_produce_proofs(true);
+        solver
+            .try_set_option(":check-proofs-strict", "true")
+            .expect("strict proof option");
+        let p = solver.declare_const("p", Sort::Bool);
+        let not_p = solver.not(p);
+        solver.assert_term(p);
+        solver.assert_term(not_p);
+        solver.check_sat_with_details()
+    }
+
+    #[cfg(feature = "proof-checker")]
+    #[test]
+    fn proof_required_authority_rejects_holes_and_checker_failures() {
+        let details = strict_boolean_unsat_details();
+        let _ = Solver::require_native_replay_proof_authority(details.clone())
+            .expect("strict complete Boolean proof must carry authority");
+        let assert_rejected = |details| {
+            assert!(matches!(
+                Solver::require_native_replay_proof_authority(details),
+                Err(SolverError::InvalidArgument {
+                    operation: "native_replay_with_proofs",
+                    ..
+                })
+            ));
+        };
+
+        let total = details
+            .statistics
+            .get_int("proof_checker_total_steps")
+            .expect("strict checker total");
+        assert!(total > 0);
+
+        // Model the partial checker's intentional Hole behavior: it can report
+        // zero failures while skipping one step. The proof-required boundary
+        // must reject that evidence even though the summary failure count is 0.
+        let mut holey = details.clone();
+        holey.statistics.proof_complete = false;
+        holey.statistics.set_int("proof_checker_failures", 0);
+        holey
+            .statistics
+            .set_int("proof_checker_skipped_hole_steps", 1);
+        holey
+            .statistics
+            .set_int("proof_checker_checked_steps", total - 1);
+        assert_rejected(holey);
+
+        let mut checker_failed = details.clone();
+        checker_failed
+            .statistics
+            .set_int("proof_checker_failures", 1);
+        checker_failed.verification.unsat_proof_checker_failures = 1;
+        assert_rejected(checker_failed);
+
+        let mut missing_raw_stats = details.clone();
+        for key in [
+            "proof_checker_failures",
+            "proof_checker_checked_steps",
+            "proof_checker_total_steps",
+            "proof_checker_skipped_hole_steps",
+        ] {
+            missing_raw_stats.statistics.extra.remove(key);
+        }
+        assert_rejected(missing_raw_stats);
+
+        let mut trusted = details.clone();
+        trusted.statistics.set_int("proof_trust", 1);
+        assert_rejected(trusted);
+
+        let mut incomplete = details.clone();
+        incomplete.statistics.proof_complete = false;
+        assert_rejected(incomplete);
+
+        let mut empty = details.clone();
+        empty.statistics.set_int("proof_checker_total_steps", 0);
+        empty.statistics.set_int("proof_checker_checked_steps", 0);
+        assert_rejected(empty);
+
+        let mut unavailable = details;
+        unavailable.verification.unsat_proof_available = false;
+        assert_rejected(unavailable);
+    }
+
+    #[cfg(not(feature = "proof-checker"))]
+    #[test]
+    fn proof_required_authority_rejects_build_without_checker() {
+        let details = strict_boolean_unsat_details();
+        assert!(matches!(
+            Solver::require_native_replay_proof_authority(details),
+            Err(SolverError::InvalidArgument {
+                operation: "native_replay_with_proofs",
+                ..
+            })
+        ));
     }
 }
 

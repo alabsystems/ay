@@ -1363,6 +1363,13 @@ impl RegExpSolver {
     /// Tries every start position and returns the shortest match at the
     /// leftmost position. Returns `Incomplete` if the regex contains
     /// constructs that `evaluate()` cannot handle.
+    ///
+    /// The empty match is eligible, which is what `str.replace_re` wants: the
+    /// SMT-LIB 2.6 Unicode Strings clause for `str.replace_re` decomposes
+    /// `s = x ++ w ++ z` with `w` in `[[r]]`, `|x|` minimal and then `|w|`
+    /// minimal, and carries **no** `w != ""` side condition. Use
+    /// [`Self::find_first_nonempty_match_with_budget`] for `str.replace_re_all`,
+    /// whose clause does carry it.
     pub(crate) fn find_first_match(terms: &TermStore, s: &str, r: TermId) -> MatchResult {
         let mut budget = RegexWorkBudget::unlimited();
         match Self::find_first_match_with_budget(terms, s, r, &mut budget) {
@@ -1377,10 +1384,40 @@ impl RegExpSolver {
         r: TermId,
         budget: &mut RegexWorkBudget,
     ) -> Result<MatchResult, RegexWorkLimitExceeded> {
+        Self::find_first_match_of_min_len(terms, s, r, 0, budget)
+    }
+
+    /// Find the leftmost, then shortest, **non-empty** match of `r` in `s`.
+    ///
+    /// This is the matcher required by the SMT-LIB 2.6 Unicode Strings clause
+    /// for `str.replace_re_all`, which decomposes `s = x ++ w ++ z` with `w` in
+    /// `[[r]]` **and `w != ""`**, `|x|` minimal and then `|w|` minimal. Using
+    /// the empty-match-eligible [`Self::find_first_match_with_budget`] there is
+    /// a soundness defect: for any nullable `r` the leftmost shortest match is
+    /// the empty match at position 0, so no replacement ever happens and the
+    /// operator degenerates to the identity.
+    pub(crate) fn find_first_nonempty_match_with_budget(
+        terms: &TermStore,
+        s: &str,
+        r: TermId,
+        budget: &mut RegexWorkBudget,
+    ) -> Result<MatchResult, RegexWorkLimitExceeded> {
+        Self::find_first_match_of_min_len(terms, s, r, 1, budget)
+    }
+
+    /// Shared leftmost-then-shortest scan with a minimum match length in
+    /// characters (`0` admits the empty match, `1` excludes it).
+    fn find_first_match_of_min_len(
+        terms: &TermStore,
+        s: &str,
+        r: TermId,
+        min_chars: usize,
+        budget: &mut RegexWorkBudget,
+    ) -> Result<MatchResult, RegexWorkLimitExceeded> {
         let chars: Vec<char> = s.chars().collect();
         for start in 0..=chars.len() {
             let start_byte = chars[..start].iter().map(|c| c.len_utf8()).sum::<usize>();
-            for end in start..=chars.len() {
+            for end in (start + min_chars)..=chars.len() {
                 let end_byte = chars[..end].iter().map(|c| c.len_utf8()).sum::<usize>();
                 let substr = &s[start_byte..end_byte];
                 match Self::evaluate_with_budget(terms, substr, r, budget)? {

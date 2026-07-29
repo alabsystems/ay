@@ -423,6 +423,16 @@ load_sat_profile_metadata() {
         exit 2
     }
 
+    # Every runtime_env key the matrix exports must be a name the solver knows.
+    # The block below already checks the REQUIRED keys are PRESENT; nothing checked
+    # that a declared key means anything, and three did not -- two of them carrying
+    # the literal placeholder value "required". A profile that exports a key nothing
+    # reads does not describe the configuration the scored run executes.
+    "${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}/competition/validate_runtime_env.py" || {
+        echo "ERROR: submission profile exports a runtime_env key the solver does not know" >&2
+        exit 2
+    }
+
     SAT_PROFILE_METADATA=()
     while IFS= read -r line; do
         line="${line%$'\r'}"

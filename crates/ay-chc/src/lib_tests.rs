@@ -1020,6 +1020,213 @@ fn prove_external_invariant_model_rejects_invalid_model() {
     );
 }
 
+/// External proof admission must validate the exact original nullary query.
+///
+/// The solve-time nullary-fail rewrite turns `error_p0 => error; query error`
+/// into a direct `query error_p0`. That rewrite is equisatisfiable for solving,
+/// but it is not a valid consumer-side model check: it erases the interpretation
+/// of `error` itself. A transported model with `error = true` must therefore be
+/// rejected even when `error_p0 = false` makes the rewritten query unreachable.
+#[test]
+fn external_model_validation_preserves_nullary_query_predicate() {
+    let smt2 = r#"
+(set-logic HORN)
+(declare-rel State (Int))
+(declare-rel error_p0 ())
+(declare-rel error ())
+(declare-var x Int)
+(declare-var xp Int)
+(rule (=> (= x 0) (State x)))
+(rule (=> (and (State x) (= xp (+ x 1))) (State xp)))
+(rule (=> (and (State x) (< x 0)) error_p0))
+(rule (=> error_p0 error))
+(query error)
+"#;
+    let problem = ChcParser::parse(smt2).expect("nullary-query fixture should parse");
+    let state = problem.lookup_predicate("State").expect("State predicate");
+    let error_p0 = problem
+        .lookup_predicate("error_p0")
+        .expect("error_p0 predicate");
+    let error = problem.lookup_predicate("error").expect("error predicate");
+    let state_var = ChcVar::new("x", ChcSort::Int);
+
+    let mut invalid = InvariantModel::new();
+    invalid.set(
+        state,
+        PredicateInterpretation::new(
+            vec![state_var.clone()],
+            ChcExpr::ge(ChcExpr::var(state_var.clone()), ChcExpr::int(0)),
+        ),
+    );
+    invalid.set(
+        error_p0,
+        PredicateInterpretation::new(Vec::new(), ChcExpr::Bool(false)),
+    );
+    invalid.set(
+        error,
+        PredicateInterpretation::new(Vec::new(), ChcExpr::Bool(true)),
+    );
+
+    let config = PdrConfig::default();
+    assert!(
+        !engines::validate_external_invariant_model(&problem, &invalid, &config)
+            .expect("validation should not panic"),
+        "a model permitting the exact nullary query predicate must be rejected"
+    );
+    let rejected =
+        engines::prove_external_invariant_model(problem.clone(), invalid, config.clone())
+            .expect("invalid candidate should demote rather than error");
+    assert!(!rejected.accepted_as_proof());
+    assert!(rejected.result.is_unknown());
+
+    let mut valid = InvariantModel::new();
+    valid.set(
+        state,
+        PredicateInterpretation::new(
+            vec![state_var.clone()],
+            ChcExpr::ge(ChcExpr::var(state_var), ChcExpr::int(0)),
+        ),
+    );
+    valid.set(
+        error_p0,
+        PredicateInterpretation::new(Vec::new(), ChcExpr::Bool(false)),
+    );
+    valid.set(
+        error,
+        PredicateInterpretation::new(Vec::new(), ChcExpr::Bool(false)),
+    );
+    assert!(
+        engines::validate_external_invariant_model(&problem, &valid, &config)
+            .expect("valid nullary-query model should verify"),
+        "preserving original clauses must still admit a genuinely valid model"
+    );
+
+    let run = engines::solve_pdr_proof(problem.clone(), config)
+        .expect("proof-grade nullary-query solve should not error");
+    assert!(
+        run.accepted_as_proof(),
+        "proof-grade PDR must construct an exact-clause model: {run:?}"
+    );
+    let solved = run
+        .result
+        .safe_invariant()
+        .expect("accepted proof must carry a Safe invariant")
+        .model();
+    assert!(
+        !solved.convergence_proven,
+        "nullary candidate completion must not inherit frame-convergence authority"
+    );
+    for predicate in problem.predicates() {
+        assert!(
+            solved.get(&predicate.id).is_some(),
+            "proof-grade model must be total for original predicate {}",
+            predicate.name
+        );
+    }
+    assert!(
+        engines::validate_external_invariant_model(&problem, solved, &PdrConfig::default())
+            .expect("the proof-grade model should validate without panicking"),
+        "the proof-grade model must satisfy every exact original clause"
+    );
+    let checked = run
+        .run_checked_replay(&problem, std::time::Duration::from_secs(10))
+        .expect("strict replay should discharge the exact nullary-query model");
+    assert!(checked.proof_run.accepted_as_proof());
+    assert!(
+        checked
+            .summary
+            .obligations
+            .iter()
+            .all(|obligation| obligation.strict_cert.is_some()),
+        "every UNSAT exact-clause obligation must carry a strict certificate"
+    );
+}
+
+/// Default-false completion of the nullary query slice is only a candidate.
+///
+/// If a defining body is reachable, exact original-clause validation must keep
+/// the result out of Safe even though the nullary predicates have no facts of
+/// their own.
+#[test]
+fn nullary_query_candidate_completion_rejects_reachable_body() {
+    let problem = ChcParser::parse(
+        r#"
+(set-logic HORN)
+(declare-rel State (Int))
+(declare-rel error_p0 ())
+(declare-rel error ())
+(declare-var x Int)
+(declare-var xp Int)
+(rule (=> (= x 0) (State x)))
+(rule (=> (and (State x) (= xp (+ x 1))) (State xp)))
+(rule (=> (and (State x) (= x 0)) error_p0))
+(rule (=> error_p0 error))
+(query error)
+"#,
+    )
+    .expect("reachable-body fixture should parse");
+
+    let run = engines::solve_pdr_proof(problem, PdrConfig::default())
+        .expect("reachable-body solve should not error");
+    assert!(
+        !run.result.is_safe(),
+        "candidate nullary completion must not mint Safe for a reachable body: {run:?}"
+    );
+}
+
+/// A queried nullary predicate with its own fact can never be completed false.
+#[test]
+fn nullary_query_candidate_completion_rejects_nullary_fact() {
+    let problem = ChcParser::parse(
+        r#"
+(set-logic HORN)
+(declare-rel State (Int))
+(declare-rel error ())
+(declare-var x Int)
+(declare-var xp Int)
+(rule (=> (= x 0) (State x)))
+(rule (=> (and (State x) (= xp (+ x 1))) (State xp)))
+(rule (=> true error))
+(query error)
+"#,
+    )
+    .expect("nullary-fact fixture should parse");
+
+    let run = engines::solve_pdr_proof(problem, PdrConfig::default())
+        .expect("nullary-fact solve should not error");
+    assert!(
+        !run.result.is_safe(),
+        "a nullary fact must prevent false candidate completion: {run:?}"
+    );
+}
+
+/// A constraint-only nullary definition is not necessarily a reachable fact.
+///
+/// This mirrors the typed abs-neg bridge shape: its defining constraint is
+/// contradictory, so exact validation can safely accept the false candidate.
+#[test]
+fn nullary_query_candidate_completion_accepts_unsat_constraint_fact() {
+    let problem = ChcParser::parse(
+        r#"
+(set-logic HORN)
+(declare-rel error ())
+(declare-var x Int)
+(rule (=> (and (= x 0) (< x 0)) error))
+(query error)
+"#,
+    )
+    .expect("UNSAT constraint-fact fixture should parse");
+
+    let run = engines::solve_pdr_proof(problem.clone(), PdrConfig::default())
+        .expect("UNSAT constraint-fact solve should not error");
+    assert!(
+        run.result.is_safe() && run.accepted_as_proof(),
+        "an UNSAT constraint-only definition should validate Safe: {run:?}"
+    );
+    run.run_checked_replay(&problem, std::time::Duration::from_secs(10))
+        .expect("strict replay should certify the UNSAT constraint-only definition");
+}
+
 /// Test proof-grade PDR API fails closed: cancellation yields Unknown/non-proof.
 #[test]
 fn test_solve_pdr_proof_cancelled_is_non_proof() {
@@ -1445,7 +1652,7 @@ fn test_external_model_validation_preserves_array_signature_model_checker_consum
 }
 
 #[test]
-fn test_external_model_validation_honors_preserve_original_clauses_config() {
+fn test_external_model_validation_always_preserves_original_clauses() {
     let src = include_str!("lib.rs");
     let fn_start = src
         .find("fn external_model_validation_config(base: &PdrConfig) -> PdrConfig")
@@ -1457,8 +1664,12 @@ fn test_external_model_validation_honors_preserve_original_clauses_config() {
     let fn_body = &fn_body[..fn_end];
 
     assert!(
-        fn_body.contains("preserve_original_clauses: base.preserve_original_clauses"),
-        "external model validation must not drop the caller's original-clause preservation flag"
+        fn_body.contains("preserve_original_clauses: true"),
+        "external model validation must always preserve the exact caller clauses"
+    );
+    assert!(
+        !fn_body.contains("preserve_original_clauses: base.preserve_original_clauses"),
+        "a caller must not be able to re-enable solve-time nullary query rewriting during validation"
     );
 }
 

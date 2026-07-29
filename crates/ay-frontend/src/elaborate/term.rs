@@ -116,8 +116,15 @@ impl Context {
                 // definitions like (define-fun my_eq () Bool (= a b))
                 if let Some((params, result_sort, body)) = self.fun_defs.get(name).cloned() {
                     if params.is_empty() {
-                        // It's a nullary function, just expand the body
-                        let term = self.elaborate_term(&body, env)?;
+                        // Expand the body in the DEFINITION-TIME environment,
+                        // which for a nullary macro has no local bindings at all
+                        // (SMT-LIB 2.6 §4.2.2: the body's symbols resolve against
+                        // the signature at definition time, i.e. the globals).
+                        // Passing the USE-SITE `env` let every enclosing binder —
+                        // quantifier variable, `let` binding, `match` pattern
+                        // variable — capture a global the body names; see the
+                        // capture-avoidance note in `elaborate_app`.
+                        let term = self.elaborate_term(&body, &HashMap::default())?;
                         // SMT-LIB implicit Int->Real coercion for define-fun:
                         // (define-fun x () Real 0) — the numeral `0` elaborates
                         // as Int but the declared sort is Real. Coerce to match.

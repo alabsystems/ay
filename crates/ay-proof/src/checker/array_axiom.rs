@@ -258,6 +258,301 @@ pub(crate) fn array_select_store_printer_terms(
     None
 }
 
+/// One `store` skipped while evaluating a chain at the read index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RowChainSkip {
+    /// The POSITIVE `(= x i)` clause literal that licenses the skip. Its
+    /// printed orientation is whatever the clause carries; the printer checks
+    /// it against both spellings and bridges with `not_symm` when needed.
+    pub guard: TermId,
+    /// `(store inner i v)` — the array term before the skip.
+    pub outer: TermId,
+    /// The array term after the skip (`inner`).
+    pub inner: TermId,
+    /// The skipped store's index `i`.
+    pub store_index: TermId,
+}
+
+/// How a read-over-write chain walk terminates at the read index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RowChainEnd {
+    /// The walk reached `(store inner x v)` whose index IS the read index, so
+    /// the chain evaluates to `v` by `arrays_idx`.
+    Value { outer: TermId, value: TermId },
+    /// The walk exhausted the chain: the value is `(select base x)`.
+    Base { base: TermId },
+}
+
+/// The intermediate array terms of one chain walk, in outermost-first order.
+///
+/// This is exactly the trace [`eval_chain_at`] takes, recorded so the Alethe
+/// printer can emit one `arrays_row` step per skipped `store`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RowChainPath {
+    pub root: TermId,
+    pub skips: Vec<RowChainSkip>,
+    pub end: RowChainEnd,
+}
+
+/// Exact `ArrayRowChain` shapes the Alethe printer may lower to Carcara's
+/// `arrays_idx` / `arrays_row` / `cong` / `trans` rules.
+///
+/// Mirrors the two sub-schemas of [`validate_array_row_chain`]. The extractor
+/// additionally demands that the clause carry NO literal beyond the ones the
+/// derivation consumes: the printer discharges exactly the guards it assumed
+/// and cannot manufacture an unrelated extra literal in the final resolvent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ArrayRowChainPrinterTerms {
+    /// Sub-schema (A): `(= (select C x) eval(C, x))`.
+    Eval {
+        conclusion: TermId,
+        select: TermId,
+        value_side: TermId,
+        read_index: TermId,
+        path: RowChainPath,
+        packed_or: Option<TermId>,
+    },
+    /// Sub-schema (B): `(not (= L R))` plus `(= eval(L, x) eval(R, x))`.
+    UnderArrayEq {
+        conclusion: TermId,
+        /// The `(not (= L R))` clause literal.
+        array_eq_lit: TermId,
+        /// The `(= L R)` term inside it.
+        eq_term: TermId,
+        /// The conclusion side `eval(L, x)` denotes.
+        left_target: TermId,
+        /// The conclusion side `eval(R, x)` denotes.
+        right_target: TermId,
+        read_index: TermId,
+        left: RowChainPath,
+        right: RowChainPath,
+        packed_or: Option<TermId>,
+    },
+}
+
+/// The literal `(= a b)` / `(= b a)` of `literals`, if the clause carries one.
+fn find_positive_eq_literal(
+    terms: &TermStore,
+    literals: &[TermId],
+    a: TermId,
+    b: TermId,
+) -> Option<TermId> {
+    literals
+        .iter()
+        .copied()
+        .find(|&lit| matches_equality_pair(terms, lit, a, b))
+}
+
+/// Record the chain walk [`eval_chain_at`] performs, keeping every
+/// intermediate array term. Returns `None` in exactly the cases
+/// `eval_chain_at` returns `None`.
+fn row_chain_path_at(
+    terms: &TermStore,
+    term: TermId,
+    index: TermId,
+    literals: &[TermId],
+) -> Option<RowChainPath> {
+    // Re-run the full well-sortedness check of the chain before trusting any
+    // of its nodes; `parse_store_chain` is the single source of that truth.
+    parse_store_chain(terms, term)?;
+    let Sort::Array(array_sort) = terms.sort(term) else {
+        return None;
+    };
+    if terms.sort(index) != &array_sort.index_sort {
+        return None;
+    }
+    let mut skips = Vec::new();
+    let mut current = term;
+    while let TermData::App(sym, args) = terms.get(current) {
+        if !matches!(sym, Symbol::Named(name) if name == "store") || args.len() != 3 {
+            break;
+        }
+        let (inner, entry_index, entry_value) = (args[0], args[1], args[2]);
+        if entry_index == index {
+            return Some(RowChainPath {
+                root: term,
+                skips,
+                end: RowChainEnd::Value {
+                    outer: current,
+                    value: entry_value,
+                },
+            });
+        }
+        let guard = find_positive_eq_literal(terms, literals, index, entry_index)?;
+        skips.push(RowChainSkip {
+            guard,
+            outer: current,
+            inner,
+            store_index: entry_index,
+        });
+        current = inner;
+    }
+    Some(RowChainPath {
+        root: term,
+        skips,
+        end: RowChainEnd::Base { base: current },
+    })
+}
+
+/// Whether the walk's terminal value is denoted by `target`.
+fn path_end_denotes(terms: &TermStore, path: &RowChainPath, index: TermId, target: TermId) -> bool {
+    match path.end {
+        RowChainEnd::Value { value, .. } => value == target,
+        RowChainEnd::Base { base } => is_select_of(terms, target, base, index),
+    }
+}
+
+/// Whether `literals` is EXACTLY the set `used` (order and multiplicity are
+/// irrelevant; every clause literal must be consumed by the derivation).
+fn consumes_every_literal(literals: &[TermId], used: &[TermId]) -> bool {
+    literals.iter().all(|lit| used.contains(lit))
+}
+
+/// Return the exact primitive terms the Alethe printer may lower to Carcara's
+/// checked array rules for an `ArrayRowChain` lemma.
+///
+/// The search order mirrors [`matches_row_chain`] exactly, so any clause this
+/// returns terms for is one [`validate_array_row_chain`] accepts. The converse
+/// does NOT hold: this refuses clauses carrying literals the derivation would
+/// not discharge, because the printer's closing `resolution` can only produce
+/// the resolvent of what it actually assumed.
+pub(crate) fn array_row_chain_printer_terms(
+    terms: &TermStore,
+    clause: &[TermId],
+) -> Option<ArrayRowChainPrinterTerms> {
+    let (literals, packed_or): (Vec<TermId>, Option<TermId>) = match clause {
+        [packed] => match terms.get(*packed) {
+            TermData::App(Symbol::Named(symbol), args) if symbol == "or" && args.len() >= 2 => {
+                (args.clone(), Some(*packed))
+            }
+            _ => (clause.to_vec(), None),
+        },
+        _ => (clause.to_vec(), None),
+    };
+
+    // Sub-schema (A).
+    for &lit in &literals {
+        let Some((lhs, rhs)) = equality_sides(terms, lit) else {
+            continue;
+        };
+        if terms.sort(lhs) != terms.sort(rhs) {
+            continue;
+        }
+        for (select_side, value_side) in [(lhs, rhs), (rhs, lhs)] {
+            let Some((array, read_index)) = well_sorted_select_parts(terms, select_side) else {
+                continue;
+            };
+            let Some(chain) = parse_store_chain(terms, array) else {
+                continue;
+            };
+            if chain.entries.is_empty() {
+                continue;
+            }
+            let Some(path) = row_chain_path_at(terms, array, read_index, &literals) else {
+                continue;
+            };
+            if !path_end_denotes(terms, &path, read_index, value_side) {
+                continue;
+            }
+            let mut used: Vec<TermId> = path.skips.iter().map(|skip| skip.guard).collect();
+            used.push(lit);
+            if !consumes_every_literal(&literals, &used) {
+                continue;
+            }
+            return Some(ArrayRowChainPrinterTerms::Eval {
+                conclusion: lit,
+                select: select_side,
+                value_side,
+                read_index,
+                path,
+                packed_or,
+            });
+        }
+    }
+
+    // Sub-schema (B).
+    let premises: Vec<(TermId, TermId, TermId)> = literals
+        .iter()
+        .filter_map(|&lit| negated_equality_sides(terms, lit).map(|(l, r)| (lit, l, r)))
+        .filter(|&(_, l, r)| {
+            matches!(terms.sort(l), Sort::Array(_)) && terms.sort(l) == terms.sort(r)
+        })
+        .collect();
+    for &lit in &literals {
+        let Some((lhs, rhs)) = equality_sides(terms, lit) else {
+            continue;
+        };
+        if terms.sort(lhs) != terms.sort(rhs) {
+            continue;
+        }
+        let mut candidates: Vec<TermId> = Vec::new();
+        for side in [lhs, rhs] {
+            if let Some((_, read_index)) = well_sorted_select_parts(terms, side) {
+                if !candidates.contains(&read_index) {
+                    candidates.push(read_index);
+                }
+            }
+        }
+        for &(premise_lit, left, right) in &premises {
+            let Sort::Array(array_sort) = terms.sort(left) else {
+                continue;
+            };
+            if terms.sort(lhs) != &array_sort.element_sort {
+                continue;
+            }
+            for &read_index in &candidates {
+                if terms.sort(read_index) != &array_sort.index_sort {
+                    continue;
+                }
+                let (Some(left_path), Some(right_path)) = (
+                    row_chain_path_at(terms, left, read_index, &literals),
+                    row_chain_path_at(terms, right, read_index, &literals),
+                ) else {
+                    continue;
+                };
+                let targets = if path_end_denotes(terms, &left_path, read_index, lhs)
+                    && path_end_denotes(terms, &right_path, read_index, rhs)
+                {
+                    (lhs, rhs)
+                } else if path_end_denotes(terms, &left_path, read_index, rhs)
+                    && path_end_denotes(terms, &right_path, read_index, lhs)
+                {
+                    (rhs, lhs)
+                } else {
+                    continue;
+                };
+                let mut used: Vec<TermId> = left_path
+                    .skips
+                    .iter()
+                    .chain(right_path.skips.iter())
+                    .map(|skip| skip.guard)
+                    .collect();
+                used.push(lit);
+                used.push(premise_lit);
+                if !consumes_every_literal(&literals, &used) {
+                    continue;
+                }
+                let eq_term = match terms.get(premise_lit) {
+                    TermData::Not(inner) => *inner,
+                    _ => continue,
+                };
+                return Some(ArrayRowChainPrinterTerms::UnderArrayEq {
+                    conclusion: lit,
+                    array_eq_lit: premise_lit,
+                    eq_term,
+                    left_target: targets.0,
+                    right_target: targets.1,
+                    read_index,
+                    left: left_path,
+                    right: right_path,
+                    packed_or,
+                });
+            }
+        }
+    }
+    None
+}
+
 /// Recognize the array theory lemma kind `clause` can be strict-validated as,
 /// or `None` when no exact schema matches (the lemma must then stay `Generic`
 /// / `:rule trust`).

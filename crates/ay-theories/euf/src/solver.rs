@@ -143,6 +143,14 @@ pub struct EufSolver<'a> {
     /// Pre-computed list of function application terms with their argument ids
     /// This avoids iterating all terms and cloning during congruence closure
     pub(crate) func_apps: Vec<FuncAppMeta>,
+    /// #euf-guard-index: indices into `func_apps` of the apps that have at least
+    /// one Bool-sorted argument. `bool_arg_model_is_congruent` cares ONLY about
+    /// those, but scanned all of `func_apps` and `continue`d on the rest — once
+    /// per check, on the hottest path in the division AY loses on CPU. Whether an
+    /// app has a Bool arg is decided by argument SORTS, which never change, so
+    /// this is computed once here and reused. Rebuilt with `func_apps` (the two
+    /// are cleared together and `func_apps_init` gates both).
+    pub(crate) bool_arg_app_idx: Vec<u32>,
     /// Index from term_id -> index in func_apps for O(1) lookup
     pub(crate) func_app_index: HashMap<u32, usize>,
     /// Whether func_apps has been initialized
@@ -377,6 +385,14 @@ pub struct EufSolver<'a> {
     /// #cong-neg-backoff: cascade lookahead currently suspended (a barren streak
     /// of non-firing runs on a large problem tripped the cap). Guidance-only, so
     /// suspension never affects soundness — see `cong_diseq_lookahead_memo`.
+    /// #cong-neg-cold: has the cascade lookahead EVER fired in this solve?
+    /// The size gate alone cannot separate the two workloads that matter:
+    /// non-incremental QF_UF/NEQ (tiny, lookahead barren — costs 2.1-2.5x) and
+    /// incremental CLEARSY (also under the gate, but the lookahead's rare fires
+    /// are worth 49 check-sats). Firing history discriminates them where size
+    /// does not: a solve that has never fired is a candidate for early suspend;
+    /// one that has fired keeps the historical never-suspend behaviour.
+    pub(crate) cong_neg_ever_fired: bool,
     pub(crate) cong_neg_suspended: bool,
     /// #cong-neg-backoff: consecutive non-firing full lookahead runs since the
     /// last fire. Resets to 0 on any fire; suspends at `CONG_NEG_BARREN_CAP`.
@@ -418,6 +434,17 @@ pub struct EufSolver<'a> {
     pub(crate) ite_terms: Vec<u32>,
     /// Whether ite_terms has been initialized
     pub(crate) ite_terms_init: bool,
+    /// #euf-ite-worklist: condition term id -> ITE terms guarded by it (built
+    /// alongside `ite_terms`). Lets an assignment enqueue exactly the ITE terms
+    /// it can possibly fire, instead of the sweep rescanning all of them.
+    pub(crate) ite_by_cond: HashMap<u32, Vec<u32>>,
+    /// ITE terms whose condition was assigned since the last sweep.
+    pub(crate) pending_ite: Vec<u32>,
+    /// Force the next sweep to scan ALL ite_terms. Set on the same events that
+    /// set `egraph_requeue_needed` (pop / reset / soft_reset / unwind), where
+    /// merges are discarded or unwound and the incremental worklist can no
+    /// longer be trusted.
+    pub(crate) ite_sweep_full_needed: bool,
     // ========================================================================
     // Reusable scratch buffers (#5575)
     // ========================================================================
@@ -453,6 +480,15 @@ pub struct EufSolver<'a> {
     /// entries cannot go stale while the memo lives).
     pub(crate) scratch_cong_neg_memo:
         ay_core::kani_compat::DetHashMap<(u32, u32), Option<crate::types::CongNegCascade>>,
+    /// #euf-guard-scratch: reusable congruence map + `Vec` pool for the
+    /// transitive fixpoint inside `bool_arg_model_is_congruent`. That fixpoint
+    /// built a fresh `DetHashMap` per guard call AND a `Vec<u32>` of argument
+    /// representatives per func_app per round. The guard runs once per complete
+    /// candidate model (~16k times on the heaviest Inc QF_Equality file), so
+    /// both were pure allocator churn. Taken/restored per call, in the same
+    /// style as `scratch_cong_neg_la`.
+    pub(crate) scratch_bool_arg_cong: ay_core::kani_compat::DetHashMap<(u64, Vec<u32>), u32>,
+    pub(crate) scratch_bool_arg_pool: Vec<Vec<u32>>,
     /// Reusable simulation state for the cascade lookahead (#cong-neg-prop):
     /// taken/restored per `cong_diseq_lookahead` call so the hot miss path
     /// allocates nothing.
@@ -500,6 +536,22 @@ pub struct EufSolver<'a> {
     /// a disequality/distinct violation, so nested cases (e.g. `f(fb(A))` vs
     /// `f(fb(B))` under a `distinct`) are caught.
     pub(crate) bool_arg_validate_transitive: bool,
+    /// Bool-arg app pairs the last `bool_arg_model_is_congruent` call found to be
+    /// FORCED equal by congruence under the candidate model — i.e. same function,
+    /// same non-Bool argument representatives, same Bool-argument truth values.
+    ///
+    /// Recorded so a caller that sees the guard downgrade `Sat` -> `Unknown` can
+    /// repair the model instead of giving up: inject `(/\ a_i = b_i) -> f(a)=f(b)`
+    /// for exactly these pairs and re-solve (targeted CEGAR). This set is
+    /// MODEL-SPECIFIC and small, which is the point — the blanket alternative of
+    /// injecting a lemma for every Bool-arg pair in the reachable set is measured
+    /// DEAD in incremental mode (`executor/theories/euf.rs`: CLEARSY completeness
+    /// collapses 121 -> ~50 solved check-sats as the fresh equality atoms inflate
+    /// the EUF proof-forest and the per-conflict `explain()` walk).
+    ///
+    /// Diagnostic only: nothing in the solver reads it, so populating it cannot
+    /// change any verdict.
+    pub(crate) last_bool_arg_forced_edges: Vec<(TermId, TermId)>,
     // Per-theory runtime statistics (#4706)
     pub(crate) check_count: u64,
     pub(crate) conflict_count: u64,
@@ -612,6 +664,17 @@ pub struct EufSolver<'a> {
     /// the incremental path on small inputs, where the debug key-set assert
     /// then validates every pop).
     pub(crate) cong_undo_min_func_apps: usize,
+    /// #euf-inc-undo-adaptive: latched once the rebuild work this solve has
+    /// ALREADY spent overtakes the undo work it WOULD have spent. Governs both
+    /// the congruence-table and disequality-index undo paths — same failure
+    /// mode, same safe switch point. Only ever set with no open scope.
+    pub(crate) undo_latched: bool,
+    /// Accrued cost of the from-scratch path: `func_apps.len()` per rebuild pop.
+    pub(crate) rebuild_work: u64,
+    /// Accrued cost the incremental path would have had: one unit per parent
+    /// reinserted during a merge, counted whether or not it is active so the
+    /// two sides are always comparable.
+    pub(crate) undo_work: u64,
     /// Incremental (trail-based) disequality-pair-index restore on pop
     /// (#euf-inc-diseq-undo). When active (default; kill-switch
     /// `AY_EUF_INC_DISEQ_UNDO=0`), `incremental_merge` (rekey) and
@@ -840,6 +903,42 @@ impl PropGapStats {
 /// decisions always agree).
 pub(crate) const CONG_UNDO_MIN_FUNC_APPS: usize = 16384;
 
+/// #euf-inc-undo-adaptive: no tuned threshold — the switch is driven by the two
+/// costs themselves, both counted at run time.
+///
+/// The decision is a straight comparison: a from-scratch pop costs O(func_apps),
+/// and incremental undo costs roughly one record per parent reinserted during a
+/// merge. Both are countable, so instead of guessing a size or a pop count, the
+/// solver accumulates the rebuild work it has ALREADY spent and the undo work it
+/// WOULD have spent, and switches when the former overtakes the latter.
+///
+/// This is why a static gate could not win here. Measured on a 600-file SQ
+/// QF_Equality sample, two interleaved rounds each:
+///   floor 16384  249.0s   — better on the broad mix (mostly pop-light)
+///   no floor     257.0s   — but 1.50x FASTER on the 10 pop-heavy NEQ files,
+///                           and turns NEQ006_size6 from `unknown` into `unsat`
+/// Neither setting is right for both workloads, and a pop-count threshold is
+/// just a third magic number. Comparing the accrued costs needs no constant and
+/// adapts per solve.
+
+/// #euf-inc-diseq-undo size gate. Borrowed `CONG_UNDO_MIN_FUNC_APPS` (16384)
+/// until it was measured independently, and the two turn out NOT to behave the
+/// same way. For the disequality index the incremental path is not merely
+/// faster — it is MORE COMPLETE.
+///
+/// Measured on SQ QF_Equality (600-file sample): 598/600 solved with the
+/// rebuild path, 599/600 with the incremental one, 0 wrong either way. The file
+/// is `QF_AX/swap/swap_invalid_t1_np_sf_ai_00010_009.cvc.smt2`, declared `sat`
+/// and confirmed `sat` by z3, which the rebuild path abandons as `unknown` after
+/// 4.2s while the incremental path answers in 2.0s. That is a correct answer the
+/// O(|assigns|) rebuild was LOSING, so gating it behind a size threshold costs
+/// completeness, not just time.
+///
+/// The pop-light case the congruence gate protects (`QF_UF_fischer.7`) is
+/// unaffected here (0.11s / 0.01s either way), so there is no measured reason to
+/// keep a floor at all.
+pub(crate) const DISEQ_UNDO_MIN_FUNC_APPS: usize = 0;
+
 impl<'a> EufSolver<'a> {
     /// Whether the incremental (trail-based) cong_table pop-restore is active
     /// for THIS solve: opted in (`AY_EUF_INC_CONG_UNDO` != 0) AND the func_apps
@@ -847,7 +946,33 @@ impl<'a> EufSolver<'a> {
     /// per-merge undo overhead (see `CONG_UNDO_MIN_FUNC_APPS`).
     #[inline]
     pub(crate) fn cong_undo_active(&self) -> bool {
-        self.inc_cong_undo_enabled && self.func_apps.len() >= self.cong_undo_min_func_apps
+        self.inc_cong_undo_enabled
+            && (self.func_apps.len() >= self.cong_undo_min_func_apps || self.undo_latched)
+    }
+
+    /// #euf-inc-cong-undo: consider switching a backtrack-heavy solve over to
+    /// incremental congruence undo.
+    ///
+    /// SAFETY, and the reason this is a separate method: `pop()` chooses replay
+    /// vs rebuild by calling `cong_undo_active()`, so a scope must never be
+    /// undone in replay mode if its merges were recorded in rebuild mode. The
+    /// switch is therefore taken ONLY with NO OPEN SCOPE. Entries below the
+    /// first scope mark are never replayed (pop only rewinds to its mark), so
+    /// once there is no open scope every future scope records and replays
+    /// consistently. That restores exactly the invariant the constant size gate
+    /// gave for free.
+    ///
+    /// Note `undo_trail.is_empty()` is the WRONG condition and was tried first:
+    /// level-0 merges from top-level assertions sit in the trail permanently, so
+    /// it is essentially never empty and the latch never fires.
+    pub(crate) fn maybe_latch_undo(&mut self) {
+        if !self.undo_latched
+            && self.inc_cong_undo_enabled
+            && self.rebuild_work > self.undo_work
+            && self.undo_scopes.is_empty()
+        {
+            self.undo_latched = true;
+        }
     }
 
     /// #euf-inc-cong-undo safety net: after the incremental (trail-based)
@@ -884,7 +1009,13 @@ impl<'a> EufSolver<'a> {
     /// agree on whether entries were trailed.
     #[inline]
     pub(crate) fn diseq_undo_active(&self) -> bool {
-        self.inc_diseq_undo_enabled && self.func_apps.len() >= self.diseq_undo_min_func_apps
+        // #euf-inc-undo-latch: same size-gate problem as `cong_undo_active` — a
+        // small but backtrack-heavy solve pays an O(|assigns|) rebuild per pop.
+        // Measured on SQ QF_Equality (600-file sample): enabling this takes the
+        // division from 598/600 to 599/600 solved, 0 wrong, and is slightly
+        // faster. An extra ANSWER outranks the CPU either way.
+        self.inc_diseq_undo_enabled
+            && (self.func_apps.len() >= self.diseq_undo_min_func_apps || self.undo_latched)
     }
 
     /// #euf-inc-diseq-undo safety net: after the incremental (trail-based)
@@ -1075,6 +1206,7 @@ impl<'a> EufSolver<'a> {
             dirty: true,
             equality_edges: HashMap::default(),
             func_apps: Vec::new(),
+            bool_arg_app_idx: Vec::new(),
             func_app_index: HashMap::default(),
             func_apps_init: false,
             has_theory_func_apps: true, // conservative until init_func_apps computes it
@@ -1130,6 +1262,7 @@ impl<'a> EufSolver<'a> {
             cong_neg_depth: cong_neg_depth_from_env(),
             cong_neg_propagation_count: 0,
             cong_neg_adaptive: cong_neg_adaptive_from_env(),
+            cong_neg_ever_fired: false,
             cong_neg_suspended: false,
             cong_neg_barren: 0,
             cong_neg_probe_skip: 0,
@@ -1143,6 +1276,9 @@ impl<'a> EufSolver<'a> {
             // Pre-indexed ITE terms (#5575)
             ite_terms: Vec::new(),
             ite_terms_init: false,
+            ite_by_cond: HashMap::default(),
+            pending_ite: Vec::new(),
+            ite_sweep_full_needed: true,
             // Reusable scratch buffers (#5575)
             scratch_diseqs: Vec::new(),
             scratch_distincts: Vec::new(),
@@ -1156,6 +1292,8 @@ impl<'a> EufSolver<'a> {
             scratch_cong_neg_memo: ay_core::kani_compat::DetHashMap::default(),
             scratch_class_eq_idxs: Vec::new(),
             scratch_seen_eq_idxs: ay_core::kani_compat::DetHashSet::default(),
+            scratch_bool_arg_cong: ay_core::kani_compat::DetHashMap::default(),
+            scratch_bool_arg_pool: Vec::new(),
             scratch_cong_neg_la: crate::types::CongNegScratch::default(),
             cong_neg_emitted: HashSet::default(),
             scratch_equalities: Vec::new(),
@@ -1172,6 +1310,7 @@ impl<'a> EufSolver<'a> {
             bool_arg_congruence: euf_debug_flags().bool_arg_congruence,
             bool_arg_validate: euf_debug_flags().bool_arg_validate,
             bool_arg_validate_transitive: euf_debug_flags().bool_arg_validate_transitive,
+            last_bool_arg_forced_edges: Vec::new(),
             check_count: 0,
             conflict_count: 0,
             propagation_count: 0,
@@ -1198,6 +1337,9 @@ impl<'a> EufSolver<'a> {
             inc_sync_enabled: true,
             inc_cong_undo_enabled: std::env::var_os("AY_EUF_INC_CONG_UNDO")
                 .is_none_or(|v| v != "0"),
+            undo_latched: false,
+            rebuild_work: 0,
+            undo_work: 0,
             cong_undo_min_func_apps: std::env::var("AY_EUF_CONG_UNDO_MIN")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -1207,7 +1349,7 @@ impl<'a> EufSolver<'a> {
             diseq_undo_min_func_apps: std::env::var("AY_EUF_DISEQ_UNDO_MIN")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(CONG_UNDO_MIN_FUNC_APPS),
+                .unwrap_or(DISEQ_UNDO_MIN_FUNC_APPS),
             neg_index_prebuilt: false,
             diseq_index_base_depth: 0,
             diseq_keys_dirty: false,
@@ -1371,6 +1513,7 @@ impl<'a> EufSolver<'a> {
         }
 
         self.func_apps.clear();
+        self.bool_arg_app_idx.clear();
         self.func_app_index.clear();
         self.bool_uf_arg_terms.clear();
         // Recompute whether any theory-sorted (Int/Real/BV) func app exists;
@@ -1410,10 +1553,16 @@ impl<'a> EufSolver<'a> {
                     // #bool-arg-congruence: record Bool-sorted arguments so the
                     // true/false class merge covers them even when the arg is a
                     // builtin/connective Bool term the SAT layer normally owns.
+                    let mut has_bool_arg = false;
                     for &arg in args {
                         if self.terms.sort(arg) == &Sort::Bool {
                             self.bool_uf_arg_terms.insert(arg.0);
+                            has_bool_arg = true;
                         }
+                    }
+                    // #euf-guard-index: the guard's per-check scan visits only these.
+                    if has_bool_arg {
+                        self.bool_arg_app_idx.push(self.func_apps.len() as u32);
                     }
                     self.func_apps.push(FuncAppMeta {
                         term_id: term_id.0,
@@ -1461,14 +1610,28 @@ impl<'a> EufSolver<'a> {
             return;
         }
         self.ite_terms.clear();
+        self.ite_by_cond.clear();
         for term_id in self.terms.term_ids() {
             if matches!(self.terms.get(term_id), TermData::Ite(..))
                 && !matches!(self.terms.sort(term_id), Sort::Bool)
             {
                 self.ite_terms.push(term_id.0);
+                // Index by the term the sweep actually consults: the condition,
+                // and — because the sweep reads `Not(inner)` conditions through
+                // `inner`'s assignment — the inner term as well.
+                if let TermData::Ite(cond, _, _) = self.terms.get(term_id) {
+                    let cond = *cond;
+                    self.ite_by_cond.entry(cond.0).or_default().push(term_id.0);
+                    if let TermData::Not(inner) = self.terms.get(cond) {
+                        let inner = *inner;
+                        self.ite_by_cond.entry(inner.0).or_default().push(term_id.0);
+                    }
+                }
             }
         }
         self.ite_terms_init = true;
+        // A freshly built index has seen no assignments yet.
+        self.ite_sweep_full_needed = true;
     }
 
     pub(crate) fn queue_pending_propagation(

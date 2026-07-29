@@ -2228,6 +2228,17 @@ impl Solver {
         self.arena.num_clauses()
     }
 
+    /// Number of Boolean variables the solver currently has state for.
+    ///
+    /// `vals` is indexed by LITERAL (`vals[lit.index()]`), so it holds two
+    /// entries per variable.
+    ///
+    /// Companion to `num_clauses` for CNF-shape reporting; both were previously
+    /// unreachable from the SMT stats layer.
+    pub fn num_variables(&self) -> usize {
+        self.vals.len() / 2
+    }
+
     /// Check if the solver has derived an empty clause (UNSAT indicator).
     pub fn has_empty_clause(&self) -> bool {
         self.has_empty_clause
@@ -2565,6 +2576,17 @@ impl Solver {
             }
         }
         count
+    }
+
+    /// Lifetime count of learned clauses DELETED by database reduction.
+    ///
+    /// `num_learned_clauses` counts what is currently RETAINED, so it cannot
+    /// show whether reduction is running at all. This exposes the companion
+    /// figure that `reduce_db` already maintains
+    /// (`stats.learned_reduction_deleted`, `reduction_execute.rs:496`), which
+    /// had no route out of the SAT core.
+    pub fn num_learned_clauses_deleted(&self) -> u64 {
+        self.stats.learned_reduction_deleted
     }
 
     /// Extract all learned (non-original) clauses from the clause database.

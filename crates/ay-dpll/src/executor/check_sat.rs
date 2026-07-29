@@ -172,6 +172,9 @@ impl Executor {
             UnknownReason::Unsupported => ("theory-combination", "unsupported-fragment"),
             UnknownReason::InternalError => ("executor", "internal-error"),
             UnknownReason::ProofTrusted => ("proof-validation", "trusted-proof-step"),
+            // "soundness-gate", not "theory-search": nothing was missing, a
+            // computed verdict was refuted.
+            UnknownReason::SelfCheckRejected => ("soundness-gate", "self-check-rejected"),
             UnknownReason::Incomplete | UnknownReason::Unknown => ("theory-search", "unknown"),
         }
     }
@@ -206,6 +209,7 @@ impl Executor {
             UnknownReason::UnsupportedMixedCollection => {
                 "the selected mixed collection/datatype fragment is unsupported".to_string()
             }
+            UnknownReason::SelfCheckRejected => "AY COMPUTED A VERDICT AND ITS OWN FAIL-CLOSED CHECKER REFUTED IT -- this is a caught wrong answer, not a missing capability".to_string(),
             UnknownReason::SplitLimit => "theory split-loop budget was exhausted".to_string(),
             UnknownReason::ExpressionSplit => {
                 "an expression split was required but not available".to_string()
@@ -905,7 +909,17 @@ impl Executor {
         // than `k` pairwise-distinct values of that sort is UNSAT. Generalizes
         // the singleton (`k == 1`) passes above to enums with `k > 1`. A no-op
         // unless a disequality clique over a finite-enum sort exceeds `k`.
-        let pigeonhole_unsat = self.add_finite_enum_pigeonhole_conflict();
+        let pigeonhole_unsat = self.add_finite_enum_pigeonhole_conflict()
+            // Int twin (#uc-qfidl): the same colouring instances in QF_IDL
+            // dialect, where the palette is a per-variable
+            // `(or (= x c1) .. (= x cm))` over plain Ints rather than an enum
+            // datatype, so the enum pass above cannot see it. Without this the
+            // certificate was reachable ONLY under produce-unsat-cores and
+            // plain solves timed out on instances AY settles in milliseconds
+            // (vlsat3_c00: plain `timeout` at 30s vs UC-prepped `unsat` in
+            // 0.01s, same binary). Pure read, fail-closed, unsat-only; it
+            // re-verifies its own certificate from the core assertions alone.
+            || self.int_domain_pigeonhole_proves_unsat();
         // Companion soundness pass: const-arrays with provably-distinct defaults
         // are extensionally distinct; assert their disequality so model-based
         // theory combination can't merge them into one class (false UNSAT).
@@ -944,6 +958,19 @@ impl Executor {
             // Tseitin-encoding the full formula just to rediscover the pushed
             // unit conflict. Same answer, same downstream mapping/restore path.
             Ok(SolveResult::unsat())
+        } else if self.int_domain_coloring_proposes_sat(&pre_dispatch_assertions) {
+            // SAT-side twin of the certificate above (#sq-qfufidl-sat): the
+            // same finite-domain coloring instances, but the SATISFIABLE half,
+            // where there is no refutation to find and the field separates on
+            // MODEL FINDING alone. A DSATUR coloring restricted to the asserted
+            // domains was built AND accepted by `finalize_sat_model_validation`
+            // plus the strict independent gate, both against the full
+            // pre-dispatch conjunction; the model is installed in `last_model`
+            // and the outer `emit_sat_verdict` funnel re-gates it against the
+            // restored USER assertion set exactly like any other model. On
+            // anything it cannot fully account for the pass declines and this
+            // arm is a no-op (`AY_INT_COLORING=0` opts out entirely).
+            Ok(SolveResult::Sat)
         } else {
             self.route_to_solver(category, &features)
         };
@@ -1226,9 +1253,9 @@ impl Executor {
         {
             if let Err(reason) = verify_bv_drat_self_cert() {
                 self.last_bv_drat_self_cert = false;
-                self.replace_last_result_with_unknown(UnknownReason::Incomplete);
+                self.replace_last_result_with_unknown(UnknownReason::SelfCheckRejected);
                 self.record_model_validation_unknown_diagnostic(format!(
-                    "self-check: BV DRAT verification failed: {reason}"
+                    "computed UNSAT rejected: BV DRAT verification failed: {reason}"
                 ));
                 tracing::warn!(
                     "self-check: BV DRAT verification failed, degrading to Unknown: {reason}"
@@ -2202,9 +2229,9 @@ impl Executor {
             && !self.unsat_proof_self_certified()
             && !bv_drat_self_cert
         {
-            self.last_unknown_reason = Some(UnknownReason::Incomplete);
+            self.last_unknown_reason = Some(UnknownReason::SelfCheckRejected);
             self.record_model_validation_unknown_diagnostic(
-                "self-check: UNSAT is not backed by a fully-checked refutation proof",
+                "computed UNSAT is not backed by a fully-checked refutation proof",
             );
             tracing::warn!(
                 "self-check: UNSAT not self-certified by internal proof checker, degrading to Unknown"
@@ -3048,6 +3075,27 @@ impl Executor {
                         self.last_core_term_to_name = Some(term_to_name);
                         return Ok(SolveResult::unsat());
                     }
+                    // Int finite-domain pigeonhole NAMED-CORE fast path
+                    // (#uc-qfidl): the QF_IDL dialect of the SAME coloring
+                    // instances, where the palette is per-variable
+                    // `(or (= x c1) .. (= x cm))` over plain Ints instead of an
+                    // enum datatype, so the pass above (gated on datatype
+                    // cardinality) never fires and the whole 20210312-Bouvier
+                    // family times out under named mode. Sibling contract:
+                    // fail-closed, unsat-only, and a pure READ (`&self`) —
+                    // declining leaves the fall-through path byte-identical.
+                    // It runs AFTER the datatype attempt, which either fires
+                    // first or returns having only read state, so the banked
+                    // QF_Datatypes emissions cannot move.
+                    if let Some(core) = self.try_int_domain_pigeonhole_named_core(&term_to_name) {
+                        self.last_model = None;
+                        self.last_proof = None;
+                        self.last_assumptions = None;
+                        self.last_unknown_reason = None;
+                        self.last_assumption_core = Some(core);
+                        self.last_core_term_to_name = Some(term_to_name);
+                        return Ok(SolveResult::unsat());
+                    }
                     // FAIL-CLOSED provenance-coverage guard (#uc-qfdt,
                     // invalidated-core root cause): `named_terms` registers
                     // the parse-time inner TermId, but assert-time
@@ -3275,6 +3323,13 @@ impl Executor {
             // too. `AY_RDL_ENGINE=0` disables the lane without a rebuild.
             LogicCategory::QfLra if self.ctx.logic() == Some("QF_RDL") => self.solve_rdl(),
             LogicCategory::QfLra => self.solve_lra(),
+            // QF_IDL: the integer sibling of the lane above, DEFAULT OFF behind
+            // `AY_IDL_ENGINE=1`. Same fail-closed shape — unless every reachable
+            // theory atom is a pure INT difference atom it delegates to
+            // `solve_lia()`, and any non-definite verdict is re-solved there.
+            // The fall-through is `solve_lia`, never `solve_lra`: handing an
+            // integer problem to the simplex lane drops integrality.
+            LogicCategory::QfLia if self.ctx.logic() == Some("QF_IDL") => self.solve_idl(),
             LogicCategory::QfLia => {
                 if features.has_bv_int_conversion {
                     let bridge_result = self.solve_bv_lia_bridge()?;

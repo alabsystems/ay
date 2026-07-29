@@ -67,9 +67,20 @@ use std::sync::Mutex;
 use std::thread::ScopedJoinHandle;
 use std::time::Instant;
 
+use crate::cert_io::{ledger as replay_ledger, ReplayClaim};
 use crate::model::{exact, Col, Model, Row, Sense};
 use crate::opts::SolveOpts;
 use crate::outcome::Outcome;
+
+/// THE TRUSTED COMPUTING BASE OF THIS DEVICE, named in every replay claim it
+/// files.
+///
+/// A verdict from this file is not backed by a 200-line checker; it is backed
+/// by all ~6400 lines of it — the AHL reformulation, the column-HNF, LLL/BKZ,
+/// the Schnorr–Euchner sweep, and the outward-rounded interval arithmetic that
+/// prunes it. That is a legitimate thing to trust and an illegitimate thing to
+/// hide, so it is written into the certificate.
+const TCB: &str = "crates/ay-milp/src/lattice.rs";
 
 /// Hard cap on the enumeration so a mis-fire can never run away: past this the
 /// device aborts to `None` and the normal search takes over. markshare1's
@@ -109,6 +120,18 @@ const LATTICE_FRONTIER_MAX_BYTES: usize = 64 * 1024 * 1024;
 /// total once a sweep's states are gone. Transient overshoot is bounded by
 /// `threads × this` — an abort can only fire EARLIER, never later.
 const SHARED_NODE_RESERVE: u64 = 4096;
+
+/// Multiplicative slack applied to the box-prune error envelope. It absorbs
+/// the `1/(1 − dim·u)` fixed-point factor of the accumulated-rounding bound and
+/// every round-to-nearest step of the O(1) envelope computation itself, with
+/// ~7 orders of magnitude to spare at any realistic `dim`.
+const BOX_PRUNE_EPS_SLACK: f64 = 1.0 + 1e-9;
+
+/// Magnitude ceiling for the box-prune envelope. Past it the running centre
+/// bound is too large to rule out `f64` overflow inside the FMA chain, so the
+/// test is skipped for that node (fail-closed: no prune, never a wrong prune).
+/// Real faces sit ~250 orders of magnitude below this.
+const BOX_PRUNE_MAX_SCALE: f64 = 1e250;
 
 /// Per-block SVP enumeration cap inside BKZ. A block on an already-LLL-reduced
 /// basis enumerates a well-conditioned ~β-dim ball, so this is generous; past it
@@ -621,7 +644,7 @@ enum LatticeSchedule {
 /// can decide its optimum is 0 or 1 within budget, return the proven
 /// `Outcome::Optimal`; otherwise `None` (hand back to the normal search).
 pub(crate) fn try_prove(model: &Model, deadline: Instant, opts: &SolveOpts) -> Option<Outcome> {
-    let schedule = if std::env::var_os("AY_MILP_NO_LATTICE").is_some() {
+    let schedule = if crate::tune::on(crate::tune::Knob::NoLattice) {
         LatticeSchedule::Disabled
     } else {
         LatticeSchedule::Threads(lattice_threads(opts))
@@ -658,7 +681,25 @@ fn try_prove_configured(
     let now = Instant::now();
     let sub_deadline = now + deadline.saturating_duration_since(now).mul_f64(0.5);
     let eng = Engine::build(&ms, sub_deadline, trace, threads, forced_beta)?;
-    eng.prove(model, &ms)
+    // REPLAY CLAIMS MUST NOT OUTLIVE A DECLINE. `prove` can file a sweep claim
+    // and then still hand the model back (a witness hunt that finds nothing, an
+    // overflow in the reconstruction). A claim left in the ledger would then
+    // attach to whatever the NORMAL search later concluded — annotating a
+    // certified verdict with someone else's trust. So the ledger is stashed
+    // across the call and the device's own claims are committed only if it
+    // actually returned a verdict.
+    let stashed = replay_ledger::take();
+    let out = eng.prove(model, &ms);
+    let filed = replay_ledger::take();
+    for c in stashed {
+        replay_ledger::record(c);
+    }
+    if out.is_some() {
+        for c in filed {
+            replay_ledger::record(c);
+        }
+    }
+    out
 }
 
 /// Closed `f64` interval with every operation rounded one ulp outward.  The
@@ -727,6 +768,18 @@ impl Interval {
         (lo.is_finite() && hi.is_finite()).then_some(Self { lo, hi })
     }
 
+    /// General (sign-agnostic) interval product. Used once per face to build
+    /// the box-prune anchor `base`; never on the per-node hot path.
+    fn mul_general(self, rhs: Self) -> Option<Self> {
+        let a = self.lo * rhs.lo;
+        let b = self.lo * rhs.hi;
+        let c = self.hi * rhs.lo;
+        let d = self.hi * rhs.hi;
+        let lo = a.min(b).min(c).min(d).next_down();
+        let hi = a.max(b).max(c).max(d).next_up();
+        (lo.is_finite() && hi.is_finite()).then_some(Self { lo, hi })
+    }
+
     /// Product of two intervals already known nonnegative (distance² × norm).
     fn mul_nonnegative(self, rhs: Self) -> Option<Self> {
         debug_assert!(self.lo >= 0.0 && rhs.lo >= 0.0);
@@ -753,6 +806,71 @@ impl Interval {
     }
 }
 
+/// Kill switch for the box-prefix prune. Set to any value to restore the
+/// historical, radius-only sweep BYTE-IDENTICALLY (same node counts, same
+/// verdicts, same witnesses).
+const BOX_PRUNE_OFF_ENV: &str = "AY_MILP_NO_BOXPRUNE";
+
+/// Face-independent tables for the BOX-PREFIX PRUNE (see `EnumState::rec`).
+///
+/// ## What it proves
+///
+/// Write the enumerated point as `x = x_d + K·y`. With `e_t` the Fincke–Pohst
+/// center the loop already forms at level `t` (`tg[t] − partial[t][t]`, a
+/// function of the STRICTLY HIGHER `y`s only) the exact identity
+///
+///   `x = base + Σ_t (y_t − e_t)·b*_t`,   `base := x_d + Σ_t tg_t·b*_t`
+///
+/// holds (`base = c − τ⊥`; it is the Babai continuation of the empty prefix,
+/// NOT the integer prefix `x_d + Σ_{t≥L} y_t·k_t`). Splitting at level `L`,
+/// everything with `t ≥ L` is already determined at the node, so
+///
+///   `x_k = C_k + Σ_{t<L} (y_t − e_t)·b*_t[k]`,
+///   `C_k := base_k + Σ_{t≥L} (y_t − e_t)·b*_t[k]`.
+///
+/// The Fincke–Pohst invariant bounds what the UNASSIGNED levels may still
+/// spend: any descendant leaf inside the enumeration ball satisfies
+/// `Σ_{t<L} (y_t − e_t)²‖b*_t‖² ≤ radius − dist(node) =: rem`. Cauchy–Schwarz
+/// on the two factors `(y_t − e_t)‖b*_t‖` and `b*_t[k]/‖b*_t‖` then gives the
+/// RIGOROUS REACH BOUND
+///
+///   `|x_k − C_k| ≤ √(rem · S[L][k])`,  `S[L][k] := Σ_{t<L} b*_t[k]²/‖b*_t‖²`.
+///
+/// So if for some original coordinate `k` the center `C_k` sits farther than
+/// that reach outside `[lo_k, up_k]`, NO completion of the remaining levels can
+/// land the point in the box: the whole subtree is provably box-infeasible and
+/// may be cut without touching the completeness of an `Empty` verdict. Every
+/// float quantity below is rounded so the tested inequality is only ever
+/// STRICTER than the exact one (see `EnumState::rec` for the error envelope).
+struct BoxPrune {
+    /// Outward `f64` enclosure of the exact GSO vector `b*_t[k]` (`dim × n`).
+    /// Only used off the hot path, to build each face's `base`.
+    bstar_i: Vec<Vec<Interval>>,
+    /// Round-to-nearest midpoint of `bstar_i[t][k]` (`dim × n`), the hot loop's
+    /// FMA multiplier. Its deviation from the exact `b*_t[k]` is covered by
+    /// `bstar_halfw[t]`.
+    bstar_mid: Vec<Vec<f64>>,
+    /// `max_k max(|lo|,|hi|)` of `bstar_i[t][·]` — an outward bound on both
+    /// `|b*_t[k]|` and `|bstar_mid[t][k]|`.
+    bstar_absmax: Vec<f64>,
+    /// `max_k` half-width of `bstar_i[t][·]`, rounded up.
+    bstar_halfw: Vec<f64>,
+    /// `√(S[l][k])` rounded UP, `l ∈ 0..=dim` (`S[0][·] = 0`: at a leaf the
+    /// unassigned levels can contribute nothing).
+    sqrt_s: Vec<Vec<f64>>,
+    /// `max_k sqrt_s[l][k]`, for the O(1) error envelope.
+    sqrt_s_max: Vec<f64>,
+    /// The exact integer box as `f64` (both endpoints are exactly
+    /// representable — `Engine::build` declines the prune otherwise).
+    lo_f: Vec<f64>,
+    up_f: Vec<f64>,
+    /// `max_k max(|lo_k|, |up_k|)`, for the error envelope.
+    bound_absmax: f64,
+    /// `(dim + 8)·f64::EPSILON`, the linear rounding coefficient of the
+    /// envelope, precomputed.
+    eps_coeff: f64,
+}
+
 /// The reduced kernel lattice + exact GSO, shared across every face.
 struct Engine {
     n: usize,
@@ -772,6 +890,10 @@ struct Engine {
     /// rely on their lower endpoints without trusting round-to-nearest.
     cnorm_i: Vec<Interval>,
     mu_i: Vec<Vec<Interval>>,
+    /// Face-independent tables for the box-prefix prune. `None` disables it
+    /// (kill switch, or a box whose endpoints are not exactly representable):
+    /// the sweep then runs byte-identically to the historical radius-only one.
+    box_prune: Option<BoxPrune>,
     /// Per-lattice-column integer bounds (copied from the compiled shape) —
     /// the exact box every candidate is adjudicated against.
     lo: Vec<i64>,
@@ -828,6 +950,138 @@ fn resolve_lattice_threads(
     threads.max(1)
 }
 
+/// Build the face-independent box-prune tables, or `None` to run the
+/// historical radius-only sweep.
+///
+/// Declines (fail-closed, never an abort) when the kill switch is set, when a
+/// box endpoint is not an exact `f64`, or when any enclosure is non-finite —
+/// the prune is an OPTIONAL accelerator, so refusing it is always safe.
+fn build_box_prune(
+    bstar_q: &[Vec<BigRational>],
+    cnorm_i: &[Interval],
+    lo: &[i64],
+    up: &[i64],
+    dim: usize,
+    n: usize,
+) -> Option<BoxPrune> {
+    if std::env::var_os(BOX_PRUNE_OFF_ENV).is_some() {
+        return None;
+    }
+    box_prune_tables(bstar_q, cnorm_i, lo, up, dim, n)
+}
+
+/// The table construction itself, with no environment lookup, so the
+/// differential test can force the prune ON regardless of the ambient
+/// kill-switch setting.
+fn box_prune_tables(
+    bstar_q: &[Vec<BigRational>],
+    cnorm_i: &[Interval],
+    lo: &[i64],
+    up: &[i64],
+    dim: usize,
+    n: usize,
+) -> Option<BoxPrune> {
+    if dim == 0 || n == 0 || bstar_q.len() < dim || cnorm_i.len() < dim {
+        return None;
+    }
+    // `f64` must represent every bound EXACTLY: the reach test compares against
+    // `lo_f`/`up_f` directly, and a rounded endpoint could widen the box (safe)
+    // or narrow it (UNSOUND). Requiring exactness removes the question.
+    if lo
+        .iter()
+        .chain(up.iter())
+        .any(|&v| v.unsigned_abs() > (1u64 << 53))
+    {
+        return None;
+    }
+    let mut bstar_i: Vec<Vec<Interval>> = Vec::with_capacity(dim);
+    for row in bstar_q.iter().take(dim) {
+        if row.len() < n {
+            return None;
+        }
+        let mut r = Vec::with_capacity(n);
+        for value in row.iter().take(n) {
+            r.push(Interval::from_rational(value)?);
+        }
+        bstar_i.push(r);
+    }
+    let mut bstar_mid = Vec::with_capacity(dim);
+    let mut bstar_absmax = Vec::with_capacity(dim);
+    let mut bstar_halfw = Vec::with_capacity(dim);
+    for row in &bstar_i {
+        let mut mid = Vec::with_capacity(n);
+        let mut amax = 0.0f64;
+        let mut hw = 0.0f64;
+        for iv in row {
+            let m = (iv.lo + iv.hi) * 0.5;
+            if !m.is_finite() {
+                return None;
+            }
+            mid.push(m);
+            amax = amax.max(iv.lo.abs().max(iv.hi.abs()));
+            // Outward half-width around the ROUNDED midpoint, so
+            // `|b*_t[k] − mid| ≤ hw` holds for the stored `mid` itself.
+            hw = hw.max((iv.hi - m).max(m - iv.lo).next_up());
+        }
+        if !amax.is_finite() || !hw.is_finite() {
+            return None;
+        }
+        bstar_mid.push(mid);
+        bstar_absmax.push(amax);
+        bstar_halfw.push(hw);
+    }
+    // S[l][k] = Σ_{t<l} b*_t[k]² / ‖b*_t‖², every step rounded UP so the stored
+    // value is an upper bound on the exact Cauchy–Schwarz factor.
+    let mut s = vec![vec![0.0f64; n]; dim + 1];
+    for t in 0..dim {
+        let denom = cnorm_i[t].lo;
+        if denom.is_nan() || denom <= 0.0 {
+            return None;
+        }
+        for kk in 0..n {
+            let sq = bstar_i[t][kk].square()?.hi;
+            let step = (sq / denom).next_up();
+            let acc = (s[t][kk] + step).next_up();
+            if !acc.is_finite() {
+                return None;
+            }
+            s[t + 1][kk] = acc;
+        }
+    }
+    let mut sqrt_s = Vec::with_capacity(dim + 1);
+    let mut sqrt_s_max = Vec::with_capacity(dim + 1);
+    for row in &s {
+        let r: Vec<f64> = row.iter().map(|v| v.sqrt().next_up()).collect();
+        let m = r.iter().fold(0.0f64, |a, &b| a.max(b));
+        if !m.is_finite() {
+            return None;
+        }
+        sqrt_s.push(r);
+        sqrt_s_max.push(m);
+    }
+    let lo_f: Vec<f64> = lo.iter().take(n).map(|&v| v as f64).collect();
+    let up_f: Vec<f64> = up.iter().take(n).map(|&v| v as f64).collect();
+    if lo_f.len() != n || up_f.len() != n {
+        return None;
+    }
+    let bound_absmax = lo_f
+        .iter()
+        .chain(up_f.iter())
+        .fold(0.0f64, |a, &b| a.max(b.abs()));
+    Some(BoxPrune {
+        bstar_i,
+        bstar_mid,
+        bstar_absmax,
+        bstar_halfw,
+        sqrt_s,
+        sqrt_s_max,
+        lo_f,
+        up_f,
+        bound_absmax,
+        eps_coeff: (dim as f64 + 8.0) * f64::EPSILON,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FrontierLimits {
     target: usize,
@@ -837,11 +1091,15 @@ struct FrontierLimits {
 /// Derive a complete-frontier item bound from both load-balancing demand and a
 /// conservative 64 MiB payload envelope. Every checked-arithmetic failure
 /// declines the parallel device instead of wrapping into an unenforced claim.
-fn frontier_limits(dim: usize, threads: usize) -> Option<FrontierLimits> {
+fn frontier_limits(dim: usize, n: usize, threads: usize) -> Option<FrontierLimits> {
     let desired = threads.checked_mul(LATTICE_FRONTIER_PER_THREAD)?;
     let per_thread_cap = desired.checked_mul(LATTICE_FRONTIER_TARGET_MULTIPLIER)?;
     let payload_per_item = size_of::<WorkItem>()
-        .checked_add(dim.checked_mul(size_of::<i64>().checked_add(size_of::<Interval>())?)?)?;
+        .checked_add(dim.checked_mul(size_of::<i64>().checked_add(size_of::<Interval>())?)?)?
+        // Box-prune payload: one `f64` per ORIGINAL coordinate (the `C` row the
+        // worker resumes from). Charged unconditionally so the envelope holds
+        // whether or not the prune is enabled.
+        .checked_add(n.checked_mul(size_of::<f64>())?)?;
     let memory_cap = LATTICE_FRONTIER_MAX_BYTES.checked_div(payload_per_item.max(1))?;
     if memory_cap == 0 {
         return None;
@@ -1032,7 +1290,59 @@ fn select_checked_kernel_basis(
     checked_kernel_basis_i64(lll_basis, ms, deadline).map(|basis| (basis, false))
 }
 
+/// File a replay claim for the solve running on this thread.
+///
+/// Deliberately a thin wrapper: the device cannot construct anything BUT a
+/// replay claim, so there is no path from here to `SUCCINCT`.
+fn file_replay(claim: ReplayClaim) {
+    replay_ledger::record(claim);
+}
+
 impl Engine {
+    /// Record an exhaustive-sweep claim.
+    ///
+    /// Everything a consumer needs to know that this is NOT a certificate:
+    /// the method, the arithmetic the pruning rests on, the node count against
+    /// the budget it would have declined at, and — the part a consumer will
+    /// otherwise file a bug about — that the enumeration tree's SHAPE depends
+    /// on the BKZ-reduced basis, and `bkz_budget` takes a fraction of REMAINING
+    /// WALL CLOCK. A different machine or a different `--time-limit` produces a
+    /// different basis and a different sweep. Re-running does not reproduce the
+    /// object; it re-attempts the claim.
+    fn file_sweep_replay(&self, claim: &str, nodes: u64) {
+        let serial = self.threads <= 1 || self.dim <= 1;
+        file_replay(ReplayClaim {
+            claim: claim.into(),
+            device: "lattice-cvp".into(),
+            method: "ahl-hnf-lll+bkz+schnorr-euchner".into(),
+            arithmetic: "outward-rounded-f64-interval".into(),
+            // The serial sweep counts its nodes; the parallel one reports
+            // through a shared envelope and is not attributed here. `unknown`
+            // is written rather than a number that would be a guess.
+            nodes_visited: if serial && nodes > 0 {
+                Some(nodes)
+            } else {
+                None
+            },
+            node_budget: NODE_BUDGET,
+            outcome: "exhausted".into(),
+            nondeterminism: vec![
+                "wall-clock-dependent-basis".into(),
+                if serial {
+                    "serial-sweep".into()
+                } else {
+                    "thread-count-dependent-work-split".into()
+                },
+            ],
+            reproduce: format!(
+                "ay-milp solve <model> --time-limit <secs>   # kernel dim {}, {} thread(s)",
+                self.dim,
+                self.threads.max(1)
+            ),
+            tcb: TCB.into(),
+        });
+    }
+
     fn build(
         ms: &MarketSplit,
         deadline: Instant,
@@ -1149,7 +1459,12 @@ impl Engine {
                     .collect::<Option<Vec<_>>>()
             })
             .collect::<Option<_>>()?;
+        let box_prune = build_box_prune(&bstar_q, &cnorm_i, &ms.lo, &ms.up, dim, n);
         if trace {
+            eprintln!(
+                "AY_MILP_TRACE lattice: box-prefix prune {}",
+                if box_prune.is_some() { "ON" } else { "OFF" }
+            );
             let norms: Vec<BigInt> = k
                 .iter()
                 .map(|v| v.iter().map(|&x| BigInt::from(x) * BigInt::from(x)).sum())
@@ -1188,6 +1503,7 @@ impl Engine {
             cnorm_q,
             cnorm_i,
             mu_i,
+            box_prune,
             lo: ms.lo.clone(),
             up: ms.up.clone(),
             radius_q,
@@ -1201,77 +1517,16 @@ impl Engine {
     /// Solve `A x = d` for an integer `x` (or `None` if no integer solution).
     /// Uses `A·U = [H|0]`: solve `H z = d`, then `x = U·[z;0]`.
     fn particular(&self, ms: &MarketSplit, d: &[i64]) -> Option<Vec<BigInt>> {
-        if Instant::now() >= self.deadline {
-            return None;
-        }
-        let m = ms.m;
-        let r = self.rank;
-        // Augmented [H | d] over BigRational, Gaussian elimination.
-        let mut hf: Vec<Vec<BigRational>> = (0..m)
-            .map(|i| {
-                let mut row: Vec<BigRational> = (0..r)
-                    .map(|j| BigRational::from(self.hh[i][j].clone()))
-                    .collect();
-                row.push(BigRational::from(BigInt::from(d[i])));
-                row
-            })
-            .collect();
-        let mut piv: Vec<(usize, usize)> = Vec::new();
-        let mut pr = 0usize;
-        for c in 0..r {
-            if Instant::now() >= self.deadline {
-                return None;
-            }
-            let prow = (pr..m).find(|&i| !hf[i][c].is_zero());
-            let Some(prow) = prow else { continue };
-            hf.swap(pr, prow);
-            let pv = hf[pr][c].clone();
-            for x in &mut hf[pr] {
-                *x /= &pv;
-            }
-            for i in 0..m {
-                if i != pr && !hf[i][c].is_zero() {
-                    let f = hf[i][c].clone();
-                    for k in 0..=r {
-                        let t = &f * &hf[pr][k];
-                        hf[i][k] -= t;
-                    }
-                }
-            }
-            piv.push((pr, c));
-            pr += 1;
-        }
-        // Consistency: a zero row with nonzero rhs ⟹ no solution.
-        for i in 0..m {
-            if (0..r).all(|c| hf[i][c].is_zero()) && !hf[i][r].is_zero() {
-                return None;
-            }
-        }
-        let mut z1 = vec![BigRational::zero(); r];
-        for &(pri, c) in &piv {
-            z1[c] = hf[pri][r].clone();
-        }
-        // z must be integral.
-        if z1.iter().any(|v| !v.is_integer()) {
-            return None;
-        }
-        let z: Vec<BigInt> = z1
-            .iter()
-            .map(|v| v.to_integer())
-            .chain(std::iter::repeat_n(BigInt::zero(), self.n - r))
-            .collect();
-        // x = U · [z; 0].
-        let mut x = vec![BigInt::zero(); self.n];
-        for i in 0..self.n {
-            let mut s = BigInt::zero();
-            for j in 0..self.n {
-                if !z[j].is_zero() {
-                    s += &self.u[i][j] * &z[j];
-                }
-            }
-            x[i] = s;
-        }
-        Some(x)
+        let db: Vec<BigInt> = d.iter().copied().map(BigInt::from).collect();
+        hnf_particular(
+            &self.hh,
+            &self.u,
+            ms.m,
+            self.n,
+            self.rank,
+            &db,
+            self.deadline,
+        )
     }
 
     /// Babai nearest-plane: reduce `x_d` modulo the reduced lattice so its entries
@@ -1398,7 +1653,59 @@ impl Engine {
         shared_nodes: Option<&'a AtomicU64>,
     ) -> EnumState<'a> {
         let dim = self.dim;
+        let n = self.n;
         let zero = Interval { lo: 0.0, hi: 0.0 };
+        // Per-face box-prune anchor `base_k = x_d[k] + Σ_t tg_t·b*_t[k]`
+        // (= `c_k − τ⊥_k`), enclosed OUTWARD once; the hot loop then carries
+        // only its rounded midpoint plus a scalar error budget. Failure to
+        // enclose disables the prune for this sweep — never an abort.
+        let (cflat, base_absmax, base_halfw, box_on) = match self.box_prune.as_ref() {
+            Some(bp) => {
+                let mut mid = vec![0.0f64; n];
+                let mut absmax = 0.0f64;
+                let mut halfw = 0.0f64;
+                let mut ok = true;
+                for (k, slot) in mid.iter_mut().enumerate() {
+                    let mut acc = Interval {
+                        lo: xd[k] as f64,
+                        hi: xd[k] as f64,
+                    };
+                    for t in 0..dim {
+                        match tg[t]
+                            .mul_general(bp.bstar_i[t][k])
+                            .and_then(|term| acc.add(term))
+                        {
+                            Some(next) => acc = next,
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !ok {
+                        break;
+                    }
+                    let m = (acc.lo + acc.hi) * 0.5;
+                    if !m.is_finite() {
+                        ok = false;
+                        break;
+                    }
+                    *slot = m;
+                    absmax = absmax.max(acc.lo.abs().max(acc.hi.abs()));
+                    halfw = halfw.max((acc.hi - m).max(m - acc.lo).next_up());
+                }
+                if ok && absmax.is_finite() && halfw.is_finite() {
+                    // Rows `0..dim` are scratch; row `dim` is the immutable
+                    // `base` every level-`dim−1` candidate reads.
+                    let mut flat = vec![0.0f64; (dim + 1) * n];
+                    flat[dim * n..].copy_from_slice(&mid);
+                    (flat, absmax, halfw, true)
+                } else {
+                    (Vec::new(), 0.0, 0.0, false)
+                }
+            }
+            None => (Vec::new(), 0.0, 0.0, false),
+        };
         EnumState {
             eng: self,
             xd,
@@ -1410,6 +1717,10 @@ impl Engine {
             // every candidate, so interval widths never grow from add/subtract
             // restoration roundoff.
             partial: vec![vec![zero; dim]; dim],
+            cflat,
+            base_absmax,
+            base_halfw,
+            box_on,
             nodes: 0,
             node_cap: NODE_BUDGET,
             shared_nodes,
@@ -1456,7 +1767,7 @@ impl Engine {
         let zero = Interval { lo: 0.0, hi: 0.0 };
         let mut st = self.fresh_state(xd, tg, radius, None);
         st.node_cap = node_cap.min(NODE_BUDGET);
-        let found = st.rec(dim - 1, zero);
+        let found = st.rec(dim - 1, zero, 0.0, 0.0);
         if self.trace {
             let status = if st.aborted {
                 "ABORTED"
@@ -1513,7 +1824,7 @@ impl Engine {
         // for good load balance. The shared node counter charges EVERY pass,
         // and the item cap bounds a bushy level before it can consume more than
         // the declared memory envelope.
-        let Some(limits) = frontier_limits(dim, self.threads) else {
+        let Some(limits) = frontier_limits(dim, self.n, self.threads) else {
             return EnumResult::Aborted;
         };
         let shared_nodes = AtomicU64::new(0);
@@ -1526,7 +1837,7 @@ impl Engine {
             // pass starts. Clear it first so iterative deepening never retains
             // two capped frontiers at once.
             items.clear();
-            st.collect(dim - 1, zero, sl, &mut items, limits.cap);
+            st.collect(dim - 1, zero, sl, &mut items, limits.cap, 0.0, 0.0);
             if st.aborted {
                 return EnumResult::Aborted;
             }
@@ -1575,8 +1886,9 @@ impl Engine {
                             for (column, &interval) in item.partial_row.iter().enumerate() {
                                 st.partial[stop_level][column] = interval;
                             }
+                            st.seed_box_row(stop_level, &item.c_row);
                             st.cancel = Some(&found);
-                            let hit = st.rec(stop_level, item.dist);
+                            let hit = st.rec(stop_level, item.dist, item.box_g, item.box_h);
                             match hit {
                                 Some(y) => {
                                     let Ok(mut guard) = best.lock() else {
@@ -1795,7 +2107,7 @@ impl Engine {
         }
         let dim = self.dim;
         let zero = Interval { lo: 0.0, hi: 0.0 };
-        let Some(limits) = frontier_limits(dim, self.threads) else {
+        let Some(limits) = frontier_limits(dim, self.n, self.threads) else {
             return FaceSweep::Aborted;
         };
         // --- Frontier generation per face (single-threaded, deterministic,
@@ -1815,7 +2127,7 @@ impl Engine {
                 let sl = dim - 1 - split;
                 let mut st = self.fresh_state(xd, tg.clone(), radius, Some(&shared));
                 items.clear();
-                st.collect(dim - 1, zero, sl, &mut items, limits.cap);
+                st.collect(dim - 1, zero, sl, &mut items, limits.cap, 0.0, 0.0);
                 if st.aborted {
                     return FaceSweep::Aborted;
                 }
@@ -1894,8 +2206,9 @@ impl Engine {
                             for (column, &interval) in item.partial_row.iter().enumerate() {
                                 st.partial[p.stop_level][column] = interval;
                             }
+                            st.seed_box_row(p.stop_level, &item.c_row);
                             st.cancel = Some(&found);
-                            let hit = st.rec(p.stop_level, item.dist);
+                            let hit = st.rec(p.stop_level, item.dist, item.box_g, item.box_h);
                             match hit {
                                 Some(y) => {
                                     let Ok(mut guard) = best.lock() else {
@@ -2005,6 +2318,28 @@ impl Engine {
                         "AY_MILP_TRACE lattice: A x = b has no integer solution — INFEASIBLE"
                     );
                 }
+                // This verdict carries NO exported certificate, so it files a
+                // replay claim: the only honest thing a device can do when its
+                // proof is "I ran a computation". Unlike the CVP sweeps below
+                // this one IS deterministic (exact BigInt column-HNF, no
+                // floating point and no wall-clock-dependent reduction), and it
+                // is also the one replay claim here that HAS a short
+                // certificate in theory — a rational `u` with `uᵀA` integral
+                // and `uᵀb` non-integral. Not built yet; recorded as trusted
+                // rather than dressed up as proved.
+                file_replay(ReplayClaim {
+                    claim: "coset-inconsistent".into(),
+                    device: "lattice-hnf".into(),
+                    method: "column-hnf-exact-bigint".into(),
+                    arithmetic: "exact-bigint".into(),
+                    nodes_visited: None,
+                    node_budget: 0,
+                    outcome: "inconsistent".into(),
+                    nondeterminism: Vec::new(),
+                    reproduce: "ay-milp solve <model>   # deterministic: exact HNF, no reduction"
+                        .into(),
+                    tcb: TCB.into(),
+                });
                 return Some(Outcome::Infeasible {
                     cert: None,
                     tree_cert: None,
@@ -2030,6 +2365,7 @@ impl Engine {
                             "AY_MILP_TRACE lattice: feasibility face PROVEN EMPTY — model INFEASIBLE"
                         );
                     }
+                    self.file_sweep_replay("feasibility-face-empty", zero_nodes);
                     return Some(Outcome::Infeasible {
                         cert: None,
                         tree_cert: None,
@@ -2048,6 +2384,13 @@ impl Engine {
                 if self.trace {
                     eprintln!("AY_MILP_TRACE lattice: b−e_{k} face FEASIBLE — optimum = 1 witness");
                 }
+                // The LOWER-BOUND half of this optimum is an exhaustive sweep
+                // over up to 4e9 nodes. There is no short witness for it, and
+                // there will not be one: the claim is "no lattice point of this
+                // coset lies in the box", and the proof IS the enumeration.
+                // Filed only now, past the witness hunt, so the claim cannot be
+                // orphaned onto a later verdict if the device declines.
+                self.file_sweep_replay("objective-face-empty", zero_nodes);
                 (1i64, y, xd)
             }
             EnumResult::Capped | EnumResult::Aborted => return None,
@@ -2304,6 +2647,15 @@ struct WorkItem {
     /// Squared-distance interval accumulated by the fixed higher coordinates,
     /// passed as `dist_above` into `rec(stop_level, dist)`.
     dist: Interval,
+    /// Box-prune resume state (empty / zero when the prune is off): the parent's
+    /// `C` row `cflat[stop_level + 1]` plus the two carried error accumulators,
+    /// so the worker's `rec(stop_level, ..)` re-derives BYTE-IDENTICAL centers
+    /// and prunes exactly where the serial sweep would. Without these the
+    /// frontier and the workers would prune differently and the "complete
+    /// partition of the serial sweep" invariant would no longer be checkable.
+    c_row: Vec<f64>,
+    box_g: f64,
+    box_h: f64,
 }
 
 struct EnumState<'a> {
@@ -2313,6 +2665,17 @@ struct EnumState<'a> {
     radius: f64,
     y: Vec<i64>,
     partial: Vec<Vec<Interval>>,
+    /// BOX-PRUNE scratch, flat `(dim + 1) × n` (empty when the prune is off).
+    /// Row `L` holds `C^(L)_k = base_k + Σ_{t≥L} (y_t − e_t)·b*_t[k]`; row `dim`
+    /// is the face's immutable `base`. A child row is rebuilt from its
+    /// immutable parent row for every candidate, exactly like `partial`, so
+    /// backtracking needs no restore and no error accumulates across siblings.
+    cflat: Vec<f64>,
+    /// `max_k |base_k|` and an outward bound on `|base_k − cflat[dim][k]|`.
+    base_absmax: f64,
+    base_halfw: f64,
+    /// Whether this state maintains/tests `cflat` at all.
+    box_on: bool,
     nodes: u64,
     /// Serial-only retryable cap. Shared parallel states use the independent
     /// `shared_budget` envelope and leave this at `NODE_BUDGET`.
@@ -2403,10 +2766,122 @@ impl EnumState<'_> {
         true
     }
 
+    /// Restore the box-prune centre row a worker resumes from: `cflat[stop+1]`
+    /// is `C^(stop+1)`, the row the frontier's parent node wrote. Seeding it
+    /// makes the worker's `rec(stop, ..)` produce BIT-IDENTICAL centres to the
+    /// serial sweep at the same node, so the frontier partition stays exact.
+    /// A row of the wrong length (prune off on either side) leaves the state's
+    /// own anchor in place, which only ever means "prune less".
+    fn seed_box_row(&mut self, stop_level: usize, row: &[f64]) {
+        let n = self.eng.n;
+        if !self.box_on || row.len() != n {
+            return;
+        }
+        let base = (stop_level + 1) * n;
+        self.cflat[base..base + n].copy_from_slice(row);
+    }
+
+    /// ONE BOX-PREFIX PRUNE STEP, fused into the node the caller has just
+    /// formed. Rebuilds the child centre row `C^(level)` from its immutable
+    /// parent row `C^(level+1)` and tests EVERY original coordinate against its
+    /// rigorous Cauchy–Schwarz reach bound (see `BoxPrune`).
+    ///
+    /// Returns `(g, h, fire)`. `fire` ⟹ the entire subtree below this node is
+    /// PROVABLY box-empty: for some coordinate `k`, every completion of the
+    /// unassigned levels that still fits the enumeration ball leaves `x_k`
+    /// outside `[lo_k, up_k]`. `g`/`h` are the child's error accumulators,
+    /// carried down the recursion beside `dist_above` (never restored on
+    /// backtrack, because each node recomputes it from its own parent's value)
+    /// and valid whether or not `fire` is set.
+    ///
+    /// The caller decides what to do with `fire`. `rec` cuts; the FRONTIER
+    /// (`collect`) deliberately does NOT — it only maintains `C`, so its
+    /// stop-level search, item count and partition stay BYTE-IDENTICAL to the
+    /// unpruned build. Pruning the frontier instead shifts `stop_level` deeper,
+    /// which reshuffles the round-robin item order and measurably delays
+    /// witness discovery on feasible faces (cd8p_s101 3.8 s → timeout,
+    /// cd_m8_s2 13.1 s → timeout). The frontier is only ~10⁴ nodes, so
+    /// declining to cut it costs nothing, and the workers still cut everything
+    /// below `stop_level` — where, per the level-mass profile, >99% of the
+    /// nodes are.
+    ///
+    /// SOUNDNESS OF THE FLOATING POINT. `dst[k]` is a round-to-nearest FMA
+    /// chain, not an interval — deliberately, since the per-operation outward
+    /// form costs ~6× and buys nothing. Instead ONE outward envelope `eps`
+    /// bounds the whole row's deviation from the exact centre:
+    ///   * `base_halfw` — the enclosure width of the face anchor `base`;
+    ///   * `h` — Σ over assigned levels of the interval widths of `y_t − e_t`
+    ///     and of `b*_t[k]` (the only non-rounding error the point form drops);
+    ///   * `eps_coeff · scale` with `eps_coeff = (dim + 8)·2⁻⁵²` — a Higham
+    ///     bound on the ≤ `dim` FMA roundings (each ≤ `u·|C|`, and
+    ///     `|C| ≤ base_absmax + g`), with 8 extra units covering the two box
+    ///     subtractions, the `− eps` subtraction and the `rt · √S` product.
+    /// The test then subtracts `eps` from the deviation and requires a STRICT
+    /// excess, so a coordinate can only fire when the EXACT deviation exceeds
+    /// the EXACT reach. Any non-finite or oversized magnitude forces
+    /// `eps = ∞`, which makes every comparison false — fail-closed.
+    #[inline]
+    fn box_step(
+        &mut self,
+        bp: &BoxPrune,
+        level: usize,
+        diff: Interval,
+        dist_lo: f64,
+        g: f64,
+        h: f64,
+    ) -> (f64, f64, bool) {
+        let n = self.eng.n;
+        // Point form of `y_level − e_level` plus an outward deviation bound
+        // valid for the ROUNDED midpoint itself (not for the exact midpoint).
+        let dm = (diff.lo + diff.hi) * 0.5;
+        let dw = (diff.hi - dm).max(dm - diff.lo).next_up();
+        let amax = bp.bstar_absmax[level];
+        let bw = bp.bstar_halfw[level];
+        let adm = dm.abs();
+        // `base_absmax + g` bounds `|C_k|` for every coordinate and every level
+        // at or above this one; `h` accumulates the point form's dropped width.
+        let gn = (g + (adm + dw) * amax).next_up();
+        let hn = (h + ((adm + dw) * bw + dw * amax)).next_up();
+        // Upper bound on the squared budget the UNASSIGNED levels may still
+        // spend: every box point of the face lies in the ball, and the levels
+        // at or above this one have already consumed at least `dist_lo`.
+        let rem = (self.radius - dist_lo).next_up();
+        let rt = if rem > 0.0 { rem.sqrt().next_up() } else { 0.0 };
+        let scale = self.base_absmax + gn + bp.bound_absmax + rt * bp.sqrt_s_max[level];
+        let mut eps =
+            ((self.base_halfw + hn + bp.eps_coeff * scale) * BOX_PRUNE_EPS_SLACK).next_up();
+        if !(scale < BOX_PRUNE_MAX_SCALE && eps > 0.0) {
+            eps = f64::INFINITY;
+        }
+        let base = level * n;
+        let (lower, upper) = self.cflat.split_at_mut(base + n);
+        let dst = &mut lower[base..base + n];
+        let src = &upper[..n];
+        let bm = &bp.bstar_mid[level][..n];
+        let sq = &bp.sqrt_s[level][..n];
+        let lo_f = &bp.lo_f[..n];
+        let up_f = &bp.up_f[..n];
+        let mut fire = false;
+        for k in 0..n {
+            let c = dm.mul_add(bm[k], src[k]);
+            dst[k] = c;
+            let dev = (c - up_f[k]).max(lo_f[k] - c) - eps;
+            fire |= dev > rt * sq[k];
+        }
+        (gn, hn, fire)
+    }
+
     /// Recursion over kernel coordinate `level` (dim−1 … 0). `dist_above` is the
     /// outward interval for the squared distance accumulated by already-fixed
-    /// higher coordinates.
-    fn rec(&mut self, level: usize, dist_above: Interval) -> Option<Vec<i64>> {
+    /// higher coordinates; `box_g`/`box_h` are the box-prune error accumulators
+    /// (both `0.0` at the root, ignored when the prune is off).
+    fn rec(
+        &mut self,
+        level: usize,
+        dist_above: Interval,
+        box_g: f64,
+        box_h: f64,
+    ) -> Option<Vec<i64>> {
         if self.aborted || self.capped || self.cancelled {
             return None;
         }
@@ -2462,14 +2937,26 @@ impl EnumState<'_> {
         // too) — a sound early stop, equivalent to the naive scan's tail of
         // pruned iterations.
         let mut order = SchnorrEuchnerOrder::new(lo, hi, e);
+        // Box-prefix prune tables, hoisted out of the candidate scan.
+        let boxp = if self.box_on {
+            eng.box_prune.as_ref()
+        } else {
+            None
+        };
         while let Some((yi, side)) = order.next() {
             let yi_i = Interval {
                 lo: yi as f64,
                 hi: yi as f64,
             };
-            let Some(d) = yi_i
-                .sub(e)
-                .and_then(Interval::square)
+            // `diff = y_level − e_level`, lifted out of the `and_then` chain so
+            // the box prune can reuse it. Identical operations in identical
+            // order: the distance interval is bit-for-bit the historical one.
+            let Some(diff) = yi_i.sub(e) else {
+                self.aborted = true;
+                return None;
+            };
+            let Some(d) = diff
+                .square()
                 .and_then(|v| v.mul_nonnegative(cnorm))
                 .and_then(|v| dist_above.add(v))
             else {
@@ -2507,6 +2994,21 @@ impl EnumState<'_> {
                 }
             }
             self.y[level] = yi;
+            // BOX-PREFIX PRUNE. Placed BEFORE the μ back-substitution so a cut
+            // node also skips that O(level) pass. It must NOT close a
+            // Schnorr–Euchner side: box infeasibility is not monotone along the
+            // candidate scan (unlike the ℓ₂ distance), so only this candidate's
+            // subtree is dropped.
+            let (child_g, child_h) = match boxp {
+                Some(bp) => {
+                    let (g, h, fire) = self.box_step(bp, level, diff, d.lo, box_g, box_h);
+                    if fire {
+                        continue;
+                    }
+                    (g, h)
+                }
+                None => (box_g, box_h),
+            };
             if level == 0 {
                 match self.box_ok() {
                     Some(true) => return Some(self.y.clone()),
@@ -2531,7 +3033,7 @@ impl EnumState<'_> {
                     };
                     self.partial[level - 1][k] = next;
                 }
-                let hit = self.rec(level - 1, d);
+                let hit = self.rec(level - 1, d, child_g, child_h);
                 if hit.is_some() {
                     return hit;
                 }
@@ -2560,23 +3062,34 @@ impl EnumState<'_> {
         stop_level: usize,
         out: &mut Vec<WorkItem>,
         frontier_cap: usize,
+        box_g: f64,
+        box_h: f64,
     ) {
         if self.aborted {
             return;
         }
         // Base case: this is a subtree root the workers will enumerate. The
-        // parent has already written `partial[stop_level][0..=stop_level]` and
-        // every `y[stop_level+1..dim]`, exactly as `rec` would have on entry to
-        // `rec(stop_level, dist_above)`.
+        // parent has already written `partial[stop_level][0..=stop_level]`,
+        // `cflat[stop_level + 1]` and every `y[stop_level+1..dim]`, exactly as
+        // `rec` would have on entry to `rec(stop_level, dist_above)`.
         if level == stop_level {
             if out.len() >= frontier_cap {
                 self.aborted = true;
                 return;
             }
+            let n = self.eng.n;
             out.push(WorkItem {
                 y_upper: self.y[stop_level + 1..self.eng.dim].to_vec(),
                 partial_row: self.partial[stop_level][0..=stop_level].to_vec(),
                 dist: dist_above,
+                c_row: if self.box_on {
+                    let base = (stop_level + 1) * n;
+                    self.cflat[base..base + n].to_vec()
+                } else {
+                    Vec::new()
+                },
+                box_g,
+                box_h,
             });
             return;
         }
@@ -2610,14 +3123,25 @@ impl EnumState<'_> {
             return;
         }
         let mut order = SchnorrEuchnerOrder::new(lo, hi, e);
+        // The frontier MAINTAINS the box-prune centres (each work item carries
+        // the row its worker resumes from) but never cuts on them, so the
+        // emitted partition is exactly the unpruned one.
+        let boxp = if self.box_on {
+            eng.box_prune.as_ref()
+        } else {
+            None
+        };
         while let Some((yi, side)) = order.next() {
             let yi_i = Interval {
                 lo: yi as f64,
                 hi: yi as f64,
             };
-            let Some(d) = yi_i
-                .sub(e)
-                .and_then(Interval::square)
+            let Some(diff) = yi_i.sub(e) else {
+                self.aborted = true;
+                return;
+            };
+            let Some(d) = diff
+                .square()
                 .and_then(|v| v.mul_nonnegative(cnorm))
                 .and_then(|v| dist_above.add(v))
             else {
@@ -2642,6 +3166,16 @@ impl EnumState<'_> {
                 return;
             }
             self.y[level] = yi;
+            // MAINTAIN-ONLY: the frontier computes the child `C` row (the
+            // workers need it) but never acts on `fire`, so the emitted
+            // partition is byte-identical to the unpruned build.
+            let (child_g, child_h) = match boxp {
+                Some(bp) => {
+                    let (g, h, _fire) = self.box_step(bp, level, diff, d.lo, box_g, box_h);
+                    (g, h)
+                }
+                None => (box_g, box_h),
+            };
             // `level > stop_level >= 0`, so `level >= 1`: always the recurse
             // branch (the leaf `box_ok` is a worker's job, never the frontier's).
             let mu = &eng.mu_i[level];
@@ -2656,7 +3190,15 @@ impl EnumState<'_> {
                 };
                 self.partial[level - 1][k] = next;
             }
-            self.collect(level - 1, d, stop_level, out, frontier_cap);
+            self.collect(
+                level - 1,
+                d,
+                stop_level,
+                out,
+                frontier_cap,
+                child_g,
+                child_h,
+            );
             if self.aborted {
                 return;
             }
@@ -2752,6 +3294,97 @@ fn col_hnf(
         }
     }
     Some((u, r, mm))
+}
+
+/// An INTEGER particular solution of `A x = d`, given `A`'s column-HNF data
+/// `(hh, u, rank)` from [`col_hnf`] (`A·U = [H | 0]`): solve `H z = d` over ℚ,
+/// require `z` integral, and return `x = U·[z; 0]`. `None` means "no integer
+/// solution I can exhibit" — a rational-but-not-integral `z`, an inconsistent
+/// system, or an expired deadline. A caller must therefore never read `None`
+/// as INFEASIBLE.
+///
+/// Shared by the market-split face solver ([`Engine::particular`]) and the
+/// root kernel reformulation ([`reformulate_kernel`]); they differ only in how
+/// they obtained `d`.
+fn hnf_particular(
+    hh: &[Vec<BigInt>],
+    u: &[Vec<BigInt>],
+    m: usize,
+    n: usize,
+    rank: usize,
+    d: &[BigInt],
+    deadline: Instant,
+) -> Option<Vec<BigInt>> {
+    if Instant::now() >= deadline {
+        return None;
+    }
+    let r = rank;
+    // Augmented [H | d] over BigRational, Gaussian elimination.
+    let mut hf: Vec<Vec<BigRational>> = (0..m)
+        .map(|i| {
+            let mut row: Vec<BigRational> = (0..r)
+                .map(|j| BigRational::from(hh[i][j].clone()))
+                .collect();
+            row.push(BigRational::from(d[i].clone()));
+            row
+        })
+        .collect();
+    let mut piv: Vec<(usize, usize)> = Vec::new();
+    let mut pr = 0usize;
+    for c in 0..r {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let prow = (pr..m).find(|&i| !hf[i][c].is_zero());
+        let Some(prow) = prow else { continue };
+        hf.swap(pr, prow);
+        let pv = hf[pr][c].clone();
+        for x in &mut hf[pr] {
+            *x /= &pv;
+        }
+        for i in 0..m {
+            if i != pr && !hf[i][c].is_zero() {
+                let f = hf[i][c].clone();
+                for k in 0..=r {
+                    let t = &f * &hf[pr][k];
+                    hf[i][k] -= t;
+                }
+            }
+        }
+        piv.push((pr, c));
+        pr += 1;
+    }
+    // Consistency: a zero row with nonzero rhs ⟹ no solution.
+    for i in 0..m {
+        if (0..r).all(|c| hf[i][c].is_zero()) && !hf[i][r].is_zero() {
+            return None;
+        }
+    }
+    let mut z1 = vec![BigRational::zero(); r];
+    for &(pri, c) in &piv {
+        z1[c] = hf[pri][r].clone();
+    }
+    // z must be integral.
+    if z1.iter().any(|v| !v.is_integer()) {
+        return None;
+    }
+    let z: Vec<BigInt> = z1
+        .iter()
+        .map(|v| v.to_integer())
+        .chain(std::iter::repeat_n(BigInt::zero(), n - r))
+        .collect();
+    // x = U · [z; 0].
+    let mut x = vec![BigInt::zero(); n];
+    for (i, xi) in x.iter_mut().enumerate() {
+        let mut s = BigInt::zero();
+        for j in 0..n {
+            if !z[j].is_zero() {
+                s += &u[i][j] * &z[j];
+            }
+        }
+        *xi = s;
+    }
+    Some(x)
 }
 
 fn col_swap(mm: &mut [Vec<BigInt>], u: &mut [Vec<BigInt>], a: usize, b: usize) {
@@ -3870,6 +4503,731 @@ fn round_rat(r: &BigRational) -> BigInt {
     num.div_floor(&den)
 }
 
+// ---------------------------------------------------------------------------
+// AARDAL–HURKENS–LENSTRA ROOT REFORMULATION
+//
+// Everything above proves a verdict by ENUMERATING a lattice. This section does
+// something different and much cheaper: it hands the ordinary branch-and-bound
+// search a different COORDINATE SYSTEM and then gets out of the way.
+// ---------------------------------------------------------------------------
+
+/// Cap on `|C|`, the block of columns re-coordinated. Every step of the build
+/// (column-HNF with unimodular tracking, LLL, the exact `|C|×|C|` unimodularity
+/// certificate, the exact ℚ-rank) is cubic in `BigInt`, and a change of
+/// coordinates only pays off on a SMALL, tightly coupled block anyway.
+const KERNEL_MAX_COLS: usize = 64;
+
+/// Cap on `|E|`, the equality rows folded away.
+const KERNEL_MAX_ROWS: usize = 32;
+
+/// Wall-clock envelope for one reformulation attempt. `reformulate_kernel` runs
+/// ONCE at the root of a solve and has no caller deadline to inherit, so it
+/// carries its own: a decline costs the solve this much at worst, and on the
+/// shapes the gate admits (`ej`: 1×3) the real cost is microseconds.
+const KERNEL_REFORM_SECS: u64 = 10;
+
+/// The exact rational `v` as an `f64`, or `None` when the `f64` would be a
+/// ROUNDED PROXY. Identical rule to `presolve::as_exact_f64` — the reformulation
+/// fails closed on every coefficient it cannot restate without loss, because a
+/// rounded coefficient in the reduced model is a different model.
+fn as_exact_f64(v: &BigRational) -> Option<f64> {
+    let f = v.to_f64()?;
+    if !f.is_finite() {
+        return None;
+    }
+    (BigRational::from_float(f).as_ref() == Some(v)).then_some(f)
+}
+
+/// Exact rank over ℚ of an integer matrix, by rational Gaussian elimination.
+///
+/// This is deliberately INDEPENDENT of [`col_hnf`]'s own pivot count: S1(c)
+/// (see [`reformulate_kernel`]) needs the kernel dimension `|C| − rank(A)` to be
+/// the truth, not the HNF's opinion of it, because a rank read one too high
+/// yields one basis vector too few and silently drops a whole direction of the
+/// feasible lattice.
+fn rank_exact_q(a: &[Vec<BigInt>], deadline: Instant) -> Option<usize> {
+    let m = a.len();
+    if m == 0 {
+        return Some(0);
+    }
+    let n = a[0].len();
+    if a.iter().any(|row| row.len() != n) {
+        return None;
+    }
+    let mut g: Vec<Vec<BigRational>> = a
+        .iter()
+        .map(|row| row.iter().map(|v| BigRational::from(v.clone())).collect())
+        .collect();
+    let mut rank = 0usize;
+    for c in 0..n {
+        if rank == m {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let Some(prow) = (rank..m).find(|&r| !g[r][c].is_zero()) else {
+            continue;
+        };
+        g.swap(prow, rank);
+        let pv = g[rank][c].clone();
+        for x in &mut g[rank] {
+            *x /= &pv;
+        }
+        for r in 0..m {
+            if r != rank && !g[r][c].is_zero() {
+                let f = g[r][c].clone();
+                for k in c..n {
+                    let t = &f * &g[rank][k];
+                    g[r][k] -= t;
+                }
+            }
+        }
+        rank += 1;
+    }
+    Some(rank)
+}
+
+/// Exact `A·B` over `BigInt` (`a` is `p×q`, `b` is `q×s`), or `None` on a shape
+/// mismatch / expired deadline.
+fn matmul_bigint(
+    a: &[Vec<BigInt>],
+    b: &[Vec<BigInt>],
+    deadline: Instant,
+) -> Option<Vec<Vec<BigInt>>> {
+    let q = b.len();
+    let s = if q == 0 { 0 } else { b[0].len() };
+    if b.iter().any(|row| row.len() != s) || a.iter().any(|row| row.len() != q) {
+        return None;
+    }
+    let mut out = vec![vec![BigInt::zero(); s]; a.len()];
+    for (i, arow) in a.iter().enumerate() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        for (k, aik) in arow.iter().enumerate() {
+            if aik.is_zero() {
+                continue;
+            }
+            for j in 0..s {
+                if !b[k][j].is_zero() {
+                    out[i][j] += aik * &b[k][j];
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// S1(c): the column-HNF really did what it claims, and `U` really is
+/// unimodular — so columns `rank..|C|` of `U` are a basis of the FULL saturated
+/// kernel `L = {y ∈ ℤ^|C| : A y = 0}`, not of some sublattice or superlattice.
+///
+/// Four exact discharges, in the order they build on each other:
+///  1. `rank` equals the ℚ-rank of `A` recomputed independently ([`rank_exact_q`]);
+///  2. `A·U == M` exactly over `BigInt`;
+///  3. `M`'s columns `rank..n` are identically zero (so those columns of `U` lie
+///     in `L` — and with (1) the first `rank` columns of `M` must then span a
+///     rank-`rank` space, i.e. be independent);
+///  4. `U` has an INTEGER inverse and `U·U⁻¹ == I` exactly, hence `det U = ±1`.
+///
+/// (4) is what upgrades "those columns lie in `L`" to "those columns GENERATE
+/// `L`": `U` unimodular means its columns are a ℤ-basis of ℤ^|C|, so any
+/// `y ∈ L ⊆ ℤ^|C|` is `U w` for a unique integer `w`, and `A y = M w = 0` with
+/// (3)+(1) forces `w_0..w_{rank−1} = 0`.
+fn hnf_kernel_invariant_holds(
+    a: &[Vec<BigInt>],
+    u: &[Vec<BigInt>],
+    mm: &[Vec<BigInt>],
+    rank: usize,
+    n: usize,
+    deadline: Instant,
+) -> bool {
+    if u.len() != n || u.iter().any(|row| row.len() != n) {
+        return false;
+    }
+    if mm.len() != a.len() || mm.iter().any(|row| row.len() != n) {
+        return false;
+    }
+    if rank_exact_q(a, deadline) != Some(rank) {
+        return false;
+    }
+    let Some(au) = matmul_bigint(a, u, deadline) else {
+        return false;
+    };
+    if au != mm {
+        return false;
+    }
+    if mm
+        .iter()
+        .any(|row| row[rank..].iter().any(|v| !v.is_zero()))
+    {
+        return false;
+    }
+    let Some(inv) = unimodular_inverse(u, deadline) else {
+        return false;
+    };
+    let Some(prod) = matmul_bigint(u, &inv, deadline) else {
+        return false;
+    };
+    (0..n).all(|i| {
+        (0..n).all(|j| {
+            if i == j {
+                prod[i][j].is_one()
+            } else {
+                prod[i][j].is_zero()
+            }
+        })
+    })
+}
+
+/// S1(a)+(b): `candidate` is a BASIS of the same lattice as `reference`, not a
+/// proper sublattice of it.
+///
+/// **This is the one way the whole design can be unsound, so both halves are
+/// mandatory.** (a) alone — every candidate vector lies in `ker A` — is passed
+/// by the DOUBLED basis `{2·b₁, b₂, …}`, which spans an index-2 sublattice: the
+/// reformulated model would then be missing half the feasible integer points and
+/// could report a strictly WORSE value while claiming OPTIMAL. (b) is the exact
+/// covolume equality (`det(B·Bᵀ)`, a unimodular invariant) that rules that out:
+/// `d` vectors of `L`, of rank `d` (a nonzero Gram determinant), whose covolume
+/// equals `L`'s, generate a sublattice of INDEX 1 — that is, `L` itself.
+fn kernel_basis_is_same_lattice(
+    a: &[Vec<BigInt>],
+    reference: &[Vec<BigInt>],
+    candidate: &[Vec<BigInt>],
+    n: usize,
+    deadline: Instant,
+) -> bool {
+    if candidate.len() != reference.len() || candidate.is_empty() {
+        return false;
+    }
+    if candidate.iter().any(|v| v.len() != n) || reference.iter().any(|v| v.len() != n) {
+        return false;
+    }
+    // (a) every candidate vector is in the kernel, over BigInt (no i64 narrowing:
+    // that is the ENUMERATOR's requirement, not a soundness one).
+    for v in candidate {
+        for arow in a {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let mut dot = BigInt::zero();
+            for (ai, vi) in arow.iter().zip(v) {
+                if !ai.is_zero() && !vi.is_zero() {
+                    dot += ai * vi;
+                }
+            }
+            if !dot.is_zero() {
+                return false;
+            }
+        }
+    }
+    // (b) identical covolume. `gram_det` declines a singular Gram matrix, so a
+    // rank-deficient candidate cannot pass here either.
+    match (gram_det(reference, deadline), gram_det(candidate, deadline)) {
+        (Some(reference_det), Some(candidate_det)) => reference_det == candidate_det,
+        _ => false,
+    }
+}
+
+/// What an individual row of the reduced model IS, in the caller's frame.
+///
+/// A certificate lift needs this and a solution lift does not, which is why it
+/// arrives with [`crate::cert_lift`]: a reduced-frame multiplier on a reduced
+/// row is only translatable if the row can be named as an ORIGINAL model fact.
+/// The reformulation emits exactly two kinds, in this order — every surviving
+/// row (folded), then one row per member of `C` with a finite bound side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KernelRowOrigin {
+    /// The reduced row is original row `.0` with `x_C = x_p + B z` substituted.
+    /// As a FACT about a feasible point it is that original row, unchanged.
+    Folded(usize),
+    /// The reduced row re-imposes the finite bound sides of original column
+    /// `.0`: its lower side is `x_j − lo_j >= 0` and its upper side is
+    /// `up_j − x_j >= 0`, written in the `z` frame.
+    ColumnBound(usize),
+}
+
+/// How to lift a solution of the kernel-reformulated model back to the caller's
+/// full column space, and how to correct a reported objective value.
+///
+/// The shape deliberately mirrors [`crate::presolve::SingletonPostsolve`]: a
+/// column map for the survivors, an exact recovery rule for the columns that
+/// went away, and an exact `const_delta` that NEVER travels through `f64`.
+///
+/// The fields are `pub(crate)` because [`crate::cert_lift`] translates reduced
+/// CERTIFICATES with the same data this translates points with; see
+/// `KernelPostsolve::lift_farkas` there for the algebra.
+pub(crate) struct KernelPostsolve {
+    pub(crate) n_orig: usize,
+    /// Original column -> reduced column, or `None` for a member of `C`.
+    pub(crate) map: Vec<Option<Col>>,
+    /// The members of `C`, ascending — the index space of `xp` and `basis`.
+    pub(crate) cols_c: Vec<usize>,
+    /// `x_p`, the integer particular solution, one entry per member of `C`.
+    pub(crate) xp: Vec<BigRational>,
+    /// The reduced kernel basis: `basis[t][p]` is coordinate `p` of `b_t`.
+    pub(crate) basis: Vec<Vec<BigRational>>,
+    /// Reduced column carrying `z_t`.
+    pub(crate) z: Vec<Col>,
+    /// The ORIGINAL row indices of `E`, the equality rows the substitution
+    /// deleted, in the order their coefficients were read. A certificate lift
+    /// re-derives multipliers for exactly these.
+    pub(crate) e_rows: Vec<usize>,
+    /// What each reduced row is, indexed by reduced row index.
+    pub(crate) reduced_rows: Vec<KernelRowOrigin>,
+    /// `c_C·x_p` — the objective constant the substitution folds out. Kept as an
+    /// exact `BigRational` and added at expansion time, because it need not be
+    /// representable as the reduced model's `f64` offset.
+    pub(crate) const_delta: BigRational,
+}
+
+impl KernelPostsolve {
+    /// The constant to add to a reduced-model objective value / dual bound to
+    /// recover the caller-frame value.
+    pub(crate) fn const_delta(&self) -> &BigRational {
+        &self.const_delta
+    }
+
+    /// Widen a reduced-model point to the caller's full column space, computing
+    /// `x_C = x_p + B z` EXACTLY.
+    pub(crate) fn widen(&self, reduced: &[BigRational]) -> Vec<BigRational> {
+        let mut full = vec![BigRational::zero(); self.n_orig];
+        for (orig, slot) in self.map.iter().enumerate() {
+            if let Some(nc) = slot {
+                if let Some(v) = reduced.get(nc.index()) {
+                    full[orig] = v.clone();
+                }
+            }
+        }
+        for (p, &j) in self.cols_c.iter().enumerate() {
+            let mut acc = self.xp[p].clone();
+            for (t, bt) in self.basis.iter().enumerate() {
+                if bt[p].is_zero() {
+                    continue;
+                }
+                if let Some(v) = reduced.get(self.z[t].index()) {
+                    acc += &bt[p] * v;
+                }
+            }
+            full[j] = acc;
+        }
+        full
+    }
+}
+
+/// AARDAL–HURKENS–LENSTRA LATTICE COLUMN-BASIS REFORMULATION, as a ROOT MODEL
+/// REFORMULATION: change coordinates on a block of integer columns so that
+/// ordinary single-variable branching in the new frame is branching on GENERAL
+/// LATTICE DISJUNCTIONS in the old one.
+///
+/// # The measurement this exists for
+///
+/// MIPLIB `ej` is one row and three columns —
+/// `min x₀ s.t. 31013·x₀ − 41014·x₁ − 51015·x₂ = 0`, all integer, `x₀ ≥ 1`,
+/// `x₁,x₂ ≥ 0` and unbounded above, optimum 25508. AY loses it: 235,008 nodes,
+/// 28.9 s, dual bound stuck at 1. It is NOT an unbounded-domain defect —
+/// ORACLE-TIGHT bounds derived from the true optimum still fail (316,909 nodes,
+/// no proof). The node LP bound is `max(1, (41014·lo(x₁) + 51015·lo(x₂))/31013)`,
+/// so it moves ONLY with lower bounds, and single-variable branching needs ~1e8
+/// leaves to walk them up. The reformulation below solves the same instance in
+/// **5 nodes, 0.000 s** with stock branch and bound — and its new columns are
+/// FREE (unbounded on BOTH sides), which is the part that makes it work rather
+/// than a fresh bounding problem.
+///
+/// # The transform
+///
+/// `E` is a set of equality rows over integral columns; `C` is the block of
+/// columns they touch; `A x_C = b` is that system cleared to integers. Then
+/// `x_C = x_p + B z` where `A x_p = b` (an integer particular solution) and `B`
+/// is an LLL-reduced basis of `L = {y ∈ ℤ^|C| : A y = 0}`. The `|C|` columns and
+/// `|E|` rows go away, `d = |C| − rank(A)` FREE INTEGER columns `z` arrive, and
+/// each originally-FINITE column bound side comes back as one row
+/// `lo_j ≤ (x_p + B z)_j ≤ up_j` (an infinite side contributes NO row, which is
+/// exactly what keeps `z` free).
+///
+/// # Soundness
+///
+/// Everything is discharged HERE, at build time; any failure returns `None` and
+/// the caller solves the original model untouched. Nothing about this reasoning
+/// mentions `ej` — the gate is a property of the MODEL.
+///
+/// * **S1 — unimodularity ⟹ bijection.** `z ↦ x_p + B z` must be a BIJECTION
+///   `ℤ^d → {x ∈ ℤ^|C| : A x = b}`. (a) `A·b_t = 0` over `BigInt` for every
+///   basis vector, (b) LLL preserves the covolume exactly, (c) `B` spans the
+///   FULL kernel — see [`kernel_basis_is_same_lattice`] and
+///   [`hnf_kernel_invariant_holds`], and read the warning in the former: (a)
+///   alone is passed by a DOUBLED basis spanning an index-2 sublattice, which
+///   would delete half the feasible points and report a worse value as OPTIMAL.
+/// * **S2 — exact fold.** Every folded coefficient (`M·B` for a row, `c_C·B` for
+///   the objective) is computed in `BigInt`/`BigRational`, and the whole
+///   reformulation DECLINES if any changed coefficient or bound does not convert
+///   back to `f64` EXACTLY — the identical rule `presolve::substitute_singletons`
+///   enforces.
+/// * **S3 — bound rows lose nothing.** Each finite column bound becomes a row on
+///   `z` with identical rational content, and an infinite side becomes no row.
+///   By S1 the correspondence is a bijection, so no integer point of the
+///   original box is added or removed.
+///
+/// An inexact-coefficient model is declined wholesale (same fail-closed rule as
+/// `presolve.rs:87` and `detect` above): the reasoning below reads the public
+/// `f64` matrix, and on a model whose true coefficients are rounded proxies that
+/// is the wrong matrix. `AY_MILP_NO_KERNEL_REFORM` is the kill switch.
+///
+/// Returns the reduced model and its postsolve, or `None`.
+pub(crate) fn reformulate_kernel(model: &Model) -> Option<(Model, KernelPostsolve)> {
+    use num_integer::Integer;
+
+    if std::env::var_os("AY_MILP_NO_KERNEL_REFORM").is_some() || model.has_inexact_coeffs() {
+        return None;
+    }
+    let deadline = Instant::now() + std::time::Duration::from_secs(KERNEL_REFORM_SECS);
+    let nc = model.num_cols();
+    let nr = model.num_rows();
+    if nc == 0 || nr == 0 {
+        return None;
+    }
+    let trace = std::env::var_os("AY_MILP_TRACE").is_some();
+
+    // ---- THE GATE -------------------------------------------------------
+    // E := equality rows whose support is entirely integral columns.
+    let integral: Vec<bool> = (0..nc)
+        .map(|j| model.col_kind(Col(j as u32)).is_integral())
+        .collect();
+    let mut e_rows: Vec<usize> = Vec::new();
+    let mut in_c = vec![false; nc];
+    for i in 0..nr {
+        let (coeffs, rlo, rup) = model.row(Row(i as u32));
+        if coeffs.is_empty() || !rlo.is_finite() || !rup.is_finite() || rlo != rup {
+            continue;
+        }
+        if coeffs.iter().any(|&(c, _)| !integral[c as usize]) {
+            continue;
+        }
+        e_rows.push(i);
+        for &(c, _) in coeffs {
+            in_c[c as usize] = true;
+        }
+    }
+    if e_rows.is_empty() || e_rows.len() > KERNEL_MAX_ROWS {
+        return None;
+    }
+    let cols_c: Vec<usize> = (0..nc).filter(|&j| in_c[j]).collect();
+    if cols_c.is_empty() || cols_c.len() > KERNEL_MAX_COLS {
+        return None;
+    }
+    // Every column of C is integral by construction of E; it must ALSO be
+    // touched by no row outside E, or folding E away would strand a row that
+    // still mentions it.
+    let mut is_e = vec![false; nr];
+    for &i in &e_rows {
+        is_e[i] = true;
+    }
+    for i in 0..nr {
+        if is_e[i] {
+            continue;
+        }
+        let (coeffs, _, _) = model.row(Row(i as u32));
+        if coeffs.iter().any(|&(c, _)| in_c[c as usize]) {
+            return None;
+        }
+    }
+    // APPLICABILITY: "the box does not bound the equalities". Either some column
+    // of C is unbounded on a side, or a coefficient of E is larger than the
+    // widest finite column range in C — in both cases a node LP's bound on the
+    // equality moves by a fraction of a unit per unit of branching, which is the
+    // regime single-variable branching cannot close and a change of coordinates
+    // can. Outside it, the reformulation is a coordinate change nobody asked for
+    // and the ordinary search is left alone.
+    let mut any_infinite_side = false;
+    let mut widest_finite_range: Option<BigRational> = None;
+    for &j in &cols_c {
+        let (l, u) = model.col_bounds(Col(j as u32));
+        if !l.is_finite() || !u.is_finite() {
+            any_infinite_side = true;
+            continue;
+        }
+        let range = exact(u)? - exact(l)?;
+        if widest_finite_range.as_ref().is_none_or(|w| &range > w) {
+            widest_finite_range = Some(range);
+        }
+    }
+    let mut max_abs_coeff = BigRational::zero();
+    for &i in &e_rows {
+        let (coeffs, _, _) = model.row(Row(i as u32));
+        for &(_, a) in coeffs {
+            let m = exact(a)?.abs();
+            if m > max_abs_coeff {
+                max_abs_coeff = m;
+            }
+        }
+    }
+    let coefficients_outgrow_the_box = widest_finite_range
+        .as_ref()
+        .is_some_and(|w| &max_abs_coeff > w);
+    if !any_infinite_side && !coefficients_outgrow_the_box {
+        return None;
+    }
+
+    // ---- THE SYSTEM `A x_C = b`, exactly over BigInt ---------------------
+    let mut pos = vec![usize::MAX; nc];
+    for (p, &j) in cols_c.iter().enumerate() {
+        pos[j] = p;
+    }
+    let n = cols_c.len();
+    let m = e_rows.len();
+    let mut abig: Vec<Vec<BigInt>> = Vec::with_capacity(m);
+    let mut bbig: Vec<BigInt> = Vec::with_capacity(m);
+    for &i in &e_rows {
+        let (coeffs, rlo, _) = model.row(Row(i as u32));
+        // Clear the row by the LCM of its denominators — the same technique
+        // `detect` uses, and the same ceiling on how far it may scale.
+        let rhs = exact(rlo)?;
+        let mut mult = rhs.denom().clone();
+        let mut terms: Vec<(usize, BigRational)> = Vec::with_capacity(coeffs.len());
+        for &(c, a) in coeffs {
+            let q = exact(a)?;
+            mult = mult.lcm(q.denom());
+            terms.push((pos[c as usize], q));
+        }
+        if mult.is_zero() || mult > BigInt::from(MAX_ROW_SCALE) {
+            return None;
+        }
+        let mult_q = BigRational::from(mult);
+        let mut arow = vec![BigInt::zero(); n];
+        for (p, q) in terms {
+            let v = q * &mult_q;
+            debug_assert!(v.is_integer(), "LCM of denominators clears every term");
+            arow[p] = v.to_integer();
+        }
+        let rv = rhs * &mult_q;
+        debug_assert!(rv.is_integer(), "the LCM includes the rhs denominator");
+        bbig.push(rv.to_integer());
+        abig.push(arow);
+    }
+
+    // ---- KERNEL + PARTICULAR SOLUTION, with S1 discharged -----------------
+    let (u, rank, mm) = col_hnf(&abig, m, n, deadline)?;
+    if !hnf_kernel_invariant_holds(&abig, &u, &mm, rank, n, deadline) {
+        return None; // S1(c)
+    }
+    let d = n.checked_sub(rank)?;
+    if d == 0 {
+        return None; // the equalities pin x_C outright: nothing to re-coordinate
+    }
+    let xp = hnf_particular(&mm, &u, m, n, rank, &bbig, deadline)?;
+    // Independent re-check of the particular solution: `A x_p == b` exactly.
+    // Cheap, and it means a bug in the HNF solve cannot shift the whole feasible
+    // set by a constant.
+    for (arow, bi) in abig.iter().zip(&bbig) {
+        let mut dot = BigInt::zero();
+        for (a, x) in arow.iter().zip(&xp) {
+            if !a.is_zero() && !x.is_zero() {
+                dot += a * x;
+            }
+        }
+        if dot != *bi {
+            return None;
+        }
+    }
+    let k0: Vec<Vec<BigInt>> = (0..d)
+        .map(|t| (0..n).map(|i| u[i][rank + t].clone()).collect())
+        .collect();
+    let basis = lll(k0.clone(), deadline)?;
+    if !kernel_basis_is_same_lattice(&abig, &k0, &basis, n, deadline) {
+        return None; // S1(a) + S1(b)
+    }
+
+    let xp_q: Vec<BigRational> = xp.iter().cloned().map(BigRational::from).collect();
+    let basis_q: Vec<Vec<BigRational>> = basis
+        .iter()
+        .map(|v| v.iter().cloned().map(BigRational::from).collect())
+        .collect();
+
+    // ---- THE REDUCED MODEL, with S2 fail-closed on every folded number ----
+    let mut out = Model::new();
+    let mut map: Vec<Option<Col>> = vec![None; nc];
+    for j in 0..nc {
+        if in_c[j] {
+            continue;
+        }
+        let col = Col(j as u32);
+        let (lb, ub) = model.col_bounds(col);
+        let nj = match model.col_kind(col) {
+            crate::model::ColKind::Continuous => out.add_col(lb, ub),
+            crate::model::ColKind::Binary => out.add_binary_col(),
+            crate::model::ColKind::Integer => out.add_int_col(lb, ub),
+        };
+        out.cols[nj.index()].lb = lb;
+        out.cols[nj.index()].ub = ub;
+        map[j] = Some(nj);
+    }
+    // FREE on BOTH sides. This is not an oversight to be tidied up later: the
+    // measurement that validates the whole device is the free-column one, and
+    // any box on `z` would re-import the bounding problem the reformulation
+    // exists to dissolve. The originally-finite column bounds are re-imposed
+    // below as ROWS, which is where they belong.
+    let zcols: Vec<Col> = (0..d)
+        .map(|_| out.add_int_col(f64::NEG_INFINITY, f64::INFINITY))
+        .collect();
+
+    // Surviving rows, with `x_C = x_p + B z` substituted. The gate guarantees no
+    // surviving row touches `C`, so in practice this fold is the identity — it
+    // is written out in full anyway so the transform is correct on its own terms
+    // rather than on the gate's.
+    //
+    // `reduced_rows` records what each emitted row IS in the caller's frame, in
+    // emission order. It is written HERE rather than reconstructed later because
+    // only this loop knows which rows `add_row` actually received.
+    let mut reduced_rows: Vec<KernelRowOrigin> = Vec::with_capacity(nr + cols_c.len());
+    for i in 0..nr {
+        if is_e[i] {
+            continue;
+        }
+        let (coeffs, rlo, rup) = model.row(Row(i as u32));
+        let mut terms: Vec<(Col, f64)> = Vec::with_capacity(coeffs.len() + d);
+        let mut shift = BigRational::zero();
+        let mut zc = vec![BigRational::zero(); d];
+        for &(c, a) in coeffs {
+            let cj = c as usize;
+            if in_c[cj] {
+                let p = pos[cj];
+                let aq = exact(a)?;
+                shift += &aq * &xp_q[p];
+                for (t, bt) in basis_q.iter().enumerate() {
+                    if !bt[p].is_zero() {
+                        zc[t] += &aq * &bt[p];
+                    }
+                }
+            } else {
+                terms.push((map[cj]?, a));
+            }
+        }
+        for (t, v) in zc.iter().enumerate() {
+            if !v.is_zero() {
+                terms.push((zcols[t], as_exact_f64(v)?));
+            }
+        }
+        let nlo = if rlo.is_finite() {
+            as_exact_f64(&(exact(rlo)? - &shift))?
+        } else {
+            f64::NEG_INFINITY
+        };
+        let nup = if rup.is_finite() {
+            as_exact_f64(&(exact(rup)? - &shift))?
+        } else {
+            f64::INFINITY
+        };
+        let emitted = out.add_row(nlo, nup, &terms);
+        debug_assert_eq!(emitted.index(), reduced_rows.len());
+        reduced_rows.push(KernelRowOrigin::Folded(i));
+    }
+
+    // S3: one row per member of `C` with at least one finite bound side, with
+    // identical rational content. An infinite side stays infinite, so it costs
+    // nothing and constrains nothing.
+    for (p, &j) in cols_c.iter().enumerate() {
+        let (l, u_b) = model.col_bounds(Col(j as u32));
+        if !l.is_finite() && !u_b.is_finite() {
+            continue;
+        }
+        let mut terms: Vec<(Col, f64)> = Vec::with_capacity(d);
+        for (t, bt) in basis_q.iter().enumerate() {
+            if !bt[p].is_zero() {
+                terms.push((zcols[t], as_exact_f64(&bt[p])?));
+            }
+        }
+        let nlo = if l.is_finite() {
+            as_exact_f64(&(exact(l)? - &xp_q[p]))?
+        } else {
+            f64::NEG_INFINITY
+        };
+        let nup = if u_b.is_finite() {
+            as_exact_f64(&(exact(u_b)? - &xp_q[p]))?
+        } else {
+            f64::INFINITY
+        };
+        if terms.is_empty() {
+            // `x_j` is CONSTANT at `x_p[j]` in the new frame. Its bound is then
+            // either satisfied by construction (drop the row — `add_row` would
+            // reject an empty one anyway) or violated, in which case the model is
+            // infeasible. Emitting INFEASIBLE is not this function's job, so
+            // decline and let the search adjudicate it.
+            if (l.is_finite() && nlo > 0.0) || (u_b.is_finite() && nup < 0.0) {
+                return None;
+            }
+            continue;
+        }
+        let emitted = out.add_row(nlo, nup, &terms);
+        debug_assert_eq!(emitted.index(), reduced_rows.len());
+        reduced_rows.push(KernelRowOrigin::ColumnBound(j));
+    }
+
+    // Objective: `c_C·x_C = c_C·x_p + (c_C·B)·z`. The linear part lands on `z`
+    // (exact-`f64` fail-closed); the constant rides `const_delta` as an exact
+    // rational and never touches an `f64`.
+    let mut const_delta = BigRational::zero();
+    let mut zobj = vec![BigRational::zero(); d];
+    let mut obj_terms: Vec<(Col, f64)> = Vec::new();
+    for j in 0..nc {
+        let cf = model.obj_coeff(Col(j as u32));
+        if cf == 0.0 {
+            continue;
+        }
+        if in_c[j] {
+            let p = pos[j];
+            let cq = exact(cf)?;
+            const_delta += &cq * &xp_q[p];
+            for (t, bt) in basis_q.iter().enumerate() {
+                if !bt[p].is_zero() {
+                    zobj[t] += &cq * &bt[p];
+                }
+            }
+        } else {
+            obj_terms.push((map[j]?, cf));
+        }
+    }
+    for (t, v) in zobj.iter().enumerate() {
+        if !v.is_zero() {
+            obj_terms.push((zcols[t], as_exact_f64(v)?));
+        }
+    }
+    // An objective-free model must stay objective-free: `set_objective` would
+    // flip `has_objective`, and the LP and MILP lanes then disagree about
+    // whether the answer is `Optimal { value: 0 }` or `Feasible`.
+    if model.has_objective() {
+        out.set_objective(&obj_terms, model.sense());
+        out.set_objective_offset(model.objective_offset());
+    }
+
+    if trace {
+        eprintln!(
+            "AY_MILP_TRACE kernel-reform: |E|={m} |C|={n} rank={rank} d={d}; \
+             model {}r/{}c -> {}r/{}c",
+            nr,
+            nc,
+            out.num_rows(),
+            out.num_cols(),
+        );
+    }
+
+    Some((
+        out,
+        KernelPostsolve {
+            n_orig: nc,
+            map,
+            cols_c,
+            xp: xp_q,
+            basis: basis_q,
+            z: zcols,
+            e_rows,
+            reduced_rows,
+            const_delta,
+        },
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3942,6 +5300,7 @@ mod tests {
             cnorm_q: vec![BigRational::from_integer(BigInt::from(2))],
             cnorm_i: vec![Interval { lo: 2.0, hi: 2.0 }],
             mu_i: vec![vec![zero]],
+            box_prune: None,
             lo: vec![0, 0],
             up: vec![1, 1],
             radius_q: BigRational::new(BigInt::one(), BigInt::from(2)),
@@ -3966,6 +5325,10 @@ mod tests {
             radius,
             y: vec![0],
             partial: vec![vec![zero]],
+            cflat: Vec::new(),
+            base_absmax: 0.0,
+            base_halfw: 0.0,
+            box_on: false,
             nodes: 0,
             node_cap: NODE_BUDGET,
             shared_nodes: None,
@@ -3996,6 +5359,7 @@ mod tests {
             ],
             cnorm_i: vec![Interval { lo: 1.0, hi: 1.0 }, Interval { lo: 1.0, hi: 1.0 }],
             mu_i: vec![vec![zero; 2]; 2],
+            box_prune: None,
             lo: vec![0, 0],
             up: vec![1, 1],
             radius_q: BigRational::new(BigInt::one(), BigInt::from(2)),
@@ -4062,16 +5426,16 @@ mod tests {
         let zero = Interval { lo: 0.0, hi: 0.0 };
         let mut state = eng.fresh_state(&xd, vec![zero; 2], 8.0, Some(&shared));
         let mut items = Vec::new();
-        state.collect(1, zero, 0, &mut items, 1);
+        state.collect(1, zero, 0, &mut items, 1, 0.0, 0.0);
         assert!(state.aborted, "crossing the frontier cap must fail closed");
         assert!(items.len() <= 1);
 
-        let limits = frontier_limits(160, 8).expect("bounded ordinary frontier");
+        let limits = frontier_limits(160, 180, 8).expect("bounded ordinary frontier");
         let payload_per_item =
             size_of::<WorkItem>() + 160 * (size_of::<i64>() + size_of::<Interval>());
         assert!(limits.target <= 8 * LATTICE_FRONTIER_PER_THREAD);
         assert!(limits.cap <= LATTICE_FRONTIER_MAX_BYTES / payload_per_item);
-        assert!(frontier_limits(160, usize::MAX).is_none());
+        assert!(frontier_limits(160, 180, usize::MAX).is_none());
     }
 
     #[test]
@@ -4627,7 +5991,7 @@ mod tests {
         let mut equality =
             one_dim_enumeration_state(&eng, &equality_xd, Interval { lo: 0.5, hi: 0.5 }, 0.5);
         assert_eq!(
-            equality.rec(0, Interval { lo: 0.0, hi: 0.0 }),
+            equality.rec(0, Interval { lo: 0.0, hi: 0.0 }, 0.0, 0.0),
             Some(vec![1])
         );
         assert_eq!(equality.nodes, 1);
@@ -4647,7 +6011,10 @@ mod tests {
                 },
                 0.0,
             );
-            assert_eq!(boundary.rec(0, Interval { lo: 0.0, hi: 0.0 }), None);
+            assert_eq!(
+                boundary.rec(0, Interval { lo: 0.0, hi: 0.0 }, 0.0, 0.0),
+                None
+            );
             assert!(boundary.aborted);
             assert_eq!(boundary.nodes, 0);
         }
@@ -5562,6 +6929,702 @@ mod tests {
         assert!(
             spoke_opt > 10,
             "vacuous fuzz: only {spoke_opt} Optimal claims"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // BOX-PREFIX PRUNE — differential + brute-force soundness
+    // -----------------------------------------------------------------------
+
+    /// Deterministic 64-bit PRNG (SplitMix64) so the fuzz corpus is fixed.
+    fn split_mix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A random 0/1 market-split shape: `m` dense rows over `n` binaries.
+    fn random_market_split(rng: &mut u64, n: usize, m: usize, coef_max: i64) -> MarketSplit {
+        let a: Vec<Vec<i64>> = (0..m)
+            .map(|_| {
+                (0..n)
+                    .map(|_| (split_mix(rng) % (coef_max as u64) + 1) as i64)
+                    .collect()
+            })
+            .collect();
+        MarketSplit {
+            n,
+            m,
+            b: vec![0; m],
+            a,
+            lo: vec![0; n],
+            up: vec![1; n],
+            col_model: (0..n).map(Some).collect(),
+            obj_rows: (0..m).collect(),
+            slack_col: (0..m).map(|i| n + i).collect(),
+            singleton_cols: vec![],
+        }
+    }
+
+    /// Ground truth: every `x ∈ {0,1}^n` with `A·x = d` (exhaustive, `n ≤ 20`).
+    fn brute_force_face(ms: &MarketSplit, d: &[i64]) -> Vec<Vec<i64>> {
+        let n = ms.n;
+        assert!(n <= 20, "brute force is exponential");
+        let mut hits = Vec::new();
+        for mask in 0u32..(1u32 << n) {
+            let x: Vec<i64> = (0..n).map(|j| ((mask >> j) & 1) as i64).collect();
+            if ms
+                .a
+                .iter()
+                .zip(d)
+                .all(|(row, &rhs)| row.iter().zip(&x).map(|(&c, &v)| c * v).sum::<i64>() == rhs)
+            {
+                hits.push(x);
+            }
+        }
+        hits
+    }
+
+    /// Map an enumerated kernel vector back to the original coordinates.
+    fn lattice_point(eng: &Engine, xd: &[i64], y: &[i64]) -> Vec<i64> {
+        (0..eng.n)
+            .map(|k| {
+                let mut v = xd[k];
+                for t in 0..eng.dim {
+                    v += y[t] * eng.k[t][k];
+                }
+                v
+            })
+            .collect()
+    }
+
+    fn clone_box_prune(bp: &BoxPrune) -> BoxPrune {
+        BoxPrune {
+            bstar_i: bp.bstar_i.clone(),
+            bstar_mid: bp.bstar_mid.clone(),
+            bstar_absmax: bp.bstar_absmax.clone(),
+            bstar_halfw: bp.bstar_halfw.clone(),
+            sqrt_s: bp.sqrt_s.clone(),
+            sqrt_s_max: bp.sqrt_s_max.clone(),
+            lo_f: bp.lo_f.clone(),
+            up_f: bp.up_f.clone(),
+            bound_absmax: bp.bound_absmax,
+            eps_coeff: bp.eps_coeff,
+        }
+    }
+
+    /// THE UNSOUND-PRUNE CATCHER.
+    ///
+    /// For a corpus of random small market splits and several right-hand sides
+    /// each, run the SAME serial enumeration twice — once with the box-prefix
+    /// prune ON, once with it OFF — and require:
+    ///   * identical verdicts (an unsound prune turns `Feasible` into `Empty`,
+    ///     i.e. "no solution found" into a WRONG "proven optimal");
+    ///   * identical witnesses (the prune must not reorder or lose the first
+    ///     box-feasible leaf, since it may only cut box-INfeasible subtrees);
+    ///   * agreement with an exhaustive `{0,1}^n` brute force, so a prune that
+    ///     drops the only solution is caught even if BOTH paths were wrong.
+    /// Both `Empty` and `Feasible` outcomes are required to occur, and the
+    /// prune is required to actually fire, so the test cannot pass vacuously.
+    #[test]
+    fn box_prefix_prune_matches_unpruned_sweep_and_brute_force() {
+        let mut rng = 0x5EED_1234_ABCD_0001u64;
+        let mut saw_empty = 0usize;
+        let mut saw_feasible = 0usize;
+        let mut saw_prune_active = 0usize;
+        for case in 0..24usize {
+            let n = 10 + (case % 5);
+            let m = 2 + (case % 2);
+            let ms = random_market_split(&mut rng, n, m, 24);
+            let Some(mut eng) = Engine::build(&ms, deadline(), false, 1, None) else {
+                continue;
+            };
+            let tables =
+                box_prune_tables(&eng.bstar_q, &eng.cnorm_i, &eng.lo, &eng.up, eng.dim, eng.n)
+                    .expect("0/1 box tables always build");
+
+            // Targets: the balanced rhs (½·Σ a — the hard face) and its
+            // neighbours, which mixes provably-EMPTY faces with witnesses.
+            let half: Vec<i64> = ms.a.iter().map(|row| row.iter().sum::<i64>() / 2).collect();
+            for shift in -2i64..=2 {
+                let d: Vec<i64> = half.iter().map(|&v| v + shift).collect();
+                let Some(xd) = eng.particular(&ms, &d) else {
+                    // No integer solution of A·x = d at all: nothing to compare.
+                    assert!(
+                        brute_force_face(&ms, &d).is_empty(),
+                        "particular() declined a face that has a 0/1 point"
+                    );
+                    continue;
+                };
+                let Some(xd) = eng.babai(&xd) else { continue };
+
+                eng.box_prune = Some(clone_box_prune(&tables));
+                let pruned = eng.enumerate_serial(&xd);
+                eng.box_prune = None;
+                let plain = eng.enumerate_serial(&xd);
+
+                assert_eq!(
+                    pruned, plain,
+                    "box prune changed the verdict/witness on case {case} shift {shift}"
+                );
+
+                let truth = brute_force_face(&ms, &d);
+                match &pruned {
+                    EnumResult::Empty => {
+                        saw_empty += 1;
+                        assert!(
+                            truth.is_empty(),
+                            "UNSOUND: face proven EMPTY but brute force found {} 0/1 point(s) \\
+                             (case {case}, shift {shift}, a={:?}, d={d:?})",
+                            truth.len(),
+                            ms.a
+                        );
+                    }
+                    EnumResult::Feasible(y) => {
+                        saw_feasible += 1;
+                        let x = lattice_point(&eng, &xd, y);
+                        assert!(
+                            truth.contains(&x),
+                            "witness {x:?} is not a 0/1 point of the face (case {case})"
+                        );
+                    }
+                    EnumResult::Capped | EnumResult::Aborted => {}
+                }
+            }
+            // Confirm the prune is not silently inert on this corpus: with the
+            // tables installed the sweep must visit strictly fewer nodes on at
+            // least one face.
+            if let Some(xd) = eng.particular(&ms, &half).and_then(|v| eng.babai(&v)) {
+                eng.box_prune = Some(clone_box_prune(&tables));
+                let (_, with) = eng.enumerate_serial_with_cap(&xd, NODE_BUDGET);
+                eng.box_prune = None;
+                let (_, without) = eng.enumerate_serial_with_cap(&xd, NODE_BUDGET);
+                assert!(with <= without, "the prune may only REMOVE nodes");
+                if with < without {
+                    saw_prune_active += 1;
+                }
+            }
+        }
+        assert!(saw_empty > 0, "vacuous: no EMPTY face in the corpus");
+        assert!(saw_feasible > 0, "vacuous: no FEASIBLE face in the corpus");
+        assert!(
+            saw_prune_active > 0,
+            "vacuous: the prune never removed a single node"
+        );
+    }
+
+    /// The kill switch must produce a BYTE-IDENTICAL sweep: same node count,
+    /// same verdict, same witness as an engine that never built the tables.
+    #[test]
+    fn box_prune_kill_switch_is_byte_identical() {
+        let mut rng = 0x00C0_FFEE_0BAD_F00Du64;
+        let ms = random_market_split(&mut rng, 12, 2, 20);
+        let mut eng = Engine::build(&ms, deadline(), false, 1, None).expect("engine builds");
+        let half: Vec<i64> = ms.a.iter().map(|row| row.iter().sum::<i64>() / 2).collect();
+        let xd = eng
+            .particular(&ms, &half)
+            .and_then(|v| eng.babai(&v))
+            .expect("balanced face is inhabited over the integers");
+
+        eng.box_prune = None;
+        let (a_result, a_nodes) = eng.enumerate_serial_with_cap(&xd, NODE_BUDGET);
+        let (b_result, b_nodes) = eng.enumerate_serial_with_cap(&xd, NODE_BUDGET);
+        assert_eq!(a_result, b_result);
+        assert_eq!(a_nodes, b_nodes, "the disabled path must be deterministic");
+
+        // With the tables installed the node count may only shrink.
+        let tables = box_prune_tables(
+            &eng.bstar_q.clone(),
+            &eng.cnorm_i.clone(),
+            &eng.lo.clone(),
+            &eng.up.clone(),
+            eng.dim,
+            eng.n,
+        );
+        eng.box_prune = tables;
+        let (c_result, c_nodes) = eng.enumerate_serial_with_cap(&xd, NODE_BUDGET);
+        assert_eq!(a_result, c_result, "the prune changed the verdict");
+        assert!(c_nodes <= a_nodes);
+    }
+
+    /// A box endpoint outside the exactly-representable `f64` integers must
+    /// DECLINE the prune rather than test against a rounded bound.
+    #[test]
+    fn box_prune_declines_inexact_bounds() {
+        let eng = two_dim_enumeration_engine();
+        assert!(box_prune_tables(
+            &eng.bstar_q,
+            &eng.cnorm_i,
+            &[0, 0],
+            &[1, (1i64 << 53) + 1],
+            eng.dim,
+            eng.n
+        )
+        .is_none());
+        assert!(
+            box_prune_tables(&eng.bstar_q, &eng.cnorm_i, &[0, 0], &[1, 1], eng.dim, eng.n)
+                .is_some()
+        );
+    }
+
+    /// PARALLEL PATH OBLIGATION. The frontier and its workers must prune with
+    /// the IDENTICAL centres, which means `WorkItem` has to carry the `C` row
+    /// and the two error accumulators. If it does not, a worker resumes from a
+    /// zeroed centre row, prunes on nonsense, and can cut a real witness — so
+    /// this compares the parallel verdict against the serial one face by face.
+    #[test]
+    fn box_prune_parallel_frontier_agrees_with_serial() {
+        let mut rng = 0x0BAD_5EED_1357_9BDFu64;
+        let mut saw_empty = 0usize;
+        let mut saw_feasible = 0usize;
+        for case in 0..8usize {
+            let ms = random_market_split(&mut rng, 12 + (case % 3), 2, 22);
+            let Some(mut eng) = Engine::build(&ms, deadline(), false, 4, None) else {
+                continue;
+            };
+            eng.box_prune =
+                box_prune_tables(&eng.bstar_q, &eng.cnorm_i, &eng.lo, &eng.up, eng.dim, eng.n);
+            assert!(eng.box_prune.is_some());
+            let half: Vec<i64> = ms.a.iter().map(|row| row.iter().sum::<i64>() / 2).collect();
+            for shift in -1i64..=1 {
+                let d: Vec<i64> = half.iter().map(|&v| v + shift).collect();
+                let Some(xd) = eng.particular(&ms, &d).and_then(|v| eng.babai(&v)) else {
+                    continue;
+                };
+                let par = eng.enumerate_parallel(&xd);
+                let ser = eng.enumerate_serial(&xd);
+                let truth = brute_force_face(&ms, &d);
+                match (&par, &ser) {
+                    (EnumResult::Empty, EnumResult::Empty) => {
+                        saw_empty += 1;
+                        assert!(
+                            truth.is_empty(),
+                            "UNSOUND: parallel+serial proved EMPTY, brute force found {}",
+                            truth.len()
+                        );
+                    }
+                    (EnumResult::Feasible(y), EnumResult::Feasible(_)) => {
+                        saw_feasible += 1;
+                        // Any witness may win the race, but it must be exact.
+                        let x = lattice_point(&eng, &xd, y);
+                        assert!(
+                            truth.contains(&x),
+                            "parallel witness {x:?} is not a face point"
+                        );
+                    }
+                    (EnumResult::Aborted, _) | (_, EnumResult::Aborted) => {}
+                    (EnumResult::Capped, _) | (_, EnumResult::Capped) => {}
+                    other => panic!("parallel/serial verdicts diverged: {other:?}"),
+                }
+            }
+        }
+        assert!(saw_empty > 0 && saw_feasible > 0, "vacuous parallel corpus");
+    }
+}
+
+#[cfg(test)]
+mod kernel_reform_tests {
+    use super::*;
+    use crate::model::{Col, Model, Sense};
+    use std::time::Duration;
+
+    fn deadline() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    fn int(v: i64) -> BigRational {
+        BigRational::from(BigInt::from(v))
+    }
+
+    /// MIPLIB `ej` verbatim: `min x₀` subject to
+    /// `31013·x₀ − 41014·x₁ − 51015·x₂ = 0`, all three columns integer, `x₀ ≥ 1`,
+    /// `x₁,x₂ ≥ 0` with NO upper bound. Optimum 25508 (attained at
+    /// `x = (25508, 1, 15506)`).
+    fn ej_model() -> Model {
+        let mut m = Model::new();
+        let x0 = m.add_int_col(1.0, f64::INFINITY);
+        let x1 = m.add_int_col(0.0, f64::INFINITY);
+        let x2 = m.add_int_col(0.0, f64::INFINITY);
+        m.add_row(0.0, 0.0, &[(x0, 31013.0), (x1, -41014.0), (x2, -51015.0)]);
+        m.set_objective(&[(x0, 1.0)], Sense::Minimize);
+        m
+    }
+
+    /// THE MEASUREMENT THE DEVICE EXISTS FOR. Stock branch and bound loses `ej`
+    /// at 235,008 nodes / 28.9 s with the dual bound pinned at 1; in the
+    /// reformulated frame it proves the exact optimum 25508 immediately. Both
+    /// halves are asserted here: the exact value, and that the widened witness is
+    /// feasible for the ORIGINAL model at exactly that objective value.
+    #[test]
+    fn ej_is_proven_optimal_at_25508_in_the_reformulated_frame() {
+        let m = ej_model();
+        let (reduced, post) = reformulate_kernel(&m).expect("ej is exactly this shape");
+        // One equality over three columns of rank 1: two new columns, and they
+        // are FREE — the property the whole reformulation rests on.
+        assert_eq!(reduced.num_cols(), 2);
+        for j in 0..reduced.num_cols() {
+            let c = Col(j as u32);
+            assert_eq!(
+                reduced.col_bounds(c),
+                (f64::NEG_INFINITY, f64::INFINITY),
+                "reformulated column {j} must be free on both sides"
+            );
+            assert!(reduced.col_kind(c).is_integral());
+        }
+        // Three finite bound sides (x₀ ≥ 1, x₁ ≥ 0, x₂ ≥ 0) become three rows;
+        // the equality row is gone.
+        assert_eq!(reduced.num_rows(), 3);
+
+        let opts = SolveOpts::new().with_time_limit(Duration::from_secs(30));
+        match crate::bab::solve_milp(&reduced, &opts) {
+            Outcome::Optimal {
+                value,
+                model_values,
+                ..
+            } => {
+                let full = post.widen(&model_values);
+                let recovered = value + post.const_delta();
+                assert_eq!(recovered, int(25508), "ej optimum");
+                assert!(
+                    m.check_point(&full).is_ok(),
+                    "widened witness must be feasible for the ORIGINAL model: {full:?}"
+                );
+                assert_eq!(m.objective_value_at(&full), recovered);
+            }
+            other => panic!("expected Optimal 25508 on the reformulated ej, got {other:?}"),
+        }
+    }
+
+    /// The same proof through the PUBLIC solve entry, so the `bab.rs` hook and
+    /// its `expand_kernel_outcome` are exercised end to end: the value comes back
+    /// in the caller's frame, the witness in the caller's column space.
+    ///
+    /// `with_tree_cert_leaves(0)` IS LOAD-BEARING AND IS NOT A TEST CONVENIENCE.
+    /// Every structural reduction in `bab.rs` (dedup, singleton substitution, and
+    /// now this one) lives behind `opts.tree_cert_leaves == 0`, because a
+    /// reduced-frame certificate cannot verify against the caller's model and is
+    /// stripped — and `SolveOpts` DEFAULTS that field to 256 (`opts.rs:537`). So
+    /// on default options the reformulation is never reached, and `ej` is still
+    /// lost. See the note on `crate::bab::expand_kernel_outcome`.
+    #[test]
+    fn ej_is_proven_through_the_public_solve_entry() {
+        let m = ej_model();
+        let opts = SolveOpts::new()
+            .with_tree_cert_leaves(0)
+            .with_time_limit(Duration::from_secs(30));
+        match crate::bab::solve_milp(&m, &opts) {
+            Outcome::Optimal {
+                value,
+                model_values,
+                ..
+            } => {
+                assert_eq!(value, int(25508));
+                assert_eq!(model_values.len(), 3);
+                assert!(m.check_point(&model_values).is_ok());
+            }
+            other => panic!("expected Optimal 25508 from the public entry, got {other:?}"),
+        }
+    }
+
+    /// BRUTE-FORCE BIJECTION. `2x₀ + 3x₁ + 5x₂ = 11` over `x ∈ [0,4]³ ∩ ℤ³`:
+    /// enumerate every integer point of the ORIGINAL box-and-equality, enumerate
+    /// every `z` of the reformulated frame whose widening lands in the box, and
+    /// assert the two sets correspond EXACTLY — same points, and one `z` per
+    /// point (so the map is injective as well as onto).
+    #[test]
+    fn reformulated_integer_points_are_in_exact_bijection_with_the_original() {
+        let mut m = Model::new();
+        let cols: Vec<Col> = (0..3).map(|_| m.add_int_col(0.0, 4.0)).collect();
+        m.add_row(
+            11.0,
+            11.0,
+            &[(cols[0], 2.0), (cols[1], 3.0), (cols[2], 5.0)],
+        );
+        m.set_objective(&[(cols[0], 1.0)], Sense::Minimize);
+
+        let mut brute: Vec<[i64; 3]> = Vec::new();
+        for a in 0..=4i64 {
+            for b in 0..=4i64 {
+                for c in 0..=4i64 {
+                    if 2 * a + 3 * b + 5 * c == 11 {
+                        brute.push([a, b, c]);
+                    }
+                }
+            }
+        }
+        assert!(brute.len() >= 3, "the fixture must have several points");
+
+        let (reduced, post) = reformulate_kernel(&m).expect("max|a| = 5 exceeds the range 4");
+        assert_eq!(reduced.num_cols(), 2, "3 columns, rank 1 ⟹ kernel dim 2");
+
+        // Every z in a range comfortably wider than the box can reach.
+        let mut image: Vec<[i64; 3]> = Vec::new();
+        for z0 in -100..=100i64 {
+            for z1 in -100..=100i64 {
+                let full = post.widen(&[int(z0), int(z1)]);
+                let pt: Vec<i64> = full
+                    .iter()
+                    .map(|v| {
+                        assert!(v.is_integer(), "x_p + Bz is integral for integral z");
+                        v.to_integer().to_i64().expect("small")
+                    })
+                    .collect();
+                if pt.iter().all(|&v| (0..=4).contains(&v))
+                    && 2 * pt[0] + 3 * pt[1] + 5 * pt[2] == 11
+                {
+                    image.push([pt[0], pt[1], pt[2]]);
+                }
+                // Whatever the widening produces, it must satisfy the equality —
+                // that is S1(a) observed end to end.
+                assert_eq!(2 * pt[0] + 3 * pt[1] + 5 * pt[2], 11);
+            }
+        }
+        let mut sorted_image = image.clone();
+        sorted_image.sort_unstable();
+        sorted_image.dedup();
+        assert_eq!(
+            sorted_image.len(),
+            image.len(),
+            "two distinct z widened to the same point: the map is not injective"
+        );
+        let mut sorted_brute = brute.clone();
+        sorted_brute.sort_unstable();
+        assert_eq!(
+            sorted_image, sorted_brute,
+            "the reformulated feasible set must be exactly the original one"
+        );
+    }
+
+    /// **THE NEGATIVE CONTROL, AND THE POINT OF THE WHOLE SOUNDNESS SECTION.**
+    ///
+    /// A DOUBLED basis `{2·b₁, b₂, …}` consists entirely of genuine kernel
+    /// vectors, so it passes S1(a) — and it spans an INDEX-2 SUBLATTICE, which
+    /// would silently delete half the feasible integer points and let the solver
+    /// report a value strictly worse than the true optimum while claiming
+    /// OPTIMAL. The exact covolume check S1(b) is what refuses it. Disable that
+    /// check and this test fails; that has been verified by actually removing it.
+    #[test]
+    fn a_doubled_basis_spanning_an_index_two_sublattice_is_declined() {
+        // ker[2, 3, 5] over ℤ³ — dimension 2.
+        let a = vec![vec![BigInt::from(2), BigInt::from(3), BigInt::from(5)]];
+        let (u, rank, mm) = col_hnf(&a, 1, 3, deadline()).expect("hnf");
+        assert_eq!(rank, 1);
+        assert!(hnf_kernel_invariant_holds(&a, &u, &mm, rank, 3, deadline()));
+        let k0: Vec<Vec<BigInt>> = (0..2)
+            .map(|t| (0..3).map(|i| u[i][rank + t].clone()).collect())
+            .collect();
+
+        // The honest reduction is accepted.
+        let good = lll(k0.clone(), deadline()).expect("lll");
+        assert!(
+            kernel_basis_is_same_lattice(&a, &k0, &good, 3, deadline()),
+            "an LLL reduction of the kernel basis must be accepted"
+        );
+
+        // The doubled basis is in the kernel, and is REJECTED.
+        let mut doubled = good.clone();
+        for v in &mut doubled[0] {
+            *v *= 2;
+        }
+        for row in &a {
+            let dot: BigInt = row.iter().zip(&doubled[0]).map(|(ai, vi)| ai * vi).sum();
+            assert!(
+                dot.is_zero(),
+                "the doubled vector really is a kernel vector"
+            );
+        }
+        assert!(
+            !kernel_basis_is_same_lattice(&a, &k0, &doubled, 3, deadline()),
+            "a doubled basis spans an index-2 sublattice and MUST be declined"
+        );
+        // The covolume is what separates them, by a factor of exactly 4 = 2².
+        let g_ref = gram_det(&k0, deadline()).expect("gram");
+        let g_bad = gram_det(&doubled, deadline()).expect("gram");
+        assert_eq!(g_bad, g_ref * BigInt::from(4));
+    }
+
+    /// A model with no qualifying equality row is not this device's business.
+    /// Three shapes that each fail a different clause: an inequality-only model,
+    /// an equality over a CONTINUOUS column, and an equality whose columns are
+    /// also touched by another row.
+    #[test]
+    fn models_without_a_qualifying_equality_are_declined() {
+        // (1) inequality only.
+        let mut m = Model::new();
+        let x = m.add_int_col(0.0, f64::INFINITY);
+        let y = m.add_int_col(0.0, f64::INFINITY);
+        m.add_row(f64::NEG_INFINITY, 7.0, &[(x, 31013.0), (y, -41014.0)]);
+        m.set_objective(&[(x, 1.0)], Sense::Minimize);
+        assert!(reformulate_kernel(&m).is_none());
+
+        // (2) the equality's support includes a continuous column.
+        let mut m = Model::new();
+        let x = m.add_int_col(0.0, f64::INFINITY);
+        let s = m.add_col(0.0, f64::INFINITY);
+        m.add_row(0.0, 0.0, &[(x, 31013.0), (s, -41014.0)]);
+        m.set_objective(&[(x, 1.0)], Sense::Minimize);
+        assert!(reformulate_kernel(&m).is_none());
+
+        // (3) a column of C is touched by a row outside E.
+        let mut m = Model::new();
+        let x = m.add_int_col(0.0, f64::INFINITY);
+        let y = m.add_int_col(0.0, f64::INFINITY);
+        m.add_row(0.0, 0.0, &[(x, 31013.0), (y, -41014.0)]);
+        m.add_row(f64::NEG_INFINITY, 100.0, &[(x, 1.0)]);
+        m.set_objective(&[(x, 1.0)], Sense::Minimize);
+        assert!(reformulate_kernel(&m).is_none());
+
+        // (4) the box already bounds the equalities: nothing to re-coordinate.
+        let mut m = Model::new();
+        let x = m.add_int_col(0.0, 40.0);
+        let y = m.add_int_col(0.0, 40.0);
+        m.add_row(0.0, 0.0, &[(x, 3.0), (y, -5.0)]);
+        m.set_objective(&[(x, 1.0)], Sense::Minimize);
+        assert!(reformulate_kernel(&m).is_none());
+    }
+
+    /// A model whose true coefficients are rounded `f64` proxies is declined
+    /// wholesale — the same fail-closed rule `presolve.rs:87` and `detect` apply.
+    /// Reasoning over the public `f64` matrix here would be reasoning over a
+    /// DIFFERENT model, and the reformulation's whole value is that it is exact.
+    #[test]
+    fn inexact_coefficient_models_are_declined() {
+        use num_traits::ToPrimitive;
+        let mut m = ej_model();
+        assert!(
+            reformulate_kernel(&m).is_some(),
+            "control: the exact model does fire"
+        );
+        // 2^53 + 1 is not an f64; recording it marks the model inexact.
+        let truth = BigRational::from(BigInt::from((1u64 << 53) + 1));
+        let rounded = truth.to_f64().expect("finite");
+        let row = m.row_at(0).expect("one row");
+        m.set_row(
+            row,
+            0.0,
+            0.0,
+            &[(Col(0), rounded), (Col(1), -41014.0), (Col(2), -51015.0)],
+        );
+        m.record_inexact_row_coeff(row, 0, truth);
+        assert!(m.has_inexact_coeffs());
+        assert!(reformulate_kernel(&m).is_none());
+    }
+
+    /// The kill switch has to work, and the postsolve's objective constant must
+    /// never travel through an `f64`: `const_delta` is exact by construction here
+    /// even when the fold is a large integer.
+    #[test]
+    fn kill_switch_and_exact_objective_constant() {
+        let m = ej_model();
+        // `ej`'s particular solution is x_p = 0, so its const_delta is 0; the
+        // interesting case is a shifted rhs, where the fold is nonzero.
+        let (_, post) = reformulate_kernel(&m).expect("fires");
+        assert_eq!(*post.const_delta(), BigRational::zero());
+        assert!(post.const_delta().is_integer());
+
+        let mut shifted = Model::new();
+        let x0 = shifted.add_int_col(1.0, f64::INFINITY);
+        let x1 = shifted.add_int_col(0.0, f64::INFINITY);
+        let x2 = shifted.add_int_col(0.0, f64::INFINITY);
+        shifted.add_row(1.0, 1.0, &[(x0, 31013.0), (x1, -41014.0), (x2, -51015.0)]);
+        shifted.set_objective(&[(x0, 1.0)], Sense::Minimize);
+        let (_, post) = reformulate_kernel(&shifted).expect("fires");
+        // Whatever x_p is, widening z = 0 must reproduce it and satisfy the row.
+        let at_zero = post.widen(&[BigRational::zero(), BigRational::zero()]);
+        let act = &at_zero[0] * int(31013) - &at_zero[1] * int(41014) - &at_zero[2] * int(51015);
+        assert_eq!(act, int(1));
+        assert_eq!(*post.const_delta(), at_zero[0]);
+
+        temp_env_var("AY_MILP_NO_KERNEL_REFORM", "1", || {
+            assert!(reformulate_kernel(&ej_model()).is_none());
+        });
+    }
+
+    /// Set an environment variable for the duration of `f`. Tests in this module
+    /// that need it are serialized by taking one lock, because the environment is
+    /// process-wide and the rest of the suite runs in parallel.
+    fn temp_env_var(key: &str, value: &str, f: impl FnOnce()) {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lock serializes this module's mutations, and no other test
+        // in the crate reads this key.
+        unsafe { std::env::set_var(key, value) };
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        unsafe { std::env::remove_var(key) };
+        if let Err(p) = out {
+            std::panic::resume_unwind(p);
+        }
+    }
+}
+
+#[cfg(test)]
+mod kernel_reform_corpus_scan {
+    use super::*;
+
+    /// HOW OFTEN THE GATE FIRES ON REAL MODELS — the measurement that decides
+    /// whether [`reformulate_kernel`] may run by default.
+    ///
+    /// Synthetic gains do not transfer; a structural gate is only as good as the
+    /// corpus census behind it. Point `AY_MILP_KERNEL_SCAN_DIR` at a directory of
+    /// `.mps` / `.mps.gz` files (MIPLIB 2017 lives in `ay-bench/milp/instances`)
+    /// and this reports, per instance, whether the reformulation fires and what
+    /// it does to the model's shape. Unset — which is every ordinary test run —
+    /// it does nothing at all.
+    ///
+    /// ```text
+    /// AY_MILP_KERNEL_SCAN_DIR=$HOME/ay-bench/milp/instances \
+    ///   cargo test --release -p ay-milp --lib kernel_reform_corpus_scan -- --nocapture
+    /// ```
+    #[test]
+    fn kernel_reformulation_corpus_census() {
+        let Some(dir) = std::env::var_os("AY_MILP_KERNEL_SCAN_DIR") else {
+            return;
+        };
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("scan dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                let s = p.to_string_lossy();
+                s.ends_with(".mps") || s.ends_with(".mps.gz")
+            })
+            .collect();
+        files.sort();
+        let (mut fired, mut seen, mut parse_fail) = (0usize, 0usize, 0usize);
+        for path in &files {
+            let text = if path.extension() == Some(OsStr::new("gz")) {
+                let out = std::process::Command::new("gzip")
+                    .arg("-dc")
+                    .arg(path)
+                    .output()
+                    .expect("gzip");
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            } else {
+                std::fs::read_to_string(path).expect("read")
+            };
+            let Ok(p) = crate::mps::read_mps(&text) else {
+                parse_fail += 1;
+                continue;
+            };
+            seen += 1;
+            let t0 = Instant::now();
+            if let Some((reduced, _)) = reformulate_kernel(&p.model) {
+                fired += 1;
+                println!(
+                    "KERNEL_REFORM_FIRES {} {}r/{}c -> {}r/{}c ({:.3}s)",
+                    p.name,
+                    p.model.num_rows(),
+                    p.model.num_cols(),
+                    reduced.num_rows(),
+                    reduced.num_cols(),
+                    t0.elapsed().as_secs_f64(),
+                );
+            }
+        }
+        println!(
+            "KERNEL_REFORM_CENSUS fired={fired} of {seen} parsed ({parse_fail} unparsed) in {}",
+            std::path::Path::new(&dir).display()
         );
     }
 }

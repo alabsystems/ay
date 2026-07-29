@@ -17,8 +17,6 @@
 #![allow(clippy::panic)]
 
 use ay_sat::{parse_dimacs, ProofOutput, SatResult, SatUnknownReason, Solver};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Solve a known-UNSAT benchmark with DRAT proof output enabled and verify
@@ -34,20 +32,14 @@ fn assert_unsat_with_drat_proof(path: &str, label: &str, timeout_secs: u64) {
         solver.add_clause(clause.clone());
     }
 
-    let flag = Arc::new(AtomicBool::new(false));
-    let flag_clone = flag.clone();
-    solver.set_interrupt(flag.clone());
-    let handle = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(timeout_secs));
-        flag_clone.store(true, Ordering::Relaxed);
-    });
+    let timer =
+        super::common::SolverInterruptTimer::start(&mut solver, Duration::from_secs(timeout_secs));
 
     let result = solver
-        .solve_interruptible(|| flag.load(Ordering::Relaxed))
+        .solve_interruptible(|| timer.is_interrupted())
         .into_inner();
 
-    flag.store(true, Ordering::Relaxed);
-    let _ = handle.join();
+    timer.cancel_and_join();
 
     let reason = solver.last_unknown_reason();
 
@@ -97,20 +89,14 @@ fn assert_not_sat_with_drat_proof(path: &str, label: &str, timeout_secs: u64) {
         solver.add_clause(clause.clone());
     }
 
-    let flag = Arc::new(AtomicBool::new(false));
-    let flag_clone = flag.clone();
-    solver.set_interrupt(flag.clone());
-    let handle = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(timeout_secs));
-        flag_clone.store(true, Ordering::Relaxed);
-    });
+    let timer =
+        super::common::SolverInterruptTimer::start(&mut solver, Duration::from_secs(timeout_secs));
 
     let result = solver
-        .solve_interruptible(|| flag.load(Ordering::Relaxed))
+        .solve_interruptible(|| timer.is_interrupted())
         .into_inner();
 
-    flag.store(true, Ordering::Relaxed);
-    let _ = handle.join();
+    timer.cancel_and_join();
 
     let reason = solver.last_unknown_reason();
 
@@ -212,20 +198,14 @@ fn small_unsat_drat_mode_no_finalize_sat_fail() {
             solver.add_clause(clause.clone());
         }
 
-        let flag = Arc::new(AtomicBool::new(false));
-        let flag_clone = flag.clone();
-        solver.set_interrupt(flag.clone());
-        let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(10));
-            flag_clone.store(true, Ordering::Relaxed);
-        });
+        let timer =
+            super::common::SolverInterruptTimer::start(&mut solver, Duration::from_secs(10));
 
         let result = solver
-            .solve_interruptible(|| flag.load(Ordering::Relaxed))
+            .solve_interruptible(|| timer.is_interrupted())
             .into_inner();
 
-        flag.store(true, Ordering::Relaxed);
-        let _ = handle.join();
+        timer.cancel_and_join();
 
         let reason = solver.last_unknown_reason();
 

@@ -2420,3 +2420,370 @@ fn test_let_dead_binding_elimination_survives_parallel_fix() {
         "live binding resolves to p; dead one dropped"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `define-fun` macro expansion is CAPTURE-AVOIDING (SMT-LIB 2.6 §4.2.2).
+//
+// A definition's body resolves its symbols against the signature AT DEFINITION
+// TIME — its own parameters plus the globals — so no binder at the USE SITE
+// (quantifier variable, `let` binding, `match` pattern variable) may capture a
+// global the body names. `(define-fun f () Int x)` is by definition equivalent
+// to `(declare-fun f () Int)` + `(assert (= f x))`, and §3.6.1 makes a
+// quantifier's `x` a fresh, unrelated variable.
+//
+// Expanding the body in the use-site environment was a wrong-verdict defect in
+// BOTH directions. Against z3 5.0.0, with `(declare-const x Int)` and
+// `(define-fun f () Int x)`:
+//   (assert (forall ((x Int)) (= f 11)))                    truth sat,   ay unsat
+//   (assert (= x 11)) (assert (exists ((x Int)) (not (= f 11))))
+//                                                           truth unsat, ay sat
+// AY also disagreed with ITSELF: the standard's own expansion of the first
+// script answered `sat`.
+//
+// These tests compare interned `TermId`s inside ONE context: the store
+// hash-conses, so two assertions share an id exactly when they elaborate to the
+// same term. Each pairs the macro form with the term it MUST denote, so they
+// pin the semantics rather than a verdict string.
+
+#[test]
+fn test_define_fun_body_not_captured_by_let_binder() {
+    // `f` is the GLOBAL `x`, so the assertion is `(and (> 5 0) (= x 11))`.
+    // Captured by the `let`, `f` would become `5` and the assertion `false`.
+    let ids = elaborated_assertions(
+        r"
+            (declare-const x Int)
+            (define-fun f () Int x)
+            (assert (let ((x 5)) (and (> x 0) (= f 11))))
+            (assert (and (> 5 0) (= x 11)))
+        ",
+    );
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        ids[0], ids[1],
+        "a define-fun body resolves against the definition-time signature, \
+         never against an enclosing let binder"
+    );
+}
+
+#[test]
+fn test_define_fun_body_not_captured_by_quantifier_binder() {
+    // The macro form and the CAPTURED reading must not coincide: `f` is the
+    // global `x`, the quantifier's `x` is a fresh unrelated variable (§3.6.1).
+    let ids = elaborated_assertions(
+        r"
+            (declare-const x Int)
+            (define-fun f () Int x)
+            (assert (forall ((x Int)) (= f 11)))
+            (assert (forall ((x Int)) (= x 11)))
+        ",
+    );
+    assert_eq!(ids.len(), 2);
+    assert_ne!(
+        ids[0], ids[1],
+        "the body's `x` is the global constant, not the quantifier's binder"
+    );
+}
+
+#[test]
+fn test_define_fun_body_under_quantifier_is_the_global_term() {
+    // The positive half, checked structurally: the quantifier's BODY must be
+    // exactly the term `(= x 11)` denotes over the global `x`. (Comparing two
+    // whole `forall`s would not work — each elaboration mints a fresh binder
+    // name, so two α-equivalent quantifiers have different ids.)
+    let commands = parse(
+        r"
+            (declare-const x Int)
+            (define-fun f () Int x)
+            (assert (forall ((q Int)) (= f 11)))
+            (assert (= x 11))
+        ",
+    )
+    .unwrap();
+    let mut ctx = Context::new();
+    for cmd in &commands {
+        ctx.process_command(cmd).unwrap();
+    }
+    assert_eq!(ctx.assertions.len(), 2);
+    let TermData::Forall(_, body, _) = ctx.terms.get(ctx.assertions[0]).clone() else {
+        panic!("expected a forall assertion");
+    };
+    assert_eq!(
+        body, ctx.assertions[1],
+        "under a binder that does not shadow it, the macro body is still the \
+         global `x` — the very term `(= x 11)` denotes"
+    );
+}
+
+#[test]
+fn test_define_fun_with_parameters_body_not_captured() {
+    // n-ary macro: the parameter `y` is bound to the argument, but the body's
+    // free `x` is still the global one.
+    let ids = elaborated_assertions(
+        r"
+            (declare-const x Int)
+            (define-fun g ((y Int)) Int (+ y x))
+            (assert (let ((x 5)) (and (> x 0) (= (g 0) 11))))
+            (assert (and (> 5 0) (= x 11)))
+        ",
+    );
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        ids[0], ids[1],
+        "an n-ary macro binds only its parameters; its free symbols stay global"
+    );
+}
+
+#[test]
+fn test_chained_define_fun_body_not_captured() {
+    // A definition that uses another definition expands through the same path.
+    let ids = elaborated_assertions(
+        r"
+            (declare-const x Int)
+            (define-fun f () Int x)
+            (define-fun h () Int (+ f 0))
+            (assert (let ((x 5)) (and (> x 0) (= h 11))))
+            (assert (and (> 5 0) (= x 11)))
+        ",
+    );
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], ids[1], "chained definitions stay capture-avoiding");
+}
+
+#[test]
+fn test_define_fun_rec_body_not_captured() {
+    let ids = elaborated_assertions(
+        r"
+            (declare-const x Int)
+            (define-fun-rec r ((n Int)) Int (ite (= n 0) x (r (- n 1))))
+            (assert (let ((x 5)) (and (> x 0) (= (r 2) 11))))
+            (assert (and (> 5 0) (= x 11)))
+        ",
+    );
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        ids[0], ids[1],
+        "define-fun-rec expansion is capture-avoiding"
+    );
+}
+
+#[test]
+fn test_define_funs_rec_body_not_captured() {
+    // The mutually-recursive form expands through the same path. Confirmed at
+    // the CLI too: with `(define-funs-rec ((p …) (q …)) …)` whose bodies name a
+    // global `x`, `(assert (forall ((x Int)) (= (p 2) 11)))` answered `unsat`
+    // where z3 answers `sat`.
+    let ids = elaborated_assertions(
+        r"
+            (declare-const x Int)
+            (define-funs-rec ((p ((n Int)) Int) (q ((n Int)) Int))
+              ((ite (= n 0) x (q (- n 1)))
+               (ite (= n 0) x (p (- n 1)))))
+            (assert (let ((x 5)) (and (> x 0) (= (p 2) 11))))
+            (assert (and (> 5 0) (= x 11)))
+        ",
+    );
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        ids[0], ids[1],
+        "define-funs-rec expansion is capture-avoiding"
+    );
+}
+
+#[test]
+fn test_define_fun_body_not_captured_by_match_pattern_variable() {
+    // A `match` pattern variable is a binder too (§3.6.5) and must not capture
+    // the body's global.
+    let ids = elaborated_assertions(
+        r"
+            (declare-const x Int)
+            (define-fun f () Int x)
+            (declare-datatypes ((Box 0)) (((mk (val Int)))))
+            (declare-const b Box)
+            (assert (match b (((mk x) (= f 11)))))
+            (assert (= x 11))
+        ",
+    );
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        ids[0], ids[1],
+        "a match pattern variable must not capture a macro body's global"
+    );
+}
+
+#[test]
+fn test_define_fun_parameter_still_binds_in_its_body() {
+    // The other direction: capture-avoidance must not break ordinary parameter
+    // binding. `(sq 7)` is `(* 7 7)`.
+    let ids = elaborated_assertions(
+        r"
+            (define-fun sq ((n Int)) Int (* n n))
+            (declare-const z Int)
+            (assert (= z (sq 7)))
+            (assert (= z (* 7 7)))
+        ",
+    );
+    assert_eq!(ids.len(), 2);
+    assert_eq!(
+        ids[0], ids[1],
+        "macro parameters must still bind in the body"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// An UNRESOLVED sort name is an error, and a sort does not outlive its scope.
+//
+// SMT-LIB 2.6: every sort symbol must already be in the signature, and an
+// assertion level owns the declarations made in it, so `(pop n)` removes them —
+// `:global-declarations` opts out and defaults to false. AY used to turn any
+// unresolved simple sort name into a fresh `Uninterpreted` sort, which accepted
+// every mistyped sort name and re-invented a popped sort's NAME with its
+// interpretation (and its finite domain) lost.
+
+fn first_elaboration_error(input: &str) -> Option<ElaborateError> {
+    let commands = parse(input).unwrap();
+    let mut ctx = Context::new();
+    for cmd in &commands {
+        if let Err(e) = ctx.process_command(cmd) {
+            return Some(e);
+        }
+    }
+    None
+}
+
+#[test]
+fn test_unknown_sort_name_is_rejected() {
+    let err = first_elaboration_error("(declare-fun t () Nonexistent)");
+    assert!(
+        matches!(err, Some(ElaborateError::UnknownSort(ref s)) if s == "Nonexistent"),
+        "a sort name that is not in the signature must be rejected, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_declare_sort_does_not_outlive_its_pop() {
+    let err = first_elaboration_error(
+        r"
+            (push 1)
+            (declare-sort S 0)
+            (pop 1)
+            (declare-fun t () S)
+        ",
+    );
+    assert!(
+        matches!(err, Some(ElaborateError::UnknownSort(ref s)) if s == "S"),
+        "a sort declared inside a push must not survive the pop, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_define_sort_does_not_outlive_its_pop() {
+    let err = first_elaboration_error(
+        r"
+            (push 1)
+            (define-sort MyInt () Int)
+            (pop 1)
+            (declare-fun t () MyInt)
+        ",
+    );
+    assert!(
+        matches!(err, Some(ElaborateError::UnknownSort(ref s)) if s == "MyInt"),
+        "a sort synonym defined inside a push must not survive the pop, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_datatype_sort_does_not_outlive_its_pop() {
+    // The worst half of the leak: the popped datatype's NAME used to survive as
+    // an uninterpreted sort, so its finite domain was silently lost.
+    let err = first_elaboration_error(
+        r"
+            (push 1)
+            (declare-datatypes ((D 0)) (((a) (b))))
+            (pop 1)
+            (declare-fun t () D)
+        ",
+    );
+    assert!(
+        matches!(err, Some(ElaborateError::UnknownSort(ref s)) if s == "D"),
+        "a popped datatype's sort name must not survive as an uninterpreted sort, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_sort_survives_pop_under_global_declarations() {
+    // `:global-declarations true` is the documented opt-out and must still work.
+    let err = first_elaboration_error(
+        r"
+            (set-option :global-declarations true)
+            (push 1)
+            (declare-sort S 0)
+            (pop 1)
+            (declare-fun t () S)
+        ",
+    );
+    assert!(
+        err.is_none(),
+        ":global-declarations true must keep the sort declared, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_declared_sort_in_scope_still_resolves() {
+    // Guard against over-rejection: an in-scope `declare-sort` still works, and
+    // so does the builtin `RoundingMode`, which is never `declare-sort`ed.
+    let err = first_elaboration_error(
+        r"
+            (declare-sort S 0)
+            (declare-fun t () S)
+            (declare-fun rm () RoundingMode)
+            (assert (= rm RNE))
+        ",
+    );
+    assert!(err.is_none(), "in-scope sorts must still resolve: {err:?}");
+}
+
+#[test]
+fn test_recursive_datatype_sort_is_in_scope_inside_its_own_declaration() {
+    // A datatype is in scope inside its own declaration, so the carrier sort
+    // must be registered before its field sorts are elaborated.
+    let err = first_elaboration_error("(declare-datatype Lst ((nil) (cons (hd Int) (tl Lst))))");
+    assert!(
+        err.is_none(),
+        "a recursive datatype must still elaborate: {err:?}"
+    );
+}
+
+/// `is_single_shot_query` is the SCOPING precondition diagnostic consumers use
+/// before treating `assertions_parsed()` as "the assertion set of the check-sat
+/// I am accompanying". It must go false on the first `push`, on the first `pop`,
+/// on `check-sat-assuming`, and from the SECOND `check-sat` onwards — including
+/// after a matched push/pop pair has restored the scope depth to zero, which is
+/// exactly the case a `scopes.is_empty()` test would miss.
+#[test]
+fn single_shot_query_tracks_scope_and_check_sat_commands() {
+    let mut ctx = Context::new();
+    assert!(ctx.is_single_shot_query());
+    ctx.process_command(&Command::CheckSat).expect("check-sat");
+    assert!(
+        ctx.is_single_shot_query(),
+        "the first check-sat is single-shot"
+    );
+    ctx.process_command(&Command::CheckSat).expect("check-sat");
+    assert!(!ctx.is_single_shot_query(), "a second check-sat is not");
+
+    // A matched push/pop pair leaves scope DEPTH at zero but the query is no
+    // longer single-shot: an assertion made inside the scope is gone from
+    // `assertions_parsed()` and a consumer must not assume it never existed.
+    let mut ctx = Context::new();
+    ctx.process_command(&Command::Push(1)).expect("push");
+    assert!(!ctx.is_single_shot_query());
+    ctx.process_command(&Command::Pop(1)).expect("pop");
+    assert_eq!(ctx.scope_depth(), 0);
+    assert!(!ctx.is_single_shot_query());
+
+    // `check-sat-assuming` hides its assumptions from the surface export.
+    let mut ctx = Context::new();
+    ctx.process_command(&Command::CheckSatAssuming(Vec::new()))
+        .expect("check-sat-assuming");
+    assert!(!ctx.is_single_shot_query());
+}

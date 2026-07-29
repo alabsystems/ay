@@ -943,6 +943,55 @@ impl BmcSolver {
         }
     }
 
+    /// Whether any clause body applies the same predicate more than once.
+    ///
+    /// [`Self::level_arg`] names a level argument by `(predicate, level, index)`
+    /// only, so every occurrence of a predicate within one body is equated to
+    /// the *same* argument tuple. A body with `N > 1` occurrences of one
+    /// predicate is therefore encoded as "all `N` premise tuples are
+    /// identical", which is strictly stronger than the clause it stands for.
+    ///
+    /// The consequence is that per-depth UNSAT becomes vacuous: it can hold
+    /// because the collapsed encoding is self-contradictory rather than because
+    /// no counterexample exists. Depth exhaustion then proves nothing, so an
+    /// `acyclic_safe` run must not report `Safe`.
+    ///
+    /// [`Self::solve_bounded_tree_refutation`] carries the exact encoding for
+    /// these bodies, but is not reachable from [`Self::solve`].
+    fn has_repeated_body_predicate(&self) -> bool {
+        self.problem.clauses().iter().any(|clause| {
+            let body = &clause.body.predicates;
+            body.iter().enumerate().any(|(index, (predicate, _))| {
+                body[index + 1..]
+                    .iter()
+                    .any(|(other, _)| other == predicate)
+            })
+        })
+    }
+
+    /// Fail closed on a `Safe` the level-flat encoding cannot justify.
+    ///
+    /// Applied at every [`Self::solve`] exit so no internal path can publish a
+    /// `Safe` that rests on a collapsed body (see
+    /// [`Self::has_repeated_body_predicate`]). Without this,
+    /// `P(0). P(1). false :- P(x), P(y), x != y.` — plainly unsafe — is
+    /// reported `Safe`, because the shared level argument forces `x == y` and
+    /// makes every depth UNSAT.
+    ///
+    /// Only `Safe` is affected. `Unsafe` still rests on its own witness replay
+    /// and is untouched.
+    fn reject_unrepresentable_safe(&self, result: ChcEngineResult) -> ChcEngineResult {
+        if matches!(result, ChcEngineResult::Safe(_)) && self.has_repeated_body_predicate() {
+            tracing::warn!(
+                "BMC: downgrading Safe to Unknown — a clause body applies one predicate \
+                 more than once, which the level-flat encoding collapses into a single \
+                 shared argument tuple, so depth exhaustion does not prove safety"
+            );
+            return ChcEngineResult::Unknown;
+        }
+        result
+    }
+
     /// Finalize the persistent executor path after it reaches `max_depth`.
     ///
     /// When adaptive stepping skipped any intermediate bounds, `acyclic_safe`
@@ -1119,7 +1168,7 @@ impl BmcSolver {
                     ChcEngineResult::NotApplicable => "NotApplicable",
                 };
                 self.log_stats(result_name);
-                return result;
+                return self.reject_unrepresentable_safe(result);
             }
         }
 
@@ -1198,7 +1247,7 @@ impl BmcSolver {
         };
         self.log_stats(result_name);
 
-        result
+        self.reject_unrepresentable_safe(result)
     }
 
     fn prefer_exact_acyclic_executor_first(&self) -> bool {

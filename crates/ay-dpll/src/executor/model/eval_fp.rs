@@ -1097,6 +1097,27 @@ impl Executor {
             // fp.to_ieee_bv : FP → BV (bit-pattern reinterpretation)
             "fp.to_ieee_bv" if args.len() == 1 => match self.evaluate_term(model, args[0]) {
                 EvalValue::Fp(v) => {
+                    // NaN has ONE value per FP sort but many IEEE encodings, so
+                    // which encoding `fp.to_ieee_bv` returns is unspecified
+                    // (the solver picks one free-but-shared pattern per format;
+                    // see `FpSolver::bitblast_to_ieee_bv`). Recomputing a
+                    // canonical guess here would contradict the solver's own
+                    // choice and falsify a perfectly good model, so read the
+                    // chosen encoding out of the bit-blasted assignment and
+                    // abstain when it is not recorded.
+                    if v.is_nan() {
+                        let chosen = self.bv_model_cache_fallback(model, term_id, sort);
+                        // With no bit-blasted BV assignment anywhere in this
+                        // solve there is no choice to contradict, so any NaN
+                        // encoding is a faithful value: report the canonical
+                        // quiet NaN rather than declining.
+                        if matches!(chosen, EvalValue::Unknown) && model.bv_model.is_some() {
+                            return EvalValue::Unknown;
+                        }
+                        if !matches!(chosen, EvalValue::Unknown) {
+                            return chosen;
+                        }
+                    }
                     let (value, width) = v.to_ieee_bv();
                     EvalValue::BitVec { value, width }
                 }

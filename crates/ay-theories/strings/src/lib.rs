@@ -253,31 +253,28 @@ fn ground_eval_replace_re_all_with_budget(
 
     loop {
         if remaining.is_empty() {
-            // SMT-LIB / cvc5 semantics: a zero-length (empty) regex match never
-            // triggers a replacement. There is nothing left to copy, so just stop.
-            // (Previously this pushed `t` when "" matched `r`, spuriously inserting
-            // the replacement and producing a false-UNSAT — #strings-replace_re_all.)
+            // SMT-LIB 2.6: the empty string admits no decomposition with a
+            // non-empty middle, so it is its own replacement. There is nothing
+            // left to copy, so just stop. (An older version pushed `t` when ""
+            // matched `r`, spuriously inserting the replacement and producing a
+            // false-UNSAT — #strings-replace_re_all. That must stay fixed.)
             break;
         }
 
-        match RegExpSolver::find_first_match_with_budget(terms, remaining, r, budget)? {
+        // SMT-LIB 2.6 Unicode Strings, `str.replace_re_all`: the decomposition
+        // `s = x ++ w ++ z` requires `w != ""`, so the matcher must look for the
+        // leftmost, then shortest, NON-EMPTY match. Asking for a possibly-empty
+        // match instead makes every nullable regex (`re.all`, `re.*`, `re.opt`,
+        // ...) match empty at position 0, after which no replacement can ever
+        // fire and the operator degenerates to the identity — a wrong-verdict
+        // defect in both directions (#strings-replace_re_all-nullable).
+        match RegExpSolver::find_first_nonempty_match_with_budget(terms, remaining, r, budget)? {
             MatchResult::Found(start, end) => {
+                debug_assert!(end > start, "non-empty matcher returned an empty match");
                 result.push_str(&remaining[..start]);
-                if start == end {
-                    // Zero-length match: SMT-LIB only replaces NON-empty matches,
-                    // so do NOT push `t`. Copy through one character to advance and
-                    // avoid an infinite loop.
-                    if let Some(ch) = remaining[end..].chars().next() {
-                        result.push(ch);
-                        remaining = &remaining[end + ch.len_utf8()..];
-                    } else {
-                        break;
-                    }
-                } else {
-                    // Non-empty match: emit the replacement.
-                    result.push_str(t);
-                    remaining = &remaining[end..];
-                }
+                result.push_str(t);
+                // `end > start` guarantees progress, so the loop terminates.
+                remaining = &remaining[end..];
             }
             MatchResult::NoMatch => {
                 result.push_str(remaining);

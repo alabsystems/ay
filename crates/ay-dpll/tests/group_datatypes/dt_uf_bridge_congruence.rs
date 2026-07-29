@@ -43,29 +43,44 @@ use ay_frontend::parse;
 const INC_SOME_LIST: &str = include_str!("../fixtures/dt_uf_bridge_congruence_inc_some_list.smt2");
 
 /// Solve `smt` in a worker thread with a hard internal timeout + interrupt, so a
-/// regression (the pre-fix depth-4 divergence) reports `unknown` instead of
-/// wedging the harness. Returns the final verdict line.
-fn solve_capped(smt: &str, timeout: Duration) -> String {
+/// regression (the pre-fix depth-4 divergence) fails with a bounded diagnostic
+/// instead of wedging the harness. Returns the final verdict line, while
+/// preserving parse/elaboration failures as errors rather than misreporting
+/// them as a solver `unknown`.
+fn solve_capped(smt: &str, timeout: Duration) -> Result<String, String> {
     let src = smt.to_string();
     let interrupt = Arc::new(AtomicBool::new(false));
     let interrupt_worker = Arc::clone(&interrupt);
     let (tx, rx) = std::sync::mpsc::channel();
-    let _worker = std::thread::spawn(move || {
-        let commands = parse(&src).expect("parse dt-uf-bridge-congruence fixture");
+    let worker = std::thread::spawn(move || {
+        let commands = match parse(&src) {
+            Ok(commands) => commands,
+            Err(error) => {
+                let _ = tx.send(Err(format!("parse failed before verdict: {error:?}")));
+                return;
+            }
+        };
         let mut exec = Executor::new();
         exec.set_interrupt(interrupt_worker);
         exec.set_timeout(Some(timeout));
-        let verdict = match exec.execute_all(&commands) {
-            Ok(outputs) => outputs.last().cloned().unwrap_or_default(),
-            Err(_) => "unknown".to_string(),
-        };
+        let verdict = exec
+            .execute_all(&commands)
+            .map(|outputs| outputs.last().cloned().unwrap_or_default())
+            .map_err(|error| format!("execution failed before verdict: {error:?}"));
         let _ = tx.send(verdict);
     });
     match rx.recv_timeout(timeout + Duration::from_secs(5)) {
-        Ok(verdict) => verdict.trim().to_string(),
-        Err(_) => {
+        Ok(verdict) => {
+            worker
+                .join()
+                .map_err(|_| "solver worker panicked after reporting a verdict".to_string())?;
+            verdict.map(|verdict| verdict.trim().to_string())
+        }
+        Err(error) => {
             interrupt.store(true, Ordering::Relaxed);
-            "unknown".to_string()
+            Err(format!(
+                "solver worker failed to report within the bounded deadline: {error}"
+            ))
         }
     }
 }
@@ -76,7 +91,8 @@ fn solve_capped(smt: &str, timeout: Duration) -> String {
 /// depth 3 and diverged at depth 4.
 #[test]
 fn inc_some_list_dual_vocab_obligation_is_unsat() {
-    let verdict = solve_capped(INC_SOME_LIST, Duration::from_mins(1));
+    let verdict = solve_capped(INC_SOME_LIST, Duration::from_mins(1))
+        .expect("the inc_some_list fixture must parse, elaborate, and execute");
     assert_eq!(
         verdict, "unsat",
         "the inc_some_list dual-vocabulary catamorphism obligation must refute \
@@ -105,10 +121,24 @@ fn bridge_congruence_does_not_force_unequal_argument_results() {
         (assert (not (= (sum (scons1 self)) (sum (tl self)))))
         (check-sat)
     "#;
-    let verdict = solve_capped(smt, Duration::from_secs(20));
+    let verdict = solve_capped(smt, Duration::from_secs(20))
+        .expect("the guarded bridge soundness fixture must parse, elaborate, and execute");
     assert_eq!(
         verdict, "sat",
         "guarded bridge congruence must not merge f(a),f(b) when a,b are not \
          equal (got `{verdict}`)"
+    );
+}
+
+#[test]
+fn malformed_fixture_sort_is_not_misreported_as_solver_unknown() {
+    let error = solve_capped(
+        "(set-logic ALL)\n(declare-const x MissingSort)\n(check-sat)\n",
+        Duration::from_secs(1),
+    )
+    .expect_err("an undeclared sort must fail during elaboration");
+    assert_eq!(
+        error,
+        "execution failed before verdict: Elaborate(UnknownSort(\"MissingSort\"))"
     );
 }

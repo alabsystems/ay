@@ -23,6 +23,104 @@ fn assert_native_replay_rejected(artifact: &NativeReplayArtifact) {
     ));
 }
 
+fn boolean_unsat_native_replay_artifact() -> NativeReplayArtifact {
+    let mut solver = Solver::try_new(Logic::QfUf).expect("solver");
+    let p = solver.declare_const("p", Sort::Bool);
+    let not_p = solver.not(p);
+    solver.assert_term(p);
+    solver.assert_term(not_p);
+    let details = solver.check_sat_with_details();
+    assert!(details.result.is_unsat());
+    solver.export_native_replay_artifact(NativeReplayMetadata::default(), Some(&details))
+}
+
+#[cfg(feature = "proof-checker")]
+#[test]
+fn native_replay_with_proofs_returns_only_strict_complete_unsat_authority() {
+    let artifact = boolean_unsat_native_replay_artifact();
+    let replay =
+        Solver::replay_native_replay_artifact_with_proofs(&artifact, Duration::from_secs(5))
+            .expect("strict proof replay");
+
+    assert!(replay.result.is_unsat());
+    assert!(replay.verification_level.has_proof_checking());
+    assert!(replay.verification.unsat_proof_available);
+    assert_eq!(replay.verification.unsat_proof_checker_failures, 0);
+    assert!(replay.statistics.proof_complete);
+    assert_eq!(replay.statistics.get_int("proof_trust"), Some(0));
+    assert_eq!(replay.statistics.get_int("proof_checker_failures"), Some(0));
+    let checked = replay
+        .statistics
+        .get_int("proof_checker_checked_steps")
+        .expect("checked step count");
+    let total = replay
+        .statistics
+        .get_int("proof_checker_total_steps")
+        .expect("total step count");
+    assert!(total > 0);
+    assert_eq!(checked, total);
+    assert_eq!(
+        replay
+            .statistics
+            .get_int("proof_checker_skipped_hole_steps"),
+        Some(0)
+    );
+}
+
+#[test]
+fn ordinary_native_replay_remains_proofless() {
+    let artifact = boolean_unsat_native_replay_artifact();
+    let replay = Solver::replay_native_replay_artifact(&artifact).expect("ordinary replay");
+
+    assert!(replay.result.is_unsat());
+    assert!(
+        !replay.verification_level.has_proof_checking(),
+        "the existing replay API must not silently enable proof production"
+    );
+    assert!(!replay.verification.unsat_proof_available);
+    assert_eq!(replay.statistics.get_int("proof_checker_failures"), None);
+}
+
+#[test]
+fn native_replay_with_proofs_honors_caller_and_artifact_timeout_bounds() {
+    let solver = Solver::try_new(Logic::QfUf).expect("solver");
+    let artifact = solver.export_native_replay_artifact(NativeReplayMetadata::default(), None);
+    let caller_bounded =
+        Solver::replay_native_replay_artifact_with_proofs(&artifact, Duration::ZERO)
+            .expect("Unknown is diagnostic, not proof authority");
+    assert!(
+        caller_bounded.result.is_unknown(),
+        "a zero caller deadline must fail closed as Unknown"
+    );
+
+    let mut recorded_bounded = artifact;
+    recorded_bounded.timeout_ms = Some(0);
+    let replay = Solver::replay_native_replay_artifact_with_proofs(
+        &recorded_bounded,
+        Duration::from_secs(5),
+    )
+    .expect("the recorded timeout is the tighter bound");
+    assert!(
+        replay.result.is_unknown(),
+        "the recorded zero deadline must win over a longer caller deadline"
+    );
+}
+
+#[test]
+fn native_replay_with_proofs_rejects_tampered_identity_tables() {
+    let mut artifact = boolean_unsat_native_replay_artifact();
+    artifact
+        .terms
+        .push(artifact.terms.first().expect("Boolean term").clone());
+    assert!(matches!(
+        Solver::replay_native_replay_artifact_with_proofs(&artifact, Duration::from_secs(5)),
+        Err(SolverError::InvalidArgument {
+            operation: "native_replay",
+            ..
+        })
+    ));
+}
+
 #[test]
 fn native_replay_artifact_round_trips_active_assertions() {
     let mut solver = Solver::try_new(Logic::QfLia).expect("solver");

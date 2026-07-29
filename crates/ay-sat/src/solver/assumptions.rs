@@ -1094,7 +1094,36 @@ impl Solver {
                 ReasonKind::Decision => {
                     // Decision variable: if it's an assumption, add to core.
                     if var_idx < is_assumption.len() && is_assumption[var_idx] {
-                        if let Some(a_lit) = assumption_lit[var_idx] {
+                        // SOUNDNESS (#unsat-core-polarity, A7): `assumption_lit`
+                        // stores ONE literal per VARIABLE, so when the caller
+                        // assumes a variable at both polarities in the same
+                        // query (`(check-sat-assuming (a b (not a)))`) it holds
+                        // whichever was registered LAST. Reporting that literal
+                        // here can name the polarity that took no part in this
+                        // conflict, producing a "core" that is itself
+                        // SATISFIABLE with the assertions — a certificate
+                        // consumer (MUS extraction, assumption-based CEGAR, BMC)
+                        // would then treat a satisfiable set as unsatisfiable.
+                        //
+                        // An assumption reaches this arm only by having been
+                        // DECIDED (`self.decide(assump_lit)` in the assumption
+                        // prefix), so the trail value IS the polarity that
+                        // participated. Derive the literal from the assignment;
+                        // fall back to the registered literal only if the
+                        // variable is somehow unassigned (it cannot be while it
+                        // is a decision, but the map keeps the walk total).
+                        let participating = self.var_value_from_vals(var_idx).map_or(
+                            assumption_lit[var_idx],
+                            |value| {
+                                let var = Variable::new(var_idx as u32);
+                                Some(if value {
+                                    Literal::positive(var)
+                                } else {
+                                    Literal::negative(var)
+                                })
+                            },
+                        );
+                        if let Some(a_lit) = participating {
                             if !in_core[var_idx] {
                                 in_core[var_idx] = true;
                                 core.push(a_lit);

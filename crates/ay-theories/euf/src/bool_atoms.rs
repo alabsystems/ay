@@ -8,8 +8,48 @@ use ay_core::term::{TermData, TermId};
 use ay_core::{Sort, TheoryLit};
 use tracing::debug;
 
+use ay_core::kani_compat::DetHashMap;
+
 use crate::solver::EufSolver;
 use crate::types::{EqualityReason, MergeReason};
+
+thread_local! {
+    /// Bool-arg app pairs recorded by the most recent
+    /// `bool_arg_model_is_congruent` call that DOWNGRADED a candidate `Sat` to
+    /// `Unknown`.
+    ///
+    /// A thread-local rather than a return value because the `EufSolver` that
+    /// computes them is constructed inside
+    /// `solve_incremental_split_loop_pipeline!`'s `create_theory` block and never
+    /// escapes it, so the executor cannot read the field off the solver. This is
+    /// the bridge that lets `solve_euf` attempt a targeted congruence repair
+    /// instead of surrendering the check-sat.
+    ///
+    /// DIAGNOSTIC ONLY — nothing inside the solver reads it, so writing it cannot
+    /// change a verdict. Cleared by `take_bool_arg_repair_candidates`.
+    static BOOL_ARG_REPAIR_CANDIDATES: std::cell::RefCell<Vec<(TermId, TermId)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Take (and clear) the Bool-arg app pairs recorded by the last congruence-guard
+/// downgrade on this thread. Empty when the guard did not fire.
+pub fn take_bool_arg_repair_candidates() -> Vec<(TermId, TermId)> {
+    BOOL_ARG_REPAIR_CANDIDATES.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// Clear any stale candidates before a solve, so a later `take` cannot observe
+/// pairs left over from an earlier check-sat on the same thread.
+pub fn clear_bool_arg_repair_candidates() {
+    BOOL_ARG_REPAIR_CANDIDATES.with(|c| c.borrow_mut().clear());
+}
+
+fn record_bool_arg_repair_candidates(edges: &[(TermId, TermId)]) {
+    BOOL_ARG_REPAIR_CANDIDATES.with(|c| {
+        let mut slot = c.borrow_mut();
+        slot.clear();
+        slot.extend_from_slice(edges);
+    });
+}
 
 impl EufSolver<'_> {
     pub(crate) fn record_assignment(&mut self, term: TermId, value: bool) {
@@ -38,6 +78,12 @@ impl EufSolver<'_> {
             None => {
                 self.trail.push((term, None));
                 self.assigns.insert(term, value);
+                // #euf-ite-worklist: this assignment may unblock ITE terms whose
+                // condition is (or negates) `term`. Enqueue exactly those.
+                if let Some(ites) = self.ite_by_cond.get(&term.0) {
+                    let ites = ites.clone();
+                    self.pending_ite.extend(ites);
+                }
                 self.dirty = true;
 
                 // #euf-idle-rebuild: feed the incremental bool-valued-atom
@@ -511,7 +557,7 @@ impl EufSolver<'_> {
     /// would be UNSAT if congruence were enforced), so downgrading to Unknown is
     /// both sound and completeness-preserving.
     pub(crate) fn bool_arg_model_is_congruent(&mut self) -> bool {
-        use std::collections::hash_map::Entry;
+        use hashbrown::hash_map::Entry;
         // Skip in verification-only solvers: they only re-check Unsat verdicts
         // (reasons discarded) and must not downgrade to Unknown. Also skip when
         // the validation flag is off or there are no Bool UF-args.
@@ -551,21 +597,37 @@ impl EufSolver<'_> {
         // Collect the forced-equal Bool-arg app pairs: two UF apps with the same
         // (func_hash, non-Bool-arg current-reps, Bool-arg model truth values)
         // MUST be congruent. Record them as union edges.
-        let mut sig_to_app: std::collections::HashMap<(u64, Vec<u32>, Vec<bool>), u32> =
-            std::collections::HashMap::new();
+        // #euf-guard-hash: this ran on `std::collections::HashMap`, i.e. SipHash-1-3
+        // with no reserved capacity, on the hottest path in the division AY is
+        // losing. Profiled on CLEARSY 0002/00126: this whole function is 28.3% of
+        // the solve, `hashbrown::rustc_entry` under it 15.8%, and pure table
+        // growth (`reserve_rehash`) 9.7% — with `sip::Hasher::write` the single
+        // largest self-time frame in the process at 11.8%.
+        // `DetHashMap` is hashbrown + foldhash FixedState: faster AND
+        // deterministic (the crate-wide convention, see kani_compat). Capacity is
+        // known up front — one app per func_app at most.
+        let mut sig_to_app: DetHashMap<(u64, Vec<u32>, Vec<bool>), u32> =
+            DetHashMap::with_capacity_and_hasher(self.bool_arg_app_idx.len(), Default::default());
         let mut forced_edges: Vec<(u32, u32)> = Vec::new();
-        let n = self.func_apps.len();
-        for i in 0..n {
-            let app_term = self.func_apps[i].term_id;
-            let func_hash = self.func_apps[i].func_hash;
-            let args: Vec<u32> = self.func_apps[i].args.clone();
+        // #euf-guard-index: iterate ONLY the apps that have a Bool argument.
+        // This used to walk every func_app and `continue` on the ones with none,
+        // paying a `args.clone()` heap allocation apiece to find that out. Which
+        // apps qualify is fixed by argument sorts, so it is precomputed once in
+        // `init_func_apps`. `has_bool` is now an invariant of the index rather
+        // than something rediscovered per check.
+        //
+        // The clone is gone too: `derive_bool_term_value` and `TermStore::sort`
+        // both take `&self`, and the only mutable borrow in the loop is the local
+        // `parent` union-find, so the arguments can be read in place.
+        for idx in 0..self.bool_arg_app_idx.len() {
+            let app = &self.func_apps[self.bool_arg_app_idx[idx] as usize];
+            let app_term = app.term_id;
+            let func_hash = app.func_hash;
             let mut non_bool_reps: Vec<u32> = Vec::new();
             let mut bool_vals: Vec<bool> = Vec::new();
-            let mut has_bool = false;
             let mut undetermined = false;
-            for &arg in &args {
+            for &arg in &app.args {
                 if self.terms.sort(TermId(arg)) == &Sort::Bool {
-                    has_bool = true;
                     match self.derive_bool_term_value(TermId(arg)) {
                         Some(v) => bool_vals.push(v),
                         None => {
@@ -577,7 +639,7 @@ impl EufSolver<'_> {
                     non_bool_reps.push(sfind(&mut parent, arg));
                 }
             }
-            if !has_bool || undetermined {
+            if undetermined {
                 continue;
             }
             match sig_to_app.entry((func_hash, non_bool_reps, bool_vals)) {
@@ -589,6 +651,19 @@ impl EufSolver<'_> {
                 }
             }
         }
+        // Record the forced pairs for a caller that wants to REPAIR rather than
+        // give up (targeted CEGAR — see `last_bool_arg_forced_edges`). Diagnostic
+        // only; no solver path reads it, so this cannot change a verdict.
+        self.last_bool_arg_forced_edges = forced_edges
+            .iter()
+            .map(|&(a, b)| (TermId(a), TermId(b)))
+            .collect();
+        // Also publish on the thread-local bridge: the solver itself never
+        // escapes the pipeline macro, so this is how `solve_euf` sees them.
+        // Written whenever the guard runs (not only on downgrade) — the executor
+        // reads them only when the verdict is `Unknown`, and clears before each
+        // solve, so a `Sat` run leaving candidates behind is harmless.
+        record_bool_arg_repair_candidates(&self.last_bool_arg_forced_edges);
         if forced_edges.is_empty() {
             return true;
         }
@@ -630,19 +705,39 @@ impl EufSolver<'_> {
             let mut changed = true;
             let mut rounds = 0usize;
             let max_rounds = self.func_apps.len() + 2;
+            // #euf-guard-hash: allocated ONCE and cleared per round. It used to be
+            // a fresh SipHash map per round, with up to `func_apps.len()+2`
+            // rounds — a Theta(n^2) allocation pattern on the hot path.
+            // #euf-guard-scratch: the map and the per-app key `Vec`s are
+            // solver-owned scratch, taken/restored per call (the
+            // `scratch_cong_neg_la` idiom). The guard runs once per complete
+            // candidate model — ~16k times on the heaviest Inc QF_Equality file —
+            // and each call otherwise builds a fresh map plus one `Vec<u32>` per
+            // func_app per round. Between rounds the keys are reclaimed by
+            // `drain()` into the pool rather than dropped by `clear()`, so steady
+            // state allocates nothing. (Keys consumed on the Occupied arm are
+            // lost to the pool; that arm fires only when two apps collide on a
+            // signature, i.e. exactly when a merge happens, which is rare.)
+            let mut cong = std::mem::take(&mut self.scratch_bool_arg_cong);
+            let mut pool = std::mem::take(&mut self.scratch_bool_arg_pool);
+            cong.reserve(self.func_apps.len().saturating_sub(cong.capacity()));
             while changed && rounds < max_rounds {
                 changed = false;
                 rounds += 1;
-                let mut cong: std::collections::HashMap<(u64, Vec<u32>), u32> =
-                    std::collections::HashMap::new();
-                for i in 0..n {
+                for ((_, k), _) in cong.drain() {
+                    pool.push(k);
+                }
+                for i in 0..self.func_apps.len() {
                     let app_term = self.func_apps[i].term_id;
                     let func_hash = self.func_apps[i].func_hash;
-                    let arg_reps: Vec<u32> = self.func_apps[i]
-                        .args
-                        .iter()
-                        .map(|&a| sfind(&mut parent, a))
-                        .collect();
+                    let mut arg_reps = pool.pop().unwrap_or_default();
+                    arg_reps.clear();
+                    arg_reps.extend(
+                        self.func_apps[i]
+                            .args
+                            .iter()
+                            .map(|&a| sfind(&mut parent, a)),
+                    );
                     match cong.entry((func_hash, arg_reps)) {
                         Entry::Vacant(e) => {
                             e.insert(app_term);
@@ -658,6 +753,11 @@ impl EufSolver<'_> {
                     }
                 }
             }
+            for ((_, k), _) in cong.drain() {
+                pool.push(k);
+            }
+            self.scratch_bool_arg_cong = cong;
+            self.scratch_bool_arg_pool = pool;
         }
 
         // Bool-VALUE collision: if the congruence closure merged two Bool-sorted
@@ -680,8 +780,8 @@ impl EufSolver<'_> {
             // two opposite-valued terms together. The baseline gate is what
             // prevents over-firing on dense models whose broad congruence-closure
             // fixpoint coincidentally collapses already-consistent classes.
-            let mut class_witnesses: std::collections::HashMap<u32, Vec<(u32, bool)>> =
-                std::collections::HashMap::new();
+            let mut class_witnesses: DetHashMap<u32, Vec<(u32, bool)>> =
+                DetHashMap::with_capacity_and_hasher(self.assigns.len(), Default::default());
             for (&t, &v) in &self.assigns {
                 if t.0 >= nverts || self.terms.sort(t) != &Sort::Bool {
                     continue;

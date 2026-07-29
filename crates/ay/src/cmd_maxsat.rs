@@ -1578,7 +1578,11 @@ fn milp_race_worker(
 
     let cutoff = shared_ub.load(Ordering::Relaxed);
     eprintln!(
-        "c milp-race: launching (hards={} softs={} vars={} cutoff={})",
+        // NB: this is the OBSERVED shared upper bound, not evidence that a cutoff
+        // row was added — that is decided below by `cutoff_applied`, which is
+        // default-OFF (see #milp-race-cutoff). Printing it as `cutoff=` here once
+        // caused a false "the fix regressed" alarm; hence `ub=`.
+        "c milp-race: launching (hards={} softs={} vars={} ub={})",
         hard.len(),
         soft.len(),
         num_vars,
@@ -1594,7 +1598,36 @@ fn milp_race_worker(
     };
     // Strict cutoff row: objective expression <= cutoff - 1 (in offset-free
     // terms). Weights are integral so the -1 step is exact.
-    let cutoff_applied = cutoff != u64::MAX && cutoff > 0;
+    //
+    // #milp-race-cutoff: DEFAULT OFF — the row is NOT free, it was COSTING the
+    // lane most of its wins. It converts a plain optimization into a
+    // constrained feasibility problem, and ay-milp's B&B closes the former far
+    // more easily on exactly the instances this lane exists to win. The race
+    // would launch correctly, well inside every size gate, and then report
+    // "Unknown after launch" while `--milp` alone solved the same instance in
+    // seconds:
+    //   cap92  race(cutoff=8572036) timeout  vs  `--milp` OPTIMUM 2.4s
+    //   cap131 race                 timeout  vs  `--milp` OPTIMUM 7.0s
+    //
+    // Full paired A/B over all 334 race-ELIGIBLE instances (60s, 3+3
+    // simultaneous, zero-wrong both legs, 0 cost mismatches on 251
+    // commonly-solved): dropping the row is **+8 solved (259 vs 251) with ZERO
+    // losses**. Five of the eight were re-verified STANDALONE against the field
+    // optima: warehouses cap92/cap131/cap132 (timeouts -> 6.6s/10.2s/12.5s),
+    // drmx-cryptogen threshold128_1 (timeout -> 1.6s), setcover rail516
+    // (timeout -> 27.2s, and the kept-row leg had only reached incumbent 251 vs
+    // the true 182). The other three solve either way.
+    //
+    // The row's purpose was to let the lane prove an OLL incumbent optimal via
+    // MilpRaceWin::CutoffProof; measurement says finding the optimum outright is
+    // simply the easier problem here. `AY_AB_MAXSAT_MILP_RACE_CUTOFF=1` restores
+    // the old seeded behavior.
+    let cutoff_row_enabled = {
+        use std::sync::OnceLock;
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_MILP_RACE_CUTOFF").as_deref() == Ok("1"))
+    };
+    let cutoff_applied = cutoff_row_enabled && cutoff != u64::MAX && cutoff > 0;
     if cutoff_applied {
         let rhs = (cutoff as f64) - offset - 1.0;
         m.add_row(f64::NEG_INFINITY, rhs, &obj);
@@ -1748,6 +1781,17 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
     if race_ok && (race_soft.is_empty() || race_soft.iter().all(|(w, _)| *w == race_soft[0].0)) {
         race_ok = false;
     }
+    if std::env::var("AY_MAXSAT_DEBUG").is_ok() {
+        eprintln!(
+            "c milp-race gate: wanted={} ok={} hard={} soft={} vars={} wsum={}",
+            race_wanted,
+            race_ok,
+            race_hard.len(),
+            race_soft.len(),
+            num_vars,
+            race_weight_sum
+        );
+    }
 
     // Launch the race thread (detached; dies with the process).
     let shared_ub = Arc::new(AtomicU64::new(u64::MAX));
@@ -1778,6 +1822,11 @@ fn solve(args: &MaxSatSolveArgs) -> Result<i32> {
         }
     };
 
+    // Hand the engine its budget, not just a stop bit. Without this every
+    // internal schedule (descent slice lengths, stall bars, probe budgets) is
+    // a fixed constant that suits exactly one timeout — the measured cause of
+    // AY's flat 60s→3600s curve.
+    solver.set_deadline(deadline);
     match solver.solve_interruptible(&should_stop, &mut on_upper_bound) {
         MaxSatResult::Optimal { model, cost } => {
             if last_printed != Some(cost) {

@@ -1071,6 +1071,9 @@ impl Context {
                 Ok(None)
             }
             Command::Push(n) => {
+                // Recorded BEFORE the preflight: a rejected push still tells a
+                // diagnostic consumer that this is not a single-shot query.
+                self.scope_commands_used = true;
                 let count = usize::try_from(*n).map_err(|_| {
                     ElaborateError::Unsupported("push count does not fit this target".to_string())
                 })?;
@@ -1098,6 +1101,7 @@ impl Context {
                 Ok(None)
             }
             Command::Pop(n) => {
+                self.scope_commands_used = true;
                 let count = usize::try_from(*n).map_err(|_| ElaborateError::ScopeUnderflow)?;
                 // Preflight the whole request.  Popping a valid prefix and
                 // then reporting underflow would leave assertions,
@@ -1111,8 +1115,16 @@ impl Context {
                 }
                 Ok(None)
             }
-            Command::CheckSat => Ok(Some(CommandResult::CheckSat)),
+            Command::CheckSat => {
+                self.check_sat_commands = self.check_sat_commands.saturating_add(1);
+                Ok(Some(CommandResult::CheckSat))
+            }
             Command::CheckSatAssuming(terms) => {
+                // The assumptions are NOT part of `assertions_parsed`, so a
+                // surface-syntax consumer cannot see the full query. Treated
+                // exactly like a scope command: not a single-shot query.
+                self.check_sat_commands = self.check_sat_commands.saturating_add(1);
+                self.scope_commands_used = true;
                 // Elaborate each assumption term to get its TermId
                 let term_ids: Vec<TermId> = terms
                     .iter()
@@ -1421,6 +1433,34 @@ impl Context {
         ctor_name: &str,
     ) -> Option<Vec<(String, Sort)>> {
         self.ctor_selector_info.get(ctor_name).cloned()
+    }
+
+    /// The bound term of the NULLARY constructor `ctor_name` **of the datatype
+    /// `dt_name`**.
+    ///
+    /// Two datatypes may share a constructor name (SMT-LIB 2.6 §4.2.3 ad-hoc
+    /// overloading; §3.6.4's `(as f σ)` exists to disambiguate it), and each
+    /// nullary constructor is bound to its own distinct term. `self.symbols`
+    /// keeps only the last-registered signature, so looking the name up bare
+    /// returns the most recently declared datatype's inhabitant regardless of
+    /// which datatype was asked for. Select by result sort instead — that is
+    /// exactly the ascription's own resolution rule — and only fall back to the
+    /// bare entry when the name is not overloaded at all.
+    pub(super) fn nullary_ctor_term_in(&self, dt_name: &str, ctor_name: &str) -> Option<TermId> {
+        let wanted = Sort::Uninterpreted(dt_name.to_string());
+        let candidates = self.symbol_candidates(ctor_name)?;
+        let mut matches = candidates
+            .iter()
+            .filter(|info| info.arg_sorts.is_empty() && info.sort == wanted);
+        let first = matches.next()?;
+        // Two nullary constructors of the SAME datatype cannot share a name, so
+        // an ambiguity here means the tables are inconsistent: decline rather
+        // than pick one (the caller then leaves the constant a free datatype
+        // variable, which is always sound).
+        if matches.next().is_some() {
+            return None;
+        }
+        first.term
     }
 
     /// Iterate over all constructor -> selector mappings.

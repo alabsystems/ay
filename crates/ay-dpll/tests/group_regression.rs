@@ -25,6 +25,8 @@ mod false_unsat_6242;
 mod false_unsat_array_ite_store_index;
 #[path = "group_regression/false_unsat_large_coeff_ite.rs"]
 mod false_unsat_large_coeff_ite;
+#[path = "group_regression/false_unsat_to_int_mod_hnf.rs"]
+mod false_unsat_to_int_mod_hnf;
 #[path = "group_regression/farkas_degradation_tests.rs"]
 mod farkas_degradation_tests;
 #[path = "group_regression/issue4701_substr_splice_regression.rs"]

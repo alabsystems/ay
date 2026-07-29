@@ -19,6 +19,8 @@ mod combined_incremental_proofs_6755;
 mod combined_proof_provenance_6759;
 #[path = "group_proofs/complementary_literal_rebuild.rs"]
 mod complementary_literal_rebuild;
+#[path = "group_proofs/congruence_collapse_rebuild.rs"]
+mod congruence_collapse_rebuild;
 #[path = "group_proofs/incremental_clausification_proofs.rs"]
 mod incremental_clausification_proofs;
 #[path = "group_proofs/incremental_proof_quality_8154.rs"]

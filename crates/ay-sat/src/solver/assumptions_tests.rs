@@ -1059,3 +1059,135 @@ fn new_var_between_assumption_solves_keeps_cache_and_correctness() {
     let third = solver.solve_with_assumptions(&[t]).into_inner();
     assert!(third.is_sat(), "assuming t should be SAT");
 }
+
+// ---------------------------------------------------------------------------
+// #unsat-core-polarity (A7): a variable assumed at BOTH polarities.
+//
+// `solve_with_assumptions_impl` tracks assumption bookkeeping per VARIABLE
+// (`is_assumption`, `assumption_lit`, `is_failed`), so an assumption list such
+// as `[a, b, !a]` registers only ONE literal for `a`. Reporting that literal
+// from the backward-resolution walk can name a polarity that took no part in
+// the conflict, and the resulting "core" is then SATISFIABLE together with the
+// clauses. These tests pin the CONTRACT rather than a specific subset:
+//   (1) core is a subset of the assumptions, and
+//   (2) clauses + core is itself UNSAT (re-solved independently).
+// ---------------------------------------------------------------------------
+
+/// Independently re-solve `clauses + core` with each core literal as a unit.
+/// Returns true when that conjunction is unsatisfiable.
+fn core_is_unsatisfiable(num_vars: usize, clauses: &[Vec<Literal>], core: &[Literal]) -> bool {
+    let mut checker = Solver::new(num_vars);
+    for clause in clauses {
+        checker.add_clause(clause.clone());
+    }
+    for &lit in core {
+        checker.add_clause(vec![lit]);
+    }
+    checker.solve().into_inner().is_unsat()
+}
+
+#[test]
+fn assumption_core_is_unsat_when_a_variable_is_assumed_both_ways() {
+    let a = Variable::new(0);
+    let b = Variable::new(1);
+    let clauses = vec![vec![Literal::negative(a), Literal::negative(b)]];
+
+    let mut solver = Solver::new(2);
+    for clause in &clauses {
+        solver.add_clause(clause.clone());
+    }
+
+    // `(check-sat-assuming (a b (not a)))` against `(or (not a) (not b))`.
+    let assumptions = [
+        Literal::positive(a),
+        Literal::positive(b),
+        Literal::negative(a),
+    ];
+    match solver.solve_with_assumptions(&assumptions).into_inner() {
+        AssumeResult::Unsat(core, _) => {
+            for lit in &core {
+                assert!(
+                    assumptions.contains(lit),
+                    "core literal {lit:?} is not one of the assumptions {assumptions:?}",
+                );
+            }
+            assert!(
+                core_is_unsatisfiable(2, &clauses, &core),
+                "returned core {core:?} is SATISFIABLE with the clauses -- \
+                 an unsat core must be an unsatisfiable subset",
+            );
+        }
+        other => panic!("expected UNSAT, got {other:?}"),
+    }
+}
+
+#[test]
+fn every_assumption_core_over_both_polarities_is_unsatisfiable() {
+    // Systematic sweep of the family the defect lives in: small clause sets
+    // over three variables x three-literal assumption lists drawn from all six
+    // literals (so both polarities of a variable can appear together).
+    let vars: Vec<Variable> = (0..3).map(Variable::new).collect();
+    let lits: Vec<Literal> = vars
+        .iter()
+        .flat_map(|&v| [Literal::positive(v), Literal::negative(v)])
+        .collect();
+
+    let clause_pool: Vec<Vec<Literal>> = vec![
+        vec![Literal::negative(vars[0]), Literal::negative(vars[1])],
+        vec![Literal::positive(vars[0]), Literal::positive(vars[1])],
+        vec![Literal::negative(vars[0]), Literal::positive(vars[1])],
+        vec![Literal::negative(vars[1]), Literal::negative(vars[2])],
+        vec![
+            Literal::positive(vars[0]),
+            Literal::negative(vars[1]),
+            Literal::positive(vars[2]),
+        ],
+    ];
+
+    let mut clause_sets: Vec<Vec<Vec<Literal>>> = vec![Vec::new()];
+    for clause in &clause_pool {
+        clause_sets.push(vec![clause.clone()]);
+    }
+    for i in 0..clause_pool.len() {
+        for j in (i + 1)..clause_pool.len() {
+            clause_sets.push(vec![clause_pool[i].clone(), clause_pool[j].clone()]);
+        }
+    }
+
+    let mut checked_unsat = 0_usize;
+    for clauses in &clause_sets {
+        for &l0 in &lits {
+            for &l1 in &lits {
+                for &l2 in &lits {
+                    let assumptions = [l0, l1, l2];
+                    let mut solver = Solver::new(3);
+                    for clause in clauses {
+                        solver.add_clause(clause.clone());
+                    }
+                    let AssumeResult::Unsat(core, _) =
+                        solver.solve_with_assumptions(&assumptions).into_inner()
+                    else {
+                        continue;
+                    };
+                    checked_unsat += 1;
+                    for lit in &core {
+                        assert!(
+                            assumptions.contains(lit),
+                            "core literal {lit:?} not in assumptions {assumptions:?} \
+                             (clauses {clauses:?})",
+                        );
+                    }
+                    assert!(
+                        core_is_unsatisfiable(3, clauses, &core),
+                        "SATISFIABLE core {core:?} returned for assumptions \
+                         {assumptions:?} over clauses {clauses:?}",
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        checked_unsat > 100,
+        "sweep should exercise many UNSAT queries, saw {checked_unsat}",
+    );
+}

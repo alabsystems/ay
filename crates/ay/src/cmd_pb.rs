@@ -553,6 +553,9 @@ fn solve_opb<W: Write>(
     wbo_projection: Option<&WboInstance>,
     source_opb_text: Option<&str>,
 ) -> Result<PbSolveOutcome> {
+    // Telemetry sink is process-scoped and monotone: clear it so a dual proven
+    // for a PREVIOUS instance can never be reported against this one.
+    ay_pb::optimize::shared_bounds::reset_reported_dual_global();
     // Borrowed view for the body; the `Arc` itself is only needed by the
     // decision frontend-timeout path (shared ownership for its worker thread).
     let instance: &PbInstance = instance_arc;

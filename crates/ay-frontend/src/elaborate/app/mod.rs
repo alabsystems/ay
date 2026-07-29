@@ -141,7 +141,28 @@ impl Context {
                 self.fun_expansion_depth -= 1;
                 return Err(error);
             }
-            let mut new_env = env.clone();
+            // MACRO EXPANSION IS CAPTURE-AVOIDING (SMT-LIB 2.6 §4.2.2): a
+            // `define-fun` body's symbols resolve against the signature as it
+            // stood AT DEFINITION TIME — its own parameters plus the globals —
+            // never against the USE SITE. So the body is elaborated in a FRESH
+            // local environment holding only the parameter bindings, exactly
+            // the environment `validate_defined_function_body` type-checks it
+            // in (declarations.rs).
+            //
+            // Starting from `env.clone()` (the use-site environment) leaked
+            // every enclosing binder — quantifier variables, `let` bindings and
+            // `match` pattern variables — into the body, so a body reference to
+            // a GLOBAL constant was captured by any same-named binder around the
+            // call. That was a wrong-verdict defect in BOTH directions:
+            //   (declare-const x Int) (define-fun f () Int x)
+            //   (assert (forall ((x Int)) (= f 11)))
+            //     is SAT (take the global x = 11); ay answered `unsat`.
+            //   … plus (assert (= x 11)) (assert (exists ((x Int)) (not (= f 11))))
+            //     is UNSAT; ay answered `sat` with a falsifying model.
+            // AY also disagreed with ITSELF: the standard's own expansion of the
+            // same script — `(declare-fun f () Int)` + `(assert (= f x))` —
+            // answered `sat`.
+            let mut new_env = HashMap::default();
             for ((param_name, _), arg_id) in params.iter().zip(arg_ids) {
                 new_env.insert(param_name.clone(), arg_id);
             }

@@ -352,6 +352,13 @@ impl Context {
         context.sort_defs = self.sort_defs.clone();
         context.parametric_sort_defs = self.parametric_sort_defs.clone();
         context.parametric_datatypes = self.parametric_datatypes.clone();
+        // The scratch context must accept exactly what the LIVE one will, or it
+        // rejects field sorts the live pass would have accepted. In particular a
+        // PROGRAMMATIC declaration may name an uninterpreted field sort into
+        // existence (see the `native_global_declaration` arm in
+        // `elaborate_sort_dispatch`); without this the preflight would reject
+        // every embedder datatype over such a sort.
+        context.native_global_declaration = self.native_global_declaration;
         context
     }
 
@@ -402,12 +409,32 @@ impl Context {
             .sort_defs
             .insert(name.to_string(), Sort::Uninterpreted(name.to_string()));
         preflight.elaborate_datatype_selector_sorts(&datatype_dec.constructors, &empty)?;
-        let selector_sorts =
-            self.elaborate_datatype_selector_sorts(&datatype_dec.constructors, &empty)?;
 
-        // Register the sort as uninterpreted
+        // Register the carrier sort BEFORE elaborating the field sorts: a
+        // datatype is in scope inside its own declaration (SMT-LIB 2.6 §4.2.3 —
+        // that is what makes `(declare-datatype Lst ((nil) (cons (hd Int) (tl
+        // Lst))))` recursive). This used to rely on unresolved sort names
+        // silently becoming fresh uninterpreted sorts; now that an unknown sort
+        // is an error, the name has to actually be in the signature. The
+        // preflight above already validated the same field sorts against a
+        // scratch context, so the live elaboration cannot fail on user input —
+        // but roll the registration back if it ever does, rather than leaving a
+        // half-declared sort behind.
         let sort = Sort::Uninterpreted(name.to_string());
-        self.sort_defs.insert(name.to_string(), sort.clone());
+        let sort_def_existed = self
+            .sort_defs
+            .insert(name.to_string(), sort.clone())
+            .is_some();
+        let selector_sorts =
+            match self.elaborate_datatype_selector_sorts(&datatype_dec.constructors, &empty) {
+                Ok(selector_sorts) => selector_sorts,
+                Err(error) => {
+                    if !sort_def_existed {
+                        self.sort_defs.remove(name);
+                    }
+                    return Err(error);
+                }
+            };
 
         // Collect constructor names for datatype lookup
         let ctor_names: Vec<String> = datatype_dec
@@ -534,6 +561,23 @@ impl Context {
                 self.track_scoped_parametric(sort_dec.name.clone());
             }
         }
+        // Every MONOMORPHIC member's carrier sort must be in the signature
+        // before any field sort is elaborated: the whole point of a
+        // `declare-datatypes` GROUP is that its members may reference each
+        // other (SMT-LIB 2.6 §4.2.3 mutual recursion). This used to work only
+        // because an unresolved sort name silently became a fresh uninterpreted
+        // sort. The names are tracked for `pop` in the same place as before;
+        // the error path below removes them again, and the preflight above has
+        // already validated these same field sorts.
+        let mut registered_sorts: Vec<&str> = Vec::new();
+        for sort_dec in sort_decs {
+            if sort_dec.arity == 0 {
+                let sort = Sort::Uninterpreted(sort_dec.name.clone());
+                if self.sort_defs.insert(sort_dec.name.clone(), sort).is_none() {
+                    registered_sorts.push(sort_dec.name.as_str());
+                }
+            }
+        }
         let selector_sorts = sort_decs
             .iter()
             .zip(datatype_decs)
@@ -554,6 +598,9 @@ impl Context {
                 // partially declared group.
                 for name in &parametric_names {
                     self.parametric_datatypes.remove(name);
+                }
+                for name in &registered_sorts {
+                    self.sort_defs.remove(*name);
                 }
                 if let Some(frame) = self.scopes.last_mut() {
                     frame.parametric_datatypes.truncate(scoped_parametric_count);

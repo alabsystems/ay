@@ -19,8 +19,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ay_sat::{parse_dimacs, ProofOutput, SatResult, Solver};
@@ -204,12 +203,7 @@ fn run_ay(dimacs: &str, with_proof: bool) -> AYResult {
         formula.into_solver()
     };
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_clone = stop.clone();
-    let _timeout_thread = std::thread::spawn(move || {
-        std::thread::sleep(SOLVER_TIMEOUT);
-        stop_clone.store(true, Ordering::Relaxed);
-    });
+    let timer = super::common::SolverInterruptTimer::start(&mut solver, SOLVER_TIMEOUT);
 
     // The forward proof checker can panic on certain inprocessing steps
     // (known pre-existing issue). When with_proof=true, catch_unwind
@@ -217,14 +211,15 @@ fn run_ay(dimacs: &str, with_proof: bool) -> AYResult {
     let solve_result = if with_proof {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             solver
-                .solve_interruptible(|| stop.load(Ordering::Relaxed))
+                .solve_interruptible(|| timer.is_interrupted())
                 .into_inner()
         }))
     } else {
         Ok(solver
-            .solve_interruptible(|| stop.load(Ordering::Relaxed))
+            .solve_interruptible(|| timer.is_interrupted())
             .into_inner())
     };
+    timer.cancel_and_join();
 
     let result = match solve_result {
         Ok(r) => r,

@@ -9,6 +9,8 @@
 //! SAT solving with unsat cores, lazily extended totalizers, weight-aware
 //! core splitting, stratification, and hardening.
 
+use std::time::Instant;
+
 use ay_sat::{Literal, SignedClause};
 
 use crate::oll::{ClauseStore, OllEngine, OllOutcome};
@@ -79,6 +81,15 @@ pub struct MaxSatStats {
     /// only through UP-implication chains, not direct binary edges
     /// (#maxsat-am1-probe)
     pub am1_probe_groups: u64,
+    /// Totalizer REVERSE-direction ("equivalence") clauses emitted so a
+    /// proven-true output can propagate downward (#tot-eqs)
+    pub tot_eq_clauses: u64,
+    /// Proven-true totalizer outputs handed to the reverse-direction pass
+    /// (#tot-eqs): one per relaxed core plus one per hardened sum bound
+    pub tot_eq_forced: u64,
+    /// Extracted core disjunctions pinned permanently into the hard formula
+    /// (#core-clause)
+    pub core_clauses_added: u64,
 }
 
 /// MAX-SAT Solver
@@ -100,6 +111,8 @@ pub struct MaxSatSolver {
     stats: MaxSatStats,
     /// Best (cost, model) seen by the last interrupted solve, if any
     best: Option<(Weight, Vec<bool>)>,
+    /// Wall-clock deadline for the whole solve, when the caller knows one.
+    deadline: Option<Instant>,
 }
 
 impl MaxSatSolver {
@@ -112,7 +125,25 @@ impl MaxSatSolver {
             next_var: 1,
             stats: MaxSatStats::default(),
             best: None,
+            deadline: None,
         }
+    }
+
+    /// Tell the engine when the solve must end.
+    ///
+    /// Without this the engine is BUDGET-BLIND: `should_stop` reports whether
+    /// to stop *now* but never how much budget remains, so every internal
+    /// policy — descent slice lengths, stall bars, probe budgets — is a fixed
+    /// absolute constant that necessarily suits exactly one timeout. Measured
+    /// consequence: AY's solved count barely moves between 60s and 3600s while
+    /// the MSE24 field's leaders climb, because they switch strategy on a
+    /// schedule (CASHWMaxSAT-S6/S9 step at exactly 600s/900s) and AY has no
+    /// schedule to switch on.
+    ///
+    /// Optional and non-breaking: `None` preserves the previous behaviour
+    /// exactly.
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
     }
 
     /// Track the variable ids used by a clause.
@@ -185,6 +216,7 @@ impl MaxSatSolver {
         let soft = std::mem::take(&mut self.soft_clauses);
         let weights = std::mem::take(&mut self.soft_weights);
         let mut engine = OllEngine::new(self.next_var, hard, soft, weights);
+        engine.set_deadline(self.deadline);
         let outcome = engine.solve(should_stop, on_upper_bound);
         self.stats = engine.stats().clone();
         self.best = None;

@@ -92,7 +92,6 @@ pub(crate) fn tighten_bounds_opt(
     // sums were ~10% of a small instance's whole solve. Same numbers, same
     // derived bounds — every op is exact either way.
     use ay_lra::rational::Rational;
-    let expired = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
     let n = model.num_cols();
     let mut lo: Vec<Option<Rational>> = Vec::with_capacity(n);
     let mut up: Vec<Option<Rational>> = Vec::with_capacity(n);
@@ -148,6 +147,157 @@ pub(crate) fn tighten_bounds_opt(
         None
     };
 
+    if !propagate(
+        model,
+        deadline,
+        plan.as_deref(),
+        &integral,
+        &mut lo,
+        &mut up,
+        trace,
+    ) {
+        return Presolved::Infeasible;
+    }
+
+    if std::env::var_os("AY_MILP_TRACE").is_some() {
+        let mut newly_finite = 0;
+        let mut biggest: f64 = 0.0;
+        for j in 0..n {
+            let (l0, u0) = model.col_bounds(Col(j as u32));
+            if !l0.is_finite() && lo[j].is_some() || !u0.is_finite() && up[j].is_some() {
+                newly_finite += 1;
+            }
+            for b in [lo[j].as_ref(), up[j].as_ref()].into_iter().flatten() {
+                biggest = biggest.max(b.to_big().to_f64().unwrap_or(0.0).abs());
+            }
+        }
+        eprintln!(
+            "AY_MILP_TRACE presolve: {newly_finite} columns gained a finite bound; \
+             largest bound magnitude {biggest:.3e}"
+        );
+    }
+
+    let mut out = model.clone();
+    for j in 0..n {
+        // OUTWARD on the way back to f64: a lower bound rounds DOWN, an upper bound rounds UP.
+        // A bound that is a hair too loose costs search. A bound that is a hair too tight can
+        // cut off the optimum, and this whole crate exists so that cannot happen.
+        let mut l = lo[j]
+            .as_ref()
+            .map_or(f64::NEG_INFINITY, |b| round_out(&b.to_big(), true));
+        let mut u = up[j]
+            .as_ref()
+            .map_or(f64::INFINITY, |b| round_out(&b.to_big(), false));
+
+        // An integer column takes every tightening; a continuous one only takes a bound that
+        // was OPEN.
+        //
+        // The two are not the same kind of gain. Pulling an integer column from [0, 100] to
+        // [0, 3] deletes 97 values the search would otherwise branch over -- that is real
+        // domain reduction, and it is exact. Squeezing a CONTINUOUS column's already-finite
+        // bound deletes no vertex the simplex was going to visit; it just moves the column onto
+        // a new bound, which makes an already-degenerate LP more degenerate. Measured: doing it
+        // anyway, blend2's root LP came back PRIMAL INFEASIBLE -- on a model that has an optimum
+        // -- and the search fell through to the rational rim, which then spent the whole time
+        // budget on a single node.
+        //
+        // The -inf in the box-minimum, which is what this module exists for, comes only from an
+        // OPEN bound. Closing those is the part that pays.
+        let (l0, u0) = model.col_bounds(Col(j as u32));
+        if !integral[j] {
+            if l0.is_finite() {
+                l = l0;
+            }
+            if u0.is_finite() {
+                u = u0;
+            }
+        }
+        if l > u {
+            return Presolved::Infeasible;
+        }
+        out.set_col_bounds(Col(j as u32), l, u);
+    }
+
+    // SECOND: with the box settled, strengthen the row coefficients themselves
+    // (see `tighten_coefficients`). This must read the box `out` actually carries — not the
+    // tighter rational bounds above — because its validity argument quantifies over exactly
+    // the points the output model admits.
+    if coef_tighten && std::env::var_os("AY_MILP_NO_COEF_TIGHTEN").is_none() {
+        let _t_coef = std::time::Instant::now();
+        let tightened = tighten_coefficients(&mut out, deadline);
+        if trace {
+            eprintln!(
+                "AY_MILP_TRACE presolve: coef-tighten wall={:.3}s applied={tightened}",
+                _t_coef.elapsed().as_secs_f64()
+            );
+        }
+        // THIRD: the same rewrite with the rest of the row bounded CONDITIONAL on a binary's
+        // value (see `tighten_coefficients_conditional`). It subsumes nothing above — it runs
+        // after, on the already-tightened rows, and only pulls a right-hand side further down.
+        //
+        // DEFAULT ON (2026-07-26). The pass costs two exact propagations per probed binary and
+        // whether that buys anything is an instance property, so it shipped opt-in — but
+        // measured across the corpus at 60s/1T it is a strict improvement where it fires and
+        // provably inert elsewhere: 12 of 13 deterministic instances are byte-identical in
+        // objective AND node count with it on (blend2 5526, flugpl 2630, gen 11, gt2 272,
+        // khb05250 13, mas76 722875, misc07 5236, mod010 1701, p0201 168, pk1 357727,
+        // qnet1 372, air03 1), and dcmulti goes 1433 -> 899 nodes / 1.11s -> 0.76s at the same
+        // proven optimum 188182.
+        //
+        // Soundness is the reason this can be a default rather than a gamble: the rewrite
+        // lowers ONLY the relaxed level's right-hand side and leaves the other level
+        // algebraically identical, so the feasible sets are EQUAL, not merely nested. Both
+        // adversarial reviewers confirmed it independently.
+        //
+        // Its GENERAL form — tightening BOTH of the binary's levels — is strictly more valid
+        // rewrites and a strictly stronger LP term by term, and was MEASURED NEGATIVE and
+        // discarded: qnet1 372 -> 1518 nodes with root closure -52.5, mod010 1701 -> 1851,
+        // gen 11 -> 22. It moved the pre-cut bound by exactly ZERO on qnet1 and mod010 while
+        // moving the optimal basis, and a moved basis is a different Gomory tableau.
+        // Strengthening a row the LP is not sitting on buys nothing and perturbs everything.
+        //
+        // `AY_MILP_NO_COND_TIGHTEN` restores the pre-2026-07-26 behaviour byte-identically;
+        // `AY_MILP_COND_TIGHTEN` is kept as the explicit-on A/B arm.
+        if std::env::var_os("AY_MILP_NO_COND_TIGHTEN").is_none() {
+            let _t_cond = std::time::Instant::now();
+            let rewritten = tighten_coefficients_conditional(&mut out, deadline);
+            if trace {
+                eprintln!(
+                    "AY_MILP_TRACE presolve: cond-tighten wall={:.3}s applied={rewritten}",
+                    _t_cond.elapsed().as_secs_f64()
+                );
+            }
+        }
+    }
+
+    Presolved::Tightened(Box::new(out))
+}
+
+/// THE exact bound-propagation sweep, over a caller-supplied workspace.
+///
+/// `lo`/`up` come in as the box the caller wants propagated from and go out as the fixpoint
+/// the rows imply — `None` on a side means "still open". Returns `false` when the rows
+/// PROVE the box empty (a column whose derived lower bound passes its upper).
+///
+/// Two callers, one primitive. [`tighten_bounds_opt`] propagates the model's declared box and
+/// then applies its output policy. [`tighten_coefficients_conditional`] propagates the SAME
+/// box with one binary pinned, and reads the workspace directly — the fixpoint, not the
+/// policy-filtered model — because the bound it needs (a continuous column's conditional
+/// ceiling) is exactly the kind the output policy deliberately discards.
+///
+/// `plan` restricts the sweep to a row subset (the float scout's advice); propagation over a
+/// subset of the rows is still propagation, so a restriction costs tightness, never validity.
+fn propagate(
+    model: &Model,
+    deadline: Option<std::time::Instant>,
+    plan: Option<&[u32]>,
+    integral: &[bool],
+    lo: &mut [Option<ay_lra::rational::Rational>],
+    up: &mut [Option<ay_lra::rational::Rational>],
+    trace: bool,
+) -> bool {
+    use ay_lra::rational::Rational;
+    let expired = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
     // Round-level economics (`AY_MILP_TRACE`): where the presolve share
     // actually goes at the 7.5M-nnz scale — wall per sweep, rows reached
     // before the deadline, bounds moved. Diagnostic only.
@@ -162,13 +312,13 @@ pub(crate) fn tighten_bounds_opt(
             }
             break; // keep whatever has been derived so far -- it is all still valid
         }
-        let row_count = plan.as_ref().map_or(model.num_rows(), Vec::len);
+        let row_count = plan.map_or(model.num_rows(), <[u32]>::len);
         for ri in 0..row_count {
             if ri % 256 == 0 && expired() {
                 break;
             }
             rows_done = ri + 1;
-            let r = plan.as_ref().map_or(ri, |v| v[ri] as usize);
+            let r = plan.map_or(ri, |v| v[ri] as usize);
             let (coeffs, rlb, rub) = model.row(Row(r as u32));
             let (rlb, rub) = (exact_small(rlb), exact_small(rub));
             if rlb.is_none() && rub.is_none() {
@@ -256,7 +406,7 @@ pub(crate) fn tighten_bounds_opt(
 
                 if let (Some(l), Some(u)) = (&lo[j], &up[j]) {
                     if l > u {
-                        return Presolved::Infeasible;
+                        return false;
                     }
                 }
             }
@@ -272,82 +422,7 @@ pub(crate) fn tighten_bounds_opt(
             break;
         }
     }
-
-    if std::env::var_os("AY_MILP_TRACE").is_some() {
-        let mut newly_finite = 0;
-        let mut biggest: f64 = 0.0;
-        for j in 0..n {
-            let (l0, u0) = model.col_bounds(Col(j as u32));
-            if !l0.is_finite() && lo[j].is_some() || !u0.is_finite() && up[j].is_some() {
-                newly_finite += 1;
-            }
-            for b in [lo[j].as_ref(), up[j].as_ref()].into_iter().flatten() {
-                biggest = biggest.max(b.to_big().to_f64().unwrap_or(0.0).abs());
-            }
-        }
-        eprintln!(
-            "AY_MILP_TRACE presolve: {newly_finite} columns gained a finite bound; \
-             largest bound magnitude {biggest:.3e}"
-        );
-    }
-
-    let mut out = model.clone();
-    for j in 0..n {
-        // OUTWARD on the way back to f64: a lower bound rounds DOWN, an upper bound rounds UP.
-        // A bound that is a hair too loose costs search. A bound that is a hair too tight can
-        // cut off the optimum, and this whole crate exists so that cannot happen.
-        let mut l = lo[j]
-            .as_ref()
-            .map_or(f64::NEG_INFINITY, |b| round_out(&b.to_big(), true));
-        let mut u = up[j]
-            .as_ref()
-            .map_or(f64::INFINITY, |b| round_out(&b.to_big(), false));
-
-        // An integer column takes every tightening; a continuous one only takes a bound that
-        // was OPEN.
-        //
-        // The two are not the same kind of gain. Pulling an integer column from [0, 100] to
-        // [0, 3] deletes 97 values the search would otherwise branch over -- that is real
-        // domain reduction, and it is exact. Squeezing a CONTINUOUS column's already-finite
-        // bound deletes no vertex the simplex was going to visit; it just moves the column onto
-        // a new bound, which makes an already-degenerate LP more degenerate. Measured: doing it
-        // anyway, blend2's root LP came back PRIMAL INFEASIBLE -- on a model that has an optimum
-        // -- and the search fell through to the rational rim, which then spent the whole time
-        // budget on a single node.
-        //
-        // The -inf in the box-minimum, which is what this module exists for, comes only from an
-        // OPEN bound. Closing those is the part that pays.
-        let (l0, u0) = model.col_bounds(Col(j as u32));
-        if !integral[j] {
-            if l0.is_finite() {
-                l = l0;
-            }
-            if u0.is_finite() {
-                u = u0;
-            }
-        }
-        if l > u {
-            return Presolved::Infeasible;
-        }
-        out.set_col_bounds(Col(j as u32), l, u);
-    }
-
-    // SECOND: with the box settled, strengthen the row coefficients themselves
-    // (see `tighten_coefficients`). This must read the box `out` actually carries — not the
-    // tighter rational bounds above — because its validity argument quantifies over exactly
-    // the points the output model admits.
-    if coef_tighten && std::env::var_os("AY_MILP_NO_COEF_TIGHTEN").is_none() {
-        let _t_coef = std::time::Instant::now();
-        let tightened = tighten_coefficients(&mut out, deadline);
-        if trace {
-            eprintln!(
-                "AY_MILP_TRACE presolve: coef-tighten wall={:.3}s applied={tightened}",
-                _t_coef.elapsed().as_secs_f64()
-            );
-        }
-    }
-
-    Presolved::Tightened(Box::new(out))
+    true
 }
 
 /// Float mirror of one `tighten_bounds` row visit, on the scout's f64
@@ -792,6 +867,477 @@ pub(crate) fn tighten_coefficients(
     applied
 }
 
+/// The deterministic work budgets for [`tighten_coefficients_conditional`], in units of
+/// `matrix passes · nnz`: `COND_WORK_BUDGET` caps the EXACT rational propagations, and
+/// `COND_SCOUT_BUDGET` caps the f64 mirrors that decide which candidates earn one.
+///
+/// Both are counted rather than timed. A wall-clock share would make the pass's OUTPUT — which
+/// rows it rewrites — depend on how loaded the host is, and a measurement that moves with the
+/// machine is not a measurement. The deadline is still honoured, but as a safety valve, not as
+/// the thing that decides.
+///
+/// The exact budget at 2M is every side every MIPLIB-easy model needs (dcmulti wants 30 sides
+/// against 1,315 nnz = 39k) with three orders of magnitude of headroom, and it is a hard
+/// ceiling on the worst case: a model whose rationals have grown big denominators pays roughly
+/// a second for 2M row visits, and then stops. The scout budget is ten times larger because a
+/// float pass is roughly two orders of magnitude cheaper than a rational one; it exists so that
+/// "cheap, times a hundred thousand binaries" cannot quietly become a time limit.
+const COND_WORK_BUDGET: usize = 2_000_000;
+const COND_SCOUT_BUDGET: usize = 20_000_000;
+
+/// CONDITIONAL coefficient tightening: [`tighten_coefficients`]'s rule with the rest of the row
+/// bounded *given the binary's value* instead of over the whole box. This is the big-M / VUB
+/// reduction, and it is the one Gurobi has and the unconditional rule provably cannot get.
+///
+/// # Why the unconditional rule is not enough
+///
+/// dcmulti row 26 is `−600·D111 + Z1121 ≤ 0` — a variable upper bound, `Z1121 ≤ 600·D111`.
+/// Base propagation proves `Z1121 ≤ 350`, so [`tighten_coefficients`] rewrites the big-M
+/// 600 -> 350 and stops: 350 is the most `Z1121` can be *anywhere in the box*. But the only
+/// point of that coefficient is the case `D111 = 1`, and CONDITIONAL on `D111 = 1` two other
+/// rows force `Z1111 ≥ 180` and `Z1111 + Z1121 ≤ 350`, so `Z1121 ≤ 170`. The valid big-M is
+/// 170. No amount of unconditional propagation finds it — the bound does not exist until the
+/// binary is pinned. Gurobi tightens exactly this row to 170, and this pass reproduces that
+/// number: dcmulti's pre-cut root LP moves 184,034.38 -> 184,136.65 and its tree 1,433 -> 899
+/// nodes.
+///
+/// # The rule, and why it is exact
+///
+/// Work in the `<=` frame, on a ONE-SIDED row `a·y + Σ_k a_k x_k ≤ b` with `y` a binary whose
+/// box is exactly `[0,1]` (a `>=` row is negated into this frame; an equality or range row is
+/// untouchable — its two sides share the coefficients). Over the feasible set the row says
+/// exactly two things:
+///
+/// ```text
+/// y = 0:   rest ≤ b            y = 1:   rest ≤ b − a
+/// ```
+///
+/// One of those two levels is the one `y` RELAXES — the level the big-M pays for: `y = 1` when
+/// `a < 0`, `y = 0` when `a > 0`. Let `R` be a valid upper bound on `rest` CONDITIONAL on `y`
+/// taking that value — here, the fixpoint of the SAME exact propagation with `y` pinned — and
+/// let `d` be the slack it leaves:
+///
+/// ```text
+/// a < 0:   d = (b − a) − R      apply  a ← a + d                (b unchanged)
+/// a > 0:   d =  b      − R      apply  a ← a − d,  b ← b − d
+/// ```
+///
+/// applied only when `0 < d < |a|`, so the coefficient shrinks toward zero and never crosses
+/// it. This is [`tighten_coefficients`]'s rule at `ū = 1` / `l̄ = 0` with the box activity `U'`
+/// replaced by the conditional `R`, and the validity argument is two lines rather than that
+/// rule's case analysis, because a binary has only two levels:
+///
+/// * **Nothing is cut off.** The rewrite touches ONE level's right-hand side and lowers it to
+///   `R`. Every feasible point at that level has `rest ≤ R` — that is what the conditional
+///   bound says — so every feasible point still satisfies the row. The OTHER level's
+///   right-hand side is algebraically unchanged (`a<0`: `b` itself; `a>0`: `b − a`, and both
+///   move by `d`), so points there are untouched.
+/// * **Nothing is let in.** A point of the new model's box has `y ∈ {0,1}`, and the new row's
+///   right-hand side at each of those two values is `≤` the old row's, so the new row implies
+///   the old one pointwise.
+///
+/// Because the two feasible sets are EQUAL, a conditional bound derived from the pre-rewrite
+/// model stays valid for the post-rewrite one: applications compose, and rewriting one row
+/// never invalidates a bound another row's rewrite is about to use.
+///
+/// The LP relaxation is strictly stronger where it matters: for `y ∈ [0,1]` the new row reads
+/// `rest ≤ b'(1−y) + (b'−a')·y`, a term-by-term tightening of the old `b(1−y) + (b−a)y`.
+///
+/// # What is deliberately NOT done, and the measurement that decided it
+///
+/// The rule generalises: tighten BOTH levels (`b' = min(b, R_0)`, `b'−a' = min(b−a, R_1)`),
+/// which also licenses `|a|` to GROW and the coefficient to reach zero. That version was
+/// implemented and measured on the 17-instance corpus, and it is NET NEGATIVE:
+///
+/// ```text
+///            nodes            root bound_cut       what it rewrote
+///   dcmulti  1433 ->  899     +105.2              the VUB big-Ms (this rule)
+///   qnet1     372 -> 1518      −52.5              a 546 -> 672 coefficient GROWTH
+///   mod010   1701 -> 1851       0.0               16 -> 20 growth on a covering row
+///   gen        11 ->   22       0.0               −45 -> 0, coefficient erased
+/// ```
+///
+/// The extra rewrites are valid and they do strengthen the LP term-by-term, but on qnet1 and
+/// mod010 they moved the pre-cut bound by exactly ZERO while moving the optimal basis — and a
+/// moved basis is a different Gomory tableau, which cost qnet1 a cut and 52 points of root
+/// closure. Strengthening a row the LP was not sitting on buys nothing and perturbs everything.
+/// So the shipped rule is the big-M direction only: `|a|` shrinks or nothing happens.
+///
+/// # Scope, and why it is not the whole matrix
+///
+/// A candidate row must have a non-binary column in its rest. `|a|` is a BIG-M only when it
+/// pays for a continuous or general-integer quantity; on a pure 0/1 row it is a knapsack
+/// coefficient, the conditional analysis there is implication structure, and that is
+/// [`crate::probe`]'s business (cliques and forced fixings), not a coefficient rewrite. The
+/// filter is also what makes the pass affordable: it takes the pure-binary instances
+/// (mas74, mas76, pk1, p0201, misc07) to zero candidates and therefore zero cost.
+///
+/// # Exactness discipline
+///
+/// Identical to [`tighten_coefficients`]: the conditional bounds are exact rationals read off
+/// the propagation WORKSPACE, not off an output model — the output policy discards a continuous
+/// column's finite bound, which is precisely the bound this pass exists to use — and a rewrite
+/// is applied only when both the new coefficient and the new right-hand side convert to `f64`
+/// EXACTLY. Skipping any subset of rewrites is sound; each one's validity reads only its own
+/// row and one conditional fixpoint.
+///
+/// A probe side that comes back INFEASIBLE means the binary is forced. That is real domain
+/// reduction, but it is [`crate::probe`]'s product, not this pass's: such a binary is skipped.
+///
+/// Returns how many coefficients were rewritten.
+pub(crate) fn tighten_coefficients_conditional(
+    model: &mut Model,
+    deadline: Option<std::time::Instant>,
+) -> usize {
+    use ay_lra::rational::Rational;
+    if model.has_inexact_coeffs() {
+        return 0;
+    }
+    let expired = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
+    let n = model.num_cols();
+    let nr = model.num_rows();
+    let integral: Vec<bool> = (0..n)
+        .map(|j| model.col_kind(Col(j as u32)).is_integral())
+        .collect();
+    // A column that is NOT a 0/1 box: the quantity a big-M can be paying for.
+    let wide: Vec<bool> = (0..n)
+        .map(|j| model.col_bounds(Col(j as u32)) != (0.0, 1.0))
+        .collect();
+
+    // ROW ELIGIBILITY, fixed up front: one-sided (so the coefficients are not shared with a
+    // second side) and carrying at least one non-0/1 column (see "Scope" above). `Some(flip)`
+    // says the finite side is the LOWER one, i.e. the row is negated into the `<=` frame.
+    // Sidedness and support are never changed by this pass, so this survives the rewrites.
+    let flip_of: Vec<Option<bool>> = (0..nr)
+        .map(|r| {
+            let row = &model.rows[r];
+            if row.coeffs.len() < 2 || !row.coeffs.iter().any(|&(c, _)| wide[c as usize]) {
+                return None;
+            }
+            match (row.lb.is_finite(), row.ub.is_finite()) {
+                (false, true) => Some(false),
+                (true, false) => Some(true),
+                _ => None,
+            }
+        })
+        .collect();
+
+    // CANDIDATES: free binaries (box exactly `[0,1]`, integral kind — a general integer boxed
+    // to `[0,1]` is a binary) in at least one eligible row, in column order. `need` records
+    // WHICH level each one is probed at: only the level its coefficient relaxes is ever read,
+    // so a binary that only ever appears with one sign costs one propagation, not two.
+    let mut rows_of: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut need = vec![[false; 2]; n];
+    for r in 0..nr {
+        let Some(flip) = flip_of[r] else { continue };
+        for &(c, a) in &model.rows[r].coeffs {
+            let j = c as usize;
+            if !integral[j] || wide[j] || a == 0.0 {
+                continue;
+            }
+            rows_of[j].push(r as u32);
+            need[j][usize::from((if flip { -a } else { a }) < 0.0)] = true;
+        }
+    }
+    let nnz: usize = model
+        .rows
+        .iter()
+        .map(|r| r.coeffs.len())
+        .sum::<usize>()
+        .max(1);
+    let mut budget = COND_WORK_BUDGET / nnz;
+    let mut scout_budget = COND_SCOUT_BUDGET / nnz;
+    let one = BigRational::one();
+    let min_gain = exact(MIN_GAIN).expect("MIN_GAIN is finite");
+    let debug = std::env::var_os("AY_MILP_COEF_TIGHTEN_DEBUG").is_some();
+    let mut applied = 0usize;
+
+    // FLOAT SCOUT (advice lane, same bargain as `scout_plan`'s). A candidate costs an exact
+    // rational propagation over the whole matrix, and on every instance measured OUTSIDE the
+    // fixed-charge family every one of those propagations comes back with nothing: qnet1 spent
+    // 0.84s over 1,288 binaries for zero rewrites, mas74 1.07s for zero. So the probe is
+    // mirrored in f64 first and the exact lane runs only for a candidate the mirror says has a
+    // material, in-range `d` somewhere. Floats ADVISE which binaries are worth exact work; every
+    // applied rewrite is still decided in exact rationals. A scout miss (float noise hiding a
+    // just-past-threshold `d`) costs a tightening, never correctness — not tightening is always
+    // sound.
+    let scout = std::env::var_os("AY_MILP_NO_COND_SCOUT").is_none();
+    let (mut flo, mut fup) = (vec![0.0f64; n], vec![0.0f64; n]);
+    for j in 0..n {
+        let (l, u) = model.col_bounds(Col(j as u32));
+        flo[j] = l;
+        fup[j] = u;
+    }
+    let nowatch = vec![false; n];
+
+    // The box every probe starts from, built once (empty until a candidate needs it).
+    let mut base: Option<(Vec<Option<Rational>>, Vec<Option<Rational>>)> = None;
+
+    for y in 0..n {
+        if rows_of[y].is_empty() {
+            continue;
+        }
+        let sides = usize::from(need[y][0]) + usize::from(need[y][1]);
+        if sides > budget || expired() {
+            break; // everything applied so far is valid on its own
+        }
+        if scout {
+            if scout_budget == 0 {
+                break; // the advice lane is spent; skipping candidates is always sound
+            }
+            scout_budget -= 1;
+            if !cond_scout_worth_it(
+                model,
+                y,
+                &need[y],
+                &rows_of[y],
+                &flip_of,
+                &flo,
+                &fup,
+                &integral,
+                &nowatch,
+            ) {
+                continue;
+            }
+        }
+        budget -= sides;
+        let (base_lo, base_up) = base.get_or_insert_with(|| {
+            let mut lo = Vec::with_capacity(n);
+            let mut up = Vec::with_capacity(n);
+            for j in 0..n {
+                let (l, u) = model.col_bounds(Col(j as u32));
+                lo.push(exact_small(l));
+                up.push(exact_small(u));
+            }
+            (lo, up)
+        });
+        // The probe, on the model AS IT STANDS (earlier rewrites preserved its feasible set
+        // exactly, so a fixpoint derived now is valid for the original model too).
+        let mut fix = [None, None];
+        for (v, slot) in fix.iter_mut().enumerate() {
+            if !need[y][v] {
+                continue;
+            }
+            let (mut lo, mut up) = (base_lo.clone(), base_up.clone());
+            lo[y] = Some(Rational::new(v as i64, 1));
+            up[y] = Some(Rational::new(v as i64, 1));
+            if propagate(model, deadline, None, &integral, &mut lo, &mut up, false) {
+                *slot = Some((lo, up));
+            }
+            // Propagation infeasible under this fixing = the binary is FORCED, which is
+            // `crate::probe`'s product; `slot` stays `None` and every row of `y` is skipped.
+        }
+
+        for ri in 0..rows_of[y].len() {
+            let r = rows_of[y][ri] as usize;
+            let flip = flip_of[r].expect("eligible row");
+            let signed = |a: f64| if flip { -a } else { a };
+            let Some(i) = model.rows[r]
+                .coeffs
+                .iter()
+                .position(|&(c, _)| c as usize == y)
+            else {
+                continue;
+            };
+            let a = exact(signed(model.rows[r].coeffs[i].1)).expect("finite coefficient");
+            if a.is_zero() {
+                continue;
+            }
+            let b_hat = exact(signed(if flip {
+                model.rows[r].lb
+            } else {
+                model.rows[r].ub
+            }))
+            .expect("finite side");
+            // The level `y` RELAXES: `y = 1` when the coefficient is negative, `y = 0` when it
+            // is positive. That level's right-hand side is the big-M this pass shrinks.
+            let level = usize::from(a.is_negative());
+            let Some((lo, up)) = fix[level].as_ref() else {
+                continue;
+            };
+
+            // The most the REST of the row can reach under that fixpoint. `None` if any needed
+            // bound is still open — the rule wants a real ceiling, not a guess.
+            let mut rest = BigRational::zero();
+            let mut open = false;
+            for (k, &(c, av)) in model.rows[r].coeffs.iter().enumerate() {
+                if k == i {
+                    continue;
+                }
+                let av = exact(signed(av)).expect("finite coefficient");
+                if av.is_zero() {
+                    continue;
+                }
+                let side = if av.is_positive() {
+                    up[c as usize].as_ref()
+                } else {
+                    lo[c as usize].as_ref()
+                };
+                match side {
+                    Some(b) => rest += av * b.to_big(),
+                    None => {
+                        open = true;
+                        break;
+                    }
+                }
+            }
+            if open {
+                continue;
+            }
+
+            // The slack the conditional ceiling leaves at the relaxed level.
+            let d = if level == 1 {
+                (&b_hat - &a) - &rest
+            } else {
+                &b_hat - &rest
+            };
+            // Material on both sides, exactly as `tighten_coefficients` gates it: `d` big
+            // enough to be worth a changed model, and `|a| − d` big enough that the surviving
+            // coefficient is not numerical dust (which also enforces `d < |a|` strictly;
+            // `d ≥ |a|` says the row is redundant at this level, and it is left alone).
+            let scale = {
+                let abs = a.abs();
+                if abs > one {
+                    abs
+                } else {
+                    one.clone()
+                }
+            };
+            let floor_gain = &min_gain * &scale;
+            if d <= floor_gain || a.abs() - &d <= floor_gain {
+                continue;
+            }
+            let (a_new, b_new) = if level == 1 {
+                (&a + &d, b_hat.clone())
+            } else {
+                (&a - &d, &b_hat - &d)
+            };
+            // Fail closed: apply only if BOTH survive the trip back to f64 exactly.
+            let (Some(af), Some(bf)) = (as_exact_f64(&a_new), as_exact_f64(&b_new)) else {
+                continue;
+            };
+            if debug {
+                eprintln!(
+                    "COND_TIGHTEN row {r} col {y}: a {} -> {af} | rhs {} -> {bf} (y={level}, d {d})",
+                    signed(model.rows[r].coeffs[i].1),
+                    signed(if flip {
+                        model.rows[r].lb
+                    } else {
+                        model.rows[r].ub
+                    }),
+                );
+            }
+            model.rows[r].coeffs[i].1 = signed(af);
+            if flip {
+                model.rows[r].lb = signed(bf);
+            } else {
+                model.rows[r].ub = signed(bf);
+            }
+            applied += 1;
+        }
+    }
+    applied
+}
+
+/// Float mirror of one candidate binary's probe, for [`tighten_coefficients_conditional`].
+///
+/// Runs the same pin-and-propagate cascade in `f64` (through [`scout_row`], which applies with
+/// HALF the exact lane's gain gate and therefore over-tightens — the safe direction for a
+/// scout: a smaller `R` means a bigger `d`, so a borderline candidate is OVER-detected and
+/// merely costs exact work) and reports whether any eligible row of `y` would then show a
+/// material, in-range `d`. `true` means "spend the exact propagation"; `false` skips the
+/// candidate, which costs at most a tightening and never correctness.
+///
+/// The threshold is deliberately half the exact gate and the range test is one-sided-loose, so
+/// float noise around either end of `0 < d < |a|` resolves toward running the exact lane.
+#[allow(clippy::too_many_arguments)]
+fn cond_scout_worth_it(
+    model: &Model,
+    y: usize,
+    need: &[bool; 2],
+    rows: &[u32],
+    flip_of: &[Option<bool>],
+    base_lo: &[f64],
+    base_up: &[f64],
+    integral: &[bool],
+    nowatch: &[bool],
+) -> bool {
+    for level in 0..2 {
+        if !need[level] {
+            continue;
+        }
+        let (mut lo, mut up) = (base_lo.to_vec(), base_up.to_vec());
+        lo[y] = level as f64;
+        up[y] = level as f64;
+        let mut suspicious = false;
+        for _ in 0..ROUNDS {
+            let mut changed = false;
+            for r in 0..model.num_rows() {
+                match scout_row(model, r, &mut lo, &mut up, integral, nowatch, nowatch) {
+                    // A float-suspected infeasibility (the pin may FORCE the binary) is handed
+                    // to the exact lane rather than judged here.
+                    ScoutRow::Suspicious => {
+                        suspicious = true;
+                        break;
+                    }
+                    ScoutRow::Moved { .. } => changed = true,
+                    ScoutRow::Clean => {}
+                }
+            }
+            if suspicious {
+                return true;
+            }
+            if !changed {
+                break;
+            }
+        }
+        for &r in rows {
+            let r = r as usize;
+            let Some(flip) = flip_of[r] else { continue };
+            let signed = |a: f64| if flip { -a } else { a };
+            let (coeffs, rlb, rub) = model.row(Row(r as u32));
+            let Some(a) = coeffs
+                .iter()
+                .find(|&&(c, _)| c as usize == y)
+                .map(|&(_, a)| signed(a))
+            else {
+                continue;
+            };
+            if (a < 0.0) != (level == 1) || a == 0.0 {
+                continue; // this row reads the OTHER level
+            }
+            let b = signed(if flip { rlb } else { rub });
+            let mut rest = 0.0f64;
+            let mut open = false;
+            for &(c, av) in coeffs {
+                if c as usize == y {
+                    continue;
+                }
+                let av = signed(av);
+                let side = if av > 0.0 {
+                    up[c as usize]
+                } else {
+                    lo[c as usize]
+                };
+                if !side.is_finite() {
+                    open = true;
+                    break;
+                }
+                rest += av * side;
+            }
+            if open || !rest.is_finite() {
+                continue;
+            }
+            let d = if level == 1 { b - a - rest } else { b - rest };
+            let gate = 0.5 * MIN_GAIN * a.abs().max(1.0);
+            if d > gate && a.abs() - d > gate {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The f64 that denotes `v` exactly, if one exists. Anything else — too many mantissa bits,
 /// out of range — is `None`: the caller must skip, not round.
 fn as_exact_f64(v: &BigRational) -> Option<f64> {
@@ -923,16 +1469,48 @@ use crate::model::ColKind;
 /// indexed by their ORIGINAL column number (they are all populated in the
 /// widened vector before any recovery runs, because an eliminated column has
 /// degree 1 — it appears in no other column's defining row).
-struct Recover {
+pub(crate) struct Recover {
     /// Original column index of the eliminated variable `x`.
-    col: usize,
+    pub(crate) col: usize,
+    /// The ORIGINAL row index of `x`'s defining equality.
+    ///
+    /// The recovery rule itself does not need it — `widen` reads `a`, `b` and
+    /// `rest`. The CERTIFICATE lift does: the deleted/rebounded equality is the
+    /// only original fact that carries a coefficient on `col`, so lifting a
+    /// reduced certificate has to be able to name the row the verifier will
+    /// price (see [`crate::cert_lift`]).
+    pub(crate) row: usize,
     /// `x`'s coefficient in its defining row (nonzero, exact).
-    a: BigRational,
+    pub(crate) a: BigRational,
     /// The defining row's right-hand side `b` (it is an equality).
-    b: BigRational,
+    pub(crate) b: BigRational,
     /// `(original survivor column, its coefficient a_k)` for every other column
     /// of the defining row.
-    rest: Vec<(usize, BigRational)>,
+    pub(crate) rest: Vec<(usize, BigRational)>,
+}
+
+/// Which original row a surviving REDUCED row is.
+///
+/// `substitute_singletons` emits reduced rows in original order, skipping the
+/// dropped ones, so a reduced row handle is not an original row handle. A
+/// certificate proved against the reduced model cites reduced rows; the lift
+/// needs this to say which original fact each one IS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SingletonRowOrigin {
+    /// The reduced row is original row `.0`, verbatim: same coefficients over
+    /// the surviving columns (an eliminated column has degree 1, so it appears
+    /// in no row but its own defining one) and the same two bounds.
+    Kept(usize),
+    /// The reduced row is the FORCING RANGE that replaced original equality row
+    /// `orig` when the eliminated column was not implied-free. `recover` indexes
+    /// [`SingletonPostsolve::recover`], which holds the eliminated column and
+    /// its exact coefficient in `orig`.
+    Rebound {
+        /// The original equality row this range came from.
+        orig: usize,
+        /// Index into [`SingletonPostsolve::recover`].
+        recover: usize,
+    },
 }
 
 /// What becomes of the defining row of an eliminated singleton.
@@ -950,16 +1528,19 @@ enum RowFate {
 /// How to lift a solution of the singleton-reduced model back to the caller's
 /// full column space, and how to correct a reported objective value.
 pub(crate) struct SingletonPostsolve {
-    n_orig: usize,
+    pub(crate) n_orig: usize,
     /// Original column -> reduced column, or `None` if the column was eliminated.
-    map: Vec<Option<Col>>,
+    pub(crate) map: Vec<Option<Col>>,
     /// One entry per eliminated column.
-    recover: Vec<Recover>,
+    pub(crate) recover: Vec<Recover>,
+    /// One entry per REDUCED row, in reduced row order: which original row it
+    /// is and how. Written as the reduced rows are emitted.
+    pub(crate) row_origin: Vec<SingletonRowOrigin>,
     /// The constant the eliminated columns' objective contributions fold into.
     /// It is NOT carried in the reduced model's `f64` offset (it need not be
     /// representable): it is added to the reported value at expansion time,
     /// where the value is an exact `BigRational`.
-    const_delta: BigRational,
+    pub(crate) const_delta: BigRational,
 }
 
 impl SingletonPostsolve {
@@ -1088,6 +1669,8 @@ pub(crate) fn substitute_singletons(model: &Model) -> Option<(Model, SingletonPo
     let mut const_delta = BigRational::zero();
     let mut eliminated = vec![false; n];
     let mut recover: Vec<Recover> = Vec::new();
+    // Original row -> its `recover` entry, for the rows that eliminated a column.
+    let mut recover_of_row: Vec<Option<usize>> = vec![None; nr];
     let mut row_fate: Vec<RowFate> = (0..nr).map(|_| RowFate::Keep).collect();
     let diag = std::env::var_os("AY_MILP_SINGLETON_DIAG").is_some();
     let (mut sk_multi, mut sk_range, mut sk_obj, mut n_drop, mut n_rebound) = (0, 0, 0, 0, 0);
@@ -1250,7 +1833,14 @@ pub(crate) fn substitute_singletons(model: &Model) -> Option<(Model, SingletonPo
         }
         eliminated[x] = true;
         row_fate[r] = fate;
-        recover.push(Recover { col: x, a, b, rest });
+        recover_of_row[r] = Some(recover.len());
+        recover.push(Recover {
+            col: x,
+            row: r,
+            a,
+            b,
+            rest,
+        });
     }
 
     if diag {
@@ -1285,14 +1875,26 @@ pub(crate) fn substitute_singletons(model: &Model) -> Option<(Model, SingletonPo
         out.cols[nc.index()].ub = ub;
         map[j] = Some(nc);
     }
+    // Reduced rows are emitted in original order with the dropped ones skipped,
+    // so `row_origin` is built HERE, in lockstep with `add_row`, rather than
+    // re-derived later from `row_fate` — a re-derivation could drift from the
+    // emission order and a certificate lift would then cite the wrong row.
+    let mut row_origin: Vec<SingletonRowOrigin> = Vec::with_capacity(nr);
     for r in 0..nr {
-        let (lb, ub) = match row_fate[r] {
+        let (lb, ub, origin) = match row_fate[r] {
             RowFate::Drop => continue,
             RowFate::Keep => {
                 let (_, lb, ub) = model.row(Row(r as u32));
-                (lb, ub)
+                (lb, ub, SingletonRowOrigin::Kept(r))
             }
-            RowFate::Rebound(lb, ub) => (lb, ub),
+            RowFate::Rebound(lb, ub) => (
+                lb,
+                ub,
+                SingletonRowOrigin::Rebound {
+                    orig: r,
+                    recover: recover_of_row[r]?,
+                },
+            ),
         };
         let (coeffs, _, _) = model.row(Row(r as u32));
         let mapped: Vec<(Col, f64)> = coeffs
@@ -1300,6 +1902,12 @@ pub(crate) fn substitute_singletons(model: &Model) -> Option<(Model, SingletonPo
             .filter_map(|&(c, a)| map[c as usize].map(|nc| (nc, a)))
             .collect();
         out.add_row(lb, ub, &mapped);
+        debug_assert_eq!(
+            row_origin.len() + 1,
+            out.num_rows(),
+            "row_origin must be indexed by REDUCED row"
+        );
+        row_origin.push(origin);
     }
     let obj_terms: Vec<(Col, f64)> = (0..n)
         .filter_map(|j| {
@@ -1333,6 +1941,7 @@ pub(crate) fn substitute_singletons(model: &Model) -> Option<(Model, SingletonPo
         n_orig: n,
         map,
         recover,
+        row_origin,
         const_delta,
     };
     Some((out, post))
@@ -1514,6 +2123,284 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// THE dcmulti SHAPE, end to end: the conditional rule must reach the number Gurobi
+    /// reaches, and it must take TWO hops to get there.
+    ///
+    /// ```text
+    ///   180·D − Z1111        ≤ 0      (D = 1 forces Z1111 ≥ 180)
+    ///   Z1111 + Z1121 − X    = 0      (X ≤ 350 caps the pair)
+    ///  −600·D + Z1121        ≤ 0      (the big-M this test is about)
+    /// ```
+    ///
+    /// Base propagation proves `Z1121 ≤ 350` and the UNCONDITIONAL rule takes 600 -> 350 —
+    /// that much is [`tighten_coefficients`]'s job and is asserted here so the test fails if
+    /// the conditional pass is silently doing the unconditional pass's work. Conditional on
+    /// `D = 1` the first two rows give `Z1121 ≤ 350 − 180 = 170`, which no unconditional
+    /// reasoning can see, and the big-M is 170.
+    #[test]
+    fn the_vub_big_m_falls_to_its_conditional_ceiling() {
+        let mut m = Model::new();
+        let d = m.add_binary_col();
+        let z1 = m.add_col(0.0, f64::INFINITY);
+        let z2 = m.add_col(0.0, f64::INFINITY);
+        let x = m.add_col(0.0, 350.0);
+        m.add_row(f64::NEG_INFINITY, 0.0, &[(d, 180.0), (z1, -1.0)]);
+        m.add_row(0.0, 0.0, &[(z1, 1.0), (z2, 1.0), (x, -1.0)]);
+        let vub = m.num_rows();
+        m.add_row(f64::NEG_INFINITY, 0.0, &[(d, -600.0), (z2, 1.0)]);
+
+        let Presolved::Tightened(mut out) = tighten_bounds(&m, None) else {
+            panic!("feasible");
+        };
+        let big_m = |mm: &Model| {
+            let (coeffs, _, _) = mm.row(Row(vub as u32));
+            coeffs
+                .iter()
+                .find(|&&(c, _)| c == d.0)
+                .map(|&(_, a)| a)
+                .expect("D is in the VUB row")
+        };
+        // The conditional pass became a DEFAULT on 2026-07-26, so the shipped pipeline now
+        // performs BOTH stages: `tighten_bounds` already lands on Gurobi's -170 rather than
+        // stopping at the unconditional rule's -350. Assert the shipped endpoint, then assert
+        // the pass is IDEMPOTENT — re-running it rewrites nothing, which is what makes it safe
+        // to have in the pipeline unconditionally.
+        assert_eq!(
+            big_m(&out),
+            -170.0,
+            "the default pipeline reaches Gurobi's 170"
+        );
+        assert_eq!(
+            tighten_coefficients_conditional(&mut out, None),
+            0,
+            "already applied by the default pipeline; re-running must be a no-op"
+        );
+        assert_eq!(
+            big_m(&out),
+            -170.0,
+            "and the coefficient does not move again"
+        );
+
+        // And it cut nothing off: every point the ORIGINAL admits, on a grid dense enough to
+        // straddle both big-Ms, survives.
+        for di in 0..2 {
+            for zi in 0..36 {
+                for xi in 0..36 {
+                    let (z2v, xv) = (zi as f64 * 10.0, xi as f64 * 10.0);
+                    let z1v = xv - z2v;
+                    let p: Vec<BigRational> = [f64::from(di), z1v, z2v, xv]
+                        .iter()
+                        .map(|&v| BigRational::from_float(v).expect("finite"))
+                        .collect();
+                    if m.check_point(&p).is_ok() {
+                        assert!(
+                            out.check_point(&p).is_ok(),
+                            "conditional rule cut off {p:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// THE LOAD-BEARING PROPERTY for the conditional rule, checked EXHAUSTIVELY: it preserves
+    /// the feasible set exactly — nothing cut off, nothing let in.
+    ///
+    /// Every column is integral, so the lattice enumerated below IS the feasible set and there
+    /// is no sampling gap: any rewrite that moved a single point in either direction fails.
+    /// (Two general integers give the rule the non-0/1 column its eligibility filter wants.)
+    #[test]
+    fn conditional_tightening_preserves_the_integer_set_exactly() {
+        let mut seed = 0x5eed_1234_abcd_0001u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) as i64
+        };
+        let mut rewrites = 0usize;
+        for _ in 0..400 {
+            let mut m = Model::new();
+            let bins: Vec<_> = (0..3).map(|_| m.add_binary_col()).collect();
+            let gis: Vec<_> = (0..2).map(|_| m.add_int_col(0.0, 3.0)).collect();
+            let cols: Vec<_> = bins.iter().chain(gis.iter()).copied().collect();
+            for _ in 0..3 {
+                let terms: Vec<_> = cols
+                    .iter()
+                    .map(|&c| (c, (rnd() % 13 - 6) as f64))
+                    .filter(|&(_, a)| a != 0.0)
+                    .collect();
+                if terms.len() < 2 {
+                    continue;
+                }
+                let b = (rnd() % 17 - 5) as f64;
+                if rnd() % 2 == 0 {
+                    m.add_row(f64::NEG_INFINITY, b, &terms);
+                } else {
+                    m.add_row(b, f64::INFINITY, &terms);
+                }
+            }
+            let mut t = m.clone();
+            rewrites += tighten_coefficients_conditional(&mut t, None);
+            for mask in 0..8u32 {
+                for g0 in 0..4 {
+                    for g1 in 0..4 {
+                        let p: Vec<BigRational> = [
+                            i64::from((mask >> 2) & 1),
+                            i64::from((mask >> 1) & 1),
+                            i64::from(mask & 1),
+                            g0,
+                            g1,
+                        ]
+                        .iter()
+                        .map(|&v| BigRational::from_integer(v.into()))
+                        .collect();
+                        assert_eq!(
+                            m.check_point(&p).is_ok(),
+                            t.check_point(&p).is_ok(),
+                            "conditional rewrite changed the feasibility of {p:?}"
+                        );
+                    }
+                }
+            }
+        }
+        // A guard that never fires is not a guard: the sweep must actually exercise the rule.
+        assert!(rewrites > 0, "no conditional rewrite was exercised");
+    }
+
+    /// The same property with a CONTINUOUS column in the mix — the shape the pass exists for.
+    /// The continuous column is sampled rather than enumerated, so this is the weaker of the
+    /// two guards; it is here because the exhaustive one cannot reach a mixed model.
+    #[test]
+    fn conditional_tightening_is_sound_with_a_continuous_column() {
+        let mut seed = 0xfeed_face_0bad_cafeu64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) as i64
+        };
+        let mut rewrites = 0usize;
+        for _ in 0..400 {
+            let mut m = Model::new();
+            let b0 = m.add_binary_col();
+            let b1 = m.add_binary_col();
+            let gi = m.add_int_col(0.0, 3.0);
+            let cont = m.add_col(0.0, 4.0);
+            let cols = [b0, b1, gi, cont];
+            for _ in 0..3 {
+                let terms: Vec<_> = cols
+                    .iter()
+                    .map(|&c| (c, (rnd() % 11 - 5) as f64))
+                    .filter(|&(_, a)| a != 0.0)
+                    .collect();
+                if terms.len() < 2 {
+                    continue;
+                }
+                let rhs = (rnd() % 15 - 4) as f64;
+                if rnd() % 2 == 0 {
+                    m.add_row(f64::NEG_INFINITY, rhs, &terms);
+                } else {
+                    m.add_row(rhs, f64::INFINITY, &terms);
+                }
+            }
+            let mut t = m.clone();
+            rewrites += tighten_coefficients_conditional(&mut t, None);
+            for a in 0..2 {
+                for b in 0..2 {
+                    for g in 0..4 {
+                        for cv in 0..17 {
+                            let p: Vec<BigRational> = vec![
+                                BigRational::from_integer(a.into()),
+                                BigRational::from_integer(b.into()),
+                                BigRational::from_integer(g.into()),
+                                BigRational::from_float(f64::from(cv) * 0.25).expect("finite"),
+                            ];
+                            assert_eq!(
+                                m.check_point(&p).is_ok(),
+                                t.check_point(&p).is_ok(),
+                                "conditional rewrite changed the feasibility of {p:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(rewrites > 0, "no conditional rewrite was exercised");
+    }
+
+    /// The rows the conditional rule must not touch — equalities and ranges (their two sides
+    /// share the coefficients) and rows with no non-0/1 column (a knapsack coefficient is not
+    /// a big-M) — come back bit-identical.
+    #[test]
+    fn conditional_tightening_leaves_untouchable_rows_alone() {
+        let mut m = Model::new();
+        let y = m.add_binary_col();
+        let z = m.add_binary_col();
+        let x = m.add_col(0.0, 3.0);
+        m.add_row(6.0, 6.0, &[(y, -9.0), (x, 1.0)]); // equality
+        m.add_row(-9.0, 6.0, &[(y, -9.0), (x, 1.0)]); // range
+        m.add_row(f64::NEG_INFINITY, 0.0, &[(y, -9.0), (z, 1.0)]); // pure 0/1: not a big-M
+        m.add_row(f64::NEG_INFINITY, 3.0, &[(z, 1.0)]); // single term
+        let before = m.clone();
+        assert_eq!(tighten_coefficients_conditional(&mut m, None), 0);
+        for r in 0..m.num_rows() {
+            let (ca, la, ua) = m.row(Row(r as u32));
+            let (cb, lb, ub) = before.row(Row(r as u32));
+            assert_eq!(ca, cb);
+            assert_eq!(la.to_bits(), lb.to_bits());
+            assert_eq!(ua.to_bits(), ub.to_bits());
+        }
+    }
+
+    /// The float scout only ADVISES. Whatever it skips, the rewrites it does let through must
+    /// be a subset of what the exact lane alone would apply — and on the shape the pass exists
+    /// for it must let the rewrite through at all.
+    #[test]
+    fn the_scout_is_advice_and_never_invents_a_rewrite() {
+        let mut seed = 0x0123_4567_89ab_cdefu64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) as i64
+        };
+        for _ in 0..200 {
+            let mut m = Model::new();
+            let b0 = m.add_binary_col();
+            let b1 = m.add_binary_col();
+            let gi = m.add_int_col(0.0, 3.0);
+            for _ in 0..3 {
+                let terms: Vec<_> = [b0, b1, gi]
+                    .iter()
+                    .map(|&c| (c, (rnd() % 11 - 5) as f64))
+                    .filter(|&(_, a)| a != 0.0)
+                    .collect();
+                if terms.len() < 2 {
+                    continue;
+                }
+                m.add_row(f64::NEG_INFINITY, (rnd() % 13 - 4) as f64, &terms);
+            }
+            // The scout path (default) against the exact-only path, on the same input.
+            let (mut scouted, mut exact_only) = (m.clone(), m.clone());
+            let n_scouted = tighten_coefficients_conditional(&mut scouted, None);
+            // SAFETY: single-threaded test, and the name is read only inside the call below.
+            unsafe { std::env::set_var("AY_MILP_NO_COND_SCOUT", "1") };
+            let n_exact = tighten_coefficients_conditional(&mut exact_only, None);
+            unsafe { std::env::remove_var("AY_MILP_NO_COND_SCOUT") };
+            assert!(
+                n_scouted <= n_exact,
+                "the scout let through {n_scouted} rewrites the exact lane would not have made \
+                 ({n_exact})"
+            );
+            for r in 0..m.num_rows() {
+                let (cs, ls, us) = scouted.row(Row(r as u32));
+                let (co, lo_, uo) = m.row(Row(r as u32));
+                let (ce, le, ue) = exact_only.row(Row(r as u32));
+                // A scouted row is either untouched or exactly what the exact lane produced.
+                let untouched =
+                    cs == co && ls.to_bits() == lo_.to_bits() && us.to_bits() == uo.to_bits();
+                let agreed =
+                    cs == ce && ls.to_bits() == le.to_bits() && us.to_bits() == ue.to_bits();
+                assert!(untouched || agreed, "scouted row {r} matches neither arm");
             }
         }
     }

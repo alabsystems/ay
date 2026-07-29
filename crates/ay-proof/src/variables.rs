@@ -12,35 +12,89 @@ use ay_core::kani_compat::DetHashSet as HashSet;
 use ay_core::{Proof, ProofStep, Sort, TermData, TermId, TermStore};
 use std::collections::BTreeMap;
 
+/// One surface symbol observed at two different sorts inside a single proof
+/// (#A9, ad-hoc overloading).
+///
+/// SMT-LIB 2.6 §4.2.3 lets independent datatype declarations reuse a
+/// constructor name, and §3.6.4 `(as f σ)` exists precisely to disambiguate
+/// such overloads — `(declare-datatypes ((A 0) (B 0)) (((e) (f)) ((e) (g))))`
+/// is well formed and AY solves it. Alethe/Carcara preambles, by contrast, are
+/// a FLAT namespace of `(declare-fun <name> () <sort>)` lines with no overload
+/// resolution, so there is no faithful rendering: emitting one declaration
+/// would silently retype the other occurrence, and emitting both would be a
+/// duplicate declaration the checker rejects.
+///
+/// The collectors therefore report the clash and the exporter DECLINES to
+/// write a certificate (the caller keeps its verdict). Previously this was a
+/// `debug_assert_eq!` that aborted the process with exit 101 *after* the
+/// correct `unsat` had already been printed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SymbolSortConflict {
+    /// The surface symbol carrying more than one sort.
+    pub name: String,
+    /// Sort recorded for the first occurrence encountered.
+    pub first: Sort,
+    /// Conflicting sort of a later occurrence.
+    pub second: Sort,
+}
+
+/// Record `name: sort`, reporting a clash instead of silently keeping one sort.
+fn record_symbol_sort(
+    vars: &mut BTreeMap<String, Sort>,
+    name: &str,
+    sort: Sort,
+) -> Result<(), SymbolSortConflict> {
+    match vars.get(name) {
+        Some(existing) if *existing != sort => Err(SymbolSortConflict {
+            name: name.to_string(),
+            first: existing.clone(),
+            second: sort,
+        }),
+        Some(_) => Ok(()),
+        None => {
+            vars.insert(name.to_string(), sort);
+            Ok(())
+        }
+    }
+}
+
 /// Collect all variables referenced in proof terms, sorted by name.
 ///
 /// Walks all terms in the proof recursively to find `Var` nodes,
 /// including Skolem variables introduced by theory solvers (e.g.,
 /// `_mod_q_*`, `_div_r_*`) that are not registered in `TermStore::names`.
-pub(crate) fn collect_proof_variables(proof: &Proof, terms: &TermStore) -> Vec<(String, Sort)> {
+///
+/// # Errors
+///
+/// Returns [`SymbolSortConflict`] when one surface symbol appears at two
+/// different sorts — see that type for why the proof is then unrenderable.
+pub(crate) fn collect_proof_variables(
+    proof: &Proof,
+    terms: &TermStore,
+) -> Result<Vec<(String, Sort)>, SymbolSortConflict> {
     let mut vars: BTreeMap<String, Sort> = BTreeMap::new();
     let mut visited: HashSet<TermId> = HashSet::default();
 
     for step in &proof.steps {
         match step {
-            ProofStep::Assume(t) => collect_term_vars(*t, terms, &mut vars, &mut visited),
+            ProofStep::Assume(t) => collect_term_vars(*t, terms, &mut vars, &mut visited)?,
             ProofStep::Resolution { clause, pivot, .. } => {
                 for t in clause {
-                    collect_term_vars(*t, terms, &mut vars, &mut visited);
+                    collect_term_vars(*t, terms, &mut vars, &mut visited)?;
                 }
-                collect_term_vars(*pivot, terms, &mut vars, &mut visited);
+                collect_term_vars(*pivot, terms, &mut vars, &mut visited)?;
             }
             ProofStep::TheoryLemma { clause, .. } => {
                 for t in clause {
-                    collect_term_vars(*t, terms, &mut vars, &mut visited);
+                    collect_term_vars(*t, terms, &mut vars, &mut visited)?;
                 }
             }
             ProofStep::Step { clause, args, .. } => {
                 for t in clause {
-                    collect_term_vars(*t, terms, &mut vars, &mut visited);
+                    collect_term_vars(*t, terms, &mut vars, &mut visited)?;
                 }
                 for t in args {
-                    collect_term_vars(*t, terms, &mut vars, &mut visited);
+                    collect_term_vars(*t, terms, &mut vars, &mut visited)?;
                 }
             }
             ProofStep::Anchor { .. } => {}
@@ -48,7 +102,7 @@ pub(crate) fn collect_proof_variables(proof: &Proof, terms: &TermStore) -> Vec<(
         }
     }
 
-    vars.into_iter().collect()
+    Ok(vars.into_iter().collect())
 }
 
 /// Recursively collect variable names and sorts from a term.
@@ -57,61 +111,68 @@ fn collect_term_vars(
     terms: &TermStore,
     vars: &mut BTreeMap<String, Sort>,
     visited: &mut HashSet<TermId>,
-) {
+) -> Result<(), SymbolSortConflict> {
     if !visited.insert(term_id) {
-        return;
+        return Ok(());
     }
     let term = terms.get(term_id);
     match term {
         TermData::Var(name, _) => {
-            vars.entry(name.clone())
-                .or_insert_with(|| terms.sort(term_id).clone());
+            let sort = terms.sort(term_id).clone();
+            record_symbol_sort(vars, name, sort)?;
         }
         TermData::Const(_) => {}
-        TermData::Not(t) => collect_term_vars(*t, terms, vars, visited),
+        TermData::Not(t) => collect_term_vars(*t, terms, vars, visited)?,
         TermData::Ite(c, t, e) => {
-            collect_term_vars(*c, terms, vars, visited);
-            collect_term_vars(*t, terms, vars, visited);
-            collect_term_vars(*e, terms, vars, visited);
+            collect_term_vars(*c, terms, vars, visited)?;
+            collect_term_vars(*t, terms, vars, visited)?;
+            collect_term_vars(*e, terms, vars, visited)?;
         }
         TermData::App(_, args) => {
             for a in args {
-                collect_term_vars(*a, terms, vars, visited);
+                collect_term_vars(*a, terms, vars, visited)?;
             }
         }
         TermData::Let(bindings, body) => {
             for (_, t) in bindings {
-                collect_term_vars(*t, terms, vars, visited);
+                collect_term_vars(*t, terms, vars, visited)?;
             }
-            collect_term_vars(*body, terms, vars, visited);
+            collect_term_vars(*body, terms, vars, visited)?;
         }
         TermData::Forall(_, body, triggers) | TermData::Exists(_, body, triggers) => {
-            collect_term_vars(*body, terms, vars, visited);
+            collect_term_vars(*body, terms, vars, visited)?;
             for trigger_set in triggers {
                 for t in trigger_set {
-                    collect_term_vars(*t, terms, vars, visited);
+                    collect_term_vars(*t, terms, vars, visited)?;
                 }
             }
         }
         _ => unreachable!("unexpected TermData variant"),
     }
+    Ok(())
 }
 
 /// Collect auxiliary proof declarations that are not in the problem scope.
+///
+/// # Errors
+///
+/// Returns [`SymbolSortConflict`] when one surface symbol appears at two
+/// different sorts — see that type for why the proof is then unrenderable.
 pub(crate) fn collect_auxiliary_proof_declarations(
     proof: &Proof,
     terms: &TermStore,
     problem_assertions: &[TermId],
-) -> Vec<(String, Sort)> {
-    let proof_free_vars = collect_free_vars_from_roots(terms, collect_proof_term_roots(proof));
-    let problem_free_vars = collect_free_vars_from_roots(terms, problem_assertions.iter().copied());
+) -> Result<Vec<(String, Sort)>, SymbolSortConflict> {
+    let proof_free_vars = collect_free_vars_from_roots(terms, collect_proof_term_roots(proof))?;
+    let problem_free_vars =
+        collect_free_vars_from_roots(terms, problem_assertions.iter().copied())?;
 
-    proof_free_vars
+    Ok(proof_free_vars
         .into_iter()
         .filter(|(name, _)| {
             !problem_free_vars.contains_key(name) && is_auxiliary_proof_symbol(name)
         })
-        .collect()
+        .collect())
 }
 
 fn collect_proof_term_roots(proof: &Proof) -> Vec<TermId> {
@@ -138,7 +199,7 @@ fn collect_proof_term_roots(proof: &Proof) -> Vec<TermId> {
 fn collect_free_vars_from_roots(
     terms: &TermStore,
     roots: impl IntoIterator<Item = TermId>,
-) -> BTreeMap<String, Sort> {
+) -> Result<BTreeMap<String, Sort>, SymbolSortConflict> {
     let mut free_vars = BTreeMap::new();
     let mut bound_names = Vec::new();
     // Terms are a DAG and proof roots repeat heavily (every literal of every
@@ -149,9 +210,9 @@ fn collect_free_vars_from_roots(
     // so skipping repeats collects exactly the same map.
     let mut visited: HashSet<TermId> = HashSet::default();
     for root in roots {
-        collect_free_vars_in_term(terms, root, &mut bound_names, &mut free_vars, &mut visited);
+        collect_free_vars_in_term(terms, root, &mut bound_names, &mut free_vars, &mut visited)?;
     }
-    free_vars
+    Ok(free_vars)
 }
 
 fn collect_free_vars_in_term(
@@ -160,50 +221,48 @@ fn collect_free_vars_in_term(
     bound_names: &mut Vec<String>,
     free_vars: &mut BTreeMap<String, Sort>,
     visited: &mut HashSet<TermId>,
-) {
+) -> Result<(), SymbolSortConflict> {
     // Memoize only outside binders: under a non-empty bound-name context the
     // same term can contribute different free variables.
     let memoize = bound_names.is_empty();
     if memoize && !visited.insert(term_id) {
-        return;
+        return Ok(());
     }
     match terms.get(term_id) {
         TermData::Var(name, _) => {
             if !bound_names.iter().any(|bound| bound == name) {
+                // #A9: a surface name carrying two sorts is ad-hoc overloading,
+                // not a solver bug — report it so the exporter can decline.
                 let sort = terms.sort(term_id).clone();
-                if let Some(existing_sort) = free_vars.get(name) {
-                    debug_assert_eq!(
-                        existing_sort, &sort,
-                        "BUG: variable {name} collected with multiple sorts"
-                    );
-                } else {
-                    free_vars.insert(name.clone(), sort);
-                }
+                record_symbol_sort(free_vars, name, sort)?;
             }
         }
         TermData::Const(_) => {}
         TermData::Not(inner) => {
-            collect_free_vars_in_term(terms, *inner, bound_names, free_vars, visited)
+            collect_free_vars_in_term(terms, *inner, bound_names, free_vars, visited)?;
         }
         TermData::Ite(cond, then_term, else_term) => {
-            collect_free_vars_in_term(terms, *cond, bound_names, free_vars, visited);
-            collect_free_vars_in_term(terms, *then_term, bound_names, free_vars, visited);
-            collect_free_vars_in_term(terms, *else_term, bound_names, free_vars, visited);
+            collect_free_vars_in_term(terms, *cond, bound_names, free_vars, visited)?;
+            collect_free_vars_in_term(terms, *then_term, bound_names, free_vars, visited)?;
+            collect_free_vars_in_term(terms, *else_term, bound_names, free_vars, visited)?;
         }
         TermData::App(_, args) => {
             for &arg in args {
-                collect_free_vars_in_term(terms, arg, bound_names, free_vars, visited);
+                collect_free_vars_in_term(terms, arg, bound_names, free_vars, visited)?;
             }
         }
         TermData::Let(bindings, body) => {
             for (_, binding_value) in bindings {
-                collect_free_vars_in_term(terms, *binding_value, bound_names, free_vars, visited);
+                collect_free_vars_in_term(terms, *binding_value, bound_names, free_vars, visited)?;
             }
             let bound_base = bound_names.len();
             for (name, _) in bindings {
                 bound_names.push(name.clone());
             }
-            collect_free_vars_in_term(terms, *body, bound_names, free_vars, visited);
+            // A propagated conflict abandons the entire walk (the `?` unwinds
+            // out of `collect_free_vars_from_roots`), so the binder context
+            // only has to be restored on the success path.
+            collect_free_vars_in_term(terms, *body, bound_names, free_vars, visited)?;
             bound_names.truncate(bound_base);
         }
         TermData::Forall(vars, body, triggers) | TermData::Exists(vars, body, triggers) => {
@@ -211,16 +270,23 @@ fn collect_free_vars_in_term(
             for (name, _) in vars {
                 bound_names.push(name.clone());
             }
-            collect_free_vars_in_term(terms, *body, bound_names, free_vars, visited);
+            collect_free_vars_in_term(terms, *body, bound_names, free_vars, visited)?;
             for trigger_set in triggers {
                 for &trigger_term in trigger_set {
-                    collect_free_vars_in_term(terms, trigger_term, bound_names, free_vars, visited);
+                    collect_free_vars_in_term(
+                        terms,
+                        trigger_term,
+                        bound_names,
+                        free_vars,
+                        visited,
+                    )?;
                 }
             }
             bound_names.truncate(bound_base);
         }
         _ => unreachable!("unexpected TermData variant"),
     }
+    Ok(())
 }
 
 fn is_auxiliary_proof_symbol(name: &str) -> bool {

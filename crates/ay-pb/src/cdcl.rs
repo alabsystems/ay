@@ -3838,7 +3838,47 @@ impl PbCdclSolver {
             match self.propagator.value(dimacs_lit) {
                 LitValue::True => continue,
                 LitValue::False => {
-                    return ApplyAssumptionsOutcome::Unsat(assumptions[..=idx].to_vec());
+                    // DOMINANT PATH on core-guided search: this assumption was
+                    // already falsified by propagation from EARLIER assumptions,
+                    // so the conflict is "the reason that forced it" plus this
+                    // assumption. Recover that reason from the trail and run the
+                    // same conflict analysis; falling back to the prefix only
+                    // when the literal has no recorded reason (a root-level
+                    // fixing, where the prefix is already the honest answer).
+                    let falsified = pb_lit_to_dimacs(assumption).unsigned_abs();
+                    let reason = self
+                        .trail
+                        .iter()
+                        .rev()
+                        .find(|entry| entry.lit.unsigned_abs() == falsified)
+                        .and_then(|entry| entry.reason);
+                    let core = match reason {
+                        Some(cid) => {
+                            let mut c =
+                                self.extract_assumption_conflict_core(cid, &assumptions[..=idx]);
+                            // The TRIGGERING assumption is part of the conflict by
+                            // construction (its negation is what propagation forced)
+                            // but it is not on the trail yet, so the analysis cannot
+                            // find it. Omitting it yields a core that does not
+                            // actually entail UNSAT.
+                            if !c.contains(&assumption) {
+                                c.push(assumption);
+                            }
+                            // Canonical order: cores are compared and summarised
+                            // downstream, so emit them in ASSUMPTION order rather
+                            // than trail-resolution order (which runs newest-first
+                            // and would make the same core look different).
+                            let rank: HashMap<PbLit, usize> = assumptions[..=idx]
+                                .iter()
+                                .enumerate()
+                                .map(|(i, &a)| (a, i))
+                                .collect();
+                            c.sort_by_key(|lit| rank.get(lit).copied().unwrap_or(usize::MAX));
+                            c
+                        }
+                        None => assumptions[..=idx].to_vec(),
+                    };
+                    return ApplyAssumptionsOutcome::Unsat(core);
                 }
                 LitValue::Unassigned => {}
             }
@@ -3848,8 +3888,10 @@ impl PbCdclSolver {
             self.stats.decisions += 1;
 
             match self.assign(dimacs_lit, None) {
-                PropResult::Conflict(_, _) => {
-                    return ApplyAssumptionsOutcome::Unsat(assumptions[..=idx].to_vec());
+                PropResult::Conflict(_, cid) => {
+                    // Same true-core extraction as the propagate_all arm below.
+                    let core = self.extract_assumption_conflict_core(cid, &assumptions[..=idx]);
+                    return ApplyAssumptionsOutcome::Unsat(core);
                 }
                 PropResult::Interrupted => return ApplyAssumptionsOutcome::Interrupted,
                 PropResult::Ok | PropResult::Propagated(_, _, _) => {}
@@ -3857,8 +3899,29 @@ impl PbCdclSolver {
 
             match self.propagate_all(should_stop) {
                 PropagateOutcome::Ok => {}
-                PropagateOutcome::Conflict(_) => {
-                    return ApplyAssumptionsOutcome::Unsat(assumptions[..=idx].to_vec());
+                PropagateOutcome::Conflict(cid) => {
+                    // TRUE CORE, not the assumption PREFIX. Returning
+                    // `assumptions[..=idx]` is sound but maximally weak: it
+                    // names every assumption applied so far, including the many
+                    // that had nothing to do with the conflict. Core-guided
+                    // search then pays for that twice — a weak core claims far
+                    // more softs than it should (so fewer disjoint cores fit in
+                    // a round, and the bound rises more slowly), and OLL burns
+                    // up to MAX_CORE_TRIM_CHECKS solves per core trying to
+                    // shrink it back down by deletion.
+                    //
+                    // Measured before this change on domset mw19_19: the
+                    // returned core was byte-identical to the assumption set in
+                    // 980 of 982 re-solves, and deletion-trimming recovered only
+                    // 0.96 literals per solve while cutting cores roughly in
+                    // half (62 -> 32) before hitting its check cap.
+                    //
+                    // `extract_assumption_conflict_core` resolves the conflict
+                    // back through the trail and keeps only the assumptions that
+                    // actually participate; it falls back to the full prefix on
+                    // any shape it cannot analyse, so this is never less sound.
+                    let core = self.extract_assumption_conflict_core(cid, &assumptions[..=idx]);
+                    return ApplyAssumptionsOutcome::Unsat(core);
                 }
                 PropagateOutcome::Interrupted => return ApplyAssumptionsOutcome::Interrupted,
             }

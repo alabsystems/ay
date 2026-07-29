@@ -553,7 +553,10 @@ fn combine_bounded(
     Ok(Combination { coeffs, constant })
 }
 
-#[cfg(test)]
+/// `BigRational` row-bound extraction, reached only from
+/// [`combine_bounded_big_reference`]. Production uses
+/// [`row_bound_exact_small`]; the two are deliberately separate code so the
+/// differential check has an independent oracle.
 fn row_bound_exact(
     model: &Model,
     row: usize,
@@ -624,7 +627,8 @@ fn row_bound_exact_small(
     .ok_or(CertificateError::InfiniteBound { index })
 }
 
-#[cfg(test)]
+/// `BigRational` column-bound extraction, reached only from
+/// [`combine_bounded_big_reference`]. Production uses [`bound_exact_small`].
 fn bound_exact(
     bound: f64,
     side: BoundSide,
@@ -677,8 +681,127 @@ fn bound_exact_small(
     crate::model::exact_small(bound).ok_or(CertificateError::InfiniteBound { index })
 }
 
+/// Pre-fast-path `BigRational` combination, retained only as a differential
+/// oracle: [`combine_bounded`] must reproduce it in every rational slot, or
+/// decline for the same reason.
+///
+/// Kept `pub(crate)` and unexported. Its callers are the `#[cfg(test)]`
+/// agreement check below and the [`crate::certify::sealed_scale`]
+/// characterization.
+pub(crate) fn combine_bounded_big_reference(
+    multipliers: &[Multiplier],
+    model: &Model,
+    col_bounds: Option<(&[Option<BigRational>], &[Option<BigRational>])>,
+) -> Result<(Vec<BigRational>, BigRational), CertificateError> {
+    if let Some((lbs, ubs)) = col_bounds {
+        let expected = model.num_cols();
+        if lbs.len() != expected || ubs.len() != expected {
+            return Err(CertificateError::MalformedBoundOverride {
+                expected,
+                lower: lbs.len(),
+                upper: ubs.len(),
+            });
+        }
+    }
+
+    let mut coeffs = vec![BigRational::zero(); model.num_cols()];
+    let mut constant = BigRational::zero();
+    for (index, m) in multipliers.iter().enumerate() {
+        if !m.coeff.is_positive() {
+            return Err(CertificateError::NonpositiveMultiplier { index });
+        }
+        match m.fact {
+            FactRef::RowBound { row, side } => {
+                if row.index() >= model.num_rows() {
+                    return Err(CertificateError::MissingFact { index });
+                }
+                let (row_coeffs, lb, ub) = model.row(row);
+                let bound = match side {
+                    BoundSide::Lower => row_bound_exact(model, row.index(), lb, side, index)?,
+                    BoundSide::Upper => row_bound_exact(model, row.index(), ub, side, index)?,
+                };
+                let sign_pos = matches!(side, BoundSide::Lower);
+                for &(c, a) in row_coeffs {
+                    if c as usize >= model.num_cols() {
+                        return Err(CertificateError::MalformedModel {
+                            index,
+                            msg: format!("row {} references missing column {c}", row.index()),
+                        });
+                    }
+                    if !a.is_finite() {
+                        return Err(CertificateError::MalformedModel {
+                            index,
+                            msg: format!(
+                                "row {} has a non-finite coefficient at column {c}",
+                                row.index()
+                            ),
+                        });
+                    }
+                    let term = &m.coeff * model.row_coeff_exact(row.index(), c, a);
+                    if sign_pos {
+                        coeffs[c as usize] += term;
+                    } else {
+                        coeffs[c as usize] -= term;
+                    }
+                }
+                if sign_pos {
+                    constant -= &m.coeff * bound;
+                } else {
+                    constant += &m.coeff * bound;
+                }
+            }
+            FactRef::ColBound { col, side } => {
+                if col.index() >= model.num_cols() {
+                    return Err(CertificateError::MissingFact { index });
+                }
+                let bound = match col_bounds {
+                    Some((lbs, ubs)) => {
+                        let slot = match side {
+                            BoundSide::Lower => lbs.get(col.index()),
+                            BoundSide::Upper => ubs.get(col.index()),
+                        }
+                        .ok_or(CertificateError::MissingFact { index })?;
+                        slot.clone()
+                            .ok_or(CertificateError::InfiniteBound { index })
+                    }
+                    None => {
+                        let (lb, ub) = model.col_bounds(col);
+                        match side {
+                            BoundSide::Lower => bound_exact(lb, side, index, "column lower bound"),
+                            BoundSide::Upper => bound_exact(ub, side, index, "column upper bound"),
+                        }
+                    }
+                }?;
+                match side {
+                    BoundSide::Lower => {
+                        coeffs[col.index()] += &m.coeff;
+                        constant -= &m.coeff * bound;
+                    }
+                    BoundSide::Upper => {
+                        coeffs[col.index()] -= &m.coeff;
+                        constant += &m.coeff * bound;
+                    }
+                }
+            }
+        }
+    }
+    Ok((coeffs, constant))
+}
+
+/// Run the production inline accumulator while preserving its `Rational`
+/// outputs. The [`crate::certify::sealed_scale`] characterization converts them
+/// to `BigRational` only after stopping its Combination timer.
+pub(crate) fn combine_bounded_fast_for_benchmark(
+    multipliers: &[Multiplier],
+    model: &Model,
+    col_bounds: Option<(&[Option<BigRational>], &[Option<BigRational>])>,
+) -> Result<(Vec<Rational>, Rational), CertificateError> {
+    let combination = combine_bounded(multipliers, model, col_bounds)?;
+    Ok((combination.coeffs, combination.constant))
+}
+
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use num_bigint::BigInt;
     use num_traits::{One, Zero};
 
@@ -707,123 +830,6 @@ pub(crate) mod tests {
         let row = model.add_row(f64::NEG_INFINITY, 0.0, &[(x, 1.0)]);
         model.rows[row.index()].coeffs[0].0 = 1;
         (model, row)
-    }
-
-    /// Pre-fast-path BigRational combination, retained as a test oracle.
-    pub(crate) fn combine_bounded_big_reference(
-        multipliers: &[Multiplier],
-        model: &Model,
-        col_bounds: Option<(&[Option<BigRational>], &[Option<BigRational>])>,
-    ) -> Result<(Vec<BigRational>, BigRational), CertificateError> {
-        if let Some((lbs, ubs)) = col_bounds {
-            let expected = model.num_cols();
-            if lbs.len() != expected || ubs.len() != expected {
-                return Err(CertificateError::MalformedBoundOverride {
-                    expected,
-                    lower: lbs.len(),
-                    upper: ubs.len(),
-                });
-            }
-        }
-
-        let mut coeffs = vec![BigRational::zero(); model.num_cols()];
-        let mut constant = BigRational::zero();
-        for (index, m) in multipliers.iter().enumerate() {
-            if !m.coeff.is_positive() {
-                return Err(CertificateError::NonpositiveMultiplier { index });
-            }
-            match m.fact {
-                FactRef::RowBound { row, side } => {
-                    if row.index() >= model.num_rows() {
-                        return Err(CertificateError::MissingFact { index });
-                    }
-                    let (row_coeffs, lb, ub) = model.row(row);
-                    let bound = match side {
-                        BoundSide::Lower => row_bound_exact(model, row.index(), lb, side, index)?,
-                        BoundSide::Upper => row_bound_exact(model, row.index(), ub, side, index)?,
-                    };
-                    let sign_pos = matches!(side, BoundSide::Lower);
-                    for &(c, a) in row_coeffs {
-                        if c as usize >= model.num_cols() {
-                            return Err(CertificateError::MalformedModel {
-                                index,
-                                msg: format!("row {} references missing column {c}", row.index()),
-                            });
-                        }
-                        if !a.is_finite() {
-                            return Err(CertificateError::MalformedModel {
-                                index,
-                                msg: format!(
-                                    "row {} has a non-finite coefficient at column {c}",
-                                    row.index()
-                                ),
-                            });
-                        }
-                        let term = &m.coeff * model.row_coeff_exact(row.index(), c, a);
-                        if sign_pos {
-                            coeffs[c as usize] += term;
-                        } else {
-                            coeffs[c as usize] -= term;
-                        }
-                    }
-                    if sign_pos {
-                        constant -= &m.coeff * bound;
-                    } else {
-                        constant += &m.coeff * bound;
-                    }
-                }
-                FactRef::ColBound { col, side } => {
-                    if col.index() >= model.num_cols() {
-                        return Err(CertificateError::MissingFact { index });
-                    }
-                    let bound = match col_bounds {
-                        Some((lbs, ubs)) => {
-                            let slot = match side {
-                                BoundSide::Lower => lbs.get(col.index()),
-                                BoundSide::Upper => ubs.get(col.index()),
-                            }
-                            .ok_or(CertificateError::MissingFact { index })?;
-                            slot.clone()
-                                .ok_or(CertificateError::InfiniteBound { index })
-                        }
-                        None => {
-                            let (lb, ub) = model.col_bounds(col);
-                            match side {
-                                BoundSide::Lower => {
-                                    bound_exact(lb, side, index, "column lower bound")
-                                }
-                                BoundSide::Upper => {
-                                    bound_exact(ub, side, index, "column upper bound")
-                                }
-                            }
-                        }
-                    }?;
-                    match side {
-                        BoundSide::Lower => {
-                            coeffs[col.index()] += &m.coeff;
-                            constant -= &m.coeff * bound;
-                        }
-                        BoundSide::Upper => {
-                            coeffs[col.index()] -= &m.coeff;
-                            constant += &m.coeff * bound;
-                        }
-                    }
-                }
-            }
-        }
-        Ok((coeffs, constant))
-    }
-
-    /// Run the production inline accumulator while preserving its `Rational`
-    /// outputs. The ignored sealed-scale benchmark converts them to
-    /// `BigRational` only after stopping its Combination timer.
-    pub(crate) fn combine_bounded_fast_for_benchmark(
-        multipliers: &[Multiplier],
-        model: &Model,
-        col_bounds: Option<(&[Option<BigRational>], &[Option<BigRational>])>,
-    ) -> Result<(Vec<Rational>, Rational), CertificateError> {
-        let combination = combine_bounded(multipliers, model, col_bounds)?;
-        Ok((combination.coeffs, combination.constant))
     }
 
     fn assert_combination_matches_big_reference(

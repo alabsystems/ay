@@ -36,6 +36,17 @@ pub struct BCEStats {
     pub skipped_expensive: u64,
     /// Number of BCE rounds
     pub rounds: u64,
+    /// Eliminations taken on the PURE arm — the blocking literal's negation
+    /// occurs nowhere, so the clause could never have propagated onto it and
+    /// removing it costs no unit propagation.
+    ///
+    /// The complement (`clauses_eliminated - pure_blocked`) is the
+    /// tautological-resolvent arm, which removes a LIVE implication. Callers
+    /// that depend on the surviving implication structure — MaxSAT's AM1
+    /// clique-cover mining reads the binary conflict graph — need to tell the
+    /// two apart: a reduction that is mostly pure is free, a reduction that is
+    /// mostly non-pure can destroy the very structure they mine.
+    pub pure_blocked: u64,
 }
 
 /// Information about an eliminated blocked clause
@@ -222,6 +233,9 @@ impl BCE {
 
         // If no clauses contain ~L, the clause is trivially blocked
         if self.occ_buf.is_empty() {
+            // PURE arm: nothing can resolve on ~L, so this deletion removes no
+            // reachable propagation (see BCEStats::pure_blocked).
+            self.stats.pure_blocked += 1;
             return true;
         }
 

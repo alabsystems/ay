@@ -174,9 +174,22 @@ impl Context {
                             // datatype — push the combined solver to `unknown` on
                             // otherwise-SAT problems. Sound + complete: every value
                             // of the sort IS that constructor.
-                            if let Some(term) =
-                                self.symbols.get(&ctor_name).and_then(|info| info.term)
-                            {
+                            // Select the constructor overload that belongs to
+                            // THIS datatype. `self.symbols` keeps only the
+                            // LAST-registered signature, so for a nullary
+                            // constructor name shared by two datatypes — which
+                            // SMT-LIB 2.6 §4.2.3 explicitly permits, and which
+                            // §3.6.4's `(as e σ)` exists to disambiguate — the
+                            // bare lookup handed back the OTHER datatype's
+                            // inhabitant. `(declare-datatypes ((A 0) (B 0))
+                            // (((e)) ((e))))` + `(declare-const x A)` then bound
+                            // `x` to B's `e` (sort B), so `(= x (as e A))` was
+                            // rejected as `Sorts B and A are incompatible` while
+                            // the B-only spelling was accepted — a pure
+                            // declaration-order artifact — and `(distinct x y)`
+                            // over `x : A`, `y : B` collapsed to `(distinct t t)`
+                            // and answered `unsat`.
+                            if let Some(term) = self.nullary_ctor_term_in(dt_name, &ctor_name) {
                                 return term;
                             }
                         } else {

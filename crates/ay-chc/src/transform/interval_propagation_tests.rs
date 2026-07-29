@@ -12,6 +12,49 @@ fn int_var(name: &str) -> ChcVar {
     ChcVar::new(name, ChcSort::Int)
 }
 
+fn bool_var(name: &str) -> ChcVar {
+    ChcVar::new(name, ChcSort::Bool)
+}
+
+/// `x = 0; while (x < 6) x++`, the shape whose upper bound needs one join more
+/// than [`WIDENING_THRESHOLD`] allows.
+///
+/// With `side` set, the step clause also carries a Bool-only body predicate:
+/// reached, but with no interval information on any argument.
+fn counting_loop_problem(side: Option<&str>) -> (ChcProblem, crate::PredicateId) {
+    let mut p = ChcProblem::new();
+    let inv = p.declare_predicate("inv", vec![ChcSort::Int]);
+    let x = int_var("x");
+    let mut body_predicates = vec![(inv, vec![ChcExpr::var(x.clone())])];
+    if let Some(side) = side {
+        let flag = bool_var("flag");
+        let side_pid = p.declare_predicate(side, vec![ChcSort::Bool]);
+        p.add_clause(HornClause::new(
+            ClauseBody::new(vec![], None),
+            ClauseHead::Predicate(side_pid, vec![ChcExpr::var(flag.clone())]),
+        ));
+        body_predicates.push((side_pid, vec![ChcExpr::var(flag)]));
+    }
+    p.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![],
+            Some(ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0))),
+        ),
+        ClauseHead::Predicate(inv, vec![ChcExpr::var(x.clone())]),
+    ));
+    p.add_clause(HornClause::new(
+        ClauseBody::new(
+            body_predicates,
+            Some(ChcExpr::lt(ChcExpr::var(x.clone()), ChcExpr::int(6))),
+        ),
+        ClauseHead::Predicate(
+            inv,
+            vec![ChcExpr::add(ChcExpr::var(x.clone()), ChcExpr::int(1))],
+        ),
+    ));
+    (p, inv)
+}
+
 /// `(x + 1) mod 256` — the shape BvToInt emits for `bvadd x 1` on BV8.
 fn wrap_add_one(x: &ChcVar) -> ChcExpr {
     ChcExpr::mod_op(
@@ -286,6 +329,131 @@ fn forward_fixpoint_widens_after_threshold() {
     let intervals = state.get(&inv).expect("inv tracked");
     assert_eq!(intervals[0].lo, Some(BigInt::from(0)), "lo must stay 0");
     assert_eq!(intervals[0].hi, None, "hi must be widened to +inf");
+}
+
+/// Compiler front ends put every arithmetic fact under a guard literal. The
+/// analysis has to unit-propagate the decided guards before it can see the
+/// assignment at all, or it derives nothing on a whole benchmark family.
+#[test]
+fn guarded_cnf_assignment_is_unit_propagated() {
+    let mut p = ChcProblem::new();
+    let inv = p.declare_predicate("inv", vec![ChcSort::Int]);
+    let x = int_var("x");
+    let g = bool_var("g");
+    // g ∧ (¬g ∨ x = 0) ⇒ inv(x): the disjunction is unit under g.
+    p.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![],
+            Some(ChcExpr::and(
+                ChcExpr::var(g.clone()),
+                ChcExpr::or(
+                    ChcExpr::not(ChcExpr::var(g.clone())),
+                    ChcExpr::eq(ChcExpr::var(x.clone()), ChcExpr::int(0)),
+                ),
+            )),
+        ),
+        ClauseHead::Predicate(inv, vec![ChcExpr::var(x.clone())]),
+    ));
+    let state = forward_fixpoint(&p);
+    let intervals = state.get(&inv).expect("inv tracked");
+    assert_eq!(
+        (intervals[0].lo.clone(), intervals[0].hi.clone()),
+        (Some(BigInt::from(0)), Some(BigInt::from(0))),
+        "the guarded assignment x = 0 must be read through the unit clause"
+    );
+}
+
+/// The other half of the guarded-CNF encoding: loop conditions are reified
+/// into a Boolean variable (`(not (= (<= 6 h) a))` with `a` a decided unit),
+/// which forces the comparison to be FALSE and so bounds `h` from above.
+#[test]
+fn reified_loop_guard_bounds_the_counter() {
+    let mut p = ChcProblem::new();
+    let inv = p.declare_predicate("inv", vec![ChcSort::Int]);
+    let h = int_var("h");
+    let a = bool_var("a");
+    // a ∧ ¬((6 <= h) = a) ⇒ inv(h), i.e. ¬(6 <= h), i.e. h <= 5.
+    p.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![],
+            Some(ChcExpr::and(
+                ChcExpr::var(a.clone()),
+                ChcExpr::not(ChcExpr::eq(
+                    ChcExpr::le(ChcExpr::int(6), ChcExpr::var(h.clone())),
+                    ChcExpr::var(a.clone()),
+                )),
+            )),
+        ),
+        ClauseHead::Predicate(inv, vec![ChcExpr::var(h.clone())]),
+    ));
+    let state = forward_fixpoint(&p);
+    let intervals = state.get(&inv).expect("inv tracked");
+    assert_eq!(
+        intervals[0].hi,
+        Some(BigInt::from(5)),
+        "the reified guard must bound the counter by 5"
+    );
+}
+
+/// SOUNDNESS PIN for the negation handling: `¬(x = c)` is NOT an interval
+/// fact, so a negated equality must leave the environment untouched rather
+/// than be approximated in either direction.
+#[test]
+fn negated_equality_yields_no_interval() {
+    let mut p = ChcProblem::new();
+    let inv = p.declare_predicate("inv", vec![ChcSort::Int]);
+    let x = int_var("x");
+    p.add_clause(HornClause::new(
+        ClauseBody::new(
+            vec![],
+            Some(ChcExpr::not(ChcExpr::eq(
+                ChcExpr::var(x.clone()),
+                ChcExpr::int(7),
+            ))),
+        ),
+        ClauseHead::Predicate(inv, vec![ChcExpr::var(x.clone())]),
+    ));
+    let state = forward_fixpoint(&p);
+    let intervals = state.get(&inv).expect("inv tracked");
+    assert!(
+        intervals[0].is_top(),
+        "x != 7 must stay top, got {:?}",
+        intervals[0]
+    );
+}
+
+/// A guarded counting loop needs exactly one more join than the widening
+/// threshold allows, so widening straight to ±∞ forgets its bound just before
+/// convergence. Climbing the ladder of constants that occur in the problem
+/// keeps it.
+#[test]
+fn landmark_widening_keeps_a_bounded_loop_bound() {
+    let (problem, inv) = counting_loop_problem(None);
+    let state = forward_fixpoint(&problem);
+    let intervals = state.get(&inv).expect("inv tracked");
+    assert_eq!(intervals[0].lo, Some(BigInt::from(0)), "lo must stay 0");
+    assert_eq!(
+        intervals[0].hi,
+        Some(BigInt::from(6)),
+        "hi must widen to the landmark 6, not to +inf"
+    );
+}
+
+/// REGRESSION: the narrowing pass reads "absent from the state" as "body not
+/// reached" and skips the clause. A predicate whose arguments are all top
+/// (here a Bool-only side condition) carries no interval information but is
+/// still reached, so dropping it before narrowing hides the step clause and
+/// narrows `inv` past its real fixpoint down to the initial value.
+#[test]
+fn all_top_predicate_does_not_hide_clauses_from_narrowing() {
+    let (problem, inv) = counting_loop_problem(Some("side"));
+    let state = narrowed_fixpoint(&problem);
+    let intervals = state.get(&inv).expect("inv tracked");
+    assert_eq!(
+        (intervals[0].lo.clone(), intervals[0].hi.clone()),
+        (Some(BigInt::from(0)), Some(BigInt::from(6))),
+        "the all-top side predicate must not remove the step clause from the abstract image"
+    );
 }
 
 #[test]

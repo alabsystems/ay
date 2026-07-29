@@ -2095,36 +2095,22 @@ pub(crate) fn separate_gmi_budget(
         // Down to f64, paying for the rounding. Each coefficient moves by at most
         // |ĉ − c|, and `x_k` is bounded by the box, so relaxing the RHS by
         // Σ |ĉ_k − c_k| · max|x_k| makes the f64 cut IMPLIED by the exact one.
+        // On a column the box cannot pay for, `coef_to_f64` rounds the coefficient
+        // in the direction the column's SIGN makes free instead, and refuses only a
+        // genuinely free one. This is a `>=` store (`ub` is `+inf` at the push below).
         let mut f_coeffs: Vec<(Col, f64)> = Vec::new();
         let mut damage = BigRational::zero();
         for (k, c) in cx.iter().enumerate() {
             if c.is_zero() {
                 continue;
             }
-            let Some(cf) = c.to_f64() else {
+            let col = Col(k as u32);
+            let Some((cf, cost)) = coef_to_f64(model, col, c, CutSide::Ge) else {
                 ok = false;
                 break;
             };
-            if !cf.is_finite() {
-                ok = false;
-                break;
-            }
-            let Some(cf_exact) = exact(cf) else {
-                ok = false;
-                break;
-            };
-            let (lo, up) = model.col_bounds(Col(k as u32));
-            let span = lo.abs().max(up.abs());
-            if !span.is_finite() {
-                ok = false; // an unbounded column: the rounding damage is unbounded too
-                break;
-            }
-            let Some(span) = exact(span) else {
-                ok = false;
-                break;
-            };
-            damage += (&cf_exact - c).abs() * span;
-            f_coeffs.push((Col(k as u32), cf));
+            damage += cost;
+            f_coeffs.push((col, cf));
         }
         if !ok || f_coeffs.is_empty() {
             continue;
@@ -2191,7 +2177,13 @@ pub(crate) fn separate_gmi_budget(
 ///     damage the rounding to `f64` can do (`Σ |ĉ_j − c_j| · max|x_j|` over the box), so the stored
 ///     cut is IMPLIED by the exact one and cannot cut off an integer point the exact one admits.
 pub(crate) fn separate_mir(model: &Model, x: &[f64], n_rows: usize, budget: usize) -> Vec<Cut> {
-    separate_mir_family(model, x, n_rows, budget, mir_from_row)
+    let t = crate::sepstat::on().then(std::time::Instant::now);
+    let out = separate_mir_family(model, x, n_rows, budget, mir_from_row);
+    crate::sepstat::add(&crate::sepstat::MIR_CUTS, out.len() as u64);
+    if let Some(t) = t {
+        crate::sepstat::add(&crate::sepstat::SEP_NS, t.elapsed().as_nanos() as u64);
+    }
+    out
 }
 
 /// Separate STRENGTHENED CHVÁTAL-GOMORY cuts — the same family, same rows, same VUB substitution as
@@ -2212,7 +2204,13 @@ pub(crate) fn separate_strongcg(
     if std::env::var_os("AY_MILP_NO_STRONGCG").is_some() {
         return Vec::new();
     }
-    separate_mir_family(model, x, n_rows, budget, strongcg_from_row)
+    let t = crate::sepstat::on().then(std::time::Instant::now);
+    let out = separate_mir_family(model, x, n_rows, budget, strongcg_from_row);
+    crate::sepstat::add(&crate::sepstat::SCG_CUTS, out.len() as u64);
+    if let Some(t) = t {
+        crate::sepstat::add(&crate::sepstat::SEP_NS, t.elapsed().as_nanos() as u64);
+    }
+    out
 }
 
 /// The row-selection + substitution core SHARED by `separate_mir` and `separate_strongcg`. `row_fn`
@@ -2386,6 +2384,7 @@ fn separate_mir_family_with(
                 continue;
             }
             let sign = if negate { -1.0 } else { 1.0 };
+            crate::sepstat::bump(&crate::sepstat::TERMS_BUILT);
             let terms: Vec<(usize, BigRational)> = coeffs
                 .iter()
                 .filter_map(|&(c, a)| exact(sign * a).map(|v| (c as usize, v)))
@@ -3108,21 +3107,13 @@ fn mixing_from_rows(model: &Model, x: &[f64], rows: &[MixRow], delta: &BigRation
         if c.is_zero() {
             continue;
         }
-        let cf = to_f64(c);
-        if !cf.is_finite() {
-            return None;
-        }
-        let back = exact(cf)?;
-        let err = (&back - c).abs();
-        if !err.is_zero() {
-            let (lo, up) = model.col_bounds(Col(*j as u32));
-            if !lo.is_finite() || !up.is_finite() {
-                return None;
-            }
-            damage += err * exact(lo.abs().max(up.abs()))?;
-        }
+        let col = Col(*j as u32);
+        // A `>=` store, so an unbounded-but-signed column rounds outward for free; see
+        // `coef_to_f64`.
+        let (cf, cost) = coef_to_f64(model, col, c, CutSide::Ge)?;
+        damage += cost;
         if cf != 0.0 {
-            out.push((Col(*j as u32), cf));
+            out.push((col, cf));
         }
     }
     // A `>=` cut: relax the right-hand side DOWNWARD by the damage, then nudge it down once more so
@@ -3237,8 +3228,9 @@ fn mir_from_row(
     rhs: &BigRational,
     vubs: &std::collections::HashMap<usize, (BigRational, usize)>,
 ) -> Option<Cut> {
+    crate::sepstat::bump(&crate::sepstat::MIR_ROWS);
     let (subs, b) = mir_build_subs(model, x, terms, rhs, vubs)?;
-    best_over_deltas(model, x, &subs, &b, mir_round)
+    best_over_deltas(model, x, &subs, &b, Rounding::Mir)
 }
 
 /// The STRENGTHENED CHVÁTAL-GOMORY sibling of `mir_from_row`: identical row preparation (the same
@@ -3252,8 +3244,9 @@ fn strongcg_from_row(
     rhs: &BigRational,
     vubs: &std::collections::HashMap<usize, (BigRational, usize)>,
 ) -> Option<Cut> {
+    crate::sepstat::bump(&crate::sepstat::SCG_ROWS);
     let (subs, b) = mir_build_subs(model, x, terms, rhs, vubs)?;
-    best_over_deltas(model, x, &subs, &b, strongcg_round)
+    best_over_deltas(model, x, &subs, &b, Rounding::StrongCg)
 }
 
 /// Put a row `Σ a_j x_j <= b` through bound substitution, returning the non-negative displacements
@@ -3267,6 +3260,7 @@ fn mir_build_subs(
     rhs: &BigRational,
     vubs: &std::collections::HashMap<usize, (BigRational, usize)>,
 ) -> Option<(Vec<Sub>, BigRational)> {
+    crate::sepstat::bump(&crate::sepstat::SUBS_BUILT);
     let mut subs: Vec<Sub> = Vec::with_capacity(terms.len());
     // Binary columns the VUB substitution drags in, accumulated before they are substituted.
     // A BTreeMap, NOT a HashMap, and the ordering is load-bearing: this map is ITERATED below,
@@ -3341,18 +3335,432 @@ fn mir_build_subs(
         }
         let bnd = exact(bnd_f)?;
         b -= &a * &bnd;
+        let bound_is_integral = bnd.is_integer();
         subs.push(Sub {
             var: Var::Col(j),
             a: if compl { -a } else { a },
             complemented: compl,
             bound: bnd,
-            integral: model.col_kind(col).is_integral(),
+            // SOUNDNESS: the SUBSTITUTED DISPLACEMENT must be integral, which needs an
+            // integral BOUND as well as an integral column. `t = x - bnd` is an integer
+            // displacement only when `bnd` is itself an integer; for an integer column with a
+            // FRACTIONAL bound, `t = x - 1.5` is not, and applying the integer MIR
+            // coefficient to it produces a cut that can delete a feasible integer point.
+            //
+            // Found by an adversarial brute-force harness with a concrete counterexample:
+            // cols x0 int [1.5,6], x1 cont [0,6], x2 int [0,3], x3 int [-0.5,4] over rows
+            // -x0-3x1-4x2-x3<=0, -2x0+4x1-2x2+5x3>=4, -3x0-x2+2x3=2 emitted
+            // `x0 - 0.3333*x3 <= 0.16667`, which deletes the feasible point (2,0,0,4)
+            // (activity 0.6667). Substituting x0 at its lower bound 1.5 with delta=3 derives
+            // exactly that cut. The bug predates the complementation work and reproduces
+            // under the historical nearest-bound rule too, so it is not a policy artifact.
+            //
+            // It is MASKED in the shipped pipeline because presolve rounds fractional bounds
+            // on integer columns before separation ever runs (verified: an integer column
+            // declared LO 1.5 reports bound_lp=2). So this is defense in depth for an
+            // in-process Model-API caller that separates without presolve — which is exactly
+            // the kind of caller an exact solver must not quietly mis-serve.
+            integral: model.col_kind(col).is_integral() && bound_is_integral,
         });
     }
     if subs.is_empty() {
+        crate::sepstat::bump(&crate::sepstat::SUBS_NONE);
         return None;
     }
     Some((subs, b))
+}
+
+/// Which rounding a `best_over_deltas` sweep is running — the screen has to model the SAME
+/// coefficient function the kernel will use, so the two must not drift apart.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rounding {
+    Mir,
+    StrongCg,
+}
+
+/// What the `f64` screen can say about one `delta`.
+enum Verdict {
+    /// The kernel provably returns `None` for this delta (its own fractionality guard fails,
+    /// evaluated EXACTLY -- this is not an approximation).
+    NoCut,
+    /// A rigorous upper bound on the violation at `x` of the cut the kernel would return.
+    Ub(f64),
+    /// The floating-point screen is not trustworthy here; the kernel must run.
+    Unknown,
+}
+
+/// PRECOMPUTED ROW GEOMETRY FOR THE VIOLATION SCREEN.
+///
+/// # Why a screen exists at all
+///
+/// Measured on mas74's root round (`AY_MILP_SEPSTAT=1 AY_ROOT_CLOSURE=1`): 26 rows, 872 exact
+/// rounding passes, **zero** cuts. 410 of the MIR passes ran the full `BigRational` derivation and
+/// produced a cut that was not violated at `x`; 418 of the strong-CG passes ran the full derivation
+/// and were then thrown away by the coefficient-sanity filter at the very end. The delta sweep
+/// multiplies this by ~17. None of that work can be removed by choosing cuts better -- it is spent
+/// before there is a cut to choose.
+///
+/// # The identity the screen rests on
+///
+/// Both kernels map their displacement-space inequality `Σ c_i t_i <= ⌊b/δ⌋` back onto the model's
+/// columns by adding `c·bound` into the right-hand side for every substituted column (and, for a
+/// VUB slack `s = u·y − x`, by splitting `c` across the two columns). Re-expanding that mapping at
+/// the separation point gives, term by term,
+///
+/// ```text
+///   Σ_j C_j x_j − RHS   =   Σ_i c_i · t_i(x)   −   ⌊b/δ⌋
+/// ```
+///
+/// exactly -- it is the same inequality written in two coordinate systems. So the violation of the
+/// finished cut can be evaluated from the DISPLACEMENTS, which are known before any coefficient is
+/// derived.
+///
+/// # Why bounding it in `f64` is sound
+///
+/// The stored `f64` cut is IMPLIED by the exact one: each kernel adds `damage = Σ|cf_j − C_j| ·
+/// max(|l_j|,|u_j|)` into the right-hand side and rounds that outward, and `|x_j| <=
+/// max(|l_j|,|u_j|)` holds for any point inside the box. Hence
+/// `violation(stored) <= violation(exact)` -- proved in the two `damage` blocks below. So an upper
+/// bound on the exact violation is an upper bound on the one `best_over_deltas` will test.
+///
+/// The bound itself is not a heuristic tolerance:
+///
+/// * `⌊b/δ⌋` and the fractionality `f` are computed in EXACT rationals (an `O(1)` bignum step, not
+///   the `O(nnz)` pass the screen is removing), so the term that carries integer-sized error
+///   carries none.
+/// * both coefficient functions are NON-DECREASING in `a` (MIR's is continuous; strong CG's jumps
+///   UPWARD by `1/(k+1)` at each integer), so evaluating at `a ± da` in the direction that makes
+///   `c_i·t_i` largest is a true upper bound on that term rather than a linearisation.
+/// * the remaining `f64` slop -- the `to_f64` of `a`, the displacement subtraction, the summation
+///   -- is bounded explicitly in `eps` below.
+///
+/// When any of that cannot be established (a right-hand side too large for `f64` to resolve its
+/// fractional part, a non-finite value), the screen answers `Unknown` and the kernel runs.
+struct ScreenRow {
+    /// `t_i(x)`, the displacement of sub `i` at the separation point.
+    tv: Vec<f64>,
+    /// The sub's coefficient on the UNDIVIDED row, in `f64`.
+    av: Vec<f64>,
+    /// A magnitude scale for sub `i` that dominates `|t_i|` and every quantity its `f64`
+    /// evaluation rounded -- used only to size the error term.
+    sc: Vec<f64>,
+    /// Strong CG projects the continuous displacements into the right-hand side before it rounds.
+    /// That penalty does not depend on `delta`, so it is computed ONCE here, exactly.
+    b_eff: BigRational,
+    /// How far outside its own column box the separation point sits, at worst. Zero for every LP
+    /// vertex; nonzero only for a synthetic or drifted point, and then it is priced into `eps`.
+    box_excess: f64,
+}
+
+impl ScreenRow {
+    fn build(
+        model: &Model,
+        x: &[f64],
+        subs: &[Sub],
+        b: &BigRational,
+        kind: Rounding,
+    ) -> Option<Self> {
+        if screen_off() {
+            return None;
+        }
+        let mut tv = Vec::with_capacity(subs.len());
+        let mut av = Vec::with_capacity(subs.len());
+        let mut sc = Vec::with_capacity(subs.len());
+        let mut b_eff = b.clone();
+        let mut box_excess = 0.0f64;
+        let mut out_of_box = |m: &Model, j: usize| {
+            let (lo, up) = m.col_bounds(Col(j as u32));
+            let xv = x.get(j).copied().unwrap_or(0.0);
+            let d = (lo - xv).max(xv - up).max(0.0);
+            if d.is_finite() {
+                box_excess = box_excess.max(d);
+            }
+        };
+        for s in subs {
+            let (t, scale) = match &s.var {
+                Var::Col(j) => {
+                    let xv = *x.get(*j)?;
+                    let bnd = to_f64(&s.bound);
+                    let t = if s.complemented { bnd - xv } else { xv - bnd };
+                    out_of_box(model, *j);
+                    (t, xv.abs() + bnd.abs())
+                }
+                Var::VubSlack { x: xj, y, u } => {
+                    let xv = *x.get(*xj)?;
+                    let yv = *x.get(*y)?;
+                    let uf = to_f64(u);
+                    out_of_box(model, *xj);
+                    out_of_box(model, *y);
+                    (uf * yv - xv, (uf * yv).abs() + xv.abs())
+                }
+            };
+            let a = to_f64(&s.a);
+            if !t.is_finite() || !a.is_finite() || !scale.is_finite() {
+                return None;
+            }
+            // Strong CG's continuous projection, in exact arithmetic and delta-independent --
+            // `strongcg_round` derives the identical `b_pen` for every delta it is handed.
+            if kind == Rounding::StrongCg && !s.integral && s.a < BigRational::zero() {
+                let r = strongcg_range(model, &s.var)?;
+                b_eff += (-&s.a) * &r;
+            }
+            tv.push(t);
+            av.push(a);
+            sc.push(scale);
+        }
+        if !box_excess.is_finite() {
+            return None;
+        }
+        Some(Self {
+            tv,
+            av,
+            sc,
+            b_eff,
+            box_excess,
+        })
+    }
+
+    fn screen_delta(&self, subs: &[Sub], delta: &BigRational, kind: Rounding) -> Verdict {
+        // EXACT: the right-hand side's integer part and its fractionality. These are the two
+        // quantities a floating-point slip would corrupt by a whole unit, and they cost `O(1)`.
+        let bd = &self.b_eff / delta;
+        let fl_r = bd.floor();
+        let fb_r = &bd - &fl_r;
+        if fb_r.is_zero() {
+            return Verdict::NoCut;
+        }
+        let fmin = BigRational::new(1.into(), 100.into());
+        if fb_r < fmin || fb_r > BigRational::one() - &fmin {
+            return Verdict::NoCut; // both kernels refuse this row at exactly this test
+        }
+        let fl = to_f64(&fl_r);
+        let fb = to_f64(&fb_r);
+        let delta_f = to_f64(delta);
+        if !fl.is_finite() || !fb.is_finite() || !delta_f.is_finite() || delta_f == 0.0 {
+            return Verdict::Unknown;
+        }
+        // `⌊b/δ⌋` must be exactly representable, or the violation's integer part is already noise.
+        if fl.abs() >= 9.0e15 {
+            return Verdict::Unknown;
+        }
+        let inv = 1.0 / (1.0 - fb);
+        // Strong CG's sub-interval count, `k = ⌈1/f⌉ − 1`, taken from the EXACT `f`.
+        let k = match kind {
+            Rounding::Mir => 0.0,
+            Rounding::StrongCg => {
+                let k_rat = (BigRational::one() / &fb_r).ceil() - BigRational::one();
+                if k_rat < BigRational::one() {
+                    return Verdict::NoCut;
+                }
+                let k = to_f64(&k_rat);
+                if !k.is_finite() || !(1.0..=1.0e6).contains(&k) {
+                    return Verdict::Unknown;
+                }
+                k
+            }
+        };
+
+        let mut sum = 0.0f64;
+        let mut mag_c = 0.0f64;
+        let mut mag_a = 0.0f64;
+        let mut sum_c = 0.0f64;
+        let mut nz = 0usize;
+        for (i, s) in subs.iter().enumerate() {
+            let t = self.tv[i];
+            let a = self.av[i] / delta_f;
+            if !a.is_finite() {
+                return Verdict::Unknown;
+            }
+            // Both coefficient rules are NON-DECREASING in `a`, so pushing `a` in the direction
+            // that grows `c·t` bounds the term from above whatever the `to_f64` of `a` did.
+            // `a` came through two `to_f64`s and a division, so ~1.5 ulp; 64 is a wide margin
+            // that costs nothing (it moves the final bound by ~1e-9, and the floor it is tested
+            // against, `MIN_VIOLATION`, is 1e-4).
+            let da = a.abs() * 64.0 * f64::EPSILON + f64::MIN_POSITIVE;
+            let want_max = t >= 0.0;
+            let ah = if want_max { a + da } else { a - da };
+            let c = screen_coeff(kind, ah, fb, inv, k, s.integral, want_max);
+            if !c.is_finite() {
+                return Verdict::Unknown;
+            }
+            sum += c * t;
+            mag_c += c.abs() * self.sc[i];
+            mag_a += a.abs() * self.sc[i];
+            sum_c += c.abs();
+            nz += 1;
+        }
+        if !sum.is_finite() {
+            return Verdict::Unknown;
+        }
+        // The residual `f64` slop, term by term: the rounded `a` entering the coefficient formula
+        // (sensitivity `1/(1−f)`); the displacement subtractions and the running sum over `nz`
+        // terms; and `f`'s own last bit, which reaches the coefficient through `1/(1−f)` twice.
+        // On mas74 this lands around 1e-9 -- five orders below the `MIN_VIOLATION` floor it gates,
+        // which is why the screen loses no power to being conservative.
+        //
+        // The last term is the only place the point's position matters. The kernels pay their
+        // `f64` coefficient rounding into the right-hand side as `Σ|cf_j − C_j|·max(|l_j|,|u_j|)`,
+        // which dominates the same rounding's effect on the left-hand side ONLY for a point inside
+        // the box. `box_excess` measures how far outside the point actually is and prices the
+        // shortfall, so the bound stands for any point rather than resting on a caller's promise.
+        let eps = f64::EPSILON
+            * (64.0 * inv * mag_a
+                + (nz as f64 + 64.0) * (mag_c + fl.abs())
+                + 8.0 * nz as f64 * inv * inv
+                + 4.0 * self.box_excess * sum_c)
+            + 1.0e-12;
+        Verdict::Ub(sum - fl + eps)
+    }
+}
+
+impl ScreenRow {
+    /// Diagnostic for `AY_MILP_SEP_SCREEN_EXPLAIN`: dump the screen's view of a row beside the cut
+    /// the kernel actually built, so a disagreement can be attributed to a term rather than guessed.
+    #[cold]
+    fn explain(&self, subs: &[Sub], delta: &BigRational, kind: Rounding, cut: &Cut, x: &[f64]) {
+        let bd = &self.b_eff / delta;
+        let fl_r = bd.floor();
+        let fb_r = &bd - &fl_r;
+        let fl = to_f64(&fl_r);
+        let fb = to_f64(&fb_r);
+        let inv = 1.0 / (1.0 - fb);
+        let df = to_f64(delta);
+        let k = match kind {
+            Rounding::Mir => 0.0,
+            Rounding::StrongCg => {
+                to_f64(&((BigRational::one() / &fb_r).ceil() - BigRational::one()))
+            }
+        };
+        eprintln!(
+            "  EXPLAIN delta={df} fl={fl} fb={fb} k={k} nsubs={}",
+            subs.len()
+        );
+        let mut sum = 0.0;
+        for (i, s) in subs.iter().enumerate() {
+            let a = self.av[i] / df;
+            let t = self.tv[i];
+            let c = screen_coeff(kind, a, fb, inv, k, s.integral, t >= 0.0);
+            sum += c * t;
+            let vs = match &s.var {
+                Var::Col(j) => format!("col{j}"),
+                Var::VubSlack { x, y, .. } => format!("vub(x{x},y{y})"),
+            };
+            eprintln!("    {vs} int={} a={a} t={t} c={c}", s.integral);
+        }
+        eprintln!("  screen sum={sum} -> viol={}", sum - fl);
+        eprintln!("  cut ub={} coeffs={:?}", cut.ub, cut.coeffs);
+        let act: f64 = cut
+            .coeffs
+            .iter()
+            .map(|&(c, a)| a * x.get(c.index()).copied().unwrap_or(0.0))
+            .sum();
+        eprintln!("  cut act={act} viol={}", act - cut.ub);
+    }
+}
+
+/// The rounded coefficient both kernels put on displacement `i`, evaluated in `f64`. Mirrors
+/// `mir_round` / `strongcg_round` term for term; the exact versions remain the only ones that ever
+/// build a cut.
+///
+/// `want_max` says which way to resolve strong CG's `⌈·⌉`, which is a STEP: the caller is bounding
+/// `c·t` from above, so it wants the largest admissible `c` when `t >= 0` and the smallest when
+/// `t < 0`. Rounding that step the same way regardless was a real defect -- it made the "upper
+/// bound" a lower bound on every term with a negative displacement, and a negative displacement is
+/// exactly what a separation point sitting outside a column's box produces.
+#[inline]
+fn screen_coeff(
+    kind: Rounding,
+    a: f64,
+    fb: f64,
+    inv: f64,
+    k: f64,
+    integral: bool,
+    want_max: bool,
+) -> f64 {
+    if !integral {
+        return match kind {
+            // Strong CG projected every continuous displacement into `b_eff` already.
+            Rounding::StrongCg => 0.0,
+            Rounding::Mir => {
+                if a < 0.0 {
+                    a * inv
+                } else {
+                    0.0
+                }
+            }
+        };
+    }
+    let fl = a.floor();
+    let fj = a - fl;
+    match kind {
+        Rounding::Mir => {
+            if fj > fb {
+                fl + (fj - fb) * inv
+            } else {
+                fl
+            }
+        }
+        Rounding::StrongCg => {
+            if fj <= fb {
+                fl
+            } else {
+                // `p = ⌈k·(f(a) − f)/(1 − f)⌉` clamped to `{1,…,k}`. `ceil` is a step: when its
+                // argument lands within a hair of an integer `m`, the exact `p` is `m` or `m+1`
+                // and the `f64` evaluation cannot tell which. Take whichever of the two the
+                // caller's direction needs.
+                let ku = k * (fj - fb) * inv;
+                let fr = ku - ku.floor();
+                let p = if !(1.0e-9..=1.0 - 1.0e-9).contains(&fr) {
+                    let m = ku.round();
+                    if want_max {
+                        m + 1.0
+                    } else {
+                        m
+                    }
+                } else {
+                    ku.ceil()
+                };
+                fl + p.clamp(1.0, k) / (k + 1.0)
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// In-process override of the screen gate. The env kill switch is read once and cached, which
+    /// is right for a solve but makes it impossible to run BOTH paths in one process — and the
+    /// property that matters about this screen ("the two paths return the same cuts") can only be
+    /// tested by running both. See `screen_scope`.
+    static SCREEN_FORCE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with the violation screen forced on or off.
+#[cfg(test)]
+fn screen_scope<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SCREEN_FORCE.with(|c| c.set(self.0));
+        }
+    }
+    let _r = Restore(SCREEN_FORCE.with(std::cell::Cell::get));
+    SCREEN_FORCE.with(|c| c.set(Some(on)));
+    f()
+}
+
+/// Kill switch for the violation screen — for A/B measurement and as an escape hatch.
+fn screen_off() -> bool {
+    if let Some(on) = SCREEN_FORCE.with(std::cell::Cell::get) {
+        return !on;
+    }
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var_os("AY_MILP_NO_SEP_SCREEN").is_some())
+}
+
+/// Audit mode: derive every delta exactly and check the screen's claim against it.
+fn screen_audit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("AY_MILP_SEP_SCREEN_AUDIT").is_some())
 }
 
 /// Search the c-MIR scalings and keep the deepest cut `round_fn` yields. SHARED by `mir_from_row`
@@ -3372,8 +3780,12 @@ fn best_over_deltas(
     x: &[f64],
     subs: &[Sub],
     b: &BigRational,
-    round_fn: fn(&Model, &[Sub], &BigRational, &BigRational) -> Option<Cut>,
+    kind: Rounding,
 ) -> Option<Cut> {
+    let round_fn = match kind {
+        Rounding::Mir => mir_round,
+        Rounding::StrongCg => strongcg_round,
+    };
     // The delta budget: `MAX_DELTAS` everywhere except inside a node-level separation round
     // (`node_delta_scope`), where each `round_fn` call is one exact-rational pass over the row and
     // the delta list multiplies the WHOLE round's bill — the tree runs thousands of rounds where
@@ -3397,21 +3809,118 @@ fn best_over_deltas(
         }
     }
 
+    crate::sepstat::bump(&crate::sepstat::DELTA_LISTS);
+    crate::sepstat::add(&crate::sepstat::DELTA_ENTRIES, deltas.len() as u64);
+
+    // THE VIOLATION SCREEN. Before any exact-rational pass, bound in `f64` how deeply the cut this
+    // `delta` would produce could possibly bite at `x`, and skip the passes that provably cannot
+    // matter. See `ScreenRow` / `screen_delta` for the derivation and the two admissible rules;
+    // both are OUTPUT-IDENTICAL, not approximations.
+    let screen = ScreenRow::build(model, x, subs, b, kind);
+    if screen.is_none() && !screen_off() {
+        crate::sepstat::bump(&crate::sepstat::SCREEN_BUILD_FAIL);
+    }
+    let mut ubs: Vec<Verdict> = Vec::new();
+    if let Some(sr) = screen.as_ref() {
+        ubs.reserve(deltas.len());
+        let mut row_max = f64::NEG_INFINITY;
+        let mut all_known = true;
+        for delta in &deltas {
+            let v = if delta.is_zero() {
+                Verdict::NoCut
+            } else {
+                sr.screen_delta(subs, delta, kind)
+            };
+            match v {
+                Verdict::Ub(u) => row_max = row_max.max(u),
+                Verdict::NoCut => {}
+                Verdict::Unknown => {
+                    all_known = false;
+                    crate::sepstat::bump(&crate::sepstat::SCREEN_UNKNOWN);
+                }
+            }
+            ubs.push(v);
+        }
+        crate::sepstat::add(&crate::sepstat::SCREEN_TRIED, deltas.len() as u64);
+        // AUDIT MODE. `AY_MILP_SEP_SCREEN_AUDIT=1` derives EVERY delta exactly, whatever the screen
+        // said, and checks the claim the screen actually makes: that `Ub(u)` is an upper bound on
+        // the finished cut's violation at `x`, and that `NoCut` means the kernel really returns
+        // `None`. It is the empirical half of the soundness argument in `ScreenRow` — the analytic
+        // half being the `damage`-implication and the monotonicity of both coefficient rules.
+        if screen_audit() {
+            for (di, delta) in deltas.iter().enumerate() {
+                if delta.is_zero() {
+                    continue;
+                }
+                let got = round_fn(model, subs, b, delta);
+                let v = got.as_ref().map_or(f64::NEG_INFINITY, |c| violation(c, x));
+                match ubs[di] {
+                    Verdict::NoCut if got.is_some() => {
+                        crate::sepstat::bump(&crate::sepstat::AUDIT_FAIL);
+                        eprintln!("AY_SEPSTAT AUDIT-FAIL NoCut but kernel derived a cut (v={v})");
+                    }
+                    Verdict::Ub(u) if v > u => {
+                        crate::sepstat::bump(&crate::sepstat::AUDIT_FAIL);
+                        eprintln!("AY_SEPSTAT AUDIT-FAIL violation {v} exceeds screen bound {u}");
+                        if std::env::var_os("AY_MILP_SEP_SCREEN_EXPLAIN").is_some() {
+                            if let (Some(sr), Some(c)) = (screen.as_ref(), got.as_ref()) {
+                                sr.explain(subs, delta, kind, c, x);
+                            }
+                        }
+                    }
+                    _ => crate::sepstat::bump(&crate::sepstat::AUDIT_OK),
+                }
+            }
+        }
+        // RULE A -- the WHOLE ROW. `best_over_deltas` returns a cut only if the winner's violation
+        // clears `MIN_VIOLATION`. If no delta on this row can reach that floor, then whichever cut
+        // won the efficacy ranking would have been thrown away by the final test, so the row's
+        // answer is `None` however the ranking came out -- and every exact pass on it is dead work.
+        if all_known && row_max <= MIN_VIOLATION {
+            crate::sepstat::add(&crate::sepstat::SCREEN_SKIP, deltas.len() as u64);
+            crate::sepstat::bump(&crate::sepstat::SCREEN_ROW_KILL);
+            return None;
+        }
+    }
+
     let mut best: Option<(f64, Cut)> = None;
-    for delta in &deltas {
+    for (di, delta) in deltas.iter().enumerate() {
         if delta.is_zero() {
             continue;
+        }
+        // RULE B -- ONE DELTA. A cut whose violation cannot exceed zero has `efficacy <= 0`, and
+        // the ranking below only ever takes a candidate with `v > 0.0`. Such a delta can therefore
+        // never become `best`, so not deriving it is invisible to the result.
+        if let Some(v) = ubs.get(di) {
+            let dead = match v {
+                Verdict::Ub(u) => *u <= 0.0,
+                Verdict::NoCut => true,
+                Verdict::Unknown => false,
+            };
+            if dead {
+                crate::sepstat::bump(&crate::sepstat::SCREEN_SKIP);
+                continue;
+            }
         }
         let Some(cut) = round_fn(model, subs, b, delta) else {
             continue;
         };
         let v = efficacy(&cut, x);
+        crate::sepstat::bump(if v > 0.0 {
+            &crate::sepstat::CAND_POS
+        } else {
+            &crate::sepstat::CAND_NONPOS
+        });
         if v > 0.0 && best.as_ref().is_none_or(|(bv, _)| v > *bv) {
             best = Some((v, cut));
         }
     }
     let (_, cut) = best?;
-    (violation(&cut, x) > MIN_VIOLATION).then_some(cut)
+    let out = (violation(&cut, x) > MIN_VIOLATION).then_some(cut);
+    if out.is_some() {
+        crate::sepstat::bump(&crate::sepstat::ROW_RET);
+    }
+    out
 }
 
 /// How deeply the cut bites at `x` -- its Euclidean distance from the point, which is scale-free.
@@ -3479,6 +3988,40 @@ fn efficacy(cut: &Cut, x: &[f64]) -> f64 {
 /// vertex they were built to cut off. Returns the kept cuts in rank order, and (as a
 /// parallel vector) the caller's per-cut tag permuted the same way — the MIR-family
 /// accounting in the root loop depends on tag and cut staying in step.
+///
+/// # W2: the fractionality-penalised rank (`frac_penalty`, DEFAULT OFF, measured LOSING)
+///
+/// The W2 campaign asked whether the rank should charge a cut for the fractionality it
+/// INTRODUCES as well as credit it for the depth it buys —
+/// the development design notes. The causal leg is real but small
+/// (controlling for bound, fractional share is significant at p = 0.028 and sign-stable
+/// across all 21 leave-one-instance-out fits, but adds only +0.10 to a within-instance
+/// R² of 0.336). This parameter is the mechanism, kept because the negative result is only
+/// re-checkable while its arm exists:
+///
+/// ```text
+///   rank key  =  depth(c)  /  (1 + frac_penalty · added(c))
+///   added(c)  =  |{ j ∈ supp(c) : j is an INTEGER column and x_j is currently INTEGRAL }|
+/// ```
+///
+/// `added` is the only admission-time proxy for induced fractionality that is actually
+/// available: a cut can only make an integer column newly fractional if it touches it, and a
+/// column already fractional at `x` is already being paid for. It is sharper than the cut
+/// DENSITY the campaign correlated (density counts continuous columns and already-fractional
+/// ones too), and it is exact, deterministic and free — no LP re-solve.
+///
+/// `frac_penalty = 0` makes the key `depth / 1.0`, which is bit-identical to the depth key
+/// (dividing an `f64` by exactly `1.0` is exact), so the default path is byte-for-byte the
+/// pre-W2 ranking. That is the A/B control and `frac_penalty_zero_is_the_depth_rank` pins it.
+///
+/// MEASURED ON 32 INSTANCES, AND IT DOES NOT WIN. At a fixed `TOPK=4` budget the penalised
+/// rank moves the tree on 8 instances — 3 better, 5 worse — for a geomean of 0.987x nodes
+/// against its own depth-ranked control (`lambda = 4`: 0.962x, still 3/5). But the budget it
+/// needs in order to bite is ITSELF a 1.287x loss against the shipped default, so the rule
+/// nets out **1.270x WORSE than shipping nothing**: it gives back 1.3% of nodes inside a lane
+/// that costs 28.7%. No verdict moved in either direction on any arm. It is structurally wrong on models
+/// where fractionality is how the bound arrives — fiber goes 43,594 -> 83,161 nodes. Default
+/// stays `0.0`; the arm stays so the negative result is re-checkable.
 pub(crate) fn select_cuts<T: Copy>(
     cuts: Vec<Cut>,
     tags: Vec<T>,
@@ -3486,16 +4029,40 @@ pub(crate) fn select_cuts<T: Copy>(
     max_keep: usize,
     max_parallel: f64,
     ncols: usize,
+    frac_penalty: f64,
+    newly_fractionable: &[bool],
 ) -> (Vec<Cut>, Vec<T>) {
     debug_assert_eq!(cuts.len(), tags.len());
     if cuts.is_empty() || (max_keep >= cuts.len() && max_parallel >= 1.0) {
         return (cuts, tags);
     }
-    // Rank by depth, deepest first. `sort_by` with a total-order fallback keeps this
-    // deterministic on ties and on any NaN a degenerate row could produce — the engine's
-    // determinism guarantee is not negotiable for a ranking heuristic.
+    // Rank by depth (penalised, if W2 is on), deepest first. `sort_by` with a total-order
+    // fallback keeps this deterministic on ties and on any NaN a degenerate row could
+    // produce — the engine's determinism guarantee is not negotiable for a ranking
+    // heuristic.
     let mut order: Vec<usize> = (0..cuts.len()).collect();
-    let depth: Vec<f64> = cuts.iter().map(|c| efficacy(c, x)).collect();
+    let key: Vec<f64> = cuts
+        .iter()
+        .map(|c| {
+            let d = efficacy(c, x);
+            if frac_penalty <= 0.0 {
+                return d;
+            }
+            // Count the integer columns this row touches that are INTEGRAL right now —
+            // the ones it could newly fractionalise. `get` because a cut may name a
+            // column the caller's mask does not cover (a slack introduced by the
+            // aggregator); an unknown column is charged nothing rather than panicking
+            // inside a ranking heuristic.
+            let added = c
+                .coeffs
+                .iter()
+                .filter(|&&(j, a)| {
+                    a != 0.0 && newly_fractionable.get(j.index()).copied().unwrap_or(false)
+                })
+                .count();
+            d / (1.0 + frac_penalty * added as f64)
+        })
+        .collect();
     let norm: Vec<f64> = cuts
         .iter()
         .map(|c| {
@@ -3508,8 +4075,8 @@ pub(crate) fn select_cuts<T: Copy>(
         })
         .collect();
     order.sort_by(|&a, &b| {
-        depth[b]
-            .partial_cmp(&depth[a])
+        key[b]
+            .partial_cmp(&key[a])
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.cmp(&b))
     });
@@ -3570,10 +4137,28 @@ pub(crate) fn select_cuts<T: Copy>(
 /// with `f = b − ⌊b⌋` and `f_j = a_j − ⌊a_j⌋`, all in exact rationals. `f = 0` means the
 /// right-hand side was already integral and there is nothing to round.
 fn mir_round(model: &Model, subs: &[Sub], b: &BigRational, delta: &BigRational) -> Option<Cut> {
+    if !crate::sepstat::on() {
+        return mir_round_inner(model, subs, b, delta);
+    }
+    crate::sepstat::bump(&crate::sepstat::MIR_PASS);
+    let r = mir_round_inner(model, subs, b, delta);
+    if r.is_some() {
+        crate::sepstat::bump(&crate::sepstat::MIR_SOME);
+    }
+    r
+}
+
+fn mir_round_inner(
+    model: &Model,
+    subs: &[Sub],
+    b: &BigRational,
+    delta: &BigRational,
+) -> Option<Cut> {
     let one = BigRational::one();
     let bd = b / delta;
     let fb = &bd - bd.floor();
     if fb.is_zero() {
+        crate::sepstat::bump(&crate::sepstat::MIR_EARLY);
         return None; // nothing to round
     }
 
@@ -3589,6 +4174,7 @@ fn mir_round(model: &Model, subs: &[Sub], b: &BigRational, delta: &BigRational) 
     // came from. Every real solver refuses it; this one now does too.
     let fmin = BigRational::new(1.into(), 100.into()); // 0.01
     if fb < fmin || fb > &one - &fmin {
+        crate::sepstat::bump(&crate::sepstat::MIR_EARLY);
         return None;
     }
     let inv = &one / (&one - &fb);
@@ -3650,7 +4236,9 @@ fn mir_round(model: &Model, subs: &[Sub], b: &BigRational, delta: &BigRational) 
     }
 
     // To f64, paying for the rounding in the right-hand side so the stored cut is IMPLIED by the
-    // exact one.
+    // exact one. A `<=` store, so the directed fallback in `coef_to_f64` rounds a non-negative
+    // column's coefficient DOWN -- the opposite of the GMI `>=` store, and the reason the side is
+    // passed in rather than guessed.
     let mut damage = BigRational::zero();
     let mut out: Vec<(Col, f64)> = Vec::with_capacity(xc.len());
     for (j, c) in xc {
@@ -3658,29 +4246,20 @@ fn mir_round(model: &Model, subs: &[Sub], b: &BigRational, delta: &BigRational) 
             continue;
         }
         let col = Col(j as u32);
-        let cf = to_f64(&c);
-        if !cf.is_finite() {
-            return None;
-        }
-        let back = exact(cf)?;
-        let err = (&back - &c).abs();
-        if !err.is_zero() {
-            let (lo, up) = model.col_bounds(col);
-            if !lo.is_finite() || !up.is_finite() {
-                return None;
-            }
-            damage += err * exact(lo.abs().max(up.abs()))?;
-        }
+        let (cf, cost) = coef_to_f64(model, col, &c, CutSide::Le)?;
+        damage += cost;
         if cf != 0.0 {
             out.push((col, cf));
         }
     }
     if out.is_empty() {
+        crate::sepstat::bump(&crate::sepstat::LATE_EMPTY);
         return None;
     }
     let relaxed = &rhs + &damage;
     let ub0 = to_f64(&relaxed);
     if !ub0.is_finite() {
+        crate::sepstat::bump(&crate::sepstat::LATE_NONFINITE);
         return None;
     }
     let ub = if exact(ub0)? < relaxed {
@@ -3698,6 +4277,7 @@ fn mir_round(model: &Model, subs: &[Sub], b: &BigRational, delta: &BigRational) 
         .filter(|&a| a > 0.0)
         .fold(f64::INFINITY, f64::min);
     if hi > MAX_CUT_COEFF || ub.abs() > MAX_CUT_COEFF || hi / lo > MAX_CUT_DYNAMISM {
+        crate::sepstat::bump(&crate::sepstat::LATE_ABSURD);
         return None;
     }
 
@@ -3755,6 +4335,23 @@ fn strongcg_round(
     b: &BigRational,
     delta: &BigRational,
 ) -> Option<Cut> {
+    if !crate::sepstat::on() {
+        return strongcg_round_inner(model, subs, b, delta);
+    }
+    crate::sepstat::bump(&crate::sepstat::SCG_PASS);
+    let r = strongcg_round_inner(model, subs, b, delta);
+    if r.is_some() {
+        crate::sepstat::bump(&crate::sepstat::SCG_SOME);
+    }
+    r
+}
+
+fn strongcg_round_inner(
+    model: &Model,
+    subs: &[Sub],
+    b: &BigRational,
+    delta: &BigRational,
+) -> Option<Cut> {
     let one = BigRational::one();
     let zero = BigRational::zero();
 
@@ -3767,7 +4364,11 @@ fn strongcg_round(
             continue;
         }
         if s.a < zero {
-            let r = strongcg_range(model, &s.var)?; // no finite range on the paying side: no cut
+            // no finite range on the paying side: no cut
+            let Some(r) = strongcg_range(model, &s.var) else {
+                crate::sepstat::bump(&crate::sepstat::SCG_RANGE_NONE);
+                return None;
+            };
             b_pen += (-&s.a) * &r;
         }
     }
@@ -3775,17 +4376,20 @@ fn strongcg_round(
     let bd = &b_pen / delta;
     let fb = &bd - bd.floor();
     if fb.is_zero() {
+        crate::sepstat::bump(&crate::sepstat::SCG_EARLY);
         return None;
     }
     // Same fractionality guard as `mir_round`: a row a hair from integral rounds to a catastrophe of
     // a cut. It also caps `k = ⌈1/f⌉ − 1 <= 99`, so the `p/(k+1)` denominators stay small.
     let fmin = BigRational::new(1.into(), 100.into()); // 0.01
     if fb < fmin || fb > &one - &fmin {
+        crate::sepstat::bump(&crate::sepstat::SCG_EARLY);
         return None;
     }
     // k = ⌈1/f⌉ − 1, the unique integer with 1/(k+1) <= f < 1/k (kept as an integer-valued rational).
     let k_rat = (&one / &fb).ceil() - &one;
     if k_rat < one {
+        crate::sepstat::bump(&crate::sepstat::SCG_EARLY);
         return None;
     }
     let kp1 = &k_rat + &one;
@@ -3845,7 +4449,7 @@ fn strongcg_round(
     }
 
     // To f64, paying for the rounding in the right-hand side so the stored cut is IMPLIED by the
-    // exact one -- verbatim from `mir_round`.
+    // exact one -- verbatim from `mir_round`, `<=` store and all.
     let mut damage = BigRational::zero();
     let mut out: Vec<(Col, f64)> = Vec::with_capacity(xc.len());
     for (j, c) in xc {
@@ -3853,29 +4457,20 @@ fn strongcg_round(
             continue;
         }
         let col = Col(j as u32);
-        let cf = to_f64(&c);
-        if !cf.is_finite() {
-            return None;
-        }
-        let back = exact(cf)?;
-        let err = (&back - &c).abs();
-        if !err.is_zero() {
-            let (lo, up) = model.col_bounds(col);
-            if !lo.is_finite() || !up.is_finite() {
-                return None;
-            }
-            damage += err * exact(lo.abs().max(up.abs()))?;
-        }
+        let (cf, cost) = coef_to_f64(model, col, &c, CutSide::Le)?;
+        damage += cost;
         if cf != 0.0 {
             out.push((col, cf));
         }
     }
     if out.is_empty() {
+        crate::sepstat::bump(&crate::sepstat::LATE_EMPTY);
         return None;
     }
     let relaxed = &rhs + &damage;
     let ub0 = to_f64(&relaxed);
     if !ub0.is_finite() {
+        crate::sepstat::bump(&crate::sepstat::LATE_NONFINITE);
         return None;
     }
     let ub = if exact(ub0)? < relaxed {
@@ -3892,6 +4487,7 @@ fn strongcg_round(
         .filter(|&a| a > 0.0)
         .fold(f64::INFINITY, f64::min);
     if hi > MAX_CUT_COEFF || ub.abs() > MAX_CUT_COEFF || hi / lo > MAX_CUT_DYNAMISM {
+        crate::sepstat::bump(&crate::sepstat::LATE_ABSURD);
         return None;
     }
 
@@ -3906,6 +4502,13 @@ fn strongcg_round(
 /// A substituted continuous column ranges over its box `up − lo`; the VUB slack `s = u·y − x` ranges
 /// over `[0, u − lo_x]` (`y ∈ {0,1}`, `x >= lo_x`), and `u − lo_x` upper-bounds it. `None` when the
 /// paying side is unbounded — the cut cannot be paid for and is refused.
+///
+/// NOT a candidate for the directed rounding in [`coef_to_f64`], and deliberately left alone when
+/// the other five unbounded-column bails in this file were replaced by it. Those five were paying
+/// for `f64` CONVERSION, an artefact the exact derivation never asked for; this one is paying
+/// `|a|·R` for genuinely DROPPING a continuous displacement out of the row, which is a term of the
+/// Letchford–Lodi inequality itself. An infinite `R` means the dropped term really can move the
+/// left-hand side without limit, and no rounding direction changes that. The refusal is the maths.
 fn strongcg_range(model: &Model, var: &Var) -> Option<BigRational> {
     match var {
         Var::Col(j) => {
@@ -3940,6 +4543,170 @@ fn next_up(v: f64) -> f64 {
     }
     let b = v.to_bits();
     f64::from_bits(if v > 0.0 { b + 1 } else { b - 1 })
+}
+
+/// Which side a cut is STORED on. The direction a coefficient may be rounded depends on it, and
+/// getting it backwards manufactures an invalid cut, so it is passed explicitly rather than
+/// inferred at each call site.
+#[derive(Clone, Copy)]
+enum CutSide {
+    /// `Σ c·x >= lb`, i.e. `Cut { lb, ub: f64::INFINITY }` -- GMI and mixing store this way.
+    Ge,
+    /// `Σ c·x <= ub`, i.e. `Cut { lb: f64::NEG_INFINITY, ub }` -- MIR, strong CG and the
+    /// aggregated tableau MIR store this way.
+    Le,
+}
+
+/// ONE exact cut coefficient down to `f64`, plus the exact damage the conversion owes the
+/// right-hand side. `None` refuses the whole cut.
+///
+/// # The bail this replaces, and how much of the corpus it was silencing
+///
+/// Every separator in this file derives in exact rationals and then has to store an `f64` row. The
+/// only way that store can be made safe is to pay for the rounding: `ĉ_j` differs from `c_j` by
+/// `|ĉ_j − c_j|`, the term moves by that times `x_j`, and relaxing the right-hand side by
+/// `Σ |ĉ_j − c_j| · max|x_j|` over the column's BOX makes the stored cut IMPLIED by the exact one.
+/// That argument needs a finite box, so the code did the only other safe thing available and threw
+/// the entire cut away the moment one column was unbounded:
+///
+/// ```text
+///     let span = lo.abs().max(up.abs());
+///     if !span.is_finite() { return None; }
+/// ```
+///
+/// ONE such column anywhere in a dense row killed the row. Counted over the 90 smallest instances
+/// of `~/ay-bench/milp` by replaying the reader's bound defaults (`mps.rs`: a column with no
+/// `BOUNDS` entry is `[0, +inf)`), 60 of them -- 67% -- carry at least one column with an infinite
+/// side, and only 13 carry a genuinely FREE one. So the bail was firing on the ordinary case and
+/// the case it was actually written for is rare. A model whose general integers are ALL unbounded
+/// -- gen-ip002, gen-ip021, gen-ip054, ej -- got literally zero cuts out of this engine, at the
+/// root and at every node.
+///
+/// # Directed rounding, which pays nothing and needs no bound
+///
+/// The span payment is not the only sound conversion. For a `>=` cut and a column with `lo >= 0`,
+/// round `c_j` UP to the next representable `f64`:
+///
+/// ```text
+///   ĉ_j >= c_j  and  x_j >= 0   =>   ĉ_j·x_j >= c_j·x_j   =>   Σ ĉ·x >= Σ c·x >= lb
+/// ```
+///
+/// so every point the exact cut admits the stored one admits too -- with the SAME right-hand side,
+/// no payment, and no reference to `up` at all. The three mirrors follow from the same two-line
+/// argument: a `>=` cut with `up <= 0` rounds DOWN, a `<=` cut with `lo >= 0` rounds DOWN, a `<=`
+/// cut with `up <= 0` rounds UP. That is strictly MORE sound than the bail (which had to discard a
+/// valid inequality) and never less: it is the exact cut, weakened.
+///
+/// The one column shape neither argument reaches is the genuinely FREE one, `-inf..+inf`, where
+/// `x_j` has no sign and `(ĉ_j − c_j)·x_j` has no sign either. Those still refuse the cut. A column
+/// bounded on one side only but straddling zero (`-3..+inf`) is the same case and refuses too.
+///
+/// This is not a new argument in this file: `emit_le_cut` already runs the `<=` / `lo == 0` corner
+/// of it, and its note records that it is what keeps khb05250's unbounded flow columns admissible.
+/// What is new is that the other four corners exist and that the five general emitters now use
+/// them, instead of every one of them refusing the row.
+///
+/// # Why the box path is kept where the box exists
+///
+/// A two-sided-finite box gets the ORIGINAL nearest-`f64` coefficient and pays the span, because
+/// that is a strictly tighter row than the directed one: the directed store moves the coefficient
+/// by up to a full ulp to buy a zero payment, and on a bounded column the ulp is worth more than
+/// the payment it saves. Only a column the span argument cannot serve at all takes the new path.
+///
+/// A coefficient that is ALREADY an `f64` (`err == 0`) now short-circuits before the box is even
+/// consulted -- it owes nothing, so an unbounded column carrying an exact coefficient no longer
+/// kills a cut either. That case was previously lost purely to the order of the two tests.
+///
+/// # What it is worth
+///
+/// `AY_ROOT_CLOSURE=1`, 10s cut share, the 90 smallest instances of `~/ay-bench/milp`, two
+/// binaries built from the same tree and differing only in this file:
+///
+/// ```text
+///   instances shipping ZERO root cuts   28  ->  10
+///   mean root closure                 4.97% -> 7.34%
+///   closure improved on 28, regressed on 1, root-loop wall 30.3s -> 30.5s over the 90
+/// ```
+///
+/// The eighteen that went from "separates nothing" to a live pool: ej, enlight4, enlight8,
+/// enlight9, enlight11, enlight_hard, b-ball, blend2, dcmulti, gen-ip002, gen-ip016, gen-ip021,
+/// gen-ip036, gen-ip054, misc05inf, neos-3072252-nete, neos-3754480-nidda, neos-5192052-neckar.
+/// The largest single gains are b-ball 0 -> 75.35% and neos-3754480-nidda 0 -> 5.94%; the
+/// unbounded-general-integer family lands at gen-ip002 1.81%, gen-ip021 1.80%, gen-ip054 0.91%.
+/// Instances that already had a pool gain too, because the bail was also silencing individual
+/// ROWS inside them: gr4x6 38.3% -> 71.8%, ran13x13 7.5% -> 17.6%, flugpl 2.0% -> 9.3%,
+/// rout 0.32% -> 0.61%.
+///
+/// THE ONE CLOSURE REGRESSION is nexp-50-20-1-1, 14.5% -> 5.9%, and it is a SELECTION effect
+/// rather than a weaker row: the instance goes from 3 cuts to 6, and `select_cuts` ranks the
+/// newly-admissible rows above the ones that were moving the bound. That is the known open problem
+/// this file already records at `separate_mir`'s note ("the unsolved problem here is not which
+/// family: it is WHICH CUTS TO KEEP"), now with one more instance in its evidence.
+///
+/// A 15s FULL-SOLVE sweep over the same 90 instances moves no verdict that survives a re-run.
+/// Zero disagreements against the MIPLIB reference in either arm. Two differences appeared:
+///   * newdano UNKNOWN -> FEASIBLE (incumbent 92.667), and it REPRODUCES on repeat runs — the
+///     search had no incumbent at all before and now finds one;
+///   * neos-3610040-iskar OPTIMAL -> FEASIBLE, and it does NOT reproduce: run alone at a 15s
+///     limit both arms prove OPTIMAL 37 in ~11.98s at an identical 68,681 nodes, so the sweep was
+///     measuring its own machine load against a 15s wall, not this change.
+///
+/// # Which bounds these are
+///
+/// `model.col_bounds` is the GLOBAL bound array in every caller (`bab.rs:4887` passes the root
+/// loop's model; `bab.rs:22447` passes the root `model` itself at tree nodes), so `lo >= 0` here is
+/// a fact about the model, not about a node. A node's bounds are tighter, so `lo_node >= lo >= 0`
+/// and the sign argument survives being carried down the tree -- which is what makes a cut derived
+/// once safe to keep everywhere. This is the same license the span payment already ran on.
+fn coef_to_f64(
+    model: &Model,
+    col: Col,
+    c: &BigRational,
+    side: CutSide,
+) -> Option<(f64, BigRational)> {
+    let cf = c.to_f64()?;
+    if !cf.is_finite() {
+        return None;
+    }
+    let back = exact(cf)?;
+    let err = (&back - c).abs();
+    if err.is_zero() {
+        return Some((cf, BigRational::zero()));
+    }
+    let (lo, up) = model.col_bounds(col);
+    if lo.is_finite() && up.is_finite() {
+        return Some((cf, err * exact(lo.abs().max(up.abs()))?));
+    }
+
+    // No finite box. `lo >= 0.0` is false for `-inf` and `up <= 0.0` is false for `+inf`, so these
+    // two tests already exclude the free and the straddling column without a separate check.
+    let round_up = match (side, lo >= 0.0, up <= 0.0) {
+        (CutSide::Ge, true, _) | (CutSide::Le, _, true) => true,
+        (CutSide::Ge, _, true) | (CutSide::Le, true, _) => false,
+        _ => return None,
+    };
+    // `to_f64`'s rounding mode is not part of its contract, so the direction is not assumed from
+    // it: take the neighbour only when the nearest value is on the wrong side, then PROVE the
+    // result lies where the argument above needs it. A cut is the one thing here that can delete
+    // an optimum, so the inequality is checked exactly rather than reasoned about.
+    let adj = if round_up {
+        if &back > c {
+            cf
+        } else {
+            next_up(cf)
+        }
+    } else if &back < c {
+        cf
+    } else {
+        next_down(cf)
+    };
+    let adj_exact = exact(adj)?; // `None` if a neighbour step overflowed to an infinity
+    let sound = if round_up {
+        &adj_exact >= c
+    } else {
+        &adj_exact <= c
+    };
+    sound.then(|| (adj, BigRational::zero()))
 }
 
 #[cfg(test)]
@@ -4071,6 +4838,241 @@ mod gmi_tests {
             "only {cases_with_cuts} cases produced GMI cuts; the guard is near-vacuous"
         );
     }
+
+    /// THE FOUR DIRECTED-ROUNDING CORNERS, AND THE ONE REFUSAL.
+    ///
+    /// [`coef_to_f64`] is the only place in this file where getting a SIGN backwards produces an
+    /// inequality that is stronger than the exact one it claims to represent — which is a deleted
+    /// optimum, reported as OPTIMAL. The brute-force guard below catches that on models; this
+    /// catches it on the arithmetic, where the failure message names the corner.
+    ///
+    /// `1/3` is not an `f64`, so every conversion here really does move the coefficient and the
+    /// `err.is_zero()` short-circuit cannot make the test vacuous.
+    #[test]
+    fn coef_to_f64_rounds_the_way_the_stored_side_needs() {
+        let mut m = Model::new();
+        let nonneg = m.add_int_col(0.0, f64::INFINITY);
+        let nonpos = m.add_int_col(f64::NEG_INFINITY, 0.0);
+        let free = m.add_int_col(f64::NEG_INFINITY, f64::INFINITY);
+        let straddle = m.add_int_col(-3.0, f64::INFINITY);
+        let boxed = m.add_int_col(0.0, 10.0);
+
+        let third = BigRational::new(1.into(), 3.into());
+        for c in [third.clone(), -third] {
+            // `>=` store: the term must never SHRINK, so a non-negative column rounds up and a
+            // non-positive one rounds down.
+            let (f, cost) = coef_to_f64(&m, nonneg, &c, CutSide::Ge).unwrap();
+            assert!(cost.is_zero(), "a directed store owes no damage");
+            assert!(
+                exact(f).unwrap() >= c,
+                "Ge / x>=0 must round UP: {f} vs {c}"
+            );
+            let (f, cost) = coef_to_f64(&m, nonpos, &c, CutSide::Ge).unwrap();
+            assert!(cost.is_zero());
+            assert!(
+                exact(f).unwrap() <= c,
+                "Ge / x<=0 must round DOWN: {f} vs {c}"
+            );
+            // `<=` store: the term must never GROW, so both directions flip.
+            let (f, cost) = coef_to_f64(&m, nonneg, &c, CutSide::Le).unwrap();
+            assert!(cost.is_zero());
+            assert!(
+                exact(f).unwrap() <= c,
+                "Le / x>=0 must round DOWN: {f} vs {c}"
+            );
+            let (f, cost) = coef_to_f64(&m, nonpos, &c, CutSide::Le).unwrap();
+            assert!(cost.is_zero());
+            assert!(
+                exact(f).unwrap() >= c,
+                "Le / x<=0 must round UP: {f} vs {c}"
+            );
+
+            // No sign, no argument — and one open side is not enough if the column straddles zero.
+            for col in [free, straddle] {
+                for side in [CutSide::Ge, CutSide::Le] {
+                    assert!(
+                        coef_to_f64(&m, col, &c, side).is_none(),
+                        "a column with no sign must still refuse the cut"
+                    );
+                }
+            }
+
+            // A two-sided-finite box keeps the OLD behaviour verbatim: the nearest `f64`, and the
+            // span payment. Moving that to directed rounding would cost a full ulp of coefficient
+            // to save a payment the box can already afford.
+            let (f, cost) = coef_to_f64(&m, boxed, &c, CutSide::Ge).unwrap();
+            assert_eq!(
+                f,
+                c.to_f64().unwrap(),
+                "a boxed column takes the nearest f64"
+            );
+            assert_eq!(cost, (&exact(f).unwrap() - &c).abs() * exact(10.0).unwrap());
+        }
+    }
+
+    /// A CUT MAY NOT DELETE AN INTEGER POINT WHEN A COLUMN HAS NO FINITE BOUND ON ONE SIDE.
+    ///
+    /// Five emitters used to pay for their `f64` rounding over the column's SPAN and refuse the
+    /// whole cut when that span was infinite. [`coef_to_f64`] now rounds such a coefficient in the
+    /// direction the column's SIGN makes free instead, which weakens the row rather than
+    /// discarding it — but a flipped direction TIGHTENS it, and a tightened cut deletes an
+    /// optimum and reports OPTIMAL. So it is brute-forced, on both signs at once.
+    ///
+    /// The model carries one integer column unbounded ABOVE (`lo = 0`) and one unbounded BELOW
+    /// (`up = 0`), each pinned to a finite range by a ROW rather than by its column bounds — which
+    /// is what leaves them unbounded to the separators while keeping the feasible set enumerable.
+    /// Every family that shares the emitter is separated on the same models: the `>=` stores (GMI,
+    /// mixing) and the `<=` stores (MIR, strong CG, aggregated MIR, tableau MIR, dual-aggregate
+    /// MIR).
+    ///
+    /// NEGATIVE CONTROL, run and recorded — BOTH directions, because a guard that cannot fail
+    /// proves nothing:
+    ///   * `(CutSide::Ge, lo >= 0)` flipped to round DOWN: fails at case 46, `a >= cut deleted the
+    ///     feasible integer point [2.0, -2.0, 0.0, 3.0]`.
+    ///   * `(CutSide::Le, lo >= 0)` flipped to round UP: fails at case 2, `a <= cut deleted the
+    ///     feasible integer point [3.0, -1.0, 4.0, 4.0]`.
+    /// Both flips were made, the failures observed, and both reverted.
+    ///
+    /// The first draft of this guard could NOT fail either flip: it compared the `f64` activity
+    /// against `cut.lb - 1e-6`, and a wrong rounding direction is one ulp. The exact evaluation
+    /// below is what makes it a control, and the reason is recorded at the assertion itself.
+    #[test]
+    fn cuts_never_remove_an_integer_point_with_an_unbounded_column() {
+        let mut seed = 0x11B0_2026_u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) as i64
+        };
+        const HI: i64 = 4;
+
+        let mut touching = 0usize;
+        for case in 0..300 {
+            let mut m = Model::new();
+            let up_free = m.add_int_col(0.0, f64::INFINITY); // unbounded ABOVE, x >= 0
+            let dn_free = m.add_int_col(f64::NEG_INFINITY, 0.0); // unbounded BELOW, x <= 0
+            let ints = m.add_int_col(0.0, HI as f64);
+            let cont = m.add_col(0.0, HI as f64);
+            let cols = [up_free, dn_free, ints, cont];
+            let n = cols.len();
+
+            let mut rows: Vec<(Vec<f64>, f64, f64)> = Vec::new();
+            m.add_row(f64::NEG_INFINITY, HI as f64, &[(up_free, 1.0)]);
+            rows.push((vec![1.0, 0.0, 0.0, 0.0], f64::NEG_INFINITY, HI as f64));
+            m.add_row(-(HI as f64), f64::INFINITY, &[(dn_free, 1.0)]);
+            rows.push((vec![0.0, 1.0, 0.0, 0.0], -(HI as f64), f64::INFINITY));
+
+            for _ in 0..3 {
+                let a: Vec<f64> = (0..n).map(|_| (rnd().rem_euclid(7) - 3) as f64).collect();
+                if a.iter().all(|&v| v == 0.0) {
+                    continue;
+                }
+                let ub = (rnd().rem_euclid(13) - 4) as f64;
+                let terms: Vec<_> = cols
+                    .iter()
+                    .zip(&a)
+                    .filter(|&(_, &v)| v != 0.0)
+                    .map(|(&c, &v)| (c, v))
+                    .collect();
+                m.add_row(f64::NEG_INFINITY, ub, &terms);
+                rows.push((a, f64::NEG_INFINITY, ub));
+            }
+            if rows.len() == 2 {
+                continue;
+            }
+            let obj: Vec<(Col, f64)> = cols
+                .iter()
+                .map(|&c| (c, (rnd().rem_euclid(5) - 2) as f64))
+                .collect();
+            m.set_objective(&obj, Sense::Minimize);
+
+            let objective: Vec<(u32, f64)> = (0..m.num_cols())
+                .map(|j| (j as u32, m.obj_coeff(Col(j as u32))))
+                .filter(|&(_, a)| a != 0.0)
+                .collect();
+            let Some(lp) = FloatLp::from_model(&m, &objective, Sense::Minimize) else {
+                continue;
+            };
+            let cand = lp.solve_bounded(&lp.lower.clone(), &lp.upper.clone(), None, None);
+            if cand.status != crate::simplex::SimplexStatus::Optimal {
+                continue;
+            }
+            let x: Vec<f64> = cand.values[..n].to_vec();
+
+            let mut cuts = separate_gmi(&m, &lp, &cand, None);
+            cuts.extend(separate_mixing(&m, &x, m.num_rows(), 8));
+            cuts.extend(separate_mir(&m, &x, m.num_rows(), 8));
+            cuts.extend(separate_strongcg(&m, &x, m.num_rows(), 8));
+            cuts.extend(separate_mir_agg(&m, &x, m.num_rows(), 8));
+            cuts.extend(separate_mir_tableau(&m, &lp, &cand));
+            cuts.extend(separate_mir_dual_agg(&m, &lp, &cand));
+
+            touching += cuts
+                .iter()
+                .filter(|c| {
+                    c.coeffs
+                        .iter()
+                        .any(|&(col, a)| a != 0.0 && (col == up_free || col == dn_free))
+                })
+                .count();
+
+            for x0 in 0..=HI {
+                for x1 in -HI..=0 {
+                    for x2 in 0..=HI {
+                        // `cont` is continuous and is swept on the integer lattice: a SUBSET of
+                        // the feasible set, which is all a "must not delete" check needs.
+                        for x3 in 0..=HI {
+                            let pt = [x0 as f64, x1 as f64, x2 as f64, x3 as f64];
+                            let feasible = rows.iter().all(|(a, lo, hi)| {
+                                let act: f64 = a.iter().zip(pt).map(|(&ai, xi)| ai * xi).sum();
+                                act >= *lo - 1e-9 && act <= *hi + 1e-9
+                            });
+                            if !feasible {
+                                continue;
+                            }
+                            for cut in &cuts {
+                                // EXACT, AND WITH ZERO TOLERANCE. A wrong rounding DIRECTION
+                                // moves a coefficient by one ulp, which a `1e-6` float check
+                                // cannot see — that slack is what let the first draft of this
+                                // test pass with the `>=` arm deliberately flipped. The property
+                                // being asserted is "the stored cut is implied by the exact one",
+                                // and it is an exact statement: the exact cut is valid, so every
+                                // feasible integer point must satisfy the STORED row with no
+                                // slack at all. Evaluating `Σ c·x` in `f64` would reintroduce a
+                                // rounding of its own and hide exactly the defect being guarded.
+                                let mut act = BigRational::zero();
+                                for &(c, a) in &cut.coeffs {
+                                    act += exact(a).unwrap() * exact(pt[c.index()]).unwrap();
+                                }
+                                if cut.lb.is_finite() {
+                                    assert!(
+                                        act >= exact(cut.lb).unwrap(),
+                                        "case {case}: a `>=` cut deleted the feasible integer \
+                                         point {pt:?}: activity {act} < {} (seed {seed:#x})",
+                                        cut.lb
+                                    );
+                                }
+                                if cut.ub.is_finite() {
+                                    assert!(
+                                        act <= exact(cut.ub).unwrap(),
+                                        "case {case}: a `<=` cut deleted the feasible integer \
+                                         point {pt:?}: activity {act} > {} (seed {seed:#x})",
+                                        cut.ub
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Under the bail this replaces, a stored cut carrying a nonzero coefficient on either
+        // unbounded column was IMPOSSIBLE — the emitter refused the whole row. So this count is
+        // both the anti-vacuity check and the direct evidence that the new path is what ran.
+        assert!(
+            touching >= 10,
+            "only {touching} cuts touched an unbounded column; the guard is near-vacuous"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4098,7 +5100,7 @@ mod selection_tests {
         ];
         let want: Vec<Vec<(Col, f64)>> = cuts.iter().map(|c| c.coeffs.clone()).collect();
         let x = vec![1.0, 1.0, 1.0];
-        let (got, tags) = select_cuts(cuts, vec![0u8, 1, 2], &x, usize::MAX, 1.0, 3);
+        let (got, tags) = select_cuts(cuts, vec![0u8, 1, 2], &x, usize::MAX, 1.0, 3, 0.0, &[]);
         assert_eq!(tags, vec![0, 1, 2]);
         let got: Vec<Vec<(Col, f64)>> = got.into_iter().map(|c| c.coeffs).collect();
         assert_eq!(got, want);
@@ -4121,6 +5123,8 @@ mod selection_tests {
             usize::MAX,
             0.99,
             3,
+            0.0,
+            &[],
         );
         assert_eq!(got.len(), 1, "a duplicated inequality must be kept once");
         assert_eq!(tags, vec!["deep"], "the survivor must be the deeper row");
@@ -4137,7 +5141,7 @@ mod selection_tests {
             cut(&[(2, 1.0)], 0.5),
         ];
         let x = vec![1.0, 1.0, 1.0];
-        let (got, _) = select_cuts(cuts, vec![0u8, 1, 2], &x, usize::MAX, 0.5, 3);
+        let (got, _) = select_cuts(cuts, vec![0u8, 1, 2], &x, usize::MAX, 0.5, 3, 0.0, &[]);
         assert_eq!(got.len(), 3);
     }
 
@@ -4152,7 +5156,7 @@ mod selection_tests {
             cut(&[(2, 1.0)], 0.5),
         ];
         let x = vec![1.0, 1.0, 1.0];
-        let (got, tags) = select_cuts(cuts, vec!["a", "b", "c"], &x, 2, 1.0, 3);
+        let (got, tags) = select_cuts(cuts, vec!["a", "b", "c"], &x, 2, 1.0, 3, 0.0, &[]);
         assert_eq!(got.len(), 2);
         assert_eq!(
             tags,
@@ -4173,8 +5177,271 @@ mod selection_tests {
             ub: f64::INFINITY,
         };
         let x = vec![1.0, 1.0, 0.0];
-        let (got, _) = select_cuts(vec![up, down], vec![0u8, 1], &x, usize::MAX, 0.9, 3);
+        let (got, _) = select_cuts(
+            vec![up, down],
+            vec![0u8, 1],
+            &x,
+            usize::MAX,
+            0.9,
+            3,
+            0.0,
+            &[],
+        );
         assert_eq!(got.len(), 1);
+    }
+
+    // ---------------------------------------------------------------------------------
+    // W2 — the fractionality-penalised rank (default off; see the doc on `select_cuts`).
+    // ---------------------------------------------------------------------------------
+
+    /// `frac_penalty = 0` MUST be the pre-W2 depth rank, whatever mask it is handed.
+    ///
+    /// This is the A/B control for the whole W2 measurement. If a zero penalty perturbed
+    /// the order even once, the arm would be measuring the reordering and not the rule,
+    /// which is the exact mistake `identity_settings_are_the_identity` exists to prevent
+    /// one level up. `depth / (1 + 0·k)` is `depth / 1.0`, and dividing an `f64` by exactly
+    /// `1.0` is exact — so this is a bit-for-bit claim, not a tolerance claim.
+    #[test]
+    fn frac_penalty_zero_is_the_depth_rank() {
+        let mk = || {
+            vec![
+                cut(&[(0, 1.0)], 0.1),
+                cut(&[(1, 1.0)], 0.9),
+                cut(&[(2, 1.0)], 0.5),
+            ]
+        };
+        let x = vec![1.0, 1.0, 1.0];
+        // A mask that WOULD reorder everything if it were consulted: the DEEPEST row's
+        // column (0, depth 0.9) is the only "newly fractionable" one, so any nonzero
+        // penalty would demote it below `c`.
+        let mask = [true, false, false];
+        let (plain, plain_tags) = select_cuts(mk(), vec!["a", "b", "c"], &x, 2, 1.0, 3, 0.0, &[]);
+        let (masked, masked_tags) =
+            select_cuts(mk(), vec!["a", "b", "c"], &x, 2, 1.0, 3, 0.0, &mask);
+        assert_eq!(plain_tags, masked_tags);
+        assert_eq!(
+            plain_tags,
+            vec!["a", "c"],
+            "deepest first: a (0.9), c (0.5)"
+        );
+        let coeffs =
+            |cs: Vec<Cut>| -> Vec<Vec<(Col, f64)>> { cs.into_iter().map(|c| c.coeffs).collect() };
+        assert_eq!(coeffs(plain), coeffs(masked));
+    }
+
+    /// With the penalty ON, a budget spends itself on the row that buys its bound over
+    /// FEWER currently-integral integer columns.
+    ///
+    /// `b` is the deepest row (0.9) but touches three integral integer columns, so at
+    /// `lambda = 1` its key is `0.9/4 = 0.225`; `a` is shallower (0.6) and touches one, so
+    /// its key is `0.6/2 = 0.30`. A one-row budget takes `a` under W2 and `b` without it.
+    /// That inversion is the entire mechanism, so it is pinned in both directions.
+    #[test]
+    fn frac_penalty_prefers_bound_per_added_fractional_column() {
+        let mk = || {
+            vec![
+                cut(&[(0, 1.0)], 0.4), // depth 0.6 at x0 = 1, one masked column
+                cut(&[(1, 1.0), (2, 0.0), (3, 0.0)], 0.1), // depth 0.9, three masked columns
+            ]
+        };
+        // Columns 2 and 3 appear with coefficient ZERO in row `b`. They must not be
+        // charged: a structurally-present-but-zero entry does not touch the column, and a
+        // count that ignored the coefficient would price padding.
+        let x = vec![1.0, 1.0, 1.0, 1.0];
+        let mask = [true, true, true, true];
+        let (_, off) = select_cuts(mk(), vec!["a", "b"], &x, 1, 1.0, 4, 0.0, &mask);
+        assert_eq!(off, vec!["b"], "without the penalty the deepest row wins");
+        let (_, zero_pad) = select_cuts(mk(), vec!["a", "b"], &x, 1, 1.0, 4, 1.0, &mask);
+        assert_eq!(
+            zero_pad,
+            vec!["b"],
+            "zero coefficients are not touches: b still charges 1, key 0.45 > a's 0.30"
+        );
+        // Now give `b` three REAL touches and the ranking must invert.
+        let real = || {
+            vec![
+                cut(&[(0, 1.0)], 0.4),
+                cut(&[(1, 1.0), (2, 1.0), (3, 1.0)], 2.1),
+            ]
+        };
+        let (_, on) = select_cuts(real(), vec!["a", "b"], &x, 1, 1.0, 4, 1.0, &mask);
+        assert_eq!(
+            on,
+            vec!["a"],
+            "with the penalty the row that fractionalises fewer columns wins the budget"
+        );
+    }
+
+    /// Only columns that are INTEGRAL at the vertex are chargeable, and an out-of-range
+    /// column is charged nothing rather than panicking.
+    ///
+    /// The mask the root loop builds is `integer column AND integral at x`. A cut may still
+    /// name a column outside it — the aggregated family introduces rows over a working
+    /// model the caller's mask was not sized for — and a ranking heuristic must not be able
+    /// to abort the solve. It is charged zero, which is the conservative direction: it can
+    /// only make the row look BETTER, never invent a penalty.
+    #[test]
+    fn frac_penalty_ignores_unmasked_and_out_of_range_columns() {
+        let cuts = vec![
+            cut(&[(0, 1.0), (9, 1.0)], 0.4), // column 9 is past the end of the mask
+            cut(&[(1, 1.0)], 0.4),
+        ];
+        let x = vec![1.0, 1.0, 1.0, 1.0];
+        let mask = [true, false, false, false];
+        // Row 0 charges 1 (column 0 masked, column 9 unknown -> free) -> key 0.6/√2/2.
+        // Row 1 charges 0 (column 1 not in the mask) -> key 0.6.
+        let (got, tags) = select_cuts(cuts, vec!["wide", "narrow"], &x, 1, 1.0, 4, 1.0, &mask);
+        assert_eq!(tags, vec!["narrow"]);
+        assert_eq!(got.len(), 1);
+    }
+
+    /// SELECTION CANNOT REMOVE A FEASIBLE INTEGER POINT — brute-forced over the whole box,
+    /// with the penalty on and off, at every budget.
+    ///
+    /// The argument is short and it is worth writing down because it is what licenses
+    /// shipping a *ranking* change at all: `select_cuts` is a pure SUBSET-AND-PERMUTE of its
+    /// input. It never constructs a `Cut`, never edits one's `coeffs`, `lb` or `ub`, and
+    /// every row it is handed has already passed the family's own validity proof plus
+    /// `clean`/`snap` in the root loop. So the set of inequalities the search ends up
+    /// carrying is a SUBSET of a set that is valid for the integer hull, and a subset of
+    /// valid inequalities is valid. Changing WHICH ones are kept — which is all W2 does —
+    /// therefore cannot move a verdict or an objective; it can only change the search.
+    ///
+    /// A proof by inspection is not a test, though, and the failure it guards against is
+    /// silent: an invalid row that survives selection produces a witness that is genuinely
+    /// feasible for the model the solver was left holding. So: random models with mixed
+    /// integer/continuous columns, separate the real families against a real vertex, run
+    /// selection at every budget and both penalties, and assert on the OUTPUT that (a) no
+    /// feasible point of the box is deleted and (b) every emitted row is byte-identical to
+    /// one of the inputs. (b) is what makes (a) transitive from the families' own guards:
+    /// it pins that selection is subset-and-permute rather than merely happening to be
+    /// valid on this seed.
+    #[test]
+    fn selection_never_removes_a_feasible_integer_point() {
+        use crate::model::Sense;
+
+        let mut seed = 0x0F27_2026_u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) as i64
+        };
+        const HI: i64 = 4;
+        let mut selected_rows = 0usize;
+
+        for case in 0..120 {
+            let mut m = Model::new();
+            // Two integer columns and one continuous one: enough structure for the MIR /
+            // strong-CG split to matter, small enough to enumerate exhaustively.
+            let cols = [
+                m.add_int_col(0.0, HI as f64),
+                m.add_int_col(0.0, HI as f64),
+                m.add_col(0.0, HI as f64),
+            ];
+            let n = cols.len();
+            let mut rows: Vec<(Vec<f64>, f64, f64)> = Vec::new();
+            for _ in 0..3 {
+                let a: Vec<f64> = (0..n).map(|_| (rnd() % 9 - 4) as f64).collect();
+                if a.iter().all(|&v| v == 0.0) {
+                    continue;
+                }
+                let hi = (rnd() % 13) as f64;
+                let lo = hi - (1 + rnd() % 10) as f64;
+                let terms: Vec<_> = cols
+                    .iter()
+                    .zip(&a)
+                    .filter(|(_, &v)| v != 0.0)
+                    .map(|(&c, &v)| (c, v))
+                    .collect();
+                m.add_row(lo, hi, &terms);
+                rows.push((a, lo, hi));
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            m.set_objective(&[(cols[0], 1.0)], Sense::Minimize);
+
+            let x: Vec<f64> = (0..n).map(|_| (rnd() % 40) as f64 / 10.0).collect();
+            let mut cuts = separate_mir(&m, &x, m.num_rows(), cuts_per_round());
+            cuts.extend(separate_strongcg(&m, &x, m.num_rows(), cuts_per_round()));
+            if cuts.is_empty() {
+                continue;
+            }
+            let inputs: Vec<(Vec<(Col, f64)>, f64, f64)> = cuts
+                .iter()
+                .map(|c| (c.coeffs.clone(), c.lb, c.ub))
+                .collect();
+            let mask: Vec<bool> = (0..n)
+                .map(|j| m.col_kind(cols[j]).is_integral() && (x[j] - x[j].round()).abs() <= 1e-9)
+                .collect();
+
+            for &penalty in &[0.0, 0.5, 1.0, 8.0] {
+                for keep in [1usize, 2, 3, usize::MAX] {
+                    for &par in &[0.5, 0.99, 1.0] {
+                        let tags: Vec<usize> = (0..cuts.len()).collect();
+                        let (sel, sel_tags) =
+                            select_cuts(cuts.clone(), tags, &x, keep, par, n, penalty, &mask);
+                        assert!(sel.len() <= inputs.len(), "selection invented rows");
+                        assert_eq!(sel.len(), sel_tags.len());
+                        selected_rows += sel.len();
+                        for (row, &t) in sel.iter().zip(&sel_tags) {
+                            // (b) SUBSET-AND-PERMUTE: byte-identical to the tagged input.
+                            let (want_c, want_lb, want_ub) = &inputs[t];
+                            assert_eq!(&row.coeffs, want_c, "case {case}: coefficients edited");
+                            assert!(
+                                row.lb.to_bits() == want_lb.to_bits()
+                                    && row.ub.to_bits() == want_ub.to_bits(),
+                                "case {case}: bounds edited by selection"
+                            );
+                        }
+                        // (a) NO FEASIBLE INTEGER POINT DELETED, exact rational activity.
+                        for x0 in 0..=HI {
+                            for x1 in 0..=HI {
+                                for x2 in 0..=HI {
+                                    let pt = [x0 as f64, x1 as f64, x2 as f64];
+                                    let feasible = rows.iter().all(|(a, lo, hi)| {
+                                        let act: f64 =
+                                            a.iter().zip(pt).map(|(&ai, xi)| ai * xi).sum();
+                                        act >= *lo - 1e-9 && act <= *hi + 1e-9
+                                    });
+                                    if !feasible {
+                                        continue;
+                                    }
+                                    for c in &sel {
+                                        let mut act = BigRational::zero();
+                                        for &(col, a) in &c.coeffs {
+                                            act +=
+                                                exact(a).unwrap() * exact(pt[col.index()]).unwrap();
+                                        }
+                                        if c.lb.is_finite() {
+                                            assert!(
+                                                act >= exact(c.lb).unwrap(),
+                                                "case {case} (penalty {penalty}, keep {keep}, \
+                                                 par {par}): a SELECTED `>=` row deleted the \
+                                                 feasible integer point {pt:?}"
+                                            );
+                                        }
+                                        if c.ub.is_finite() {
+                                            assert!(
+                                                act <= exact(c.ub).unwrap(),
+                                                "case {case} (penalty {penalty}, keep {keep}, \
+                                                 par {par}): a SELECTED `<=` row deleted the \
+                                                 feasible integer point {pt:?}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // A guard that selected nothing proves nothing. Pin that the generator actually fed
+        // the assertions -- this is the "quasi-vacuous success" failure mode.
+        assert!(
+            selected_rows > 500,
+            "brute-force guard was near-vacuous: only {selected_rows} rows ever selected"
+        );
     }
 }
 
@@ -4767,6 +6034,128 @@ mod mir_tests {
             "no mixing cut was ever separated: the guard is vacuous"
         );
     }
+
+    /// THE VIOLATION SCREEN CHANGES NOTHING IT RETURNS.
+    ///
+    /// `best_over_deltas` skips exact-rational derivations the `f64` screen can prove cannot end up
+    /// in the answer (see `ScreenRow`). "Cannot" is a claim about every row of every model, not
+    /// about the corpus it was measured on, so it is checked here the only way it can be: run BOTH
+    /// paths on random models — including the fixed-charge VUB structure, which is what puts a
+    /// continuous slack and a dragged-in binary into the same substituted row — and require the
+    /// returned cuts to be identical to the BIT.
+    ///
+    /// A screen that is merely a good heuristic passes the validity guard above (it never invents
+    /// a cut) and fails this one. That is the distinction worth a test.
+    #[test]
+    fn the_violation_screen_is_bit_identical() {
+        let mut seed = 0x5EED_2026_u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            (seed >> 33) as i64
+        };
+        const HI: i64 = 5;
+        let mut seen_cuts = 0usize;
+        let mut seen_skips = 0usize;
+
+        for case in 0..600 {
+            let mut m = Model::new();
+            let cols: Vec<Col> = (0..3)
+                .map(|j| {
+                    if j % 3 == 2 {
+                        m.add_col(0.0, HI as f64)
+                    } else {
+                        m.add_int_col(0.0, HI as f64)
+                    }
+                })
+                .collect();
+            let sw = m.add_binary_col();
+            let flow = m.add_col(0.0, HI as f64);
+            m.add_row(f64::NEG_INFINITY, 0.0, &[(flow, 1.0), (sw, -(HI as f64))]);
+            let cols: Vec<Col> = cols.into_iter().chain([sw, flow]).collect();
+            let n = cols.len();
+            for _ in 0..3 {
+                let a: Vec<f64> = (0..n).map(|_| (rnd() % 13 - 6) as f64).collect();
+                if a.iter().all(|&v| v == 0.0) {
+                    continue;
+                }
+                let hi = (rnd() % 21) as f64;
+                let lo = hi - (1 + rnd() % 17) as f64;
+                let terms: Vec<_> = cols
+                    .iter()
+                    .zip(&a)
+                    .filter(|(_, &v)| v != 0.0)
+                    .map(|(&c, &v)| (c, v))
+                    .collect();
+                m.add_row(lo, hi, &terms);
+            }
+            m.set_objective(&[(cols[0], 1.0)], Sense::Minimize);
+            // DELIBERATELY NOT CLAMPED TO THE COLUMN BOX. A separation point outside a column's
+            // bounds gives that column a NEGATIVE displacement, and a negative displacement flips
+            // which end of a step-function coefficient the screen must take. Rounding strong CG's
+            // `⌈·⌉` the same way in both directions was a real defect this generator caught in 16
+            // cases out of 600; clamping the point would have hidden it. `box_excess` in
+            // `ScreenRow` prices the other half of the same situation.
+            let x: Vec<f64> = (0..n).map(|_| (rnd() % 50) as f64 / 10.0).collect();
+
+            for family in [0u8, 1] {
+                let run = |on: bool| {
+                    screen_scope(on, || {
+                        if family == 0 {
+                            separate_mir(&m, &x, m.num_rows(), cuts_per_round())
+                        } else {
+                            separate_strongcg(&m, &x, m.num_rows(), cuts_per_round())
+                        }
+                    })
+                };
+                let with = run(true);
+                let without = run(false);
+                seen_cuts += without.len();
+                assert_eq!(
+                    with.len(),
+                    without.len(),
+                    "case {case} family {family}: the screen changed the cut COUNT"
+                );
+                for (i, (a, b)) in with.iter().zip(&without).enumerate() {
+                    assert_eq!(
+                        a.ub.to_bits(),
+                        b.ub.to_bits(),
+                        "case {case} family {family} cut {i}: right-hand side moved"
+                    );
+                    assert_eq!(a.lb.to_bits(), b.lb.to_bits());
+                    assert_eq!(a.coeffs.len(), b.coeffs.len());
+                    for (&(ca, va), &(cb, vb)) in a.coeffs.iter().zip(&b.coeffs) {
+                        assert_eq!(ca, cb);
+                        assert_eq!(
+                            va.to_bits(),
+                            vb.to_bits(),
+                            "case {case} family {family} cut {i}: coefficient moved"
+                        );
+                    }
+                }
+            }
+            // ...and the screen must actually be DOING something on this family of models, or the
+            // equality above is the equality of two identical code paths.
+            let before = crate::sepstat::SCREEN_SKIP.load(std::sync::atomic::Ordering::Relaxed);
+            screen_scope(true, || {
+                separate_mir(&m, &x, m.num_rows(), cuts_per_round());
+            });
+            seen_skips += (crate::sepstat::SCREEN_SKIP.load(std::sync::atomic::Ordering::Relaxed)
+                - before) as usize;
+        }
+        assert!(
+            seen_cuts > 0,
+            "the screen guard never saw a cut: it is vacuous"
+        );
+        // `SCREEN_SKIP` only moves when `AY_MILP_SEPSTAT` is set, so this half of the guard is
+        // only meaningful under it -- assert it exactly then.
+        if crate::sepstat::on() {
+            assert!(
+                seen_skips > 0,
+                "the screen skipped nothing on 600 random models: it is inert, \
+                 so the equality above proves nothing"
+            );
+        }
+    }
 }
 
 /// Separate MIR cuts from the TABLEAU, with the row multipliers computed in floats.
@@ -5020,7 +6409,8 @@ fn mir_from_lp_row(
         }
     }
 
-    // To f64, paying for the rounding in the right-hand side.
+    // To f64, paying for the rounding in the right-hand side. A `<=` store, like the other two
+    // MIR roundings.
     let mut damage = BigRational::zero();
     let mut out: Vec<(Col, f64)> = Vec::new();
     for (j, c) in xc {
@@ -5028,19 +6418,8 @@ fn mir_from_lp_row(
             continue;
         }
         let col = Col(j as u32);
-        let cf = c.to_f64()?;
-        if !cf.is_finite() {
-            return None;
-        }
-        let back = exact(cf)?;
-        let err = (&back - &c).abs();
-        if !err.is_zero() {
-            let (lo, up) = model.col_bounds(col);
-            if !lo.is_finite() || !up.is_finite() {
-                return None;
-            }
-            damage += err * exact(lo.abs().max(up.abs()))?;
-        }
+        let (cf, cost) = coef_to_f64(model, col, &c, CutSide::Le)?;
+        damage += cost;
         if cf != 0.0 {
             out.push((col, cf));
         }
@@ -5636,6 +7015,7 @@ fn implied_variable_upper_bounds(
 }
 
 /// The next `f64` BELOW `v` -- the mirror of [`next_up`], for rounding a coefficient OUTWARD.
+/// Used by `emit_le_cut` below and by the generalisation of its argument in [`coef_to_f64`].
 fn next_down(v: f64) -> f64 {
     if !v.is_finite() {
         return v;
@@ -5705,6 +7085,7 @@ fn emit_le_cut(
         .filter(|&a| a > 0.0)
         .fold(f64::INFINITY, f64::min);
     if hi > MAX_CUT_COEFF || ub.abs() > MAX_CUT_COEFF || hi / lo > MAX_CUT_DYNAMISM {
+        crate::sepstat::bump(&crate::sepstat::LATE_ABSURD);
         return None;
     }
     Some(Cut {
@@ -8036,6 +9417,97 @@ mod clique_tests {
             "no lifted odd-hole cut was ever separated: the lift guard is vacuous"
         );
     }
+
+    /// THE WIDTH GATE DESCRIBES THE SEPARATOR, NOT AN INSTANCE. It must admit
+    /// the set-partition models the odd-hole family is FOR — including one
+    /// carrying side rows, which is what the all-or-nothing predicate it
+    /// replaced could not do — and must reject the shapes where the conflict
+    /// graph is not a wide 0/1 object. Each admitted model is checked against
+    /// the separator itself, so the gate cannot drift into arming a class the
+    /// family is silent on. (The CUTS are validity-guarded by
+    /// `odd_cycle_cuts_never_remove_an_integer_point`; this guards the gate.)
+    #[test]
+    fn wide_set_partition_gate_matches_structure() {
+        // `rows` disjoint sum-to-1 rows over `width` columns each, plus
+        // `side` rows that are NOT sum-to-1 equalities.
+        let build = |rows: usize, width: usize, side: usize, continuous: bool| -> Model {
+            let mut m = Model::new();
+            let mut sp: Vec<Vec<Col>> = Vec::new();
+            for _ in 0..rows {
+                let cols: Vec<Col> = (0..width)
+                    .map(|_| {
+                        if continuous {
+                            m.add_col(0.0, 1.0)
+                        } else {
+                            m.add_binary_col()
+                        }
+                    })
+                    .collect();
+                let terms: Vec<(Col, f64)> = cols.iter().map(|&c| (c, 1.0)).collect();
+                m.add_row(1.0, 1.0, &terms);
+                sp.push(cols);
+            }
+            for s in 0..side {
+                let terms: Vec<(Col, f64)> = sp.iter().map(|r| (r[s % width], 3.0)).collect();
+                m.add_row(f64::NEG_INFINITY, 5.0, &terms);
+            }
+            m.set_objective(&[(sp[0][0], 1.0)], Sense::Maximize);
+            m
+        };
+
+        // The class: 4 sum-to-1 rows, 40 columns each — wide, all binary.
+        assert!(is_wide_set_partition(&build(4, 40, 0, false)));
+        // SIDE ROWS ARE TOLERATED while the sum-to-1 rows stay the majority.
+        // This is mod010's shape, and exactly what the old gate refused.
+        assert!(is_wide_set_partition(&build(4, 40, 2, false)));
+        assert!(
+            !is_pure_set_partitioning(&build(4, 40, 2, false)),
+            "the old all-or-nothing predicate is what this case escapes"
+        );
+        // Side rows in the MAJORITY: no longer a set-partitioning model.
+        assert!(!is_wide_set_partition(&build(4, 40, 5, false)));
+        // NOT WIDE: 4 rows of 9 columns is 36 columns, under the 10x ratio.
+        assert!(!is_wide_set_partition(&build(4, 9, 0, false)));
+        // NOT BINARY: the conflict graph and its independence-number argument
+        // are 0/1 objects.
+        assert!(!is_wide_set_partition(&build(4, 40, 0, true)));
+        // A single sum-to-1 row is a clique, never a hole.
+        assert!(!is_wide_set_partition(&build(1, 40, 0, false)));
+        // The empty model must not fire.
+        assert!(!is_wide_set_partition(&Model::new()));
+
+        // AND THE ADMITTED CLASS SEPARATES. A 5-hole of sum-to-1 rows over a
+        // wide column set, at the half-integral vertex the LP would land on:
+        // every pair-clique is satisfied, the hole is not.
+        let mut m = Model::new();
+        let v: Vec<Col> = (0..5).map(|_| m.add_binary_col()).collect();
+        let filler: Vec<Col> = (0..120).map(|_| m.add_binary_col()).collect();
+        for i in 0..5 {
+            m.add_row(
+                1.0,
+                1.0,
+                &[
+                    (v[i], 1.0),
+                    (v[(i + 1) % 5], 1.0),
+                    (filler[i], 1.0),
+                    (filler[i + 5], 1.0),
+                ],
+            );
+        }
+        m.set_objective(&[(v[0], 1.0)], Sense::Maximize);
+        assert!(
+            is_wide_set_partition(&m),
+            "125 columns over 5 sum-to-1 rows"
+        );
+        let mut x = vec![0.0; m.num_cols()];
+        for &c in &v {
+            x[c.index()] = 0.5;
+        }
+        assert!(
+            !separate_odd_cycle(&m, &x, m.num_rows()).is_empty(),
+            "the admitted class must actually separate: the gate would be inert"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -8198,6 +9670,63 @@ pub(crate) fn is_pure_set_partitioning(model: &Model) -> bool {
         }
     }
     true
+}
+
+/// The default-on gate for `separate_odd_cycle` (see `bab.rs`): is this model a
+/// WIDE set-partitioning model — one whose sum-to-1 rows are the bulk of the
+/// model and whose columns vastly outnumber them?
+///
+/// Written to describe the SEPARATOR's input rather than a named model class.
+/// The odd-hole separator builds a conflict graph out of all-binary packing
+/// rows and looks for chordless odd cycles in it, so the two things that decide
+/// whether it can find anything are:
+///
+///  * every column binary — the conflict graph, the independence-number
+///    argument behind `Σ_{v∈C} x_v ≤ (|C|−1)/2`, and the wheel lifts are all
+///    0/1 objects; and
+///  * many columns per sum-to-1 row. A sum-to-1 row over `k` columns is a
+///    `k`-clique in the conflict graph; odd HOLES (the facets the cliques miss)
+///    only appear once the rows overlap in many different ways, which is what a
+///    large column-to-row ratio buys.
+///
+/// The sum-to-1 rows must also be the MAJORITY, so this stays a statement about
+/// what the model IS. Rows that are not sum-to-1 equalities are simply invisible
+/// to the separator — it never aggregates them — so tolerating a handful of side
+/// rows cannot make an emitted cut wrong. That tolerance is the whole point:
+/// `is_pure_set_partitioning` is all-or-nothing and two side rows out of 146
+/// disqualified mod010, an instance where the family is worth +8.6% of root
+/// closure.
+pub(crate) fn is_wide_set_partition(model: &Model) -> bool {
+    let (n, m) = (model.num_cols(), model.num_rows());
+    if n == 0 || m == 0 {
+        return false;
+    }
+    for j in 0..n {
+        let col = Col(j as u32);
+        if !model.col_kind(col).is_integral() {
+            return false;
+        }
+        let (lb, ub) = model.col_bounds(col);
+        // A presolve-FIXED binary still counts: fixing a column does not change
+        // the conflict structure of the rows it sits in.
+        if !(lb == 0.0 || lb == 1.0) || !(ub == 0.0 || ub == 1.0) || lb > ub {
+            return false;
+        }
+    }
+    let mut sp_rows = 0usize;
+    for r in 0..m {
+        let Some(row) = model.row_at(r) else {
+            return false;
+        };
+        let (coeffs, lb, ub) = model.row(row);
+        if coeffs.is_empty() || lb != 1.0 || ub != 1.0 {
+            continue;
+        }
+        if coeffs.iter().all(|&(_, a)| a == 1.0) {
+            sp_rows += 1;
+        }
+    }
+    sp_rows >= 2 && 2 * sp_rows >= m && n >= 10 * sp_rows
 }
 
 /// Separate {0,1/2}-Chvátal–Gomory ("zero-half") cuts (Caprara–Fischetti, GF(2) elimination).

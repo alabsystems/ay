@@ -259,74 +259,72 @@ impl<A> CountingAllocator<A> {
 #[cfg(feature = "mimalloc-arena-trim")]
 static ARENA_TRIM_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Peak-RSS trim: zero mimalloc's `arena_reserve` on the VERY FIRST allocation —
-/// which is the first mimalloc use, before any arena has been reserved — so the
-/// whole process (and, via copy-on-write, any child the fork-before-threads solve
-/// supervisor forks from it) reserves and commits OS pages at segment granularity
-/// instead of inside the default 1 GiB arena, whose looser commit granularity runs
-/// peak RSS well above the live heap (measured ~1.7x on a churn-heavy proof solve).
+/// Counting allocator for a binary whose actual global allocator is mimalloc.
 ///
-/// This is the ONLY point early enough: mimalloc reserves its first arena on the
-/// first `malloc`, which happens during runtime startup BEFORE `main`, so a runtime
-/// `mi_option_set` from `main` (let alone from a post-`fork` child) is already too
-/// late — it only resizes FUTURE arenas, and a working set that fits in the first
-/// 1 GiB arena never triggers one. Setting it here, ahead of the first inner
-/// allocation, makes the first arena itself small. This replaces the old
-/// re-exec-child `MIMALLOC_ARENA_RESERVE=0` env injection, which the fork model
-/// cannot use (a forked child inherits the parent's already-initialized allocator).
+/// This is deliberately separate from [`CountingAllocator`]. Cargo features
+/// unify across all selected workspace roots: building the `ay` and `ay-pb`
+/// binaries together enables `mimalloc-arena-trim` in their shared `ay-sys`,
+/// even though `ay-pb` uses the system allocator. Keeping mimalloc-symbol
+/// references behind this distinct type means only a binary that instantiates
+/// this wrapper must link mimalloc.
 ///
-/// Soundness-neutral: an allocator arena-sizing knob only changes WHERE bytes land,
-/// never which pointer is returned or any solve verdict. An explicit user
-/// `MIMALLOC_ARENA_RESERVE` always wins (checked allocation-free via `getenv`, so
-/// mimalloc's own env read applies instead). Self-validating against mimalloc enum
-/// drift: only acts when the option currently reads as a GiB-scale reserve
-/// (mimalloc's 1 GiB 64-bit default), confirming the ordinal still names
-/// `arena_reserve`; otherwise a no-op, so a future enum reorder forfeits only the
-/// trim and never sets a wrong option. No-op unless the `mimalloc-arena-trim`
-/// feature is on (only the final `ay` binary links mimalloc).
+/// The wrapper preserves ordinary live-byte accounting and additionally zeroes
+/// mimalloc's `arena_reserve` before its first allocation. Only use it when `A`
+/// is the linked mimalloc allocator.
 #[cfg(feature = "mimalloc-arena-trim")]
-#[inline]
-fn ensure_arena_reserve_trimmed() {
-    use std::sync::atomic::Ordering;
-    // Fast path: after the first allocation this is a single relaxed load.
-    if ARENA_TRIM_DONE.load(Ordering::Relaxed) {
-        return;
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MimallocCountingAllocator<A> {
+    counted: CountingAllocator<A>,
+}
+
+#[cfg(feature = "mimalloc-arena-trim")]
+impl<A> MimallocCountingAllocator<A> {
+    /// Wrap the linked mimalloc allocator.
+    pub const fn new(inner: A) -> Self {
+        Self {
+            counted: CountingAllocator::new(inner),
+        }
     }
-    if ARENA_TRIM_DONE.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    // v3 `mi_option_t` ordinal for `mi_option_arena_reserve`, verified against the
-    // linked libmimalloc-sys 0.1.49 vendored v3 header (cross-checked: the same enum
-    // count yields `_mi_option_last == 47`, matching the crate's binding).
-    const MI_OPTION_ARENA_RESERVE: libc::c_int = 23;
-    extern "C" {
-        fn mi_option_get_size(option: libc::c_int) -> usize;
-        fn mi_option_set(option: libc::c_int, value: libc::c_long);
-        fn getenv(name: *const libc::c_char) -> *mut libc::c_char;
-    }
-    // SAFETY: `getenv` reads `environ` and returns a borrowed pointer (no
-    // allocation, so no re-entry into this allocator); `mi_option_get_size` /
-    // `mi_option_set` are mimalloc's documented option API (present because the
-    // final binary statically links mimalloc under this feature) and perform no
-    // allocation. `c"..."` is a valid NUL-terminated C string.
-    unsafe {
-        // Respect an explicit user setting: mimalloc reads MIMALLOC_ARENA_RESERVE
-        // from the env at its first arena reservation (after this hook), so if the
-        // user set it we leave the option untouched and let that env read win.
-        if !getenv(c"MIMALLOC_ARENA_RESERVE".as_ptr()).is_null() {
+
+    /// Zero mimalloc's `arena_reserve` on the first allocation, before any
+    /// arena has been reserved.
+    ///
+    /// An explicit user `MIMALLOC_ARENA_RESERVE` always wins. The option
+    /// ordinal is self-checked against a GiB-scale current value, so enum drift
+    /// makes this a no-op.
+    #[inline]
+    fn ensure_arena_reserve_trimmed() {
+        use std::sync::atomic::Ordering;
+
+        if ARENA_TRIM_DONE.load(Ordering::Relaxed) {
             return;
         }
-        if mi_option_get_size(MI_OPTION_ARENA_RESERVE) >= 64 * 1024 * 1024 {
-            mi_option_set(MI_OPTION_ARENA_RESERVE, 0);
+        if ARENA_TRIM_DONE.swap(true, Ordering::Relaxed) {
+            return;
+        }
+
+        // v3 `mi_option_t` ordinal for `mi_option_arena_reserve`, verified
+        // against the linked libmimalloc-sys 0.1.49 vendored v3 header.
+        const MI_OPTION_ARENA_RESERVE: libc::c_int = 23;
+        extern "C" {
+            fn mi_option_get_size(option: libc::c_int) -> usize;
+            fn mi_option_set(option: libc::c_int, value: libc::c_long);
+            fn getenv(name: *const libc::c_char) -> *mut libc::c_char;
+        }
+        // SAFETY: `getenv` returns a borrowed pointer without allocating. The
+        // mimalloc option functions are supplied by the allocator linked by
+        // the binary that instantiates this wrapper and perform no allocation.
+        // The C string is NUL-terminated.
+        unsafe {
+            if !getenv(c"MIMALLOC_ARENA_RESERVE".as_ptr()).is_null() {
+                return;
+            }
+            if mi_option_get_size(MI_OPTION_ARENA_RESERVE) >= 64 * 1024 * 1024 {
+                mi_option_set(MI_OPTION_ARENA_RESERVE, 0);
+            }
         }
     }
 }
-
-/// No-op when mimalloc is not the linked allocator (feature off): other consumers
-/// of [`CountingAllocator`] must not reference mimalloc symbols and pay nothing.
-#[cfg(not(feature = "mimalloc-arena-trim"))]
-#[inline(always)]
-fn ensure_arena_reserve_trimmed() {}
 
 // SAFETY: All four methods forward verbatim to `self.inner`, which upholds the
 // `GlobalAlloc` contract by assumption. The only added work is updating the
@@ -337,9 +335,6 @@ fn ensure_arena_reserve_trimmed() {}
 unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // Peak-RSS trim: zero mimalloc's arena_reserve on the first allocation,
-        // before any arena is reserved (see `ensure_arena_reserve_trimmed`).
-        ensure_arena_reserve_trimmed();
         // SAFETY: forwarded unchanged; caller upholds `alloc`'s contract.
         let ptr = unsafe { self.inner.alloc(layout) };
         if !ptr.is_null() {
@@ -350,8 +345,6 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // Peak-RSS trim on the first allocation (see `ensure_arena_reserve_trimmed`).
-        ensure_arena_reserve_trimmed();
         // SAFETY: forwarded unchanged; caller upholds `alloc_zeroed`'s contract.
         let ptr = unsafe { self.inner.alloc_zeroed(layout) };
         if !ptr.is_null() {
@@ -384,6 +377,38 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
         // On failure the original block is unchanged, so the counter is correct
         // as-is (no adjustment needed).
         new_ptr
+    }
+}
+
+// SAFETY: this wrapper only runs the allocation-free mimalloc option hook and
+// then delegates every operation to `CountingAllocator`, whose `GlobalAlloc`
+// implementation preserves the inner allocator's contract.
+#[cfg(feature = "mimalloc-arena-trim")]
+unsafe impl<A: GlobalAlloc> GlobalAlloc for MimallocCountingAllocator<A> {
+    #[inline]
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        Self::ensure_arena_reserve_trimmed();
+        // SAFETY: forwarded unchanged; caller upholds `alloc`'s contract.
+        unsafe { self.counted.alloc(layout) }
+    }
+
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        Self::ensure_arena_reserve_trimmed();
+        // SAFETY: forwarded unchanged; caller upholds `alloc_zeroed`'s contract.
+        unsafe { self.counted.alloc_zeroed(layout) }
+    }
+
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: forwarded unchanged; caller upholds `dealloc`'s contract.
+        unsafe { self.counted.dealloc(ptr, layout) };
+    }
+
+    #[inline]
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: forwarded unchanged; caller upholds `realloc`'s contract.
+        unsafe { self.counted.realloc(ptr, layout, new_size) }
     }
 }
 

@@ -26,8 +26,6 @@
 //! Part of #7925 — held-out PAR-2 benchmark harness.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::common::workspace_root;
@@ -144,21 +142,14 @@ fn run_ay_timed(cnf_content: &str) -> (Outcome, Duration) {
     };
     let mut solver = formula.into_solver();
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_clone = stop.clone();
-    let timeout_thread = std::thread::spawn(move || {
-        std::thread::sleep(TIMEOUT);
-        stop_clone.store(true, Ordering::Relaxed);
-    });
+    let timer = super::common::SolverInterruptTimer::start(&mut solver, TIMEOUT);
 
     let result = solver
-        .solve_interruptible(|| stop.load(Ordering::Relaxed))
+        .solve_interruptible(|| timer.is_interrupted())
         .into_inner();
 
     let elapsed = start.elapsed();
-
-    // Clean up: the timeout thread will eventually exit on its own.
-    drop(timeout_thread);
+    timer.cancel_and_join();
 
     let outcome = match result {
         SatResult::Sat(_) => Outcome::Sat,

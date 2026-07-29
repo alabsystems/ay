@@ -6,7 +6,7 @@ The plan's first finding was that ay-milp's gap to the commercial solvers is
 per-component QUALITY, not a missing component — and that without attribution you
 cannot tell a refinement from noise. This is the attribution tool.
 
-Four modes, each answering one question:
+Modes, each answering one question:
 
 ``closure``   *What are the cuts worth, on their own?*
     Root dual bound before and after the cut loop, no branching (``AY_ROOT_CLOSURE``).
@@ -30,6 +30,17 @@ Four modes, each answering one question:
     reported as a soundness alarm, never averaged into a score. Wall/node
     regressions are reported separately, because a slow answer and a wrong answer
     are not the same kind of event.
+
+``lp``        *How much of the gap is the LP core?*
+    The same relaxation through ay's float lane and through Gurobi. Measured 8.2x
+    geomean, which is why cut quality is not affordable: every adopted cut row is
+    charged as LP work at every node.
+
+``par``       *What are threads WORTH, and on which shapes?*
+    P0 of the development design notes. Gurobi at
+    1/2/4/8T gives the ceiling a parallel ay could buy per shape; ay's deterministic
+    nodes-to-proof is recorded as the byte-equality gate a future parallel path must
+    pass at one thread.
 
 Results are JSON so that two runs can be diffed exactly; ``compare`` does that.
 
@@ -151,7 +162,15 @@ def run_ay(inst: dict, secs: float, env_extra: dict[str, str] | None = None,
             bound = float(mb.group(1))
         except ValueError:
             bound = None
-    return {"status": st, "obj": val, "bound": bound, "t": wall}
+    # Field 3 is nodes-to-proof — deterministic for a given build and input, where wall
+    # clock is not. It is the signal that says whether two builds ran the SAME search.
+    nodes = None
+    if len(f) > 3:
+        try:
+            nodes = int(f[3])
+        except ValueError:
+            nodes = None
+    return {"status": st, "obj": val, "bound": bound, "t": wall, "nodes": nodes}
 
 
 # --------------------------------------------------------------------------- gurobi
@@ -170,7 +189,8 @@ def gurobi():
     return _GRB
 
 
-def run_gurobi(inst: dict, secs: float, node_limit: int | None = None) -> dict:
+def run_gurobi(inst: dict, secs: float, node_limit: int | None = None,
+               threads: int = 1) -> dict:
     gp = gurobi()
     if not gp:
         return {"status": "SKIP", "why": "gurobipy missing"}
@@ -178,7 +198,7 @@ def run_gurobi(inst: dict, secs: float, node_limit: int | None = None) -> dict:
     try:
         env = gp.Env(params={"OutputFlag": 0})
         m = gp.read(inst["file"], env=env)
-        m.setParam("Threads", 1)
+        m.setParam("Threads", threads)
         m.setParam("TimeLimit", secs)
         if node_limit is not None:
             m.setParam("NodeLimit", node_limit)
@@ -464,9 +484,14 @@ def run_ay_lp(inst: dict, secs: float) -> dict:
     if not m:
         return {"status": "NOPARSE", "t": None}
     it = re.search(r"primal=(\d+).*?dual=(\d+)", txt, re.S)
+    # Degenerate-step count: how many pivots moved the objective by nothing. This is the
+    # discriminator for what an LP-primal build should target — a walk that is mostly
+    # degenerate wants an anti-degeneracy device, one that is not wants better pricing.
+    dg = re.search(r"degen=(\d+)", txt)
     return {"status": m.group(1), "t": float(m.group(2)),
             "primal_iters": int(it.group(1)) if it else None,
-            "dual_iters": int(it.group(2)) if it else None}
+            "dual_iters": int(it.group(2)) if it else None,
+            "primal_degen": int(dg.group(1)) if dg else None}
 
 
 def run_gurobi_lp(inst: dict, secs: float) -> dict:
@@ -533,6 +558,61 @@ def cmd_lp(args) -> int:
         worst = sorted(have, key=lambda r: -r["ratio"])[:8]
         for r in worst:
             print(f"   {r['name']:26s} {r['ratio']:8.1f}x  ({r['rows']}x{r['cols']})")
+    return 0
+
+
+def cmd_par(args) -> int:
+    """P0 of the parallel-B&B design: what are threads WORTH, and on which shapes?
+
+    See the development design notes. Two questions,
+    and they are different:
+
+    1. **The prize.** How much does a solver that keeps its algorithms get from N
+       threads, per instance? Gurobi at 1/2/4/8T answers that, and it is the number
+       that says whether a parallel ay would be worth building for a given shape —
+       measured, this is 5-8x on the dense-binary ladder and 1.13x on markshare.
+    2. **The gate.** ay's nodes-to-proof, which is deterministic. When a parallel path
+       exists, P1 requires its 1T node count to be byte-EQUAL to serial's; anything
+       else means the workers are not running ay's search, and no number of threads
+       repairs that. Recording serial's counts now makes that comparison possible
+       later rather than requiring a re-run.
+
+    ay is single-threaded, so its column is the 1T baseline until a parallel path lands.
+    """
+    corpus = load_corpus(args.tier, args.only, args.limit, opt_only=False)
+    threads = [int(t) for t in (args.threads or "1,2,4,8").split(",")]
+    print(f"[par] {len(corpus)} instances, gurobi threads {threads}, {args.secs}s each",
+          flush=True)
+    rows = []
+    for i, inst in enumerate(corpus):
+        a = run_ay(inst, args.secs, parse_knobs(args.knob), mode="solve")
+        row = {"name": inst["name"], "ay_1t": a, "gurobi": {}}
+        for t in threads:
+            g = run_gurobi(inst, args.secs, threads=t)
+            row["gurobi"][str(t)] = g
+        g1 = row["gurobi"].get(str(threads[0]), {})
+        gn = row["gurobi"].get(str(threads[-1]), {})
+        # The parallel speedup is only meaningful where BOTH thread counts proved.
+        if g1.get("status") == gn.get("status") == "OPTIMAL" and (gn.get("t") or 0) > 0:
+            row["gurobi_speedup"] = (g1.get("t") or 0) / gn["t"]
+        rows.append(row)
+        sp = row.get("gurobi_speedup")
+        print(f"  {i+1:3d}/{len(corpus)} {inst['name']:26s} "
+              f"ay1T={a.get('status','?'):9s} {a.get('t',0):6.1f}s nodes={a.get('nodes')} | "
+              f"grb {threads[0]}T={g1.get('t')} {threads[-1]}T={gn.get('t')} "
+              f"{'' if sp is None else f'speedup={sp:.2f}x'}", flush=True)
+        emit(args.out, {"mode": "par", "secs": args.secs, "threads": threads, "rows": rows},
+             quiet=True)
+    emit(args.out, {"mode": "par", "secs": args.secs, "threads": threads, "rows": rows})
+    sp = [r["gurobi_speedup"] for r in rows if r.get("gurobi_speedup")]
+    if sp:
+        logs = sorted(math.log(s) for s in sp)
+        print(f"\n[par] gurobi {threads[0]}T->{threads[-1]}T speedup over {len(sp)}: "
+              f"geomean {math.exp(sum(logs)/len(logs)):.2f}x, "
+              f"median {math.exp(logs[len(logs)//2]):.2f}x, "
+              f"max {max(sp):.2f}x")
+        print("[par] that geomean IS the ceiling a parallel ay could buy on this set — "
+              "and ay currently buys none of it.")
     return 0
 
 
@@ -741,11 +821,14 @@ def main() -> int:
 
     for name, fn in (("closure", cmd_closure), ("baseline", cmd_baseline),
                      ("ablate", cmd_ablate), ("gate", cmd_gate), ("audit", cmd_audit),
-                     ("lp", cmd_lp)):
+                     ("lp", cmd_lp), ("par", cmd_par)):
         p = sub.add_parser(name)
         common(p)
         if name in ("gate", "audit"):
             p.add_argument("--tol", type=float, default=REL_TOL)
+        if name == "par":
+            p.add_argument("--threads", default="1,2,4,8",
+                           help="comma-separated Gurobi thread counts (default 1,2,4,8)")
         if name == "closure":
             p.add_argument("--with-gurobi", action="store_true",
                            help="also measure Gurobi's root bound, head-to-head")

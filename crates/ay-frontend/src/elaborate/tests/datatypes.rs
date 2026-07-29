@@ -833,3 +833,105 @@ fn test_same_name_different_selector_sort_still_rejected() {
         "a same-name datatype with a different selector sort must still be rejected"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Two datatypes may share a nullary constructor NAME (SMT-LIB 2.6 §4.2.3 is the
+// standard's main source of ad-hoc overloading, and §3.6.4's `(as f σ)` exists
+// precisely to disambiguate it). Each such constructor is a DISTINCT value of a
+// DISTINCT sort.
+//
+// `Context::symbols` keeps only the last-registered signature for a name, so a
+// bare lookup of the constructor handed back the most recently declared
+// datatype's inhabitant regardless of which datatype was asked for. With
+// `(declare-datatypes ((A 0) (B 0)) (((e)) ((e))))`, `(declare-const x A)` bound
+// `x` to B's `e`: `(= x (as e A))` was rejected as `Sorts B and A are
+// incompatible` while the B-only spelling was accepted — a pure
+// declaration-order artifact — and `(distinct x y)` over `x : A`, `y : B`
+// collapsed to `(distinct t t)` and answered `unsat`.
+
+fn declared_const_term(ctx: &Context, name: &str) -> TermId {
+    ctx.symbols
+        .get(name)
+        .and_then(|info| info.term)
+        .unwrap_or_else(|| panic!("constant '{name}' has no bound term"))
+}
+
+fn elaborate_script(input: &str) -> Context {
+    let commands = parse(input).unwrap();
+    let mut ctx = Context::new();
+    for cmd in &commands {
+        ctx.process_command(cmd)
+            .unwrap_or_else(|e| panic!("elaboration failed on {cmd:?}: {e:?}"));
+    }
+    ctx
+}
+
+#[test]
+fn test_overloaded_nullary_constructor_binds_the_right_datatype() {
+    let ctx = elaborate_script(
+        "(declare-datatypes ((A 0) (B 0)) (((e)) ((e))))\n\
+         (declare-const x A)\n\
+         (declare-const y B)",
+    );
+    let x = declared_const_term(&ctx, "x");
+    let y = declared_const_term(&ctx, "y");
+    assert_eq!(
+        ctx.terms.sort(x),
+        &Sort::Uninterpreted("A".to_string()),
+        "x : A must be bound to a term of sort A, not to B's same-named constructor"
+    );
+    assert_eq!(
+        ctx.terms.sort(y),
+        &Sort::Uninterpreted("B".to_string()),
+        "y : B must be bound to a term of sort B"
+    );
+    assert_ne!(
+        x, y,
+        "A's `e` and B's `e` are distinct values of distinct sorts and must not \
+         be conflated into one term"
+    );
+}
+
+#[test]
+fn test_as_ascription_selects_the_ascribed_datatype_either_way() {
+    // Both ascriptions must be accepted, and each must denote its OWN
+    // datatype's constructor — the resolution is decided by the ascription, not
+    // by declaration order.
+    let ctx = elaborate_script(
+        "(declare-datatypes ((A 0) (B 0)) (((e)) ((e))))\n\
+         (declare-const x A)\n\
+         (declare-const y B)\n\
+         (assert (= x (as e A)))\n\
+         (assert (= y (as e B)))",
+    );
+    assert_eq!(ctx.assertions.len(), 2);
+    let x = declared_const_term(&ctx, "x");
+    let y = declared_const_term(&ctx, "y");
+    assert_ne!(
+        x, y,
+        "the two ascriptions must not resolve to the same term"
+    );
+    // A zero-field single-constructor datatype has exactly one inhabitant, so
+    // each equality is the SAME trivially-true term.
+    assert_eq!(
+        ctx.assertions[0], ctx.assertions[1],
+        "each constant is its own datatype's sole inhabitant, so both equalities \
+         reduce to the same trivially-true term"
+    );
+}
+
+#[test]
+fn test_non_overloaded_nullary_constructor_still_binds_its_inhabitant() {
+    // Guard against over-declining: the ordinary, non-overloaded case must
+    // still eagerly bind the constant to the datatype's sole inhabitant.
+    let ctx = elaborate_script(
+        "(declare-datatypes ((Unit 0)) (((u))))\n\
+         (declare-const p Unit)\n\
+         (declare-const q Unit)",
+    );
+    assert_eq!(
+        declared_const_term(&ctx, "p"),
+        declared_const_term(&ctx, "q"),
+        "a zero-field single-constructor datatype has exactly one inhabitant"
+    );
+}

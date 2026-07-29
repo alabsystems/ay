@@ -177,6 +177,9 @@ impl Executor {
             euf_model_ref,
             &should_stop,
         );
+        self.register_ematching_proof_provenance(
+            &ematching_result.unconditional_forall_instantiations,
+        );
 
         let mut existing: HashSet<TermId> = self.ctx.assertions.iter().copied().collect();
         let mut added = 0usize;

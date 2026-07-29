@@ -17,7 +17,7 @@ use ay_fp::FpModel;
 use ay_lra::LraModel;
 use ay_sat::{SatResult, Solver as SatSolver};
 
-use crate::executor_types::{Result, SolveResult};
+use crate::executor_types::{Result, SolveResult, UnknownReason};
 use crate::features::StaticFeatures;
 
 use super::super::super::Executor;
@@ -47,7 +47,23 @@ impl Executor {
             term_to_fp,
             var_offset,
             total_vars,
+            congruence_incomplete,
         } = self.encode_fp_assertions(&fp_assertions, &sites)?;
+
+        // Uninterpreted structure the encoder could not represent (see the
+        // `congruence` module) makes a model of this encoding no witness for
+        // the input, so every `sat` below degrades to `unknown`. The `unsat`
+        // exits stay as they are: the encoding only relaxes the input, so a
+        // refutation of it refutes the input too.
+        let decline_sat = |executor: &mut Self| {
+            tracing::warn!(
+                "FP to_real path could not encode all uninterpreted structure — degrading sat to unknown"
+            );
+            executor.last_model = None;
+            executor.last_model_validated = false;
+            executor.last_unknown_reason = Some(UnknownReason::Incomplete);
+            Ok(SolveResult::Unknown)
+        };
 
         // Real-guided pre-solve (#6241): solve the Real side first to find what
         // value fp.to_real needs to produce. If the target is exactly representable
@@ -77,6 +93,9 @@ impl Executor {
                     ),
                     Ok(FpRefinementStep::Sat)
                 ) {
+                    if congruence_incomplete {
+                        return decline_sat(self);
+                    }
                     return Ok(SolveResult::Sat);
                 }
             }
@@ -115,7 +134,12 @@ impl Executor {
                         sat_model,
                         &tseitin_result,
                     )? {
-                        FpRefinementStep::Sat => return Ok(SolveResult::Sat),
+                        FpRefinementStep::Sat => {
+                            if congruence_incomplete {
+                                return decline_sat(self);
+                            }
+                            return Ok(SolveResult::Sat);
+                        }
                         FpRefinementStep::Unknown => {
                             return self
                                 .store_unknown_or_unsat(SatResult::Unknown, &tseitin_result);

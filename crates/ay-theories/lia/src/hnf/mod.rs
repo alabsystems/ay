@@ -14,8 +14,18 @@
 //! 1. Collect tight equality constraints A'x = b' (active at current solution)
 //! 2. Compute HNF H and unimodular U such that A'U = H
 //! 3. Transform: H y = b' where y = U^{-1} x
-//! 4. If y[i] = (H^{-1} b')[i] is non-integer, generate cut y[i] <= floor(y[i])
-//! 5. Translate back to original variables: (e_i H^{-1} A') x <= floor(y[i])
+//! 4. Pick a row i whose `y[i] = (H^{-1} b')[i]` is non-integer — a heuristic
+//!    for where an integrality obstruction is likely to sit
+//! 5. Form the multiplier row `f = e_i H^{-1}`, the coefficient row
+//!    `c = f A'` and the forced value `v = f b'`, scale both to integers, and
+//!    emit the GCD cut `c x <= gcd(c) * floor(v / gcd(c))`
+//!
+//! Step 5 keeps the cut sound WITHOUT relying on `H` being the exact Hermite
+//! form: `c x = f (A' x) = f b' = v` holds for every `x` in the (real) solution
+//! set by construction, and `c x` is a multiple of `gcd(c)` at every integer
+//! point, so the emitted bound is valid over the integers whatever `f` is. The
+//! cut only bites when `gcd(c)` does not divide `v`, i.e. when the equalities
+//! have no integer solution at all.
 //!
 //! This avoids slack variables entirely since we work with original constraints.
 //!

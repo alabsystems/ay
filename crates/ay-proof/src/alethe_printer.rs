@@ -141,6 +141,27 @@ pub enum AlethePrintError {
         /// Identifier of the step that cannot be rendered.
         id: ProofId,
     },
+    /// One surface symbol occurs at two different sorts (#A9).
+    ///
+    /// Ad-hoc overloading is legal SMT-LIB 2.6 (§4.2.3 reuses constructor
+    /// names across independent datatypes; §3.6.4 `(as f σ)` disambiguates
+    /// them) and AY solves such scripts correctly. The Alethe preamble is a
+    /// flat `(declare-fun <name> () <sort>)` namespace with no overload
+    /// resolution, so no faithful declaration exists: the exporter declines
+    /// and the caller keeps its verdict. Formerly a `debug_assert_eq!` that
+    /// aborted the process with exit 101 after `unsat` had been printed.
+    #[error(
+        "symbol {name} occurs at two sorts ({first} and {second}); \
+         Alethe declarations are not overloaded, so no faithful preamble exists"
+    )]
+    AmbiguousSymbolSort {
+        /// The overloaded surface symbol.
+        name: String,
+        /// Sort of the first occurrence encountered.
+        first: Sort,
+        /// Conflicting sort of a later occurrence.
+        second: Sort,
+    },
 }
 
 impl AlethePrintError {
@@ -152,6 +173,29 @@ impl AlethePrintError {
             _ => "Other",
         }
     }
+}
+
+/// The index-equality guards a read-over-write-chain subproof assumes.
+///
+/// Positions line up across all four vectors: entry `k` describes the `k`-th
+/// DISTINCT guard literal, assumed as `(not printed[k])` under `assume_ids[k]`,
+/// with `row_ids[k]` naming the step whose unit clause is the
+/// `(not (= store_index read_index))` orientation `arrays_row` requires.
+#[derive(Default)]
+struct RowChainGuards {
+    order: Vec<TermId>,
+    printed: Vec<String>,
+    assume_ids: Vec<String>,
+    row_ids: Vec<String>,
+    bridges: Vec<String>,
+}
+
+/// What one chain walk contributes to the surrounding equality chain.
+enum RowChainPathProof {
+    /// The walk's value IS `(select root index)`; nothing to prove.
+    Reflexive,
+    /// The named step proves `(= (select root index) tail)`.
+    Step(String),
 }
 
 /// Alethe proof printer
@@ -1222,6 +1266,16 @@ impl<'a> AlethePrinter<'a> {
         if let ay_core::TheoryLemmaKind::ArraySelectStore { index_eq } = kind {
             return self.format_array_select_store(id, clause, *index_eq);
         }
+        // Lower an internally checked read-over-write CHAIN to Carcara's
+        // `arrays_idx`/`arrays_row`/`cong`/`trans`. `None` means the clause is
+        // outside the exactly-reconstructible subset: fall through to the
+        // faithful (but externally uncheckable) `read_over_write_chain` rule
+        // name rather than emit anything the derivation cannot justify.
+        if matches!(kind, ay_core::TheoryLemmaKind::ArrayRowChain) {
+            if let Some(text) = self.format_array_row_chain(id, clause) {
+                return Ok(text);
+            }
+        }
         if kind.alethe_rule() == "eq_congruent" {
             match self.surface_eq_congruent_bridge(id, clause, &[], &[]) {
                 Ok(Some(text)) => return Ok(text),
@@ -1665,6 +1719,430 @@ impl<'a> AlethePrinter<'a> {
                     printed_row.as_str(),
                     output,
                 )
+            }
+        }
+    }
+
+    /// Lower an internally checked `ArrayRowChain` lemma to Carcara's
+    /// `arrays_idx` / `arrays_row` / `cong` / `trans` rules.
+    ///
+    /// The chain walk that AY's checker performed
+    /// (`validate_array_row_chain`) is replayed one `store` at a time: each
+    /// skipped write becomes an `arrays_row` step discharged against the
+    /// clause's own index-equality guard, the terminating write becomes
+    /// `arrays_idx`, and `trans` composes them. Sub-schema (B) additionally
+    /// transports the two walks across the assumed array equality with `cong`.
+    /// Everything happens inside ONE subproof whose assumptions are exactly
+    /// the negations of the clause literals, so the closing `resolution`
+    /// reproduces the original clause byte-for-byte.
+    ///
+    /// Returns `None` — leaving the caller to emit the faithful, externally
+    /// uncheckable `read_over_write_chain` rule name — whenever the printed
+    /// surface is not the compositional rendering of the certified terms (a
+    /// `let`-abbreviated array equality, a re-spelled `store`, a guard printed
+    /// as neither orientation of its index pair). Reconstructing a derivation
+    /// from strings that do not correspond to the certified terms is exactly
+    /// the failure mode this fails closed on.
+    fn format_array_row_chain(&self, id: ProofId, clause: &[TermId]) -> Option<String> {
+        use crate::checker::ArrayRowChainPrinterTerms as Shape;
+
+        let shape = crate::checker::array_row_chain_printer_terms(self.terms, clause)?;
+        let (flat_lits, packed): (Vec<TermId>, Option<TermId>) = match clause {
+            [single] => match self.terms.get(*single) {
+                TermData::App(Symbol::Named(symbol), args) if symbol == "or" && args.len() >= 2 => {
+                    (args.clone(), Some(*single))
+                }
+                _ => (clause.to_vec(), None),
+            },
+            _ => (clause.to_vec(), None),
+        };
+        let flat_id = if packed.is_some() {
+            format!("{id}.flat")
+        } else {
+            id.to_string()
+        };
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut assume_lines: Vec<String> = Vec::new();
+        let mut discharge: Vec<String> = Vec::new();
+        let subproof_prefix: Vec<String>;
+        let mut nn_lines: Vec<String> = Vec::new();
+        let mut nn_ids: Vec<String> = Vec::new();
+
+        let (guards, printed_conclusion) = match &shape {
+            Shape::Eval {
+                conclusion,
+                select,
+                value_side,
+                read_index,
+                path,
+                packed_or,
+            } => {
+                if *packed_or != packed {
+                    return None;
+                }
+                let index_str = self.format_term(*read_index);
+                let head = format!("(select {} {index_str})", self.format_term(path.root));
+                if self.format_term(*select) != head {
+                    return None;
+                }
+                let tail = self.format_term(*value_side);
+                let printed_conclusion = self.format_term(*conclusion);
+                let reverse_final = if printed_conclusion == format!("(= {head} {tail})") {
+                    false
+                } else if printed_conclusion == format!("(= {tail} {head})") {
+                    true
+                } else {
+                    return None;
+                };
+                let guards = self.row_chain_guards(id, &index_str, &[path])?;
+                // A guard-free walk is the depth-1 ROW1 unit lemma, which
+                // `ArraySelectStore` already claims; without an assumption
+                // there is no subproof to name the closing step.
+                if guards.order.is_empty() {
+                    return None;
+                }
+                let mut body: Vec<String> = Vec::new();
+                let RowChainPathProof::Step(step) = self.emit_row_chain_path(
+                    &guards,
+                    &format!("{id}.p"),
+                    &index_str,
+                    path,
+                    &tail,
+                    &mut body,
+                )?
+                else {
+                    return None;
+                };
+                if reverse_final {
+                    body.push(format!(
+                        "(step {id}.fin (cl {printed_conclusion}) :rule symm :premises ({step}))"
+                    ));
+                }
+                subproof_prefix = body;
+                (guards, printed_conclusion)
+            }
+            Shape::UnderArrayEq {
+                conclusion,
+                array_eq_lit,
+                eq_term,
+                left_target,
+                right_target,
+                read_index,
+                left,
+                right,
+                packed_or,
+            } => {
+                if *packed_or != packed {
+                    return None;
+                }
+                let index_str = self.format_term(*read_index);
+                let printed_eq = self.format_term(*eq_term);
+                let left_str = self.format_term(left.root);
+                let right_str = self.format_term(right.root);
+                let eq_args = split_application(&printed_eq, "=")?;
+                let [printed_left, printed_right] = eq_args.as_slice() else {
+                    return None;
+                };
+                if printed_left != &left_str || printed_right != &right_str {
+                    return None;
+                }
+                if self.format_term(*array_eq_lit) != format!("(not {printed_eq})") {
+                    return None;
+                }
+                let left_head = format!("(select {left_str} {index_str})");
+                let right_head = format!("(select {right_str} {index_str})");
+                let left_tail = self.format_term(*left_target);
+                let right_tail = self.format_term(*right_target);
+                let printed_conclusion = self.format_term(*conclusion);
+                let reverse_final = if printed_conclusion == format!("(= {left_tail} {right_tail})")
+                {
+                    false
+                } else if printed_conclusion == format!("(= {right_tail} {left_tail})") {
+                    true
+                } else {
+                    return None;
+                };
+                let guards = self.row_chain_guards(id, &index_str, &[left, right])?;
+                let heq_id = format!("{id}.h{}", guards.order.len());
+
+                let mut body: Vec<String> = Vec::new();
+                let left_proof = self.emit_row_chain_path(
+                    &guards,
+                    &format!("{id}.l"),
+                    &index_str,
+                    left,
+                    &left_tail,
+                    &mut body,
+                )?;
+                let right_proof = self.emit_row_chain_path(
+                    &guards,
+                    &format!("{id}.r"),
+                    &index_str,
+                    right,
+                    &right_tail,
+                    &mut body,
+                )?;
+                body.push(format!(
+                    "(step {id}.cong (cl (= {left_head} {right_head})) :rule cong :premises ({heq_id}))"
+                ));
+                let mut trans_premises: Vec<String> = Vec::new();
+                if let RowChainPathProof::Step(step) = left_proof {
+                    body.push(format!(
+                        "(step {id}.ls (cl (= {left_tail} {left_head})) :rule symm :premises ({step}))"
+                    ));
+                    trans_premises.push(format!("{id}.ls"));
+                }
+                trans_premises.push(format!("{id}.cong"));
+                if let RowChainPathProof::Step(step) = right_proof {
+                    trans_premises.push(step);
+                }
+                if trans_premises.len() > 1 {
+                    body.push(format!(
+                        "(step {id}.tr (cl (= {left_tail} {right_tail})) :rule trans :premises ({}))",
+                        trans_premises.join(" ")
+                    ));
+                }
+                if reverse_final {
+                    body.push(format!(
+                        "(step {id}.fin (cl {printed_conclusion}) :rule symm :premises ({}))",
+                        if trans_premises.len() > 1 {
+                            format!("{id}.tr")
+                        } else {
+                            format!("{id}.cong")
+                        }
+                    ));
+                }
+                subproof_prefix = body;
+                assume_lines.push(format!("(assume {heq_id} {printed_eq})"));
+                discharge.push(heq_id);
+                (guards, printed_conclusion)
+            }
+        };
+
+        // Assumptions come first, in the order the discharge list names them.
+        let mut header: Vec<String> = Vec::with_capacity(guards.order.len());
+        for (index, printed) in guards.printed.iter().enumerate() {
+            header.push(format!(
+                "(assume {} (not {printed}))",
+                guards.assume_ids[index]
+            ));
+        }
+        header.extend(assume_lines);
+        let mut discharge_ids: Vec<String> = guards.assume_ids.clone();
+        discharge_ids.extend(discharge);
+
+        // `subproof` negates each assumption in order, so a guard assumed as
+        // `(not G)` reappears as `(not (not G))`; `not_not` turns that back
+        // into the clause's own positive `G`.
+        let mut subproof_clause = String::from("(cl");
+        for printed in &guards.printed {
+            subproof_clause.push_str(&format!(" (not (not {printed}))"));
+        }
+        if let Shape::UnderArrayEq { array_eq_lit, .. } = &shape {
+            subproof_clause.push(' ');
+            subproof_clause.push_str(&self.format_term(*array_eq_lit));
+        }
+        subproof_clause.push(' ');
+        subproof_clause.push_str(&printed_conclusion);
+        subproof_clause.push(')');
+
+        for (index, printed) in guards.printed.iter().enumerate() {
+            let nn_id = format!("{id}.nn{index}");
+            nn_lines.push(format!(
+                "(step {nn_id} (cl (not (not (not {printed}))) {printed}) :rule not_not)"
+            ));
+            nn_ids.push(nn_id);
+        }
+
+        lines.push(format!("(anchor :step {id}.sp)"));
+        lines.extend(header);
+        lines.extend(guards.bridges.iter().cloned());
+        lines.extend(subproof_prefix);
+        lines.push(format!(
+            "(step {id}.sp {subproof_clause} :rule subproof :discharge ({}))",
+            discharge_ids.join(" ")
+        ));
+        lines.extend(nn_lines);
+        // With no guards the subproof clause already IS the flat clause up to
+        // literal order, and `resolution` needs two premises — restore the
+        // original order with `reordering` instead.
+        if nn_ids.is_empty() {
+            lines.push(format!(
+                "(step {flat_id} {} :rule reordering :premises ({id}.sp))",
+                self.format_clause(&flat_lits)
+            ));
+        } else {
+            let mut resolution_premises = vec![format!("{id}.sp")];
+            resolution_premises.extend(nn_ids);
+            lines.push(format!(
+                "(step {flat_id} {} :rule resolution :premises ({}))",
+                self.format_clause(&flat_lits),
+                resolution_premises.join(" ")
+            ));
+        }
+
+        if let Some(packed_or) = packed {
+            let packed_str = self.format_term(packed_or);
+            let children = split_application(&packed_str, "or")?;
+            if children.len() != flat_lits.len() {
+                return None;
+            }
+            let mut or_neg_ids: Vec<String> = Vec::with_capacity(children.len());
+            for (index, (child, &lit)) in children.iter().zip(flat_lits.iter()).enumerate() {
+                if child != &self.format_term(lit) {
+                    return None;
+                }
+                let or_id = format!("{id}.o{index}");
+                lines.push(format!(
+                    "(step {or_id} (cl {packed_str} (not {child})) :rule or_neg :args ({index}))"
+                ));
+                or_neg_ids.push(or_id);
+            }
+            let mut premises = vec![flat_id];
+            premises.extend(or_neg_ids);
+            lines.push(format!(
+                "(step {id} (cl {packed_str}) :rule resolution :premises ({}))",
+                premises.join(" ")
+            ));
+        }
+
+        Some(lines.join("\n"))
+    }
+
+    /// Build the guard assumptions of a row-chain subproof.
+    ///
+    /// One assumption per DISTINCT index-equality literal the walks consume,
+    /// in first-use order. `arrays_row` demands its premise spell the
+    /// disequality as `(not (= store_index read_index))`; a clause carrying
+    /// the mirror spelling is bridged with `not_symm`, and any other printed
+    /// surface fails closed.
+    fn row_chain_guards(
+        &self,
+        id: ProofId,
+        index_str: &str,
+        paths: &[&crate::checker::RowChainPath],
+    ) -> Option<RowChainGuards> {
+        let mut guards = RowChainGuards::default();
+        for path in paths {
+            for skip in &path.skips {
+                if guards.order.contains(&skip.guard) {
+                    continue;
+                }
+                let position = guards.order.len();
+                let printed = self.format_term(skip.guard);
+                let store_index = self.format_term(skip.store_index);
+                let forward = format!("(= {store_index} {index_str})");
+                let reverse = format!("(= {index_str} {store_index})");
+                let assume_id = format!("{id}.h{position}");
+                let row_id = if printed == forward {
+                    assume_id.clone()
+                } else if printed == reverse {
+                    let bridge_id = format!("{id}.s{position}");
+                    guards.bridges.push(format!(
+                        "(step {bridge_id} (cl (not {forward})) :rule not_symm :premises ({assume_id}))"
+                    ));
+                    bridge_id
+                } else {
+                    return None;
+                };
+                guards.order.push(skip.guard);
+                guards.printed.push(printed);
+                guards.assume_ids.push(assume_id);
+                guards.row_ids.push(row_id);
+            }
+        }
+        Some(guards)
+    }
+
+    /// Emit one chain walk's `arrays_row`/`arrays_idx` steps and return the id
+    /// of a single step proving `(= (select root index) tail)`.
+    ///
+    /// `RowChainPathProof::Reflexive` means the walk contributes no step
+    /// because `tail` IS `(select root index)` (a base array with no writes).
+    /// `None` is the fail-closed answer: the printed surface of some `store`
+    /// node is not the compositional rendering of the certified term.
+    fn emit_row_chain_path(
+        &self,
+        guards: &RowChainGuards,
+        prefix: &str,
+        index_str: &str,
+        path: &crate::checker::RowChainPath,
+        tail: &str,
+        lines: &mut Vec<String>,
+    ) -> Option<RowChainPathProof> {
+        use crate::checker::RowChainEnd;
+
+        let mut step_ids: Vec<String> = Vec::new();
+        let mut current = self.format_term(path.root);
+        for (position, skip) in path.skips.iter().enumerate() {
+            let outer = self.format_term(skip.outer);
+            if outer != current {
+                return None;
+            }
+            let inner = self.format_term(skip.inner);
+            let store_index = self.format_term(skip.store_index);
+            let store_args = split_application(&outer, "store")?;
+            let [printed_inner, printed_index, _printed_value] = store_args.as_slice() else {
+                return None;
+            };
+            if printed_inner != &inner || printed_index != &store_index {
+                return None;
+            }
+            let guard_position = guards.order.iter().position(|&g| g == skip.guard)?;
+            let step_id = format!("{prefix}{position}");
+            lines.push(format!(
+                "(step {step_id} (cl (= (select {outer} {index_str}) (select {inner} {index_str}))) \
+                 :rule arrays_row :premises ({}))",
+                guards.row_ids[guard_position]
+            ));
+            step_ids.push(step_id);
+            current = inner;
+        }
+        match path.end {
+            RowChainEnd::Value { outer, value } => {
+                let printed_outer = self.format_term(outer);
+                if printed_outer != current {
+                    return None;
+                }
+                let store_args = split_application(&printed_outer, "store")?;
+                let [_printed_inner, printed_index, printed_value] = store_args.as_slice() else {
+                    return None;
+                };
+                if printed_index != index_str || printed_value != &self.format_term(value) {
+                    return None;
+                }
+                if printed_value != tail {
+                    return None;
+                }
+                let step_id = format!("{prefix}idx");
+                lines.push(format!(
+                    "(step {step_id} (cl (= (select {printed_outer} {index_str}) {tail})) \
+                     :rule arrays_idx)"
+                ));
+                step_ids.push(step_id);
+            }
+            RowChainEnd::Base { base } => {
+                let printed_base = self.format_term(base);
+                if printed_base != current {
+                    return None;
+                }
+                if tail != format!("(select {printed_base} {index_str})") {
+                    return None;
+                }
+            }
+        }
+        match step_ids.len() {
+            0 => Some(RowChainPathProof::Reflexive),
+            1 => Some(RowChainPathProof::Step(step_ids.remove(0))),
+            _ => {
+                let head = format!("(select {} {index_str})", self.format_term(path.root));
+                let step_id = format!("{prefix}tr");
+                lines.push(format!(
+                    "(step {step_id} (cl (= {head} {tail})) :rule trans :premises ({}))",
+                    step_ids.join(" ")
+                ));
+                Some(RowChainPathProof::Step(step_id))
             }
         }
     }

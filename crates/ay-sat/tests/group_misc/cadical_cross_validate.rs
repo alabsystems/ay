@@ -12,8 +12,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use ay_sat::{parse_dimacs, SatResult};
@@ -105,19 +103,13 @@ fn run_ay(cnf_content: &str) -> (OracleResult, Option<Vec<bool>>) {
     let original_clauses = formula.clauses.clone();
     let mut solver = formula.into_solver();
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_clone = stop.clone();
-    let timeout_thread = std::thread::spawn(move || {
-        std::thread::sleep(SOLVER_TIMEOUT);
-        stop_clone.store(true, Ordering::Relaxed);
-    });
+    let timer = super::common::SolverInterruptTimer::start(&mut solver, SOLVER_TIMEOUT);
 
     let result = solver
-        .solve_interruptible(|| stop.load(Ordering::Relaxed))
+        .solve_interruptible(|| timer.is_interrupted())
         .into_inner();
 
-    // Clean up timeout thread (it will exit on its own, but don't wait)
-    drop(timeout_thread);
+    timer.cancel_and_join();
 
     match result {
         SatResult::Sat(ref model) => {

@@ -844,7 +844,7 @@ impl LpModel {
     ) -> Option<DualSolution> {
         match self.solve_dual_small(should_stop, early_stop_bound) {
             SmallDualOutcome::Solved(result) => result,
-            SmallDualOutcome::Overflow => {
+            SmallDualOutcome::Overflow { partial } => {
                 if let Some(certified) = self.solve_dual_f64_certified(should_stop) {
                     // Accept the certified floor only when it already satisfies
                     // the caller's target (or no target was given). A targeted
@@ -859,7 +859,19 @@ impl LpModel {
                         return Some(certified);
                     }
                 }
-                self.solve_dual_big(should_stop, early_stop_bound)
+                // Keep whichever tier proved more. The two solutions are never
+                // spliced: each carries the duals that attain its OWN bound, so
+                // a Farkas certificate built from either stays valid. The small
+                // tier's pre-overflow vertex regularly wins on instances whose
+                // exact-rational pivots are too slow for the big tier to
+                // converge.
+                match (self.solve_dual_big(should_stop, early_stop_bound), partial) {
+                    (Some(big), Some(small)) => {
+                        Some(if small.bound > big.bound { small } else { big })
+                    }
+                    (Some(big), None) => Some(big),
+                    (None, partial) => partial,
+                }
             }
         }
     }
@@ -962,10 +974,22 @@ impl LpModel {
                 return None;
             };
 
+            // ANYTIME: a stopped pivot corrupts the tableau, so the POST-pivot
+            // vertex is unreadable — but the PRE-pivot vertex was dual-feasible
+            // and its bound is sound (the same invariant the early exit above
+            // relies on). Snapshot it, and on a stopped pivot fall through to
+            // the normal readout with the snapshot restored instead of
+            // discarding everything the simplex proved.
+            //
+            // This matters: on a 467-var covering LP the exact-rational pivot is
+            // ~1.3M BigRational ops, so the deadline reliably lands mid-pivot and
+            // the old `return None` threw away the whole floor. Soundness is
+            // unchanged — weak duality holds at every dual-feasible vertex, and
+            // `optimal` stays false so no primal is recovered from it.
+            let snapshot = (basis.clone(), rhs.clone());
             if !pivot(&mut tab, &mut rhs, &mut obj, prow, col, n, should_stop) {
-                // Stopped mid-pivot: the tableau is inconsistent, so no sound
-                // vertex readout exists — decline (`None` = no information).
-                return None;
+                (basis, rhs) = snapshot;
+                break;
             }
             basis[prow] = col;
 
@@ -1055,22 +1079,22 @@ impl LpModel {
         let mut c_small: Vec<SmallRat> = Vec::with_capacity(n);
         for value in &self.c {
             let Some(small) = SmallRat::from_big(value) else {
-                return Overflow;
+                return Overflow { partial: None };
             };
             c_small.push(small);
         }
         let Some(offset) = SmallRat::from_big(&self.offset) else {
-            return Overflow;
+            return Overflow { partial: None };
         };
         let mut rows_small: Vec<(Vec<(usize, SmallRat)>, SmallRat)> = Vec::with_capacity(m);
         for row in &self.rows {
             let Some(b) = SmallRat::from_big(&row.b) else {
-                return Overflow;
+                return Overflow { partial: None };
             };
             let mut coeffs = Vec::with_capacity(row.coeffs.len());
             for &(v, ref coeff) in &row.coeffs {
                 let Some(small) = SmallRat::from_big(coeff) else {
-                    return Overflow;
+                    return Overflow { partial: None };
                 };
                 coeffs.push((v, small));
             }
@@ -1125,7 +1149,7 @@ impl LpModel {
                         entering = Some(col);
                     }
                     Some(_) => {}
-                    None => return Overflow,
+                    None => return Overflow { partial: None },
                 }
             }
             let Some(col) = entering else {
@@ -1143,13 +1167,13 @@ impl LpModel {
                     continue;
                 }
                 let Some(ratio) = rhs[i].checked_div(a) else {
-                    return Overflow;
+                    return Overflow { partial: None };
                 };
                 let take = match best_ratio {
                     Some(br) => match ratio.checked_cmp(br) {
                         Some(std::cmp::Ordering::Less) => true,
                         Some(_) => false,
-                        None => return Overflow,
+                        None => return Overflow { partial: None },
                     },
                     None => true,
                 };
@@ -1163,6 +1187,11 @@ impl LpModel {
                 return Solved(None);
             };
 
+            // Denominator growth is the small tier's failure mode (measured:
+            // this LP dies in the pivot after exactly 52 of them). Snapshot the
+            // dual-feasible vertex first so an overflow costs the NEXT pivot,
+            // not the 52 already paid for.
+            let snapshot = (basis.clone(), rhs.clone());
             match pivot_small(&mut tab, &mut rhs, &mut obj, prow, col, n, should_stop) {
                 PivotOutcome::Done => {}
                 // Mid-pivot stop: the tableau is inconsistent and the whole
@@ -1171,7 +1200,12 @@ impl LpModel {
                 // source, so a strided memory-guard trip is never re-polled and
                 // misclassified as overflow.
                 PivotOutcome::Stopped => return Solved(None),
-                PivotOutcome::Overflow => return Overflow,
+                PivotOutcome::Overflow => {
+                    let (basis, rhs) = snapshot;
+                    return Overflow {
+                        partial: small_vertex_solution(&rows_small, &basis, &rhs, offset, m, n),
+                    };
+                }
             }
             basis[prow] = col;
 
@@ -1204,10 +1238,10 @@ impl LpModel {
                 continue;
             }
             let Some(product) = b.checked_mul(y[r]) else {
-                return Overflow;
+                return Overflow { partial: None };
             };
             let Some(sum) = exact_bound.checked_add(product) else {
-                return Overflow;
+                return Overflow { partial: None };
             };
             exact_bound = sum;
         }
@@ -1755,9 +1789,53 @@ enum SmallDualOutcome {
     /// dual-unbounded / out-of-`i128`-ceil, which are value-identical).
     Solved(Option<DualSolution>),
     /// Some value did not fit checked `i128` rational arithmetic. The caller
-    /// must re-solve with the BigRational tier; nothing from the small run is
-    /// reused.
-    Overflow,
+    /// must re-solve with the BigRational tier.
+    ///
+    /// `partial` carries what the small run had already PROVEN when it hit the
+    /// wall: the dual-feasible vertex from immediately before the failed pivot,
+    /// as a complete [`DualSolution`] (duals attain its own `bound`, `primal`
+    /// is `None` because the run never reached optimality). It is a sound floor
+    /// by weak duality, exactly like the big tier's anytime readout. The caller
+    /// escalates as before and keeps whichever tier proves more — the two are
+    /// never spliced, so a solution's duals always attain its own bound.
+    Overflow { partial: Option<DualSolution> },
+}
+
+/// Builds a complete [`DualSolution`] from a dual-feasible small-tier vertex.
+///
+/// Every simplex iteration begins at a dual-feasible point, so `offset + b·y`
+/// read off that basis is a sound lower bound by weak duality — the same
+/// invariant the in-simplex early exit relies on. `primal` is deliberately
+/// `None`: the run did not reach optimality, so no primal vertex may be
+/// recovered from it. Returns `None` if the readout itself overflows, in which
+/// case the caller simply has no partial to keep.
+fn small_vertex_solution(
+    rows_small: &[(Vec<(usize, SmallRat)>, SmallRat)],
+    basis: &[usize],
+    rhs: &[SmallRat],
+    offset: SmallRat,
+    m: usize,
+    n: usize,
+) -> Option<DualSolution> {
+    let mut y: Vec<SmallRat> = vec![SmallRat::ZERO; m];
+    for i in 0..n {
+        if basis[i] < m {
+            y[basis[i]] = rhs[i];
+        }
+    }
+    let mut exact_bound = offset;
+    for (r, (_, b)) in rows_small.iter().enumerate() {
+        if y[r].is_zero() {
+            continue;
+        }
+        exact_bound = exact_bound.checked_add(b.checked_mul(y[r])?)?;
+    }
+    Some(DualSolution {
+        bound: exact_bound.ceil_i128()?,
+        exact_bound: exact_bound.to_big(),
+        duals: y.iter().map(SmallRat::to_big).collect(),
+        primal: None,
+    })
 }
 
 /// Exact rational with `i128` numerator/denominator: `den > 0`, fully reduced.
@@ -2617,7 +2695,7 @@ mod tests {
             };
             let big = model.solve_dual_big(&never_stop, None);
             match model.solve_dual_small(&never_stop, None) {
-                SmallDualOutcome::Overflow => continue, // fallback path; covered below.
+                SmallDualOutcome::Overflow { .. } => continue, // fallback path; covered below.
                 SmallDualOutcome::Solved(small) => {
                     compared += 1;
                     match (&small, &big) {
@@ -2675,7 +2753,7 @@ mod tests {
         assert!(
             matches!(
                 model.solve_dual_small(&never_stop, None),
-                SmallDualOutcome::Overflow
+                SmallDualOutcome::Overflow { .. }
             ),
             "huge coefficients must trip the checked-i128 overflow guard"
         );
@@ -2745,7 +2823,7 @@ mod tests {
             };
             let big = model.solve_dual_big(&never_stop, None);
             match model.solve_dual_small(&never_stop, None) {
-                SmallDualOutcome::Overflow => {
+                SmallDualOutcome::Overflow { .. } => {
                     overflows += 1;
                     // The public dispatcher resolves via the f64-certified tier
                     // (bound <= big, never above — THE soundness ordering) or,
@@ -3111,7 +3189,7 @@ mod tests {
         assert!(
             matches!(
                 model.solve_dual_small(&never_stop, Some(int_opt)),
-                SmallDualOutcome::Overflow
+                SmallDualOutcome::Overflow { .. }
             ),
             "fixture must overflow the i128 tier in targeted mode"
         );
@@ -3238,7 +3316,7 @@ mod tests {
             .expect("huge model");
         assert!(matches!(
             huge_model.solve_dual_small(&never_stop, None),
-            SmallDualOutcome::Overflow
+            SmallDualOutcome::Overflow { .. }
         ));
         let exact = huge_model
             .solve_dual_big(&never_stop, None)
@@ -3283,7 +3361,7 @@ mod tests {
             LpModel::build(&objective, std::slice::from_ref(&constraint), 2).expect("model");
         assert!(matches!(
             model.solve_dual_small(&never_stop, None),
-            SmallDualOutcome::Overflow
+            SmallDualOutcome::Overflow { .. }
         ));
 
         let certified = model
@@ -3320,7 +3398,7 @@ mod tests {
                 LpModel::build(&objective, std::slice::from_ref(&constraint), 2).expect("model");
             assert!(matches!(
                 model.solve_dual_small(&never_stop, None),
-                SmallDualOutcome::Overflow
+                SmallDualOutcome::Overflow { .. }
             ));
             let certified = model
                 .solve_dual_f64_certified(&never_stop)

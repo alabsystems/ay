@@ -1666,3 +1666,209 @@ fn bounded_regex_replacements_share_the_whole_operation_budget() {
         Ok(Some("xxxx".to_string()))
     );
 }
+
+// ── str.replace_re_all with a NULLABLE regex (#strings-replace_re_all-nullable)
+//
+// SMT-LIB 2.6 Unicode Strings defines
+//   (str.replace_re_all s r t) = s                                   if s has no
+//     decomposition s = x ++ w ++ z with w in [[r]] and w != "";
+//   (str.replace_re_all s r t) = x ++ t ++ (str.replace_re_all z r t) otherwise,
+//     for the decomposition with |x| minimal and then |w| minimal.
+//
+// The `w != ""` side condition is what makes the recursion terminate; it does
+// NOT disable the operator on a nullable regex. AY used the empty-match-eligible
+// leftmost-shortest matcher here, so for every nullable r the match found was
+// the empty word at position 0, no replacement ever fired, and the operator
+// silently became the identity — a wrong verdict in BOTH directions.
+
+#[test]
+fn find_first_nonempty_match_skips_the_empty_match() {
+    let mut terms = TermStore::new();
+    let a = mk_str_to_re(&mut terms, "a");
+    let star = mk_re_star(&mut terms, a);
+    let mut budget = RegexWorkBudget::unlimited();
+
+    // The empty-match-eligible matcher (used by str.replace_re, whose clause
+    // has NO `w != ""` condition) still reports the empty match at 0.
+    assert!(matches!(
+        RegExpSolver::find_first_match(&terms, "bab", star),
+        MatchResult::Found(0, 0)
+    ));
+
+    // The non-empty matcher (used by str.replace_re_all) must skip past it and
+    // report the leftmost, then shortest, NON-EMPTY match: "a" at index 1.
+    assert!(matches!(
+        RegExpSolver::find_first_nonempty_match_with_budget(&terms, "bab", star, &mut budget),
+        Ok(MatchResult::Found(1, 2))
+    ));
+}
+
+#[test]
+fn find_first_nonempty_match_is_leftmost_then_shortest() {
+    let mut terms = TermStore::new();
+    // re.union(str.to_re("ab"), str.to_re("a")) — both start at index 1 in "xab";
+    // the shortest non-empty one is "a".
+    let ab = mk_str_to_re(&mut terms, "ab");
+    let a = mk_str_to_re(&mut terms, "a");
+    let r = mk_re_union(&mut terms, vec![ab, a]);
+    let mut budget = RegexWorkBudget::unlimited();
+    assert!(matches!(
+        RegExpSolver::find_first_nonempty_match_with_budget(&terms, "xab", r, &mut budget),
+        Ok(MatchResult::Found(1, 2))
+    ));
+}
+
+#[test]
+fn find_first_nonempty_match_none_when_only_epsilon_is_in_the_language() {
+    let mut terms = TermStore::new();
+    // L(str.to_re("")) = {ε}: no non-empty match exists anywhere.
+    let eps = mk_str_to_re(&mut terms, "");
+    let mut budget = RegexWorkBudget::unlimited();
+    assert!(matches!(
+        RegExpSolver::find_first_nonempty_match_with_budget(&terms, "abc", eps, &mut budget),
+        Ok(MatchResult::NoMatch)
+    ));
+}
+
+#[test]
+fn replace_re_all_nullable_re_all_replaces_every_character() {
+    let mut terms = TermStore::new();
+    let all = mk_re_all(&mut terms);
+    // Shortest non-empty match of re.all is one character, everywhere.
+    assert_eq!(
+        crate::ground_eval_replace_re_all(&terms, "a", all, "b"),
+        Some("b".to_string())
+    );
+    assert_eq!(
+        crate::ground_eval_replace_re_all(&terms, "abc", all, "-"),
+        Some("---".to_string())
+    );
+}
+
+#[test]
+fn replace_re_all_star_and_plus_agree() {
+    // L(a*) and L(a+) differ only by ε, which the `w != ""` side condition
+    // filters out, so the two terms are provably equal for every s and t.
+    // AY used to answer "XXb" for re.+ and "aab" for re.* — a self-contradiction.
+    let mut terms = TermStore::new();
+    let a = mk_str_to_re(&mut terms, "a");
+    let star = mk_re_star(&mut terms, a);
+    let plus = mk_re_plus(&mut terms, a);
+    for subject in ["aab", "", "b", "aaa", "baa", "bab"] {
+        assert_eq!(
+            crate::ground_eval_replace_re_all(&terms, subject, star, "X"),
+            crate::ground_eval_replace_re_all(&terms, subject, plus, "X"),
+            "re.* and re.+ disagree on {subject:?}"
+        );
+    }
+    assert_eq!(
+        crate::ground_eval_replace_re_all(&terms, "aab", star, "X"),
+        Some("XXb".to_string())
+    );
+}
+
+#[test]
+fn replace_re_all_re_opt_is_not_the_identity() {
+    let mut terms = TermStore::new();
+    let a = mk_str_to_re(&mut terms, "a");
+    let opt = mk_re_opt(&mut terms, a); // nullable: L = {ε, "a"}
+    assert_eq!(
+        crate::ground_eval_replace_re_all(&terms, "bab", opt, "Z"),
+        Some("bZb".to_string())
+    );
+}
+
+#[test]
+fn replace_re_all_epsilon_only_regex_is_the_identity() {
+    // Guards the earlier fix (#strings-replace_re_all): a regex whose only word
+    // is ε must NOT insert the replacement anywhere. That was a false-UNSAT.
+    let mut terms = TermStore::new();
+    let eps = mk_str_to_re(&mut terms, "");
+    assert_eq!(
+        crate::ground_eval_replace_re_all(&terms, "abc", eps, "X"),
+        Some("abc".to_string())
+    );
+    assert_eq!(
+        crate::ground_eval_replace_re_all(&terms, "", eps, "X"),
+        Some(String::new())
+    );
+}
+
+#[test]
+fn replace_re_all_empty_subject_is_the_identity() {
+    // "" admits no decomposition with a non-empty middle, so it is its own image
+    // under every regex — including nullable ones.
+    let mut terms = TermStore::new();
+    let all = mk_re_all(&mut terms);
+    let a = mk_str_to_re(&mut terms, "a");
+    let star = mk_re_star(&mut terms, a);
+    assert_eq!(
+        crate::ground_eval_replace_re_all(&terms, "", all, "X"),
+        Some(String::new())
+    );
+    assert_eq!(
+        crate::ground_eval_replace_re_all(&terms, "", star, "X"),
+        Some(String::new())
+    );
+}
+
+#[test]
+fn replace_re_all_re_none_is_the_identity() {
+    let mut terms = TermStore::new();
+    let none = mk_re_none(&mut terms);
+    assert_eq!(
+        crate::ground_eval_replace_re_all(&terms, "abc", none, "X"),
+        Some("abc".to_string())
+    );
+}
+
+#[test]
+fn replace_re_all_nullable_is_char_indexed_not_byte_indexed() {
+    // The matcher returns BYTE offsets from a CHARACTER-indexed scan; a nullable
+    // regex over multi-byte characters must still slice on character boundaries.
+    let mut terms = TermStore::new();
+    let all = mk_re_all(&mut terms);
+    assert_eq!(
+        crate::ground_eval_replace_re_all(&terms, "\u{3b1}\u{3b2}", all, "-"),
+        Some("--".to_string())
+    );
+    let alpha = mk_str_to_re(&mut terms, "\u{3b1}");
+    let star = mk_re_star(&mut terms, alpha);
+    assert_eq!(
+        crate::ground_eval_replace_re_all(&terms, "x\u{3b1}\u{3b2}", star, "A"),
+        Some("xA\u{3b2}".to_string())
+    );
+}
+
+#[test]
+fn replace_re_all_nullable_budget_is_still_threaded() {
+    // The non-empty matcher always advances, so the loop cannot spin. An
+    // exhausted budget must remain a resource abort, not a semantic answer.
+    let mut terms = TermStore::new();
+    let all = mk_re_all(&mut terms);
+    assert_eq!(
+        crate::ground_eval_replace_re_all_with_work_limit(&terms, "aaaa", all, "x", 0),
+        Err(RegexWorkLimitExceeded)
+    );
+}
+
+#[test]
+fn replace_re_keeps_empty_match_eligibility() {
+    // str.replace_re's SMT-LIB clause is not recursive, so it needs no
+    // termination side condition and carries none: with a nullable regex the
+    // minimal-|x|, then minimal-|w| decomposition is x = w = ε and t is
+    // inserted at the front. That behaviour is pre-existing and was separately
+    // adjudicated as correct; the replace_re_all fix must not disturb it.
+    let mut terms = TermStore::new();
+    let all = mk_re_all(&mut terms);
+    assert_eq!(
+        crate::ground_eval_replace_re(&terms, "a", all, "b"),
+        Some("ba".to_string())
+    );
+    let a = mk_str_to_re(&mut terms, "a");
+    let star = mk_re_star(&mut terms, a);
+    assert_eq!(
+        crate::ground_eval_replace_re(&terms, "bbb", star, "X"),
+        Some("Xbbb".to_string())
+    );
+}

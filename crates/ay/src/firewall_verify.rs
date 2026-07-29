@@ -195,12 +195,26 @@ fn checked_diagnostic_source_total(current: usize, next: usize) -> Option<usize>
 // base. NiaProduct carries the McCormick bilinear-product bridge that the
 // nonlinear-integer emitter injects; like the others it is import-free, so it
 // concatenates cleanly after the imports have been stripped.
+//
+// StringThy and RegexThy were MISSING here until the `str.in_re` length-
+// invariant emitter landed, which meant every string-theory emitter (`str.len`
+// over concat, `str.len = 0`, `str.at`, `str.indexof`, and now `str.in_re`)
+// produced an artifact this gate rejected as "an untrusted Lean import" — the
+// acceptance path had never once run for a string emitter. RegexThy is the only
+// embedded module with an import of its own (`AySoundness.StringThy`); it is
+// stripped below and the two are concatenated in dependency order.
 const LRAT_SOURCE: &str = include_str!("../../../verification/lean/AySoundness/Lrat.lean");
 const FIREWALL_SOURCE: &str = include_str!("../../../verification/lean/AySoundness/Firewall.lean");
 const FP_SOURCE: &str = include_str!("../../../verification/lean/AySoundness/FpThy.lean");
 const DATATYPE_SOURCE: &str = include_str!("../../../verification/lean/AySoundness/Datatype.lean");
 const NIA_PRODUCT_SOURCE: &str =
     include_str!("../../../verification/lean/AySoundness/NiaProduct.lean");
+const STRING_SOURCE: &str = include_str!("../../../verification/lean/AySoundness/StringThy.lean");
+const REGEX_SOURCE: &str = include_str!("../../../verification/lean/AySoundness/RegexThy.lean");
+/// The REAL-faithful ordered-field model abstraction the QF_UFLRA congruence
+/// emitter quantifies over. Import-free (Lean core only), so it concatenates
+/// cleanly like the other embedded theory modules.
+const ORD_FIELD_SOURCE: &str = include_str!("../../../verification/lean/AySoundness/OrdField.lean");
 const LAKEFILE_SOURCE: &str = include_str!("../../../verification/lean/lakefile.toml");
 const LEAN_TOOLCHAIN_SOURCE: &str = include_str!("../../../verification/lean/lean-toolchain");
 
@@ -575,6 +589,9 @@ const AXIOM_AUDIT_SUFFIX: &str = "\"\n";
 struct StandaloneParts<'a> {
     body: &'a str,
     firewall: &'static str,
+    /// `REGEX_SOURCE` with its `import AySoundness.StringThy` header stripped,
+    /// so it concatenates after the embedded `STRING_SOURCE`.
+    regex: &'static str,
     audit_at: usize,
 }
 
@@ -583,12 +600,25 @@ struct StandaloneParts<'a> {
 /// lists these modules in a different relative order leaves a residual `import `
 /// line and is rejected as untrusted. `AySoundness.NiaProduct` therefore sits
 /// immediately AFTER `AySoundness.Firewall`, matching
-/// `render_nia_product_lean`'s two-line header.
-const ALLOWED_EMITTED_IMPORTS: [&str; 4] = [
+/// `render_nia_product_lean`'s two-line header. Skipping entries is fine — the
+/// walk only strips what is actually present — so the string emitters'
+/// `Firewall`/`StringThy` pair, the regex emitter's
+/// `Firewall`/`StringThy`/`RegexThy` triple, and the REAL-sorted ordered-field
+/// emitter's `Firewall`/`OrdField` pair all pass.
+///
+/// Modules whose emitters are still REJECTED here (their sources are not
+/// embedded, so accepting the import would let a working-directory module
+/// redefine the lemma): `AySoundness.SeqThy`, `AySoundness.SetThy`,
+/// `AySoundness.FpUnderflow`. Adding one means embedding its source below and
+/// concatenating it in dependency order — not just listing it here.
+const ALLOWED_EMITTED_IMPORTS: [&str; 7] = [
     "import AySoundness.Firewall\n",
     "import AySoundness.NiaProduct\n",
     "import AySoundness.FpThy\n",
     "import AySoundness.Datatype\n",
+    "import AySoundness.StringThy\n",
+    "import AySoundness.RegexThy\n",
+    "import AySoundness.OrdField\n",
 ];
 
 fn standalone_parts(emitted: &str) -> Result<StandaloneParts<'_>, String> {
@@ -605,6 +635,9 @@ fn standalone_parts(emitted: &str) -> Result<StandaloneParts<'_>, String> {
     let firewall = FIREWALL_SOURCE
         .strip_prefix("import AySoundness.Lrat\n")
         .ok_or_else(|| "embedded Firewall source has an unexpected import header".to_string())?;
+    let regex = REGEX_SOURCE
+        .strip_prefix("import AySoundness.StringThy\n")
+        .ok_or_else(|| "embedded RegexThy source has an unexpected import header".to_string())?;
     let theorem = body
         .find("theorem no_model")
         .ok_or_else(|| "emitter produced no no_model theorem".to_string())?;
@@ -615,6 +648,7 @@ fn standalone_parts(emitted: &str) -> Result<StandaloneParts<'_>, String> {
     Ok(StandaloneParts {
         body,
         firewall,
+        regex,
         audit_at: theorem + relative_end,
     })
 }
@@ -631,6 +665,12 @@ fn standalone_firewall_source_len(emitted: &str) -> Result<usize, String> {
         DATATYPE_SOURCE.len(),
         1,
         NIA_PRODUCT_SOURCE.len(),
+        1,
+        STRING_SOURCE.len(),
+        1,
+        parts.regex.len(),
+        1,
+        ORD_FIELD_SOURCE.len(),
         1,
         parts.body.len(),
         AXIOM_AUDIT_PREFIX.len(),
@@ -659,6 +699,15 @@ fn standalone_firewall_source(emitted: &str) -> Result<String, String> {
     source.push_str(DATATYPE_SOURCE);
     source.push('\n');
     source.push_str(NIA_PRODUCT_SOURCE);
+    source.push('\n');
+    // Dependency order: RegexThy's stripped source refers to StringThy's `Str`
+    // and `len`, so StringThy must precede it. OrdField is import-free and
+    // independent of both, so it follows them.
+    source.push_str(STRING_SOURCE);
+    source.push('\n');
+    source.push_str(parts.regex);
+    source.push('\n');
+    source.push_str(ORD_FIELD_SOURCE);
     source.push('\n');
     source.push_str(&parts.body[..parts.audit_at]);
     source.push_str(AXIOM_AUDIT_PREFIX);
@@ -1411,6 +1460,120 @@ end AySoundness.Emitted.NiaProd_77b5a9d756ebabfd
                 "import AySoundness.NiaProduct\n"
             ]
         );
+    }
+
+    /// The verbatim body of a real `--emit-firewall-lean` artifact from the
+    /// `str.in_re` length-invariant emitter, produced on
+    /// `benchmarks/smtcomp/QF_SLIA/.../regex-011-unsat-fuzz-graft-reverse.smt2`
+    /// (doc comment elided). Three allow-listed imports, and both a
+    /// `AySoundness.StringThy` and a `AySoundness.RegexThy` name applied inside
+    /// the proof.
+    const STR_IN_RE_ARTIFACT: &str = r#"import AySoundness.Firewall
+import AySoundness.StringThy
+import AySoundness.RegexThy
+namespace AySoundness.Emitted.StrInReLen_e14609b60131ee43
+open AySoundness
+
+abbrev Val := StringThy.Str
+
+def re1 : RegexThy.Re :=
+  (RegexThy.Re.cat (RegexThy.Re.star (RegexThy.Re.lit [58, 123, 39, 104, 65, 97])) (RegexThy.Re.star (RegexThy.Re.star (RegexThy.Re.lit [58, 123, 39, 104, 65, 97]))))
+
+noncomputable def atomVal (m : Val) (n : Nat) : Bool :=
+  match n with
+  | 1 => decide (RegexThy.Mem re1 m)
+  | 2 => decide (StringThy.len m = 4)
+  | _ => false
+
+def original : List (Cid × Clause) := [(1, [1]), (2, [2])]
+def lemmas   : List (Cid × Clause) := [(3, [-1, -2])]
+def proof    : List (Cid × Clause × List Int) := [(4, [], [1, 2, 3])]
+
+theorem lemma_valid (m : Val) : clauseSat (atomVal m) [-1, -2] = true := by
+  by_cases hm : RegexThy.Mem re1 m
+  · have hpin : ¬ (StringThy.len m = 4) := fun h =>
+      RegexThy.regex_len_mod_conflict (k := 6) (by decide) hm h (by decide)
+    have ha : atomVal m 2 = false := by
+      simp only [atomVal, decide_eq_false_iff_not]
+      exact hpin
+    simp [clauseSat, litSat, List.any_cons, List.any_nil, ha]
+  · have ha : atomVal m 1 = false := by
+      simp only [atomVal, decide_eq_false_iff_not]
+      exact hm
+    simp [clauseSat, litSat, List.any_cons, List.any_nil, ha]
+
+theorem lemmas_valid :
+    ∀ cl ∈ clauses lemmas, ∀ m : Val, clauseSat (atomVal m) cl = true := by
+  intro cl hcl m
+  simp only [clauses, lemmas, List.map_cons, List.map_nil, List.mem_cons,
+    List.not_mem_nil, or_false] at hcl
+  subst hcl
+  exact lemma_valid m
+
+theorem no_model : ∀ m : Val, ¬ Sat (atomVal m) (clauses original) :=
+  firewall_combined_unsat (original := original) (lemmas := lemmas) (proof := proof)
+    atomVal (by decide) (by decide) lemmas_valid (by decide)
+
+end AySoundness.Emitted.StrInReLen_e14609b60131ee43
+"#;
+
+    /// REGRESSION (the acceptance path had never run for ANY string emitter):
+    /// `AySoundness.StringThy` was absent from the allow-list AND from the
+    /// embedded sources, so every `str.len`/`str.at`/`str.indexof`/`str.in_re`
+    /// artifact was rejected with "emitter requested an untrusted Lean import"
+    /// before a kernel ever saw it. Both halves matter — allow-listing an import
+    /// whose source is not embedded would let a module in the working directory
+    /// redefine the lemma the gate claims to check.
+    #[test]
+    fn standalone_source_embeds_the_string_and_regex_base() {
+        let source = standalone_firewall_source(STR_IN_RE_ARTIFACT).expect("standalone source");
+        assert_eq!(
+            source.len(),
+            standalone_firewall_source_len(STR_IN_RE_ARTIFACT).expect("standalone source length")
+        );
+        // Nothing is imported: every trusted module is inlined from this binary.
+        assert!(!source.lines().any(|line| line.starts_with("import ")));
+        assert!(source.contains("namespace AySoundness.StringThy"));
+        assert!(source.contains("namespace AySoundness.RegexThy"));
+        assert!(source.contains("theorem mem_len_dvd"));
+        assert!(source.contains("theorem regex_len_mod_conflict"));
+        // Dependency order: RegexThy's body mentions `StringThy.Str`.
+        let string_thy = source
+            .find("namespace AySoundness.StringThy")
+            .expect("StringThy in the embedded base");
+        let regex_thy = source
+            .find("namespace AySoundness.RegexThy")
+            .expect("RegexThy in the embedded base");
+        let use_site = source
+            .find("RegexThy.regex_len_mod_conflict (k := 6)")
+            .expect("corollary application in the emitted body");
+        assert!(string_thy < regex_thy);
+        assert!(regex_thy < use_site);
+        assert!(source.contains(AXIOM_AUDIT_SENTINEL));
+        eprintln!("----STANDALONE-BEGIN----\n{source}\n----STANDALONE-END----");
+    }
+
+    /// The REAL-sorted ordered-field emitter writes
+    /// `Firewall` then `OrdField`, so both must strip and the embedded
+    /// `OrdField` source must land in the standalone file ahead of the body.
+    #[test]
+    fn standalone_source_embeds_ord_field_for_the_real_emitter() {
+        let emitted = "import AySoundness.Firewall\n\
+                       import AySoundness.OrdField\n\
+                       namespace X\n\
+                       theorem no_model (F : AySoundness.OrdField) : True := by trivial\n\
+                       end X\n";
+        let source = standalone_firewall_source(emitted).expect("standalone source");
+        assert!(source.contains("structure OrdField where"));
+        assert!(source.contains("theorem ordField_nonvacuous"));
+        let ord_field = source
+            .find("structure OrdField where")
+            .expect("embedded OrdField");
+        let body = source.find("namespace X").expect("emitted body");
+        assert!(ord_field < body);
+        // The embedded module must be import-free, or the concatenation breaks.
+        assert!(!ORD_FIELD_SOURCE.contains("\nimport "));
+        assert!(!ORD_FIELD_SOURCE.starts_with("import "));
     }
 
     #[test]

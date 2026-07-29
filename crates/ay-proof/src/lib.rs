@@ -95,7 +95,19 @@ pub use terminal_trust::{
 };
 
 use alethe_printer::AlethePrinter;
-use variables::{collect_auxiliary_proof_declarations, collect_proof_variables};
+use variables::{
+    collect_auxiliary_proof_declarations, collect_proof_variables, SymbolSortConflict,
+};
+
+impl From<SymbolSortConflict> for AlethePrintError {
+    fn from(conflict: SymbolSortConflict) -> Self {
+        Self::AmbiguousSymbolSort {
+            name: conflict.name,
+            first: conflict.first,
+            second: conflict.second,
+        }
+    }
+}
 
 /// Render a single term with the exact Alethe surface syntax used by
 /// [`export_alethe`] (same symbol quoting, constant spelling, and operator
@@ -165,7 +177,7 @@ pub fn try_export_alethe(proof: &Proof, terms: &TermStore) -> Result<String, Ale
 
     // Collect all variables referenced in proof terms and emit declarations.
     // Carcara requires all symbols to be declared before use.
-    let vars = collect_proof_variables(proof, terms);
+    let vars = collect_proof_variables(proof, terms)?;
     for (name, sort) in &vars {
         if printer.is_skolem_witness_name(name) {
             continue;
@@ -338,7 +350,10 @@ pub fn try_export_alethe_with_problem_scope_overrides_and_budget_to<W: std::io::
         .prepare_proof(proof)
         .map_err(AletheStreamError::Print)?;
 
-    for (name, sort) in collect_auxiliary_proof_declarations(proof, terms, problem_assertions) {
+    let auxiliary_declarations =
+        collect_auxiliary_proof_declarations(proof, terms, problem_assertions)
+            .map_err(|conflict| AletheStreamError::Print(conflict.into()))?;
+    for (name, sort) in auxiliary_declarations {
         if printer.is_skolem_witness_name(&name) {
             continue;
         }

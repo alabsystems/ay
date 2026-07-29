@@ -1,0 +1,49 @@
+# AY <-> VeriPB checker PIN. Single source of truth.
+#
+# Everything that verifies an AY proof — CI, `scripts/ci/pb_certified_gate.sh`,
+# and the Rust gate in `crates/ay-test-support/src/veripb.rs` (module `pin`,
+# which `include_str!`s THIS file) — reads the checker identity from here.
+# There is no second copy to drift.
+#
+# WHY A PIN AT ALL. "VeriPB accepted it" only means something if you can say
+# WHICH VeriPB. Upstream 3.0.2 as published has six confirmed wrong-verdict
+# bugs (see ci/veripb-soundness/README.md): it will print `s VERIFIED
+# UNSATISFIABLE` for satisfiable formulas and `s VERIFIED SATISFIABLE` for
+# unsatisfiable ones, given the right (small, non-adversarial-looking) proof.
+# A green CI run against such a checker is not evidence. So the pin names an
+# exact commit PLUS a patch that fixes all six, and the gate re-proves the
+# fixes on every run against committed fixtures before it trusts a verdict.
+#
+# FORMAT: strict KEY=VALUE, no spaces, no quoting, no expansion. It is `.`-able
+# from POSIX sh and parsed by a hand-written Rust reader; keep it boring.
+#
+# TO MOVE THE PIN (checker upgrade):
+#   1. Rebase the patch onto the new upstream commit.
+#   2. Update VERIPB_COMMIT / VERIPB_VERSION / VERIPB_PATCH_SHA256 here.
+#   3. Run `scripts/ci/pb_certified_gate.sh`. It rebuilds from scratch, re-runs
+#      the six soundness fixtures, and re-verifies every certified-track proof.
+#      If the new checker regressed any of the six, the gate fails and the
+#      upgrade does not land. That is the whole point: a checker swap cannot
+#      change what "verified" means without turning CI red.
+
+# Upstream repository the pinned checker is built from.
+VERIPB_REPO=https://gitlab.com/MIAOresearch/software/VeriPB.git
+
+# Exact upstream commit. `--version` is NOT an identity: 3.0.2 has been many
+# different checkers. The sha is the identity; the version is a cross-check.
+VERIPB_COMMIT=4bb10c2ce98a8c80122a7a2399d7f35ffdc6e58e
+
+# What the pinned build must report for `veripb --version` (last field).
+VERIPB_VERSION=3.0.2
+
+# Patch applied on top of VERIPB_COMMIT before building. Fixes the six
+# wrong-verdict bugs. Reproducible from public sources: clone + checkout +
+# `git apply` + `cargo build --release --bin veripb`.
+VERIPB_PATCH=ci/veripb-patches/0001-ay-validated-soundness-fixes.patch
+VERIPB_PATCH_SHA256=2e7c26e5b23cb190fe4dc4a30caa150994b9cbfd876ac628d00db313d8526a22
+
+# Fixtures the pinned checker MUST reject (one directory per known bug).
+VERIPB_SOUNDNESS_DIR=ci/veripb-soundness
+
+# The certified-track instance set and its expected verdicts.
+VERIPB_CERT_MANIFEST=ci/cert-instances/manifest.tsv

@@ -612,6 +612,7 @@ impl Executor {
         //    genuine constraint and turns a decided verdict into `Unknown`
         //    (#stale-presolve-frame-skip). Suppress that skip for such problems —
         //    adding every sound E-matched instance can only recover completeness.
+        self.register_ematching_proof_provenance(&ematching.unconditional_forall_instantiations);
         let ematching_added = self.add_ematching_instances(
             ematching.instantiations,
             &ematching.unconditional_forall_roots,

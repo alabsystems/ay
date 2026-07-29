@@ -173,7 +173,38 @@ impl Executor {
             }
         }
 
-        self.check_sat_assuming(assumptions)
+        let result = self.check_sat_assuming(assumptions);
+        // #A7: `(get-unsat-assumptions)` publishes the harvest as a
+        // CERTIFICATE — SMT-LIB 2.6 requires the returned subset to be
+        // unsatisfiable together with the asserted formulas, and a consumer
+        // (MUS extraction, assumption-based CEGAR, BMC) that trusts a
+        // satisfiable "core" draws exactly the conclusion a wrong `unsat`
+        // would licence. The named-core branch above already gates its
+        // harvest; this branch (`:produce-unsat-assumptions` WITHOUT
+        // `:produce-unsat-cores`) published the raw harvest, which
+        // `unsat_assumptions` then only membership-filtered. Route it through
+        // the same fail-closed re-solve: a proper-subset harvest must re-prove
+        // UNSAT on its own or it is discarded, after which the full assumption
+        // set — always a sound core when the query is UNSAT — prints instead.
+        // Gated on the option so plain solving and internal probes pay
+        // nothing.
+        if self.produce_unsat_assumptions_enabled() {
+            let certified = self.certify_assumption_core(assumptions, result);
+            // The gate's re-solves overwrite `last_assumptions` with whatever
+            // set they checked; narrow it back to the USER literals so
+            // `get-unsat-assumptions` keeps its SMT-LIB subset contract.
+            self.last_assumptions = Some(assumptions.to_vec());
+            return certified;
+        }
+        result
+    }
+
+    /// Check if produce-unsat-assumptions is enabled (SMT-LIB 2.6 §4.1.7).
+    fn produce_unsat_assumptions_enabled(&self) -> bool {
+        matches!(
+            self.ctx.get_option("produce-unsat-assumptions"),
+            Some(OptionValue::Bool(true))
+        )
     }
 
     /// Certificate gate for assumption-core harvests (#unsat-core-miscount).
@@ -197,9 +228,13 @@ impl Executor {
     ///   padded superset prints downstream) after restoring the original
     ///   solve state deterministically by re-solving the original query.
     ///
-    /// Runs only on the produce-unsat-cores paths, so plain solving pays
-    /// nothing. Callers must invoke it while the named/unnamed base split is
-    /// still in effect.
+    /// Runs only on the core-producing paths (`:produce-unsat-cores` and, per
+    /// #A7, `:produce-unsat-assumptions`), so plain solving pays nothing.
+    /// Callers must invoke it against the SAME base assertion set the harvest
+    /// was produced under — on the named-core path that means while the
+    /// named/unnamed split is still in effect; on the plain
+    /// produce-unsat-assumptions path the base is simply the full assertion
+    /// set.
     pub(crate) fn certify_assumption_core(
         &mut self,
         combined: &[TermId],

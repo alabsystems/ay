@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ay-script: smt-ab-interleaved
 """Order-balanced A/B harness for Incremental QF_LRA lever decisions.
 
 WHY THIS EXISTS

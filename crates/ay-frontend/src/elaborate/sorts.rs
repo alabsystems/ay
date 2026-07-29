@@ -300,12 +300,57 @@ impl Context {
                     "Float32" => Ok(Sort::FloatingPoint(8, 24)),
                     "Float64" => Ok(Sort::FloatingPoint(11, 53)),
                     "Float128" => Ok(Sort::FloatingPoint(15, 113)),
+                    // The FloatingPoint theory's `RoundingMode` is a BUILTIN
+                    // sort that is never `declare-sort`ed, so it is not in
+                    // `sort_defs`. Its carrier is the reserved name
+                    // `Uninterpreted("RoundingMode")` — the same sort the RM
+                    // literals (`RNE` … `roundTowardZero`) elaborate to, and the
+                    // name the executor's finite-domain pass keys on.
+                    // `ensure_sort_name_available` already forbids redeclaring
+                    // it, so this can never shadow a user sort.
+                    "RoundingMode" => Ok(Sort::Uninterpreted("RoundingMode".to_string())),
                     other => {
                         if let Some(s) = self.sort_defs.get(other) {
-                            Ok(s.clone())
-                        } else {
-                            Ok(Sort::Uninterpreted(other.to_string()))
+                            return Ok(s.clone());
                         }
+                        // PROGRAMMATIC (non-SMT-LIB) declarations only: naming
+                        // an uninterpreted sort CREATES it, the way
+                        // `Z3_mk_uninterpreted_sort` does — an embedder calling
+                        // `declare_fun("f", &[Sort::uninterpreted("U")], …)` has
+                        // no `declare-sort` command to issue and holds a sort
+                        // handle that outlives SMT-LIB assertion scopes. The
+                        // flag is set ONLY by
+                        // `Context::execute_native_global_declaration`, so the
+                        // SMT-LIB TEXT path — where `declare-sort`/`define-sort`
+                        // ARE the way to extend the signature — stays strict.
+                        // Registering it (rather than returning an unregistered
+                        // sort) is what makes the name resolvable afterwards.
+                        if self.native_global_declaration {
+                            let sort = Sort::Uninterpreted(other.to_string());
+                            self.sort_defs.insert(other.to_string(), sort.clone());
+                            self.track_scoped_sort_def(other.to_string());
+                            return Ok(sort);
+                        }
+                        // An UNRESOLVED sort name is an ERROR, not a silent new
+                        // uninterpreted sort (SMT-LIB 2.6 §3.4/§4.2.1: every
+                        // sort symbol in a term or declaration must already be
+                        // in the signature; `declare-sort`/`define-sort` are the
+                        // only ways to add one, and an assertion level owns the
+                        // declarations made in it, so `(pop n)` removes them —
+                        // `:global-declarations` exists to opt out and defaults
+                        // to false).
+                        //
+                        // The fallback silently accepted every MISTYPED sort
+                        // name in every script, and it is what let a sort
+                        // declared inside a `push` keep working after the
+                        // matching `pop`: the scope machinery removed the
+                        // `sort_defs` entry correctly, but the next use just
+                        // re-invented the name here. A popped `declare-datatypes`
+                        // degraded the same way — the name survived as an
+                        // UNINTERPRETED sort with the datatype's interpretation
+                        // (and its finite domain) lost, so `(distinct x y z)`
+                        // over a popped 2-element datatype answered `sat`.
+                        Err(ElaborateError::UnknownSort(other.to_string()))
                     }
                 }
             }

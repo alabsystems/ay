@@ -181,6 +181,12 @@ impl EufSolver<'_> {
         }
 
         let parents_to_reinsert: Vec<u32> = self.enodes[r1 as usize].parents.clone();
+        // #euf-inc-undo-adaptive: what the incremental path WOULD cost for this
+        // merge — one undo record per reinserted parent. Counted unconditionally
+        // so the two accrued costs remain comparable in either mode.
+        self.undo_work = self
+            .undo_work
+            .saturating_add(parents_to_reinsert.len() as u64);
         for &parent in &parents_to_reinsert {
             if let Some(sig) = self.get_func_app_sig(parent) {
                 // #euf-inc-cong-undo: record the mapping we are about to drop so

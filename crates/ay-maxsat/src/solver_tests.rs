@@ -543,3 +543,31 @@ fn test_large_optimum_lsu_descent() {
         other => panic!("expected optimal, got {other:?}"),
     }
 }
+
+/// `residual_units` must return `None` for a bound too large to be represented.
+///
+/// This pins the exact invariant whose violation produced ten wrong answers
+/// (all optima overshot by +1..+15 on protein_ins/rna-alignment). The build site
+/// had `ceil(target/w).min(sels.len())`, which silently converts a VACUOUS bound
+/// — one no achievable violation count can reach — into a real constraint
+/// forbidding "every selector falsified", a model that may still cost less than
+/// the incumbent. The 41-instance brute-force suite did NOT catch that, because
+/// its instances never reach the regime where the clamp bites, so the invariant
+/// is tested directly here.
+#[test]
+fn residual_units_refuses_a_bound_it_cannot_represent() {
+    use crate::oll::OllEngine;
+
+    // Representable: ceil(10/2) = 5 <= 8 selectors.
+    assert_eq!(OllEngine::residual_units_for_test(10, 2, 8), Some(5));
+    // Exactly representable at the boundary.
+    assert_eq!(OllEngine::residual_units_for_test(16, 2, 8), Some(8));
+    // VACUOUS: ceil(40/2) = 20 > 8. Must be None, never clamped to 8 — clamping
+    // is precisely the unsound step.
+    assert_eq!(OllEngine::residual_units_for_test(40, 2, 8), None);
+    // A zero budget has nothing to exclude.
+    assert_eq!(OllEngine::residual_units_for_test(0, 2, 8), None);
+    // Weight 1, budget just past the selector count.
+    assert_eq!(OllEngine::residual_units_for_test(9, 1, 8), None);
+    assert_eq!(OllEngine::residual_units_for_test(8, 1, 8), Some(8));
+}

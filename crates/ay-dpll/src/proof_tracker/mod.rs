@@ -433,12 +433,38 @@ impl ProofTracker {
         let mut final_units = Vec::with_capacity(disjuncts.len());
         for &disjunct in &disjuncts {
             let disjunct_complement = complement(terms, disjunct);
-            disjunct_complements.push((disjunct, disjunct_complement));
-            match terms.get(disjunct_complement) {
+            // The Skolemizer keeps ITE conditions opaque while pushing the
+            // negative polarity into both branches:
+            //
+            //   (not (ite c t e))  ==>  (ite c (not t) (not e)).
+            //
+            // Preserve that exact source/target pair here.  Restrict the
+            // bridge to an unsimplified Boolean ITE with the same condition
+            // and exact branch complements; every other rewrite fails closed.
+            let nnf_complement = match terms.get(disjunct).clone() {
+                TermData::Ite(cond, then_branch, else_branch) => {
+                    let not_then = complement(terms, then_branch);
+                    let not_else = complement(terms, else_branch);
+                    let target = terms.mk_ite(cond, not_then, not_else);
+                    match terms.get(target) {
+                        TermData::Ite(target_cond, target_then, target_else)
+                            if *target_cond == cond
+                                && *target_then == not_then
+                                && *target_else == not_else =>
+                        {
+                            target
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => disjunct_complement,
+            };
+            disjunct_complements.push((disjunct_complement, nnf_complement));
+            match terms.get(nnf_complement) {
                 TermData::App(Symbol::Named(name), args) if name == "and" => {
                     final_units.extend(args.iter().copied());
                 }
-                _ => final_units.push(disjunct_complement),
+                _ => final_units.push(nnf_complement),
             }
         }
         final_units.sort_unstable();
@@ -490,7 +516,7 @@ impl ProofTracker {
         // `not(instance)`. This is operand-order independent (unlike treating
         // the canonical, TermId-sorted `or` as a positional implication).
         let mut unit_ids: HashMap<TermId, ProofId> = HashMap::default();
-        for (_disjunct, disjunct_complement) in disjunct_complements {
+        for (disjunct_complement, nnf_complement) in disjunct_complements {
             let or_neg = self.proof.add_rule_step(
                 AletheRule::OrNeg,
                 vec![instance, disjunct_complement],
@@ -504,22 +530,95 @@ impl ProofTracker {
                 or_neg,
             );
             unit_ids.insert(disjunct_complement, unit);
-            if let TermData::App(Symbol::Named(name), nested) =
-                terms.get(disjunct_complement).clone()
-            {
+
+            // Strictly derive the Skolemizer's NNF ITE complement from the
+            // raw `(not (ite ...))` unit.  The four Boolean rules are checked
+            // independently by ay-proof; the three resolutions leave exactly
+            // the target ITE as a unit.
+            let normalized_unit = if nnf_complement != disjunct_complement {
+                let TermData::Not(source_ite) = terms.get(disjunct_complement) else {
+                    return None;
+                };
+                let TermData::Ite(cond, then_branch, else_branch) = terms.get(*source_ite).clone()
+                else {
+                    return None;
+                };
+                let not_cond = complement(terms, cond);
+                let not_then = complement(terms, then_branch);
+                let not_else = complement(terms, else_branch);
+                let not_not_then = terms.mk_not_raw(not_then);
+                let not_not_else = terms.mk_not_raw(not_else);
+                if !matches!(
+                    terms.get(nnf_complement),
+                    TermData::Ite(target_cond, target_then, target_else)
+                        if *target_cond == cond
+                            && *target_then == not_then
+                            && *target_else == not_else
+                ) {
+                    return None;
+                }
+
+                let source_else = self.proof.add_rule_step(
+                    AletheRule::NotIte1,
+                    vec![cond, not_else],
+                    vec![unit],
+                    Vec::new(),
+                );
+                let source_then = self.proof.add_rule_step(
+                    AletheRule::NotIte2,
+                    vec![not_cond, not_then],
+                    vec![unit],
+                    Vec::new(),
+                );
+                let target_else = self.proof.add_rule_step(
+                    AletheRule::IteNeg1,
+                    vec![nnf_complement, cond, not_not_else],
+                    Vec::new(),
+                    Vec::new(),
+                );
+                let target_then = self.proof.add_rule_step(
+                    AletheRule::IteNeg2,
+                    vec![nnf_complement, not_cond, not_not_then],
+                    Vec::new(),
+                    Vec::new(),
+                );
+                let target_or_cond = self.proof.add_resolution(
+                    vec![nnf_complement, cond],
+                    not_else,
+                    source_else,
+                    target_else,
+                );
+                let target_or_not_cond = self.proof.add_resolution(
+                    vec![nnf_complement, not_cond],
+                    not_then,
+                    source_then,
+                    target_then,
+                );
+                self.proof.add_resolution(
+                    vec![nnf_complement],
+                    cond,
+                    target_or_cond,
+                    target_or_not_cond,
+                )
+            } else {
+                unit
+            };
+            unit_ids.insert(nnf_complement, normalized_unit);
+
+            if let TermData::App(Symbol::Named(name), nested) = terms.get(nnf_complement).clone() {
                 if name == "and" {
                     for (index, arg) in nested.into_iter().enumerate() {
-                        let not_conjunction = terms.mk_not_raw(disjunct_complement);
+                        let not_conjunction = terms.mk_not_raw(nnf_complement);
                         let projection = self.proof.add_rule_step(
                             AletheRule::AndPos(index as u32),
                             vec![not_conjunction, arg],
                             Vec::new(),
-                            vec![disjunct_complement],
+                            vec![nnf_complement],
                         );
                         let projected = self.proof.add_resolution(
                             vec![arg],
-                            disjunct_complement,
-                            unit,
+                            nnf_complement,
+                            normalized_unit,
                             projection,
                         );
                         unit_ids.insert(arg, projected);
@@ -555,10 +654,374 @@ impl ProofTracker {
             return None;
         }
 
+        // The solve pipeline flattens the certified NNF conjunction before
+        // proof-context registration. Index every exact derived conjunct so
+        // `add_assumption(arg)` reuses its Skolem derivation instead of
+        // manufacturing an ambient problem Assume for a preprocessor-created
+        // unit. Only units already obtained above by resolution from the
+        // authenticated `not(forall)` source are admitted.
+        for &arg in &final_args {
+            let unit = *unit_ids.get(&arg)?;
+            self.lemma_map
+                .entry(LemmaKey::new(TheoryLemmaKind::Generic, &[arg], None))
+                .or_insert(unit);
+        }
         self.lemma_map.insert(
             LemmaKey::new(TheoryLemmaKind::Generic, &[skolemized_body], None),
             current_id,
         );
+        Some(current_id)
+    }
+
+    /// Derive one exact ground instance from a directly asserted `forall`.
+    ///
+    /// The E-matcher supplies the source quantifier, positional binding, and
+    /// generated instance. Recompute the simultaneous substitution here before
+    /// emitting any authority. The proof is the authored forall `Assume`, a
+    /// strict-checker-supported premiseless `forall_inst` implication, Boolean
+    /// `or` clausification, and resolution to the ground unit.
+    pub(crate) fn add_forall_instantiated_assertion(
+        &mut self,
+        terms: &mut TermStore,
+        quantified: TermId,
+        values: &[TermId],
+        instance: TermId,
+    ) -> Option<ProofId> {
+        if !self.enabled {
+            return None;
+        }
+        let TermData::Forall(bindings, body, _) = terms.get(quantified).clone() else {
+            return None;
+        };
+        if bindings.is_empty() || bindings.len() != values.len() {
+            return None;
+        }
+        let mut substitution = HashMap::default();
+        for ((name, sort), &value) in bindings.iter().zip(values) {
+            if terms.sort(value) != sort {
+                return None;
+            }
+            substitution.insert(name.clone(), value);
+        }
+        if crate::ematching::subst_vars(terms, body, &substitution) != instance {
+            return None;
+        }
+
+        let source_id = self.add_assumption(quantified, None)?;
+        let not_quantified = terms.mk_not_raw(quantified);
+        let implication = terms.mk_app(Symbol::named("or"), [not_quantified, instance], Sort::Bool);
+        let forall_inst = self.proof.add_rule_step(
+            AletheRule::ForallInst,
+            vec![implication],
+            Vec::new(),
+            values.to_vec(),
+        );
+        let clausified = self.proof.add_rule_step(
+            AletheRule::Or,
+            vec![not_quantified, instance],
+            vec![forall_inst],
+            Vec::new(),
+        );
+        let unit = self
+            .proof
+            .add_resolution(vec![instance], quantified, clausified, source_id);
+        self.lemma_map
+            .entry(LemmaKey::new(TheoryLemmaKind::Generic, &[instance], None))
+            .or_insert(unit);
+        Some(unit)
+    }
+
+    /// Derive an E-matching instance of a directly authored `forall` after the
+    /// NNF pass has normalized arithmetic negations in its body.
+    ///
+    /// `normalized_quantified` is only provenance: it never becomes an
+    /// assumption. The authored quantifier is instantiated structurally,
+    /// preserving every raw connective, and every changed ground disjunct must
+    /// then pass the independent Farkas checker as an exact implication before
+    /// the solver-visible normalized `or` is reconstructed. This deliberately
+    /// supports only a flat, nonempty disjunction with a one-to-one disjunct
+    /// mapping; all broader Boolean or quantified rewrites fail closed.
+    pub(crate) fn add_normalized_forall_instantiated_assertion(
+        &mut self,
+        terms: &mut TermStore,
+        quantified: TermId,
+        normalized_quantified: TermId,
+        values: &[TermId],
+        instance: TermId,
+    ) -> Option<ProofId> {
+        if !self.enabled || quantified == normalized_quantified {
+            return None;
+        }
+        let TermData::Forall(bindings, body, triggers) = terms.get(quantified).clone() else {
+            return None;
+        };
+        let TermData::Forall(normalized_bindings, normalized_body, normalized_triggers) =
+            terms.get(normalized_quantified).clone()
+        else {
+            return None;
+        };
+        if bindings.is_empty()
+            || bindings.len() != values.len()
+            || bindings != normalized_bindings
+            || triggers != normalized_triggers
+        {
+            return None;
+        }
+
+        let mut substitution = HashMap::default();
+        for ((name, sort), &value) in bindings.iter().zip(values) {
+            if terms.sort(value) != sort {
+                return None;
+            }
+            substitution.insert(name.clone(), value);
+        }
+        if crate::ematching::subst_vars(terms, normalized_body, &substitution) != instance {
+            return None;
+        }
+
+        // Rebuild the authored body without any simplifying constructors. The
+        // strict forall_inst checker independently performs the same exact,
+        // simultaneous substitution and rejects nested binders/lets.
+        fn substitute_exact(
+            terms: &mut TermStore,
+            term: TermId,
+            substitution: &HashMap<String, TermId>,
+            work: &mut usize,
+        ) -> Option<TermId> {
+            const WORK_LIMIT: usize = 100_000;
+            if *work >= WORK_LIMIT {
+                return None;
+            }
+            *work += 1;
+            stacker::maybe_grow(32 * 1024, 1024 * 1024, || match terms.get(term).clone() {
+                TermData::Var(name, _) => Some(*substitution.get(&name).unwrap_or(&term)),
+                TermData::Const(..) => Some(term),
+                TermData::App(symbol, args) => {
+                    let sort = terms.sort(term).clone();
+                    let rewritten: Vec<TermId> = args
+                        .iter()
+                        .copied()
+                        .map(|arg| substitute_exact(terms, arg, substitution, work))
+                        .collect::<Option<_>>()?;
+                    if rewritten == args {
+                        Some(term)
+                    } else {
+                        Some(terms.mk_app(symbol, rewritten, sort))
+                    }
+                }
+                TermData::Not(inner) => {
+                    let rewritten = substitute_exact(terms, inner, substitution, work)?;
+                    if rewritten == inner {
+                        Some(term)
+                    } else {
+                        Some(terms.mk_not_raw(rewritten))
+                    }
+                }
+                TermData::Ite(cond, then_branch, else_branch) => {
+                    let rewritten_cond = substitute_exact(terms, cond, substitution, work)?;
+                    let rewritten_then = substitute_exact(terms, then_branch, substitution, work)?;
+                    let rewritten_else = substitute_exact(terms, else_branch, substitution, work)?;
+                    if (rewritten_cond, rewritten_then, rewritten_else)
+                        == (cond, then_branch, else_branch)
+                    {
+                        Some(term)
+                    } else {
+                        Some(terms.mk_ite_raw(rewritten_cond, rewritten_then, rewritten_else))
+                    }
+                }
+                TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => None,
+                _ => None,
+            })
+        }
+
+        let mut work = 0usize;
+        let raw_instance = substitute_exact(terms, body, &substitution, &mut work)?;
+        let TermData::App(Symbol::Named(raw_name), raw_args) = terms.get(raw_instance).clone()
+        else {
+            return None;
+        };
+        let TermData::App(Symbol::Named(target_name), target_args) = terms.get(instance).clone()
+        else {
+            return None;
+        };
+        if raw_name != "or"
+            || target_name != "or"
+            || raw_args.len() != target_args.len()
+            || raw_args.is_empty()
+        {
+            return None;
+        }
+
+        fn complement(terms: &mut TermStore, term: TermId) -> TermId {
+            match terms.get(term) {
+                TermData::Not(inner) => *inner,
+                _ => terms.mk_not_raw(term),
+            }
+        }
+        fn valid_farkas_clause(terms: &TermStore, clause: &[TermId]) -> Option<FarkasAnnotation> {
+            let annotation = FarkasAnnotation::from_ints(&vec![1; clause.len()]);
+            let conflict: Vec<TheoryLit> = clause
+                .iter()
+                .map(|&literal| match terms.get(literal) {
+                    TermData::Not(inner) => TheoryLit::new(*inner, true),
+                    _ => TheoryLit::new(literal, false),
+                })
+                .collect();
+            ay_core::proof_validation::verify_farkas_conflict_lits_full(
+                terms,
+                &conflict,
+                &annotation,
+            )
+            .is_ok()
+            .then_some(annotation)
+        }
+
+        #[derive(Clone)]
+        struct RewritePlan {
+            source: TermId,
+            target: TermId,
+            clause: Vec<TermId>,
+            farkas: FarkasAnnotation,
+        }
+
+        // Match every normalized disjunct to exactly one authored disjunct.
+        // Exact terms need no theory authority; every changed pair must itself
+        // be a checked two-literal arithmetic tautology.
+        let mut used = vec![false; raw_args.len()];
+        let mut target_sources = Vec::with_capacity(target_args.len());
+        let mut rewrites = Vec::new();
+        for &target in &target_args {
+            if let Some((index, &source)) = raw_args
+                .iter()
+                .enumerate()
+                .find(|(index, source)| !used[*index] && **source == target)
+            {
+                used[index] = true;
+                target_sources.push((target, source));
+                continue;
+            }
+            let mut selected = None;
+            for (index, &source) in raw_args.iter().enumerate() {
+                if used[index] {
+                    continue;
+                }
+                let not_source = complement(terms, source);
+                let clause = vec![not_source, target];
+                if let Some(farkas) = valid_farkas_clause(terms, &clause) {
+                    selected = Some((
+                        index,
+                        RewritePlan {
+                            source,
+                            target,
+                            clause,
+                            farkas,
+                        },
+                    ));
+                    break;
+                }
+            }
+            let (index, plan) = selected?;
+            used[index] = true;
+            target_sources.push((target, plan.source));
+            rewrites.push(plan);
+        }
+        if used.iter().any(|used| !*used) {
+            return None;
+        }
+
+        let source_id = self.add_assumption(quantified, None)?;
+        let not_quantified = terms.mk_not_raw(quantified);
+        let implication = terms.mk_app(
+            Symbol::named("or"),
+            [not_quantified, raw_instance],
+            Sort::Bool,
+        );
+        let forall_inst = self.proof.add_rule_step(
+            AletheRule::ForallInst,
+            vec![implication],
+            Vec::new(),
+            values.to_vec(),
+        );
+        let implication_clause = self.proof.add_rule_step(
+            AletheRule::Or,
+            vec![not_quantified, raw_instance],
+            vec![forall_inst],
+            Vec::new(),
+        );
+        let raw_unit = self.proof.add_resolution(
+            vec![raw_instance],
+            quantified,
+            implication_clause,
+            source_id,
+        );
+        let mut current_clause = raw_args;
+        let mut current_id = self.proof.add_rule_step(
+            AletheRule::Or,
+            current_clause.clone(),
+            vec![raw_unit],
+            Vec::new(),
+        );
+
+        for (target, source) in target_sources {
+            if target == source {
+                continue;
+            }
+            let plan = rewrites
+                .iter()
+                .find(|plan| plan.source == source && plan.target == target)?;
+            let lemma = self.add_theory_lemma_with_farkas_and_kind(
+                plan.clause.clone(),
+                plan.farkas.clone(),
+                TheoryLemmaKind::LraFarkas,
+            )?;
+            let position = current_clause
+                .iter()
+                .position(|&literal| literal == source)?;
+            let _ = current_clause.remove(position);
+            if !current_clause.contains(&target) {
+                current_clause.push(target);
+            }
+            current_id =
+                self.proof
+                    .add_resolution(current_clause.clone(), source, current_id, lemma);
+        }
+        let mut expected = target_args.clone();
+        expected.sort_unstable();
+        expected.dedup();
+        let mut actual = current_clause.clone();
+        actual.sort_unstable();
+        actual.dedup();
+        if actual != expected {
+            return None;
+        }
+
+        // Repack the checked flat normalized clause into the exact
+        // solver-visible `(or ...)` unit.
+        for &target in &target_args {
+            let not_target = complement(terms, target);
+            let intro = self.proof.add_rule_step(
+                AletheRule::OrNeg,
+                vec![instance, not_target],
+                Vec::new(),
+                vec![instance],
+            );
+            let position = current_clause
+                .iter()
+                .position(|&literal| literal == target)?;
+            let _ = current_clause.remove(position);
+            if !current_clause.contains(&instance) {
+                current_clause.push(instance);
+            }
+            current_id =
+                self.proof
+                    .add_resolution(current_clause.clone(), target, current_id, intro);
+        }
+        if current_clause != [instance] {
+            return None;
+        }
+        self.lemma_map
+            .entry(LemmaKey::new(TheoryLemmaKind::Generic, &[instance], None))
+            .or_insert(current_id);
         Some(current_id)
     }
 
@@ -783,6 +1246,15 @@ impl ProofTracker {
         }
         if current_clause != [target] {
             return None;
+        }
+        // As above, ground preprocessing flattens the rewritten conjunction.
+        // Preserve the already-checked per-unit derivations across that
+        // boundary so no rewritten atom is later introduced as a free Assume.
+        for &target_arg in &target_args {
+            let unit = *target_units.get(&target_arg)?;
+            self.lemma_map
+                .entry(LemmaKey::new(TheoryLemmaKind::Generic, &[target_arg], None))
+                .or_insert(unit);
         }
         self.lemma_map.insert(
             LemmaKey::new(TheoryLemmaKind::Generic, &[target], None),

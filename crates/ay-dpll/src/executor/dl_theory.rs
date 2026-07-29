@@ -129,6 +129,15 @@ pub(crate) struct DiffLogicTheory<'a, W: DlWeight> {
     /// Vertices each propagation Dijkstra may settle. Tunable via
     /// `AY_RDL_PROP_BUDGET`; 0 disables theory propagation entirely.
     prop_budget: usize,
+    /// INTEGER difference logic (QF_IDL) rather than the Real lane (QF_RDL).
+    ///
+    /// When set, difference variables must all be `Int` and every bound is
+    /// integer-TIGHTENED before lowering (see [`tighten_int`]). That is what
+    /// makes the lane both sound and integral: after tightening, every edge
+    /// weight is an integer with a zero epsilon, so the shortest-path
+    /// potentials are integers and the extracted model is integral. Lowering an
+    /// Int atom through the rational table instead would only be a RELAXATION.
+    int_mode: bool,
     /// Edge ids activated so far (mirrors the engine's own trail so model
     /// extraction can compute exact slacks). Duplicates are harmless.
     active_edges: Vec<usize>,
@@ -160,12 +169,31 @@ impl<'a, W: DlWeight> DiffLogicTheory<'a, W> {
             tag_edge_count: Vec::new(),
             pending_props: Vec::new(),
             prop_budget: prop_budget_from_env(),
+            int_mode: false,
             active_edges: Vec::new(),
             active_marks: Vec::new(),
             scope_depth: 0,
             pending_conflict: None,
             unsupported: None,
         }
+    }
+
+    /// QF_IDL constructor: the same engine with integer-tightened lowering.
+    ///
+    /// Verified but NOT yet wired to a production route — hence the `allow`.
+    /// The lowering (the soundness-critical half) is exercised by
+    /// `dl_theory_tests::int_lane_*` and `int_tighten_tests::*`. What remains is
+    /// plumbing, and it is deliberately not half-done: a `solve_idl` mirroring
+    /// `solve_rdl` must fall through to `solve_lia` (NOT `solve_lra`, which
+    /// would silently reintroduce the real relaxation this lane exists to
+    /// avoid) and must place the extracted model in `TheoryModels::lia` rather
+    /// than `lra`, which needs an `LraModel` -> `LiaModel` conversion. Gate it
+    /// behind an env flag like `AY_RDL_ENGINE` and run a full-division
+    /// differential before default-on. See the development design notes §3a2.
+    pub(crate) fn new_int(terms: &'a TermStore) -> Self {
+        let mut this = Self::new(terms);
+        this.int_mode = true;
+        this
     }
 
     /// Graph vertex for an arithmetic variable term, interning on first use.
@@ -187,13 +215,14 @@ impl<'a, W: DlWeight> DiffLogicTheory<'a, W> {
         &mut self,
         atom: &CollectedAtom,
         op: Op,
+        c: &BigRational,
         lit: TheoryLit,
     ) -> Option<Vec<usize>> {
         let x = self.vertex(atom.lhs);
         let y = atom.rhs.map(|r| self.vertex(r));
         let diff = match y {
-            Some(y) => DiffAtom::diff(x, y, op, atom.c.clone()),
-            None => DiffAtom::var_const(x, op, atom.c.clone()),
+            Some(y) => DiffAtom::diff(x, y, op, c.clone()),
+            None => DiffAtom::var_const(x, op, c.clone()),
         };
         let constraints = W::lower(&diff, ZERO_VERTEX)?;
         let tag = u64::try_from(self.tag_lits.len()).ok()?;
@@ -231,17 +260,30 @@ impl<'a, W: DlWeight> DiffLogicTheory<'a, W> {
             };
         };
 
-        // QF_RDL: every difference variable must be Real. An Int variable would
-        // need integer-tightened lowering (`< c` ⇒ `<= c−1`); the rational
-        // lowering is only a relaxation of it, so refuse rather than approximate.
+        // Sort gate. QF_RDL requires every difference variable to be Real;
+        // QF_IDL (`int_mode`) requires every one to be Int. NEVER mixed, and
+        // never Int through the rational lowering — that is only a relaxation,
+        // which is why the Real lane still refuses Int outright.
+        let want = if self.int_mode { Sort::Int } else { Sort::Real };
         for v in std::iter::once(atom.lhs).chain(atom.rhs) {
-            if !matches!(self.terms.sort(v), Sort::Real) {
+            if *self.terms.sort(v) != want {
                 return AtomKind::Unsupported;
             }
         }
+        // Over Int a non-integral equality bound is simply unsatisfiable. It is
+        // representable only as a contradiction, so refuse rather than encode a
+        // bound that is not equivalent to it.
+        if self.int_mode && matches!(atom.op, Op::Eq) && !atom.c.is_integer() {
+            return AtomKind::Unsupported;
+        }
 
         let pos_lit = TheoryLit::new(term, true);
-        let Some(pos) = self.register_polarity(&atom, atom.op, pos_lit) else {
+        let (pos_op, pos_c) = if self.int_mode {
+            tighten_int(atom.op, &atom.c)
+        } else {
+            (atom.op, atom.c.clone())
+        };
+        let Some(pos) = self.register_polarity(&atom, pos_op, &pos_c, pos_lit) else {
             return AtomKind::Unsupported;
         };
 
@@ -258,7 +300,19 @@ impl<'a, W: DlWeight> DiffLogicTheory<'a, W> {
             None
         } else {
             let neg_lit = TheoryLit::new(term, false);
-            match self.register_polarity(&atom, negate_op(atom.op), neg_lit) {
+            // Tighten the NEGATED operator against the ORIGINAL constant.
+            // `negate_op` maps Le↔Gt and Lt↔Ge, so the negation is strict again
+            // exactly when the positive form was not — tightening only the
+            // positive polarity would leave the negative one as a relaxation
+            // and admit models the atom forbids.
+            //   ¬(x−y < c) ⇔ x−y ≥ c → ≥ ceil(c)
+            //   ¬(x−y ≤ c) ⇔ x−y > c → ≥ floor(c)+1
+            let (neg_op, neg_c) = if self.int_mode {
+                tighten_int(negate_op(atom.op), &atom.c)
+            } else {
+                (negate_op(atom.op), atom.c.clone())
+            };
+            match self.register_polarity(&atom, neg_op, &neg_c, neg_lit) {
                 Some(edges) => Some(edges),
                 None => return AtomKind::Unsupported,
             }
@@ -705,6 +759,42 @@ fn atom_touches_arithmetic(terms: &TermStore, term: TermId) -> bool {
 ///
 /// This is the routing gate: the `solve_rdl` lane is taken only when it holds
 /// for every theory atom reachable from the assertions.
+/// Integer-tightened lowering of a difference bound.
+///
+/// Over the integers every bound has an EXACT non-strict equivalent, and a
+/// non-integral bound tightens to its floor/ceil:
+///
+/// ```text
+///   x − y ≤ c  ⇔  x − y ≤ floor(c)
+///   x − y < c  ⇔  x − y ≤ ceil(c) − 1
+///   x − y ≥ c  ⇔  x − y ≥ ceil(c)
+///   x − y > c  ⇔  x − y ≥ floor(c) + 1
+/// ```
+///
+/// This is an EQUIVALENCE over Int, not a relaxation, which is what makes the
+/// integer lane sound. Applying it BEFORE the weight lowering is also what
+/// makes the model integral: afterwards every edge weight is an integer with a
+/// zero epsilon coefficient, so the engine's shortest-path potentials are
+/// integers and the extracted assignment needs no rounding.
+///
+/// Lowering an Int atom straight through the rational table instead yields
+/// `≤ c − ε`, which is only a RELAXATION of `≤ c − 1` — that is precisely why
+/// `build_atom` refused Int before this lane existed, and why relabelling a
+/// QF_IDL file to `QF_RDL` turns a derivable `unsat` into `unknown`.
+///
+/// `Eq` is returned unchanged: an integral `c` is already exact, and a
+/// non-integral one is handled by the caller (the atom is unsatisfiable over
+/// Int and is refused rather than approximated).
+fn tighten_int(op: Op, c: &BigRational) -> (Op, BigRational) {
+    match op {
+        Op::Le => (Op::Le, c.floor()),
+        Op::Lt => (Op::Le, c.ceil() - BigRational::from_integer(1.into())),
+        Op::Ge => (Op::Ge, c.ceil()),
+        Op::Gt => (Op::Ge, c.floor() + BigRational::from_integer(1.into())),
+        Op::Eq => (Op::Eq, c.clone()),
+    }
+}
+
 pub(super) fn atom_is_routable(terms: &TermStore, term: TermId) -> bool {
     let Some(atom) = collect_comparison(terms, term) else {
         return !atom_touches_arithmetic(terms, term);
@@ -729,8 +819,118 @@ pub(super) fn atom_is_routable(terms: &TermStore, term: TermId) -> bool {
     }
     // Real-only (QF_RDL): an Int variable would need integer-tightened lowering
     // (`< c` ⇒ `<= c−1`), and the rational lowering is only a relaxation of it,
-    // so refuse rather than approximate.
+    // so refuse rather than approximate. The integer lane is
+    // [`atom_is_routable_int`].
     std::iter::once(atom.lhs)
         .chain(atom.rhs)
         .all(|v| matches!(terms.sort(v), Sort::Real))
+}
+
+/// QF_IDL analogue of [`atom_is_routable`]: identical structural conditions,
+/// but every difference variable must be `Int` rather than `Real`.
+///
+/// The `Op::Eq` refusal is shared and load-bearing for the same reason — the
+/// NEGATION of an arithmetic equality is a disjunction a conjunctive constraint
+/// graph cannot hold. Kept as a separate function rather than a `Sort`
+/// parameter so the Real lane's behaviour is provably untouched by this lane.
+pub(super) fn atom_is_routable_int(terms: &TermStore, term: TermId) -> bool {
+    let Some(atom) = collect_comparison(terms, term) else {
+        return !atom_touches_arithmetic(terms, term);
+    };
+    if matches!(atom.op, Op::Eq) {
+        return false;
+    }
+    std::iter::once(atom.lhs)
+        .chain(atom.rhs)
+        .all(|v| matches!(terms.sort(v), Sort::Int))
+}
+
+#[cfg(test)]
+mod int_tighten_tests {
+    use super::{tighten_int, Op};
+    use num_rational::BigRational;
+
+    fn r(n: i64, d: i64) -> BigRational {
+        BigRational::new(n.into(), d.into())
+    }
+    fn i(n: i64) -> BigRational {
+        BigRational::from_integer(n.into())
+    }
+
+    /// Integral bounds: only the STRICT operators move, and they move by
+    /// exactly one. `≤ 3` and `≥ 3` are already exact over Int.
+    #[test]
+    fn integral_bounds_tighten_strict_by_one() {
+        assert_eq!(tighten_int(Op::Le, &i(3)), (Op::Le, i(3)));
+        assert_eq!(tighten_int(Op::Lt, &i(3)), (Op::Le, i(2)));
+        assert_eq!(tighten_int(Op::Ge, &i(3)), (Op::Ge, i(3)));
+        assert_eq!(tighten_int(Op::Gt, &i(3)), (Op::Ge, i(4)));
+    }
+
+    /// Non-integral bounds collapse to the nearest integer INSIDE the feasible
+    /// region. `x−y ≤ 7/2` over Int is `≤ 3`; `x−y ≥ 7/2` is `≥ 4`.
+    #[test]
+    fn fractional_bounds_collapse_inward() {
+        assert_eq!(tighten_int(Op::Le, &r(7, 2)), (Op::Le, i(3)));
+        assert_eq!(tighten_int(Op::Lt, &r(7, 2)), (Op::Le, i(3)));
+        assert_eq!(tighten_int(Op::Ge, &r(7, 2)), (Op::Ge, i(4)));
+        assert_eq!(tighten_int(Op::Gt, &r(7, 2)), (Op::Ge, i(4)));
+    }
+
+    /// Negatives must use floor/ceil, not truncation — the classic sign bug.
+    /// `x−y < −5/2` over Int is `≤ −3`, NOT `≤ −2`.
+    #[test]
+    fn negative_bounds_use_floor_ceil_not_truncation() {
+        assert_eq!(tighten_int(Op::Lt, &r(-5, 2)), (Op::Le, i(-3)));
+        assert_eq!(tighten_int(Op::Le, &r(-5, 2)), (Op::Le, i(-3)));
+        assert_eq!(tighten_int(Op::Gt, &r(-5, 2)), (Op::Ge, i(-2)));
+        assert_eq!(tighten_int(Op::Ge, &r(-5, 2)), (Op::Ge, i(-2)));
+    }
+
+    /// The result is always NON-STRICT, which is the property the lowering
+    /// relies on: afterwards every edge weight is an integer with a zero
+    /// epsilon, so the engine's potentials — and the model — are integral.
+    #[test]
+    fn output_is_always_non_strict() {
+        for op in [Op::Le, Op::Lt, Op::Ge, Op::Gt] {
+            for c in [i(0), i(7), i(-7), r(1, 3), r(-1, 3)] {
+                let (o, k) = tighten_int(op, &c);
+                assert!(matches!(o, Op::Le | Op::Ge), "{op:?} {c} -> {o:?}");
+                assert!(k.is_integer(), "{op:?} {c} -> non-integral {k}");
+            }
+        }
+    }
+
+    /// Tightening a bound and tightening its NEGATION must partition the
+    /// integers exactly — no integer satisfies both, and none satisfies
+    /// neither. This is what makes registering both polarities sound.
+    #[test]
+    fn positive_and_negated_tightenings_partition_the_integers() {
+        let negate = |op: Op| match op {
+            Op::Le => Op::Gt,
+            Op::Gt => Op::Le,
+            Op::Lt => Op::Ge,
+            Op::Ge => Op::Lt,
+            Op::Eq => Op::Eq,
+        };
+        let holds = |op: Op, k: &BigRational, v: i64| {
+            let v = BigRational::from_integer(v.into());
+            match op {
+                Op::Le => v <= *k,
+                Op::Ge => v >= *k,
+                _ => unreachable!("tightened output is non-strict"),
+            }
+        };
+        for op in [Op::Le, Op::Lt, Op::Ge, Op::Gt] {
+            for c in [i(0), i(3), i(-3), r(7, 2), r(-5, 2)] {
+                let (po, pk) = tighten_int(op, &c);
+                let (no, nk) = tighten_int(negate(op), &c);
+                for v in -6..=6 {
+                    let p = holds(po, &pk, v);
+                    let n = holds(no, &nk, v);
+                    assert!(p != n, "{op:?} {c} at {v}: pos={p} neg={n} must differ");
+                }
+            }
+        }
+    }
 }

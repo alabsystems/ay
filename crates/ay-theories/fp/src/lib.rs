@@ -257,6 +257,15 @@ pub struct FpSolver<'a> {
     /// it stays free (any BV) yet congruent: equal FP inputs of the same
     /// signedness/width must produce equal results (#bug13 / ay#8870).
     to_bv_unspec_sites: Vec<ToBvUnspecSite>,
+    /// The single fixed-but-unspecified IEEE NaN encoding per FP format,
+    /// keyed by `(exponent_bits, stored_significand_bits)`.
+    ///
+    /// A `FloatingPoint` sort has exactly ONE NaN element but many IEEE
+    /// bit-patterns for it, so `fp.to_ieee_bv` is unspecified on NaN — yet it
+    /// is still a *function*, so every NaN argument must map to the SAME
+    /// bitvector. Sharing one cached encoding per format delivers exactly
+    /// that (see `bitblast_to_ieee_bv`).
+    ieee_nan_encodings: HashMap<(usize, usize), Vec<CnfLit>>,
 }
 
 /// A recorded `fp.to_{s,u}bv` site for congruence Ackermannization.
@@ -290,6 +299,7 @@ impl<'a> FpSolver<'a> {
             bool_input_lits: HashMap::default(),
             has_encoding_gap: false,
             to_bv_unspec_sites: Vec::new(),
+            ieee_nan_encodings: HashMap::default(),
         }
     }
 
@@ -313,6 +323,7 @@ impl<'a> FpSolver<'a> {
             bool_input_lits: HashMap::default(),
             has_encoding_gap: false,
             to_bv_unspec_sites: Vec::new(),
+            ieee_nan_encodings: HashMap::default(),
         }
     }
 

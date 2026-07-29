@@ -149,6 +149,17 @@ pub(crate) static LU_FACT_NANOS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 /// Count of factorizations that returned singular (kept the old factor + deferred retry).
 pub(crate) static LU_FACT_FAIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// LATE LU PROMOTIONS (`Simplex::refactorize`): solves that started on the eta
+/// file and were switched to the FT engine mid-flight because their measured
+/// eta-rebuild bill crossed `cold_lu_eta_work()`. See `LATE_LU_ETA_WORK`.
+pub(crate) static LU_LATE_PROMOTE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Total eta-rebuild fill charged across the process (`AY_MILP_TRACE`), in the
+/// same `entries + m` units the per-solve budget counts. Process-global and so
+/// NOT a decision input — it exists to calibrate `AY_MILP_COLD_LU_ETA_WORK`
+/// against a corpus without a rebuild.
+pub(crate) static ETA_WORK_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 /// FT-adoption diagnostics (Lever A, `refactorize`): adoptions absorbed as
 /// Forrest–Tomlin updates instead of a full base factor / attempts rejected
 /// (singular intermediate or update rejection; the full factor then runs) /
@@ -658,6 +669,231 @@ fn record_lane(lane: usize, eta_delta: u64) {
     CALLER_ETA[c].fetch_add(eta_delta, Relaxed);
 }
 
+// ============================ THE ITERATION LEDGER ============================
+//
+// `AY_MILP_ITER_LEDGER`. Attributes every simplex ITERATION this process runs to
+// the SOLVE PHASE that asked for it, and splits each phase's iterations by KIND
+// (dual pivot / primal phase-I / primal phase-II).
+//
+// WHY THIS EXISTS. The measured gap against Gurobi's LP is 8.2x = 4.87x
+// ITERATIONS x 1.67x per-iteration. The per-iteration side is already
+// instrumented to death (`AY_MILP_ITER_PROFILE`: RTPROFILE / UPDPROFILE /
+// PXPROFILE / SBPROFILE all normalise BY PIVOT and answer "what does one pivot
+// cost"). NOTHING attributed the pivot COUNT, so "ay takes five times too many
+// steps" could not be localised: root LP, cut re-optimisation, node children,
+// strong branching, heuristic sub-solves and in-solve recovery all pour into one
+// global `stats::DUAL_ITERS + stats::PRIMAL_ITERS` total. Every attempt to close
+// the gap so far has been aimed by guesswork and several regressed (the
+// structural-presolve transplant: qnet1 4.18s -> 15.75s, nodes 372 -> 2209).
+//
+// WHY IT IS DETERMINISTIC. It counts ITERATIONS and SOLVES, never nanoseconds.
+// Iteration counts are load-invariant: the same binary on the same input emits
+// the identical ledger on an idle box and on a contended one, which is exactly
+// what wall-clock attribution cannot do here.
+//
+// WHY IT SUMS. The two counters `stats::work()` is built from have exactly ONE
+// bump site each — `stats::DUAL_ITERS` in `dual_simplex_inner`'s pivot loop and
+// `stats::PRIMAL_ITERS` in `loop_phase_inner`'s. The ledger charges its deltas
+// around the two functions that OWN those loops (`dual_simplex`, `loop_phase`),
+// so the partition is exhaustive BY CONSTRUCTION and `Σ phases == stats::work()`
+// is a real self-check, not a hope: if a future arm adds a third pivot loop, the
+// residual `unattributed` field in the reported line goes non-zero and says so.
+//
+// PHASES ARE A FLAT PARTITION. An iteration belongs to exactly one phase — the
+// innermost scope live when it ran. Heuristics fired mid-node re-tag themselves
+// and restore the node tag on drop (`PhaseScope` is RAII), and the three
+// in-solve recovery paths re-tag over whatever asked for the solve, because
+// "which caller provoked the recovery" is a question the LANEMAP/CALLERMAP
+// census already answers and "how many iterations does recovery eat" is the one
+// this instrument exists for.
+pub(crate) const LEDGER_PHASES: usize = 12;
+/// The unattributed default. A solve issued outside every scope lands here; a
+/// large `other` is itself a finding (a phase nobody tagged).
+pub(crate) const PH_OTHER: usize = 0;
+/// The initial ROOT LP: one cold solve of the (post-presolve, post-root-cut)
+/// relaxation, before any branching.
+pub(crate) const PH_ROOT_LP: usize = 1;
+/// ROOT CUT re-optimisation: each root cut round's re-solve after rows are added.
+pub(crate) const PH_ROOT_CUT: usize = 2;
+/// A tree NODE's own LP — the warm re-solve from the parent's basis (and the
+/// prepared/continuation lanes, which are the same solve by another door).
+pub(crate) const PH_NODE: usize = 3;
+/// A COLD retry after a warm attempt was abandoned. Both doors lead here: the
+/// caller-level retry (`Stopped` warm solve -> `warm = None` re-solve) and the
+/// engine's own `try_cold_dual` restart after the warm dual failed and its basis
+/// was rolled back.
+pub(crate) const PH_COLD_RETRY: usize = 4;
+/// NODE-LEVEL cut separation's throwaway trial re-solve (the fixed-slot block).
+pub(crate) const PH_NODE_CUT: usize = 5;
+/// STRONG BRANCHING / pseudocost probing — both probe shapes (`probe_duals`'s
+/// iteration-capped dual walk and the full `solve_bounded` child probe).
+pub(crate) const PH_SB_PROBE: usize = 6;
+/// The DIVE heuristics.
+pub(crate) const PH_DIVE: usize = 7;
+/// The feasibility PUMP.
+pub(crate) const PH_PUMP: usize = 8;
+/// RENS / RINS sub-MIP solves.
+pub(crate) const PH_RINS: usize = 9;
+/// The flip-LNS primal heuristic.
+pub(crate) const PH_FLIP_LNS: usize = 10;
+/// RECOVERY: iterations spent re-walking after the engine gave up on a walk it
+/// had already paid for — `rounds`' drift retries (round > 0, each preceded by a
+/// refactorisation), the lazy perturb-retry-and-polish after a `Stopped` walk,
+/// and the chain-distress bundle retry. These are pure re-work: the LP was
+/// already being solved once when they started.
+pub(crate) const PH_RECOVERY: usize = 11;
+pub(crate) const LEDGER_LABELS: [&str; LEDGER_PHASES] = [
+    "other",
+    "root-lp",
+    "root-cut",
+    "node",
+    "cold-retry",
+    "node-cut",
+    "sb-probe",
+    "dive",
+    "pump",
+    "rins",
+    "flip-lns",
+    "recovery",
+];
+/// `solve_bounded` / `probe_duals` entries charged to each phase, counted at the
+/// phase live ON ENTRY. `recovery` counts EPISODES instead (it never enters a
+/// solve of its own — it re-tags iterations inside somebody else's), which is
+/// the more useful denominator for it anyway.
+pub(crate) static PHASE_SOLVES: [std::sync::atomic::AtomicU64; LEDGER_PHASES] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; LEDGER_PHASES];
+/// Dual-simplex pivots charged to each phase.
+pub(crate) static PHASE_DUAL: [std::sync::atomic::AtomicU64; LEDGER_PHASES] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; LEDGER_PHASES];
+/// Primal PHASE-I iterations charged to each phase.
+pub(crate) static PHASE_P1: [std::sync::atomic::AtomicU64; LEDGER_PHASES] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; LEDGER_PHASES];
+/// Primal PHASE-II iterations charged to each phase.
+pub(crate) static PHASE_P2: [std::sync::atomic::AtomicU64; LEDGER_PHASES] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; LEDGER_PHASES];
+thread_local! {
+    /// The solve phase the current thread is running on behalf of (index into
+    /// the `PHASE_*` arrays). Set by `PhaseScope`; defaults to `PH_OTHER`.
+    /// Thread-local because the parallel prefix workers each run their own
+    /// scopes; the counters they feed are process-global atomics, so a
+    /// multi-worker run reports the SUM over workers.
+    static LEDGER_PHASE: std::cell::Cell<usize> = const { std::cell::Cell::new(PH_OTHER) };
+}
+/// True for the four primal-heuristic phases. See [`PhaseScope::new`].
+#[inline]
+fn ledger_phase_is_heuristic(p: usize) -> bool {
+    matches!(p, PH_DIVE | PH_PUMP | PH_RINS | PH_FLIP_LNS)
+}
+/// Scoped setter for the ledger phase: install on entry, restore the previous
+/// value on drop, so nested phases (a dive inside a node, a recovery inside a
+/// dive) nest correctly and an early return still releases.
+///
+/// THE OUTERMOST HEURISTIC OWNS EVERYTHING UNDER IT. RINS and RENS run a NESTED
+/// `bab_solve` on a sub-model — with its own root LP, its own cut rounds, its
+/// own tree and its own strong branching. Left to re-tag freely, that sub-tree
+/// pours into `root-lp`/`node`/`sb-probe` and the ledger reports the root LP of
+/// a 30-second mas74 run as 271 solves, which is not a root LP by any reading;
+/// worse, "what does RINS cost" becomes unanswerable because RINS' own spend is
+/// scattered across five other phases. So `new` DECLINES to re-tag while a
+/// heuristic phase is live, and a heuristic's number is inclusive of its whole
+/// nested search. The two RE-WORK phases are the deliberate exception and use
+/// [`Self::new_forced`]: "how many iterations go into redoing a walk we already
+/// paid for" is a question worth answering wherever it happens, heuristic
+/// included.
+///
+/// ZERO COST WHEN OFF. Both constructors return `None` unless
+/// `AY_MILP_ITER_LEDGER` is set, so the default path pays one `OnceLock` bool
+/// load per scope entry (NOT per iteration) and never writes the thread-local.
+pub(crate) struct PhaseScope(usize);
+impl PhaseScope {
+    /// Enter `phase` unless a heuristic phase is already live (see the type note).
+    #[inline]
+    pub(crate) fn new(phase: usize) -> Option<Self> {
+        if !iter_ledger_enabled() {
+            return None;
+        }
+        let prev = ledger_phase();
+        if ledger_phase_is_heuristic(prev) {
+            return None;
+        }
+        LEDGER_PHASE.with(|c| c.set(phase));
+        Some(PhaseScope(prev))
+    }
+
+    /// Enter `phase` unconditionally — for the re-work phases, which are broken
+    /// out even inside a heuristic.
+    #[inline]
+    pub(crate) fn new_forced(phase: usize) -> Option<Self> {
+        if !iter_ledger_enabled() {
+            return None;
+        }
+        Some(PhaseScope(LEDGER_PHASE.with(|c| c.replace(phase))))
+    }
+}
+impl Drop for PhaseScope {
+    #[inline]
+    fn drop(&mut self) {
+        LEDGER_PHASE.with(|c| c.set(self.0));
+    }
+}
+#[inline]
+fn ledger_phase() -> usize {
+    LEDGER_PHASE.with(std::cell::Cell::get)
+}
+/// Charge one solve (or one recovery episode) to the phase now live.
+#[inline]
+pub(crate) fn ledger_note_solve() {
+    if iter_ledger_enabled() {
+        PHASE_SOLVES[ledger_phase()].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+/// One parseable line per run, in the shape of `ROOTCLOSURE` / `LPSTAT` /
+/// `RTPROFILE`: `key=value` tokens a script can split on whitespace.
+///
+/// Per phase, `<label>=<solves>s/<dual>d/<p1>+<p2>p/<total>i@<iters-per-solve>`.
+/// Phases with no traffic are omitted. Both the COUNT and the SOLVES are
+/// reported because iterations-per-SOLVE is the diagnostic ratio: a phase with
+/// 40% of the iterations is a different problem depending on whether it ran 10
+/// solves or 100,000.
+///
+/// `total` is the ledger's own sum and `engine` is `stats::work()`; `unattributed`
+/// is their difference and MUST be 0. A non-zero value means a pivot loop exists
+/// that neither `dual_simplex` nor `loop_phase` owns — the ledger is wrong, and
+/// the line says so rather than quietly under-reporting.
+#[must_use]
+pub fn iter_ledger_line() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let engine = stats::work();
+    let mut parts: Vec<String> = Vec::new();
+    let mut sum = 0u64;
+    for p in 0..LEDGER_PHASES {
+        let (s, d, p1, p2) = (
+            PHASE_SOLVES[p].load(Relaxed),
+            PHASE_DUAL[p].load(Relaxed),
+            PHASE_P1[p].load(Relaxed),
+            PHASE_P2[p].load(Relaxed),
+        );
+        let it = d + p1 + p2;
+        sum += it;
+        if s == 0 && it == 0 {
+            continue;
+        }
+        parts.push(format!(
+            "{}={s}s/{d}d/{p1}+{p2}p/{it}i@{:.1}",
+            LEDGER_LABELS[p],
+            it as f64 / s.max(1) as f64,
+        ));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(
+        "ITERLEDGER total={sum} engine={engine} unattributed={} | {}",
+        engine as i64 - sum as i64,
+        parts.join(" "),
+    )
+}
+
 /// PER-WALK DUAL ANATOMY (`AY_MILP_DUAL_ANATOMY`; trace-accounting only, off by
 /// default and skipped entirely unless the env is set). Answers WHERE a long
 /// degenerate dual walk spends its iterations, PARTITIONED BY HOW THE WALK
@@ -1072,6 +1308,14 @@ fn iter_profile_enabled() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *B.get_or_init(|| std::env::var_os("AY_MILP_ITER_PROFILE").is_some())
 }
+/// Per-phase ITERATION LEDGER (`AY_MILP_ITER_LEDGER`). See `iter_ledger_line`.
+/// Read once per SCOPE ENTRY and once per dual/primal WALK — never inside a
+/// pivot loop, so the default path pays a `OnceLock` load a few times per solve
+/// and nothing per iteration.
+fn iter_ledger_enabled() -> bool {
+    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var_os("AY_MILP_ITER_LEDGER").is_some())
+}
 /// BREAKPOINT-SORT INTEGER-KEY comparator (`AY_MILP_NO_RT_BITS_KEY` kills it).
 /// The dual long-step (BFRT) select phase sorts `self.bp: Vec<(f64,u32)>` by the
 /// ratio with `sort_unstable_by(|x,y| x.0.total_cmp(&y.0))`. Every ratio is
@@ -1156,9 +1400,16 @@ fn no_wide_bloom() -> bool {
 /// byte-for-byte. Verdict-neutral either way (only the float pivot SEQUENCE and
 /// thus the walk length change; every exit is re-checked, every leaf re-derived
 /// exactly — `safe_bound` is rigorous for ANY float duals).
+///
+/// The process-wide `OnceLock` cache this used to hold is gone, and its
+/// removal is the point rather than a side effect: caching the first read made
+/// the switch per-*process*, so an in-process consumer could not disable the
+/// relaxation for one solve and keep it for another. `tune` resolves the
+/// caller's per-solve setting first and the environment from a snapshot taken
+/// once, so the environment read the cache was avoiding does not happen here
+/// either way.
 fn no_bloom_relax() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_BLOOM_RELAX").is_some())
+    crate::tune::on(crate::tune::Knob::NoBloomRelax)
 }
 /// DUAL COST PERTURBATION (anti-degeneracy). The qiu class (`tall_lu`, a
 /// capacity==demand network) runs warm-child dual walks that are ~80% DUAL
@@ -1400,6 +1651,169 @@ fn no_tall_lu() -> bool {
     *B.get_or_init(|| std::env::var_os("AY_MILP_NO_TALL_LU").is_some())
 }
 
+/// Kill switch for the COLD-ROOT LU band (`FloatLp::cold_root_lu`): restores the
+/// historical `plain_cold` eta-file cold root byte-for-byte. This is the A/B
+/// lever the band's measurements were taken against — NEVER delete it.
+fn no_cold_lu() -> bool {
+    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var_os("AY_MILP_NO_COLD_LU").is_some())
+}
+
+/// Row FLOOR of the cold-root LU band (`AY_MILP_COLD_LU_ROWS`).
+///
+/// 3 000, not `TALL_LU_ROWS` (1 000): the measured crossover is between
+/// binkar10_1 (m = 2 298, mixed: better incumbent, fewer nodes, no clear win)
+/// and nursesched-sprint02 (m = 3 522, 3.5× pivots/s and a bound that did not
+/// exist). Under the floor the eta rebuild is cheap enough that the FT engine's
+/// per-pivot cost is pure loss — and it MOVES THE VERTEX, which is how the
+/// force-lever A/B turned air05's proven bound into a bare incumbent. The floor
+/// is deliberately NOT tuned any finer than that: on a contended box the
+/// deadline-truncated instances between 1 000 and 3 000 rows swing more from
+/// machine load than from the lane (air05, same arm, four runs: 374/374/374 vs
+/// 2 340 eta rebuilds). See `FloatLp::cold_root_lu` for the table.
+/// ⚠ A FLOOR OF ZERO IS REJECTED, not honoured. `AY_MILP_COLD_LU_ROWS=0` reads
+/// as "no floor" and silently opens the band to EVERY in-band `plain_cold`
+/// solve — which is sound but measurably costs verdicts (gt2 and qiu both fall
+/// OPTIMAL -> FEASIBLE, timtab1 loses its incumbent), because under the floor
+/// the FT engine's per-pivot cost is pure loss and it moves the vertex. A knob
+/// whose zero value quietly degrades the solver is a footgun, so zero falls
+/// back to the compiled floor, matching `parse_lu_max_fill_nnz`'s own
+/// `.filter(|&v| v > 0)` (`lu.rs`). Use `AY_MILP_NO_COLD_LU=1` to turn the band
+/// off; that is what the kill switch is for.
+fn cold_lu_min_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("AY_MILP_COLD_LU_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(COLD_LU_MIN_ROWS)
+    })
+}
+
+/// Row CEILING of the cold-root LU band (`AY_MILP_COLD_LU_MAX_ROWS`), default
+/// `REFACTOR_TALL_ROWS`. Above it `LuEngine::update`'s O(m) dense sweeps replace
+/// the refactorisation wall rather than removing it (measured 1.85 ms/update at
+/// m = 40 962, 3.57 ms at m = 69 608 — 23–34 % of LP time); raise it to re-run
+/// that experiment after `lu.rs::update` is sparsified.
+///
+/// THAT EXPERIMENT HAS NOW BEEN RUN, AND THE CEILING STAYS AT 8 192.
+/// `LuEngine::update_nz` sparsified the spike build (5.31x per update on
+/// uccase12, 1.71x on physiciansched6-2 — see `SPIKE_SPARSE_MARGIN`), and the
+/// four above-ceiling models that emit no dual bound were re-run at 400 s with
+/// the ceiling at 400 000, in three arms: shipped, raised+dense, raised+sparse.
+///
+/// ```text
+///   model              root LP bound: shipped ->   raised+dense ->  raised+sparse
+///   ex9                        19.169281        62.120038         53.301826
+///   ex10                       11.689389        14.782647         14.480692
+///   uccase12                44578.338559     66344.077189      76226.248267
+///   physiciansched6-2       13070.500000     13070.500000      13070.500000
+/// ```
+///
+/// The partial root bound gets much tighter (uccase12 +71 %, ex9 3.2x) — but
+/// the root LP is `Stopped` in EVERY arm, no rigorous tree bound is emitted in
+/// any of them, and the verdict is `UNKNOWN` 4/4 throughout. Zero verdicts
+/// gained. Meanwhile the raise would move the seeding vertex for all 106
+/// above-ceiling corpus models, so it is a large blast radius bought with no
+/// measured verdict.
+///
+/// The reason is that `update` was never the binding constraint up there. With
+/// the sparse arm, uccase12's update is 13.57 s of a ~398 s solve (3 %), and
+/// the LP still does not converge. Its cost has moved to BTRAN: 171 780 calls
+/// at avg_reach 53 583 of m = 121 161 (44 % dense) ≈ 9.2e9 slot touches, and
+/// `btran` is untouched by the spike work. That — not the ceiling — is the
+/// next lever for this class.
+fn cold_lu_max_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("AY_MILP_COLD_LU_MAX_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(REFACTOR_TALL_ROWS)
+    })
+}
+
+/// LATE LU PROMOTION BUDGET, in eta-file ENTRIES (plus `m` per rebuild — see
+/// the charge site in `refactorize`). `0` (the default) disables the lane.
+///
+/// # Why the row band needed a companion, and why this is not another row rule
+///
+/// The shipped band `[COLD_LU_MIN_ROWS, REFACTOR_TALL_ROWS)` is keyed on `m`,
+/// and `m` does not predict what the FT engine costs. Measured over 39 corpus
+/// models (`AY_MILP_LU=1`, 60 s, deterministic `LU_FTRAN_REACH`/`LUFACT`
+/// counters), Spearman against ns per FT update per row:
+///
+/// ```text
+///   spike density (LU_FTRAN_REACH / m)   0.841
+///   factor fill   (LUFACT avg_nnz / m)   0.598
+///   m                                   -0.045   <-- the band's own variable
+///   m  vs. spike density                -0.429   <-- and BACKWARDS: bigger m, SPARSER spikes
+/// ```
+///
+/// uccase12 (m = 121 161, spike 0.0004) costs 0.56 ns/update/row; ex9
+/// (m = 40 962, spike 0.57) costs 39.50 — 70x more per row at a THIRD of the
+/// rows. So the ceiling excludes the cheapest models in the corpus and the
+/// floor excludes the downstream optimization consumer's entire sub-3 000-row mip-diff corpus.
+///
+/// # Why the trigger is the ETA bill and not the spike density
+///
+/// It has to be. Spike density is a property of `B^{-1}` UNDER THE FT ENGINE:
+/// `LU_FTRAN_REACH` only exists once the LU lane is running. A solve on the eta
+/// file has no reach to read, so the quantity that best predicts FT cost is
+/// exactly the one a promotion trigger cannot observe. (A 5 s prefix predicts
+/// the full-solve spike density well — Spearman 0.943, N = 38 — but only from
+/// inside the LU arm, so it can inform a DEMOTION, never this promotion.)
+///
+/// Statically it is no better: over the same 39 models, out-of-sample on 1 000
+/// random 2/3-1/3 splits, no MPS-derived feature predicts spike density at all
+/// (best mean R2 = +0.018, for raw density; `m` alone is -0.090, i.e. worse
+/// than predicting the corpus mean). Even a Gilbert-Peierls symbolic FTRAN
+/// reach computed on the greedy triangular CRASH basis — literally this
+/// quantity with the crash basis substituted for the optimal one — classifies
+/// dense-vs-sparse worse (AUC 0.621) than the ratio `n/m` (0.755). The crash
+/// basis does not carry the optimal basis's fill.
+///
+/// What IS observable from the eta lane is the thing the band was actually
+/// buying. The band's +6 verdicts came from the O(m*nnz) refactorisation bill
+/// it REMOVES, not from cheap FT updates: in-band, 89 220 -> 21 264 eta
+/// rebuilds and 861.2 s -> 99.3 s of REFAC. That bill is directly countable
+/// while it is being paid, so this lane counts it and switches when it has
+/// grown large enough to dominate whatever the FT engine will cost.
+///
+/// # Why FILL and not seconds, and not `m * nnz` either
+///
+/// Wall time is not deterministic and this decision changes the pivot sequence,
+/// hence the vertex, hence the tree — a load-dependent trigger would make node
+/// counts irreproducible. So the unit has to be a counter.
+///
+/// It cannot be the STATIC counter, though. `m * nnz` is the crate's own stated
+/// complexity bound for a rebuild, and it ranks the real cost backwards at both
+/// ends of the eta-arm census (see the charge site: aflow40b 19x LESS modelled
+/// work than drayage-100-23 and 1.35x MORE time; cvs16r70-62 a seventh of
+/// drayage's modelled work and 43x its time). A rebuild costs what it FILLS, and
+/// fill is a property of the basis, not of the model — the same reason no static
+/// feature predicts spike density. So the budget counts the fill as it is
+/// produced, which is free because `refactorize` already computes it.
+///
+/// That keeps the budget scale-free in the way the row floor was reaching for:
+/// a small ny model whose basis stays near-triangular charges ~`m` per rebuild
+/// and must burn thousands to trip, while a model generating a dense file trips
+/// in a few. The floor at 3 000 rows exists because small models' rebuilds are
+/// cheap — a fill budget says "cheap" directly instead of proxying it by `m`.
+fn cold_lu_eta_work() -> u128 {
+    static N: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("AY_MILP_COLD_LU_ETA_WORK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(LATE_LU_ETA_WORK)
+    })
+}
+
+/// Default late-promotion budget. `0` = OFF; see `cold_lu_eta_work`.
+const LATE_LU_ETA_WORK: u128 = 0;
+
 /// LU-LANE EXTENSION for `WarmSolver` (`AY_MILP_WARM_LU=1`; A/B lever, DEFAULT
 /// OFF). The pooled bound-change re-solver (the dive/flip-LNS loop) keeps its
 /// `Simplex` — and, with this on, its LU operator — ALIVE across solves. On the
@@ -1417,9 +1831,11 @@ fn no_tall_lu() -> bool {
 /// incumbent (−132.873) and the whole corpus's exact values are shown to hold.
 /// Gated to `tall_lu` (below), so every square-ish/dense-ladder instance keeps
 /// the eta path bit-for-bit whether the lever is on or off.
+///
+/// Per-solve, not per-process: see `no_bloom_relax` above for why the
+/// first-read cache had to go with the move to `tune`.
 pub(crate) fn warm_lu_enabled() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| std::env::var_os("AY_MILP_WARM_LU").is_some())
+    crate::tune::on(crate::tune::Knob::WarmLu)
 }
 
 /// Kill switch for the tall-LP extension of the dual anti-churn band (restores
@@ -1602,8 +2018,106 @@ pub(crate) mod stats {
     /// choose the branching, which chooses the tree -- so the same binary on the same input proves
     /// qnet1 in 16.7s on one run and not at all in 20s on the next. A budget denominated in
     /// iterations buys the same thing and is the same on every run.
+    ///
+    /// ⚠ DIAGNOSTICS ONLY. This is a PROCESS total and is never reset, so under an
+    /// in-process consumer running concurrent solves it counts other solves' work
+    /// as well. A *budget* must use [`solve_work`]; see its documentation for the
+    /// defect that distinction fixes.
     pub(crate) fn work() -> u64 {
         get(&DUAL_ITERS) + get(&PRIMAL_ITERS)
+    }
+
+    thread_local! {
+        /// Simplex iterations charged to the top-level solve running on this thread.
+        ///
+        /// Bumped at the same two sites as [`DUAL_ITERS`]/[`PRIMAL_ITERS`] and rebased
+        /// by [`SolveWorkFrame`]. A `Cell<u64>` rather than an atomic: it is per-thread
+        /// by construction, and a non-atomic increment is cheaper than the `fetch_add`
+        /// beside it.
+        static SOLVE_ITERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// Nesting depth of [`SolveWorkFrame`]. Only the OUTERMOST frame rebases: a
+        /// sub-MIP (RINS/RENS/local branching) re-enters the solver on the same thread
+        /// and must keep spending the enclosing solve's budget, not open a fresh one.
+        static SOLVE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Charge one iteration to the current solve. Paired with every `bump` of
+    /// [`DUAL_ITERS`] / [`PRIMAL_ITERS`], which are the only two pivot loops.
+    #[inline]
+    pub(crate) fn bump_solve() {
+        SOLVE_ITERS.with(|c| c.set(c.get().wrapping_add(1)));
+    }
+
+    /// THE BUDGET CLOCK. Simplex iterations spent by the current top-level solve on
+    /// this thread.
+    ///
+    /// # The defect this exists to fix
+    ///
+    /// [`work()`] is a process-global `AtomicU64` pair that is never reset, and
+    /// `bab.rs`'s strong-branching and bound-moving budgets were denominated in it
+    /// under a comment claiming the resulting budgets are *"the same on every run, on
+    /// every machine"*. That holds for a one-solve-per-process harness and fails for
+    /// ay-milp's primary consumer: the development design notes §M1
+    /// records a heavily multi-threaded verifier whose workers *"can be inside an ay
+    /// solve while another thread configures the next one"*. There, solve A's
+    /// strong-branching allowance grows with solves B..H's iterations — and strong
+    /// branching chooses the branching, which chooses the tree.
+    ///
+    /// The wall→work conversion was itself a fix for machine-load dependence. It
+    /// removed that dependence and substituted OTHER-SOLVE dependence; this removes
+    /// the second without reintroducing the first.
+    ///
+    /// # Why per TOP-LEVEL solve
+    ///
+    /// A sub-MIP re-enters `solve_milp_*` on the same thread while its parent is live.
+    /// Rebasing there would hand every sub-search a fresh full budget, which is a
+    /// behaviour change on every instance that runs one. Only the outermost frame
+    /// rebases, so a sub-MIP keeps drawing on the budget its parent has been spending.
+    ///
+    /// # Byte-identity
+    ///
+    /// On the one-solve-per-process measurement harness this is equal to [`work()`]
+    /// at every read: the counter starts at zero, one thread bumps it, and nothing
+    /// else runs. That is what makes the change free to validate against the corpus.
+    pub(crate) fn solve_work() -> u64 {
+        SOLVE_ITERS.with(std::cell::Cell::get)
+    }
+
+    /// Rebases [`solve_work`] for the duration of one TOP-LEVEL solve.
+    ///
+    /// `!Send` for the same reason `tune::Active` is: its `Drop` mutates a
+    /// thread-local, so a guard created on one thread and dropped on another would
+    /// restore the wrong thread's baseline.
+    #[must_use = "the solve's work frame is active only while this guard is held"]
+    pub(crate) struct SolveWorkFrame {
+        /// The value to restore. `None` on a nested frame, which does nothing.
+        restore: Option<u64>,
+        _not_send: std::marker::PhantomData<*const ()>,
+    }
+
+    impl SolveWorkFrame {
+        /// Enter a solve. Rebases only if this is the outermost frame on the thread.
+        pub(crate) fn enter() -> Self {
+            let outermost = SOLVE_DEPTH.with(|d| {
+                let was = d.get();
+                d.set(was.saturating_add(1));
+                was == 0
+            });
+            let restore = outermost.then(|| SOLVE_ITERS.with(|c| c.replace(0)));
+            Self {
+                restore,
+                _not_send: std::marker::PhantomData,
+            }
+        }
+    }
+
+    impl Drop for SolveWorkFrame {
+        fn drop(&mut self) {
+            SOLVE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+            if let Some(v) = self.restore {
+                SOLVE_ITERS.with(|c| c.set(v));
+            }
+        }
     }
 }
 
@@ -1667,6 +2181,11 @@ impl<'a> WarmSolver<'a> {
         deadline: Option<std::time::Instant>,
     ) -> Candidate {
         stats::bump(&stats::SOLVES);
+        // ITERATION LEDGER: the pooled bound-change re-solve is a third door
+        // into the pivot loops (the dive/flip-LNS eval loop lives on it), so it
+        // charges a solve like the other two or its phase's iterations-per-solve
+        // would read as infinite.
+        ledger_note_solve();
         let t = std::time::Instant::now();
         // LANE/CALLER ATTRIBUTION (trace only). A `WarmSolver` never installs an
         // LU engine (`Simplex::new`), so it is ALWAYS the eta lane, warm — the
@@ -1839,6 +2358,24 @@ const EAGER_PERTURB_MIN_ROWS: usize = 200;
 /// the historical behavior byte-for-byte; the `no_tall_lu` kill switch still
 /// disables the lane entirely). See the journal at `tall_lu`.
 const TALL_LU_ROWS: usize = 1_000;
+
+/// The cold-root LU band membership test, extracted from `FloatLp::cold_root_lu`
+/// so the WINDOW itself is unit-testable without standing up a 5,000-row LP.
+/// Half-open on purpose: the ceiling is a class boundary shared with
+/// `REFACTOR_TALL_ROWS`, and a model sitting exactly on it belongs to the class
+/// ABOVE (the w5/cifar regime), which is where the rest of the code puts it.
+#[inline]
+fn cold_root_lu_band(m: usize, min_rows: usize, max_rows: usize) -> bool {
+    m >= min_rows && m < max_rows
+}
+
+/// Row floor of the COLD-ROOT LU band (`FloatLp::cold_root_lu`). Deliberately
+/// 3× `TALL_LU_ROWS`: admitting a WARM node re-solve to the LU lane risks only
+/// a child bound that is re-derived downstream, while admitting the COLD root
+/// changes which optimal VERTEX seeds every heuristic. The higher bar is the
+/// price of that asymmetry, and the A/B says it is the right bar — see the
+/// measurement table on `FloatLp::cold_root_lu`.
+const COLD_LU_MIN_ROWS: usize = 3_000;
 
 /// Row floor for `FloatLp::tall_lu`, with an env override (`AY_MILP_TALL_LU_ROWS`)
 /// so the LU-engine boundary can be A/B'd (=1200 restores the pre-qiu default).
@@ -2264,12 +2801,11 @@ impl FloatLp {
         self.sscale = sscale;
     }
 
-    /// STAGE-0 PARALLEL PoC ONLY (inert on the serial path): a deterministic
-    /// estimate of this engine's heap footprint — the byte capacity of every
-    /// owned matrix / bound / cost / scaling vector. On a FRESH clone every
-    /// interior cache is empty, so this is the per-worker `FloatLp::clone()` cost
-    /// the parallel plan flags for wide instances (air05: ~7195 cols). Never
-    /// called by `solve_milp_in`, the node driver, or the simplex hot loop.
+    /// Deterministic structural estimate of this engine's heap footprint: the
+    /// byte capacity of every owned matrix / bound / cost / scaling vector.
+    /// A fresh clone has empty interior caches. The proof-first prefix scheduler
+    /// conservatively multiplies this estimate before admitting owned workers;
+    /// the serial node driver and simplex hot loop never call it.
     pub(crate) fn approx_bytes(&self) -> usize {
         use std::mem::size_of;
         self.col_ptr.capacity() * size_of::<usize>()
@@ -2367,6 +2903,105 @@ impl FloatLp {
     /// maintenance, not the LP admission checks or verdict semantics.
     pub(crate) fn tall_lu(&self) -> bool {
         self.m >= tall_lu_rows() && !no_tall_lu()
+    }
+
+    /// COLD-ROOT LU BAND: the row window where the FT engine is measured to beat
+    /// the product-form eta file on the *vertex-seeding* solve as well as on the
+    /// warm ones, so `plain_cold` may hand it the cold root LP too.
+    ///
+    /// # Why a band and not a floor
+    ///
+    /// `plain_cold` (see the field's note) pins COLD solves to the eta file
+    /// because the root vertex seeds the pump/dive/RINS chain. That pin is
+    /// correct policy and wrong at one size class. Measured, 2026-07-27/28,
+    /// 60–120 s caps, `AY_MILP_LU=1` as the force-lever (deterministic counters
+    /// first, wall indicative — the box was contended):
+    ///
+    /// | m | instance | eta lane | LU lane |
+    /// |---|----------|----------|---------|
+    /// | 12–780 | mas76…gen (9 instances) | REFAC 0.06–0.88 s, i.e. <20 % of LP time | 1.4–2.7× wall, 1.15–2.5× nodes, **air05 LOSES its proven bound** |
+    /// | 1 192 | qiu | 4 541 nodes / 38.1 s | 2 986 nodes / 55.9 s (mixed) |
+    /// | 2 298 | binkar10_1 | 44 645 nodes | 40 477 nodes (mixed) |
+    /// | 3 522 | nursesched-sprint02 | root LP 59.2 s, REFAC **2 611 / 39.3 s**, 899 piv/s, UNKNOWN 4 nodes | root LP 17.4 s, REFAC 424 / 3.1 s, 3 117 piv/s (**3.5×**), **BOUND 55**, 31 nodes |
+    /// | 4 744 | neos-960392 | REFAC 819 / 9.7 s, **2 nodes** | REFAC 33 / 0.02 s, **287 nodes (143×)** |
+    /// | 5 195 | hypothyroid-k1 | REFAC **687 / 89.7 s = 76 % of LP time**, root LP **stopped, NO BOUND** | root LP Optimal @34.6 s, **bound −2902.852586** |
+    /// | 40 962–168 336 | ex9/ex10/uccase12/physiciansched6-2 | REFAC 23–87 s (38–74 %) | REFAC falls 30–166× **but** `LuEngine::update` is O(m) dense per pivot (1.85 ms/update at m=40 962, 3.57 ms at m=69 608) and eats 23–34 % back; net pivots/s 0.79–1.31×, no lane converges |
+    ///
+    /// So the win is a WINDOW, not a ray. Below the floor the eta rebuild is
+    /// O(m·nnz) with a tiny `m` and is already free, while the FT engine's
+    /// per-pivot cost is pure loss AND moves the vertex (air05, rout). Above the
+    /// ceiling the refactorisation wall is genuinely removed and the bound does
+    /// improve (ex9 10.64 → 16.36, uccase12 1954 → 2385) but a NEW O(m) wall
+    /// takes its place, so the lane change is not yet a win to bank — that is a
+    /// `lu.rs::update` sparsification job, not a dispatch job.
+    ///
+    /// # What the band bought, A/B'd against `AY_MILP_NO_COLD_LU` at 60 s
+    ///
+    /// 61 instance pairs (40 in band, 21 outside), one binary, both arms.
+    /// In-band totals: 89,220 → 21,264 eta rebuilds, 861.2 s → 99.3 s of REFAC,
+    /// and 4,245,309 → 6,445,155 simplex pivots — 1.52× the LP work done inside
+    /// the same 60 s budget, bought entirely from the refactorisation bill.
+    ///
+    /// * ELEVEN in-band models complete their FIRST root LP where the eta lane
+    ///   cannot finish it at all — cvs16r70-62 / r89-60 / r128-89, glass-sc,
+    ///   hypothyroid-k1, milo-v12-6-r2-40-1, peg-solitaire-a3, seymour,
+    ///   seymour1, nursesched-sprint02, cmflsp50-24-8-8. Deterministic
+    ///   counters, eta → LU: peg-solitaire-a3 7,034 rebuilds/36.71 s → 66/0.70 s
+    ///   with 41,732 → 219,065 pivots; seymour 3,670/48.21 s → 0/0.00 s with
+    ///   20,612 → 74,770; cvs16r70-62 3,183/49.85 s → 439/6.12 s with
+    ///   17,927 → 161,725. Sweep totals: 158,126 → 88,116 eta rebuilds,
+    ///   987.0 s → 223.4 s of REFAC.
+    /// * +7 verdicts (cvs16r70-62, cvs16r89-60, cvs16r128-89, glass-sc,
+    ///   nursesched-sprint02, peg-solitaire-a3, seymour1), −1 (cmflsp50-24-8-8,
+    ///   whose root LP the LU lane PROVES Optimal at 40.2 s where the eta lane
+    ///   is still `Stopped` at 50.7 s — the verdict is lost in the tree-bound
+    ///   REPORTER, which forfeits the global claim when an open node cannot
+    ///   re-derive its own bound, not in this lane).
+    /// * ZERO verdict disagreements against `manifest.json` `ref_obj`, and zero
+    ///   lane disagreements: on all 38 pairs where BOTH lanes solve the pure LP
+    ///   relaxation (`cut round 0`, the identical LP in both arms) the bounds
+    ///   are bit-identical — worst relative deviation exactly 0.0.
+    /// * OUT OF BAND, all 9 pairs that reach a proof are bit-identical in
+    ///   verdict, objective, node count AND eta-rebuild count (mas76 909,442
+    ///   nodes, misc07 4,702, qnet1 373, qiu 4,541, decomp2 6,513, gen 11,
+    ///   p0201 168, flugpl 1,582, markshare1 0). Deadline-truncated
+    ///   out-of-band runs differ by less than SAME-ARM repeat noise on a
+    ///   contended box: air05 alone spans 374/374/374 vs 2,340 eta rebuilds and
+    ///   17 vs 35 nodes across four runs of the IDENTICAL arm, which is why the
+    ///   floor is not tuned on truncated instances.
+    /// * ABOVE the ceiling nothing moves, checked rather than assumed: ex9
+    ///   (m = 40,962) 242 vs 243 eta rebuilds with the identical root LP bound
+    ///   9.028183 and `LUFACT count=0` in both arms, and neos-827175
+    ///   (m = 14,187) 371 vs 373 with its triangular crash intact in both —
+    ///   which is the confound the `AY_MILP_LU=1` force-lever could not avoid.
+    /// * `AY_MILP_LU_VERIFY=1` — refactorize-from-scratch and re-ask after EVERY
+    ///   single Forrest–Tomlin update, the strictest cross-check the crate has,
+    ///   and in class here because the band sits inside `verify_after_for`'s
+    ///   `tall_lu() && m < REFACTOR_TALL_ROWS` gate — reproduces the root LP
+    ///   bound EXACTLY on all six band winners tried (nursesched-sprint02
+    ///   54.416667, peg-solitaire-a3 1.000000, seymour1 403.846474, glass-sc
+    ///   14.080296, cvs16r70-62 −70.000000, and hypothyroid-k1 −2902.852586 once
+    ///   given 150 s) at 1.5–2.0× wall, with `singular_deferred=0` throughout.
+    ///   A wrong factorisation would have to be wrong the SAME way with 1 update
+    ///   between refactorisations as with 64 to survive that.
+    ///
+    /// # Why the ceiling is `REFACTOR_TALL_ROWS`
+    ///
+    /// 8 192 is already the class boundary for `lu_verify_after`, `adopt_ft_max`
+    /// and the tall refactor cadence: below it the FT engine is the trusted
+    /// operator and its staleness/adoption policy is tuned; above it the code
+    /// hands control back to the w5/cifar wide-tall regime. Reusing that line
+    /// keeps ONE notion of "the FT-trusted band" instead of two, and it happens
+    /// to sit above every measured winner (max 5 195) and below the measured
+    /// wash (min 40 962). `AY_MILP_COLD_LU_MAX_ROWS` moves it for the follow-up
+    /// experiment once `update` is sparse.
+    ///
+    /// WARM solves are untouched here: they already take the LU lane through
+    /// `node_lu` (`warm.is_some() && tall_lu()`), which is why the only measured
+    /// gap was the cold root. `AY_MILP_NO_COLD_LU` restores the historical
+    /// eta-file cold root byte-for-byte.
+    pub(crate) fn cold_root_lu(&self) -> bool {
+        !no_cold_lu() && cold_root_lu_band(self.m, cold_lu_min_rows(), cold_lu_max_rows())
     }
 
     /// Gate for the DUAL RATIO-TEST ANTI-CHURN (Harris) BAND: at a degenerate
@@ -2849,6 +3484,11 @@ impl FloatLp {
             "direct-primal warm modes require an adopted warm basis"
         );
         stats::bump(&stats::SOLVES);
+        // ITERATION LEDGER: charge this solve to the phase live ON ENTRY. The
+        // iterations it goes on to run are charged where they RUN, so a solve
+        // that falls into recovery contributes its solve count here and part of
+        // its iterations there — which is exactly the split to be shown.
+        ledger_note_solve();
         let _t_solve = std::time::Instant::now();
         // Pooled solver state: reset-in-place is `Simplex::new` minus the ~25
         // allocations, at ~70k calls per proof. A warm caller keeps the pooled
@@ -2953,12 +3593,31 @@ impl FloatLp {
         // /12.84s against ~717 LU factors /0.62s; the truth tables agreed and
         // this side keeps the kill switch.)
         let node_lu = warm.is_some() && (self.wide_tall() || self.tall_lu()) && !no_node_lu();
-        if self.plain_cold && !lu_enabled() && !node_lu {
+        // COLD-ROOT LU BAND: the one place `plain_cold`'s eta pin is measured
+        // WRONG. `node_lu` above already routes every WARM tall re-solve to the
+        // FT engine, so on a tall model the only solve still on the eta file is
+        // the cold root — and that is exactly the solve whose REFAC bill runs
+        // 76% of LP time on hypothyroid-k1 (687 rebuilds / 89.7s) and returns NO
+        // BOUND AT ALL inside 120s, where the same LP on the LU lane is Optimal
+        // at 34.6s with bound -2902.852586. Band, not ray: see
+        // `FloatLp::cold_root_lu` for the m=12..168,336 A/B behind 3,000 and
+        // 8,192, and for why the ends of the range keep the eta file.
+        //
+        // Ordered AFTER the triangular crash on purpose. The crash and the LU
+        // operator "cannot compose" (the note above), and the blunt
+        // `AY_MILP_LU=1` force-lever suppresses the crash outright via
+        // `!lu_enabled()` — which is what made neos-827175 (m=14,187, 10,512/
+        // 10,512 equality rows peeled) look like an LU-lane loss when it was a
+        // crash loss. This gate never fires when `crash_installed`, so a
+        // layered-equality model keeps its crash AND its eta path.
+        let cold_root_lu = warm.is_none() && self.plain_cold && self.cold_root_lu();
+        if self.plain_cold && !lu_enabled() && !node_lu && !cold_root_lu {
             sx.lu = None;
         }
         if !crash_installed
             && sx.lu.is_none()
             && (lu_enabled()
+                || cold_root_lu
                 || ((self.wide_tall() || self.tall_lu()) && (!self.plain_cold || node_lu)))
         {
             sx.lu = Some(LuCache {
@@ -3121,6 +3780,10 @@ impl FloatLp {
                 // hands the armed bundle to the caller's own retry instead).
                 self.chain_shape.set(1);
                 if deadline.is_none_or(|d| std::time::Instant::now() < d) {
+                    // ITERATION LEDGER: the probe walk above already spent its
+                    // budget; this retry re-solves the same LP from scratch.
+                    let _ledger_recover = PhaseScope::new_forced(PH_RECOVERY);
+                    ledger_note_solve();
                     sx.reset(self, lower, upper, false);
                     if !no_tri_crash() {
                         sx.triangular_crash(self, self.range_logical_triangular_crash_enabled());
@@ -3275,6 +3938,13 @@ impl FloatLp {
         deadline: Option<std::time::Instant>,
     ) -> (Vec<f64>, bool) {
         stats::bump(&stats::SOLVES);
+        // ITERATION LEDGER: every probe is strong-branching / pseudocost advice
+        // by construction (that is the whole contract of this entry point), so
+        // it tags itself rather than relying on each of its half-dozen call
+        // sites to remember. The scope also covers the `dual_simplex` walk below,
+        // so the probe's pivots land in `sb-probe` and not in the caller's phase.
+        let _ledger = PhaseScope::new(PH_SB_PROBE);
+        ledger_note_solve();
         let _t_solve = std::time::Instant::now();
         let mut sx: Box<Simplex> = match self.sx_cache.0.borrow_mut().take() {
             Some(mut b) if b.m == self.m && b.cols == self.cols => {
@@ -4117,6 +4787,21 @@ struct Simplex {
     /// `solve_bounded` from the LP's cross-solve cache; advice-lane only, like
     /// everything here: a defect costs speed or tightness, never soundness.
     lu: Option<LuCache>,
+    /// Eta-rebuild work this SOLVE has paid, in `m * nnz` units — the trigger
+    /// for the late LU promotion in `refactorize` (see `cold_lu_eta_work`).
+    /// Deterministic by construction: it counts rebuilds, not nanoseconds.
+    ///
+    /// Reset on every `reset`, INCLUDING `keep_factor=true`. A pooled warm
+    /// solver's rebuild bill is a different lane's problem (`AY_MILP_WARM_LU`,
+    /// default off, and a documented incumbent-moving landmine); charging its
+    /// cross-solve total to one solve's budget would promote the flip-LNS eval
+    /// loop, which is not what any of this was measured on.
+    eta_work: u128,
+    /// Latched once this solve has finished with late promotion — either
+    /// because it promoted, or because a promoted engine was dropped again
+    /// (singular basis / fill decline). Without it, a solve whose LU factor
+    /// keeps failing would re-install and re-drop an engine at every rebuild.
+    lu_late_locked: bool,
     /// Support scratch for the LU-mode sparse BTRAN.
     ynz: Vec<usize>,
     /// Does `y` currently hold `c_B B^{-1}` under the TRUE costs for the
@@ -4408,6 +5093,8 @@ impl Simplex {
             bump_lu_override: None,
             refactor_kicked: 0,
             refactor_bump_lu_used: false,
+            eta_work: 0,
+            lu_late_locked: false,
         };
         s.reset(lp, lower, upper, false);
         s
@@ -4458,6 +5145,10 @@ impl Simplex {
             self.lo.extend_from_slice(lower);
             self.up.extend_from_slice(upper);
         }
+        // The late-promotion budget is PER SOLVE (see the field's note): each
+        // solve gets its own eta bill and its own one-shot switch.
+        self.eta_work = 0;
+        self.lu_late_locked = false;
         self.price_cursor = 0;
         self.price_pool.clear();
         self.pcost.clear();
@@ -5049,6 +5740,57 @@ impl Simplex {
         // A rebuilt inverse computes (bitwise) different duals — never reuse
         // a `y` from before it.
         self.y_is_duals = false;
+        // LATE LU PROMOTION (`cold_lu_eta_work`): this solve started on the eta
+        // file — because the row band declined it — and has now paid more in
+        // O(m*nnz) rebuilds than the budget allows. Switch lanes.
+        //
+        // THIS IS THE ONLY PLACE THE SWITCH CAN HAPPEN, and it is free here.
+        // `B^{-1}` has exactly two representations and `apply_inverse_parts`
+        // picks ONE — an installed engine short-circuits, the eta file is not
+        // consulted — so the lanes never compose and a switch is not a merge.
+        // It is a re-derivation of `B^{-1}` from `self.basis`, which is
+        // precisely what the code below this line was about to do anyway. So
+        // the switch costs the DIFFERENCE between the two rebuild kinds, not a
+        // rebuild on top of one; and paired 60 s runs over 14 models make the
+        // LU factor the cheaper of the two on 13 of them (ms per rebuild,
+        // eta / LU: decomp2 22.35x, cvs16r70-62 18.89x, tbfp-network 16.26x,
+        // comp21-2idx 14.02x, dano3_3 13.32x, atlanta-ip 9.97x, seymour 5.68x,
+        // neos-960392 5.40x, glass-sc 2.59x, aflow40b 2.23x, neos-1456979
+        // 1.27x, hypothyroid-k1 1.22x, drayage-100-23 0.82x — median 9.97x).
+        // Nothing is reconstructed, no basis is re-crashed and no vertex
+        // invariant is restored: `LuEngine::factor` preserves position binding,
+        // so `basis` and `basic_row` are untouched by the swap.
+        //
+        // ⚠ IT STILL MOVES THE VERTEX. The LU inverse is not bitwise the eta
+        // inverse, so every pivot after this one may differ, and on a
+        // `plain_cold` solve that vertex seeds pump/dive/RINS. That is the same
+        // blast radius the row band already accepted, not a new one — which is
+        // why this shares the band's kill switch rather than adding a second.
+        //
+        // Placed BEFORE `verify_cap`/`cadence`/`ft_max` so all three are
+        // computed against the lane that will actually run. `rep_basis` is left
+        // EMPTY on purpose: it cannot match `self.basis`, so the match-skip is
+        // declined and the FT-adoption diff is declined (`same_len` false), and
+        // control falls to the full factor — the correct first act for an
+        // engine that represents nothing yet.
+        if self.lu.is_none() && !self.lu_late_locked && !no_cold_lu() {
+            let budget = cold_lu_eta_work();
+            if budget > 0 && self.eta_work >= budget {
+                self.lu = Some(LuCache {
+                    eng: crate::lu::LuEngine::new(self.m),
+                    rep_basis: Vec::new(),
+                });
+                self.lu_late_locked = true;
+                // The eta file stops being maintained from here (its append is
+                // guarded on `self.lu.is_none()`), so it no longer represents
+                // the basis — say so now rather than at the first LU pivot, or
+                // a later `reset(keep_factor=true)` would take the CROSS-SOLVE
+                // ETA REUSE skip against a file that has been dead for a whole
+                // solve.
+                self.factor_live = false;
+                LU_LATE_PROMOTE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         // Computed before the cache borrow (it reads `self.lu.is_some()`).
         let verify_cap = self.verify_after_for(lp).min(self.refactor_cadence(lp));
         let cadence = self.refactor_cadence(lp);
@@ -5190,7 +5932,10 @@ impl Simplex {
                             nz.push(j - lp.n);
                         }
                         cache.eng.ftran_nz(&mut buf, &mut nz);
-                        let res = cache.eng.update(p, &buf);
+                        // `nz` is the solve's support (and is used two lines
+                        // down to re-zero `buf`), so the LU's spike build gets
+                        // its pattern for free — see `LuEngine::update_nz`.
+                        let res = cache.eng.update_nz(p, &buf, &nz);
                         for &r in &nz {
                             buf[r] = 0.0;
                         }
@@ -5270,6 +6015,7 @@ impl Simplex {
                     // raise the sticky flag the pivot loops watch.
                     self.oom = true;
                     self.lu = None;
+                    self.lu_late_locked = true; // do not re-promote into the same decline
                     return;
                 }
                 Err(crate::lu::FactorFail::Singular(_)) => {
@@ -5296,6 +6042,10 @@ impl Simplex {
             LU_FACT_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.lu = None;
+        // Reaching here from a PROMOTED engine is a demotion (singular basis).
+        // Latch, so the budget — which is already over — cannot bounce the lane
+        // back and forth once per rebuild.
+        self.lu_late_locked = true;
         REFAC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _t = std::time::Instant::now();
         // Stash the current file by SWAP (buffer reuse), build afresh in `etas`.
@@ -5903,6 +6653,37 @@ impl Simplex {
         }
         REFAC_NANOS.fetch_add(
             u64::try_from(_t.elapsed().as_nanos()).unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // CHARGE THE LATE-PROMOTION BUDGET (`cold_lu_eta_work`) — here, at the
+        // epilogue of a rebuild that actually completed, and in the units of the
+        // fill it actually produced.
+        //
+        // The first version of this charged a STATIC `m * nnz`, the crate's own
+        // stated complexity for a rebuild. It is the wrong unit and the eta-arm
+        // census says so outright: over 14 models it ranks the real cost
+        // BACKWARDS at the ends. aflow40b charges 1.18e7 per rebuild and takes
+        // 0.73 ms; drayage-100-23 charges 2.28e8 — 19x more — and takes 0.54 ms,
+        // LESS. cvs16r70-62 charges 3.16e7 and takes 23.1 ms, 43x drayage's time
+        // on a seventh of drayage's modelled work. `m * nnz` bounds the rebuild;
+        // it does not measure it, because what a rebuild actually costs is the
+        // eta FILL it generates, and fill is a property of the basis, not of the
+        // model. That is the same lesson the static-predictor search returned for
+        // spike density — a structural quantity of `B^{-1}` is not a function of
+        // the MPS — so the budget has to count the fill rather than predict it.
+        //
+        // `etas.entries() + m` is that count, and it is free: `eta_nnz` was just
+        // assigned from it three lines up. Deterministic (it is a product of the
+        // basis and the pivot order, not of the clock), so the promotion it
+        // triggers lands at the same rebuild on every run and the tree stays
+        // reproducible. The `+ m` floors the charge so a run of trivially small
+        // rebuilds still accumulates — a solve rebuilding a nearly-triangular
+        // basis thousands of times is paying, even though each file is tiny.
+        self.eta_work = self
+            .eta_work
+            .saturating_add(self.eta_nnz as u128 + self.m as u128);
+        ETA_WORK_TOTAL.fetch_add(
+            u64::try_from(self.eta_nnz + self.m).unwrap_or(u64::MAX),
             std::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -6666,7 +7447,18 @@ impl Simplex {
         deadline: Option<std::time::Instant>,
         budget: usize,
     ) -> bool {
+        // ITERATION LEDGER: `dual_simplex_inner`'s pivot loop owns the ONLY
+        // `stats::DUAL_ITERS` bump site, so charging its delta here attributes
+        // every dual pivot in the process to the phase that asked for it. One
+        // flag read + two relaxed loads per WALK, nothing per pivot.
+        let led = iter_ledger_enabled().then(|| stats::get(&stats::DUAL_ITERS));
         let r = self.dual_simplex_inner(lp, deadline, budget);
+        if let Some(before) = led {
+            PHASE_DUAL[ledger_phase()].fetch_add(
+                stats::get(&stats::DUAL_ITERS).wrapping_sub(before),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         if self.dual_perturb_active {
             // Bit-exact restore of the un-perturbed costs. `pcost` is only READ
             // by the walk, never written, so the saved slice is authoritative.
@@ -6998,6 +7790,7 @@ impl Simplex {
                 return false; // out of WORK, not out of time
             }
             stats::bump(&stats::DUAL_ITERS);
+            stats::bump_solve();
             // Divergence guard (see `bloom_cap` above): a thrashing walk is
             // abandoned to the rollback in ~hundreds of pivots, not thousands.
             if iter % 128 == 127 {
@@ -7934,7 +8727,11 @@ impl Simplex {
             // so a rejection leaves the whole state untouched — the dual then
             // aborts transactionally, exactly like a vanishing pivot.
             if let Some(cache) = self.lu.as_mut() {
-                if cache.eng.update(row, &self.alpha).is_err() {
+                // `self.nz` is `self.alpha`'s support from the FTRAN above
+                // (nothing between narrows it, and the pivot loops only ever
+                // zero entries, which keeps it a superset) — the pattern the
+                // sparse spike build needs, at no cost. See `update_nz`.
+                if cache.eng.update_nz(row, &self.alpha, &self.nz).is_err() {
                     use std::sync::atomic::Ordering::Relaxed;
                     DUAL_LUREJ.fetch_add(1, Relaxed);
                     DUAL_LUREJ_IT.fetch_add(iter as u64, Relaxed);
@@ -8731,9 +9528,26 @@ impl Simplex {
                 // `xb` numerically diverged) plus a 27,373-iteration phase-I
                 // retry, ~36s for one `Stopped` answer. The cold dual start
                 // solves the same LP in ~3k pivots (~0.4s), deterministically.
-                if lp.wide_tall() && !no_cold_dual() && self.try_cold_dual(lp, deadline) {
-                    DUAL_OK.fetch_add(1, Relaxed);
-                    return SimplexStatus::Optimal;
+                // ITERATION LEDGER: this IS the in-solve cold retry — the warm
+                // dual ran, failed, and its basis was rolled back to the
+                // parent's, and the walk below restarts from B = -I. Same
+                // phase as the caller-level `warm = None` re-solve, because it
+                // is the same thing happening one frame lower.
+                //
+                // The `&&` chain is split so the episode is charged only where
+                // a walk actually happens. Charging it before the gates counted
+                // every ROLLBACK as a cold retry, and on the square-ish corpus
+                // (which is not `wide_tall`, so `try_cold_dual` never runs) the
+                // ledger read `cold-retry=397 solves / 0 iterations` — a phase
+                // that had not run once. Same short-circuit order, so the
+                // default path is unchanged.
+                if lp.wide_tall() && !no_cold_dual() {
+                    let _ledger_cold = PhaseScope::new_forced(PH_COLD_RETRY);
+                    ledger_note_solve();
+                    if self.try_cold_dual(lp, deadline) {
+                        DUAL_OK.fetch_add(1, Relaxed);
+                        return SimplexStatus::Optimal;
+                    }
                 }
             }
         }
@@ -8834,6 +9648,11 @@ impl Simplex {
         // This runs ONLY on the path that already fails, so it cannot cost anything that works.
         // And it cannot lie: the true bounds are restored before `primal_feasible` is consulted,
         // and that check — against the real box — is still what licenses `Optimal`.
+        // ITERATION LEDGER: from here to the end of `run` is RECOVERY — the
+        // whole walk above already ran and came back `Stopped`, so the perturbed
+        // re-walk and the polish that follows it are re-work by definition.
+        let _ledger_recover = PhaseScope::new_forced(PH_RECOVERY);
+        ledger_note_solve();
         let (save_lo, save_up) = (self.lo.clone(), self.up.clone());
         self.perturb_box(lp);
         let perturbed = self.rounds(lp, deadline);
@@ -8870,7 +9689,19 @@ impl Simplex {
         if self.oom {
             return SimplexStatus::OutOfMemory;
         }
+        // ITERATION LEDGER: rounds past the first are pure RE-WORK — a round is
+        // only ever reached because the drift check rejected the previous one's
+        // answer, so every iteration in it re-walks an LP already walked. Held
+        // for the whole tail of the loop (not per round) so the scope is entered
+        // at most once. (`collection_is_never_read` reads the `Option` as a
+        // container; it is an RAII guard whose whole purpose is its lifetime.)
+        #[allow(clippy::collection_is_never_read)]
+        let mut _ledger_retry: Option<PhaseScope> = None;
         for round in 0..4 {
+            if round == 1 {
+                _ledger_retry = PhaseScope::new_forced(PH_RECOVERY);
+                ledger_note_solve();
+            }
             // Refactorize only when there is reason to. A rebuild is O(m · nnz) —
             // on a dense 60x45 that is the dominant per-node cost, and doing it
             // unconditionally between every phase was paying it three times a node
@@ -8933,12 +9764,40 @@ impl Simplex {
         }
     }
 
-    /// Stats shim over the pivot loop: when `AY_MILP_LP_STATS` is set, print one
-    /// `LPSTAT` line per phase — iteration count, degenerate-step and bound-flip
-    /// counts, objective-moving iterations, wall. Counters are relaxed atomics
-    /// bumped inside the loop either way (same cost class as `PRIMAL_ITERS`,
-    /// which the loop already bumps); the prints never touch the float path.
+    /// Stats shim over the pivot loop, and the ITERATION LEDGER's primal hook.
+    ///
+    /// When `AY_MILP_LP_STATS` is set it prints one `LPSTAT` line per phase —
+    /// iteration count, degenerate-step and bound-flip counts, objective-moving
+    /// iterations, wall. Counters are relaxed atomics bumped inside the loop
+    /// either way (same cost class as `PRIMAL_ITERS`, which the loop already
+    /// bumps); the prints never touch the float path.
+    ///
+    /// When `AY_MILP_ITER_LEDGER` is set it also charges this phase's primal
+    /// iterations to the (solve-phase, phase-I/II) ledger cell. Both hooks are
+    /// per-CALL, never per-iteration.
     fn loop_phase(
+        &mut self,
+        lp: &FloatLp,
+        phase1: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> SimplexStatus {
+        // ITERATION LEDGER: `loop_phase_inner`'s pivot loop owns the ONLY
+        // `stats::PRIMAL_ITERS` bump site, and this shim is the only door into
+        // it, so charging the delta here attributes every primal iteration in
+        // the process to a (phase, phase-I/II) cell. One flag read + two relaxed
+        // loads per PHASE, nothing per iteration.
+        let led = iter_ledger_enabled().then(|| stats::get(&stats::PRIMAL_ITERS));
+        let status = self.loop_phase_stats(lp, phase1, deadline);
+        if let Some(before) = led {
+            let spent = stats::get(&stats::PRIMAL_ITERS).wrapping_sub(before);
+            let bucket = if phase1 { &PHASE_P1 } else { &PHASE_P2 };
+            bucket[ledger_phase()].fetch_add(spent, std::sync::atomic::Ordering::Relaxed);
+        }
+        status
+    }
+
+    /// The `AY_MILP_LP_STATS` half of [`Self::loop_phase`]; see its note.
+    fn loop_phase_stats(
         &mut self,
         lp: &FloatLp,
         phase1: bool,
@@ -9037,6 +9896,7 @@ impl Simplex {
             }
             self.probe_iters_left -= 1;
             stats::bump(&stats::PRIMAL_ITERS);
+            stats::bump_solve();
             if iter % 64 == 0 {
                 if let Some(d) = deadline {
                     if std::time::Instant::now() >= d {
@@ -9593,7 +10453,10 @@ impl Simplex {
                         (false, _) => false,
                         (true, None) => true,
                         (true, Some(cache)) => {
-                            let ok = cache.eng.update(p, &self.alpha).is_ok();
+                            // Same as the dual arm: `self.nz` is the FTRAN's
+                            // support, so the spike build gets its pattern for
+                            // free. See `LuEngine::update_nz`.
+                            let ok = cache.eng.update_nz(p, &self.alpha, &self.nz).is_ok();
                             if ok {
                                 cache.rep_basis[p] = col;
                                 self.eta_nnz = cache.eng.nnz();
@@ -9971,6 +10834,205 @@ mod warm_solve_mode_tests {
         assert!(
             default_lp.dual_adapt.get().0 > 0 && explicit_lp.dual_adapt.get().0 > 0,
             "Normal mode must retain the historical warm-dual routing"
+        );
+    }
+}
+
+/// THE COLD-ROOT LU BAND, pinned to the instances it was measured on.
+///
+/// The band is a policy decision with a corpus behind it (see
+/// `FloatLp::cold_root_lu`), and the failure mode of a factorisation dispatch is
+/// not a crash — it is a silently different pivot sequence on a model class
+/// nobody re-measured. So the boundaries are asserted against the ROW COUNTS of
+/// the actual A/B instances, which makes an accidental widening of the window
+/// fail here with the name of the instance it would have swept in.
+#[cfg(test)]
+mod cold_root_lu_band_tests {
+    use super::*;
+
+    /// `(m, in_band)` for every instance the 2026-07-27/28 A/B covered.
+    const MEASURED: &[(usize, bool, &str)] = &[
+        (12, false, "mas76: eta wins, 2.66x wall / 1.51x nodes on LU"),
+        (
+            18,
+            false,
+            "flugpl: eta wins, 1.96x wall / 2.53x nodes on LU",
+        ),
+        (212, false, "misc07: eta wins"),
+        (
+            291,
+            false,
+            "rout: LU lands a WORSE incumbent (1117.6 vs 1083.5)",
+        ),
+        (
+            426,
+            false,
+            "air05: force-lever LU traded BOUND 26143 for a bare incumbent",
+        ),
+        (
+            503,
+            false,
+            "qnet1: eta wins, 1.37x wall; verdict 16029.692681 either way",
+        ),
+        (780, false, "gen: eta wins"),
+        (
+            1_192,
+            false,
+            "qiu: mixed (-34% nodes, +47% wall) — not admitted",
+        ),
+        (2_298, false, "binkar10_1: mixed — not admitted"),
+        (
+            3_068,
+            true,
+            "cvs16r89-60: eta never finishes LP0; LU proves -89.0",
+        ),
+        (
+            3_278,
+            true,
+            "cvs16r70-62: 17,927 -> 161,725 pivots, UNKNOWN -> FEASIBLE",
+        ),
+        (
+            3_522,
+            true,
+            "nursesched-sprint02: 3.5x pivots/s, root LP 59.2s -> 17.4s",
+        ),
+        (
+            4_587,
+            true,
+            "peg-solitaire-a3: 7,034 rebuilds/36.7s -> 66/0.70s",
+        ),
+        (
+            4_744,
+            true,
+            "neos-960392: 2 -> 287 nodes, REFAC 819/9.7s -> 33/0.02s",
+        ),
+        (
+            4_944,
+            true,
+            "seymour1: eta never finishes LP0; LU proves 403.846474",
+        ),
+        (
+            5_195,
+            true,
+            "hypothyroid-k1: no root bound -> bound -2902.852586",
+        ),
+        (
+            6_119,
+            true,
+            "glass-sc: 3,657 rebuilds/46.3s -> 167/0.30s, UNKNOWN -> FEASIBLE",
+        ),
+        (
+            7_029,
+            true,
+            "bnatt500: 3,157 rebuilds/17.9s -> 294/2.6s, same BOUND 0",
+        ),
+        (
+            8_382,
+            false,
+            "neos-4647030-tutaki: first instance past the ceiling",
+        ),
+        (
+            9_499,
+            false,
+            "mzzv11: above the ceiling, w5/cifar regime keeps it",
+        ),
+        (
+            14_187,
+            false,
+            "neos-827175: layered-equality, keeps its triangular crash",
+        ),
+        (
+            40_962,
+            false,
+            "ex9: refac wall removed but O(m) FT update replaces it",
+        ),
+        (69_608, false, "ex10: same — net 0.79x pivots/s"),
+        (121_161, false, "uccase12"),
+        (168_336, false, "physiciansched6-2"),
+    ];
+
+    #[test]
+    fn the_band_admits_exactly_the_instances_it_was_measured_on() {
+        for &(m, want, why) in MEASURED {
+            assert_eq!(
+                cold_root_lu_band(m, COLD_LU_MIN_ROWS, REFACTOR_TALL_ROWS),
+                want,
+                "m = {m} ({why})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_band_is_half_open_at_both_ends() {
+        assert!(!cold_root_lu_band(
+            COLD_LU_MIN_ROWS - 1,
+            COLD_LU_MIN_ROWS,
+            REFACTOR_TALL_ROWS
+        ));
+        assert!(cold_root_lu_band(
+            COLD_LU_MIN_ROWS,
+            COLD_LU_MIN_ROWS,
+            REFACTOR_TALL_ROWS
+        ));
+        assert!(cold_root_lu_band(
+            REFACTOR_TALL_ROWS - 1,
+            COLD_LU_MIN_ROWS,
+            REFACTOR_TALL_ROWS
+        ));
+        // A model exactly on the ceiling belongs to the class ABOVE, the same
+        // way `lu_verify_after`/`adopt_ft_max` hand it back at `m >= 8192`.
+        assert!(!cold_root_lu_band(
+            REFACTOR_TALL_ROWS,
+            COLD_LU_MIN_ROWS,
+            REFACTOR_TALL_ROWS
+        ));
+    }
+
+    /// The band sits strictly INSIDE the tall-LU class, so every model it admits
+    /// already had the FT engine on its WARM node solves (`node_lu`) and already
+    /// falls in the class where `lu_verify_after` and `adopt_ft_max` are tuned.
+    /// The dispatch therefore extends an existing lane; it never opens a new one.
+    #[test]
+    fn the_band_is_contained_in_the_tall_lu_class() {
+        assert!(COLD_LU_MIN_ROWS > TALL_LU_ROWS);
+        assert!(REFACTOR_TALL_ROWS > COLD_LU_MIN_ROWS);
+    }
+
+    /// An empty or inverted window must decline, not admit everything — this is
+    /// the shape a fat-fingered `AY_MILP_COLD_LU_ROWS=99999` takes.
+    #[test]
+    fn an_inverted_window_admits_nothing() {
+        for m in [0usize, 1, 3_000, 5_195, 1 << 20] {
+            assert!(!cold_root_lu_band(m, 8_192, 3_000));
+        }
+    }
+
+    /// A FLOOR OF ZERO MUST NOT OPEN THE BAND TO EVERYTHING.
+    ///
+    /// The inverted-window test above covers `min > max`; it does not cover
+    /// `min = 0`, which is the reachable footgun: an operator writing
+    /// `AY_MILP_COLD_LU_ROWS=0` means "no floor", and honouring that literally
+    /// admits every in-band `plain_cold` solve. That is sound but measurably
+    /// worse — gt2 and qiu both fall OPTIMAL -> FEASIBLE and timtab1 loses its
+    /// incumbent — because below the floor the FT engine's per-pivot cost is
+    /// pure loss and it moves the vertex. `cold_lu_min_rows` therefore filters
+    /// zero back to the compiled floor, so a zero floor must still exclude the
+    /// small models the floor exists to protect.
+    #[test]
+    fn a_zero_floor_still_excludes_the_models_the_floor_protects() {
+        // What the band does with the compiled floor restored, which is what
+        // `cold_lu_min_rows` yields for an explicit 0.
+        for m in [1usize, 200, 1_000, 2_298, 2_999] {
+            assert!(
+                !cold_root_lu_band(m, COLD_LU_MIN_ROWS, 8_192),
+                "m = {m} is below the floor and must stay on the eta lane",
+            );
+        }
+        // And a literal zero floor would admit exactly those — the behaviour
+        // the filter exists to prevent.
+        assert!(
+            cold_root_lu_band(2_298, 0, 8_192),
+            "a zero floor admits binkar10_1-sized models; that is why it is filtered out",
         );
     }
 }
@@ -10357,5 +11419,89 @@ mod bump_lu_tests {
             })
             .collect();
         assert!(bump_eliminate(m, cols, &open, 1e-9, 8).is_none());
+    }
+}
+
+#[cfg(test)]
+mod solve_work_frame_tests {
+    use super::stats;
+
+    /// The frame's whole purpose: a budget reads THIS solve's iterations, not the
+    /// process's. Two sequential solves on one thread must not see each other's work.
+    #[test]
+    fn sequential_solves_do_not_see_each_other() {
+        {
+            let _f = stats::SolveWorkFrame::enter();
+            stats::bump_solve();
+            stats::bump_solve();
+            assert_eq!(stats::solve_work(), 2);
+        }
+        {
+            let _f = stats::SolveWorkFrame::enter();
+            assert_eq!(stats::solve_work(), 0, "solve 2 inherited solve 1's work");
+            stats::bump_solve();
+            assert_eq!(stats::solve_work(), 1);
+        }
+    }
+
+    /// A sub-MIP re-enters `solve_milp_*` on the same thread while its parent is live.
+    /// Rebasing there would hand every sub-search a fresh full budget — a behaviour
+    /// change on every instance that runs one. Only the outermost frame rebases.
+    #[test]
+    fn a_nested_frame_does_not_rebase() {
+        let _outer = stats::SolveWorkFrame::enter();
+        stats::bump_solve();
+        stats::bump_solve();
+        stats::bump_solve();
+        {
+            let _sub_mip = stats::SolveWorkFrame::enter();
+            assert_eq!(
+                stats::solve_work(),
+                3,
+                "a sub-MIP opened a fresh budget instead of drawing on its parent's"
+            );
+            stats::bump_solve();
+        }
+        assert_eq!(
+            stats::solve_work(),
+            4,
+            "the sub-MIP's work was not charged to the enclosing solve"
+        );
+    }
+
+    /// The property that makes this free to validate: on the one-solve-per-process
+    /// harness the frame is a no-op, because both clocks start at zero and only this
+    /// thread bumps them. Every bump site raises both counters in lockstep.
+    #[test]
+    fn matches_the_process_clock_when_it_is_the_only_solve() {
+        let base = stats::work();
+        let _f = stats::SolveWorkFrame::enter();
+        for _ in 0..5 {
+            stats::bump(&stats::DUAL_ITERS);
+            stats::bump_solve();
+        }
+        assert_eq!(stats::solve_work(), stats::work() - base);
+    }
+
+    /// A worker thread starts with its own zeroed clock rather than inheriting the
+    /// spawning solve's count — which is what makes the budget per-solve rather than
+    /// per-process in the first place.
+    #[test]
+    fn a_fresh_thread_starts_at_zero() {
+        let _f = stats::SolveWorkFrame::enter();
+        stats::bump_solve();
+        assert_eq!(stats::solve_work(), 1);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                assert_eq!(stats::solve_work(), 0);
+                stats::bump_solve();
+                assert_eq!(stats::solve_work(), 1);
+            });
+        });
+        assert_eq!(
+            stats::solve_work(),
+            1,
+            "a worker leaked into the parent's clock"
+        );
     }
 }

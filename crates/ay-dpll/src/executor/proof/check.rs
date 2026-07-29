@@ -78,6 +78,11 @@ impl Executor {
     /// Populate statistics extra map with proof quality metrics.
     pub(super) fn populate_proof_quality_stats(&mut self, quality: &ProofQuality) {
         use crate::executor_types::StatValue;
+        // Keep the typed field and the extensible compatibility statistic in
+        // lockstep. Native replay and other structured consumers read the
+        // typed source of truth; previously it was never assigned and therefore
+        // reported every proof as incomplete even when strict checking passed.
+        self.last_statistics.proof_complete = quality.is_complete();
         let extra = &mut self.last_statistics.extra;
         extra.insert(
             "proof_steps".to_string(),
@@ -276,6 +281,26 @@ impl Executor {
         if let Some(lean) =
             crate::executor::lean_firewall::emit_str_len_zero_firewall_lean_from_parsed(
                 self.ctx.assertions_parsed(),
+            )
+        {
+            out.push(lean);
+        }
+
+        // SYMBOLIC `str.in_re` LENGTH-INVARIANT conflicts: `(str.in_re X R)`
+        // together with a `str.len X` pin the structural length abstraction of
+        // `R` cannot satisfy (modulus / minimum / maximum member length),
+        // grounded in the verified `AySoundness.RegexThy` invariants. `X` stays
+        // universally quantified, so this covers genuinely symbolic strings.
+        //
+        // The `is_single_shot_query` argument is a SCOPING gate, not a
+        // performance one: with `push`/`pop` or a second `check-sat`, the
+        // surface-syntax assertion export cannot establish that the rendered
+        // assertions are in scope at the check-sat being reported, and the
+        // emitter must decline. See `emit_str_in_re_len_firewall_lean_from_parsed`.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_str_in_re_len_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+                self.ctx.is_single_shot_query(),
             )
         {
             out.push(lean);
@@ -628,15 +653,22 @@ impl Executor {
         }
 
         // Floating-point RNE DOT-PRODUCT forward-error proof emission is
-        // deliberately disabled. The Lean `FpErrorBound` declarations prove
-        // fixed-grid `qround` models, but no theorem connects the parsed
-        // IEEE-754 operations and intermediate magnitude bounds to those
-        // models. The hook below therefore declines every threshold, including
-        // guard2's 2.0, until that semantic bridge exists and is reviewed.
+        // deliberately disabled. `AySoundness.FpBridge` now proves the rational
+        // side end to end (the half-ULP bridge, `IsF64` representability under
+        // the independent `FpUnderflow.decodeFin` decode, chained finiteness of
+        // the six intermediates, and the composed conflict), but the residual
+        // identification of SMT-LIB `fp.mul`/`fp.add` RNE with the bridge's
+        // `NearestF64` spec is hand-argued and outside the kernel. The hook
+        // below therefore still declines every threshold, including guard2's
+        // 2.0. Its FORMAT gate is live regardless: the third argument carries
+        // the declared floating-point formats, without which the emitter could
+        // not tell this UNSAT `Float64` benchmark from its SATISFIABLE
+        // `Float32` clone (their parsed assertion terms are byte-identical).
         if let Some(lean) =
             crate::executor::lean_firewall::emit_fp_dot_error_bound_firewall_lean_from_parsed(
                 self.ctx.assertions_parsed(),
                 &self.ctx.nullary_defined_terms(),
+                &self.ctx.nullary_fp_formats(),
             )
         {
             if !out.push(lean) {
@@ -1133,6 +1165,23 @@ impl Executor {
         // be inserted BEFORE the emit_general_firewall_lean call.
         if let Some(lean) =
             crate::executor::lean_firewall::emit_euf_lia_congruence_firewall_lean_from_parsed(
+                self.ctx.assertions_parsed(),
+                &self.ctx,
+            )
+        {
+            out.push(lean);
+        }
+
+        // EUF + ORDERED-FIELD fused congruence-value conflict (bucket
+        // "euf_uflra") — the REAL-sorted sibling of the emitter above. Lean core
+        // has no ℝ, so this one quantifies the model over an ARBITRARY linearly
+        // ordered field (`AySoundness.OrdField`); "no model in any ordered field"
+        // entails "no real model". It shares NO recognizer with the Int path: its
+        // gates demand `Sort::Real` throughout and it never pins from a STRICT
+        // bound, because integer pinning (`x > 5 ∧ x < 7 ⟹ x = 6`) is unsound
+        // over ℝ.
+        if let Some(lean) =
+            crate::executor::lean_firewall::emit_euf_ordfield_congruence_firewall_lean_from_parsed(
                 self.ctx.assertions_parsed(),
                 &self.ctx,
             )

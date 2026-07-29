@@ -364,6 +364,20 @@ where
         .max(fixer.lp_lower_bound())
         .max(am1_floor);
 
+    // Report the constraint-derived floor immediately: on families where core
+    // extraction stalls (measured: 0 cores in 60s on liu/domset while CP-SAT's
+    // bool_core found 96 in 300s) this is the only dual the run ever proves,
+    // and without it an OPT run that ends SATISFIABLE reports nothing at all.
+    {
+        let floor = external_floor.min(best_value);
+        if let Some(bus) = external_bounds {
+            bus.publish_reported_dual(floor);
+        }
+        if crate::optimize::shared_bounds::publish_reported_dual_global(floor) {
+            eprintln!("c dual {floor}");
+        }
+    }
+
     // LP-FLOOR INCUMBENT PROBE. When the (exact-rational, cut-strengthened) LP
     // relaxation floor sits strictly below the current incumbent, try to realize a
     // model AT the floor by a single bounded `objective <= floor` query — exactly
@@ -455,10 +469,50 @@ where
         // model). It NEVER overwrites `best_value` — the engine's returned
         // pair stays its OWN witness (the §2.7 desync fix); incumbents still
         // only ever come from the engine's own models.
+        //
+        // SINGLE-STRATUM SKIP (measured 2026-07-28). At a FULL stratum the
+        // assumption set forces `objective == lower_bound`, and
+        // `lower_bound <= optimum <= cutoff` always holds, so the row is
+        // ENTAILED by the assumptions and can prune nothing — it is dead weight
+        // in every propagation and every conflict resolution.
+        //
+        // On a unit-weight objective (this domset family: 467/467 unit terms)
+        // `initialize_threshold` makes max weight == min weight, so
+        // `collect_stratum_assumptions` reports a full stratum from iteration 1
+        // and the row is NEVER able to bite. Measured cost of installing it
+        // anyway, 90s per arm on `domset ..._mw19_19`:
+        //     no cutoff        -> dual 127
+        //     cutoff 177       -> dual 65
+        //     cutoff 140       -> dual 65
+        //     cutoff 230       -> dual 65   (near-vacuous vs the engine's own
+        //                                    best of 237 — the CONTROL)
+        // The vacuous arm costing exactly as much as the tight one shows the
+        // damage is the 467-term dense row itself, not the strength of the
+        // bound. This crippled the one bus consumer (`native-oll-opt`, the
+        // FULL-budget worker) to the parity floor on every default parallel
+        // run, which is why the parallel dual (124) trailed the bus-free
+        // sequential pre-pass (127).
+        //
+        // The row is still installed for genuinely multi-stratum (weighted)
+        // objectives, where a partial stratum does not pin the objective and
+        // the cutoff can legitimately prune.
         let external_ub_cutoff: Option<i128> = external_bounds.and_then(SharedBounds::ub);
-        if let Some(cutoff) =
-            external_cutoff_row_wanted(external_ub_cutoff, best_value, installed_cutoff)
-        {
+        // CANARY (kept even when the row is skipped). The `Conflict` arm below
+        // used to be the only in-engine signal that the bus ub sits BELOW the
+        // true optimum — a poisoned bus. Skipping the row would silence it, so
+        // check the same invariant directly and cheaply: a bus ub must never be
+        // below a bound we have already PROVEN.
+        if let Some(ub) = external_ub_cutoff {
+            debug_assert!(
+                ub >= lower_bound,
+                "poisoned bus: ub {ub} < proven lower bound {lower_bound}"
+            );
+        }
+        if let Some(cutoff) = external_cutoff_row_wanted(
+            external_ub_cutoff.filter(|_| state.stratification_enabled()),
+            best_value,
+            installed_cutoff,
+        ) {
             // A row-construction overflow (`Err`) is treated as NO CUTOFF.
             if let Ok(row) = objective_at_most_constraint(objective, cutoff) {
                 match solver.add_constraint_runtime(&row) {
@@ -594,6 +648,31 @@ where
                             ));
                         }
                         state.lower_threshold();
+                    }
+                }
+                // TELEMETRY ONLY (see `SharedBounds::publish_reported_dual`):
+                // surface how far core-guided reasoning has driven the dual, so
+                // an OPT run that ends SATISFIABLE still reports what it proved.
+                // Clamped to `best_value` because this accumulator is a floor
+                // over the CURRENT solver state — hardening, the external-UB
+                // prune row and (opt-in) reduced-cost fixings can all push it
+                // past the true optimum, and the clamp keeps the printed number
+                // inside `[.., incumbent]` where it is meaningful. It licenses
+                // nothing: the bus routes it away from `lb`, which is the only
+                // value the OPTIMUM upgrade reads.
+                let reported = lower_bound.max(external_floor).min(best_value);
+                if let Some(bus) = external_bounds {
+                    bus.publish_reported_dual(reported);
+                }
+                {
+                    if crate::optimize::shared_bounds::publish_reported_dual_global(reported) {
+                        // STDERR, and only on improvement. The PB competition
+                        // verdict is read from STDOUT, so this cannot perturb a
+                        // result; it exists because an OPT run that ends
+                        // SATISFIABLE currently reports nothing about how far it
+                        // drove the dual, which makes the dual side of the
+                        // search unmeasurable from outside.
+                        eprintln!("c dual {reported}");
                     }
                 }
                 if should_stop() {
@@ -986,6 +1065,25 @@ where
 /// loop exactly (see [`process_disjoint_core_round`]).
 const MAX_DISJOINT_CORES_PER_ROUND: usize = 4096;
 
+/// Wall-clock budget for ONE disjoint-core round.
+///
+/// The count cap alone does not bound a round's cost: each additional core
+/// costs an intra-round assumption solve PLUS up to [`MAX_CORE_TRIM_CHECKS`]
+/// trimming solves, and those solves get harder as the stratum tightens. With
+/// the cap at 4096 a single round can issue >100k solves.
+///
+/// Measured on `domset ..._mw19_19` before this budget existed, the rounds ran
+/// 32ms, 101ms, **12.6s**, **85.2s** — i.e. the engine spent whole minutes
+/// inside one round and the reported dual sat frozen at the parity floor while
+/// it did. Core-guided search wants MANY ratcheting rounds, not one enormous
+/// one: every applied core raises `lower_bound` immediately, so finishing a
+/// round early and re-solving strictly dominates stalling inside it.
+///
+/// Cutting a round short is purely a scheduling decision — every core already
+/// collected is still applied, and each is independently valid — so this
+/// bounds latency without touching the bound's soundness.
+const DISJOINT_CORE_ROUND_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// DISJOINT-CORE EXTRACTION ROUND.
 ///
 /// Given the stratum's `base_assumptions` (no-cost-polarity literals for every
@@ -1065,7 +1163,21 @@ where
     let mut claimed: HashSet<PbLit> = first_softs.clone();
     let mut collected: Vec<HashSet<PbLit>> = vec![first_softs];
 
-    while collected.len() < round_core_cap && !should_stop() {
+    let round_started = std::time::Instant::now();
+    // The budget must bind INSIDE the solves, not only between them. Checking it
+    // in the loop condition alone leaves a single hard intra-round query free to
+    // run forever: measured on `domset ..._mw19_19`, the dual reached 125 in 6.9s
+    // and then one such query consumed the remaining 83s of a 90s run without
+    // returning. Wrapping the stop closure makes every intra-round solve — and
+    // every trimming solve beneath it — honour the same deadline, so the round
+    // ends with the cores it has instead of hanging.
+    let mut round_stop = |elapsed: &mut dyn FnMut() -> bool| {
+        round_started.elapsed() >= DISJOINT_CORE_ROUND_BUDGET || elapsed()
+    };
+    while collected.len() < round_core_cap
+        && !round_stop(&mut *should_stop)
+        && round_started.elapsed() < DISJOINT_CORE_ROUND_BUDGET
+    {
         // Reduced assumption set: drop every assumption literal whose underlying
         // soft has already been claimed. (Assumption literals are
         // `complement(soft.literal)`, so an assumption `a` is claimed iff
@@ -1081,9 +1193,11 @@ where
             break;
         }
 
-        match solver.solve_with_assumptions_interruptible(&reduced, &mut *should_stop) {
+        let mut bounded = || round_stop(&mut *should_stop);
+        match solver.solve_with_assumptions_interruptible(&reduced, &mut bounded) {
             PbCdclAssumptionResult::Unsatisfiable { core } => {
-                let trimmed = trim_core(solver, core, should_stop);
+                let mut bounded = || round_stop(&mut *should_stop);
+                let trimmed = trim_core(solver, core, &mut bounded);
                 let mut softs: HashSet<PbLit> = trimmed.into_iter().map(complement).collect();
                 if softs.is_empty() {
                     // No more cores reachable under the reduced set.

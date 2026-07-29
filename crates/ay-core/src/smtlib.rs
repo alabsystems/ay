@@ -146,13 +146,30 @@ pub(crate) fn is_symbol_char(c: char) -> bool {
 ///
 /// SMT-LIB 2.6 string literals are sequences of Unicode code points. Only
 /// printable ASCII (`0x20..=0x7E`) prints literally, with `"` doubled to `""`.
-/// Backslash (`0x5C`) is a printable ASCII character and prints literally (it is
-/// NOT an escape character in the standard). Every other code point — control
-/// characters and all non-ASCII (BMP and astral, up to `0x2FFFF`) — is emitted
-/// as a `\u{X}` escape, where `X` is the LOWERCASE, minimal-digit hex code
-/// point (e.g. U+03B1 -> `\u{3b1}`, U+0009 -> `\u{9}`, U+1F600 -> `\u{1f600}`).
-/// This matches z3's `(get-value)` output so the printed literal round-trips
-/// through a strict SMT-LIB reader (z3 and ay's own parser).
+/// Backslash (`0x5C`) is a printable ASCII character and normally prints
+/// literally (it is NOT an escape character in the standard). Every other code
+/// point in the theory alphabet — control characters and all non-ASCII, up to
+/// [`SMTLIB_MAX_CODE_POINT`] — is emitted as a `\u{X}` escape, where `X` is the
+/// LOWERCASE, minimal-digit hex code point (e.g. U+03B1 -> `\u{3b1}`,
+/// U+0009 -> `\u{9}`, U+1F600 -> `\u{1f600}`). This matches z3's `(get-value)`
+/// output.
+///
+/// The output is an exact left inverse of [`unescape_string_contents`]: reading
+/// it back yields the same sequence of code points. Two cases need care, and
+/// both were live round-trip defects (`get-value` printing a literal that
+/// denotes a DIFFERENT String element than the model value):
+///
+/// 1. A literal backslash that the reader would re-absorb. `"\u{5c}u{61}"`
+///    denotes the six code points `\ u { 6 1 }`; printing them verbatim gives
+///    `"\u{61}"`, which denotes the single character `a`. So a backslash whose
+///    successors form a well-formed, in-alphabet `\u` escape is itself written
+///    as `\u{5c}` (as z3 does). A backslash that cannot start an escape still
+///    prints literally, so ordinary text such as `path\to\file` is unchanged.
+/// 2. A code point ABOVE the theory alphabet. `\u{30000}` is not an escape
+///    sequence at all (SMT-LIB 2.6 restricts both `\u` forms to
+///    `0..=0x2FFFF`), so a conformant reader takes its nine characters
+///    literally. Such code points are therefore written raw, which does
+///    round-trip, rather than as a `\u{...}` form that does not.
 ///
 /// # Examples
 /// ```
@@ -164,13 +181,26 @@ pub(crate) fn is_symbol_char(c: char) -> bool {
 /// assert_eq!(escape_string_contents("\u{03b1}"), r"\u{3b1}");
 /// assert_eq!(escape_string_contents("\t"), r"\u{9}");
 /// assert_eq!(escape_string_contents("\u{1f600}"), r"\u{1f600}");
+/// // A backslash that would be re-absorbed as an escape is itself escaped.
+/// assert_eq!(escape_string_contents(r"\u{61}"), r"\u{5c}u{61}");
 /// ```
 pub fn escape_string_contents(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
     let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
+    for (i, &c) in chars.iter().enumerate() {
         match c {
             '"' => result.push_str("\"\""),
+            // A backslash the reader would absorb into a `\u` escape must be
+            // written as an escape itself, or the printed literal denotes a
+            // different (shorter) string than the value being printed.
+            '\\' if parse_unicode_escape(&chars, i + 1).is_some() => {
+                result.push_str("\\u{5c}");
+            }
             c if ('\u{20}'..='\u{7e}').contains(&c) => result.push(c),
+            // Outside the theory alphabet a `\u{...}` form is not an escape, so
+            // escaping would corrupt the value. Emit the code point raw: the
+            // reader takes raw characters literally, so this round-trips.
+            c if c as u32 > SMTLIB_MAX_CODE_POINT => result.push(c),
             c => result.push_str(&format!("\\u{{{:x}}}", c as u32)),
         }
     }

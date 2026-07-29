@@ -37,8 +37,52 @@ impl Executor {
         if std::env::var_os("AY_DEBUG_READ_PIN").is_some() {
             eprintln!("[validation-unknown] {detail}");
         }
-        self.last_statistics
-            .set_string("unknown.reason", UnknownReason::Incomplete.to_string());
+        // LOUD, UNCONDITIONALLY. Reaching here means AY built a candidate model
+        // (or refutation) and its OWN validator would not confirm it. That is a
+        // latent wrong answer, not a missing feature.
+        //
+        // This used to record `Incomplete` and whisper through `tracing::warn!`,
+        // which has no subscriber in normal runs. The result: a 2026-07-25
+        // corpus scoreboard found 13 real wrong answers (12 UFBV wrong-SATs, one
+        // AUFLIA wrong-UNSAT) that this gate had ALREADY caught and reported as
+        // a bland `(:reason-unknown incomplete)` — indistinguishable from an
+        // unsupported logic, so nobody ever looked.
+        //
+        // Verdict-neutral by construction: this only records and prints. It
+        // cannot turn a correct answer into a wrong one, so making it loud
+        // carries no soundness risk — only noise, which is the right trade for
+        // a signal this important. `SELF-CHECK-REJECTED` is the greppable token
+        // harnesses count.
+        self.last_statistics.set_string(
+            "unknown.reason",
+            UnknownReason::SelfCheckRejected.to_string(),
+        );
+        // TIER: this is the UNCONFIRMED tier, and saying so is load-bearing.
+        //
+        // "computed then not certified" is NOT the same as "wrong". Measured on
+        // the 2026-07-25 corpus scoreboard: 480 files were decided by AY and
+        // returned `unknown` under `--self-check`, and 414 of those 480 AGREE
+        // with z3. An alarm that shouts "rejected" on every one of them is ~86%
+        // false positives, and an alarm nobody can trust is worse than none.
+        //
+        // The REFUTED tier — where a checker positively disproved the verdict,
+        // which is a near-certain internal bug — already has its own loud,
+        // detailed banner with the falsifying assignment
+        // (`report_caught_invalid_model`, independent_gate.rs). This line must
+        // not be confusable with it.
+        //
+        // Mode still matters within this tier: under `--self-check` the
+        // non-confirmation WITHHELD the verdict, while in default mode the
+        // completeness-favoring path may publish it anyway.
+        let tier = if self.self_check {
+            "UNCONFIRMED/withheld"
+        } else {
+            "UNCONFIRMED/published"
+        };
+        ay_core::safe_eprintln!(
+            "c !! MODEL-UNCONFIRMED [{tier}] (not a refutation — see \
+             [AY SOUNDNESS GATE] for caught invalid models) {detail}"
+        );
         self.last_statistics
             .set_string("unknown.phase", "model-validation");
         self.last_statistics

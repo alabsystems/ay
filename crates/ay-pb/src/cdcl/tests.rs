@@ -7522,3 +7522,102 @@ fn test_undecidable_lower_bound_opt_proof_defers_without_conclusion() {
         "no conclusion may be claimed for an underivable lower bound: {proof}"
     );
 }
+
+/// THE ABORT-SEMANTICS CONTRACT.
+///
+/// Core-guided search treats every `Unsatisfiable { core }` as a PROOF that the
+/// core cannot all hold, and adds its weight to the lower bound. If an
+/// interrupted solve could ever surface as `Unsatisfiable` instead of `Unknown`,
+/// every abort would be a free `+1` on the bound: `lower_bound` would run up to
+/// `best_value` in seconds and the engine would report a false OPTIMUM on
+/// essentially any instance. Conflict-capped probing is gated behind this
+/// property, so it is pinned here rather than assumed.
+///
+/// The test drives `solve_with_assumptions_interruptible` on random instances
+/// with a `should_stop` that fires after a varying number of polls — sweeping
+/// the abort across every phase of the solve — and asserts:
+///   1. an aborted call never returns `Unsatisfiable`, and
+///   2. whenever it DOES return `Unsatisfiable`, the core is genuinely
+///      unsatisfiable, re-checked by an independent uninterrupted solve.
+#[test]
+fn interrupted_assumption_solve_never_reports_a_bogus_core() {
+    // Small xorshift so the sweep is deterministic and reproducible.
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut rand = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+
+    let mut aborted_calls = 0usize;
+    let mut unsat_calls = 0usize;
+
+    for round in 0..60 {
+        let num_vars: u32 = 4 + (round % 6); // 4..9
+                                             // Random covering rows: sum of a few literals >= 1. Dense enough that
+                                             // all-false assumptions are usually UNSAT, so the abort sweep lands on
+                                             // real proofs rather than trivial SAT answers.
+        let mut constraints = Vec::new();
+        for _ in 0..(2 + (round % 4)) {
+            let mut terms = Vec::new();
+            for v in 1..=num_vars {
+                if rand() % 3 == 0 {
+                    terms.push(linear_term(1, lit(v)));
+                }
+            }
+            if terms.is_empty() {
+                terms.push(linear_term(1, lit(1)));
+            }
+            constraints.push(ge_constraint(terms, 1));
+        }
+        let instance = PbInstance {
+            num_vars,
+            num_constraints: constraints.len() as u32,
+            constraints,
+            objective: None,
+        };
+        // Assume every variable FALSE — the shape core-guided search uses.
+        let assumptions: Vec<PbLit> = (1..=num_vars).map(not).collect();
+
+        // Sweep the abort point across the whole solve, including "never".
+        for budget in 0..12usize {
+            let mut polls = 0usize;
+            let mut stop = || {
+                polls += 1;
+                budget != 11 && polls > budget
+            };
+            let mut solver = PbCdclSolver::new(&instance);
+            let result = solver.solve_with_assumptions_interruptible(&assumptions, &mut stop);
+
+            match result {
+                PbCdclAssumptionResult::Unsatisfiable { core } => {
+                    unsat_calls += 1;
+                    // PROPERTY 2: the claimed core must really be unsatisfiable.
+                    // Re-check with a fresh solver and NO interruption.
+                    let mut check = PbCdclSolver::new(&instance);
+                    let verdict = check.solve_with_assumptions(&core);
+                    assert!(
+                        matches!(verdict, PbCdclAssumptionResult::Unsatisfiable { .. }),
+                        "round {round} budget {budget}: reported core {core:?} is NOT \
+                         unsatisfiable on an independent re-solve — core-guided search \
+                         would add its weight to the bound and over-count"
+                    );
+                }
+                PbCdclAssumptionResult::Unknown => aborted_calls += 1,
+                PbCdclAssumptionResult::Satisfiable(_) | PbCdclAssumptionResult::Unsupported => {}
+            }
+        }
+    }
+
+    // The sweep is worthless if it never actually aborted or never proved
+    // anything; assert it exercised both directions.
+    assert!(
+        aborted_calls > 0,
+        "no call was ever interrupted — the abort sweep did not exercise the contract"
+    );
+    assert!(
+        unsat_calls > 0,
+        "no call ever returned a core — the instances were too easy to test the contract"
+    );
+}

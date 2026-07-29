@@ -436,6 +436,9 @@ fn reduce_selectors_rec(
 /// Intermediate results from the E-matching phase.
 pub(super) struct EmatchingSummary {
     pub instantiations: Vec<TermId>,
+    /// Exact source/binding records for proof-producing instances of
+    /// unconditionally asserted foralls.
+    pub unconditional_forall_instantiations: Vec<crate::ematching::ForallInstantiationProvenance>,
     pub has_uninstantiated: bool,
     pub uninstantiated_quantifiers: HashSet<TermId>,
     pub reached_limit: bool,
@@ -447,6 +450,33 @@ pub(super) struct EmatchingSummary {
     /// UNCONDITIONALLY-asserted Foralls — the SOUND conflict-verification
     /// support subset (see [`crate::ematching::collect_unconditional_foralls`]).
     pub unconditional_forall_roots: HashSet<TermId>,
+}
+
+fn classify_ematching_proof_sources(
+    provenance: &super::super::theories::solve_harness::ProofProblemAssertionProvenance,
+) -> (HashSet<TermId>, HashMap<TermId, TermId>) {
+    let direct: HashSet<TermId> = provenance
+        .original_problem_assertions
+        .iter()
+        .copied()
+        .collect();
+    let normalized = provenance
+        .assertion_sources
+        .iter()
+        .filter_map(|(&derived, source_sets)| {
+            // Require one unambiguous singleton source rooted in the immutable
+            // authored assertion set. Duplicate and multi-source mappings fail
+            // closed and cannot reach the proof tracker.
+            let [source_set] = source_sets.as_slice() else {
+                return None;
+            };
+            let [source] = source_set.as_slice() else {
+                return None;
+            };
+            (!direct.contains(&derived) && direct.contains(source)).then_some((derived, *source))
+        })
+        .collect();
+    (direct, normalized)
 }
 
 /// Intermediate results from CEGQI setup.
@@ -566,6 +596,48 @@ impl Executor {
                 assertion_sources,
             },
         );
+    }
+
+    /// Register strict proof derivations for exact E-matching instances whose
+    /// source is itself a direct authenticated problem assertion.
+    ///
+    /// `collect_unconditional_foralls` also recognizes foralls nested under a
+    /// top-level conjunction. Those instances are semantically sound, but this
+    /// narrow proof lane does not yet derive the conjunction projection, so it
+    /// refuses them here rather than introducing the nested forall as a free
+    /// Assume. The tracker independently recomputes every substitution.
+    pub(super) fn register_ematching_proof_provenance(
+        &mut self,
+        records: &[crate::ematching::ForallInstantiationProvenance],
+    ) {
+        if !self.produce_proofs_enabled() || records.is_empty() {
+            return;
+        }
+        let (direct_sources, normalized_sources) = self
+            .proof_problem_assertion_provenance
+            .as_ref()
+            .map(classify_ematching_proof_sources)
+            .unwrap_or_default();
+        for record in records {
+            if direct_sources.contains(&record.quantifier) {
+                let _ = self.proof_tracker.add_forall_instantiated_assertion(
+                    &mut self.ctx.terms,
+                    record.quantifier,
+                    &record.binding,
+                    record.instance,
+                );
+            } else if let Some(&source) = normalized_sources.get(&record.quantifier) {
+                let _ = self
+                    .proof_tracker
+                    .add_normalized_forall_instantiated_assertion(
+                        &mut self.ctx.terms,
+                        source,
+                        record.quantifier,
+                        &record.binding,
+                        record.instance,
+                    );
+            }
+        }
     }
 
     /// Expand finite-domain quantifiers (Bool, small BV) into ground conjunctions/disjunctions.
@@ -1565,6 +1637,8 @@ impl Executor {
         let mut seen_instantiations: HashSet<TermId> =
             assertions_for_round.iter().copied().collect();
         let mut all_instantiations = Vec::new();
+        let mut all_unconditional_forall_instantiations = Vec::new();
+        let mut seen_forall_instantiations = HashSet::default();
         let mut has_uninstantiated = false;
         let mut uninstantiated_quantifiers = HashSet::default();
         let mut reached_limit = false;
@@ -1592,6 +1666,7 @@ impl Executor {
             let round_reached_limit = ematching_result.reached_limit;
             let round_has_uninstantiated = ematching_result.has_uninstantiated;
             let round_uninstantiated_quantifiers = ematching_result.uninstantiated_quantifiers;
+            let round_forall_instantiations = ematching_result.unconditional_forall_instantiations;
             instances_created += ematching_result.instantiations.len() as u64;
             all_unconditional_forall_roots.extend(ematching_result.unconditional_forall_roots);
             let mut round_added = 0usize;
@@ -1601,6 +1676,20 @@ impl Executor {
                     assertions_for_round.push(inst);
                     all_instantiations.push(inst);
                     round_added += 1;
+                }
+            }
+            // Keep proof provenance independently of instance novelty. The same
+            // ground term can be seen first from a nested/non-direct quantifier
+            // and only later from an authenticated direct forall. Dropping the
+            // latter record would lose a valid certificate (not soundness), so
+            // deduplicate by the exact source/binding/instance triple instead.
+            for record in round_forall_instantiations {
+                if seen_forall_instantiations.insert((
+                    record.quantifier,
+                    record.binding.clone(),
+                    record.instance,
+                )) {
+                    all_unconditional_forall_instantiations.push(record);
                 }
             }
 
@@ -1651,6 +1740,7 @@ impl Executor {
 
         EmatchingSummary {
             instantiations: all_instantiations,
+            unconditional_forall_instantiations: all_unconditional_forall_instantiations,
             has_uninstantiated,
             uninstantiated_quantifiers,
             reached_limit,
@@ -1699,6 +1789,12 @@ impl Executor {
             .into_iter()
             .map(|i| reduce_selectors_rec(&mut self.ctx.terms, &ctor_sels, i, &mut memo))
             .collect();
+        ematching
+            .unconditional_forall_instantiations
+            .retain(|record| {
+                reduce_selectors_rec(&mut self.ctx.terms, &ctor_sels, record.instance, &mut memo)
+                    == record.instance
+            });
         let roots = std::mem::take(&mut ematching.unconditional_forall_roots);
         ematching.unconditional_forall_roots = roots
             .into_iter()
@@ -2115,6 +2211,9 @@ impl Executor {
         // `invalidate_index` cached-TermIndex path).
         let ematching_result =
             qm.run_ematching_round(&mut self.ctx.terms, &combined, euf_model_ref, &should_stop);
+        self.register_ematching_proof_provenance(
+            &ematching_result.unconditional_forall_instantiations,
+        );
 
         let existing: HashSet<TermId> = self.ctx.assertions.iter().copied().collect();
         let mut added_count = 0usize;
@@ -2140,6 +2239,8 @@ impl Executor {
             let inst_count = ematching_result.instantiations.len() as u64;
             let summary = EmatchingSummary {
                 instantiations: ematching_result.instantiations,
+                unconditional_forall_instantiations: ematching_result
+                    .unconditional_forall_instantiations,
                 has_uninstantiated: ematching_result.has_uninstantiated,
                 uninstantiated_quantifiers: ematching_result.uninstantiated_quantifiers,
                 reached_limit: ematching_result.reached_limit,
@@ -2452,8 +2553,244 @@ fn trigger_group_covers_names(terms: &TermStore, group: &[TermId], names: &[&str
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ay_core::{Sort, Symbol, TermData};
+    use ay_core::{ProofId, ProofStep, Sort, Symbol, TermData};
     use ay_frontend::parse;
+    use num_bigint::BigInt;
+
+    fn raw_nnf_forall_source(
+        terms: &mut TermStore,
+        prefix: &str,
+        predicate: &str,
+    ) -> (TermId, String) {
+        let binder_name = format!("{prefix}_x");
+        let x = terms.mk_var(&binder_name, Sort::Int);
+        let upper = terms.mk_var(&format!("{prefix}_upper"), Sort::Int);
+        let zero = terms.mk_int(BigInt::from(0));
+        let p_x = terms.mk_app(Symbol::named(predicate), [x], Sort::Bool);
+        let nonnegative = terms.mk_le(zero, x);
+        let below_upper = terms.mk_lt(x, upper);
+        let raw_not_nonnegative = terms.mk_not_raw(nonnegative);
+        let raw_not_below_upper = terms.mk_not_raw(below_upper);
+        let raw_body = terms.mk_app(
+            Symbol::named("or"),
+            [p_x, raw_not_nonnegative, raw_not_below_upper],
+            Sort::Bool,
+        );
+        (
+            terms.mk_forall(vec![(binder_name.clone(), Sort::Int)], raw_body),
+            binder_name,
+        )
+    }
+
+    fn instantiate_forall_body(
+        terms: &mut TermStore,
+        quantified: TermId,
+        binder_name: &str,
+        value: TermId,
+    ) -> TermId {
+        let TermData::Forall(_, body, _) = terms.get(quantified).clone() else {
+            panic!("expected forall");
+        };
+        let mut substitution = HashMap::default();
+        substitution.insert(binder_name.to_string(), value);
+        subst_vars(terms, body, &substitution)
+    }
+
+    #[test]
+    fn ambiguous_normalized_forall_source_mapping_fails_closed() {
+        let authored_a = TermId(1);
+        let authored_b = TermId(2);
+        let unique = TermId(3);
+        let duplicate = TermId(4);
+        let multi_source = TermId(5);
+        let unauthored = TermId(6);
+        let mut assertion_sources = HashMap::default();
+        assertion_sources.insert(unique, vec![vec![authored_a]]);
+        assertion_sources.insert(duplicate, vec![vec![authored_a], vec![authored_a]]);
+        assertion_sources.insert(multi_source, vec![vec![authored_a, authored_b]]);
+        assertion_sources.insert(unauthored, vec![vec![TermId(99)]]);
+        let provenance =
+            super::super::super::theories::solve_harness::ProofProblemAssertionProvenance {
+                original_problem_assertions: vec![authored_a, authored_b],
+                problem_assertions: vec![authored_a, authored_b],
+                assertion_sources,
+            };
+
+        let (direct, normalized) = classify_ematching_proof_sources(&provenance);
+        assert_eq!(direct.len(), 2);
+        assert_eq!(normalized.get(&unique), Some(&authored_a));
+        assert!(
+            !normalized.contains_key(&duplicate),
+            "duplicate source records must be treated as ambiguous"
+        );
+        assert!(
+            !normalized.contains_key(&multi_source),
+            "multi-source provenance must not authorize this narrow lane"
+        );
+        assert!(
+            !normalized.contains_key(&unauthored),
+            "a source outside the immutable authored roots must be rejected"
+        );
+    }
+
+    #[test]
+    fn exact_recursive_nnf_forall_provenance_registers_strict_instance() {
+        let mut exec = Executor::new();
+        exec.set_produce_proofs(true);
+        let (authored, binder_name) =
+            raw_nnf_forall_source(&mut exec.ctx.terms, "exact_nnf", "exact_nnf_p");
+        exec.ctx.assertions.push(authored);
+        exec.install_proof_source_provenance(&[authored]);
+
+        exec.fold_quantified_linear_eqs();
+        let [normalized] = exec.ctx.assertions.as_slice() else {
+            panic!("expected one normalized assertion");
+        };
+        let normalized = *normalized;
+        assert_ne!(normalized, authored);
+        let (_, exact_sources) = classify_ematching_proof_sources(
+            exec.proof_problem_assertion_provenance
+                .as_ref()
+                .expect("proof provenance"),
+        );
+        assert_eq!(
+            exact_sources.get(&normalized),
+            Some(&authored),
+            "recursive NNF must install its exact constructor-minted source edge"
+        );
+
+        let value = exec.ctx.terms.mk_var("exact_nnf_k", Sort::Int);
+        let instance =
+            instantiate_forall_body(&mut exec.ctx.terms, normalized, &binder_name, value);
+        exec.register_ematching_proof_provenance(&[
+            crate::ematching::ForallInstantiationProvenance {
+                quantifier: normalized,
+                binding: vec![value],
+                instance,
+            },
+        ]);
+
+        let mut proof = exec.proof_tracker.take_proof();
+        let derived = proof
+            .steps
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, step)| {
+                matches!(
+                    step,
+                    ProofStep::Resolution { clause, .. } if clause == &[instance]
+                )
+                .then(|| ProofId(u32::try_from(index).expect("proof index")))
+            })
+            .expect("exact recursive provenance must register the instance");
+        let not_instance = exec.ctx.terms.mk_not_raw(instance);
+        let negated = proof.add_assume(not_instance, None);
+        proof.add_resolution(Vec::new(), instance, derived, negated);
+        let quality = ay_proof::check_proof_strict_with_context(
+            &proof,
+            &exec.ctx.terms,
+            None,
+            None,
+            Some(&[authored, not_instance]),
+        )
+        .expect("recursive NNF instance proof must pass the strict checker");
+        assert!(quality.is_complete());
+        assert_eq!(quality.trust_count, 0);
+    }
+
+    #[test]
+    fn absent_exact_nnf_record_never_uses_duplicate_or_same_shape_roots() {
+        let mut exec = Executor::new();
+        exec.set_produce_proofs(true);
+        let (authored_a, binder_name) =
+            raw_nnf_forall_source(&mut exec.ctx.terms, "same_shape", "same_shape_a");
+        let (authored_b, _) =
+            raw_nnf_forall_source(&mut exec.ctx.terms, "same_shape", "same_shape_b");
+        exec.ctx.assertions.push(authored_a);
+        exec.fold_quantified_linear_eqs();
+        let [normalized] = exec.ctx.assertions.as_slice() else {
+            panic!("fixture must produce one normalized forall");
+        };
+        let normalized = *normalized;
+        assert_ne!(normalized, authored_a);
+
+        // Freeze the authored roots but deliberately do not install the minted
+        // transform record. Identical binder/trigger shapes and a duplicate
+        // authored occurrence must not act as an implicit source search.
+        exec.ctx.assertions = vec![authored_a, authored_b, authored_a];
+        exec.install_proof_source_provenance(&[authored_a, authored_b, authored_a]);
+        let value = exec.ctx.terms.mk_var("same_shape_k", Sort::Int);
+        let instance =
+            instantiate_forall_body(&mut exec.ctx.terms, normalized, &binder_name, value);
+        exec.register_ematching_proof_provenance(&[
+            crate::ematching::ForallInstantiationProvenance {
+                quantifier: normalized,
+                binding: vec![value],
+                instance,
+            },
+        ]);
+        assert_eq!(
+            exec.proof_tracker.num_steps(),
+            0,
+            "no exact record means no proof authority, regardless of source shape"
+        );
+    }
+
+    #[test]
+    fn recursive_nnf_record_from_nested_nonroot_forall_is_filtered() {
+        let mut exec = Executor::new();
+        exec.set_produce_proofs(true);
+        let (nested, binder_name) =
+            raw_nnf_forall_source(&mut exec.ctx.terms, "nested_nnf", "nested_nnf_p");
+        let guard = exec.ctx.terms.mk_var("nested_nnf_guard", Sort::Bool);
+        let root = exec
+            .ctx
+            .terms
+            .mk_app(Symbol::named("and"), [guard, nested], Sort::Bool);
+        exec.ctx.assertions.push(root);
+        exec.install_proof_source_provenance(&[root]);
+
+        exec.fold_quantified_linear_eqs();
+        let [rewritten_root] = exec.ctx.assertions.as_slice() else {
+            panic!("expected one rewritten root");
+        };
+        let TermData::App(symbol, arguments) = exec.ctx.terms.get(*rewritten_root) else {
+            panic!("rewritten root must remain a conjunction");
+        };
+        assert_eq!(symbol.name(), "and");
+        let normalized = arguments
+            .iter()
+            .copied()
+            .find(|&term| matches!(exec.ctx.terms.get(term), TermData::Forall(..)))
+            .expect("nested forall must remain present");
+        assert_ne!(normalized, nested);
+        let (_, exact_sources) = classify_ematching_proof_sources(
+            exec.proof_problem_assertion_provenance
+                .as_ref()
+                .expect("proof provenance"),
+        );
+        assert!(
+            !exact_sources.contains_key(&normalized),
+            "a constructor-minted record cannot authorize a non-root source"
+        );
+
+        let value = exec.ctx.terms.mk_var("nested_nnf_k", Sort::Int);
+        let instance =
+            instantiate_forall_body(&mut exec.ctx.terms, normalized, &binder_name, value);
+        exec.register_ematching_proof_provenance(&[
+            crate::ematching::ForallInstantiationProvenance {
+                quantifier: normalized,
+                binding: vec![value],
+                instance,
+            },
+        ]);
+        assert_eq!(
+            exec.proof_tracker.num_steps(),
+            0,
+            "nested/non-root source must not reach proof registration"
+        );
+    }
 
     /// Proof authority is frozen before the binder-tower merge. The merged
     /// assertion is a semantics-preserving solver input, but it is not authored

@@ -469,6 +469,13 @@ pub mod engines {
 
     fn solve_pdr_proof_unchecked(problem: ChcProblem, mut config: PdrConfig) -> ChcPdrProofRun {
         config.strict_proofs = true;
+        // Proof-grade solving must construct an invariant for the exact
+        // caller-supplied clauses. The ordinary solve-time nullary-fail
+        // expansion is equisatisfiable, but it erases predicates such as
+        // `error` from the model surface and has no model backtranslation.
+        // Keeping the original clauses here also makes the solving,
+        // validation, and checked-replay boundaries agree.
+        config.preserve_original_clauses = true;
 
         // Exact acyclic BMC certificate prepass.
         //
@@ -500,7 +507,11 @@ pub mod engines {
             cancellation_token: base.cancellation_token.clone(),
             solve_timeout: Some(PDR_PROOF_VALIDATION_TIMEOUT),
             disable_array_scalarization: true,
-            preserve_original_clauses: base.preserve_original_clauses,
+            // Proof validation is a consumer of the candidate model for the
+            // exact caller-supplied problem. Re-running solve-time nullary-fail
+            // expansion here can erase `fail => false` and validate a model
+            // that interprets the erased nullary query predicate as `true`.
+            preserve_original_clauses: true,
             ..PdrConfig::default()
         }
     }
@@ -512,7 +523,10 @@ pub mod engines {
             cancellation_token: base.cancellation_token.clone(),
             solve_timeout: base.solve_timeout.or(Some(PDR_PROOF_VALIDATION_TIMEOUT)),
             disable_array_scalarization: true,
-            preserve_original_clauses: base.preserve_original_clauses,
+            // External models are bound to the original predicate signatures
+            // and clauses. In particular, do not erase nullary fail/query
+            // predicates before checking their interpretations.
+            preserve_original_clauses: true,
             ..PdrConfig::default()
         }
     }

@@ -91,6 +91,82 @@ fn test_escape_string_contents() {
     );
 }
 
+/// `escape_string_contents` must be an exact left inverse of
+/// `unescape_string_contents`: `get-value` prints a TERM, and per SMT-LIB 2.6
+/// §3.9.2 that term must denote the model value. Printing a literal that
+/// re-reads as a different String element is a wrong-value defect even when no
+/// sat/unsat verdict moves, because every consumer of the model is misled.
+///
+/// This pins the SEMANTICS (decode(encode(v)) == v) rather than any particular
+/// spelling, over a corpus that covers each branch of the printer.
+#[test]
+fn escape_string_contents_round_trips_exactly() {
+    let corpus = [
+        "",
+        "hello",
+        r"path\to\file",
+        r#"both \"#,
+        r#"say "hi""#,
+        // The A8 witness: six code points `\ u { 6 1 }`. Printing them verbatim
+        // yields `\u{61}`, which re-reads as the SINGLE character `a`.
+        r"\u{61}",
+        r"\u{5c}",
+        r"\u{5c}u{61}",
+        "a\\u0041b",
+        r"\u{2ffff}",
+        // Not escapes, so the backslash stays literal on the way out too.
+        r"\u{}",
+        r"\u{ZZZZ}",
+        r"\u{41",
+        r"\uZZZZ",
+        r"\u",
+        r"\n",
+        r"\\u{41}",
+        "\u{0}\t\u{3b1}\u{4e2d}\u{1f600}\u{2ffff}",
+        // Above the theory alphabet: `\u{30000}` is not an escape at all, so the
+        // code point must be written raw or the round-trip loses it.
+        "\u{30000}",
+        "x\u{10ffff}y",
+        "\u{30000}\\u{41}",
+    ];
+    for original in corpus {
+        let printed = escape_string_contents(original);
+        let decoded = unescape_string_contents(&printed).unwrap_or_else(|e| {
+            panic!("{original:?} printed as {printed:?} failed to decode: {e}")
+        });
+        assert_eq!(
+            decoded, original,
+            "round-trip lost {original:?} (printed as {printed:?})"
+        );
+        // The character count is what str.len reports; pin it independently so a
+        // future regression cannot pass by coincidence of byte equality.
+        assert_eq!(decoded.chars().count(), original.chars().count());
+    }
+}
+
+/// The specific spellings the round-trip relies on, so the intent is readable.
+#[test]
+fn escape_string_contents_escapes_a_reabsorbable_backslash() {
+    // A backslash that WOULD start a well-formed, in-alphabet escape is written
+    // as `\u{5c}` (z3 does the same); one that would not stays literal.
+    assert_eq!(escape_string_contents(r"\u{61}"), r"\u{5c}u{61}");
+    assert_eq!(escape_string_contents("\\u0041"), "\\u{5c}u0041");
+    assert_eq!(escape_string_contents(r"path\to\file"), r"path\to\file");
+    assert_eq!(escape_string_contents(r"\u{}"), r"\u{}");
+    assert_eq!(escape_string_contents(r"\u{FFFFF}"), r"\u{FFFFF}");
+}
+
+/// Code points above `SMTLIB_MAX_CODE_POINT` have no `\u` spelling at all — a
+/// `\u{30000}` form is nine literal characters to a conformant reader — so they
+/// are emitted raw, which does round-trip.
+#[test]
+fn escape_string_contents_does_not_fake_an_out_of_alphabet_escape() {
+    assert_eq!(escape_string_contents("\u{30000}"), "\u{30000}");
+    assert!(!escape_string_contents("\u{30000}").contains(r"\u"));
+    // The last in-alphabet code point still escapes.
+    assert_eq!(escape_string_contents("\u{2ffff}"), r"\u{2ffff}");
+}
+
 #[test]
 fn test_string_literal() {
     assert_eq!(string_literal("hello"), "\"hello\"");

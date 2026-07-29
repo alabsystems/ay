@@ -210,7 +210,46 @@ impl Executor {
     /// Returns `result` unchanged (the verdict is never altered); on progress
     /// `last_assumption_core` is pinned to the final solve-verified subset,
     /// on zero progress the core bookkeeping is restored byte-identically.
+    /// Shrink a certified UNSAT assumption core by deletion-based subset
+    /// re-solving.
+    ///
+    /// #uc-minimize-verdict-restore: this is a thin wrapper that SAVES and
+    /// RESTORES `last_result` around the pass. The inner pass probes subsets via
+    /// `check_sat_assuming`, and that sets `self.last_result` on every call — so
+    /// the LAST probe (typically `Sat`/`Unknown`, which is exactly how the pass
+    /// learns an assertion is load-bearing) would otherwise be left as the
+    /// solver's verdict. `try_get_unsat_core()` reads `last_result` and then
+    /// fails with `SolverError::NotUnsat` even though the query really is UNSAT.
+    ///
+    /// The verdict is decided BEFORE this pass runs (the inner function returns
+    /// immediately unless it was handed `Unsat`), so the pass has no business
+    /// changing it — it only shrinks the core. Restoring is therefore a
+    /// correction, not a mask.
+    ///
+    /// Latent in the EUF/ArrayEuf path too, not only under
+    /// `AY_UC_MINIMIZE_GENERAL`: those divisions read cores from harness stdout
+    /// rather than the API, so nothing exercised the combination until
+    /// `test_unsat_core_includes_assumption_literals_after_check_sat_assuming`
+    /// hit it.
     pub(crate) fn minimize_assumption_core(
+        &mut self,
+        combined: &[TermId],
+        result: Result<SolveResult>,
+        rescue_elapsed: Option<Duration>,
+    ) -> Result<SolveResult> {
+        let saved_result = self.last_result.clone();
+        let saved_unknown_reason = self.last_unknown_reason;
+        let out = self.minimize_assumption_core_inner(combined, result, rescue_elapsed);
+        // Only restore when the pass was entered on an UNSAT verdict (the inner
+        // function is a no-op otherwise, so nothing was clobbered).
+        if matches!(saved_result, Some(SolveResult::Unsat(_))) {
+            self.last_result = saved_result;
+            self.last_unknown_reason = saved_unknown_reason;
+        }
+        out
+    }
+
+    fn minimize_assumption_core_inner(
         &mut self,
         combined: &[TermId],
         result: Result<SolveResult>,
@@ -255,7 +294,56 @@ impl Executor {
             }
             _ => false,
         };
-        if !euf_like {
+        // #uc-minimize-general: the category gate above is historical — it was
+        // scoped to EUF/ArrayEuf because those were the divisions being worked,
+        // not because the pass is theory-specific. Deletion-based minimization
+        // is logic-AGNOSTIC: it re-solves subsets and adopts one ONLY when the
+        // subset itself re-proves UNSAT (`certify`/fail-closed below). A theory
+        // the solver cannot decide simply yields Unknown on the subset solve and
+        // the candidate is kept — the worst case is wasted time, never a wrong
+        // core.
+        //
+        // Measured 2026-07-27 on UnsatCore/FPArith (BVFPLRA, quantified FP):
+        // AY answered 8/15 unsat with 8/8 cores VALID and 0 invalidated, but
+        // scored reduction 0 — every core was the full assumption set, because
+        // this gate returned before the minimizer ever ran. Hand-checking one of
+        // them (`bary_diverge_..._1264`, 3 asserts) showed asserts #1 and #2 are
+        // BOTH removable and assert #3 ALONE re-proves unsat: a reduction of 2
+        // that AY is fully capable of verifying, left on the table by a gate.
+        //
+        // So: allow any category through when the core is small enough that the
+        // deletion scan is affordable. The cap is the guard — the risk here is
+        // SPENT TIME (attempts eat the solve budget and could cost an answer),
+        // not soundness.
+        //
+        // EXCLUSION: the datatype arms are deliberately left alone. They carry
+        // their own `reverify_minimized_dt_assumption_core` pass and they WON
+        // UnsatCore/QF_Datatypes (4,550,583 = 3.54x cvc5). Routing them through
+        // a second, general minimizer risks disturbing a banked division for no
+        // measured gain — the original gate excluded them on purpose and this
+        // generalization must preserve that.
+        const GENERAL_MINIMIZE_CAP: usize = 32;
+        let dt_owned = matches!(
+            category,
+            LogicCategory::QfDt
+                | LogicCategory::DtAuflia
+                | LogicCategory::DtAuflra
+                | LogicCategory::DtUfbv
+                | LogicCategory::DtAufbv
+                | LogicCategory::DtAuflira
+                | LogicCategory::DtAx
+        );
+        // DEFAULT ON. This was briefly default-off because enabling it regressed
+        // `test_unsat_core_includes_assumption_literals_after_check_sat_assuming`
+        // with `core must be available: NotUnsat`. That defect is fixed at its
+        // source — see `minimize_assumption_core`'s verdict save/restore — and it
+        // was latent in the EUF path too, so the kill switch is now an escape
+        // hatch (`AY_NO_UC_MINIMIZE_GENERAL=1`) rather than an opt-in.
+        let general_ok = !euf_like
+            && !dt_owned
+            && std::env::var_os("AY_NO_UC_MINIMIZE_GENERAL").is_none()
+            && combined.len() <= GENERAL_MINIMIZE_CAP;
+        if !euf_like && !general_ok {
             return result;
         }
         // Array containment rule (see ARRAY_SCOPED_RESCUE_CAP): scoped subset

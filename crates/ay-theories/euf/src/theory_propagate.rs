@@ -30,6 +30,12 @@ pub(crate) const CONG_NEG_SIZE_GATE: usize = 16_384;
 /// lookahead productively (QG-classification / NEQ QF_UF, where it fires
 /// frequently) never accumulates a barren streak this long and is unaffected.
 pub(crate) const CONG_NEG_BARREN_CAP: u32 = 200_000;
+/// #cong-neg-cold: barren cap for a solve in which the lookahead has NEVER
+/// fired. Far tighter than `CONG_NEG_BARREN_CAP` because a never-fired solve has
+/// shown no evidence the lookahead pays, and the counter is reset (and this cap
+/// abandoned for the generous one) the instant it does fire. Sized to absorb a
+/// short warm-up without letting a barren workload pay the full 2x.
+pub(crate) const CONG_NEG_COLD_CAP: u32 = 1_000;
 /// #cong-neg-backoff: while suspended, run 1 full lookahead in this many as a
 /// re-probe. If a probe fires, the lookahead un-suspends (a firing PHASE that
 /// begins after a barren warmup recovers). The overhead while suspended is
@@ -293,6 +299,37 @@ impl EufSolver<'_> {
     /// conflict/soundness authority — but the full-scan-per-BCP-call this
     /// replaces was the #1 profile leaf on QF_UFLIA model search (hash_sat:
     /// ~220 decisions/s with EufSolver::propagate dominating).
+    /// #cong-neg-scan-gate: is the cascade lookahead worth calling AT ALL for this
+    /// scan?
+    ///
+    /// `cong_diseq_lookahead_memo` already returns `None` immediately while the
+    /// backoff has it suspended — but not before two `enode_find_const` calls, a
+    /// memo hash lookup and (on a miss) a `None` insert. On QF_UF/NEQ that
+    /// per-pair bookkeeping is paid millions of times for a lookahead that fires
+    /// ZERO times (`euf_cong_neg_propagations = 0`), and once the conflict-verifier
+    /// fix removed its competitor it became the largest frame in the profile at
+    /// 37% self time.
+    ///
+    /// Skipping at the CALL SITE removes that cost entirely. The re-probe counter
+    /// advances ONCE PER SCAN rather than once per pair — the crucial difference
+    /// from an earlier attempt that hoisted this test inside the memo, which
+    /// advanced per pair, re-probed far more often, and cost 2 division answers.
+    /// Per-scan advancement keeps periodic re-probing (a workload that starts
+    /// firing later still recovers) while making the barren case free.
+    fn cong_neg_scan_suspended(&mut self) -> bool {
+        let adaptive = self.cong_neg_adaptive
+            && (self.func_apps.len() >= CONG_NEG_SIZE_GATE || !self.cong_neg_ever_fired);
+        if !adaptive || !self.cong_neg_suspended {
+            return false;
+        }
+        self.cong_neg_probe_skip = self.cong_neg_probe_skip.saturating_add(1);
+        if self.cong_neg_probe_skip < CONG_NEG_REPROBE {
+            return true;
+        }
+        self.cong_neg_probe_skip = 0; // let this scan re-probe
+        false
+    }
+
     pub(crate) fn propagate_disequalities(&mut self, propagations: &mut Vec<TheoryPropagation>) {
         if !self.inc_neg_enabled || self.neg_full_scan_needed {
             self.propagate_disequalities_full_scan();
@@ -334,7 +371,10 @@ impl EufSolver<'_> {
         // once per `CONG_NEG_REPROBE` skips so a later firing phase recovers.
         // Guidance-only: `check()` remains the conflict/soundness authority, so
         // skipping can never change the sat/unsat answer — only search guidance.
-        let adaptive = self.cong_neg_adaptive && self.func_apps.len() >= CONG_NEG_SIZE_GATE;
+        // #cong-neg-cold: adaptive backoff applies to big problems (the original
+        // size gate) OR to any solve where the lookahead has not yet fired.
+        let adaptive = self.cong_neg_adaptive
+            && (self.func_apps.len() >= CONG_NEG_SIZE_GATE || !self.cong_neg_ever_fired);
         if adaptive && self.cong_neg_suspended {
             self.cong_neg_probe_skip += 1;
             if self.cong_neg_probe_skip < CONG_NEG_REPROBE {
@@ -345,13 +385,23 @@ impl EufSolver<'_> {
         }
 
         let res = self.cong_diseq_lookahead(lhs, rhs);
+        // Recorded unconditionally: firing history must be accurate even on the
+        // runs where the backoff itself is inactive.
+        if res.is_some() {
+            self.cong_neg_ever_fired = true;
+        }
         if adaptive {
             if res.is_some() {
                 self.cong_neg_barren = 0;
                 self.cong_neg_suspended = false;
             } else {
                 self.cong_neg_barren = self.cong_neg_barren.saturating_add(1);
-                if self.cong_neg_barren >= CONG_NEG_BARREN_CAP {
+                let cap = if self.cong_neg_ever_fired {
+                    CONG_NEG_BARREN_CAP
+                } else {
+                    CONG_NEG_COLD_CAP
+                };
+                if self.cong_neg_barren >= cap {
                     self.cong_neg_suspended = true;
                     self.cong_neg_barren = 0;
                     self.cong_neg_probe_skip = 0;
@@ -1175,6 +1225,7 @@ impl EufSolver<'_> {
     /// FULL negative scan: rebuild `diseq_pair_index`/`diseq_keys_by_rep` from
     /// all current assignments and check every equality term against it.
     fn propagate_disequalities_full_scan(&mut self) {
+        let _cong_neg_skip_scan = self.cong_neg_scan_suspended();
         let n_eqs = self.eq_terms.len();
 
         if self.neg_index_prebuilt {
@@ -1309,9 +1360,10 @@ impl EufSolver<'_> {
             if let Some(&(diseq_a, diseq_b, diseq_term)) = self.diseq_pair_index.get(&key) {
                 self.scratch_neg_props
                     .push((term_id, lhs, rhs, diseq_a, diseq_b, diseq_term));
-            } else if la_sweep
-                || (self.cong_neg_enabled
-                    && (la_dirty.contains(&lhs_rep) || la_dirty.contains(&rhs_rep)))
+            } else if !_cong_neg_skip_scan
+                && (la_sweep
+                    || (self.cong_neg_enabled
+                        && (la_dirty.contains(&lhs_rep) || la_dirty.contains(&rhs_rep))))
             {
                 // #cong-neg-prop: cascade congruence lookahead on direct miss.
                 if let Some(cascade) = self.cong_diseq_lookahead_memo(lhs, rhs) {
@@ -1457,6 +1509,7 @@ impl EufSolver<'_> {
     /// INCREMENTAL negative scan: process only new disequalities and equalities
     /// touching merge-dirtied class reps. See `propagate_disequalities`.
     fn propagate_disequalities_incremental(&mut self) {
+        let _cong_neg_skip_scan2 = self.cong_neg_scan_suspended();
         self.scratch_neg_props.clear();
         self.scratch_cong_neg_props.clear();
         self.scratch_cong_neg_memo.clear();
@@ -1527,7 +1580,7 @@ impl EufSolver<'_> {
                 if let Some(&(diseq_a, diseq_b, diseq_term)) = self.diseq_pair_index.get(&key) {
                     self.scratch_neg_props
                         .push((term_id, lhs, rhs, diseq_a, diseq_b, diseq_term));
-                } else if self.cong_neg_enabled {
+                } else if self.cong_neg_enabled && !_cong_neg_skip_scan2 {
                     // #cong-neg-prop: cascade congruence lookahead on direct
                     // miss. Trigger coverage: `incremental_merge` dirties the
                     // arg classes of every reinserted parent, and

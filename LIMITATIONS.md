@@ -53,6 +53,15 @@ reproducible results and independently checked evidence.
 
 ## Known limitations (0.1.0)
 
+- **`(mod (to_int r) k)` over a Real variable with a negative floor returns
+  `unknown`.** In QF_LIRA, an Int-side `mod`/`div` whose dividend is `(to_int r)`
+  for a Real variable `r` that floors to a negative integer is not decided: the
+  LIA/LRA fixpoint converges but the combination does not close the branch, so
+  AY answers `unknown` rather than `sat`. (Positive floors are decided, as are
+  the same shapes with `div` instead of `mod`, and constant-folded arguments.)
+  This is an incompleteness, not a wrong answer — AY previously answered `unsat`
+  here, which is fixed and covered by
+  `crates/ay-dpll/tests/group_regression/false_unsat_to_int_mod_hnf.rs`.
 - **Build time and running tests.** The workspace includes one very large crate
   (`ay-dpll`, ~430,000 lines), so a from-scratch build of the whole workspace is
   slow and is the dominant compile cost. To *use* AY, prefer the release binary

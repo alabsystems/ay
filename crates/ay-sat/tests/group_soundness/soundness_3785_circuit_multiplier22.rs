@@ -5,8 +5,6 @@
 #![allow(clippy::panic)]
 
 use ay_sat::{parse_dimacs, SatResult};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Regression test for #3785.
@@ -25,22 +23,13 @@ fn circuit_multiplier22_known_sat_regression() {
 
     let mut solver = formula.into_solver();
 
-    // Use interrupt-based 30s timeout instead of unbounded solve.
-    let flag = Arc::new(AtomicBool::new(false));
-    let flag_clone = flag.clone();
-    solver.set_interrupt(flag.clone());
-    let handle = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(30));
-        flag_clone.store(true, Ordering::Relaxed);
-    });
+    let timer = super::common::SolverInterruptTimer::start(&mut solver, Duration::from_secs(30));
 
     let result = solver
-        .solve_interruptible(|| flag.load(Ordering::Relaxed))
+        .solve_interruptible(|| timer.is_interrupted())
         .into_inner();
 
-    // Stop timer thread if solver finished early.
-    flag.store(true, Ordering::Relaxed);
-    let _ = handle.join();
+    timer.cancel_and_join();
 
     match result {
         SatResult::Sat(model) => {

@@ -326,6 +326,9 @@ impl PbPortfolioPhaseTimings {
 pub struct PbPortfolioOutcome {
     pub solution: PbSolution,
     pub timings: PbPortfolioPhaseTimings,
+    /// Best REPORTED dual bound observed on the bus, if any. Telemetry only —
+    /// see `SharedBounds::publish_reported_dual`; it never licenses a verdict.
+    pub reported_dual: Option<i128>,
 }
 
 /// Strategy selected by the portfolio heuristic.
@@ -671,7 +674,11 @@ fn portfolio_outcome(
     portfolio_start: Instant,
 ) -> PbPortfolioOutcome {
     timings.total_ms = duration_ms(portfolio_start.elapsed());
-    PbPortfolioOutcome { solution, timings }
+    PbPortfolioOutcome {
+        solution,
+        timings,
+        reported_dual: None,
+    }
 }
 
 /// Solves a decision PB instance using the portfolio strategy.
@@ -4632,9 +4639,9 @@ fn run_parallel_optimization_traced(
     on_improve: &mut dyn FnMut(i128, &[bool]),
     worker_count: usize,
     route: OptimizationPortfolioRoute,
-) -> (PbSolution, Vec<&'static str>) {
+) -> (PbSolution, Vec<&'static str>, Option<i128>) {
     if !objective_range_fits_i64(objective) {
-        return (unsupported_solution(), Vec::new());
+        return (unsupported_solution(), Vec::new(), None);
     }
 
     let profile = InstanceProfile::from_instance(instance);
@@ -4668,6 +4675,7 @@ fn run_parallel_optimization_traced(
                 on_improve,
             ),
             Vec::new(),
+            None,
         );
     }
 
@@ -4749,7 +4757,10 @@ fn run_parallel_optimization_traced(
     );
     controls.stop_all();
     let spawned_labels = controls.labels();
-    (outcome, spawned_labels)
+    // Carry the TELEMETRY dual out alongside the solution. Read after
+    // `stop_all` so it reflects everything the workers proved. Reporting only:
+    // it comes from the bus slot no soundness decision consults.
+    (outcome, spawned_labels, shared_bounds.reported_dual())
 }
 
 /// Everything one optimization worker spawn needs besides the spec itself:

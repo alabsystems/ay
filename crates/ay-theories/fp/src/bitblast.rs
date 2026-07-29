@@ -370,10 +370,62 @@ impl FpSolver<'_> {
     }
 
     /// Bit-blast `fp.to_ieee_bv`.
+    ///
+    /// # NaN is unspecified but still FUNCTIONAL
+    ///
+    /// A `(_ FloatingPoint eb sb)` sort has exactly ONE NaN element (SMT-LIB
+    /// 2.6 FloatingPoint theory: all NaN bit-patterns denote the same value,
+    /// which is why `(= (fp.neg NaN) NaN)` holds), but IEEE 754 has many NaN
+    /// bit-patterns for it. `fp.to_ieee_bv` therefore leaves the returned
+    /// pattern unspecified on NaN — *unspecified*, not non-functional: SMT-LIB
+    /// 2.6 §5.2 makes every function symbol denote a total function and `=`
+    /// denote identity, so equal arguments MUST give equal results.
+    ///
+    /// The internal decomposition cannot serve that role directly: `fp.neg`
+    /// flips the raw sign bit even on NaN (IEEE 754-2008 §5.5.1), so the raw
+    /// bits of `NaN` and `(fp.neg NaN)` differ although the two terms denote
+    /// the same element. Returning the raw bits let AY refute the satisfiable
+    /// `(= (fp.to_ieee_bv NaN) (fp.to_ieee_bv (fp.neg NaN)))` and report two
+    /// different values for one function at one argument.
+    ///
+    /// Fix: on NaN return one fixed-but-unspecified NaN *encoding* per format,
+    /// shared by every `fp.to_ieee_bv` site — free enough that no admissible
+    /// pattern is refuted, single-valued enough to stay a function.
     pub fn bitblast_to_ieee_bv(&mut self, fp_term: TermId) -> Vec<CnfLit> {
         let fp = self.get_fp(fp_term);
         let exp_and_sig = Self::bv_concat(&fp.significand, &fp.exponent);
-        Self::bv_concat(&exp_and_sig, &[fp.sign])
+        let raw = Self::bv_concat(&exp_and_sig, &[fp.sign]);
+        let is_nan = self.is_nan(&fp);
+        let nan_encoding = self.ieee_nan_encoding(fp.exponent.len(), fp.significand.len());
+        self.make_ite_bits(is_nan, &nan_encoding, &raw)
+    }
+
+    /// The single fixed-but-unspecified IEEE NaN encoding of a format.
+    ///
+    /// Free in the sign bit and in the payload, but pinned to an actual NaN
+    /// pattern (exponent all ones, stored significand non-zero) — a non-NaN
+    /// result would contradict the operation's own definition (reinterpreting
+    /// it back with `to_fp` must recover NaN). Cached per format so that all
+    /// NaN arguments — necessarily equal, there being one NaN per sort — map
+    /// to the same bitvector.
+    fn ieee_nan_encoding(&mut self, exp_bits: usize, sig_bits: usize) -> Vec<CnfLit> {
+        if let Some(bits) = self.ieee_nan_encodings.get(&(exp_bits, sig_bits)) {
+            return bits.clone();
+        }
+        let significand: Vec<CnfLit> = (0..sig_bits).map(|_| self.fresh_var()).collect();
+        // Payload non-zero: an all-zero significand with a max exponent is an
+        // infinity encoding, not a NaN encoding.
+        if !significand.is_empty() {
+            self.add_clause(ay_core::CnfClause::new(significand.clone()));
+        }
+        let one = self.const_true();
+        let exponent = vec![one; exp_bits];
+        let sign = self.fresh_var();
+        let exp_and_sig = Self::bv_concat(&significand, &exponent);
+        let bits = Self::bv_concat(&exp_and_sig, &[sign]);
+        self.ieee_nan_encodings
+            .insert((exp_bits, sig_bits), bits.clone());
+        bits
     }
 
     fn bitblast_bv_app_value(
@@ -693,6 +745,27 @@ impl FpSolver<'_> {
         let a_bits = self.bitblast_bv_term(a, bv_sz);
         let b_bits = self.bitblast_bv_term(b, bv_sz);
         self.make_bits_equal(&a_bits, &b_bits)
+    }
+
+    /// Bit-blast a BV equality `(= a b)` without ever failing open.
+    ///
+    /// Unlike [`Self::bitblast_bv_eq`], composite operands are encoded through
+    /// the supported-op path and an unsupported operand yields `None` instead
+    /// of fresh unconstrained leaf bits. Callers that need a *sound* premise
+    /// (congruence, for instance) must use this and treat `None` as "cannot
+    /// encode" rather than as a free literal.
+    pub fn try_bitblast_bv_eq(&mut self, a: TermId, b: TermId) -> Option<CnfLit> {
+        let a_sort = self.terms.sort(a).clone();
+        if a_sort != *self.terms.sort(b) {
+            return None;
+        }
+        let Sort::BitVec(bv_sort) = a_sort else {
+            return None;
+        };
+        let bv_sz = bv_sort.width as usize;
+        let a_bits = self.bitblast_bv_value(a, bv_sz)?;
+        let b_bits = self.bitblast_bv_value(b, bv_sz)?;
+        Some(self.make_bits_equal(&a_bits, &b_bits))
     }
 
     /// Bit-blast a BV predicate in the FP solver's variable space.

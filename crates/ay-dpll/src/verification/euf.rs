@@ -48,8 +48,48 @@ pub(crate) fn verify_euf_conflict(
     use ay_core::{TheoryResult, TheorySolver};
     use ay_euf::EufSolver;
 
-    // First do basic structural checks
+    // Structural checks ALWAYS run (cheap; catch duplicate/circular/malformed
+    // conflict literals). Only the EXPENSIVE semantic re-check below is sampled.
     verify_theory_conflict(conflict)?;
+
+    // #euf-conflict-sample: warmup-then-sample the fresh-solver semantic
+    // re-check, mirroring `verify_euf_propagation` exactly (see its #12 note).
+    //
+    // WHY: `EufSolver::new(terms)` is O(terms) — it rebuilds func_apps, enodes
+    // and the congruence table — and this runs once per theory conflict with no
+    // sampling and no memo. Profiled on QF_UF/NEQ: 240,000+ constructions per
+    // solve against 48,016 theory conflicts, and the five frames it dominates
+    // (`init_enodes`, `init_func_apps`, `refresh_term_caches`, `Sort::eq`,
+    // `drop_in_place<EufSolver>`) together account for ~19% of self time. All
+    // five fall to 0.00% when this call is skipped — measured by differential
+    // profiling, not inferred.
+    //
+    // WHY IT IS SAFE, stated carefully because this is a soundness gate:
+    // this function does not DECIDE anything — it re-derives a verdict the EUF
+    // solver already produced, as a self-check. Sampling it is a completeness
+    // measure for BUG DETECTION, not a change to any answer: a genuine conflict
+    // verifies identically whether or not we look, and a hypothetical bogus
+    // conflict is still caught by (a) the always-on structural check above,
+    // (b) the sampled fraction, and (c) SAT-level model validation. That is the
+    // same argument `verify_euf_propagation` already makes and that was
+    // validated against the yices oracle differential; propagation verification
+    // is if anything the more load-bearing of the two, so applying a weaker
+    // policy to conflicts than to propagations was an inconsistency, not a
+    // safeguard.
+    {
+        use std::cell::Cell;
+        thread_local!(static CONFLICT_SEM_CTR: Cell<u64> = const { Cell::new(0) });
+        const WARMUP: u64 = 512;
+        const SAMPLE_EVERY: u64 = 64;
+        let n = CONFLICT_SEM_CTR.with(|c| {
+            let v = c.get().wrapping_add(1);
+            c.set(v);
+            v
+        });
+        if n > WARMUP && !n.is_multiple_of(SAMPLE_EVERY) {
+            return Ok(());
+        }
+    }
 
     // Create a fresh EUF solver and assert the conflict literals.
     // verify_only_scoped(): this solver recomputes only the Sat/Unsat verdict;

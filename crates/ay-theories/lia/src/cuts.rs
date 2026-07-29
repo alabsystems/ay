@@ -122,16 +122,35 @@ impl LiaSolver<'_> {
                     continue;
                 }
 
-                // Track this equality atom as a reason for all HNF cuts (#5388).
-                equality_reasons.push((literal, true));
-
-                // Equality constraint - always tight
-                let (var_coeffs, constant) =
-                    self.parse_equality_for_hnf(args[0], args[1], &term_to_idx);
+                // Equality constraint - always tight.
+                //
+                // SOUNDNESS (#hnf-unfaithful-row): the parse must be EXACT. A
+                // subterm the linear collector cannot place in a column used to
+                // be dropped silently, so `(= (to_int r) (+ (* 3 q) rr))` was
+                // recorded as the row `-3q - rr = 0` — an equality the solver
+                // never asserted. HNF then "correctly" found that row
+                // unsatisfiable over the integers together with `rr = 1` and
+                // emitted the cut `q >= 0`, which was installed as an LRA bound
+                // justified by the two real equality atoms, refuting the
+                // satisfiable `(= r (- 1.5)) /\ (= (mod (to_int r) 3) 1)`.
+                // A non-exact parse now drops the whole equality instead.
+                let Some((var_coeffs, constant)) =
+                    self.parse_equality_for_hnf(args[0], args[1], &term_to_idx)
+                else {
+                    if debug {
+                        safe_eprintln!(
+                            "[HNF] Skipping equality {literal:?}: not exactly linearizable"
+                        );
+                    }
+                    continue;
+                };
 
                 if var_coeffs.is_empty() {
                     continue;
                 }
+
+                // Track this equality atom as a reason for all HNF cuts (#5388).
+                equality_reasons.push((literal, true));
 
                 // Track this equality for soundness checking
                 asserted_equalities.push((var_coeffs.clone(), constant.clone()));
@@ -343,22 +362,49 @@ impl LiaSolver<'_> {
     }
 
     /// Parse an equality (lhs = rhs) into coefficient/constant form for HNF.
-    /// Returns (coefficients, constant) where coefficients maps var_idx -> BigInt.
+    ///
+    /// Returns `Some((coefficients, constant))` — meaning
+    /// `Σ(coeff * var) = constant` — only when the parse is EXACT: every leaf of
+    /// both sides was either folded into the constant or placed in a column.
+    /// Returns `None` as soon as any subterm could not be represented.
+    ///
+    /// The exactness requirement is a soundness requirement, not tidiness. The
+    /// row built here is fed to `HnfCutter` as a *fact about the solver state*,
+    /// and every cut derived from the resulting matrix is asserted with the
+    /// original equality atoms as its reasons. Dropping an unmappable subterm
+    /// (the previous behaviour: `fallback_as_var = false` silently ignores the
+    /// `_` arm of the collector) fabricates a stronger equality than the one
+    /// asserted, and a cut valid for the fabricated row can refute a satisfiable
+    /// problem. `fallback_as_var` is now on, so an opaque application such as
+    /// `(to_int r)` resolves through its own column, and anything that still has
+    /// no column aborts the parse.
     fn parse_equality_for_hnf(
         &self,
         lhs: TermId,
         rhs: TermId,
         term_to_idx: &HashMap<TermId, usize>,
-    ) -> (Vec<(usize, BigInt)>, BigInt) {
+    ) -> Option<(Vec<(usize, BigInt)>, BigInt)> {
         let mut coeffs: HashMap<usize, BigInt> = HashMap::default();
         let mut constant = BigInt::zero();
 
-        let resolve_var = |t: TermId| term_to_idx.get(&t).copied();
+        // Set when the collector meets something it cannot place exactly.
+        let exact = std::cell::Cell::new(true);
+
+        let resolve_var = |t: TermId| {
+            let idx = term_to_idx.get(&t).copied();
+            if idx.is_none() {
+                exact.set(false);
+            }
+            idx
+        };
         let convert_const = |c: &Constant| -> Option<BigInt> {
             match c {
                 Constant::Int(n) => Some(n.clone()),
                 Constant::Rational(r) if r.0.denom().is_one() => Some(r.0.numer().clone()),
-                _ => None,
+                _ => {
+                    exact.set(false);
+                    None
+                }
             }
         };
         let terms = self.terms;
@@ -375,7 +421,7 @@ impl LiaSolver<'_> {
             &convert_const,
             &extract_mul_const,
             false,
-            false,
+            true,
         );
 
         // Parse rhs with negative sign (move to LHS)
@@ -389,8 +435,12 @@ impl LiaSolver<'_> {
             &convert_const,
             &extract_mul_const,
             false,
-            false,
+            true,
         );
+
+        if !exact.get() {
+            return None;
+        }
 
         // The equation is: Σ(coeff * var) - constant = 0
         // So: Σ(coeff * var) = constant
@@ -409,6 +459,87 @@ impl LiaSolver<'_> {
             coeffs_vec.windows(2).all(|w| w[0].0 < w[1].0),
             "BUG: HNF coefficient vector contains duplicate/out-of-order indices"
         );
-        (coeffs_vec, constant)
+        Some((coeffs_vec, constant))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ay_core::{Sort, TermStore};
+
+    /// `(to_int r)` is an opaque Int-sorted application, not a `Var`. It is a
+    /// column of the LIA variable index like any other leaf, and the HNF parse
+    /// must record its coefficient.
+    ///
+    /// Before the fix the collector ran with `fallback_as_var = false`, so the
+    /// `_` arm dropped the application and `(= (to_int r) (+ (* 3 q) rr))` was
+    /// recorded as `-3q - rr = 0` — an equality that is NOT asserted. Together
+    /// with `rr = 1` that fabricated row has no integer solution, HNF emitted
+    /// the "cut" `q >= 0`, and the resulting wrong `unsat` on
+    /// `(= r (- 1.5)) /\ (= (mod (to_int r) 3) 1)` was proof-carrying.
+    #[test]
+    fn hnf_equality_parse_keeps_opaque_int_applications() {
+        let mut terms = TermStore::new();
+        let r = terms.mk_var("r", Sort::Real);
+        let to_int_r = terms.mk_to_int(r);
+        let q = terms.mk_var("q", Sort::Int);
+        let rr = terms.mk_var("rr", Sort::Int);
+        let three = terms.mk_int(BigInt::from(3));
+        let three_q = terms.mk_mul(vec![three, q]);
+        let rhs = terms.mk_add(vec![three_q, rr]);
+
+        let mut solver = LiaSolver::new(&terms);
+        solver.register_integer_var(to_int_r);
+        solver.register_integer_var(q);
+        solver.register_integer_var(rr);
+
+        let (term_to_idx, _idx_to_term) = solver.build_var_index();
+        let (coeffs, constant) = solver
+            .parse_equality_for_hnf(to_int_r, rhs, &term_to_idx)
+            .expect("an equality over registered LIA columns must parse exactly");
+
+        assert!(constant.is_zero(), "expected constant 0, got {constant}");
+        let coeff_of = |t| {
+            let idx = term_to_idx[&t];
+            coeffs
+                .iter()
+                .find(|(i, _)| *i == idx)
+                .map_or_else(BigInt::zero, |(_, c)| c.clone())
+        };
+        assert_eq!(
+            coeff_of(to_int_r),
+            BigInt::one(),
+            "(to_int r) must not be dropped from the HNF row"
+        );
+        assert_eq!(coeff_of(q), BigInt::from(-3));
+        assert_eq!(coeff_of(rr), BigInt::from(-1));
+    }
+
+    /// An equality mentioning an Int term with no column must abort the parse
+    /// rather than silently yield a stronger row.
+    #[test]
+    fn hnf_equality_parse_refuses_unmapped_terms() {
+        let mut terms = TermStore::new();
+        let r = terms.mk_var("r", Sort::Real);
+        let to_int_r = terms.mk_to_int(r);
+        let q = terms.mk_var("q", Sort::Int);
+        let rr = terms.mk_var("rr", Sort::Int);
+        let three = terms.mk_int(BigInt::from(3));
+        let three_q = terms.mk_mul(vec![three, q]);
+        let rhs = terms.mk_add(vec![three_q, rr]);
+
+        let mut solver = LiaSolver::new(&terms);
+        // Deliberately do NOT register `to_int_r`, so it has no column.
+        solver.register_integer_var(q);
+        solver.register_integer_var(rr);
+
+        let (term_to_idx, _idx_to_term) = solver.build_var_index();
+        assert!(
+            solver
+                .parse_equality_for_hnf(to_int_r, rhs, &term_to_idx)
+                .is_none(),
+            "an equality with an uncolumned subterm must be refused, not approximated"
+        );
     }
 }

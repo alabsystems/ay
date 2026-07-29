@@ -1997,6 +1997,28 @@ fn exit_if_timed_out_with_transcript_context(state: &SmtTranscriptState) {
     exit_if_timed_out();
 }
 
+/// Emit `--stats` counters before a timeout exit (#wp1-stats-on-timeout).
+///
+/// The runs worth instrumenting are precisely the ones that end by timeout, and
+/// those were the only runs that emitted NO counters at all: the normal exit path
+/// prints stats, the timeout path did not. That made every measurement on a hard
+/// instance a reverse-engineering exercise over env-gated debug channels, and it
+/// hid the counters that attribute per-round cost. `-st`/`--stats` is a request
+/// for counters, and a timeout is still a run.
+///
+/// Emits only when stats were actually requested, so default runs are byte-identical.
+fn exit_if_timed_out_with_stats(
+    state: &SmtTranscriptState,
+    executor: &Executor,
+    formula_stats: Option<&FormulaStats>,
+    stats_cfg: stats_output::StatsConfig,
+) {
+    if is_timed_out() && stats_cfg.any() {
+        print_smt_stats(executor, state, formula_stats, stats_cfg);
+    }
+    exit_if_timed_out_with_transcript_context(state);
+}
+
 fn update_rlimit_after_command(state: &mut SmtTranscriptState, cmd: &Command) {
     match cmd {
         Command::Assert(_) => state.rlimit = state.rlimit.saturating_add(3),
@@ -7462,7 +7484,12 @@ fn run_smt_file_content(
                         );
                     }
                 }
-                exit_if_timed_out_with_transcript_context(&transcript);
+                exit_if_timed_out_with_stats(
+                    &transcript,
+                    &executor,
+                    Some(&formula_stats),
+                    stats_cfg,
+                );
             }
         }
     }

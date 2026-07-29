@@ -1,5 +1,7 @@
 (set-option :produce-unsat-cores true)
 (set-logic ALL)
+(declare-sort |__verification_consumer_mutref::int| 0)
+(declare-sort Unit 0)
 (declare-datatypes ((List 0)) (((Cons (enum_payload_get_0_1_u4c697374 Int) (enum_payload_get_1_1_u4c697374 List)) (Nil))))
 (declare-const call_16 |__verification_consumer_mutref::int|)
 (declare-const __verification_consumer_ite_int_aux_5 Int)

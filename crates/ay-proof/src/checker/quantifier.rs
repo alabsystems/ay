@@ -10,11 +10,23 @@ use ay_core::{AletheRule, Proof, ProofId, ProofStep, Sort, Symbol, TermData, Ter
 use super::ProofCheckError;
 
 fn invalid(step: ProofId, reason: impl Into<String>) -> ProofCheckError {
+    invalid_rule(step, "sko_forall", reason)
+}
+
+fn invalid_rule(
+    step: ProofId,
+    rule: impl Into<String>,
+    reason: impl Into<String>,
+) -> ProofCheckError {
     ProofCheckError::InvalidBooleanRule {
         step,
-        rule: "sko_forall".to_string(),
+        rule: rule.into(),
         reason: reason.into(),
     }
+}
+
+fn invalid_forall_inst(step: ProofId, reason: impl Into<String>) -> ProofCheckError {
+    invalid_rule(step, "forall_inst", reason)
 }
 
 #[derive(Clone, Copy)]
@@ -37,17 +49,16 @@ fn decode_eq(terms: &TermStore, term: TermId) -> Option<(TermId, TermId)> {
 
 const SKOLEM_TERM_WORK_LIMIT: usize = 100_000;
 
-/// Exact, capture-safe single-binder substitution matcher.
+/// Exact, capture-safe quantifier substitution matcher.
 ///
 /// The dedicated producer is intentionally restricted to a quantifier-free
 /// body, so encountering any nested binder/let fails closed instead of trying
 /// to approximate shadowing or alpha-renaming.
-fn matches_single_substitution(
+fn matches_substitution(
     terms: &TermStore,
     pattern: TermId,
     instance: TermId,
-    binder: &str,
-    witness: TermId,
+    substitutions: &HashMap<&str, TermId>,
     work: &mut usize,
 ) -> Option<bool> {
     let mut visited = HashSet::default();
@@ -64,12 +75,16 @@ fn matches_single_substitution(
             return Some(false);
         }
         match terms.get(expected) {
-            TermData::Var(name, _) if name == binder => {
-                if actual != witness {
+            TermData::Var(name, _) => {
+                if let Some(&replacement) = substitutions.get(name.as_str()) {
+                    if actual != replacement {
+                        return Some(false);
+                    }
+                } else if expected != actual {
                     return Some(false);
                 }
             }
-            TermData::Var(..) | TermData::Const(..) => {
+            TermData::Const(..) => {
                 if expected != actual {
                     return Some(false);
                 }
@@ -107,6 +122,169 @@ fn matches_single_substitution(
         }
     }
     Some(true)
+}
+
+fn matches_single_substitution(
+    terms: &TermStore,
+    pattern: TermId,
+    instance: TermId,
+    binder: &str,
+    witness: TermId,
+    work: &mut usize,
+) -> Option<bool> {
+    let mut substitutions = HashMap::default();
+    substitutions.insert(binder, witness);
+    matches_substitution(terms, pattern, instance, &substitutions, work)
+}
+
+/// Check that an instantiation argument is ground with respect to every binder
+/// introduced by the source forall. Nested binders/lets in arguments are
+/// outside this deliberately narrow certificate lane.
+fn argument_is_ground_for(
+    terms: &TermStore,
+    root: TermId,
+    binder_names: &HashSet<&str>,
+    work: &mut usize,
+) -> Option<bool> {
+    let mut visited = HashSet::default();
+    let mut stack = vec![root];
+    while let Some(term) = stack.pop() {
+        if !visited.insert(term) {
+            continue;
+        }
+        if *work >= SKOLEM_TERM_WORK_LIMIT {
+            return None;
+        }
+        *work += 1;
+        match terms.get(term) {
+            TermData::Var(name, _) => {
+                if binder_names.contains(name.as_str()) {
+                    return Some(false);
+                }
+            }
+            TermData::Const(..) => {}
+            TermData::Not(inner) => stack.push(*inner),
+            TermData::Ite(condition, then_branch, else_branch) => {
+                stack.extend([*condition, *then_branch, *else_branch]);
+            }
+            TermData::App(_, args) => stack.extend(args.iter().copied()),
+            TermData::Let(..) | TermData::Forall(..) | TermData::Exists(..) => {
+                return Some(false);
+            }
+            _ => return Some(false),
+        }
+    }
+    Some(true)
+}
+
+/// Validate AY's flat, premiseless `forall_inst` representation.
+///
+/// Shape: one unit literal
+/// `(or (not (forall ((x1 S1) .. (xn Sn)) phi)) phi[ti/xi])`
+/// and positional arguments `t1 .. tn`. Every argument must have the declared
+/// sort and be ground with respect to the source binders; the body must be the
+/// exact simultaneous structural substitution. Nested binders/lets are
+/// rejected rather than approximated.
+pub(crate) fn validate_forall_inst(
+    terms: &TermStore,
+    step: ProofId,
+    clause: &[TermId],
+    premise_count: usize,
+    args: &[TermId],
+) -> Result<(), ProofCheckError> {
+    if premise_count != 0 {
+        return Err(invalid_forall_inst(step, "must not have premises"));
+    }
+    let [implication] = clause else {
+        return Err(invalid_forall_inst(
+            step,
+            "conclusion must be one or-wrapped implication",
+        ));
+    };
+    let TermData::App(Symbol::Named(or_name), disjuncts) = terms.get(*implication) else {
+        return Err(invalid_forall_inst(step, "conclusion must be an or term"));
+    };
+    if terms.sort(*implication) != &Sort::Bool {
+        return Err(invalid_forall_inst(
+            step,
+            "outer or implication must have Boolean sort",
+        ));
+    }
+    if or_name != "or" || disjuncts.len() != 2 {
+        return Err(invalid_forall_inst(
+            step,
+            "conclusion must be exactly (or (not forall) instance)",
+        ));
+    }
+    let TermData::Not(quantified) = terms.get(disjuncts[0]) else {
+        return Err(invalid_forall_inst(
+            step,
+            "first disjunct must be the negated source forall",
+        ));
+    };
+    let instance = disjuncts[1];
+    let TermData::Forall(bindings, body, _) = terms.get(*quantified) else {
+        return Err(invalid_forall_inst(step, "negated source must be a forall"));
+    };
+    if bindings.is_empty() || args.len() != bindings.len() {
+        return Err(invalid_forall_inst(
+            step,
+            "positional argument count must equal the non-empty binder count",
+        ));
+    }
+
+    let binder_names: HashSet<&str> = bindings.iter().map(|(name, _)| name.as_str()).collect();
+    if binder_names.len() != bindings.len() {
+        return Err(invalid_forall_inst(
+            step,
+            "source forall contains duplicate binder names",
+        ));
+    }
+    let mut substitutions: HashMap<&str, TermId> = HashMap::default();
+    let mut work = 0usize;
+    for ((name, sort), &argument) in bindings.iter().zip(args) {
+        if terms.sort(argument) != sort {
+            return Err(invalid_forall_inst(
+                step,
+                "argument sort does not match its positional binder",
+            ));
+        }
+        match argument_is_ground_for(terms, argument, &binder_names, &mut work) {
+            Some(true) => {}
+            Some(false) => {
+                return Err(invalid_forall_inst(
+                    step,
+                    "argument is not ground with respect to the source binders",
+                ));
+            }
+            None => {
+                return Err(invalid_forall_inst(
+                    step,
+                    format!(
+                        "argument groundness check exceeds {SKOLEM_TERM_WORK_LIMIT} distinct terms"
+                    ),
+                ));
+            }
+        }
+        substitutions.insert(name.as_str(), argument);
+    }
+    if terms.sort(instance) != &Sort::Bool {
+        return Err(invalid_forall_inst(
+            step,
+            "instantiated body must be Boolean",
+        ));
+    }
+    match matches_substitution(terms, *body, instance, &substitutions, &mut work) {
+        Some(true) => Ok(()),
+        Some(false) => Err(invalid_forall_inst(
+            step,
+            "instance is not the exact simultaneous binder substitution",
+        )),
+        None => Err(invalid_forall_inst(
+            step,
+            format!("substitution check exceeds {SKOLEM_TERM_WORK_LIMIT} distinct term pairs"),
+        )),
+    }
 }
 
 fn term_contains(
@@ -664,6 +842,213 @@ mod tests {
 
     use super::*;
 
+    struct ForallInstFixture {
+        terms: TermStore,
+        quantified: TermId,
+        instance: TermId,
+        implication: TermId,
+        int_value: TermId,
+        bool_value: TermId,
+    }
+
+    fn forall_inst_fixture() -> ForallInstFixture {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("fi_x", Sort::Int);
+        let b = terms.mk_var("fi_b", Sort::Bool);
+        let p_x = terms.mk_app(Symbol::named("fi_p"), [x], Sort::Bool);
+        let body = terms.mk_app(Symbol::named("and"), [p_x, b], Sort::Bool);
+        let quantified = terms.mk_forall(
+            vec![
+                ("fi_x".to_string(), Sort::Int),
+                ("fi_b".to_string(), Sort::Bool),
+            ],
+            body,
+        );
+        let int_value = terms.mk_int(7.into());
+        let bool_value = terms.mk_bool(true);
+        let p_value = terms.mk_app(Symbol::named("fi_p"), [int_value], Sort::Bool);
+        let instance = terms.mk_app(Symbol::named("and"), [p_value, bool_value], Sort::Bool);
+        let not_quantified = terms.mk_not_raw(quantified);
+        let implication = terms.mk_app(Symbol::named("or"), [not_quantified, instance], Sort::Bool);
+        ForallInstFixture {
+            terms,
+            quantified,
+            instance,
+            implication,
+            int_value,
+            bool_value,
+        }
+    }
+
+    #[test]
+    fn exact_multi_binder_forall_instantiation_is_valid() {
+        let fixture = forall_inst_fixture();
+        validate_forall_inst(
+            &fixture.terms,
+            ProofId(0),
+            &[fixture.implication],
+            0,
+            &[fixture.int_value, fixture.bool_value],
+        )
+        .expect("exact simultaneous forall substitution must validate");
+    }
+
+    #[test]
+    fn forall_inst_or_and_resolution_chain_is_strict_context_valid() {
+        let mut fixture = forall_inst_fixture();
+        let not_quantified = fixture.terms.mk_not_raw(fixture.quantified);
+        let not_instance = fixture.terms.mk_not_raw(fixture.instance);
+        let mut proof = Proof::new();
+        let quantified_assume = proof.add_assume(fixture.quantified, None);
+        let forall_inst = proof.add_rule_step(
+            AletheRule::ForallInst,
+            vec![fixture.implication],
+            Vec::new(),
+            vec![fixture.int_value, fixture.bool_value],
+        );
+        let clausified = proof.add_rule_step(
+            AletheRule::Or,
+            vec![not_quantified, fixture.instance],
+            vec![forall_inst],
+            Vec::new(),
+        );
+        let instance = proof.add_resolution(
+            vec![fixture.instance],
+            fixture.quantified,
+            clausified,
+            quantified_assume,
+        );
+        let negated_instance = proof.add_assume(not_instance, None);
+        proof.add_resolution(Vec::new(), fixture.instance, instance, negated_instance);
+
+        let quality = crate::check_proof_strict_with_context(
+            &proof,
+            &fixture.terms,
+            None,
+            None,
+            Some(&[fixture.quantified, not_instance]),
+        )
+        .expect("exact forall_inst + or + resolution chain must validate strictly");
+        assert!(quality.is_complete());
+        assert_eq!(quality.trust_count, 0);
+    }
+
+    #[test]
+    fn forall_inst_rejects_wrong_source_and_body() {
+        let mut fixture = forall_inst_fixture();
+        let y = fixture.terms.mk_var("fi_y", Sort::Int);
+        let other_body = fixture.terms.mk_app(Symbol::named("fi_q"), [y], Sort::Bool);
+        let other_quantified = fixture
+            .terms
+            .mk_forall(vec![("fi_y".to_string(), Sort::Int)], other_body);
+        let not_other = fixture.terms.mk_not_raw(other_quantified);
+        let wrong_source = fixture.terms.mk_app(
+            Symbol::named("or"),
+            [not_other, fixture.instance],
+            Sort::Bool,
+        );
+        assert!(validate_forall_inst(
+            &fixture.terms,
+            ProofId(0),
+            &[wrong_source],
+            0,
+            &[fixture.int_value],
+        )
+        .is_err());
+
+        let wrong_instance = fixture.terms.mk_bool(false);
+        let not_quantified = fixture.terms.mk_not_raw(fixture.quantified);
+        let wrong_body = fixture.terms.mk_app(
+            Symbol::named("or"),
+            [not_quantified, wrong_instance],
+            Sort::Bool,
+        );
+        assert!(validate_forall_inst(
+            &fixture.terms,
+            ProofId(0),
+            &[wrong_body],
+            0,
+            &[fixture.int_value, fixture.bool_value],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn forall_inst_rejects_wrong_arity_order_and_sort() {
+        let mut fixture = forall_inst_fixture();
+        assert!(validate_forall_inst(
+            &fixture.terms,
+            ProofId(0),
+            &[fixture.implication],
+            0,
+            &[fixture.int_value],
+        )
+        .is_err());
+        assert!(validate_forall_inst(
+            &fixture.terms,
+            ProofId(0),
+            &[fixture.implication],
+            0,
+            &[fixture.bool_value, fixture.int_value],
+        )
+        .is_err());
+
+        let not_quantified = fixture.terms.mk_not_raw(fixture.quantified);
+        let non_boolean_or = fixture.terms.mk_app(
+            Symbol::named("or"),
+            [not_quantified, fixture.instance],
+            Sort::Int,
+        );
+        assert!(validate_forall_inst(
+            &fixture.terms,
+            ProofId(0),
+            &[non_boolean_or],
+            0,
+            &[fixture.int_value, fixture.bool_value],
+        )
+        .is_err());
+
+        let not_quantified = fixture.terms.mk_not_raw(fixture.quantified);
+        let reversed = fixture.terms.mk_app(
+            Symbol::named("or"),
+            [fixture.instance, not_quantified],
+            Sort::Bool,
+        );
+        assert!(validate_forall_inst(
+            &fixture.terms,
+            ProofId(0),
+            &[reversed],
+            0,
+            &[fixture.int_value, fixture.bool_value],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn forall_inst_rejects_nested_binder_and_partial_capture() {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("outer_x", Sort::Int);
+        let inner_x = terms.mk_var("inner_x", Sort::Int);
+        let inner_body = terms.mk_app(Symbol::named("nested_p"), [x, inner_x], Sort::Bool);
+        let nested = terms.mk_forall(vec![("inner_x".to_string(), Sort::Int)], inner_body);
+        let quantified = terms.mk_forall(vec![("outer_x".to_string(), Sort::Int)], nested);
+        let value = terms.mk_int(1.into());
+        let attempted_instance = nested;
+        let not_quantified = terms.mk_not_raw(quantified);
+        let implication = terms.mk_app(
+            Symbol::named("or"),
+            [not_quantified, attempted_instance],
+            Sort::Bool,
+        );
+        assert!(validate_forall_inst(&terms, ProofId(0), &[implication], 0, &[value],).is_err());
+
+        let binder_as_argument = x;
+        assert!(
+            validate_forall_inst(&terms, ProofId(0), &[implication], 0, &[binder_as_argument],)
+                .is_err()
+        );
+    }
+
     fn fixture() -> (TermStore, TermId, TermId, TermId) {
         let mut terms = TermStore::new();
         let x = terms.mk_var("sko_x", Sort::Int);
@@ -687,6 +1072,15 @@ mod tests {
     fn unregistered_witness_is_rejected() {
         let (mut terms, _, _, quant) = fixture();
         let forged = terms.mk_var("ordinary_constant", Sort::Int);
+        let instance = terms.mk_app(Symbol::named("sko_p"), [forged], Sort::Bool);
+        let equality = terms.mk_eq(quant, instance);
+        assert!(validate_sko_forall(&terms, ProofId(0), &[equality], 0, &[forged]).is_err());
+    }
+
+    #[test]
+    fn skolem_shaped_but_unregistered_witness_is_rejected() {
+        let (mut terms, _, _, quant) = fixture();
+        let forged = terms.mk_var("sk!looks_authentic_but_is_user_owned", Sort::Int);
         let instance = terms.mk_app(Symbol::named("sko_p"), [forged], Sort::Bool);
         let equality = terms.mk_eq(quant, instance);
         assert!(validate_sko_forall(&terms, ProofId(0), &[equality], 0, &[forged]).is_err());

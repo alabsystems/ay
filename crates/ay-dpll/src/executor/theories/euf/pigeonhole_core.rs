@@ -56,6 +56,14 @@ use super::super::super::Executor;
 use ay_core::kani_compat::{DetHashMap as HashMap, DetHashSet as HashSet};
 use ay_core::{Sort, TermData, TermId};
 
+/// Int finite-domain sibling of this pass (#uc-qfidl): the QF_IDL dialect of
+/// the same coloring instances, where the palette is spelled out per variable
+/// as `(or (= x c1) ... (= x cm))` instead of an enum datatype. A CHILD module
+/// so it can reuse `CliqueGraph`, `assemble_pigeonhole_core` and
+/// `EnumDiseqEdges`/`EnumMembership` with NO visibility widening — the banked
+/// QF_Datatypes core path stays byte-identical.
+mod int_domain;
+
 /// Size-gated core ENRICHMENT (giant-clique validator hardness, #uc-qfdt):
 /// for cliques over sorts with `k >= AY_UC_ENRICH_K` (default 43) the core
 /// additionally includes edge assertions with EXACTLY ONE endpoint in the

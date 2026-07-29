@@ -469,51 +469,18 @@ impl CoreSolver {
 
     /// Evaluate `str.replace_re_all(s, r, t)`: replace all regex matches in s with t.
     ///
-    /// SMT-LIB / cvc5 semantics: only NON-EMPTY (positive-length) matches are
-    /// replaced. A zero-length (empty) match never triggers a replacement — it is
-    /// skipped past one character at a time. Thus the empty regex is an identity.
+    /// SMT-LIB 2.6 semantics: each replaced match must be NON-EMPTY (the
+    /// theory's recursive clause carries the `w != ""` side condition), so a
+    /// nullable regex still replaces its shortest non-empty matches. This
+    /// delegates to the single crate-level implementation
+    /// (`crate::ground_eval_replace_re_all`) so the two entry points cannot
+    /// drift apart again.
     pub(super) fn eval_str_replace_re_all(
         terms: &TermStore,
         s: &str,
         r: TermId,
         t: &str,
     ) -> Option<String> {
-        let mut result = String::new();
-        let mut remaining = s;
-
-        loop {
-            if remaining.is_empty() {
-                // Nothing left to copy; an empty match never inserts `t` (SMT-LIB),
-                // so just stop (previously this pushed `t`, a false-UNSAT source).
-                break;
-            }
-
-            match RegExpSolver::find_first_match(terms, remaining, r) {
-                MatchResult::Found(start, end) => {
-                    result.push_str(&remaining[..start]);
-                    if start == end {
-                        // Zero-length match: do NOT push `t`. Copy one character
-                        // through and advance to avoid an infinite loop.
-                        if let Some(ch) = remaining[end..].chars().next() {
-                            result.push(ch);
-                            remaining = &remaining[end + ch.len_utf8()..];
-                        } else {
-                            break;
-                        }
-                    } else {
-                        // Non-empty match: emit the replacement.
-                        result.push_str(t);
-                        remaining = &remaining[end..];
-                    }
-                }
-                MatchResult::NoMatch => {
-                    result.push_str(remaining);
-                    break;
-                }
-                MatchResult::Incomplete => return None,
-            }
-        }
-
-        Some(result)
+        crate::ground_eval_replace_re_all(terms, s, r, t)
     }
 }

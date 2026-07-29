@@ -84,6 +84,9 @@ pub(crate) struct SatStatsSnapshot {
     pub propagations: u64,
     pub restarts: u64,
     pub learned_clauses: u64,
+    pub deleted_clauses: u64,
+    pub num_vars: u64,
+    pub num_clauses: u64,
     pub unknown_reason: Option<SatUnknownReason>,
 }
 
@@ -243,6 +246,9 @@ pub(crate) fn collect_sat_stats_snapshot(
     stats.propagations = snapshot.propagations;
     stats.restarts = snapshot.restarts;
     stats.learned_clauses = snapshot.learned_clauses;
+    stats.deleted_clauses = snapshot.deleted_clauses;
+    stats.num_vars = snapshot.num_vars;
+    stats.num_clauses = snapshot.num_clauses;
     *pending_sat_unknown_reason = snapshot.unknown_reason;
 }
 

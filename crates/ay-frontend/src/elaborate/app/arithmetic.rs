@@ -29,24 +29,39 @@ impl Context {
                 Ok(Some(self.terms.mk_mul(arg_ids.to_vec())))
             }
             "^" => Ok(Some(self.elaborate_power(arg_ids)?)),
+            // SMT-LIB 2.6 theory `Reals` / `Reals_Ints` declare
+            // `(/ Real Real Real :left-assoc)`, so `(/ a b c)` abbreviates
+            // `(/ (/ a b) c)`. Only two-or-more is well-sorted.
             "/" => {
                 self.promote_int_consts_to_real(arg_ids)?;
-                if arg_ids.len() != 2 {
+                if arg_ids.len() < 2 {
                     return Err(ElaborateError::InvalidConstant(format!(
-                        "/ requires 2 arguments, got {}",
+                        "/ requires at least 2 arguments, got {}",
                         arg_ids.len()
                     )));
                 }
-                Ok(Some(self.terms.mk_div(arg_ids[0], arg_ids[1])))
+                let mut acc = arg_ids[0];
+                for &rhs in &arg_ids[1..] {
+                    acc = self.terms.mk_div(acc, rhs);
+                }
+                Ok(Some(acc))
             }
+            // SMT-LIB 2.6 theory `Ints` declares `(div Int Int Int :left-assoc)`,
+            // so `(div a b c)` abbreviates `(div (div a b) c)`. Note that `mod`,
+            // `rem` and `abs` in the same theory are NOT `:left-assoc` — they are
+            // fixed-arity and must stay so (see the arms below).
             "div" => {
-                if arg_ids.len() != 2 {
+                if arg_ids.len() < 2 {
                     return Err(ElaborateError::InvalidConstant(format!(
-                        "div requires 2 arguments, got {}",
+                        "div requires at least 2 arguments, got {}",
                         arg_ids.len()
                     )));
                 }
-                Ok(Some(self.terms.mk_intdiv(arg_ids[0], arg_ids[1])))
+                let mut acc = arg_ids[0];
+                for &rhs in &arg_ids[1..] {
+                    acc = self.terms.mk_intdiv(acc, rhs);
+                }
+                Ok(Some(acc))
             }
             "mod" => {
                 if arg_ids.len() != 2 {

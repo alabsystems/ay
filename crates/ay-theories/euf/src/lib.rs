@@ -46,6 +46,7 @@ mod verification;
 mod tests;
 
 // Re-export public API
+pub use bool_atoms::{clear_bool_arg_repair_candidates, take_bool_arg_repair_candidates};
 pub use solver::EufSolver;
 pub use solver_query::DiscoveredDisequality;
 pub use theory_propagate::{EUF_LAZY_MAGIC, EUF_LAZY_MAGIC_MASK};

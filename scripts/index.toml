@@ -59,6 +59,15 @@ requires = ["oom-guard"]
 cli     = "ay bench compare run smtcomp-2025"
 
 [[script]]
+name    = "smt-ab-interleaved"
+path    = "scripts/ab_interleaved.py"
+lang    = "python"
+group   = "compare.smt"
+summary = "Order-balanced same-binary A/B harness for incremental SMT levers, with order-effect and verdict-agreement checks."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
 name    = "chccomp-harness"
 path    = "scripts/chccomp_harness.py"
 lang    = "python"
@@ -508,6 +517,15 @@ publish = "public"
 cli_note = "fold into corpora.toml http entries post-0.1.0"
 
 [[script]]
+name    = "smtcomp-fixtures"
+path    = "scripts/link_smtcomp_fixtures.sh"
+lang    = "bash"
+group   = "corpus.prepare"
+summary = "Populate flat SMT-COMP fixture paths by linking already-downloaded SMT-LIB 2025 files into benchmarks/smtcomp/."
+publish = "public"
+cli_note = "no fronting subcommand yet"
+
+[[script]]
 name    = "satlib-fetch"
 path    = "scripts/download_satlib_benchmarks.sh"
 lang    = "bash"
@@ -695,10 +713,10 @@ name    = "pb-audit"
 path    = "scripts/pb_audit.sh"
 lang    = "sh"
 group   = "bench.pb"
-summary = "PB soundness audit: verify SAT/OPTIMUM models with check_opb.py (broken: check_opb.py is untracked)."
+summary = "PB soundness audit: verify SAT/OPTIMUM models with an external OPB model checker named by $MODEL_CHECKER (still broken: no validator is tracked in-repo)."
 publish = "public"
 status  = "broken"
-cli_note = "broken; restore check_opb.py or exclude pre-0.1.0"
+cli_note = "broken; needs MODEL_CHECKER=<check_opb.py>. Now exits 2 when unset, requires checker exit 0, and compares exact VALID/INVALID tokens"
 
 [[script]]
 name    = "pb-ab-compare"
@@ -728,6 +746,36 @@ summary = "CERT-track CI gate (campaign M0: CakePB/VeriPB CI harness, stage 1)."
 publish = "public"
 tools   = ["veripb"]
 cli_note = "switch to `ay tool which veripb` post-0.1.0"
+
+[[script]]
+name    = "veripb-verdict-lib"
+path    = "scripts/lib/veripb_verdict.sh"
+lang    = "sh"
+group   = "gate.pb"
+summary = "The one shell-side VeriPB verdict gate: exit code + exact conclusion + a six-probe checker self-test."
+publish = "public"
+entrypoint = "library"
+
+[[script]]
+name    = "veripb-fake-checker-gate"
+path    = "scripts/ci/veripb_fake_checker_gate.sh"
+lang    = "sh"
+group   = "gate.pb"
+summary = "Runs every VeriPB-backed gate against the four fake checkers in ci/fake-checkers/ and fails if any gate passes."
+publish = "public"
+tools   = ["veripb"]
+requires = ["veripb-verdict-lib"]
+cli_note = "no fronting subcommand yet; needs a real veripb for the delegate + control case"
+
+[[script]]
+name    = "pb-certified-gate"
+path    = "scripts/ci/pb_certified_gate.sh"
+lang    = "sh"
+group   = "gate.pb"
+summary = "PB certified-track CI gate: pinned VeriPB must accept every proof AY emits for the committed instance set, and must first reject the six known wrong-verdict fixtures."
+publish = "public"
+tools   = ["veripb"]
+cli_note = "run directly; builds/runs ay-pb from the exact checkout and builds the pinned checker on demand; AY_PB_BIN explicitly opts into an external solver"
 
 [[script]]
 name    = "linux-static-build"
@@ -816,6 +864,15 @@ group   = "gate.release"
 summary = "Unauthenticated public-clone build evidence: simulate what a fresh clone of the public repo sees."
 publish = "public"
 cli_note = "shipped caller cmd_submission.rs"
+
+[[script]]
+name    = "workspace-feature-unification-gate"
+path    = "scripts/ci/workspace_feature_unification_gate.sh"
+lang    = "bash"
+group   = "gate.release"
+summary = "Fresh-target build gate for the ay CLI plus the system-allocator ay-pb binary under unified workspace features."
+publish = "public"
+cli_note = "run directly; intentionally uses a fresh release target directory"
 
 [[script]]
 name    = "setup-audit-tools"

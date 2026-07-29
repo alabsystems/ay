@@ -44,15 +44,15 @@ script does not exist until its index entry does
 | wind-tunnel | bench.core | `scripts/wind_tunnel.py` | python | active | - | The Wind Tunnel: full-corpus PAR-2 evaluation with an independent output checker. |
 | lp-bench | bench.milp | `scripts/lp_bench.py` | python | active | - | Time LP/MILP solvers on a corpus and compare verdicts. |
 | milp-compare | bench.milp | `scripts/compare.py` | python | active | - | ay-milp vs HiGHS verdict agreement on the real .milp corpus. |
-| milp-refsolve | bench.milp | `scripts/refsolve.py` | python | active | - | HiGHS + SCIP + Gurobi verdicts on the .milp corpus via the exact-MPS bridge. |
-| milp2mps | bench.milp | `scripts/milp2mps.py` | python | active | - | Convert the .milp serialization to standard MPS (bit-exact f64 fields). |
 | milp-corpus | bench.milp | `scripts/milp_corpus.py` | python | active | - | Fetch and index the MIPLIB 2017 corpus (+ .solu reference optima) the W0 harness measures on. |
+| milp-refsolve | bench.milp | `scripts/refsolve.py` | python | active | - | HiGHS + SCIP + Gurobi verdicts on the .milp corpus via the exact-MPS bridge. |
 | milp-w0 | bench.milp | `scripts/milp_w0.py` | python | active | - | W0 attribution harness: root closure, solver baselines, per-knob ablation, regression gate, Gurobi audit, LP-throughput gap. |
+| milp2mps | bench.milp | `scripts/milp2mps.py` | python | active | - | Convert the .milp serialization to standard MPS (bit-exact f64 fields). |
 | miplib-bench | bench.milp | `scripts/miplib_bench.py` | python | active | - | Run ay-milp and HiGHS on the same MPS files and compare verdicts. |
 | solver-portfolio | bench.milp | `scripts/solver_portfolio.py` | python | active | - | Run AY against a portfolio of reference MILP solvers at matched single-thread budgets. |
 | mzn-local-bench | bench.mzn | `benchmarks/minizinc/run_benchmarks.sh` | bash | deprecated | - | Run local FlatZinc benchmarks through the competition CLI surface. |
 | pb-ab-compare | bench.pb | `scripts/pb_ab_compare.py` | python | deprecated | - | A/B compare two ay-pb binaries over a PB corpus. |
-| pb-audit | bench.pb | `scripts/pb_audit.sh` | sh | broken | - | PB soundness audit: verify SAT/OPTIMUM models with check_opb.py (broken: check_opb.py is untracked). |
+| pb-audit | bench.pb | `scripts/pb_audit.sh` | sh | broken | - | PB soundness audit: verify SAT/OPTIMUM models with an external OPB model checker named by $MODEL_CHECKER (still broken: no validator is tracked in-repo). |
 | pb-bench | bench.pb | `scripts/pb_bench.sh` | sh | active | - | Parallel PB benchmark runner for AY. |
 | pb-cert-coverage | bench.pb | `scripts/pb_cert_coverage.sh` | bash | active | - | PB certificate coverage probe: solve with --proof and check emitted proofs with VeriPB. |
 | pb-sweep | bench.pb | `scripts/pb_sweep.py` | python | active | - | Pseudo-Boolean sweep: AY-PB vs a reference (RoundingSat) on OPB/WBO with verdict cross-checks. |
@@ -90,6 +90,7 @@ script does not exist until its index entry does
 | mzn-setup | compare.mzn | `scripts/mzn_challenge/setup.sh` | bash | active | - | Reconstitute the MiniZinc Challenge 2025 harness on a fresh machine (minizinc, corpus, fzn-exec). |
 | pbcomp-harness | compare.pb | `scripts/pbcomp_harness.py` | python | active | `ay bench compare run pbcomp-2026` | PB-COMP harness: ay pb solve over OPB/WBO instances under competition budgets. |
 | sat-compare | compare.sat | `scripts/sat_bench/sat_compare.py` | python | active | `ay bench compare run satcomp-2025` | Head-to-head SAT comparison harness: AY vs a reference (e.g. Kissat) with verdict cross-validation. |
+| smt-ab-interleaved | compare.smt | `scripts/ab_interleaved.py` | python | active | - | Order-balanced same-binary A/B harness for incremental SMT levers, with order-effect and verdict-agreement checks. |
 | smtcomp-restage | compare.smt | `scripts/smtcomp_harness.py` | python | active | `ay bench compare run smtcomp-2025` | SMT-COMP 2025 restage harness: AY and the real 2025 entrants on the exact 2025 selection. |
 
 ## compat
@@ -128,6 +129,7 @@ script does not exist until its index entry does
 | satlib-fetch | corpus.fetch | `scripts/download_satlib_benchmarks.sh` | bash | deprecated | - | Fetch the SATLIB uniform-random 3-SAT sets the ay-sat soundness/DRAT tests resolve. |
 | smtcomp-fetch | corpus.fetch | `scripts/download_smtcomp_benchmarks.sh` | bash | active | - | Fetch SMT-LIB non-incremental benchmarks for a logic into benchmarks/smtcomp/<LOGIC>/. |
 | mzn-gen-community | corpus.gen | `benchmarks/minizinc/gen_community.py` | python | active | - | Generate a FlatZinc community-detection benchmark (mexican.s26.k4-like). |
+| smtcomp-fixtures | corpus.prepare | `scripts/link_smtcomp_fixtures.sh` | bash | active | - | Populate flat SMT-COMP fixture paths by linking already-downloaded SMT-LIB 2025 files into benchmarks/smtcomp/. |
 
 ## dev
 
@@ -155,10 +157,14 @@ script does not exist until its index entry does
 | chc-baseline-compare | gate.chc | `scripts/chc_baseline_compare.py` | python | active | `ay submission` | Compare current AY CHC results against a checked-in baseline snapshot. |
 | chccomp-regression | gate.chc | `scripts/chccomp_regression.py` | python | active | - | Regression safety net: re-run every baselined CHC solve; fail on wrong answers or regressions. |
 | cert-ci-gate | gate.pb | `scripts/cert_ci.sh` | sh | active | - | CERT-track CI gate (campaign M0: CakePB/VeriPB CI harness, stage 1). |
+| pb-certified-gate | gate.pb | `scripts/ci/pb_certified_gate.sh` | sh | active | - | PB certified-track CI gate: pinned VeriPB must accept every proof AY emits for the committed instance set, and must first reject the six known wrong-verdict fixtures. |
 | proof-overhead-gate | gate.pb | `scripts/proof_overhead.py` | python | active | - | Proof Tap overhead gate: dense-tap proof-on vs plain, median <= 2x. |
+| veripb-fake-checker-gate | gate.pb | `scripts/ci/veripb_fake_checker_gate.sh` | sh | active | - | Runs every VeriPB-backed gate against the four fake checkers in ci/fake-checkers/ and fails if any gate passes. |
+| veripb-verdict-lib | gate.pb | `scripts/lib/veripb_verdict.sh` | sh | active | - | The one shell-side VeriPB verdict gate: exit code + exact conclusion + a six-probe checker self-test. |
 | critical-solver-policy-gate | gate.release | `scripts/check_critical_solver_policy.sh` | bash | active | `ay gate` | Enforce that changes to critical solver files land with native solver gate evidence. |
 | doc-reality-gate | gate.release | `scripts/check_doc_reality.sh` | bash | active | `ay gate` | Check that local Markdown links in AY's public documentation resolve inside the checkout. |
 | public-clone-check | gate.release | `scripts/public-clone-check.sh` | bash | active | - | Unauthenticated public-clone build evidence: simulate what a fresh clone of the public repo sees. |
+| workspace-feature-unification-gate | gate.release | `scripts/ci/workspace_feature_unification_gate.sh` | bash | active | - | Fresh-target build gate for the ay CLI plus the system-allocator ay-pb binary under unified workspace features. |
 | sat-soundness-gate | gate.soundness | `scripts/ci/sat_soundness_gate.sh` | bash | active | `ay gate` | SAT soundness gate: run ay on labeled vendored CNFs; fail the build on wrong verdicts. |
 | smt-soundness-gate | gate.soundness | `scripts/ci/smt_soundness_gate.sh` | bash | active | `ay gate` | SMT soundness-differential gate; the in-tree pre-push net. |
 

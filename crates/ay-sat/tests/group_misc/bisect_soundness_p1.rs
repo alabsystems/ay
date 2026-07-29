@@ -12,8 +12,7 @@
 use ay_sat::{parse_dimacs, SatResult, Solver};
 use ntest::timeout;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 fn repo_root() -> PathBuf {
@@ -113,24 +112,12 @@ fn make_solver_excluding(cnf: &str, exclude: &[&str]) -> Solver {
 /// `solve_interruptible` (checked every 100 conflicts in the CDCL main loop).
 fn solve_with_timeout(solver: &mut Solver, timeout: Duration) -> SatResult {
     let start = Instant::now();
-    let flag = Arc::new(AtomicBool::new(false));
-    let flag_clone = flag.clone();
-
-    // Register the interrupt flag with the solver for preprocessing/inprocessing.
-    solver.set_interrupt(flag.clone());
-
-    // Spawn a timer thread that sets the flag after the timeout.
-    let handle = std::thread::spawn(move || {
-        std::thread::sleep(timeout);
-        flag_clone.store(true, Ordering::Relaxed);
-    });
+    let timer = super::common::SolverInterruptTimer::start(solver, timeout);
 
     let result = solver
-        .solve_interruptible(|| flag.load(Ordering::Relaxed))
+        .solve_interruptible(|| timer.is_interrupted())
         .into_inner();
-    // Stop the timer thread if the solver finished early.
-    flag.store(true, Ordering::Relaxed);
-    let _ = handle.join();
+    timer.cancel_and_join();
     let elapsed = start.elapsed();
     eprintln!("  solve completed in {elapsed:.1?}");
     result

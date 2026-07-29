@@ -20,8 +20,71 @@ pub use ay_test_support::{
 };
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Sender};
+use std::sync::{Arc, OnceLock};
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Cancellation-aware wall-clock deadline for an interruptible SAT solve.
+///
+/// A timeout thread that only sleeps and is then joined charges the full
+/// deadline even when the solve finishes immediately. This helper lets normal
+/// completion cancel the deadline thread while still setting the solver's
+/// interrupt flag when the deadline expires. Dropping it also cancels and
+/// joins the thread, so early returns and panics cannot leak a sleeping thread.
+pub struct SolverInterruptTimer {
+    interrupted: Arc<AtomicBool>,
+    cancel: Option<Sender<()>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl SolverInterruptTimer {
+    pub fn start(solver: &mut Solver, timeout: Duration) -> Self {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        solver.set_interrupt(interrupted.clone());
+
+        let (cancel, cancelled) = channel();
+        let deadline_interrupt = interrupted.clone();
+        let handle = std::thread::spawn(move || {
+            if matches!(
+                cancelled.recv_timeout(timeout),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                deadline_interrupt.store(true, Ordering::Relaxed);
+            }
+        });
+
+        Self {
+            interrupted,
+            cancel: Some(cancel),
+            handle: Some(handle),
+        }
+    }
+
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Relaxed)
+    }
+
+    pub fn cancel_and_join(mut self) {
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for SolverInterruptTimer {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
 
 /// Result of running an external SAT solver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

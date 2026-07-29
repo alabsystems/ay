@@ -12,6 +12,7 @@
 use ay_core::kani_compat::DetHashMap as HashMap;
 use num_bigint::BigInt;
 
+use num_integer::Integer;
 use num_traits::{One, Signed, Zero};
 use tracing::{debug, info};
 
@@ -275,8 +276,26 @@ impl HnfCutter {
                 f[k] = -&sum / &hkk;
             }
 
-            // Compute cut coefficients: (e_i H^{-1} A_basis) * x <= floor(y0_i)
+            // Cut coefficients `c = f * A_basis` and the value `v = f * b` that
+            // `c . x` is FORCED to take by the asserted equalities.
+            //
+            // SOUNDNESS (#hnf-gcd-cut): `c` and `v` are both built from the SAME
+            // multiplier row `f`, so `c . x = f . (A_basis x) = f . b = v` holds
+            // for every `x` satisfying the equalities — an identity that stands
+            // whatever `f` is, and in particular whether or not the modulo-HNF
+            // that produced `f` is exact. It therefore replaces the previous
+            // bound source `y0[cut_i] = (H^-1 b)[cut_i]`, which is only equal to
+            // `v` when `H` is the exact Hermite form of `A_basis`. When the
+            // modulo reduction in `compute_hnf` is driven by a modulus that is
+            // not the true determinant, `y0` and `v` DIVERGE and the old
+            // `c . x <= floor(y0)` was asserted against a system that actually
+            // forces `c . x = v > floor(y0)` — an invalid cut carrying the
+            // equality atoms as its reasons, i.e. a wrong `unsat`. Observed on
+            // `(= r (- 1.5)) /\ (= (mod (to_int r) 3) 1)`, where the equalities
+            // `to_int(r) = 3q + rr /\ rr = 1` yielded the bogus cut `q >= 0` and
+            // refuted a satisfiable formula.
             let mut rational_coeffs: Vec<(usize, BigRational)> = Vec::new();
+            let mut unmapped_column = false;
             for j in 0..a_basis.col_count() {
                 let mut coeff = BigRational::zero();
                 for (i, f_i) in f.iter().enumerate().take(a_basis.row_count()) {
@@ -288,55 +307,104 @@ impl HnfCutter {
                     if col_idx < self.var_indices.len() {
                         let orig_var_idx = self.var_indices[col_idx];
                         rational_coeffs.push((orig_var_idx, coeff));
+                    } else {
+                        // Dropping a non-zero coefficient would break the
+                        // `c . x = v` identity the soundness argument rests on.
+                        unmapped_column = true;
+                        break;
                     }
                 }
             }
 
-            if rational_coeffs.is_empty() {
+            if unmapped_column || rational_coeffs.is_empty() {
                 continue;
             }
 
-            // Make integer coefficients: multiply by LCM of denominators (coeffs and bound).
+            // v = f . b, the value the equalities force on `c . x`.
+            let mut implied_value = BigRational::zero();
+            for (i, f_i) in f.iter().enumerate().take(b.len()) {
+                implied_value = &implied_value + f_i * BigRational::from(b[i].clone());
+            }
+
+            // Make integer coefficients: multiply by LCM of denominators
+            // (coefficients and the implied value).
             let mut lcm = BigInt::one();
             for (_, coeff) in &rational_coeffs {
                 lcm = num_integer::lcm(lcm, coeff.denom().clone());
             }
-            lcm = num_integer::lcm(lcm, y0[cut_i].denom().clone());
+            lcm = num_integer::lcm(lcm, implied_value.denom().clone());
 
             let lcm_rat = BigRational::from(lcm.clone());
 
             let mut cut_coeffs: Vec<(usize, BigInt)> = Vec::new();
+            let mut non_integer_after_scaling = false;
             for (idx, coeff) in rational_coeffs {
                 let scaled = coeff * lcm_rat.clone();
                 if scaled.denom().is_one() {
                     cut_coeffs.push((idx, scaled.numer().clone()));
-                } else if debug {
-                    safe_eprintln!(
-                        "[HNF] Skipping cut with non-integer coefficient after scaling: {}",
-                        scaled
-                    );
+                } else {
+                    if debug {
+                        safe_eprintln!(
+                            "[HNF] Skipping cut with non-integer coefficient after scaling: {}",
+                            scaled
+                        );
+                    }
+                    non_integer_after_scaling = true;
+                    break;
                 }
             }
 
-            if cut_coeffs.is_empty() {
+            if non_integer_after_scaling || cut_coeffs.is_empty() {
                 continue;
             }
 
-            // SOUNDNESS FIX (#1054): Floor FIRST, then scale.
-            // The HNF cut is: (row combo) <= floor(y0[cut_i])
-            // Scaling both sides by lcm preserves the inequality direction.
-            // But floor(a*b) != b*floor(a) when a is non-integer, so we must
-            // compute floor(y0) first, then multiply by lcm.
-            let floored_bound = crate::LiaSolver::floor_rational(&y0[cut_i]);
-            let cut_bound = &floored_bound * &lcm;
+            // Scaled identity: `cut_coeffs . x = scaled_value` for every `x`
+            // satisfying the asserted equalities, with both sides integral.
+            let scaled_value = implied_value * lcm_rat;
+            if !scaled_value.denom().is_one() {
+                continue;
+            }
+            let scaled_value = scaled_value.numer().clone();
+
+            // `cut_coeffs . x` is a multiple of `g = gcd(cut_coeffs)` at every
+            // INTEGER point, so `cut_coeffs . x <= g * floor(scaled_value / g)`
+            // is valid over the integers: at an integer solution of the
+            // equalities the left side equals `scaled_value` and is a multiple
+            // of `g`, hence at most the largest multiple of `g` below it. When
+            // `g` divides `scaled_value` the bound IS `scaled_value` and the cut
+            // is already implied by the equalities, so it carries no
+            // information; the useful case is `g doesn't divide scaled_value`,
+            // where no integer solution exists and the cut closes the branch —
+            // exactly the classical GCD test, and the only conclusion an
+            // equality-only HNF row can soundly support.
+            let mut g = BigInt::zero();
+            for (_, coeff) in &cut_coeffs {
+                g = g.gcd(coeff);
+            }
+            if g.is_zero() {
+                continue;
+            }
+            if (&scaled_value % &g).is_zero() {
+                if debug {
+                    safe_eprintln!(
+                        "[HNF] Row {} carries no GCD conflict (gcd {} divides {}), no cut",
+                        cut_i,
+                        g,
+                        scaled_value
+                    );
+                }
+                continue;
+            }
+            let cut_bound = &g * scaled_value.div_floor(&g);
 
             if debug {
                 safe_eprintln!(
-                    "[HNF] Cut: y0[{}]={}, floor={}, lcm={}, coeffs: {:?}, bound: {}",
+                    "[HNF] Cut: y0[{}]={}, implied={}, lcm={}, gcd={}, coeffs: {:?}, bound: {}",
                     cut_i,
                     y0[cut_i],
-                    floored_bound,
+                    scaled_value,
                     lcm,
+                    g,
                     cut_coeffs,
                     cut_bound
                 );

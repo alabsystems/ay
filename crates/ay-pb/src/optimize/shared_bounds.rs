@@ -59,6 +59,52 @@ const UB_ABSENT: i64 = i64::MAX;
 /// Sentinel for "no lower bound published" (mirror of [`UB_ABSENT`]).
 const LB_ABSENT: i64 = i64::MIN;
 
+/// PROCESS-SCOPED REPORTING SINK for the best dual any engine has proven.
+///
+/// # Why a global rather than a threaded handle
+///
+/// The engine that actually drives the dual on OLL-dominant instances runs
+/// inside `solve_optimization_portfolio` -> `..._inner` -> `try_pre_native_oll`,
+/// a chain that begins at a PUBLIC entry point carrying no bus. Threading a bus
+/// handle down it would change several public signatures purely for
+/// observability, while the bus-holding worker (`native-oll-opt`) is a
+/// different instance that may prove far less.
+///
+/// This value can never affect a verdict: it is written only by
+/// [`publish_reported_dual_global`], read only for output, and — unlike
+/// [`SharedBounds::lb`] — no upgrade, prune, or cutoff consults it. Callers
+/// must [`reset_reported_dual_global`] at the start of a solve so a value can
+/// never leak from a previous one.
+static REPORTED_DUAL_GLOBAL: AtomicI64 = AtomicI64::new(LB_ABSENT);
+
+/// Publishes a REPORTING-ONLY dual bound. Monotone (keeps the max); returns
+/// whether it raised the value. Rejected on i64 overflow. See
+/// [`REPORTED_DUAL_GLOBAL`] for why this cannot affect soundness.
+pub fn publish_reported_dual_global(value: i128) -> bool {
+    let Ok(value64) = i64::try_from(value) else {
+        return false;
+    };
+    if value64 == LB_ABSENT {
+        return false;
+    }
+    value64 > REPORTED_DUAL_GLOBAL.fetch_max(value64, Ordering::Relaxed)
+}
+
+/// Best reported dual this process has seen, or `None`. Output/telemetry only.
+pub fn reported_dual_global() -> Option<i128> {
+    match REPORTED_DUAL_GLOBAL.load(Ordering::Relaxed) {
+        LB_ABSENT => None,
+        value => Some(i128::from(value)),
+    }
+}
+
+/// Clears the sink. Call at the start of a solve: the value is monotone, so a
+/// stale bound from a previous instance would otherwise persist and be reported
+/// against the wrong problem.
+pub fn reset_reported_dual_global() {
+    REPORTED_DUAL_GLOBAL.store(LB_ABSENT, Ordering::Relaxed);
+}
+
 /// A lower bound on the objective that is sound over ALL feasible points of
 /// the ORIGINAL instance (a "global-sound floor"), typed by source.
 ///
@@ -110,6 +156,10 @@ pub struct SharedBounds {
     /// Best GLOBAL-SOUND objective floor, or [`LB_ABSENT`]. Monotonically
     /// non-decreasing; written only through the typed [`GlobalSoundFloor`].
     lb: AtomicI64,
+    /// REPORTING-ONLY dual bound, or [`LB_ABSENT`]. Structurally severed from
+    /// `lb`: no soundness decision reads this slot. See
+    /// [`SharedBounds::publish_reported_dual`].
+    reported_dual: AtomicI64,
     /// The model attaining `ub`. Kept in lockstep with `ub` under this Mutex
     /// (every writer holds it); the OPTIMUM upgrade decision locks it for the
     /// whole lock -> read-lb -> re-verify sequence.
@@ -122,6 +172,7 @@ impl SharedBounds {
         Self {
             ub: AtomicI64::new(UB_ABSENT),
             lb: AtomicI64::new(LB_ABSENT),
+            reported_dual: AtomicI64::new(LB_ABSENT),
             incumbent: Mutex::new(None),
         }
     }
@@ -209,6 +260,46 @@ impl SharedBounds {
     /// `None` on a poisoned slot (fail-closed: no upgrade).
     pub(crate) fn locked_incumbent(&self) -> Option<MutexGuard<'_, Option<Arc<[bool]>>>> {
         self.incumbent.lock().ok()
+    }
+
+    /// REPORTING ONLY. Publishes a worker's best dual bound for HUMAN/telemetry
+    /// consumption. Monotonic (keeps the max), rejected on i64 overflow.
+    ///
+    /// # This is deliberately NOT a [`GlobalSoundFloor`]
+    ///
+    /// The values that flow here (e.g. the core-guided OLL accumulator) are
+    /// floors over the CURRENT SOLVER STATE, not necessarily over the original
+    /// instance: OLL's persistent solver may carry an external-UB prune row,
+    /// hardening units, or — when the opt-in LP reduced-cost fixer is armed —
+    /// level-0 units that delete optimal TIES. Any of those can let the
+    /// accumulator exceed the true optimum, which as a `lb` would be an
+    /// unretractable false-OPTIMUM license (the upgrade gate `value <= floor`
+    /// is one-sided and monotone).
+    ///
+    /// So this channel is structurally severed from soundness: it is written
+    /// through its own slot, and [`SharedBounds::lb`] — the only value the
+    /// OPTIMUM upgrade reads — never observes it. A wrong value here can
+    /// mislead a human or a benchmark table; it cannot mint a wrong answer.
+    /// Promoting any of it to a real floor requires a new audited
+    /// [`GlobalSoundFloor`] constructor plus the guards in that audit.
+    pub fn publish_reported_dual(&self, value: i128) -> bool {
+        let Ok(value64) = i64::try_from(value) else {
+            return false;
+        };
+        if value64 == LB_ABSENT {
+            return false;
+        }
+        value64 > self.reported_dual.fetch_max(value64, Ordering::Relaxed)
+    }
+
+    /// Best REPORTED (non-licensing) dual bound, for output/telemetry only.
+    /// Never consulted by the OPTIMUM upgrade — see
+    /// [`SharedBounds::publish_reported_dual`].
+    pub fn reported_dual(&self) -> Option<i128> {
+        match self.reported_dual.load(Ordering::Relaxed) {
+            LB_ABSENT => None,
+            value => Some(i128::from(value)),
+        }
     }
 }
 

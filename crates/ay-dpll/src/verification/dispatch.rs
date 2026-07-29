@@ -1652,6 +1652,22 @@ pub(crate) fn verify_lra_conflict_semantic(
 /// Unlike `verify_lra_conflict_semantic`, this correctly handles integer-gap
 /// conflicts (e.g., `x > 5 AND x < 6`) that are UNSAT over integers but SAT
 /// over reals. (#6853)
+/// Wall-clock budget for a single semantic conflict verification (#verify-budget).
+///
+/// Verifications are supposed to be cheap — they re-check one conflict, not the problem.
+/// The budget exists so a pathological case cannot spend the solve's time inside a
+/// verifier; exceeding it degrades to the pre-existing "accept optimistically" path.
+/// Override with `AY_VERIFY_SOLVE_BUDGET_MS`.
+fn verify_solve_budget() -> std::time::Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(*MS.get_or_init(|| {
+        std::env::var("AY_VERIFY_SOLVE_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1_000)
+    }))
+}
+
 pub(crate) fn verify_lia_conflict_semantic(
     conflict: &[TheoryLit],
     terms: &TermStore,
@@ -1661,6 +1677,21 @@ pub(crate) fn verify_lia_conflict_semantic(
 
     ay_lia::instrument::bump_verify_fresh_lia_solve();
     let mut verify_lia = LiaSolver::new(terms);
+    // #verify-budget: bound this verification.
+    //
+    // This runs per theory conflict on the default-on path and previously installed NO
+    // deadline and no timeout callback, so every `should_timeout()` inside `check_inner`
+    // was inert and the `try_patching -> continue` loop ran uncounted. A single spurious
+    // conflict on a large arithmetic problem could therefore burn unbounded wall clock
+    // inside a *verifier* — time that comes straight out of the solve budget, i.e. out of
+    // answers.
+    //
+    // The fallback is unchanged: on `Unknown` this function already accepts optimistically
+    // (`_ => Ok(())` below), which is exactly what a budget trip produces. So bounding it
+    // can cost verification strength on a pathological conflict, never correctness of the
+    // accept/reject contract. `set_deadline` (not the callback) is used because it also
+    // propagates into the IntSat probe's BigInt loop.
+    verify_lia.set_deadline(ay_core::time::Instant::now() + verify_solve_budget());
     for lit in conflict {
         verify_lia.assert_literal(lit.term, lit.value);
     }

@@ -36,6 +36,15 @@ macro_rules! collect_sat_stats {
                 propagations: ($sat).total_num_propagations(),
                 restarts: ($sat).total_num_restarts(),
                 learned_clauses: ($sat).num_learned_clauses(),
+                deleted_clauses: ($sat).num_learned_clauses_deleted(),
+                // #stats-cnf: CNF shape of the INPUT problem. Both were declared,
+                // exposed and printed but never assigned, so `-st` always said 0
+                // and the only way to see the encoding's size was to instrument
+                // `add_clause` by hand. `num_original_clauses` (not `num_clauses`)
+                // is the right source: the latter is the live database and grows
+                // with learned clauses, which is what `:learned-clauses` reports.
+                num_vars: ($sat).num_variables() as u64,
+                num_clauses: ($sat).num_original_clauses() as u64,
                 unknown_reason: ($sat).last_unknown_reason(),
             },
         );

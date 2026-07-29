@@ -566,10 +566,17 @@ impl VerifiedChcResult {
 /// `unsat` verdict on every obligation therefore independently re-establishes
 /// exactly what the exhaustive acyclic BMC certificate claims.
 ///
-/// Fail-closed guards: cyclic systems, non-scalar sorts (arrays, reals,
-/// datatypes, uninterpreted sorts), missing query clauses, and expansions
-/// exceeding [`ACYCLIC_EXPANSION_MAX_INSTANTIATIONS`] all return `Err`, which
-/// keeps the run metadata-only.
+/// Query-irrelevant dead-end cycles are removed with the same deterministic,
+/// verdict-preserving transform used by the acyclic certificate solve and
+/// validation paths. The original problem still owns query clause indices and
+/// normalized-input binding; only cycle classification and recursive expansion
+/// use the stripped clone.
+///
+/// Fail-closed guards: cycles remaining in the query cone after that transform,
+/// non-scalar sorts (arrays, reals, datatypes, uninterpreted sorts), missing
+/// query clauses, and expansions exceeding
+/// [`ACYCLIC_EXPANSION_MAX_INSTANTIATIONS`] all return `Err`, which keeps the
+/// run metadata-only.
 pub(crate) fn acyclic_exhaustion_replay_obligations(
     problem: &ChcProblem,
 ) -> ChcResult<Vec<ChcReplayObligation>> {
@@ -587,7 +594,9 @@ pub(crate) fn acyclic_exhaustion_replay_obligations(
             }
         }
     }
-    let features = ProblemClassifier::classify(problem);
+    let mut expansion_problem = problem.clone();
+    expansion_problem.strip_dead_end_cycle_predicates();
+    let features = ProblemClassifier::classify(&expansion_problem);
     if features.has_cycles {
         return Err(verification_error(
             "acyclic-exhaustion replay export requires an acyclic clause system",
@@ -609,7 +618,7 @@ pub(crate) fn acyclic_exhaustion_replay_obligations(
             let renamed_args: Vec<ChcExpr> =
                 args.iter().map(|arg| arg.substitute(&subst)).collect();
             conjuncts.push(expansion.expand_predicate(
-                problem,
+                &expansion_problem,
                 *pred_id,
                 &renamed_args,
                 &mut Vec::new(),

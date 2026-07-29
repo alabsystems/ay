@@ -178,6 +178,143 @@ fn test_hnf_d_equals_1() {
     );
 }
 
+/// Feed an equality system to the cutter exactly the way `try_hnf_cuts` does
+/// (one upper- and one lower-bound row per equality) and return the cuts.
+fn cuts_for_equalities(
+    eqs: &[(Vec<(usize, BigInt)>, BigInt)],
+    vars: usize,
+) -> Vec<super::cutter::HnfCut> {
+    let mut cutter = HnfCutter::new();
+    for idx in 0..vars {
+        cutter.register_var(idx);
+    }
+    for (coeffs, constant) in eqs {
+        cutter.add_constraint(coeffs, constant.clone(), true);
+        cutter.add_constraint(coeffs, constant.clone(), false);
+    }
+    cutter.generate_cuts()
+}
+
+/// Assert that no generated cut excludes `point`, an integer solution of the
+/// equality system the cuts were derived from.
+fn assert_cuts_admit(cuts: &[super::cutter::HnfCut], point: &[i64], label: &str) {
+    for cut in cuts {
+        let mut lhs = BigInt::zero();
+        for (idx, coeff) in &cut.coeffs {
+            lhs += coeff * BigInt::from(point[*idx]);
+        }
+        assert!(
+            lhs <= cut.bound,
+            "HNF cut {:?} <= {} excludes the integer solution {label} = {point:?} \
+             of the very equalities it was derived from (lhs = {lhs})",
+            cut.coeffs,
+            cut.bound,
+        );
+    }
+}
+
+/// The invariant every HNF cut must satisfy: it may never exclude an integer
+/// point that satisfies the equalities it was derived from.
+///
+/// The system is the one `mod`/`div` elimination emits for
+/// `(= r (- 1.5)) /\ (= (mod (to_int r) 3) 1)`:
+///
+/// ```text
+/// x0 - 3*x1 - x2 = 0      (to_int(r) = 3q + rr)
+/// x2 = 1                  (rr = 1)
+/// ```
+///
+/// `(x0, x1, x2) = (-2, -1, 1)` is an integer solution — the one SMT-LIB
+/// requires, since `to_int` is floor so `to_int(-1.5) = -2` and `-2 = 3*(-1)+1`.
+///
+/// Note this exact row set does NOT reproduce the wrong `unsat`: the solver only
+/// built the bogus cut because `parse_equality_for_hnf` dropped the `(to_int r)`
+/// term and handed the cutter the row `-3*x1 - x2 = 0` instead of the first row
+/// above (see `cuts.rs`). This test guards the cutter's own contract so that a
+/// future caller feeding it a faithful system cannot be answered with a cut that
+/// refutes a real solution.
+#[test]
+fn hnf_cut_never_excludes_an_integer_solution_of_its_own_equalities() {
+    let eqs = vec![
+        (
+            vec![
+                (0, BigInt::from(1)),
+                (1, BigInt::from(-3)),
+                (2, BigInt::from(-1)),
+            ],
+            BigInt::zero(),
+        ),
+        (vec![(2, BigInt::from(1))], BigInt::one()),
+    ];
+    let cuts = cuts_for_equalities(&eqs, 3);
+    // Every integer point on the line to_int = 3q + 1 must survive.
+    assert_cuts_admit(&cuts, &[-5, -2, 1], "q=-2");
+    assert_cuts_admit(&cuts, &[-2, -1, 1], "q=-1");
+    assert_cuts_admit(&cuts, &[1, 0, 1], "q=0");
+    assert_cuts_admit(&cuts, &[4, 1, 1], "q=1");
+    assert_cuts_admit(&cuts, &[301, 100, 1], "q=100");
+}
+
+/// Same invariant on a system with a larger modulus and a negative solution
+/// branch, to pin that the fix is not specific to divisor 3.
+#[test]
+fn hnf_cut_admits_integer_solutions_for_other_divisors() {
+    for k in [2_i64, 4, 5, 7, 12] {
+        for residue in 0..k {
+            let eqs = vec![
+                (
+                    vec![
+                        (0, BigInt::from(1)),
+                        (1, BigInt::from(-k)),
+                        (2, BigInt::from(-1)),
+                    ],
+                    BigInt::zero(),
+                ),
+                (vec![(2, BigInt::from(1))], BigInt::from(residue)),
+            ];
+            let cuts = cuts_for_equalities(&eqs, 3);
+            for q in -4_i64..=4 {
+                let x0 = k * q + residue;
+                assert_cuts_admit(
+                    &cuts,
+                    &[x0, q, residue],
+                    &format!("k={k} residue={residue}"),
+                );
+            }
+        }
+    }
+}
+
+/// The cut machinery must still be able to close a system that genuinely has no
+/// integer solution: `2*x0 = 1` forces `x0 = 1/2`.
+#[test]
+fn hnf_cut_still_refutes_a_system_with_no_integer_solution() {
+    let eqs = vec![(vec![(0, BigInt::from(2))], BigInt::one())];
+    let cuts = cuts_for_equalities(&eqs, 1);
+    assert!(
+        !cuts.is_empty(),
+        "an equality with no integer solution should still yield a closing cut"
+    );
+    for cut in &cuts {
+        // The cut must contradict the equality `2*x0 = 1`, i.e. bound < 1 after
+        // normalising to the same coefficient row.
+        assert_eq!(cut.coeffs.len(), 1);
+        let (idx, coeff) = &cut.coeffs[0];
+        assert_eq!(*idx, 0);
+        // 2*x0 <= 0 (the largest multiple of 2 not exceeding 1) or the negated
+        // orientation; either way no integer x0 makes `2*x0 = 1` true.
+        assert!(
+            (coeff % BigInt::from(2)).is_zero(),
+            "expected an even coefficient row, got {coeff}"
+        );
+        assert!(
+            (&cut.bound % BigInt::from(2)).is_zero(),
+            "the bound must be a multiple of the row gcd, got {}",
+            cut.bound
+        );
+    }
+}
+
 #[test]
 fn test_divide_r_by_diagonal_exact_division() {
     let q = divide_r_by_diagonal(&BigInt::from(12), &BigInt::from(3), 0);

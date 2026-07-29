@@ -200,9 +200,33 @@ impl TermStore {
     pub fn mk_var(&mut self, name: impl Into<String>, sort: Sort) -> TermId {
         let name = name.into();
 
-        // Check if we already have this variable
-        if let Some(&(id, _)) = self.names.get(&name) {
-            return id;
+        // Reuse the cached variable ONLY when the SORT also matches.
+        //
+        // This used to destructure `&(id, _)`, discarding the requested sort and
+        // handing back a term of the WRONG SORT whenever a name was reused at a
+        // different sort — even though the map has always stored the sort right
+        // there. `define-fun` formals are bound through here, so a file whose
+        // second definition reuses a parameter name at another sort got a
+        // mis-sorted binder, its body failed to type-check, the command was
+        // dropped, the problem was tainted, and AY emitted `(error ...)` with no
+        // verdict at all.
+        //
+        // Measured 2026-07-26 on the full SMT-LIB corpus: that single line
+        // accounted for 402 of the 637 z3-decided files across the 25 divisions
+        // AY scored 0% on (428 corpus-wide) — not a theory gap, a name collision.
+        //
+        // Sort-aware interning is already the invariant one function down
+        // (`intern`, #6734): two terms with identical `TermData` but different
+        // sorts are DISTINCT values and must never be merged. This restores it
+        // for named variables.
+        if let Some((id, cached_sort)) = self.names.get(&name) {
+            if *cached_sort == sort {
+                return *id;
+            }
+            // Same visible name, different sort: a genuinely distinct binder.
+            // That is exactly the redeclaration case `mk_fresh_named_var` exists
+            // for — fresh internal identity, unchanged user-facing name.
+            return self.mk_fresh_named_var(name, sort);
         }
 
         let var_id = self.var_counter;

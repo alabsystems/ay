@@ -1082,3 +1082,88 @@ fn unary_minus_lhs_flips_the_operator_in_both_polarities() {
         &[(a, false), (y_lt_m3, true)]
     )));
 }
+
+// ---------------------------------------------------------------------------
+// Integer lane (QF_IDL): sort gating and integer-tightened lowering
+// ---------------------------------------------------------------------------
+
+/// The same shapes as `Table` but over `Int`, for the `new_int` lane.
+struct IntTable {
+    terms: TermStore,
+    x: TermId,
+    y: TermId,
+}
+
+impl IntTable {
+    fn new() -> Self {
+        let mut terms = TermStore::new();
+        let x = terms.mk_var("ix", Sort::Int);
+        let y = terms.mk_var("iy", Sort::Int);
+        Self { terms, x, y }
+    }
+    fn diff_cmp(&mut self, op: Cmp, c: i64) -> TermId {
+        let d = self.terms.mk_sub(vec![self.x, self.y]);
+        raw_cmp(&mut self.terms, op, d, c)
+    }
+}
+
+/// The Real lane must still REFUSE Int atoms. Lowering them through the
+/// rational table is only a relaxation, which is the whole reason the integer
+/// lane exists — if this ever flips to "dl", QF_RDL has silently started
+/// approximating integers.
+#[test]
+fn real_lane_still_refuses_int_atoms() {
+    let mut tb = IntTable::new();
+    let le = tb.diff_cmp(Cmp::Le, 3);
+    let mut th = DiffLogicTheory::new(&tb.terms);
+    assert_eq!(th.debug_kind(le), "unsupported");
+}
+
+/// The integer lane accepts Int atoms, and the LOWERED edges carry an integral
+/// weight with a ZERO epsilon for every operator — including the strict ones,
+/// which is exactly what tightening buys. A non-zero epsilon here would mean
+/// the model is only rational and the lane is unsound over Int.
+#[test]
+fn int_lane_lowers_every_operator_to_integral_zero_epsilon_edges() {
+    for (op, c) in [
+        (Cmp::Le, 3),
+        (Cmp::Lt, 3),
+        (Cmp::Ge, 3),
+        (Cmp::Gt, 3),
+        (Cmp::Le, -2),
+        (Cmp::Lt, -2),
+        (Cmp::Ge, -2),
+        (Cmp::Gt, -2),
+    ] {
+        let mut tb = IntTable::new();
+        let t = tb.diff_cmp(op, c);
+        let mut th = DiffLogicTheory::new_int(&tb.terms);
+        assert_eq!(
+            th.debug_kind(t),
+            "dl",
+            "{op:?} {c} must route on the int lane"
+        );
+        for value in [true, false] {
+            let es = th.debug_edges(t, value).expect("both polarities lower");
+            for (_, _, q, eps) in es {
+                assert!(
+                    q.is_integer(),
+                    "{op:?} {c} {value}: non-integral weight {q}"
+                );
+                assert_eq!(eps, 0, "{op:?} {c} {value}: epsilon must be tightened away");
+            }
+        }
+    }
+}
+
+/// The int lane must refuse REAL atoms, mirroring the real lane's refusal of
+/// Int. (A genuinely mixed difference cannot be built at all — `mk_sub` panics
+/// on mismatched sorts — so the sort system already excludes that case
+/// upstream, and the per-lane gate only has to reject the wrong uniform sort.)
+#[test]
+fn int_lane_refuses_real_atoms() {
+    let tb = Table::new();
+    let le = tb.term(0, Cmp::Le, 3);
+    let mut th = DiffLogicTheory::new_int(&tb.terms);
+    assert_eq!(th.debug_kind(le), "unsupported");
+}

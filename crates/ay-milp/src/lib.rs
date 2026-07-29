@@ -22,6 +22,19 @@
 //! 4. **Deadlines and determinism.** [`SolveOpts`] deadlines are honored
 //!    inside solve loops; determinism gives run-to-run identical outcomes.
 //! 5. **`Model: Send + Sync + Clone`**; sessions are `Send`.
+//! 6. **Evidence can LEAVE the process.** [`cert_io`] serialises a verdict's
+//!    evidence as `.ayc` — exact rationals, bound to a digest of the model
+//!    text AND of the canonical post-read model — with the EVIDENCE KIND
+//!    stated per claim (`SUCCINCT` / `REPLAY` / `NONE`). The kind is derived
+//!    from the Rust type that is present, never chosen; [`cert_io::check`]
+//!    re-parses the model itself and reserves the word "verified".
+//! 7. **Self-validation is always on.** Every verdict leaves a session through
+//!    `finish` -> `validate_witnesses`, INDEPENDENT of
+//!    [`SolveOpts::require_certificates`]: `check_point`, exact value
+//!    re-derivation, `cert.verify`, a bound-crossing test, and (on a
+//!    continuous model) a dual bound that must MEET the primal. A verdict
+//!    whose own witness does not hold up is withheld as
+//!    [`UnknownReason::WitnessRejected`], never returned.
 //!
 //! ## Solver paths
 //!
@@ -46,6 +59,9 @@ pub use bab::{
     diag_refine_probe,
     // W0 measurement: root dual bound before/after the cut loop, no branching.
     diag_root_closure,
+    // P0 instrument: nodes-to-proof, the load-invariant search metric.
+    nodes_explored,
+    reset_nodes_explored,
     BumpLuDiff,
     // STAGE-0 COLD-CLONE READINESS PoC (inert to the serial path; see bab.rs):
     // driven only by tests/parallel_ready.rs.
@@ -53,10 +69,23 @@ pub use bab::{
     NodeLpProbe,
 };
 mod cert;
+pub mod cert_io;
+// Reduced-frame -> caller-frame certificate translation, called from the
+// `expand_*_outcome` functions in `bab.rs`.
+mod cert_lift;
 mod certify;
+// Exact-arithmetic measurement scaffold (not a shipped API): returns a text
+// report only, driven by the `sealed_scale_rational_weak_row` example.
+#[doc(hidden)]
+pub use certify::sealed_scale::diag_sealed_scale_rational_weak_row;
 mod cuts;
 mod error;
 mod exact;
+mod knobs;
+pub use knobs::{
+    env_audit, Bucket, Deprecation, EnvAudit, Knob, Route, Routed, ZeroIgnored, ALLOW_UNKNOWN_ENV,
+    DEPRECATED, KNOBS, ROUTED, ZERO_IGNORED,
+};
 mod lattice;
 mod lu;
 mod margin;
@@ -70,12 +99,20 @@ mod outcome;
 mod parity;
 mod presolve;
 mod probe;
+pub mod sepstat;
 mod session;
 mod simplex;
 #[cfg(feature = "smt")]
 mod smt;
 mod symmetry;
 mod tree_cert;
+mod tune;
+// The SHIPPED `tune::env_layer` arm is the frozen `OnceLock` snapshot, and a
+// unit test cannot reach it: under `cfg(test)` that fn compiles to a live read.
+// This is the seam `tests/env_layer_snapshot.rs` uses to assert about the arm
+// releases actually run. Read-only and knob-name-addressed; it installs nothing.
+#[doc(hidden)]
+pub use tune::{diag_env_layer, EnvLayerProbe};
 
 pub use cert::{
     BoundSide, CertificateError, CertifiedRow, FactRef, FarkasCertificate, Multiplier,
@@ -84,8 +121,8 @@ pub use cert::{
 pub use error::{MilpError, ModelError};
 pub use model::{Col, ColKind, Model, PointViolation, Row, Sense};
 pub use mps::{read_mps, MpsError, MpsProblem};
-pub use opts::{FixedAssignmentTreeWarmStart, SolveOpts};
-pub use outcome::{Outcome, UnknownReason};
+pub use opts::{EngineConfigError, EngineEconomics, FixedAssignmentTreeWarmStart, SolveOpts};
+pub use outcome::{Outcome, Trust, UnknownReason};
 pub use session::{
     AdaptiveFiveLeafCombTargetFsbReport, AdaptiveFourLeafCombTargetFsbReport,
     AdaptiveThreeLeafTargetFsbReport, BabSession, CertifiedAdaptiveFiveLeafComb,
@@ -94,5 +131,7 @@ pub use session::{
     CertifiedSplitHarvest, LpSession, ObbtOpts, ObbtReport, TargetFsbOpts, TargetFsbReport,
     MAX_CERTIFIED_BINARY_ASSIGNMENT_TREE_LEAVES, MAX_TARGET_FSB_CANDIDATES,
 };
-pub use simplex::{px_profile_line, rt_profile_line, sb_profile_line, upd_profile_line};
+pub use simplex::{
+    iter_ledger_line, px_profile_line, rt_profile_line, sb_profile_line, upd_profile_line,
+};
 pub use tree_cert::{MilpInfeasibilityCertificate, TreeNode};

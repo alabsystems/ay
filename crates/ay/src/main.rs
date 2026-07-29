@@ -5493,18 +5493,19 @@ fn install_sigterm_handler() {
 // libsystem_malloc was ~20%+ of leaf samples. mimalloc removes that tax for
 // the CLI binary only (lib consumers choose their own allocator).
 //
-// The mimalloc allocator is wrapped in `ay_sys::CountingAllocator`, which keeps
-// an exact, instantaneous count of live heap bytes (~2 relaxed atomics per
-// allocation, no syscalls). That counter feeds `ay_sys::process_memory_exceeded`
-// — already consulted at every solver cancellation checkpoint — so a runaway
-// bulk allocation trips the existing `Unknown(MemoryLimit)` path the moment it
-// lands, instead of letting the process grow until the OS OOM-killer panics the
-// machine. Soundness-neutral: it only observes bytes and drives Unknown, never a
-// wrong SAT/UNSAT. Binary-only; library consumers keep their own allocator.
+// The mimalloc allocator is wrapped in `ay_sys::MimallocCountingAllocator`,
+// which owns the mimalloc-only first-allocation arena trim and keeps an exact,
+// instantaneous count of live heap bytes (~2 relaxed atomics per allocation,
+// no syscalls). That counter feeds `ay_sys::process_memory_exceeded` — already
+// consulted at every solver cancellation checkpoint — so a runaway bulk
+// allocation trips the existing `Unknown(MemoryLimit)` path the moment it lands,
+// instead of letting the process grow until the OS OOM-killer panics the
+// machine. Soundness-neutral: it only observes bytes and drives Unknown, never
+// a wrong SAT/UNSAT. Binary-only; library consumers keep their own allocator.
 #[cfg(feature = "cli")]
 #[global_allocator]
-static GLOBAL: ay_sys::CountingAllocator<mimalloc::MiMalloc> =
-    ay_sys::CountingAllocator::new(mimalloc::MiMalloc);
+static GLOBAL: ay_sys::MimallocCountingAllocator<mimalloc::MiMalloc> =
+    ay_sys::MimallocCountingAllocator::new(mimalloc::MiMalloc);
 
 fn main() {
     let provenance_args = env::args_os().collect::<Vec<_>>();

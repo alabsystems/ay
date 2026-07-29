@@ -1605,6 +1605,25 @@ fn declines_fp_rem_non_concrete_or_mismatched() {
 // RNE dot-product forward-error firewall (`guard_claim` shape).
 // ----------------------------------------------------------------------------
 
+/// The declared-format table a `guard_claim` script produces: the seven inputs
+/// and the six named intermediates are `Float64`, `B`/`rreal` are `Real`.
+fn fp_formats_of(fmt: (u32, u32)) -> Vec<(String, Option<(u32, u32)>)> {
+    let mut out: Vec<(String, Option<(u32, u32)>)> = [
+        "nx", "ny", "nz", "px", "py", "pz", "d", "t1", "t2", "t3", "s1", "s2", "rf",
+    ]
+    .iter()
+    .map(|n| ((*n).to_string(), Some(fmt)))
+    .collect();
+    out.push(("B".to_string(), None));
+    out.push(("rreal".to_string(), None));
+    out
+}
+
+/// The binary64 (`Float64`) declared-format table.
+fn f64_formats() -> Vec<(String, Option<(u32, u32)>)> {
+    fp_formats_of((11, 53))
+}
+
 /// The seven magnitude/normality constraints of the `guard_claim` shape:
 /// `|nᵢ| ≤ 1` for the direction, `|pᵢ|,|d| ≤ 2⁴⁸` for the position/offset.
 fn guard_mag_constraints(pbound: &str) -> Vec<ay_frontend::command::Term> {
@@ -1637,6 +1656,230 @@ fn guard_threshold_inlined(threshold: &str) -> ay_frontend::command::Term {
     ))
 }
 
+// ----------------------------------------------------------------------------
+// The FORMAT prerequisite: `Float64` vs its byte-identical `Float32` clone.
+// ----------------------------------------------------------------------------
+
+/// The full parsed shape of `benchmarks/smt/QF_FPLRA/guard_claim_guard2.smt2`
+/// and of `guard_claim_guard2_float32.smt2` — they are the SAME terms.
+fn guard2_parsed_and_defined() -> (
+    Vec<ay_frontend::command::Term>,
+    Vec<(String, ay_frontend::command::Term)>,
+) {
+    let d = |n: &str, body: &str| (n.to_string(), parse_assertion(body));
+    let defined = vec![
+        d("B", "281474976710656.0"),
+        d("t1", "(fp.mul RNE nx px)"),
+        d("t2", "(fp.mul RNE ny py)"),
+        d("t3", "(fp.mul RNE nz pz)"),
+        d("s1", "(fp.add RNE t1 t2)"),
+        d("s2", "(fp.add RNE s1 t3)"),
+        d("rf", "(fp.add RNE s2 d)"),
+        d(
+            "rreal",
+            "(+ (* (fp.to_real nx) (fp.to_real px)) (* (fp.to_real ny) (fp.to_real py)) \
+               (* (fp.to_real nz) (fp.to_real pz)) (fp.to_real d))",
+        ),
+    ];
+    let mut parsed = guard_mag_constraints("B");
+    parsed.push(parse_assertion("(>= (- (fp.to_real rf) rreal) 2.0)"));
+    (parsed, defined)
+}
+
+#[test]
+fn guard2_float32_clone_has_identical_parsed_terms() {
+    // The premise of the whole format prerequisite: the ONLY thing separating
+    // the UNSAT Float64 benchmark from its SATISFIABLE Float32 clone is the
+    // declaration sorts, which the parsed terms do not carry. If this ever
+    // stops holding, the format gate below is no longer the thing standing
+    // between the emitter and a wrong `unsat`.
+    let (parsed_a, defined_a) = guard2_parsed_and_defined();
+    let (parsed_b, defined_b) = guard2_parsed_and_defined();
+    assert_eq!(parsed_a, parsed_b);
+    assert_eq!(defined_a, defined_b);
+    assert_ne!(f64_formats(), fp_formats_of((8, 24)));
+}
+
+#[test]
+fn fp_vocabulary_binary64_gate_accepts_float64_and_rejects_every_other_format() {
+    let (parsed, defined) = guard2_parsed_and_defined();
+
+    // Float64 (11, 53): the gate passes — it is the only thing that does.
+    assert!(parsed_fp_vocabulary_is_binary64(
+        &parsed,
+        &defined,
+        &f64_formats()
+    ));
+
+    // Float16 (5, 11), Float32 (8, 24), Float128 (15, 113) and a bespoke
+    // `(_ FloatingPoint 11 54)` must all be refused. The Float32 case is the
+    // live wrong-`unsat` hazard: `guard_claim_guard2_float32.smt2` is SAT, and
+    // `guard_claim_guard2_float32_witness.smt2` pins a model with error
+    // 16777214 >= 2.
+    for fmt in [(5u32, 11u32), (8, 24), (15, 113), (11, 54), (12, 53)] {
+        assert!(
+            !parsed_fp_vocabulary_is_binary64(&parsed, &defined, &fp_formats_of(fmt)),
+            "format {fmt:?} must be refused"
+        );
+    }
+}
+
+#[test]
+fn fp_vocabulary_binary64_gate_is_fail_closed_on_unknown_and_mixed_vocabulary() {
+    let (parsed, defined) = guard2_parsed_and_defined();
+
+    // An EMPTY table: every operand's sort is unknown. Unknown is not binary64.
+    assert!(!parsed_fp_vocabulary_is_binary64(&parsed, &defined, &[]));
+
+    // One operand missing from the table (e.g. dropped as ambiguous/overloaded)
+    // is enough to decline — the gate never fills a gap with a guess.
+    for missing in ["nx", "px", "d", "t1", "s2", "rf"] {
+        let mut table = f64_formats();
+        table.retain(|(n, _)| n != missing);
+        assert!(
+            !parsed_fp_vocabulary_is_binary64(&parsed, &defined, &table),
+            "missing declaration for {missing} must decline"
+        );
+    }
+
+    // One operand declared with a NON-floating-point sort is also a decline:
+    // `Some(None)` means "declared, not FP", which cannot be binary64 either.
+    let mut mixed = f64_formats();
+    for entry in &mut mixed {
+        if entry.0 == "pz" {
+            entry.1 = None;
+        }
+    }
+    assert!(!parsed_fp_vocabulary_is_binary64(&parsed, &defined, &mixed));
+
+    // A SINGLE Float32 operand among twelve Float64 ones still declines.
+    let mut one_f32 = f64_formats();
+    for entry in &mut one_f32 {
+        if entry.0 == "py" {
+            entry.1 = Some((8, 24));
+        }
+    }
+    assert!(!parsed_fp_vocabulary_is_binary64(
+        &parsed, &defined, &one_f32
+    ));
+}
+
+#[test]
+fn fp_vocabulary_binary64_gate_declines_when_there_is_no_fp_vocabulary() {
+    // No `fp.*` application at all: nothing was checked, so nothing is
+    // certified. Declining here is what makes "the gate passed" meaningful.
+    let parsed = vec![parse_assertion("(>= (- x y) 2.0)")];
+    let defined: Vec<(String, ay_frontend::command::Term)> = Vec::new();
+    assert!(!parsed_fp_vocabulary_is_binary64(
+        &parsed,
+        &defined,
+        &f64_formats()
+    ));
+}
+
+#[test]
+fn fp_vocabulary_binary64_gate_never_classifies_a_symbol_by_prefix() {
+    // `RNE` is a rounding mode; `RNEx`, `RN`, `rne`, `roundy`, `fpx` are all
+    // legal user-declarable SMT-LIB simple symbols and NOT rounding modes.
+    // Each must be treated as a real floating-point operand, so an absent or
+    // wrong-format declaration for it must decline.
+    for name in ["RNEx", "RN", "rne", "roundy", "fpx", "RNE2"] {
+        let parsed = vec![parse_assertion(&format!("(fp.isNormal {name})"))];
+        let defined: Vec<(String, ay_frontend::command::Term)> = Vec::new();
+        assert!(
+            !parsed_fp_vocabulary_is_binary64(&parsed, &defined, &[]),
+            "{name} must be treated as an operand needing a declaration"
+        );
+        assert!(
+            parsed_fp_vocabulary_is_binary64(
+                &parsed,
+                &defined,
+                &[(name.to_string(), Some((11, 53)))]
+            ),
+            "{name} declared Float64 must pass"
+        );
+        assert!(
+            !parsed_fp_vocabulary_is_binary64(
+                &parsed,
+                &defined,
+                &[(name.to_string(), Some((8, 24)))]
+            ),
+            "{name} declared Float32 must decline"
+        );
+    }
+
+    // The real rounding mode is skipped, so `RNE` needs no declaration.
+    let rne = vec![parse_assertion("(fp.isNormal (fp.mul RNE nx px))")];
+    let defined: Vec<(String, ay_frontend::command::Term)> = Vec::new();
+    assert!(parsed_fp_vocabulary_is_binary64(
+        &rne,
+        &defined,
+        &[
+            ("nx".to_string(), Some((11, 53))),
+            ("px".to_string(), Some((11, 53))),
+        ]
+    ));
+}
+
+#[test]
+fn fp_vocabulary_binary64_gate_declines_binding_forms() {
+    // A `let`-bound name is NOT the declared symbol of that name, so looking it
+    // up in the declaration table would read the wrong sort. Refuse the term.
+    let bound = vec![parse_assertion(
+        "(let ((nx (fp.mul RNE py pz))) (fp.isNormal nx))",
+    )];
+    let defined: Vec<(String, ay_frontend::command::Term)> = Vec::new();
+    assert!(!parsed_fp_vocabulary_is_binary64(
+        &bound,
+        &defined,
+        &f64_formats()
+    ));
+
+    // Same for a `let` hidden inside a macro body rather than an assertion.
+    let (parsed, _) = guard2_parsed_and_defined();
+    let shadowing_defined = vec![(
+        "t1".to_string(),
+        parse_assertion("(let ((px pz)) (fp.mul RNE nx px))"),
+    )];
+    assert!(!parsed_fp_vocabulary_is_binary64(
+        &parsed,
+        &shadowing_defined,
+        &f64_formats()
+    ));
+}
+
+#[test]
+fn fp_dot_error_bound_declines_the_satisfiable_float32_clone() {
+    // THE PREREQUISITE, end to end. Identical parsed terms, two declaration
+    // tables. Both must decline today (the semantic-bridge authority gate is
+    // still closed), but the Float32 one must decline for the FORMAT reason —
+    // which is checked directly by the gate assertions below, so that if the
+    // authority gate is ever opened the Float32 clone stays refused.
+    let (parsed, defined) = guard2_parsed_and_defined();
+
+    assert!(parsed_fp_vocabulary_is_binary64(
+        &parsed,
+        &defined,
+        &f64_formats()
+    ));
+    assert!(!parsed_fp_vocabulary_is_binary64(
+        &parsed,
+        &defined,
+        &fp_formats_of((8, 24))
+    ));
+
+    assert!(emit_fp_dot_error_bound_firewall_lean_from_parsed(
+        &parsed,
+        &defined,
+        &fp_formats_of((8, 24))
+    )
+    .is_none());
+    assert!(
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined, &f64_formats())
+            .is_none()
+    );
+}
+
 #[test]
 fn declines_fp_dot_error_bound_guard2_inlined_from_parsed() {
     // benchmarks/smt/QF_FPLRA/guard_claim_guard2.smt2 (define-funs inlined):
@@ -1647,7 +1890,10 @@ fn declines_fp_dot_error_bound_guard2_inlined_from_parsed() {
     let mut parsed = guard_mag_constraints("281474976710656.0");
     parsed.push(guard_threshold_inlined("2.0"));
     let defined: Vec<(String, ay_frontend::command::Term)> = Vec::new();
-    assert!(emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined).is_none());
+    assert!(
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined, &f64_formats())
+            .is_none()
+    );
 }
 
 #[test]
@@ -1672,7 +1918,10 @@ fn declines_fp_dot_error_bound_guard2_with_define_fun_resolution() {
     ];
     let mut parsed = guard_mag_constraints("B");
     parsed.push(parse_assertion("(>= (- (fp.to_real rf) rreal) 2.0)"));
-    assert!(emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined).is_none());
+    assert!(
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined, &f64_formats())
+            .is_none()
+    );
 }
 
 #[test]
@@ -1681,7 +1930,10 @@ fn declines_fp_dot_error_bound_higher_threshold_without_ieee_bridge() {
     let mut parsed = guard_mag_constraints("281474976710656.0");
     parsed.push(guard_threshold_inlined("4.0"));
     let defined: Vec<(String, ay_frontend::command::Term)> = Vec::new();
-    assert!(emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined).is_none());
+    assert!(
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined, &f64_formats())
+            .is_none()
+    );
 }
 
 #[test]
@@ -1695,7 +1947,8 @@ fn fp_dot_error_bound_threshold_authority_is_fail_closed_at_boundaries() {
         let mut parsed = guard_mag_constraints("281474976710656.0");
         parsed.push(guard_threshold_inlined(threshold));
         assert!(
-            emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined).is_none(),
+            emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined, &f64_formats())
+                .is_none(),
             "sub-2.0 threshold {threshold} must decline"
         );
     }
@@ -1704,14 +1957,16 @@ fn fp_dot_error_bound_threshold_authority_is_fail_closed_at_boundaries() {
     let mut below_two = guard_mag_constraints("281474976710656.0");
     below_two.push(guard_threshold_inlined("1.999999999999999999"));
     assert!(
-        emit_fp_dot_error_bound_firewall_lean_from_parsed(&below_two, &defined).is_none(),
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&below_two, &defined, &f64_formats())
+            .is_none(),
         "threshold immediately below 2.0 must decline"
     );
 
     let mut at_two = guard_mag_constraints("281474976710656.0");
     at_two.push(guard_threshold_inlined("2.0"));
     assert!(
-        emit_fp_dot_error_bound_firewall_lean_from_parsed(&at_two, &defined).is_none(),
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&at_two, &defined, &f64_formats())
+            .is_none(),
         "threshold 2.0 must decline without an IEEE-to-qround bridge"
     );
 }
@@ -1733,7 +1988,8 @@ fn fp_dot_error_bound_oversized_rationals_decline_without_panicking() {
         let mut parsed = guard_mag_constraints("281474976710656.0");
         parsed.push(guard_threshold_inlined(threshold));
         assert!(
-            emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined).is_none(),
+            emit_fp_dot_error_bound_firewall_lean_from_parsed(&parsed, &defined, &f64_formats())
+                .is_none(),
             "oversized threshold {threshold} must decline"
         );
     }
@@ -1747,18 +2003,27 @@ fn declines_fp_dot_error_bound_subthreshold_and_malformed() {
     // emitting UNSAT would be UNSOUND. Decline.
     let mut tight = guard_mag_constraints("281474976710656.0");
     tight.push(guard_threshold_inlined("0.0000001"));
-    assert!(emit_fp_dot_error_bound_firewall_lean_from_parsed(&tight, &defined).is_none());
+    assert!(
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&tight, &defined, &f64_formats())
+            .is_none()
+    );
 
     // Missing magnitude constraints (only the threshold assertion) — the scaling
     // model's spacing is unjustified, so fail-closed. Decline.
     let bare = vec![guard_threshold_inlined("2.0")];
-    assert!(emit_fp_dot_error_bound_firewall_lean_from_parsed(&bare, &defined).is_none());
+    assert!(
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&bare, &defined, &f64_formats())
+            .is_none()
+    );
 
     // Wrong position magnitude bound (2^49 instead of 2^48) — the modeled
     // spacing would UNDER-approximate the true ulp. Decline.
     let mut wrongb = guard_mag_constraints("562949953421312.0"); // 2^49
     wrongb.push(guard_threshold_inlined("2.0"));
-    assert!(emit_fp_dot_error_bound_firewall_lean_from_parsed(&wrongb, &defined).is_none());
+    assert!(
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&wrongb, &defined, &f64_formats())
+            .is_none()
+    );
 
     // Any non-RNE operation is outside the half-ULP theorem's scope.
     let mut wrong_rm = guard_mag_constraints("281474976710656.0");
@@ -1769,7 +2034,10 @@ fn declines_fp_dot_error_bound_subthreshold_and_malformed() {
             (+ (* (fp.to_real nx) (fp.to_real px)) (* (fp.to_real ny) (fp.to_real py)) \
                (* (fp.to_real nz) (fp.to_real pz)) (fp.to_real d))) 2.0)",
     ));
-    assert!(emit_fp_dot_error_bound_firewall_lean_from_parsed(&wrong_rm, &defined).is_none());
+    assert!(
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&wrong_rm, &defined, &f64_formats())
+            .is_none()
+    );
 
     // Reassociated accumulator (d added first) — not the certified association.
     let mut reassoc = guard_mag_constraints("281474976710656.0");
@@ -1780,7 +2048,10 @@ fn declines_fp_dot_error_bound_subthreshold_and_malformed() {
             (+ (* (fp.to_real nx) (fp.to_real px)) (* (fp.to_real ny) (fp.to_real py)) \
                (* (fp.to_real nz) (fp.to_real pz)) (fp.to_real d))) 2.0)",
     ));
-    assert!(emit_fp_dot_error_bound_firewall_lean_from_parsed(&reassoc, &defined).is_none());
+    assert!(
+        emit_fp_dot_error_bound_firewall_lean_from_parsed(&reassoc, &defined, &f64_formats())
+            .is_none()
+    );
 }
 
 #[test]
@@ -6658,4 +6929,784 @@ fn nia_product_declines_out_of_domain_coefficients() {
     let wide_refs: Vec<&str> = wide.iter().map(String::as_str).collect();
     let wide_parsed = nia_parsed(&wide_refs);
     assert!(emit_nia_product_firewall_lean_from_parsed(&wide_parsed, &[], &wide_context).is_none());
+}
+
+/// The binary64 vocabulary gate must range over the WHOLE formula, not over the
+/// symbols that happen to sit in direct `fp.*` operand position.
+///
+/// An earlier version collected only direct same-sort `fp.*` operands, so a
+/// non-binary64 value reachable any other way was never examined and the gate's
+/// `all(...)` passed VACUOUSLY. Since the entire purpose of the gate is that
+/// `Term::Symbol` carries no sort — the `Float32` clone of `guard_claim_guard2`
+/// has byte-identical parsed terms yet is SATISFIABLE — a subset check is worth
+/// nothing. Each shape below was demonstrated to return `true` before the fix.
+#[test]
+fn fp_vocabulary_gate_rejects_non_binary64_reachable_off_the_operand_path() {
+    // A Float32 symbol declared in the session, reachable only under `=`.
+    let via_eq = vec![parse_assertion("(= f32a f32b)")];
+    let mut table = f64_formats();
+    table.push(("f32a".to_string(), Some((8, 24))));
+    table.push(("f32b".to_string(), Some((8, 24))));
+    assert!(
+        !parsed_fp_vocabulary_is_binary64(&via_eq, &[], &table),
+        "a declared Float32 symbol must decline however it is reached"
+    );
+
+    // binary32 arithmetic behind an `(_ to_fp 8 24)` conversion: the indices
+    // name the result format, and IndexedApp arguments used to be recursed into
+    // without ever being collected.
+    let via_to_fp = vec![parse_assertion(
+        "(fp.isNormal ((_ to_fp 8 24) RNE (fp.to_real nx)))",
+    )];
+    assert!(
+        !parsed_fp_vocabulary_is_binary64(&via_to_fp, &[], &f64_formats()),
+        "a to_fp index pair other than (11,53) must decline"
+    );
+    // The binary64 conversion itself is still acceptable.
+    let to_fp64 = vec![parse_assertion(
+        "(fp.isNormal ((_ to_fp 11 53) RNE (fp.to_real nx)))",
+    )];
+    assert!(parsed_fp_vocabulary_is_binary64(
+        &to_fp64,
+        &[],
+        &f64_formats()
+    ));
+
+    // A Float32 operand under `ite`, which is not an `fp.*` operator.
+    let via_ite = vec![parse_assertion("(fp.isNormal (ite B f32a nx))")];
+    let mut ite_table = f64_formats();
+    ite_table.push(("f32a".to_string(), Some((8, 24))));
+    assert!(
+        !parsed_fp_vocabulary_is_binary64(&via_ite, &[], &ite_table),
+        "a Float32 value under `ite` must decline"
+    );
+
+    // An `(fp ...)` bit-pattern literal: the surface syntax does not carry the
+    // format, so it is refused outright rather than assumed binary64.
+    let via_literal = vec![parse_assertion(
+        "(fp.isNormal (fp #b0 #b00000001 #b00000000000000000000000))",
+    )];
+    assert!(
+        !parsed_fp_vocabulary_is_binary64(&via_literal, &[], &f64_formats()),
+        "an `fp` bit-pattern literal must decline"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `str.in_re` LENGTH-INVARIANT emitter (AySoundness.RegexThy).
+// ---------------------------------------------------------------------------
+
+fn in_re_parsed(asserts: &[&str]) -> Vec<ay_frontend::command::Term> {
+    asserts.iter().map(|s| parse_assertion(s)).collect()
+}
+
+/// Emit for a SINGLE-SHOT query (no push/pop, one check-sat).
+fn emit_in_re(asserts: &[&str]) -> Option<String> {
+    emit_str_in_re_len_firewall_lean_from_parsed(&in_re_parsed(asserts), true)
+}
+
+/// `benchmarks/smtcomp/QF_SLIA/.../regex-011-unsat-fuzz-graft-reverse.smt2` —
+/// the headline target. `":{'hAa"` is 6 code points and the regex is the
+/// doubly-nested `re.+ (re.* ...)`, so the MODULAR invariant sees `6 ∤ 4`
+/// straight through the nesting.
+#[test]
+fn emits_str_in_re_modular_conflict_for_regex_011() {
+    let lean = emit_in_re(&[
+        r#"(str.in_re x (re.+ (re.* (str.to_re ":{'hAa"))))"#,
+        r#"(str.in_re y (str.to_re "dP!$ba"))"#,
+        "(= 4 (str.len x))",
+    ])
+    .expect("modular conflict");
+    assert!(lean.contains("import AySoundness.RegexThy"));
+    assert!(lean.contains("RegexThy.regex_len_mod_conflict (k := 6)"));
+    assert!(lean.contains("decide (StringThy.len m = 4)"));
+    // `re.+ r` is rendered as the Lean `plus` abbreviation `cat r (star r)`.
+    assert!(lean.contains(
+        "RegexThy.Re.cat (RegexThy.Re.star (RegexThy.Re.lit [58, 123, 39, 104, 65, 97]))"
+    ));
+    assert!(lean.contains("theorem no_model"));
+}
+
+/// The finite-language tier: `str.to_re "...."` bounds every member at 4, and
+/// the modular check does NOT close it (4 ∣ 20).
+#[test]
+fn emits_str_in_re_max_len_conflict() {
+    let lean = emit_in_re(&[r#"(str.in_re x (str.to_re "...."))"#, "(= (str.len x) 20)"])
+        .expect("max-length conflict");
+    assert!(lean.contains("RegexThy.regex_len_max_conflict (n := 4)"));
+}
+
+/// The "too short" tier.
+#[test]
+fn emits_str_in_re_min_len_conflict() {
+    let lean = emit_in_re(&[
+        r#"(str.in_re x (re.++ (str.to_re "abc") (re.+ (str.to_re "de"))))"#,
+        "(= (str.len x) 4)",
+    ])
+    .expect("min-length conflict");
+    assert!(lean.contains("RegexThy.regex_len_min_conflict hm h"));
+}
+
+/// INEQUALITY pins fire only through the two proved inequality corollaries.
+/// `(< (str.len x) 5)` normalises to `len ≤ 4`, below `minLen = 5`.
+#[test]
+fn emits_str_in_re_min_len_conflict_for_strict_upper_bound() {
+    let lean = emit_in_re(&[
+        r#"(str.in_re x (re.++ (str.to_re "abc") (re.+ (str.to_re "de"))))"#,
+        "(< (str.len x) 5)",
+    ])
+    .expect("min-length inequality conflict");
+    assert!(lean.contains("RegexThy.regex_len_min_conflict_le hm h"));
+    assert!(lean.contains("decide (StringThy.len m ≤ 4)"));
+}
+
+/// `(> (str.len x) 4)` normalises to `5 ≤ len`, above `maxLen = 4`.
+#[test]
+fn emits_str_in_re_max_len_conflict_for_strict_lower_bound() {
+    let lean = emit_in_re(&[r#"(str.in_re x (str.to_re "...."))"#, "(> (str.len x) 4)"])
+        .expect("max-length inequality conflict");
+    assert!(lean.contains("RegexThy.regex_len_max_conflict_ge (n := 4)"));
+    assert!(lean.contains("decide (5 ≤ StringThy.len m)"));
+}
+
+/// SECTION-0 (O1). A membership asserted inside a `push` that is popped before
+/// the reported `check-sat` is NOT part of that query. The frontend export
+/// cannot express per-check-sat scoping, so the emitter declines outright on
+/// any query that used push/pop or a second check-sat — even when the very same
+/// assertion list would otherwise fire.
+#[test]
+fn declines_str_in_re_when_the_query_is_not_single_shot() {
+    let asserts = [
+        r#"(str.in_re x (re.+ (re.* (str.to_re ":{'hAa"))))"#,
+        "(= 4 (str.len x))",
+    ];
+    assert!(emit_in_re(&asserts).is_some());
+    assert!(emit_str_in_re_len_firewall_lean_from_parsed(&in_re_parsed(&asserts), false).is_none());
+}
+
+/// SECTION-0 (O3). The modular invariant has NO inequality form: `6 ∣ len x`
+/// is compatible with `len x < 4` (namely `len x = 0`). Firing `Mod` on an
+/// inequality would certify a falsehood, so the emitter must decline.
+#[test]
+fn declines_modular_tier_on_an_inequality_pin() {
+    // `re.* (str.to_re "abcdef")` has minLen 0 and unbounded maxLen, so only the
+    // modular tier could apply — and it must not, on an inequality.
+    assert!(emit_in_re(&[
+        r#"(str.in_re x (re.* (str.to_re "abcdef")))"#,
+        "(< (str.len x) 4)",
+    ])
+    .is_none());
+    assert!(emit_in_re(&[
+        r#"(str.in_re x (re.* (str.to_re "abcdef")))"#,
+        "(> (str.len x) 4)",
+    ])
+    .is_none());
+    // The equality form of the same conflict DOES fire.
+    assert!(emit_in_re(&[
+        r#"(str.in_re x (re.* (str.to_re "abcdef")))"#,
+        "(= (str.len x) 4)",
+    ])
+    .is_some());
+}
+
+/// SECTION-0 (O5). `re.loop` / `re.^` reach the parser as `IndexedApp`, and
+/// `AySoundness.RegexThy` proves no invariant for bounded repetition (its
+/// `n > m` case denotes the EMPTY language). The decline must be explicit, not
+/// an accident of the matcher's shape. Same for `re.comp` / `re.diff`.
+#[test]
+fn declines_unproven_regex_constructors() {
+    for regex in [
+        "((_ re.loop 2 3) (str.to_re \"ab\"))",
+        "((_ re.^ 3) (str.to_re \"ab\"))",
+        "(re.comp (str.to_re \"ab\"))",
+        "(re.diff (str.to_re \"ab\") (str.to_re \"cd\"))",
+    ] {
+        let asserts = [
+            format!("(str.in_re x {regex})"),
+            "(= (str.len x) 3)".to_string(),
+        ];
+        let refs: Vec<&str> = asserts.iter().map(String::as_str).collect();
+        assert!(emit_in_re(&refs).is_none(), "must decline on {regex}");
+    }
+    // A declined constructor NESTED inside an otherwise-supported one still
+    // declines the whole regex — there is no partial rendering.
+    assert!(emit_in_re(&[
+        "(str.in_re x (re.++ (str.to_re \"abcd\") (re.comp (str.to_re \"ab\"))))",
+        "(= (str.len x) 3)",
+    ])
+    .is_none());
+}
+
+/// `re.range` is rendered as the ONE-SIDED `anyChar` over-approximation. Sound
+/// for a refutation (the source assertion implies the rendered atom), but the
+/// artifact must say so rather than present itself as a byte-mirror.
+#[test]
+fn renders_re_range_as_a_declared_over_approximation() {
+    let lean = emit_in_re(&[
+        r#"(str.in_re x (re.++ (re.range "a" "z") (re.range "0" "9")))"#,
+        "(= (str.len x) 5)",
+    ])
+    .expect("max-length conflict through the anyChar over-approximation");
+    assert!(lean.contains("RegexThy.Re.anyChar"));
+    assert!(lean.contains("ONE-SIDED RENDERING"));
+    assert!(lean.contains("RegexThy.regex_len_max_conflict (n := 2)"));
+}
+
+/// The pin and the membership must name the SAME symbol.
+#[test]
+fn declines_when_the_length_pin_names_a_different_symbol() {
+    assert!(emit_in_re(&[
+        r#"(str.in_re x (re.+ (str.to_re "ed")))"#,
+        "(= (str.len y) 9)",
+    ])
+    .is_none());
+    assert!(emit_in_re(&[
+        r#"(str.in_re x (re.+ (str.to_re "ed")))"#,
+        "(= (str.len x) 9)",
+    ])
+    .is_some());
+}
+
+/// No conflict, no artifact: a length the regex genuinely admits.
+#[test]
+fn declines_when_the_pinned_length_is_admissible() {
+    assert!(emit_in_re(&[
+        r#"(str.in_re x (re.+ (str.to_re "ed")))"#,
+        "(= (str.len x) 8)",
+    ])
+    .is_none());
+}
+
+/// O2. String literals arrive pre-decoded by `ay_core::unescape_string_contents`
+/// through the frontend s-expression reader, so the emitter counts exactly the
+/// code points the SOLVER saw — there is no second decoder here to get out of
+/// step with the one the verdict was computed from.
+///
+/// The three SMT-LIB 2.6 behaviours that a C-style decoder gets WRONG, each of
+/// which would flip the modulus and so the verdict this emitter certifies:
+///   * `\u{41}` is ONE code point (`A`), not six;
+///   * `\t` is TWO characters (backslash, `t`) — a backslash is literal except
+///     in the two unicode escapes;
+///   * in `\\u{41}` the FIRST backslash is literal (the next character is not
+///     `u`) and the SECOND opens a real escape, giving TWO characters (`\`,
+///     `A`) — not one, and not seven.
+#[test]
+fn str_in_re_literal_length_follows_the_smtlib_escape_decoder() {
+    // `\u{41}` decodes to "A": one code point, refuting a length-0 pin through
+    // the minLen invariant.
+    let one = emit_in_re(&[r#"(str.in_re x (str.to_re "\u{41}"))"#, "(= (str.len x) 0)"])
+        .expect("single-code-point literal");
+    assert!(one.contains("RegexThy.Re.lit [65]"));
+    // `\t` is backslash + `t`, so `re.+` has modulus 2 and refutes len 5.
+    let backslash_t = emit_in_re(&[
+        r#"(str.in_re x (re.+ (str.to_re "\t")))"#,
+        "(= (str.len x) 5)",
+    ])
+    .expect("literal backslash-t");
+    assert!(backslash_t.contains("RegexThy.Re.lit [92, 116]"));
+    assert!(backslash_t.contains("RegexThy.regex_len_mod_conflict (k := 2)"));
+    // `\\u{41}` is a literal backslash followed by a REAL escape: `\`, `A`.
+    let mixed = emit_in_re(&[
+        r#"(str.in_re x (re.+ (str.to_re "\\u{41}")))"#,
+        "(= (str.len x) 5)",
+    ])
+    .expect("literal backslash then escape");
+    assert!(mixed.contains("RegexThy.Re.lit [92, 65]"));
+    assert!(mixed.contains("RegexThy.regex_len_mod_conflict (k := 2)"));
+}
+
+/// Every operator name the emitter interprets must be RESERVED, so a user
+/// `declare-fun` of that name cannot be conflated with the builtin. (The
+/// emitter re-checks this at run time and fails closed; this pins the table.)
+#[test]
+fn str_in_re_interpreted_ops_are_all_reserved() {
+    for name in REGEX_LEN_INTERPRETED_OPS {
+        assert!(
+            ay_frontend::is_reserved_op_name(name),
+            "{name} must be reserved or the emitter would conflate a user function with it"
+        );
+    }
+}
+
+/// Text spliced into the emitted block comment must not be able to open a
+/// nested comment (`/-`) or close the header early (`-/`).
+#[test]
+fn lean_comment_safe_neutralises_comment_delimiters() {
+    let out = lean_comment_safe("a/-b-/c");
+    assert!(!out.contains("/-"));
+    assert!(!out.contains("-/"));
+    assert_eq!(lean_comment_safe("plain_name"), "plain_name");
+    // Non-printable / non-ASCII is replaced rather than emitted verbatim.
+    assert_eq!(lean_comment_safe("a\nb\u{1F600}"), "a?b?");
+}
+
+/// The Rust length abstractions must agree with the Lean ones they mirror; a
+/// disagreement only ever produces a file that fails to compile, but that is a
+/// wasted artifact, so pin the arithmetic.
+#[test]
+fn regex_len_abstractions_mirror_the_lean_definitions() {
+    let w6 = ReAst::Lit(vec![58, 123, 39, 104, 65, 97]);
+    let plus_star = ReAst::Cat(
+        Box::new(ReAst::Star(Box::new(w6.clone()))),
+        Box::new(ReAst::Star(Box::new(ReAst::Star(Box::new(w6.clone()))))),
+    );
+    assert_eq!(plus_star.modulus(), 6);
+    assert!(plus_star.kdvd(6));
+    assert_eq!(plus_star.min_len(), Some(0));
+    assert_eq!(plus_star.max_len(), None);
+    // `star` of a language whose only member is ε is bounded by 0.
+    let star_eps = ReAst::Star(Box::new(ReAst::Lit(Vec::new())));
+    assert_eq!(star_eps.max_len(), Some(0));
+    // `0 ∣ n` only for `n = 0`, matching Lean's `Nat.dvd`.
+    assert!(divides(0, 0));
+    assert!(!divides(0, 3));
+    // `inter` is one-sided in BOTH directions.
+    let inter = ReAst::Inter(Box::new(w6), Box::new(ReAst::Lit(vec![1, 2, 3, 4])));
+    assert_eq!(inter.min_len(), Some(6));
+    assert_eq!(inter.max_len(), Some(4));
+    assert!(inter.kdvd(6));
+    assert!(inter.kdvd(4));
+}
+
+/// The `re.+` desugaring DUPLICATES its operand, so `(re.+ (re.+ (re.+ …)))`
+/// doubles the rendered node count at every level. Without a size check at each
+/// construction point, a 40-deep nest would allocate `2^40` nodes before any
+/// post-hoc cap could look at the result. The emitter must decline in bounded
+/// time and bounded memory.
+#[test]
+fn str_in_re_declines_exponentially_blowing_up_nests_in_bounded_memory() {
+    let mut regex = String::from(r#"(str.to_re "ab")"#);
+    for _ in 0..40 {
+        regex = format!("(re.+ {regex})");
+    }
+    let asserts = [
+        format!("(str.in_re x {regex})"),
+        "(= (str.len x) 3)".to_string(),
+    ];
+    let refs: Vec<&str> = asserts.iter().map(String::as_str).collect();
+    assert!(emit_in_re(&refs).is_none());
+    // A literal past the character cap is declined at the leaf, before it can
+    // be duplicated by an enclosing `re.+`.
+    let long = "a".repeat(REGEX_LEN_MAX_LITERAL_CHARS + 1);
+    let asserts = [
+        format!(r#"(str.in_re x (str.to_re "{long}"))"#),
+        "(= (str.len x) 3)".to_string(),
+    ];
+    let refs: Vec<&str> = asserts.iter().map(String::as_str).collect();
+    assert!(emit_in_re(&refs).is_none());
+    // Just under the node cap still emits, so the guard is not vacuous.
+    let mut small = String::from(r#"(str.to_re "ab")"#);
+    for _ in 0..4 {
+        small = format!("(re.+ {small})");
+    }
+    let asserts = [
+        format!("(str.in_re x {small})"),
+        "(= (str.len x) 3)".to_string(),
+    ];
+    let refs: Vec<&str> = asserts.iter().map(String::as_str).collect();
+    assert!(emit_in_re(&refs).is_some());
+}
+
+// ==== APPENDED TESTS: euf_uflra (REAL-faithful ordered-field firewall) ====
+
+/// The five assertions of `benchmarks/smt/QF_UFLRA/unsat_equality_propagation.smt2`.
+fn ordfield_target_assertions() -> Vec<ay_frontend::command::Term> {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let dec = |d: &str| PTerm::Const(PConst::Decimal(d.to_string()));
+    let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+    vec![
+        app(">=", vec![sym("x"), dec("5.0")]),
+        app("<=", vec![sym("x"), dec("5.0")]),
+        app("=", vec![sym("y"), dec("5.0")]),
+        app("=", vec![app("f", vec![sym("x")]), dec("10.0")]),
+        app("=", vec![app("f", vec![sym("y")]), dec("20.0")]),
+    ]
+}
+
+#[test]
+fn emits_euf_ordfield_congruence_from_parsed_real_assertions() {
+    let real_context = cbr_typed_context(Sort::Real);
+    let lean = emit_euf_ordfield_congruence_firewall_lean_from_parsed(
+        &ordfield_target_assertions(),
+        &real_context,
+    )
+    .expect("Real-sorted EUF congruence conflict should emit");
+    // The header must list exactly the two allow-listed imports, in this order.
+    assert!(lean.starts_with("import AySoundness.Firewall\nimport AySoundness.OrdField\n"));
+    assert!(lean.contains("firewall_combined_unsat"));
+    // The model is an ARBITRARY ordered field, never Int/Rat.
+    assert!(lean.contains("structure Val (F : OrdField)"));
+    assert!(lean.contains("f_f : F.carrier -> F.carrier"));
+    assert!(!lean.contains(": Int"));
+    // No integer reasoning survives into the CODE (the header prose mentions
+    // `omega` only to say what it replaced).
+    let code = lean.split_once("\n-/\n").expect("header block").1;
+    assert!(!code.contains("omega"));
+    // The only `Int` left is the LRAT hint list's element type, never a model
+    // carrier: `: Int` (a field or ascription) must not appear at all.
+    assert!(code.contains("List Int"));
+    // The two ordered-field steps that replace `omega`.
+    assert!(lean.contains("F.le_antisymm"));
+    assert!(lean.contains("F.ofNat_ne"));
+}
+
+#[test]
+fn euf_ordfield_firewall_declines_int_sorted_assertions() {
+    // O1, direction A: an Int file must NEVER reach the ordered-field render.
+    let int_context = cbr_typed_context(Sort::Int);
+    assert!(
+        emit_euf_ordfield_congruence_firewall_lean_from_parsed(
+            &ordfield_target_assertions(),
+            &int_context
+        )
+        .is_none(),
+        "Int-sorted symbols must not route to the ordered-field emitter"
+    );
+}
+
+#[test]
+fn euf_lia_firewall_declines_real_sorted_assertions() {
+    // O1, direction B: a Real file must NEVER reach the `omega`/Int render.
+    let real_context = cbr_typed_context(Sort::Real);
+    assert!(
+        emit_euf_lia_congruence_firewall_lean_from_parsed(
+            &ordfield_target_assertions(),
+            &real_context
+        )
+        .is_none(),
+        "Real-sorted symbols must not route to the Int emitter"
+    );
+}
+
+#[test]
+fn euf_ordfield_firewall_never_pins_from_strict_bounds() {
+    // O1, the measured consequence: `x > 5 && x < 7` pins `x = 6` over Int but
+    // leaves `x` free over ℝ, where the whole conjunction is SAT. The Int
+    // emitter must fire on the Int analogue and the Real one must decline.
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |n: &str| PTerm::Const(PConst::Numeral(n.to_string()));
+    let dec = |d: &str| PTerm::Const(PConst::Decimal(d.to_string()));
+    let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+
+    let real_parsed = vec![
+        app(">", vec![sym("x"), dec("5.0")]),
+        app("<", vec![sym("x"), dec("7.0")]),
+        app("=", vec![sym("y"), dec("6.0")]),
+        app("=", vec![app("f", vec![sym("x")]), dec("10.0")]),
+        app("=", vec![app("f", vec![sym("y")]), dec("20.0")]),
+    ];
+    assert!(
+        emit_euf_ordfield_congruence_firewall_lean_from_parsed(
+            &real_parsed,
+            &cbr_typed_context(Sort::Real)
+        )
+        .is_none(),
+        "strict Real bounds pin nothing; this conjunction is SAT over ℝ"
+    );
+
+    let int_parsed = vec![
+        app(">", vec![sym("x"), num("5")]),
+        app("<", vec![sym("x"), num("7")]),
+        app("=", vec![sym("y"), num("6")]),
+        app("=", vec![app("f", vec![sym("x")]), num("10")]),
+        app("=", vec![app("f", vec![sym("y")]), num("20")]),
+    ];
+    assert!(
+        emit_euf_lia_congruence_firewall_lean_from_parsed(
+            &int_parsed,
+            &cbr_typed_context(Sort::Int)
+        )
+        .is_some(),
+        "the Int analogue IS unsat and must keep its omega-discharged artifact"
+    );
+}
+
+#[test]
+fn euf_ordfield_firewall_declines_colliding_sanitized_symbols() {
+    // O3: two distinct SMT symbols that sanitize onto one `Val` field would
+    // silently force an equality, proving a MORE-CONSTRAINED formula.
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let dec = |d: &str| PTerm::Const(PConst::Decimal(d.to_string()));
+    let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+
+    let mut context = cbr_typed_context(Sort::Real);
+    register_firewall_test_constant(&mut context, "p-q", Sort::Real);
+    register_firewall_test_constant(&mut context, "p.q", Sort::Real);
+    let parsed = vec![
+        app("=", vec![sym("p-q"), dec("5.0")]),
+        app("=", vec![sym("p.q"), dec("5.0")]),
+        app("=", vec![app("f", vec![sym("p-q")]), dec("10.0")]),
+        app("=", vec![app("f", vec![sym("p.q")]), dec("20.0")]),
+    ];
+    assert!(
+        emit_euf_ordfield_congruence_firewall_lean_from_parsed(&parsed, &context).is_none(),
+        "`p-q` and `p.q` both sanitize to `x_p_q` and must be declined"
+    );
+}
+
+#[test]
+fn euf_ordfield_firewall_declines_unrepresentable_literals() {
+    // Only NON-NEGATIVE INTEGER-VALUED Real literals have an `F.ofNat` image.
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let dec = |d: &str| PTerm::Const(PConst::Decimal(d.to_string()));
+    let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+    let context = cbr_typed_context(Sort::Real);
+
+    // A genuinely fractional decimal.
+    let fractional = vec![
+        app("=", vec![sym("x"), dec("2.5")]),
+        app("=", vec![sym("y"), dec("2.5")]),
+        app("=", vec![app("f", vec![sym("x")]), dec("10.0")]),
+        app("=", vec![app("f", vec![sym("y")]), dec("20.0")]),
+    ];
+    assert!(
+        emit_euf_ordfield_congruence_firewall_lean_from_parsed(&fractional, &context).is_none()
+    );
+
+    // A negated numeral is an arithmetic application, not a literal.
+    let negative = vec![
+        app("=", vec![sym("x"), app("-", vec![dec("5.0")])]),
+        app("=", vec![sym("y"), app("-", vec![dec("5.0")])]),
+        app("=", vec![app("f", vec![sym("x")]), dec("10.0")]),
+        app("=", vec![app("f", vec![sym("y")]), dec("20.0")]),
+    ];
+    assert!(emit_euf_ordfield_congruence_firewall_lean_from_parsed(&negative, &context).is_none());
+
+    // Any arithmetic operator at all: atoms are rendered directly, never
+    // normalized, so no linear form (and no unrepresentable negative
+    // coefficient) can ever arise.
+    let arithmetic = vec![
+        app("=", vec![app("+", vec![sym("x"), dec("1.0")]), dec("5.0")]),
+        app("=", vec![sym("y"), dec("4.0")]),
+        app("=", vec![app("f", vec![sym("x")]), dec("10.0")]),
+        app("=", vec![app("f", vec![sym("y")]), dec("20.0")]),
+    ];
+    assert!(
+        emit_euf_ordfield_congruence_firewall_lean_from_parsed(&arithmetic, &context).is_none()
+    );
+}
+
+#[test]
+fn euf_ordfield_firewall_declines_consistent_real_assertions() {
+    // No congruence conflict and no empty interval: nothing to certify.
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let dec = |d: &str| PTerm::Const(PConst::Decimal(d.to_string()));
+    let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+    let parsed = vec![
+        app(">=", vec![sym("x"), dec("5.0")]),
+        app("<=", vec![sym("x"), dec("9.0")]),
+        app("=", vec![app("f", vec![sym("x")]), dec("10.0")]),
+        app("=", vec![app("f", vec![sym("y")]), dec("20.0")]),
+    ];
+    assert!(emit_euf_ordfield_congruence_firewall_lean_from_parsed(
+        &parsed,
+        &cbr_typed_context(Sort::Real)
+    )
+    .is_none());
+}
+
+#[test]
+fn emits_euf_ordfield_bound_contradiction() {
+    use ay_frontend::command::{Constant as PConst, Term as PTerm};
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let dec = |d: &str| PTerm::Const(PConst::Decimal(d.to_string()));
+    let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+    let context = cbr_typed_context(Sort::Real);
+
+    // Crossed weak bounds: `x >= 10 && x <= 5`.
+    let crossed = vec![
+        app(">=", vec![sym("x"), dec("10.0")]),
+        app("<=", vec![sym("x"), dec("5.0")]),
+    ];
+    let lean = emit_euf_ordfield_congruence_firewall_lean_from_parsed(&crossed, &context)
+        .expect("crossed Real bounds should emit");
+    assert!(lean.contains("F.lt_le_absurd"));
+    assert!(lean.contains("F.ofNat_lt_of_lt"));
+    assert!(!lean
+        .split_once("\n-/\n")
+        .expect("header block")
+        .1
+        .contains("omega"));
+
+    // Empty open interval: `x > 5 && x < 5`.
+    let strict = vec![
+        app(">", vec![sym("x"), dec("5.0")]),
+        app("<", vec![sym("x"), dec("5.0")]),
+    ];
+    let lean = emit_euf_ordfield_congruence_firewall_lean_from_parsed(&strict, &context)
+        .expect("empty open Real interval should emit");
+    assert!(lean.contains("F.lt_le_absurd"));
+
+    // NON-empty: `x >= 5 && x <= 5` is satisfiable (x = 5) and must decline.
+    let pinned = vec![
+        app(">=", vec![sym("x"), dec("5.0")]),
+        app("<=", vec![sym("x"), dec("5.0")]),
+    ];
+    assert!(
+        emit_euf_ordfield_congruence_firewall_lean_from_parsed(&pinned, &context).is_none(),
+        "`x >= 5 && x <= 5` is SAT; a certificate here would be unsound"
+    );
+
+    // NON-empty open interval: `x > 5 && x < 7` is SAT over ℝ.
+    let open = vec![
+        app(">", vec![sym("x"), dec("5.0")]),
+        app("<", vec![sym("x"), dec("7.0")]),
+    ];
+    assert!(
+        emit_euf_ordfield_congruence_firewall_lean_from_parsed(&open, &context).is_none(),
+        "`x > 5 && x < 7` is SAT over ℝ even though it is UNSAT over Int"
+    );
+}
+
+/// The verifier's exact reproduction: Float32 symbols reachable only under `=`,
+/// alongside a Float64 operand. Must decline.
+#[test]
+fn fp_gate_declines_float32_under_equality_verifier_repro() {
+    let parsed = vec![
+        parse_assertion("(= g h)"),
+        parse_assertion("(fp.isNormal nx)"),
+    ];
+    let mut table = f64_formats();
+    table.push(("g".to_string(), Some((8, 24))));
+    table.push(("h".to_string(), Some((8, 24))));
+    assert!(
+        !parsed_fp_vocabulary_is_binary64(&parsed, &[], &table),
+        "Float32 under `=` alongside a Float64 operand must decline"
+    );
+}
+
+/// The emitted `str.in_re` artifact must carry a `maxRecDepth` that SCALES with
+/// the rendered regex.
+///
+/// The rendered `Re` is one constructor per code point, so `decide`/`simp`
+/// recurse once per character. Under Lean's default depth (512) a literal past
+/// ~120 code points overflowed: the artifact failed to compile and reported
+/// `sorryAx`. Measured cliff before the fix — 111 code points kernel-checked,
+/// 130 did not — and an artifact that does not kernel-check is worse than
+/// declining. The guard is SCALED, never disabled: proof size is
+/// attacker-amplifiable, so it must move with the input rather than switch off.
+#[test]
+fn str_in_re_artifact_scales_max_rec_depth_with_the_regex() {
+    let depth_for = |n: usize| -> usize {
+        let lit = "a".repeat(n);
+        let asserts = [
+            format!(r#"(str.in_re x (re.++ (str.to_re "{lit}") (str.to_re "cd")))"#),
+            "(= (str.len x) 3)".to_string(),
+        ];
+        let refs: Vec<&str> = asserts.iter().map(String::as_str).collect();
+        let lean = emit_in_re(&refs).expect("emitter fires on the length-invariant shape");
+        let tail = lean
+            .split("set_option maxRecDepth ")
+            .nth(1)
+            .expect("emitted artifact must set maxRecDepth");
+        tail.split_whitespace()
+            .next()
+            .expect("a numeric depth")
+            .parse()
+            .expect("a numeric depth")
+    };
+
+    let small = depth_for(2);
+    let large = depth_for(400);
+    assert!(
+        small >= 4_096,
+        "even a tiny regex gets the clamped floor, got {small}"
+    );
+    assert!(
+        large > small,
+        "depth must grow with the rendered regex: {small} -> {large}"
+    );
+    assert!(
+        large <= 262_144,
+        "and stay clamped so a hostile proof cannot demand an unbounded stack, got {large}"
+    );
+}
+
+/// Atoms that defeat the nested-`by_cases` closing tactic must make the emitter
+/// DECLINE, not write an artifact that fails to compile.
+///
+/// Both shapes were found by fuzzing and both produced a file that fails
+/// `lake env lean` and reports `sorryAx` — strictly worse than declining, and a
+/// REGRESSION against the previous behaviour of declining these inputs.
+///
+/// 1. A syntactically reflexive equality: `simp`'s `eq_self` rewrites the atom
+///    to `True` before the branch hypothesis `¬(t = t)` can be used, so the goal
+///    survives. Adding `(assert (= x x))` to the otherwise-clean frontier
+///    benchmark was enough to turn a checking artifact into a `sorryAx` one.
+/// 2. A disequality whose sides stand in an occurs relation: the closing branch
+///    hands `h : y = g y` to `simp` as a rewrite rule, which loops to
+///    "maximum recursion depth".
+#[test]
+fn ordfield_emitter_declines_atoms_that_defeat_the_closing_tactic() {
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let dec = |s: &str| PTerm::Const(PConst::Decimal(s.to_string()));
+    let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+    let real_context = cbr_typed_context(Sort::Real);
+
+    // Control: the frontier target itself still emits.
+    assert!(emit_euf_ordfield_congruence_firewall_lean_from_parsed(
+        &ordfield_target_assertions(),
+        &real_context
+    )
+    .is_some());
+
+    // 1. The target plus a harmless reflexive equality must now DECLINE.
+    let mut with_refl = ordfield_target_assertions();
+    with_refl.push(app("=", vec![sym("x"), sym("x")]));
+    assert!(
+        emit_euf_ordfield_congruence_firewall_lean_from_parsed(&with_refl, &real_context).is_none(),
+        "a reflexive equality atom defeats the closing tactic and must decline"
+    );
+
+    // A reflexive equality between two renderings of the same numeral likewise.
+    let mut with_num_refl = ordfield_target_assertions();
+    with_num_refl.push(app("=", vec![dec("5.0"), dec("5.0")]));
+    assert!(
+        emit_euf_ordfield_congruence_firewall_lean_from_parsed(&with_num_refl, &real_context)
+            .is_none(),
+        "a reflexive numeral equality must decline too"
+    );
+
+    // 2. A disequality whose sides stand in an occurs relation must DECLINE.
+    let mut with_occurs = ordfield_target_assertions();
+    with_occurs.push(app(
+        "not",
+        vec![app("=", vec![sym("y"), app("f", vec![sym("y")])])],
+    ));
+    assert!(
+        emit_euf_ordfield_congruence_firewall_lean_from_parsed(&with_occurs, &real_context)
+            .is_none(),
+        "an occurs-relation disequality loops the closing `simp` and must decline"
+    );
+}
+
+/// The same guard on the Int emitter this one was modelled on — the reflexive
+/// class was present there first and was copied along with the closing tactic.
+#[test]
+fn euf_lia_emitter_declines_reflexive_equality_atoms() {
+    let sym = |s: &str| PTerm::Symbol(s.to_string());
+    let num = |s: &str| PTerm::Const(PConst::Numeral(s.to_string()));
+    let app = |op: &str, a: Vec<PTerm>| PTerm::App(op.to_string(), a);
+    let int_context = cbr_typed_context(Sort::Int);
+
+    let base = vec![
+        app(">=", vec![sym("a"), num("3")]),
+        app("<=", vec![sym("a"), num("3")]),
+        app("=", vec![sym("b"), num("3")]),
+        app("=", vec![app("f", vec![sym("a")]), num("10")]),
+        app("=", vec![app("f", vec![sym("b")]), num("20")]),
+    ];
+    assert!(emit_euf_lia_congruence_firewall_lean_from_parsed(&base, &int_context).is_some());
+
+    let mut with_refl = base;
+    with_refl.push(app("=", vec![sym("a"), sym("a")]));
+    assert!(
+        emit_euf_lia_congruence_firewall_lean_from_parsed(&with_refl, &int_context).is_none(),
+        "the Int emitter must decline the same reflexive shape"
+    );
 }

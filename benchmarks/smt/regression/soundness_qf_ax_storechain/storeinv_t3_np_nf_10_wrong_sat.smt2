@@ -7,6 +7,7 @@
 ; assertions_contain_array_disequality -> downgrade Sat to Unknown). Now: unknown (sound).
 (set-info :status unsat)
 (set-logic QF_AX)
+(set-info :source |
 Benchmarks used in the followin paper:
 Big proof engines as little proof engines: new results on rewrite-based satisfiability procedure
 Alessandro Armando, Maria Paola Bonacina, Silvio Ranise, Stephan Schulz. 

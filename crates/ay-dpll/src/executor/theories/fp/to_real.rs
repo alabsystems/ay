@@ -38,6 +38,10 @@ pub(super) struct FpEncoding {
     pub(super) var_offset: i32,
     /// Total variable count (Tseitin + FP).
     pub(super) total_vars: usize,
+    /// True when the encoder could not represent some uninterpreted structure
+    /// (see the `congruence` module). The encoding is still a relaxation, so
+    /// `unsat` transfers, but every `sat` must degrade to `unknown`.
+    pub(super) congruence_incomplete: bool,
 }
 
 /// Result of solving a rewritten mixed subproblem.

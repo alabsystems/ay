@@ -20,8 +20,19 @@ use crate::executor_types::{Result, SolveResult};
 use crate::term_helpers::{collect_bool_arg_congruence_lemmas, or_implies_eq_endpoints};
 // #8529: Use deterministic hash sets in all builds.
 use ay_core::kani_compat::DetHashSet as HashSet;
-use ay_core::{TermId, TermStore, TheoryLemmaKind};
+use ay_core::term::TermData;
+use ay_core::{Sort, TermId, TermStore, TheoryLemmaKind};
 use ay_euf::EufSolver;
+
+/// `AY_EUF_BOOL_ARG_REPAIR=1` enables the targeted Bool-arg congruence repair
+/// loop in `solve_euf`. DEFAULT OFF: unset keeps the historical behaviour of
+/// surrendering the check-sat to `Unknown` when the post-SAT guard rejects a
+/// non-congruent model, so the default path is byte-identical. Single cached
+/// env read.
+fn bool_arg_repair_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AY_EUF_BOOL_ARG_REPAIR").ok().as_deref() == Some("1"))
+}
 
 /// Collect all TermIds transitively reachable from the given root terms (#6726).
 /// Used to scope array axiom generation to terms in the current assertion set,
@@ -101,9 +112,7 @@ impl Executor {
         let len = self.ctx.terms.len();
         for idx in 0..len {
             let t = TermId::new(idx as u32);
-            if matches!(self.ctx.terms.get(t), ay_core::TermData::Var(..))
-                && !reachable.contains(&t)
-            {
+            if matches!(self.ctx.terms.get(t), TermData::Var(..)) && !reachable.contains(&t) {
                 return true;
             }
         }
@@ -118,7 +127,7 @@ impl Executor {
         (0..len).any(|idx| {
             matches!(
                 self.ctx.terms.get(TermId::new(idx as u32)),
-                ay_core::TermData::Var(..)
+                TermData::Var(..)
             )
         })
     }
@@ -135,9 +144,9 @@ impl Executor {
             return format!("#{}", term.0);
         }
         match self.ctx.terms.get(term) {
-            ay_core::TermData::Const(c) => format!("{c:?}"),
-            ay_core::TermData::Var(name, _) => format!("{}#{}", name, term.0),
-            ay_core::TermData::App(sym, args) => {
+            TermData::Const(c) => format!("{c:?}"),
+            TermData::Var(name, _) => format!("{}#{}", name, term.0),
+            TermData::App(sym, args) => {
                 let mut s = format!("({}#{}", sym.name(), term.0);
                 for a in args {
                     s.push(' ');
@@ -146,14 +155,14 @@ impl Executor {
                 s.push(')');
                 s
             }
-            ay_core::TermData::Not(inner) => {
+            TermData::Not(inner) => {
                 format!(
                     "(not#{} {})",
                     term.0,
                     self.pretty_print_term_for_debug(*inner, depth - 1)
                 )
             }
-            ay_core::TermData::Ite(c, t, e) => {
+            TermData::Ite(c, t, e) => {
                 format!(
                     "(ite#{} {} {} {})",
                     term.0,
@@ -200,7 +209,7 @@ impl Executor {
             // available.  In particular, the `site` string must never decide a
             // proof rule.
             let clause = match self.ctx.terms.get(axiom) {
-                ay_core::TermData::App(sym, args) if sym.name() == "or" => args.clone(),
+                TermData::App(sym, args) if sym.name() == "or" => args.clone(),
                 _ => vec![axiom],
             };
             if let Some(index_eq) = ay_proof::recognize_array_select_store(&self.ctx.terms, &clause)
@@ -243,7 +252,7 @@ impl Executor {
             DetHashMap::default();
         for idx in 0..self.ctx.terms.len() {
             let term_id = TermId(idx as u32);
-            if let ay_core::TermData::App(sym, args) = self.ctx.terms.get(term_id) {
+            if let TermData::App(sym, args) = self.ctx.terms.get(term_id) {
                 if args.is_empty() || crate::features::is_builtin_symbol_name(sym.name()) {
                     continue;
                 }
@@ -392,8 +401,6 @@ impl Executor {
             }
         }
 
-        let solve_interrupt = self.solve_interrupt.clone();
-        let solve_deadline = self.solve_deadline.clone();
         // #bool-arg-congruence: the SOUND post-SAT model-validation guard runs in
         // BOTH incremental and non-incremental modes. It only ever downgrades a
         // candidate `Sat` to `Unknown` (never asserts UNSAT), so it carries zero
@@ -416,7 +423,131 @@ impl Executor {
         // verdicts were certified against models that violate functional
         // congruence. `AY_EUF_BOOL_ARG_VALIDATE=0` disables the guard entirely
         // for experiments.
-        self.with_isolated_incremental_state(None, |this| {
+        // #clearsy-repair: targeted Bool-arg congruence repair (DEFAULT OFF).
+        //
+        // The post-SAT guard downgrades `Sat` -> `Unknown` when the candidate
+        // model is non-congruent over Bool UF-args, even where a *congruent*
+        // model exists (z3 finds one). On the 20190906-CLEARSY incremental
+        // proof-obligation files that costs 57 otherwise-decidable check-sats
+        // (measured: Inc QF_Equality 14,001 of a 14,060 ceiling).
+        //
+        // Rather than surrender, re-solve with the congruence axiom instances
+        // for exactly the app pairs the guard found FORCED equal under that
+        // model. Injecting a lemma for every Bool-arg pair in the reachable set
+        // is measured DEAD here (completeness 121 -> ~50); this set is
+        // model-specific and small, which is what makes it viable.
+        //
+        // SOUND BY CONSTRUCTION: only valid instances of the congruence axiom
+        // are added, so no sat/unsat verdict can flip; the lemmas ride through
+        // `solve_euf_once(Some(..))`, whose isolation discards them on exit so
+        // they cannot leak into a later check-sat; and exhausting the attempt
+        // bound returns the guard's original `Unknown`, i.e. today's behaviour.
+        //
+        // UNMEASURED — gate stays OFF until a CLEARSY-sweep differential shows
+        // the completeness collapse does not recur at this granularity.
+        if !bool_arg_repair_enabled() {
+            return self.solve_euf_once(None);
+        }
+
+        const MAX_REPAIR_ROUNDS: usize = 4;
+        ay_euf::clear_bool_arg_repair_candidates();
+        let base_assertions = self.ctx.assertions.clone();
+        let mut extra: Vec<TermId> = Vec::new();
+        let mut seen: HashSet<(TermId, TermId)> = HashSet::default();
+
+        for _round in 0..=MAX_REPAIR_ROUNDS {
+            let run_assertions = if extra.is_empty() {
+                None
+            } else {
+                let mut v = base_assertions.clone();
+                v.extend(extra.iter().copied());
+                Some(v)
+            };
+            let result = self.solve_euf_once(run_assertions)?;
+            if !matches!(result, SolveResult::Unknown) {
+                return Ok(result);
+            }
+            let candidates = ay_euf::take_bool_arg_repair_candidates();
+            let mut added = false;
+            for (app_a, app_b) in candidates {
+                let key = if app_a.0 <= app_b.0 {
+                    (app_a, app_b)
+                } else {
+                    (app_b, app_a)
+                };
+                if !seen.insert(key) {
+                    continue;
+                }
+                if let Some(lemma) = self.bool_arg_congruence_lemma(app_a, app_b) {
+                    extra.push(lemma);
+                    added = true;
+                }
+            }
+            if !added {
+                return Ok(result);
+            }
+        }
+        // Attempt bound exhausted: fall back to the guard's verdict.
+        self.solve_euf_once(None)
+    }
+
+    /// Build `(/\_i a_i = b_i) -> f(a) = f(b)` as the clause
+    /// `\/_i ~(a_i = b_i) \/ (f(a) = f(b))` for one forced-congruence app pair,
+    /// restricted to the Bool-sorted argument positions where the two differ.
+    ///
+    /// Returns `None` when the pair is not two same-arity applications, or when
+    /// no Bool-sorted position actually differs (nothing to constrain).
+    fn bool_arg_congruence_lemma(&mut self, app_a: TermId, app_b: TermId) -> Option<TermId> {
+        if app_a == app_b {
+            return None;
+        }
+        let (args_a, args_b) = match (self.ctx.terms.get(app_a), self.ctx.terms.get(app_b)) {
+            (TermData::App(sym_a, aa), TermData::App(sym_b, bb)) => {
+                if sym_a != sym_b || aa.len() != bb.len() {
+                    return None;
+                }
+                (aa.clone(), bb.clone())
+            }
+            _ => return None,
+        };
+        let mut bool_pairs: Vec<(TermId, TermId)> = Vec::new();
+        for (&a, &b) in args_a.iter().zip(args_b.iter()) {
+            if a == b {
+                continue;
+            }
+            if self.ctx.terms.sort(a) == &Sort::Bool && self.ctx.terms.sort(b) == &Sort::Bool {
+                bool_pairs.push((a, b));
+            } else {
+                // A differing NON-Bool position means these apps are not related
+                // by the Bool-arg gap; emitting the lemma would be unhelpful (and
+                // its antecedent would not be the congruence trigger).
+                return None;
+            }
+        }
+        if bool_pairs.is_empty() {
+            return None;
+        }
+        let mut clause_lits: Vec<TermId> = Vec::with_capacity(bool_pairs.len() + 1);
+        for (a, b) in bool_pairs {
+            let arg_eq = self.ctx.terms.mk_eq(a, b);
+            clause_lits.push(self.ctx.terms.mk_not(arg_eq));
+        }
+        let app_eq = self.ctx.terms.mk_eq(app_a, app_b);
+        clause_lits.push(app_eq);
+        Some(self.ctx.terms.mk_or(clause_lits))
+    }
+
+    /// One EUF solve attempt, optionally with a REPLACEMENT assertion list.
+    ///
+    /// `assertions: Some(v)` routes through `with_isolated_incremental_state`'s
+    /// swap-and-restore, which also installs a fresh `IncrementalTheoryState`
+    /// (and therefore a fresh `persistent_sat`). Anything the attempt Tseitin-
+    /// encodes is discarded on exit, so extra lemmas passed here CANNOT leak into
+    /// a later check-sat — the property the targeted congruence repair relies on.
+    fn solve_euf_once(&mut self, assertions: Option<Vec<TermId>>) -> Result<SolveResult> {
+        let solve_interrupt = self.solve_interrupt.clone();
+        let solve_deadline = self.solve_deadline.clone();
+        self.with_isolated_incremental_state(assertions, |this| {
             solve_incremental_split_loop_pipeline!(this,
                 tag: "EUF",
                 persistent_sat_field: persistent_sat,

@@ -159,6 +159,96 @@ fn am1_maxcover_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_AM1_MAXCOVER").as_deref() != Ok("0"))
 }
 
+/// #tot-eqs budget constants — CGSS2's `add_eq_max_decs` / `add_eq_max_cost` /
+/// `add_eq_max_prod` defaults (ss_encoder.h:200-202). They bound the recursion
+/// that adds totalizer REVERSE-direction clauses: `DECS` caps how many inputs
+/// would have to be shown false elsewhere before a subtree learns anything,
+/// `COST` caps the equivalences other subtrees must pay for that information,
+/// and `PROD` caps their product. Together they keep the encoding from growing
+/// faster than the propagation it buys (AY has measured the opposite extreme:
+/// a blanket-strong encoding — GTE — blew clause counts up 250x and lost).
+const TOT_EQ_MAX_DECS: i64 = 50;
+const TOT_EQ_MAX_COST: i64 = 50;
+const TOT_EQ_MAX_PROD: i64 = 2500;
+
+/// #tot-eqs recursion budget, resolved once per process. CGSS2's defaults were
+/// tuned against SHARED totalizer nodes (its encoder reuses subtrees across
+/// cores, so one equivalence can pay off in several cardinality constraints);
+/// AY's trees are per-core, so the productive budget may differ and each bound
+/// is env-overridable for A/B without a rebuild.
+#[derive(Clone, Copy)]
+struct TotEqCfg {
+    max_decs: i64,
+    max_cost: i64,
+    max_prod: i64,
+}
+
+fn tot_eq_cfg() -> TotEqCfg {
+    use std::sync::OnceLock;
+    static CFG: OnceLock<TotEqCfg> = OnceLock::new();
+    *CFG.get_or_init(|| {
+        let get = |key: &str, default: i64| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse::<i64>().ok())
+                .filter(|&v| v >= 0)
+                .unwrap_or(default)
+        };
+        TotEqCfg {
+            max_decs: get("AY_AB_MAXSAT_TOT_EQ_DECS", TOT_EQ_MAX_DECS),
+            max_cost: get("AY_AB_MAXSAT_TOT_EQ_COST", TOT_EQ_MAX_COST),
+            max_prod: get("AY_AB_MAXSAT_TOT_EQ_PROD", TOT_EQ_MAX_PROD),
+        }
+    })
+}
+
+/// #tot-eqs per-instance ceiling on emitted reverse-direction clauses,
+/// as a multiple of the hard-clause count. Backstop only: the CGSS2 cost model
+/// above is what normally bounds emission. Prevents a pathological
+/// many-cores instance from trading its whole BCP budget for encoding
+/// strength, which is the failure mode that killed the GTE encoder.
+const TOT_EQ_CLAUSE_BUDGET_FACTOR: i64 = 2;
+const TOT_EQ_CLAUSE_BUDGET_FLOOR: i64 = 200_000;
+
+/// #tot-eqs master gate (env A/B). When ON, every totalizer output that OLL has
+/// PROVEN true — the `sum >= 1` of a freshly relaxed core, and every bound a
+/// unit core hardens — gets CGSS2's budgeted reverse-direction clauses so the
+/// proven bound can actually propagate (CGSS2 calls `forced_true` at exactly
+/// these two points: cgss2.cpp:714 after building a core's totalizer, and
+/// cgss2.cpp:621 in exhaust_totalizer after asserting the output unit).
+///
+/// Motivation: AY already asserts those units (process_core's unit-core branch)
+/// but its totalizers are input->output ONLY (see `TotNode`), so a TRUE output
+/// satisfies every clause it appears in and propagates NOTHING downward — the
+/// engine must re-derive an already-proven bound by search on every later
+/// conflict. That is the shape of AY's measured weakness: 64K-134K conflicts
+/// per unit of lower bound on the deep lb-proving UNSAT calls, where cgss
+/// proves the same optima in ~7x fewer conflicts.
+fn tot_eqs_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_TOT_EQS").as_deref() != Ok("0"))
+}
+
+/// #core-clause gate (env A/B). Adds the extracted core's own disjunction
+/// `(∨ members' violation indicators)` to the hard formula when the core is
+/// relaxed.
+///
+/// Sound and non-restricting: an UNSAT core means the hard clauses ENTAIL that
+/// disjunction, so adding it removes no model and cannot change the optimum.
+///
+/// Why it may pay where the full `#tot-eqs` machinery does not: the reverse
+/// clauses' first-order benefit on a SMALL core is exactly this disjunction
+/// (for a 2-member core `#tot-eqs` emits three clauses plus a unit just to make
+/// it derivable), and the CDCL engine's own copy — learned during core
+/// extraction — is subject to `reduce_db` deletion, whereas this one is
+/// permanent. One clause per core instead of a budgeted subtree walk.
+fn core_clause_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_CORE_CLAUSE").as_deref() == Ok("1"))
+}
+
 /// Active-soft cap for the EAGER initial probe (#maxsat-am1-probe eager init).
 /// The failed sweep itself is uncapped (only the hit-rate abort bounds it), so
 /// on million-scale active sets even its 200-probe SAMPLE — each a decide+BCP
@@ -228,6 +318,99 @@ const BMO_MAX_CHECK_CLAUSES: usize = 2_000_000;
 /// threshold (so the LP-extracted mid-size families qualify) AND arms BCE.
 const BCE_ONESHOT_MIN_HARDS: usize = 100_000;
 
+/// #bce-risky-revert kill switch (env A/B). DEFAULT ON.
+///
+/// The one-shot pass's BCE has two arms (`ay_sat::bce`). The PURE arm deletes a
+/// clause whose blocking literal's negation occurs nowhere — it could never
+/// have propagated onto it, so the deletion is FREE. The tautological-resolvent
+/// arm deletes a LIVE implication. On metro the reduction is ~99% pure (54% of
+/// the formula, genuinely free) and one-shot mode is a large win. On
+/// `quantum-circuit-qgan_6_15` it is **0% pure**: every pure literal there
+/// belongs to a FROZEN soft variable, which BCE skips as a blocking candidate,
+/// so all ~11.8k deletions come from the risky arm and are live `(¬a ∨ ¬b)`
+/// MUTEX edges — precisely the binary conflict graph that `adapt_am1` /
+/// `run_am1_probe` mine for the AM1 clique-cover lower bound. The preprocessor
+/// eats the solver's own lower bound: qgan goes from a 6.7s optimum (pass off)
+/// to a 60s timeout stuck at cost 33 against a true optimum of 24.
+///
+/// So when the reduction is mostly RISKY, discard the preprocessed engine and
+/// rebuild from the untouched hard clauses — landing the instance on exactly
+/// the measured-good no-preprocessing trajectory. Raising the reduction bar
+/// instead does NOT work (measured: the edges are already gone by then).
+///
+/// With BCE unarmed (`AY_AB_MAXSAT_BCE` unset) the risky count is 0, so the
+/// predicate collapses to the legacy rule and the default lane is unchanged.
+fn bce_risky_revert_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_BCE_REVERT").as_deref() != Ok("0"))
+}
+
+/// #bce-risky-revert: install exactly the size-banded SAT configuration the
+/// NON-one-shot path installs, so a reverted instance runs on the measured-good
+/// no-preprocessing trajectory rather than on a third, unmeasured one. Mirrors
+/// the `else` arm of the one-shot branch; that arm is left textually untouched
+/// so this cannot perturb it.
+fn install_non_oneshot_sat_config(sat: &mut SatSolver, n_hard: usize) {
+    if n_hard > 2_000_000 {
+        sat.set_preprocess_enabled(false);
+    }
+    if let Some(profile) = non_oneshot_inprocessing_profile(n_hard) {
+        sat.set_inprocessing_profile(&profile);
+    }
+}
+
+/// #oneshot-dry-guard-band: the single source of truth for the size-banded
+/// inprocessing profile the NON-one-shot path runs on.
+///
+/// `None` means **install no profile at all**. That is what the non-one-shot
+/// path does at or below 500k hards, and it is NOT equivalent to installing
+/// `InprocessingFeatureProfile::default()` — that would also re-arm
+/// `preprocess` (`default().preprocess == true`).
+///
+/// This function exists because the one-shot dry-guard used to carry its own
+/// hand-copied duplicate of these bands. The copy asserted `hard.len() >= 1M`,
+/// an invariant that held while `ONESHOT_PREPROC_MIN_HARDS` (1M) was the only
+/// gate and was broken the same day by `BCE_ONESHOT_MIN_HARDS` (100k), which
+/// `AY_AB_MAXSAT_BCE=1` lowers the gate to. A 242,578-hard instance then ran
+/// its whole solve on a profile meant for a formula 4x larger — every
+/// inprocessing technique disabled where the correct path leaves them on. On
+/// `tcp_wt-tcp_students_112_it_5` that cost a ~5,000x conflict blow-up
+/// (5.7e3 -> 3.2e7) and produced WRONG ANSWERS: `o 3441`, `o 3477` and
+/// `o 3549` across runs, against a true optimum of 3366. Both callers now
+/// share this function so the two mirrors cannot drift apart again.
+///
+/// NOTE: this removes the *enabler*. The underlying unsoundness — a wrong
+/// UNSAT out of `ay-sat` after ~3e7 conflicts, surfacing either as an empty
+/// core or as an over-paid lb ladder — is nondeterministic and still open.
+fn non_oneshot_inprocessing_profile(n_hard: usize) -> Option<ay_sat::InprocessingFeatureProfile> {
+    if n_hard <= 500_000 {
+        return None;
+    }
+    let mut profile = ay_sat::InprocessingFeatureProfile::default();
+    profile.vivify = false;
+    profile.subsume = false;
+    profile.probe = false;
+    profile.transred = false;
+    profile.sweep = false;
+    profile.congruence = false;
+    if n_hard > 2_000_000 {
+        profile.bve = false;
+        profile.bce = false;
+        profile.sbva = false;
+        profile.htr = false;
+        profile.gate = false;
+        profile.factor = false;
+        profile.decompose = false;
+        profile.hbr = false;
+        profile.condition = false;
+        profile.backbone = false;
+        profile.symmetry = false;
+        profile.cce = false;
+    }
+    Some(profile)
+}
+
 /// Opt-in switch for BCE-first one-shot preprocessing
 /// (#maxsat-bce-preprocess): `AY_AB_MAXSAT_BCE=1`. DEFAULT OFF — net-negative
 /// under bench jobs=10 contention, net-positive at the jobs=1 competition
@@ -259,6 +442,114 @@ fn maxsat_early_descent_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_EARLY_DESCENT").as_deref() != Ok("0"))
+}
+
+/// #descent-organic-slice: bound the ORGANIC descent entry the same way kick
+/// entries are already bounded, instead of committing for
+/// `Duration::from_hours(8760)` (one year, i.e. the rest of the run).
+///
+/// `descend()` only ever advances `self.ub`; the lower bound moves exclusively
+/// in the OLL loop, which a one-way commit never re-enters. So the instant the
+/// organic gate fires, lb is frozen for the whole remaining budget — measured
+/// on causal-discovery at 60–93% of the run spent unable to improve lb at all.
+/// That is the flat time-curve: 3600s buys exactly what 60s bought.
+///
+/// The bounded form keeps the kick path's proven discipline — a slice that
+/// improved the incumbent earns another (the descent is converging; cutting it
+/// wastes warm bound clauses), and only a DRY slice hands control back to OLL —
+/// so a productive descent still runs to completion. What it removes is the
+/// case where an UNPRODUCTIVE descent owns the rest of the run.
+///
+/// DEFAULT OFF pending the paired A/B; `AY_AB_MAXSAT_DESCENT_ORGANIC_SLICE=1`.
+fn descent_organic_slice_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_DESCENT_ORGANIC_SLICE").as_deref() == Ok("1"))
+}
+
+/// Organic descent slice when the engine is budget-blind (no deadline set).
+/// Larger than the kick's 10s because an organic entry has already cleared the
+/// stall evidence the kicks only guess at.
+const ORGANIC_DESCENT_SLICE: Duration = Duration::from_secs(30);
+
+/// Share of the REMAINING budget one organic descent slice may take when a
+/// deadline is known. The point is not the constant but that the slice scales:
+/// a 60s run keeps today's short slices, while a 3600s run alternates OLL and
+/// descent in large blocks instead of handing the descent everything at once.
+const ORGANIC_DESCENT_BUDGET_DIVISOR: u32 = 8;
+
+/// Clamp for the budget-scaled organic slice.
+const ORGANIC_DESCENT_SLICE_MIN: Duration = Duration::from_secs(10);
+const ORGANIC_DESCENT_SLICE_MAX: Duration = Duration::from_secs(300);
+
+/// #descent-gap-tile: the two descent kick gates cap at `ub - lb <= 32` while
+/// the organic gate's `gap_ok` (uniform-weight arm) floors at
+/// `ub - lb > w * lsu_min_gap_units` = 128w. Nothing covers `32 < gap <= 128w`,
+/// so a uniform-weight instance sitting in that band can NEVER descend by any
+/// path. Traced on minimize-5gons (unweighted, optimum 77): 31 cores, lb=30,
+/// ub=102 — gap 72, squarely inside the band — then no bound motion whatsoever
+/// for the rest of the run, and zero descent lines in the trace. 99 of AY's 122
+/// achievable unweighted misses (81%) have ub <= 128, so their entire gap range
+/// lies at or below the organic floor.
+///
+/// This raises the kick cap to meet the organic floor so the two mechanisms
+/// TILE the gap range instead of leaving a hole. It does not make the descent
+/// fire more often than the organic gate already permits above the floor, and
+/// kick entries are reversible 10s slices, so a mis-fire costs one slice.
+///
+/// DEFAULT OFF pending the paired A/B; `AY_AB_MAXSAT_DESCENT_GAP_TILE=1`.
+fn descent_gap_tile_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_DESCENT_GAP_TILE").as_deref() == Ok("1"))
+}
+
+/// Pre-tile kick gap cap, kept as the floor of the tiled bar.
+const DESCENT_KICK_GAP: Weight = 32;
+
+/// The measured kick slice, and the floor of the budget-scaled form.
+const DESCENT_KICK_SLICE: Duration = Duration::from_secs(10);
+
+/// #descent-residual: encode the descent bound over the REFORMULATED residual
+/// objective (cap `ub - lb`) instead of the original objective (cap
+/// `ub - preproc_cost`). See `DescentEnc::ResidualTot`. DEFAULT OFF;
+/// `AY_AB_MAXSAT_DESCENT_RESIDUAL=1`.
+fn descent_residual_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_DESCENT_RESIDUAL").as_deref() == Ok("1"))
+}
+
+/// #descent-kick-scale: budget-scale the KICK descent slice, which is otherwise
+/// a hard-coded 10s.
+///
+/// The organic arm already scales (`ORGANIC_DESCENT_*`), but measurement shows
+/// the organic gate is UNREACHABLE on the expensive-core families: it demands
+/// `cores_found >= lsu_min_cores` = 64 and af-synthesis runs end at ~17 cores.
+/// So on exactly the instances this matters for, the 10s kick is the ONLY entry
+/// path — 17% of a 60s budget but **0.28% of a 3600s budget**, against a proof
+/// obligation that Pacose/PacoseMP2 need 275–803s to refute with a stronger
+/// encoding than AY's GTE.
+///
+/// A kick slice is reversible (a DRY slice hands control back to OLL; one that
+/// improved the incumbent earns another), and the descent's UNSAT branch is a
+/// complete optimality proof, so a longer slice is a second complete route to
+/// the answer rather than a gamble. The downside is bounded by one dry slice.
+///
+/// DEFAULT OFF — the 10s kick is measured behaviour and scaling it changes the
+/// default path. `AY_AB_MAXSAT_DESCENT_KICK_SCALE=1`.
+fn descent_kick_scale_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AY_AB_MAXSAT_DESCENT_KICK_SCALE").as_deref() == Ok("1"))
+}
+
+/// Diagnostic: print the residual cost-identity residue on every descent model.
+/// `AY_MAXSAT_IDENTITY_CHECK=1`. Never changes search.
+fn identity_check_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("AY_MAXSAT_IDENTITY_CHECK").as_deref() == Ok("1"))
 }
 
 /// Wall-clock budget for one core-exhaustion SAT probe.
@@ -368,6 +659,12 @@ pub(crate) struct OllTuning {
     /// LP-boost lane mode (#lp-boost). Default Auto (on, gated to
     /// non-uniform weights).
     pub(crate) lp_boost: LpBoostMode,
+    /// #tot-eqs override: `None` defers to the `AY_AB_MAXSAT_TOT_EQS` env
+    /// gate, `Some(b)` forces the lever (tests pin it ON so the
+    /// brute-force cross-checks cover the reverse-direction clauses).
+    pub(crate) tot_eqs: Option<bool>,
+    /// #core-clause override: `None` defers to `AY_AB_MAXSAT_CORE_CLAUSE`.
+    pub(crate) core_clause: Option<bool>,
 }
 
 impl Default for OllTuning {
@@ -384,6 +681,8 @@ impl Default for OllTuning {
             abstraction_min_cores: u64::MAX,
             force_cluster: false,
             lp_boost: LpBoostMode::Auto,
+            tot_eqs: None,
+            core_clause: None,
         }
     }
 }
@@ -392,10 +691,25 @@ impl Default for OllTuning {
 ///
 /// `outs[j]` is a literal that is implied true whenever at least `j + 1` of
 /// the leaf input literals are true. Only the input→output direction is
-/// encoded (sufficient for enforcing upper bounds via assuming `¬outs[j]`).
+/// encoded (sufficient for enforcing upper bounds via assuming `¬outs[j]`);
+/// the output→input direction is added LAZILY where it can propagate — see
+/// [`TotNode::force_true`] (#tot-eqs).
 ///
-/// MEASURED NEGATIVE — adding the reverse direction does NOT pay here
-/// (2026-07-25, branch `maxsat/tot-eqs-experiment`, not merged). The known
+/// ⚠️ STATUS (corrected 2026-07-27): `#tot-eqs` is **LANDED and DEFAULT ON** for
+/// weighted instances — `tot_eqs_enabled()` reads `AY_AB_MAXSAT_TOT_EQS != "0"`,
+/// and commit `26de25fa7` measured **+5 solved full-track** (571 @60s paired,
+/// zero-wrong, 0 cost mismatches on 321 commonly-solved). It is gated to
+/// weighted instances by `tot_eq_budget = 0` unless there are ≥2 distinct soft
+/// weights, so the unweighted track is bit-identical.
+///
+/// The "default-OFF / MEASURED NEGATIVE" text that stood here until 2026-07-27
+/// described the pre-landing state and contradicted the code beside it; it was
+/// on track to make a future session re-propose a lever that is already in.
+/// The −3 record below is retained because its REASONING is still correct and
+/// still explains the shape of the win — but read it as history, not status.
+///
+/// HISTORICAL — the reverse direction measured −3 BEFORE the fixes that made it
+/// pay (2026-07-25, branch `maxsat/tot-eqs-experiment`). The known
 /// gap is real: with implication-only clauses a PROVEN-true output satisfies
 /// every clause it occurs in and propagates nothing downward, so the engine
 /// re-derives an already-proven bound by search on every later conflict.
@@ -424,6 +738,16 @@ struct TotNode {
     size: usize,
     /// Bound this node's clause set is complete up to (`min(k, size)`).
     built_k: usize,
+    /// #tot-eqs: reverse-direction bookkeeping, mirroring CGSS2's
+    /// `Node::lleq`/`rreq`/`litseq` (ss_encoder.h:20-22). `eq_l` / `eq_r` are
+    /// the left/right child output-index ranges the reverse clauses are
+    /// complete for, and `eq_outs` the number of this node's outputs they
+    /// cover. All three only grow, so a clause is never emitted twice
+    /// (duplicate clauses are sound but inflate the watch lists this engine
+    /// scans linearly on removal).
+    eq_l: usize,
+    eq_r: usize,
+    eq_outs: usize,
     left: Option<Box<TotNode>>,
     right: Option<Box<TotNode>>,
 }
@@ -438,6 +762,9 @@ impl TotNode {
                 outs: vec![lits[0]],
                 size: 1,
                 built_k: 1,
+                eq_l: 0,
+                eq_r: 0,
+                eq_outs: 0,
                 left: None,
                 right: None,
             };
@@ -449,6 +776,9 @@ impl TotNode {
             outs: Vec::new(),
             size: lits.len(),
             built_k: 0,
+            eq_l: 0,
+            eq_r: 0,
+            eq_outs: 0,
             left: Some(left),
             right: Some(right),
         }
@@ -504,6 +834,200 @@ impl TotNode {
             }
         }
         self.built_k = target;
+    }
+
+    /// #tot-eqs: emit this node's REVERSE-direction clauses, extending
+    /// coverage to left-child output range `leq_in`, right-child range
+    /// `req_in`, and every output built so far. Port of CGSS2
+    /// `SSEncoder::add_equivalences` (ss_encoder.cpp:434-476).
+    ///
+    /// Each emitted clause is `(l.outs[li] ∨ r.outs[ri] ∨ ¬outs[li+ri])`:
+    /// `¬l.outs[li]` bounds the left subtree's true-input count by `li` and
+    /// `¬r.outs[ri]` bounds the right's by `ri`, so the total is at most
+    /// `li + ri` and `outs[li+ri]` (which asserts at least `li+ri+1`) must be
+    /// false. An index equal to the child's own input count is a tautological
+    /// bound, so that literal is DROPPED — a shorter, strictly stronger
+    /// clause. Every clause is therefore a valid consequence of the intended
+    /// meaning of the (fresh) output variables, which is what makes this
+    /// sound: it can only pin `outs` closer to the exact count.
+    fn add_equivalences(
+        &mut self,
+        leq_in: usize,
+        req_in: usize,
+        sat: &mut SatSolver,
+        budget: &mut i64,
+    ) {
+        let (Some(left), Some(right)) = (self.left.as_ref(), self.right.as_ref()) else {
+            return; // leaf: its single output IS its input
+        };
+        let outs = &self.outs;
+        let m = outs.len();
+        if m == 0 || *budget <= 0 {
+            return;
+        }
+        // Clamp to output literals that exist (a partially built child only
+        // supports the indices it has) and keep coverage monotone.
+        let leq = leq_in.min(left.outs.len()).max(self.eq_l);
+        let req = req_in.min(right.outs.len()).max(self.eq_r);
+        let (l_size, r_size) = (left.size, right.size);
+        let (l_outs, r_outs) = (&left.outs, &right.outs);
+        let (eq_l, eq_r, eq_outs) = (self.eq_l, self.eq_r, self.eq_outs);
+
+        let mut emit = |li: usize, ri: usize| {
+            let t = li + ri;
+            debug_assert!(t < m);
+            let mut clause = Vec::with_capacity(3);
+            if li != l_size {
+                match l_outs.get(li) {
+                    Some(&lit) => clause.push(lit),
+                    None => return, // index not materialized: skip
+                }
+            }
+            if ri != r_size {
+                match r_outs.get(ri) {
+                    Some(&lit) => clause.push(lit),
+                    None => return,
+                }
+            }
+            clause.push(outs[t].negated());
+            *budget -= 1;
+            sat.add_clause(clause);
+        };
+
+        // (a) Outputs grew: backfill pairs inside the already-committed child
+        //     ranges for the new output indices.
+        for t in eq_outs..m {
+            for ri in 0..=t {
+                let li = t - ri;
+                if ri < eq_r || li < eq_l {
+                    emit(li, ri);
+                }
+            }
+        }
+        // (b) The left range grew: all partners for each newly covered li.
+        for li in eq_l..leq {
+            let mut ri = 0;
+            while li + ri < m && ri <= r_outs.len() {
+                emit(li, ri);
+                ri += 1;
+            }
+        }
+        // (c) The right range grew: all partners for each newly covered ri,
+        //     skipping the li values (b) just covered.
+        for ri in eq_r..req {
+            let mut li = 0;
+            while ri + li < m && li <= l_outs.len() {
+                if !(li >= eq_l && li < leq) {
+                    emit(li, ri);
+                }
+                li += 1;
+            }
+        }
+
+        self.eq_l = leq;
+        self.eq_r = req;
+        self.eq_outs = m;
+    }
+
+    /// #tot-eqs: make this whole subtree a full-equivalence subtree (CGSS2
+    /// `SSEncoder::add_full_eqs`, ss_encoder.cpp:481-487).
+    fn add_full_eqs(&mut self, sat: &mut SatSolver, budget: &mut i64) {
+        if *budget <= 0 {
+            return;
+        }
+        self.add_equivalences(usize::MAX, usize::MAX, sat, budget);
+        if let (Some(left), Some(right)) = (self.left.as_mut(), self.right.as_mut()) {
+            left.add_full_eqs(sat, budget);
+            right.add_full_eqs(sat, budget);
+        }
+    }
+
+    /// #tot-eqs: recursive, budgeted equivalence addition (CGSS2
+    /// `SSEncoder::add_partial_eqs`, ss_encoder.cpp:502-531).
+    ///
+    /// `nof_true` is how many of this subtree's inputs are known true (may go
+    /// negative: then it records how many inputs must be shown FALSE
+    /// elsewhere before this subtree learns anything), and `cost` how many
+    /// equivalences other subtrees would have to pay for that information to
+    /// arrive. The three budget constants cut the recursion off before the
+    /// encoding grows faster than the propagation it buys. Return sign
+    /// follows CGSS2: negative asks the caller to make the SIBLING a full
+    /// equivalence subtree, magnitude is the child output range to cover.
+    fn add_partial_eqs(
+        &mut self,
+        nof_true: i64,
+        cost: i64,
+        cfg: TotEqCfg,
+        sat: &mut SatSolver,
+        budget: &mut i64,
+    ) -> i64 {
+        if *budget <= 0 {
+            return 0;
+        }
+        if nof_true <= -cfg.max_decs || (nof_true <= 0 && cost > cfg.max_cost) {
+            return 0;
+        }
+        if nof_true <= 0 && nof_true.saturating_neg().saturating_mul(cost) > cfg.max_prod {
+            return 0;
+        }
+        let (Some(left), Some(right)) = (self.left.as_ref(), self.right.as_ref()) else {
+            // Leaf: its output is an input literal, so information reaching
+            // here propagates directly.
+            return if nof_true > 0 { 1 } else { -1 };
+        };
+        let (l_size, r_size) = (left.size as i64, right.size as i64);
+        let l_cost = cost.saturating_add(l_size.saturating_mul(l_size));
+        let r_cost = cost.saturating_add(r_size.saturating_mul(r_size));
+
+        let eql = self
+            .left
+            .as_mut()
+            .map(|l| l.add_partial_eqs(nof_true - r_size, r_cost, cfg, sat, budget))
+            .unwrap_or(0);
+        let eqr = self
+            .right
+            .as_mut()
+            .map(|r| r.add_partial_eqs(nof_true - l_size, l_cost, cfg, sat, budget))
+            .unwrap_or(0);
+        if eql == 0 && eqr == 0 {
+            // Nothing below can propagate, and (unlike CGSS2, whose nodes are
+            // shared between cores) an unshared node has no other consumer.
+            return 0;
+        }
+        if eql < 0 {
+            if let Some(right) = self.right.as_mut() {
+                right.add_full_eqs(sat, budget);
+            }
+        }
+        if eqr < 0 {
+            if let Some(left) = self.left.as_mut() {
+                left.add_full_eqs(sat, budget);
+            }
+        }
+        let (leq, req) = (eql.unsigned_abs() as usize, eqr.unsigned_abs() as usize);
+        self.add_equivalences(leq, req, sat, budget);
+
+        let m = self.outs.len() as i64;
+        if cost > cfg.max_cost {
+            return m.min(nof_true);
+        }
+        -(m.min(nof_true.saturating_add(cfg.max_decs)))
+    }
+
+    /// #tot-eqs: `outs[ix]` has been PROVEN true (asserted as a hard unit), so
+    /// at least `ix + 1` of this node's inputs are violated. Add the reverse
+    /// clauses that let unit propagation actually use that fact — CGSS2
+    /// `SSEncoder::forced_true` (ss_encoder.cpp:537-549).
+    ///
+    /// Without this the unit is inert: with only input→output clauses, a TRUE
+    /// output satisfies every clause it occurs in and propagates nothing, so
+    /// the SAT engine must re-derive the already-proven bound by search on
+    /// every subsequent conflict.
+    fn force_true(&mut self, ix: usize, sat: &mut SatSolver, budget: &mut i64) {
+        if *budget <= 0 {
+            return;
+        }
+        self.add_partial_eqs(ix as i64 + 1, 0, tot_eq_cfg(), sat, budget);
     }
 }
 
@@ -817,6 +1341,10 @@ pub(crate) struct OllEngine {
     tot_base_w: Vec<Weight>,
     /// Highest opened bound per totalizer, parallel to `totalizers`.
     tot_top_bound: Vec<usize>,
+    /// #tot-eqs: remaining budget of reverse-direction clauses this instance
+    /// may emit (see `TOT_EQ_CLAUSE_BUDGET_FACTOR`). Zero when the lever is
+    /// gated off, which makes every `force_true` call a no-op.
+    tot_eq_budget: i64,
     /// Certified lower bound on the optimum.
     lb: Weight,
     /// Cost of the incumbent model (u64::MAX when none).
@@ -840,6 +1368,15 @@ pub(crate) struct OllEngine {
     descent: Option<DescentEnc>,
     /// True when no descent encoding is available (build too large).
     descent_unavailable: bool,
+    /// #descent-residual: the residual bound can no longer tighten (it is a
+    /// relaxation, so a model can meet it and still cost `ub`). Latches so the
+    /// next build falls back to the exact original-objective encoding, which is
+    /// the only one that can certify optimality.
+    residual_exhausted: bool,
+    /// Wall-clock deadline for the whole solve, when the caller supplied one
+    /// (`MaxSatSolver::set_deadline`). `None` = budget-blind, the historical
+    /// behaviour: policies fall back to their fixed absolute constants.
+    deadline: Option<Instant>,
     /// Activation literal guarding every descent clause: descents assume it
     /// true; OLL solves leave it free so the solver can switch the entire
     /// descent circuit off instead of dragging it through core extraction.
@@ -968,6 +1505,48 @@ enum DescentEnc {
     Adder {
         bits: Vec<Option<Literal>>,
         bound: Weight,
+    },
+    /// #descent-residual: uniform-weight totalizer over the REFORMULATED
+    /// residual objective (`active ∪ pool` at residual weights) rather than
+    /// over the original softs at original weights.
+    ///
+    /// The other variants encode the ORIGINAL objective capped at
+    /// `ub - preproc_cost` — the whole objective — so on a proof-bound instance
+    /// the descent's query re-proves from scratch what OLL already established
+    /// through its cores (measured 2×–931× too loose, worst where the gap is
+    /// smallest). Here the cap is `ub - lb`, so the query shrinks as OLL works.
+    ///
+    /// SOUNDNESS. Identity: `cost(A) = lb + Σ_{active ∪ pool} + T(A)`, all terms
+    /// nonnegative, so `Σ <= cost - lb`. Excluding models with `Σ >= ub - lb`
+    /// therefore only excludes models with `cost >= ub`. Verified empirically:
+    /// `AY_MAXSAT_IDENTITY_CHECK=1` printed `HOLDS=true` on every descent model.
+    ///
+    /// ⚠️ THIS IS A RELAXATION, NOT AN EXACT COST ENCODING. A first attempt was
+    /// reverted for TEN wrong answers, and both bugs were the same mistake —
+    /// applying exact-encoding logic to it:
+    ///   1. the build clamped `units` with `.min(sels.len())`, silently turning
+    ///      a VACUOUS bound into a real one that excluded models where every
+    ///      selector is falsified;
+    ///   2. the tighten step used `k.min(units)`, deriving the bound from the
+    ///      model just found. That is valid for an exact encoding ("find
+    ///      something strictly better than this model") but invalid here,
+    ///      because a model with the SAME Σ can be cheaper.
+    /// So: the bound is only ever derived from `ub`, never from a model, and a
+    /// bound that cannot be represented (`units > sels.len()`) is VACUOUS and
+    /// must not be asserted at all.
+    ResidualTot {
+        tot: TotNode,
+        /// Common residual weight of every encoded selector.
+        w: Weight,
+        /// Selectors in POSITIVE form; falsified when the model does not
+        /// satisfy the literal.
+        sels: Vec<Literal>,
+        /// `self.lb` when `sels`/`w` were read. MUST be the plain `lb`, never
+        /// `effective_lb()`: the LP-boost `boost_lb` is an external lift that
+        /// does not participate in the identity.
+        lb_at_build: Weight,
+        /// Tightest count bound asserted so far.
+        last_k: usize,
     },
 }
 
@@ -1250,10 +1829,33 @@ impl OllEngine {
             // first OLL solve will then return Unsatisfiable. Reconstruction
             // over eliminated hard vars runs automatically on every later solve.
             let clauses_before = sat.active_clause_count();
+            let (bce_elim0, bce_pure0) = {
+                let s = sat.bce_stats();
+                (s.clauses_eliminated, s.pure_blocked)
+            };
             let _ = sat.preprocess_once();
             let clauses_after = sat.active_clause_count();
+            // #bce-risky-revert: split the reduction into the FREE (pure-arm)
+            // and RISKY (tautological-resolvent) parts — see
+            // `bce_risky_revert_enabled`. A mostly-risky reduction has eaten
+            // live implications, which on these instances are the very mutex
+            // edges the AM1 clique-cover lower bound is mined from.
+            let (bce_elim1, bce_pure1) = {
+                let s = sat.bce_stats();
+                (s.clauses_eliminated, s.pure_blocked)
+            };
+            let bce_removed = bce_elim1.saturating_sub(bce_elim0);
+            let bce_pure = bce_pure1.saturating_sub(bce_pure0);
+            let risky = bce_removed.saturating_sub(bce_pure);
+            let removed = clauses_before.saturating_sub(clauses_after) as u64;
+            let free = removed.saturating_sub(risky);
+            let mostly_risky = risky > free;
             if std::env::var("AY_MAXSAT_DEBUG").is_ok() {
-                eprintln!("c ONESHOT-PREPROC: clauses {clauses_before} -> {clauses_after}");
+                eprintln!(
+                    "c ONESHOT-PREPROC: clauses {clauses_before} -> {clauses_after} \
+                     (bce removed {bce_removed}, pure {bce_pure}, risky {risky}, free {free}{})",
+                    if mostly_risky { ", MOSTLY-RISKY" } else { "" }
+                );
             }
             // #oneshot-dry-guard: on binary-dense formulas BVE finds nothing
             // (rna-alignment: 1002441 -> 1002441). Require a reduction larger
@@ -1262,12 +1864,39 @@ impl OllEngine {
             // A dry pass instead falls back to EXACTLY the size-banded
             // profile the non-oneshot path installs at this scale — no third
             // behavior.
+            // #bce-risky-revert: a mostly-risky reduction has removed live
+            // implications (the AM1 mutex edges). Throw the preprocessed engine
+            // away and rebuild from the untouched hard clauses — `hard` is
+            // still alive here (dropped below, after root-UP).
+            let reverted = bce_risky_revert_enabled() && mostly_risky;
+            if reverted {
+                let mut fresh = SatSolver::new(num_vars as usize);
+                if std::env::var_os("AY_AB_NO_DOMAIN_BCP").is_some() {
+                    fresh.set_domain_bcp_min_vars(100_000_000);
+                }
+                fresh.set_incremental_inprobe_divisor(Some(MAXSAT_INCR_INPROBE_DIVISOR));
+                for clause in hard.iter() {
+                    fresh.add_clause(clause.to_vec());
+                }
+                install_non_oneshot_sat_config(&mut fresh, hard.len());
+                sat = fresh;
+                if std::env::var("AY_MAXSAT_DEBUG").is_ok() {
+                    eprintln!(
+                        "c ONESHOT-PREPROC: REVERTED (risky {risky} > free {free}); \
+                         rebuilt {} hard clauses without preprocessing",
+                        hard.len()
+                    );
+                }
+            }
             let oneshot_paid = clauses_after < clauses_before.saturating_sub(clauses_before / 100);
-            let mut off = ay_sat::InprocessingFeatureProfile::default();
-            if oneshot_paid {
+            if reverted {
+                // Configuration already installed by the rebuild above; do not
+                // overwrite it with the one-shot/dry profile.
+            } else if oneshot_paid {
                 // One-shot mode proper: the pass simplified the formula; stop
                 // ALL further inprocessing (this is what makes it a ONE-shot
                 // and dodges the per-solve rehash storm).
+                let mut off = ay_sat::InprocessingFeatureProfile::default();
                 off.bve = false;
                 off.bce = false;
                 off.subsume = false;
@@ -1286,32 +1915,18 @@ impl OllEngine {
                 off.backbone = false;
                 off.symmetry = false;
                 off.cce = false;
-            } else {
-                // Mirror the non-oneshot >500k band (hard.len() >= 1M here),
-                // including the >2M occurrence-list extension.
-                off.vivify = false;
-                off.subsume = false;
-                off.probe = false;
-                off.transred = false;
-                off.sweep = false;
-                off.congruence = false;
-                if hard.len() > 2_000_000 {
-                    off.bve = false;
-                    off.bce = false;
-                    off.sbva = false;
-                    off.htr = false;
-                    off.gate = false;
-                    off.factor = false;
-                    off.decompose = false;
-                    off.hbr = false;
-                    off.condition = false;
-                    off.backbone = false;
-                    off.symmetry = false;
-                    off.cce = false;
-                }
+                sat.set_inprocessing_profile(&off);
+                // preprocess_once already set preprocess_enabled=false.
+            } else if let Some(off) = non_oneshot_inprocessing_profile(hard.len()) {
+                // Dry pass: the one-shot removed nothing, so run on exactly the
+                // configuration the NON-one-shot path would have used — via the
+                // shared band helper, never a hand-copy of it. At or below 500k
+                // hards the helper returns `None` and we install NOTHING, which
+                // is what the non-one-shot path does at that size. See
+                // `non_oneshot_inprocessing_profile` for the wrong answers the
+                // previous hand-copied duplicate caused.
+                sat.set_inprocessing_profile(&off);
             }
-            sat.set_inprocessing_profile(&off);
-            // preprocess_once already set preprocess_enabled=false.
         }
         // #root-up-softs (MaxPre 'u' rule): root-UP consequences of the HARD
         // formula hold in every model, so softs can be normalized against
@@ -1326,6 +1941,8 @@ impl OllEngine {
         // moment a round derives nothing (formulas without unit hards pay
         // exactly one scan).
         let root_vals = Self::root_up_implied(&hard, num_vars as usize);
+        // #tot-eqs: sized off the hard formula (see TOT_EQ_CLAUSE_BUDGET_FACTOR).
+        let num_hard_clauses = hard.len();
         drop(hard);
 
         // #lp-boost instance gate, judged on the ORIGINAL input weights
@@ -1361,6 +1978,18 @@ impl OllEngine {
             totalizers: Vec::new(),
             tot_base_w: Vec::new(),
             tot_top_bound: Vec::new(),
+            // #tot-eqs: WEIGHTED-ONLY by construction. A zero budget makes
+            // every force_true call a no-op, so uniform-weight instances — the
+            // whole UNWEIGHTED TRACK, where AY holds the crown at 341 vs
+            // cgss2's 332 — run bit-identically to the lever-free engine and
+            // need no re-measurement. Every measured gain is on a weighted
+            // instance, so the gate costs nothing.
+            tot_eq_budget: if lp_eligible {
+                TOT_EQ_CLAUSE_BUDGET_FLOOR
+                    .max(num_hard_clauses as i64 * TOT_EQ_CLAUSE_BUDGET_FACTOR)
+            } else {
+                0
+            },
             lb: 0,
             ub: Weight::MAX,
             ub_last_improved: Instant::now(),
@@ -1371,6 +2000,8 @@ impl OllEngine {
             tuning: OllTuning::default(),
             descent: None,
             descent_unavailable: false,
+            residual_exhausted: false,
+            deadline: None,
             descent_guard: None,
             hardened_sels: HashSet::new(),
             abstraction_done: false,
@@ -3014,6 +3645,46 @@ impl OllEngine {
             );
         }
 
+        // #stale-core diagnostic (2026-07-28): the `w_min` filter_map below
+        // SILENTLY SKIPS core members that are no longer in `active`, yet
+        // `lb += w_min` is paid regardless. Absent-because-hardened is sound —
+        // a hardened soft is true in every model, so it cannot be the
+        // falsified member. Absent because the member's residual was already
+        // spent into a totalizer or an AM1 disjunction is NOT sound: a model
+        // falsifying only that member pays nothing, so `lb` is over-paid. That
+        // is the defect recorded at oll.rs:2570-2582 (reported 20 on
+        // privilege-escalation-task-54, optimum 19), whose fix guarded one
+        // call site rather than this computation.
+        if debug_trace() {
+            let (mut hardened, mut pooled) = (0usize, 0usize);
+            let mut unaccounted: Vec<Literal> = Vec::new();
+            for sel in core {
+                if self.active.contains_key(sel) {
+                    continue;
+                }
+                if self.hardened_sels.contains(sel) {
+                    hardened += 1;
+                } else if self.pool.iter().any(|(p, _)| p == sel) {
+                    pooled += 1;
+                } else {
+                    unaccounted.push(*sel);
+                }
+            }
+            if hardened + pooled + unaccounted.len() > 0 {
+                eprintln!(
+                    "c STALE-CORE #{}: absent={} hardened={} pooled={} UNACCOUNTED={} lb={} ub={} sels={:?}",
+                    self.stats.cores_found,
+                    hardened + pooled + unaccounted.len(),
+                    hardened,
+                    pooled,
+                    unaccounted.len(),
+                    self.lb,
+                    self.ub,
+                    unaccounted.iter().take(8).collect::<Vec<_>>()
+                );
+            }
+        }
+
         let w_min = core
             .iter()
             .filter_map(|sel| self.active.get(sel).copied())
@@ -3047,6 +3718,24 @@ impl OllEngine {
             // Unit core: the selector is falsified in every model of the
             // current formula; make it a hard fact for propagation.
             self.sat.add_clause(vec![core[0].negated()]);
+            // #tot-eqs: when that selector is a sum selector `¬outs[b]`, the
+            // unit just asserted is `outs[b]` — a PROVEN bound of at least
+            // b+1 violations in this totalizer. Add the reverse clauses so
+            // the bound propagates instead of being re-derived by search
+            // (CGSS2 exhaust_totalizer, cgss2.cpp:614-621, does exactly this
+            // after its matching add_clause).
+            if self.tot_eqs_on() {
+                if let Some(&SumRef { tot, bound }) = self.sums.get(&core[0]) {
+                    let mut budget = self.tot_eq_budget;
+                    self.totalizers[tot].force_true(bound - 1, &mut self.sat, &mut budget);
+                    self.stats.tot_eq_clauses = self
+                        .stats
+                        .tot_eq_clauses
+                        .saturating_add((self.tot_eq_budget - budget) as u64);
+                    self.stats.tot_eq_forced = self.stats.tot_eq_forced.saturating_add(1);
+                    self.tot_eq_budget = budget;
+                }
+            }
             return new_sums;
         }
 
@@ -3068,6 +3757,12 @@ impl OllEngine {
     /// at bound 2, and activate the bound-2 selector at the core's
     /// extraction-time w_min. Exactly the structure eager OLL used to build
     /// inside process_core.
+    /// #tot-eqs: lever active for this instance? Tuning override first (tests),
+    /// then the env gate, and always subject to the remaining clause budget.
+    fn tot_eqs_on(&self) -> bool {
+        self.tot_eq_budget > 0 && self.tuning.tot_eqs.unwrap_or_else(tot_eqs_enabled)
+    }
+
     fn relax_core(&mut self, members: &[Literal], w_min: Weight) -> Literal {
         let inputs: Vec<Literal> = members.iter().map(|sel| sel.negated()).collect();
         let mut root = TotNode::build(&inputs);
@@ -3080,7 +3775,32 @@ impl OllEngine {
             Literal::positive(var)
         };
         root.extend(2, &mut self.sat, &mut fresh, None);
+        // #core-clause: the core was UNSAT, so the hard clauses entail that at
+        // least one member is violated. Pin that disjunction permanently.
+        if self.tuning.core_clause.unwrap_or_else(core_clause_enabled) {
+            self.sat.add_clause(inputs.clone());
+            self.stats.core_clauses_added = self.stats.core_clauses_added.saturating_add(1);
+        }
         let sum_sel = root.outs[1].negated();
+        // #tot-eqs: the core was UNSAT, so the hard clauses entail that at
+        // least one member is violated — `outs[0]` is proven true. Assert it
+        // and add the reverse clauses that make the assertion propagate
+        // (CGSS2 cgss2.cpp:714 calls forced_true(t.outputs[0]) here). Asserting
+        // it cannot change the optimum: `outs` are fresh variables and every
+        // model of the hard clauses violates >= 1 member, so every optimum
+        // extends to satisfy the unit.
+        if self.tot_eqs_on() {
+            let out0 = root.outs[0];
+            self.sat.add_clause(vec![out0]);
+            let mut budget = self.tot_eq_budget;
+            root.force_true(0, &mut self.sat, &mut budget);
+            self.stats.tot_eq_clauses = self
+                .stats
+                .tot_eq_clauses
+                .saturating_add((self.tot_eq_budget - budget) as u64);
+            self.stats.tot_eq_forced = self.stats.tot_eq_forced.saturating_add(1);
+            self.tot_eq_budget = budget;
+        }
         self.totalizers.push(root);
         self.tot_base_w.push(w_min);
         self.tot_top_bound.push(2);
@@ -3723,6 +4443,121 @@ impl OllEngine {
         w0.filter(|&w| w > 0)
     }
 
+    /// The live residual objective (`active ∪ pool`) when every live selector
+    /// carries the SAME residual weight, as selector literals plus that weight.
+    ///
+    /// This is the objective OLL actually maintains, as opposed to
+    /// `residual_uniform_weight`, which despite its name scans the ORIGINAL
+    /// softs at their ORIGINAL weights. Hardened selectors are satisfied in
+    /// every remaining model and are skipped; dropping zero-cost terms keeps
+    /// the identity's inequality direction (`Σ <= cost - lb`) intact.
+    fn uniform_residual_objective(&self) -> Option<(Vec<Literal>, Weight)> {
+        let mut sels: Vec<Literal> = Vec::with_capacity(self.active.len() + self.pool.len());
+        let mut w0: Option<Weight> = None;
+        for (&sel, &w) in self
+            .active
+            .iter()
+            .chain(self.pool.iter().map(|(l, w)| (l, w)))
+        {
+            if w == 0 || self.hardened_sels.contains(&sel) {
+                continue;
+            }
+            match w0 {
+                None => w0 = Some(w),
+                Some(prev) if prev == w => {}
+                _ => return None,
+            }
+            sels.push(sel);
+        }
+        // `active` is a HashMap: sort so the encoding cannot depend on hash
+        // iteration order.
+        sels.sort_unstable();
+        sels.dedup();
+        w0.filter(|&w| w > 0 && !sels.is_empty()).map(|w| (sels, w))
+    }
+
+    /// Test shim for [`Self::residual_units`] (an associated fn on a private
+    /// type is otherwise unreachable from the test module).
+    #[cfg(test)]
+    pub(crate) fn residual_units_for_test(
+        target_r: Weight,
+        w: Weight,
+        n_sels: usize,
+    ) -> Option<usize> {
+        Self::residual_units(target_r, w, n_sels)
+    }
+
+    /// Count bound for the residual encoding, derived ONLY from `ub`.
+    ///
+    /// Returns `None` when the bound is VACUOUS — `ceil((ub - lb) / w)` exceeds
+    /// the number of encoded selectors, so no achievable count violates it. It
+    /// must then not be asserted: clamping it into range is exactly the bug
+    /// that produced ten wrong answers.
+    fn residual_units(target_r: Weight, w: Weight, n_sels: usize) -> Option<usize> {
+        if target_r == 0 {
+            return None;
+        }
+        let units = target_r.div_ceil(w.max(1)) as usize;
+        (units >= 1 && units <= n_sels).then_some(units)
+    }
+
+    /// DIAGNOSTIC ONLY — never changes search. Checks the engine's cost
+    /// identity against a real model:
+    ///
+    ///   cost(A) = lb + Σ_{sel ∈ active ∪ pool} w_sel·[sel falsified] + T(A)
+    ///
+    /// with the ladder term `T(A) >= 0`, so the testable consequence is
+    /// `Σ <= cost - lb`. A `#descent-residual` attempt that bounded `Σ` by
+    /// `ub - lb` produced TEN wrong answers (all optima overshot by +1..+15 on
+    /// protein_ins/rna-alignment), which means this inequality does NOT hold
+    /// for the naive `active ∪ pool` scan. This prints the actual numbers so
+    /// the violating term can be identified instead of guessed at.
+    fn report_residual_identity(&self, model: &[bool], cost: Weight) {
+        let falsified =
+            |sel: Literal| model.get(sel.variable().index()).copied() != Some(sel.is_positive());
+        let mut sigma_active: Weight = 0;
+        let mut sigma_active_hardened: Weight = 0;
+        let mut n_act = 0usize;
+        for (&sel, &w) in self.active.iter() {
+            if falsified(sel) {
+                if self.hardened_sels.contains(&sel) {
+                    sigma_active_hardened = sigma_active_hardened.saturating_add(w);
+                } else {
+                    sigma_active = sigma_active.saturating_add(w);
+                }
+                n_act += 1;
+            }
+        }
+        let mut sigma_pool: Weight = 0;
+        for (sel, w) in self.pool.iter() {
+            if falsified(*sel) {
+                sigma_pool = sigma_pool.saturating_add(*w);
+            }
+        }
+        // Same quantity restricted to ORIGINAL soft selectors, to separate the
+        // original-soft terms from the relax_core sum-selector terms.
+        let orig: std::collections::HashSet<Literal> =
+            self.soft_selectors.iter().copied().collect();
+        let mut sigma_orig: Weight = 0;
+        let mut sigma_sum: Weight = 0;
+        for (&sel, &w) in self.active.iter() {
+            if falsified(sel) && !self.hardened_sels.contains(&sel) {
+                if orig.contains(&sel) {
+                    sigma_orig = sigma_orig.saturating_add(w);
+                } else {
+                    sigma_sum = sigma_sum.saturating_add(w);
+                }
+            }
+        }
+        let sigma = sigma_active.saturating_add(sigma_pool);
+        let budget = cost.saturating_sub(self.lb);
+        eprintln!(
+            "c identity: cost={cost} lb={} budget=cost-lb={budget} sigma={sigma}              (active={sigma_active} pool={sigma_pool} orig={sigma_orig} sum_sel={sigma_sum}              hardened_falsified={sigma_active_hardened} n_falsified_active={n_act})              HOLDS={}",
+            self.lb,
+            sigma <= budget,
+        );
+    }
+
     /// Build (once) the best-fitting descent encoding for this instance:
     /// totalizer for uniform weights, GTE for small mixed-weight instances,
     /// adder network otherwise. Returns false when none is available.
@@ -3749,6 +4584,50 @@ impl OllEngine {
         if soft_idx.is_empty() {
             self.descent_unavailable = true;
             return false;
+        }
+        // #descent-residual: prefer the reformulated residual objective when
+        // its live weights are uniform — its cap (`ub - lb`) is never looser
+        // than the original objective's and is dramatically tighter once OLL
+        // has paid cores into `lb`.
+        if descent_residual_enabled() && !self.residual_exhausted {
+            if let Some((sels, wr)) = self.uniform_residual_objective() {
+                let target_r = self.ub.saturating_sub(self.lb);
+                if let Some(units) = Self::residual_units(target_r, wr, sels.len()) {
+                    if sels.len().saturating_mul(units) <= 10_000_000 {
+                        let indicators: Vec<Literal> = sels.iter().map(|s| s.negated()).collect();
+                        let mut tot = TotNode::build(&indicators);
+                        let next_var = &mut self.next_var;
+                        let mut fresh = |sat: &mut SatSolver| {
+                            let var = sat.new_var();
+                            *next_var = var.id() + 1;
+                            sat.set_phase(var, false);
+                            Literal::positive(var)
+                        };
+                        tot.extend(units, &mut self.sat, &mut fresh, guard);
+                        let mut clause = vec![tot.outs[units - 1].negated()];
+                        if let Some(g) = guard {
+                            clause.push(g.negated());
+                        }
+                        self.sat.add_clause(clause);
+                        if debug_trace() {
+                            eprintln!(
+                                "c descent: RESIDUAL totalizer over {} selectors (w={wr} cap={target_r} units={units} lb={} ub={})",
+                                indicators.len(),
+                                self.lb,
+                                self.ub,
+                            );
+                        }
+                        self.descent = Some(DescentEnc::ResidualTot {
+                            tot,
+                            w: wr,
+                            sels,
+                            lb_at_build: self.lb,
+                            last_k: units,
+                        });
+                        return true;
+                    }
+                }
+            }
         }
         let uniform_w = {
             let mut it = soft_idx.iter().map(|&i| self.soft_weights[i]);
@@ -3985,6 +4864,9 @@ impl OllEngine {
             match result {
                 AssumeResult::Sat(model) => {
                     let cost = self.model_cost(&model);
+                    if identity_check_enabled() {
+                        self.report_residual_identity(&model, cost);
+                    }
                     if debug_trace() {
                         eprintln!("c descent sat: cost={} ub={}", cost, self.ub);
                     }
@@ -4004,6 +4886,74 @@ impl OllEngine {
                     }
                     // Tighten the bound below the fresh model's cost.
                     match self.descent.as_mut().expect("descent encoding present") {
+                        DescentEnc::ResidualTot {
+                            tot,
+                            w,
+                            sels,
+                            lb_at_build,
+                            last_k,
+                        } => {
+                            // Bound derived ONLY from `ub` — never from the
+                            // model just found. For an EXACT encoding "beat
+                            // this model" is valid; for a relaxation it is not,
+                            // because a model with the same Σ can be cheaper.
+                            // The relaxation's defining inequality, asserted on
+                            // every real model rather than argued on paper. The
+                            // first version of this lever shipped a valid proof
+                            // and ten wrong answers; the 41-test brute-force
+                            // suite passed it, because its instances never enter
+                            // the regime where the bound bites. This catches a
+                            // violation at the first model instead of at the
+                            // next benchmark.
+                            debug_assert!(
+                                {
+                                    let sigma = sels
+                                        .iter()
+                                        .filter(|&&sl| {
+                                            model.get(sl.variable().index()).copied()
+                                                != Some(sl.is_positive())
+                                        })
+                                        .count()
+                                        as Weight
+                                        * *w;
+                                    sigma <= cost.saturating_sub(*lb_at_build)
+                                },
+                                "residual identity violated: Σ > cost - lb_at_build",
+                            );
+                            let target_r = self.ub.saturating_sub(*lb_at_build);
+                            match Self::residual_units(target_r, *w, sels.len()) {
+                                Some(units) if units < *last_k => {
+                                    *last_k = units;
+                                    let next_var = &mut self.next_var;
+                                    let mut fresh = |sat: &mut SatSolver| {
+                                        let var = sat.new_var();
+                                        *next_var = var.id() + 1;
+                                        sat.set_phase(var, false);
+                                        Literal::positive(var)
+                                    };
+                                    tot.extend(units, &mut self.sat, &mut fresh, guard);
+                                    let mut clause = vec![tot.outs[units - 1].negated()];
+                                    if let Some(g) = guard {
+                                        clause.push(g.negated());
+                                    }
+                                    self.sat.add_clause(clause);
+                                }
+                                _ => {
+                                    // Cannot tighten (or the bound became
+                                    // vacuous): this relaxation is spent. Fall
+                                    // back to the exact original-objective
+                                    // encoding, the only one that can certify.
+                                    if debug_trace() {
+                                        eprintln!(
+                                            "c descent: residual bound spent (last_k={last_k}) -> exact encoding",
+                                        );
+                                    }
+                                    self.residual_exhausted = true;
+                                    self.descent = None;
+                                    return None;
+                                }
+                            }
+                        }
                         DescentEnc::Tot { tot, w, soft_idx } => {
                             // Count violations over the residual softs the
                             // encoding covers; hardened softs are satisfied
@@ -4054,9 +5004,26 @@ impl OllEngine {
                         } => {
                             // Sound bound (see enum docs): cost < ub implies
                             // cluster violations < ceil(target / band_min).
-                            let k_bound = (target.div_ceil((*band_min).max(1)) as usize)
-                                .min(member_idx.len())
-                                .max(1);
+                            //
+                            // This is a RELAXATION — the off-band "dust" softs
+                            // carry cost the cluster totalizer does not count —
+                            // so the bound may only ever come from `ub`, and a
+                            // bound too large to be represented is VACUOUS.
+                            // Clamping it into range with `.min(member_idx.len())`
+                            // would forbid "every member violated", a model that
+                            // can still be cheaper than the incumbent. That is
+                            // exactly the mistake that made #descent-residual
+                            // produce ten wrong answers (see `ResidualTot`);
+                            // it is unreachable here only because this path is
+                            // gated behind `tuning.force_cluster` (default OFF).
+                            // A vacuous bound falls through to the exact-adder
+                            // swap below rather than being asserted.
+                            let units = (target.div_ceil((*band_min).max(1)) as usize).max(1);
+                            let k_bound = if units <= member_idx.len() {
+                                units
+                            } else {
+                                usize::MAX
+                            };
                             if k_bound < *last_k {
                                 *last_k = k_bound;
                                 let next_var = &mut self.next_var;
@@ -4154,6 +5121,23 @@ impl OllEngine {
     ///
     /// `should_stop` is polled inside SAT calls and between iterations.
     /// `on_upper_bound` is invoked whenever the incumbent improves.
+    /// Supply the whole-solve deadline (see `MaxSatSolver::set_deadline`).
+    pub(crate) fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
+    }
+
+    /// Budget remaining, when the caller supplied a deadline.
+    ///
+    /// This is the one piece of information the engine historically lacked, and
+    /// its absence is why every internal policy is a fixed constant tuned at a
+    /// single timeout. Returns `None` when budget-blind, and callers MUST fall
+    /// back to their previous fixed behaviour in that case so nothing changes
+    /// for callers that never set a deadline.
+    fn budget_remaining(&self) -> Option<Duration> {
+        self.deadline
+            .map(|d| d.saturating_duration_since(Instant::now()))
+    }
+
     pub(crate) fn solve(
         &mut self,
         should_stop: &dyn Fn() -> bool,
@@ -4336,9 +5320,19 @@ impl OllEngine {
             // reversible KICK path (10s slice; OLL resumes on expiry) and
             // honors descent_not_before so an unproductive slice cannot
             // re-enter for 15s.
+            // #descent-gap-tile: raise the kick cap to meet the organic
+            // `gap_ok` floor so the two entry mechanisms tile the gap range.
+            // Only the uniform-weight arm of `gap_ok` has a floor (the mixed
+            // arm degenerates to `ub > lb`), so only that arm leaves a hole.
+            let kick_gap_cap = match (descent_gap_tile_enabled(), self.residual_uniform_weight()) {
+                (true, Some(w)) => {
+                    DESCENT_KICK_GAP.max(w.saturating_mul(self.tuning.lsu_min_gap_units))
+                }
+                _ => DESCENT_KICK_GAP,
+            };
             if !descent_kick
                 && self.best_model.is_some()
-                && self.ub.saturating_sub(self.effective_lb()) <= 32
+                && self.ub.saturating_sub(self.effective_lb()) <= kick_gap_cap
                 && Instant::now() >= descent_not_before
                 && (self.ub_last_improved.elapsed() > Duration::from_secs(15)
                     && started.elapsed() > Duration::from_secs(20))
@@ -4358,7 +5352,7 @@ impl OllEngine {
             if !descent_kick
                 && maxsat_early_descent_enabled()
                 && self.best_model.is_some()
-                && self.ub.saturating_sub(self.effective_lb()) <= 32
+                && self.ub.saturating_sub(self.effective_lb()) <= kick_gap_cap
                 && Instant::now() >= descent_not_before
                 && self.stats.cores_found >= 8
                 && started.elapsed() > Duration::from_secs(4)
@@ -4437,25 +5431,75 @@ impl OllEngine {
                     // the warm bound clauses (protein 1bpi: gap 14 needs
                     // several 10s slices). Only a DRY slice hands control
                     // back to OLL.
+                    // #descent-organic-slice: an organic entry gets a bounded,
+                    // progress-extending slice too, so an UNPRODUCTIVE descent
+                    // cannot own the rest of the run with lb frozen. A
+                    // productive one still runs to completion via the same
+                    // "improved ⇒ another slice" rule the kicks use.
+                    let organic_slice = descent_organic_slice_enabled();
+                    let bounded = kick_entry || organic_slice;
+                    // Budget-scaled when a deadline is known, fixed otherwise
+                    // (budget-blind callers keep their previous behaviour).
+                    let organic_len = match self.budget_remaining() {
+                        Some(rem) => (rem / ORGANIC_DESCENT_BUDGET_DIVISOR)
+                            .clamp(ORGANIC_DESCENT_SLICE_MIN, ORGANIC_DESCENT_SLICE_MAX),
+                        None => ORGANIC_DESCENT_SLICE,
+                    };
+                    // #descent-kick-scale: same treatment for the kick arm,
+                    // which on the expensive-core families is the ONLY reachable
+                    // entry (the organic gate needs 64 cores; those runs end at
+                    // ~17). Falls back to the measured 10s when disabled or
+                    // budget-blind.
+                    let kick_len = match (descent_kick_scale_enabled(), self.budget_remaining()) {
+                        (true, Some(rem)) => (rem / ORGANIC_DESCENT_BUDGET_DIVISOR)
+                            .clamp(DESCENT_KICK_SLICE, ORGANIC_DESCENT_SLICE_MAX),
+                        _ => DESCENT_KICK_SLICE,
+                    };
                     let outcome = loop {
                         let deadline = if kick_entry {
-                            Instant::now() + Duration::from_secs(10)
+                            Instant::now() + kick_len
+                        } else if organic_slice {
+                            Instant::now() + organic_len
                         } else {
                             Instant::now() + Duration::from_hours(8760)
                         };
                         let ub_before = self.ub;
                         let outcome = self.descend(deadline, should_stop, on_upper_bound);
-                        if outcome.is_some() || !kick_entry || self.ub >= ub_before {
+                        if outcome.is_some() || !bounded || self.ub >= ub_before {
                             break outcome;
                         }
                     };
                     if let Some(outcome) = outcome {
                         return outcome;
                     }
-                    // Dry slice expired (kick entries only): back to OLL.
-                    // Keep the organic gate from immediately re-committing on
-                    // the same post-fold state it never vetted.
-                    descent_not_before = Instant::now() + Duration::from_secs(15);
+                    // Dry slice expired: back to OLL. (Kick entries always;
+                    // organic entries too under #descent-organic-slice, which
+                    // is the whole point — lb resumes moving.) Keep the
+                    // organic gate from immediately re-committing on the same
+                    // post-fold state it never vetted.
+                    //
+                    // #descent-duty-cycle: the OLL window must scale with the
+                    // slice it follows, or the alternation is not an
+                    // alternation. The organic slice is budget-scaled
+                    // (`organic_len` = clamp(remaining/8, 10s, 300s)) while this
+                    // bar was a fixed 15s, making OLL's share
+                    // 15/(15+organic_len) — 4.8% at a 3600s budget. That
+                    // starves the lower-bound lane the lever exists to revive,
+                    // and it is why the first #descent-organic-slice A/B
+                    // measured inert: the descent got a bigger slice and OLL
+                    // never got its turn back. Kick entries keep the measured
+                    // 15s (their slice is a fixed 10s, so 15s is already a
+                    // longer window than the slice).
+                    let oll_window = if kick_entry {
+                        // Same duty-cycle rule: the OLL window must not be
+                        // shorter than the slice it follows once that slice
+                        // scales, or OLL is starved exactly as it was on the
+                        // organic arm.
+                        kick_len.max(Duration::from_secs(15))
+                    } else {
+                        organic_len.max(Duration::from_secs(15))
+                    };
+                    descent_not_before = Instant::now() + oll_window;
                 }
             }
 
@@ -4837,6 +5881,50 @@ impl OllEngine {
 mod tot_tests {
     use super::*;
 
+    /// #oneshot-dry-guard-band regression: the one-shot dry arm and
+    /// `install_non_oneshot_sat_config` must agree band for band, because the
+    /// dry arm's whole contract is "run on the configuration the non-one-shot
+    /// path would have used".
+    ///
+    /// They used to be hand-copied duplicates. The dry copy hard-coded the
+    /// >500k disables while asserting `hard.len() >= 1M`, an invariant broken
+    /// when `BCE_ONESHOT_MIN_HARDS` (100k) lowered the gate under
+    /// `AY_AB_MAXSAT_BCE=1`. Instances in the 100k..=500k band then ran every
+    /// solve with vivify/subsume/probe/transred/sweep disabled, which produced
+    /// wrong answers on `tcp_wt-tcp_students_112_it_5` (242,578 hards):
+    /// `o 3441`/`3477`/`3549` against a true optimum of 3366.
+    ///
+    /// The band boundary is the assertion that matters: at 242,578 hards the
+    /// answer must be "install nothing".
+    #[test]
+    fn non_oneshot_band_installs_nothing_below_500k() {
+        // The failing instance's exact size — this is the regression.
+        assert!(
+            non_oneshot_inprocessing_profile(242_578).is_none(),
+            "tcp_wt-tcp_students_112_it_5 (242,578 hards) must install NO \
+             inprocessing profile; installing the >500k band here is the \
+             #oneshot-dry-guard-band wrong-answer bug"
+        );
+        // Band edges.
+        assert!(non_oneshot_inprocessing_profile(BCE_ONESHOT_MIN_HARDS).is_none());
+        assert!(non_oneshot_inprocessing_profile(500_000).is_none());
+        assert!(non_oneshot_inprocessing_profile(500_001).is_some());
+
+        // >500k: the five inprocessing disables. The occurrence-list passes
+        // that default ON stay ON until 2M. (`bve`/`bce`/`congruence` default
+        // OFF, so they are not evidence either way here.)
+        let mid = non_oneshot_inprocessing_profile(600_000).expect("500k..2M installs a profile");
+        assert!(!mid.vivify && !mid.subsume && !mid.probe && !mid.transred && !mid.sweep);
+        assert!(
+            mid.factor && mid.sbva && mid.htr && mid.gate && mid.backbone,
+            "occ-list passes must survive below 2M"
+        );
+
+        // >2M additionally disables the occurrence-list passes.
+        let big = non_oneshot_inprocessing_profile(2_000_001).expect("2M+ installs a profile");
+        assert!(!big.factor && !big.sbva && !big.htr && !big.gate && !big.backbone);
+    }
+
     /// Incremental totalizer: extending the bound stepwise must produce a
     /// complete "at least t inputs true => O_t" implication set at every
     /// step. We check by assuming ¬O_t plus t chosen inputs and expecting
@@ -4968,6 +6056,12 @@ mod lsu_tests {
                 abstraction_min_cores: 0,
                 force_cluster: false,
                 lp_boost: LpBoostMode::Auto,
+                // #tot-eqs pinned ON so the reverse-direction clauses are exercised
+                // wherever the fixture has >= 2 distinct soft weights. Production also
+                // defaults ON (env gate AY_AB_MAXSAT_TOT_EQS != "0"); `tot_eq_budget`
+                // is 0 on uniform weights, so the pin is inert on unit-weight fixtures.
+                tot_eqs: Some(true),
+                core_clause: Some(true),
             });
 
             let outcome = engine.solve(&|| false, &mut |_| {});
@@ -5076,6 +6170,12 @@ mod lsu_tests {
                 abstraction_min_cores: 0,
                 force_cluster: false,
                 lp_boost: LpBoostMode::Auto,
+                // #tot-eqs pinned ON so the reverse-direction clauses are exercised
+                // wherever the fixture has >= 2 distinct soft weights. Production also
+                // defaults ON (env gate AY_AB_MAXSAT_TOT_EQS != "0"); `tot_eq_budget`
+                // is 0 on uniform weights, so the pin is inert on unit-weight fixtures.
+                tot_eqs: Some(true),
+                core_clause: Some(true),
             });
 
             let outcome = engine.solve(&|| false, &mut |_| {});
@@ -5179,6 +6279,12 @@ mod lsu_tests {
                 abstraction_min_cores: 0,
                 force_cluster: true,
                 lp_boost: LpBoostMode::Auto,
+                // #tot-eqs pinned ON so the reverse-direction clauses are exercised
+                // wherever the fixture has >= 2 distinct soft weights. Production also
+                // defaults ON (env gate AY_AB_MAXSAT_TOT_EQS != "0"); `tot_eq_budget`
+                // is 0 on uniform weights, so the pin is inert on unit-weight fixtures.
+                tot_eqs: Some(true),
+                core_clause: Some(true),
             });
 
             let outcome = engine.solve(&|| false, &mut |_| {});
@@ -5280,6 +6386,12 @@ mod lsu_tests {
                 abstraction_min_cores: 0,
                 force_cluster: false,
                 lp_boost: LpBoostMode::Auto,
+                // #tot-eqs pinned ON so the reverse-direction clauses are exercised
+                // wherever the fixture has >= 2 distinct soft weights. Production also
+                // defaults ON (env gate AY_AB_MAXSAT_TOT_EQS != "0"); `tot_eq_budget`
+                // is 0 on uniform weights, so the pin is inert on unit-weight fixtures.
+                tot_eqs: Some(true),
+                core_clause: Some(true),
             });
 
             let outcome = engine.solve(&|| false, &mut |_| {});
@@ -5333,6 +6445,12 @@ mod lsu_tests {
             abstraction_min_cores: u64::MAX,
             force_cluster: false,
             lp_boost: LpBoostMode::Off,
+            // #tot-eqs pinned ON so the reverse-direction clauses are exercised
+            // wherever the fixture has >= 2 distinct soft weights. Production also
+            // defaults ON (env gate AY_AB_MAXSAT_TOT_EQS != "0"); `tot_eq_budget`
+            // is 0 on uniform weights, so the pin is inert on unit-weight fixtures.
+            tot_eqs: Some(true),
+            core_clause: Some(true),
         });
         match engine.solve(&|| false, &mut |_| {}) {
             OllOutcome::Optimal { cost, .. } => assert_eq!(cost, 11),
@@ -5377,6 +6495,12 @@ mod level_tests {
             abstraction_min_cores: u64::MAX,
             force_cluster: false,
             lp_boost: LpBoostMode::Auto,
+            // #tot-eqs pinned ON so the reverse-direction clauses are exercised
+            // wherever the fixture has >= 2 distinct soft weights. Production also
+            // defaults ON (env gate AY_AB_MAXSAT_TOT_EQS != "0"); `tot_eq_budget`
+            // is 0 on uniform weights, so the pin is inert on unit-weight fixtures.
+            tot_eqs: Some(true),
+            core_clause: Some(true),
         }
     }
 
@@ -5573,6 +6697,12 @@ mod wce_tests {
             abstraction_min_cores: u64::MAX,
             force_cluster: false,
             lp_boost: LpBoostMode::Off,
+            // #tot-eqs pinned ON so the reverse-direction clauses are exercised
+            // wherever the fixture has >= 2 distinct soft weights. Production also
+            // defaults ON (env gate AY_AB_MAXSAT_TOT_EQS != "0"); `tot_eq_budget`
+            // is 0 on uniform weights, so the pin is inert on unit-weight fixtures.
+            tot_eqs: Some(true),
+            core_clause: Some(true),
         }
     }
 
@@ -5706,6 +6836,12 @@ mod minimize_tests {
             abstraction_min_cores: u64::MAX,
             force_cluster: false,
             lp_boost: LpBoostMode::Off,
+            // #tot-eqs pinned ON so the reverse-direction clauses are exercised
+            // wherever the fixture has >= 2 distinct soft weights. Production also
+            // defaults ON (env gate AY_AB_MAXSAT_TOT_EQS != "0"); `tot_eq_budget`
+            // is 0 on uniform weights, so the pin is inert on unit-weight fixtures.
+            tot_eqs: Some(true),
+            core_clause: Some(true),
         }
     }
 
@@ -5999,6 +7135,12 @@ mod lp_boost_tests {
                 abstraction_min_cores: u64::MAX,
                 force_cluster: false,
                 lp_boost: LpBoostMode::Force,
+                // #tot-eqs pinned ON so the reverse-direction clauses are exercised
+                // wherever the fixture has >= 2 distinct soft weights. Production also
+                // defaults ON (env gate AY_AB_MAXSAT_TOT_EQS != "0"); `tot_eq_budget`
+                // is 0 on uniform weights, so the pin is inert on unit-weight fixtures.
+                tot_eqs: Some(true),
+                core_clause: Some(true),
             });
 
             let outcome = engine.solve(&|| false, &mut |_| {});
@@ -6050,6 +7192,12 @@ mod lp_boost_tests {
             abstraction_min_cores: u64::MAX,
             force_cluster: false,
             lp_boost: LpBoostMode::Auto,
+            // #tot-eqs pinned ON so the reverse-direction clauses are exercised
+            // wherever the fixture has >= 2 distinct soft weights. Production also
+            // defaults ON (env gate AY_AB_MAXSAT_TOT_EQS != "0"); `tot_eq_budget`
+            // is 0 on uniform weights, so the pin is inert on unit-weight fixtures.
+            tot_eqs: Some(true),
+            core_clause: Some(true),
         });
         match engine.solve(&|| false, &mut |_| {}) {
             OllOutcome::Optimal { cost, .. } => assert_eq!(cost, 21),
@@ -6081,6 +7229,12 @@ mod lp_boost_tests {
         let mut engine = OllEngine::new(3, ClauseStore::new(), soft_store, vec![8, 8]);
         engine.set_tuning(OllTuning {
             lp_boost: LpBoostMode::Force,
+            // #tot-eqs pinned ON so the reverse-direction clauses are exercised
+            // wherever the fixture has >= 2 distinct soft weights. Production also
+            // defaults ON (env gate AY_AB_MAXSAT_TOT_EQS != "0"); `tot_eq_budget`
+            // is 0 on uniform weights, so the pin is inert on unit-weight fixtures.
+            tot_eqs: Some(true),
+            core_clause: Some(true),
             ..OllTuning::default()
         });
         engine.lp_cores.push(vec![0]);
@@ -6153,6 +7307,79 @@ mod abstraction_tests {
     /// constraint (all 3-subsets blocked) has optimum cost 6, and the
     /// co-occurring cores over those selectors should coalesce into a
     /// shared counting set.
+    /// #tot-eqs: the reverse-direction pass must actually FIRE (otherwise the
+    /// cross-checks above pass vacuously) and must not move the optimum. The
+    /// instance is an at-most-2-of-8 clique with all 8 softs wanted, so OLL
+    /// relaxes a core and then hardens bounds on it — hitting both
+    /// force_true call sites (relax_core and the unit-core branch).
+    #[test]
+    fn tot_eqs_emit_reverse_clauses_and_stay_exact() {
+        let n: i32 = 8;
+        // #tot-eqs is WEIGHTED-ONLY (uniform weights leave the budget at 0 so the
+        // unweighted track stays bit-identical), so this instance must carry >= 2
+        // distinct weights for the lever to be active at all. Making one soft
+        // weight 2 keeps the optimum at 6: at most 2 of the 8 softs can hold, and
+        // satisfying the weight-2 soft plus one weight-1 soft leaves 6 violated.
+        let mut weights = vec![1u64; n as usize];
+        weights[(n - 1) as usize] = 2;
+
+        let run = |tot_eqs: Option<bool>| {
+            let mut hs = ClauseStore::new();
+            for a in 1..=n {
+                for b in (a + 1)..=n {
+                    for c in (b + 1)..=n {
+                        hs.push_from_iter([-a, -b, -c].iter().map(|&l| Literal::from(l)));
+                    }
+                }
+            }
+            let mut ss = ClauseStore::new();
+            for i in 1..=n {
+                ss.push_from_iter([i].iter().map(|&l| Literal::from(l)));
+            }
+            let mut engine = OllEngine::new(n as u32 + 1, hs, ss, weights.clone());
+            engine.set_tuning(OllTuning {
+                lsu_min_cores: u64::MAX,
+                lsu_min_gap_units: Weight::MAX,
+                lsu_stall_ms_per_core: 0,
+                force_adder: false,
+                abstraction_min_cores: u64::MAX,
+                force_cluster: false,
+                lp_boost: LpBoostMode::Off,
+                tot_eqs,
+                core_clause: Some(false),
+            });
+            let cost = match engine.solve(&|| false, &mut |_| {}) {
+                OllOutcome::Optimal { cost, .. } => cost,
+                other => panic!("expected optimal, got {other:?}"),
+            };
+            (
+                cost,
+                engine.stats().tot_eq_clauses,
+                engine.stats().tot_eq_forced,
+            )
+        };
+
+        // At most 2 of the 8 softs can hold => optimum violates 6.
+        let (cost_on, eq_clauses, eq_forced) = run(Some(true));
+        let (cost_off, off_clauses, off_forced) = run(Some(false));
+        assert_eq!(cost_on, 6, "reverse clauses must not move the optimum");
+        assert_eq!(cost_off, 6);
+        assert!(
+            eq_forced > 0,
+            "force_true must fire on a core-relaxing instance",
+        );
+        assert!(
+            eq_clauses > 0,
+            "the pass must emit reverse-direction clauses (got 0: gate or budget \
+             is silently swallowing them, making the cross-checks vacuous)",
+        );
+        assert_eq!(
+            (off_clauses, off_forced),
+            (0, 0),
+            "gated off must be bit-identical: no reverse clauses, no forced outputs",
+        );
+    }
+
     #[test]
     fn abstraction_sets_form_and_stay_exact() {
         let n: i32 = 8;
@@ -6178,6 +7405,12 @@ mod abstraction_tests {
             abstraction_min_cores: 0,
             force_cluster: false,
             lp_boost: LpBoostMode::Auto,
+            // #tot-eqs pinned ON so the reverse-direction clauses are exercised
+            // wherever the fixture has >= 2 distinct soft weights. Production also
+            // defaults ON (env gate AY_AB_MAXSAT_TOT_EQS != "0"); `tot_eq_budget`
+            // is 0 on uniform weights, so the pin is inert on unit-weight fixtures.
+            tot_eqs: Some(true),
+            core_clause: Some(true),
         });
 
         match engine.solve(&|| false, &mut |_| {}) {
@@ -6221,6 +7454,12 @@ mod am1_probe_tests {
             abstraction_min_cores: u64::MAX,
             force_cluster: false,
             lp_boost: LpBoostMode::Off,
+            // #tot-eqs pinned ON so the reverse-direction clauses are exercised
+            // wherever the fixture has >= 2 distinct soft weights. Production also
+            // defaults ON (env gate AY_AB_MAXSAT_TOT_EQS != "0"); `tot_eq_budget`
+            // is 0 on uniform weights, so the pin is inert on unit-weight fixtures.
+            tot_eqs: Some(true),
+            core_clause: Some(true),
         }
     }
 

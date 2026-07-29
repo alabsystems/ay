@@ -461,6 +461,134 @@ fn test_elaborate_power_symbolic_exp_stays_uninterpreted() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `:left-assoc` arity for `/` and `div` (SMT-LIB 2.6 theories `Reals`, `Ints`)
+// ---------------------------------------------------------------------------
+
+/// Elaborate every assertion of `input` in ONE context and return the
+/// assertion `TermId`s, so structural identity can be compared by interning.
+fn elaborate_assertions(input: &str) -> (Context, Vec<TermId>) {
+    let commands = parse(input).unwrap();
+    let mut ctx = Context::new();
+    for cmd in &commands {
+        ctx.process_command(cmd).unwrap();
+    }
+    let assertions = ctx.assertions.clone();
+    (ctx, assertions)
+}
+
+/// True when elaborating `input` reports an error on some command.
+fn elaboration_rejects(input: &str) -> bool {
+    let commands = parse(input).unwrap();
+    let mut ctx = Context::new();
+    commands.iter().any(|cmd| ctx.process_command(cmd).is_err())
+}
+
+/// SMT-LIB 2.6 theory `Reals` declares `(/ Real Real Real :left-assoc)`, so
+/// `(/ a b c)` abbreviates `(/ (/ a b) c)`. Compared by interned `TermId`, not
+/// by a solver verdict.
+#[test]
+fn division_is_left_associative() {
+    let (_ctx, assertions) = elaborate_assertions(
+        r"
+        (set-logic QF_LRA)
+        (declare-const a Real)
+        (declare-const b Real)
+        (declare-const c Real)
+        (assert (= (/ a b c) 0.0))
+        (assert (= (/ (/ a b) c) 0.0))
+        (assert (= (/ a b c a) 0.0))
+        (assert (= (/ (/ (/ a b) c) a) 0.0))
+    ",
+    );
+    assert_eq!(assertions.len(), 4);
+    assert_eq!(
+        assertions[0], assertions[1],
+        "(/ a b c) must intern to the same term as (/ (/ a b) c)"
+    );
+    assert_eq!(
+        assertions[2], assertions[3],
+        "(/ a b c a) must intern to the same term as (/ (/ (/ a b) c) a)"
+    );
+}
+
+/// SMT-LIB 2.6 theory `Ints` declares `(div Int Int Int :left-assoc)`.
+#[test]
+fn intdiv_is_left_associative() {
+    let (_ctx, assertions) = elaborate_assertions(
+        r"
+        (set-logic QF_LIA)
+        (declare-const a Int)
+        (declare-const b Int)
+        (declare-const c Int)
+        (assert (= (div a b c) 0))
+        (assert (= (div (div a b) c) 0))
+    ",
+    );
+    assert_eq!(assertions.len(), 2);
+    assert_eq!(
+        assertions[0], assertions[1],
+        "(div a b c) must intern to the same term as (div (div a b) c)"
+    );
+}
+
+/// `mod`, `rem` and `abs` are NOT `:left-assoc` in SMT-LIB 2.6 `Ints`; they are
+/// fixed arity and an over-application is a well-sortedness error. Pinning this
+/// keeps the `:left-assoc` fix from spreading to operators the standard makes
+/// binary.
+#[test]
+fn mod_rem_abs_stay_fixed_arity() {
+    for input in [
+        "(set-logic QF_LIA)\n(assert (= (mod 100 7 3) 2))",
+        "(set-logic QF_LIA)\n(assert (= (rem 100 7 3) 2))",
+        "(set-logic QF_LIA)\n(assert (= (abs 1 2) 1))",
+    ] {
+        assert!(
+            elaboration_rejects(input),
+            "over-applied fixed-arity operator must be rejected: {input}"
+        );
+    }
+}
+
+/// A one-argument `/` or `div` is still ill-sorted: `:left-assoc` in SMT-LIB 2.6
+/// means two-or-more, not one-or-more.
+#[test]
+fn division_still_requires_two_arguments() {
+    for input in [
+        "(set-logic QF_LRA)\n(declare-const a Real)\n(assert (= (/ a) 0.0))",
+        "(set-logic QF_LIA)\n(declare-const a Int)\n(assert (= (div a) 0))",
+    ] {
+        assert!(
+            elaboration_rejects(input),
+            "unary division must be rejected: {input}"
+        );
+    }
+}
+
+/// The folded value of a fully-constant n-ary `/` and `div` follows the
+/// left-associative reading: `(/ 8.0 2.0 2.0) = 2.0` and `(div 100 5 2) = 10`.
+#[test]
+fn nary_division_folds_left_associatively() {
+    let (ctx, assertions) = elaborate_assertions(
+        r"
+        (set-logic QF_LIRA)
+        (assert (= (/ 8.0 2.0 2.0) 2.0))
+        (assert (= (div 100 5 2) 10))
+    ",
+    );
+    assert_eq!(assertions.len(), 2);
+    for a in assertions {
+        assert!(
+            matches!(
+                ctx.terms.get(a),
+                TermData::Const(ay_core::Constant::Bool(true))
+            ),
+            "constant-folded n-ary division must be true, got {:?}",
+            ctx.terms.get(a)
+        );
+    }
+}
+
 /// `(^ 2 5)` over Int base produces `32` via constant folding.
 #[test]
 fn test_elaborate_power_int_base_literal_fold() {

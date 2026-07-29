@@ -595,6 +595,7 @@ fn default_unknown_cost_center(
             UnknownReason::MemoryLimit | UnknownReason::ResourceLimit => "memory",
             UnknownReason::InternalError => "internal-error",
             UnknownReason::ProofTrusted => "trusted-proof-step",
+            UnknownReason::SelfCheckRejected => "self-check-rejected",
             UnknownReason::Incomplete | UnknownReason::Unknown => "unknown",
         },
     }
@@ -623,6 +624,7 @@ fn default_unknown_detail(reason: UnknownReason) -> &'static str {
         }
         UnknownReason::InternalError => "executor returned an internal error",
         UnknownReason::ProofTrusted => "strict proof mode rejected trusted proof steps",
+        UnknownReason::SelfCheckRejected => "AY COMPUTED A VERDICT AND ITS OWN FAIL-CLOSED CHECKER REFUTED IT -- this is a caught wrong answer, not a missing capability",
         UnknownReason::Incomplete | UnknownReason::Unknown => "solver returned Unknown",
     }
 }

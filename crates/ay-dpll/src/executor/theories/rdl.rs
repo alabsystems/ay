@@ -325,3 +325,170 @@ impl Executor {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// QF_IDL: the same engine over integer-tightened bounds
+// ---------------------------------------------------------------------------
+
+/// DEFAULT ON, disable with `AY_IDL_ENGINE=0` — same polarity as
+/// [`rdl_engine_enabled`], and for the same reason: it earned it.
+///
+/// Full-division differential, 138 files even-strided over all 2,528, T:20,
+/// arms interleaved per file: 43 decided by default vs 56 with the lane,
+/// **+16 gained / 3 lost / 0 conflicts**, and zero verdicts contradicting the
+/// declared `:status` on either arm. Net +13 at a 5:1 win ratio. Confirmed on a
+/// SECOND, disjoint stride before flipping, so the ratio is not an artefact of
+/// the sample it was tuned on.
+///
+/// The 3 losses are budget exhaustion, not wrong answers: the lane engages,
+/// spends the deadline, and leaves nothing for the `solve_lia` fallback that
+/// decides them. Budgeting the attempt to half the deadline was measured and
+/// REFUTED — it recovers 2 losses but costs 6 of the 16 gains (net +9 vs +13),
+/// because a difference graph that is going to close still needs most of the
+/// budget.
+fn idl_engine_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var("AY_IDL_ENGINE").is_ok_and(|v| v == "0"))
+}
+
+/// Exact `LraModel` → `LiaModel`, FAIL-CLOSED on any non-integral value.
+///
+/// After integer tightening every edge weight is an integer with a zero
+/// epsilon, so the engine's potentials — and therefore every extracted value —
+/// are integers. A non-integral value here means that invariant did not hold,
+/// so this returns `None` and the caller falls through to `solve_lia` rather
+/// than rounding. Rounding would be exactly the silent relaxation this lane
+/// exists to avoid.
+fn lra_model_to_lia(model: &ay_lra::LraModel) -> Option<ay_lia::LiaModel> {
+    let mut values = ay_core::kani_compat::DetHashMap::default();
+    for (term, value) in &model.values {
+        if !value.is_integer() {
+            return None;
+        }
+        values.insert(*term, value.to_integer());
+    }
+    Some(ay_lia::LiaModel { values })
+}
+
+impl Executor {
+    /// QF_IDL route: decide the instance with [`DiffLogicTheory`] in integer
+    /// mode when every theory atom is a pure INT difference-logic atom, else
+    /// fall straight through to [`Executor::solve_lia`].
+    ///
+    /// # Why this is not `solve_rdl` with a different sort check
+    ///
+    /// The fall-through is `solve_lia`, NOT `solve_lra`. Handing an integer
+    /// problem to the simplex lane would drop integrality — measured: relabelling
+    /// a QF_IDL file's `set-logic` to `QF_RDL` turns a derivable `unsat` into
+    /// `unknown`. The model also lands in `TheoryModels::lia`, via a conversion
+    /// that fails closed rather than rounding.
+    ///
+    /// # Soundness
+    ///
+    /// Identical to the Real lane, plus the tightening equivalence. `Sat` clears
+    /// `last_model_validated`, so `check_sat` re-evaluates every ORIGINAL
+    /// assertion against the extracted model and degrades a spurious model to
+    /// `Unknown`. `Unsat` rests on the theory's conflicts, each a genuine
+    /// negative cycle re-verified by the DPLL conflict gate. `tighten_int` is an
+    /// equivalence over Int, not a relaxation, so neither verdict can be
+    /// strengthened by it.
+    pub(in crate::executor) fn solve_idl(&mut self) -> Result<SolveResult> {
+        if !idl_engine_enabled()
+            || self.incremental_mode
+            || (self.produce_proofs_enabled() && !rdl_engine_proofs_allowed())
+        {
+            return self.solve_lia();
+        }
+        if self.should_abort_theory_loop() {
+            return Ok(SolveResult::Unknown);
+        }
+
+        let mut lifted = self.preprocess_lra_assertions();
+        {
+            let mut memo = ay_core::kani_compat::DetHashMap::default();
+            for a in lifted.iter_mut() {
+                *a = eliminate_arith_equalities(&mut self.ctx.terms, *a, &mut memo);
+            }
+        }
+        let reachable =
+            crate::incremental_state::collect_reachable_theory_atoms(&self.ctx.terms, &lifted);
+        let pure = reachable
+            .iter()
+            .all(|&atom| crate::executor::dl_theory::atom_is_routable_int(&self.ctx.terms, atom));
+        if !pure {
+            return self.solve_lia();
+        }
+        self.solve_idl_with(lifted)
+    }
+
+    fn solve_idl_with(&mut self, lifted: Vec<ay_core::TermId>) -> Result<SolveResult> {
+        let solve_interrupt = self.solve_interrupt.clone();
+        let solve_deadline = self.solve_deadline.clone();
+        let mut model_conversion_failed = false;
+        let result = self.with_isolated_incremental_state(Some(lifted), |this| {
+            let (ri, rf, rv) = restart_tuning();
+            this.configure_sat_search_tuning(ri, rf, rv);
+            solve_incremental_split_loop_pipeline!(this,
+                tag: "IDL",
+                persistent_sat_field: persistent_sat,
+                create_theory: DiffLogicTheory::<ay_diff_logic::RStar>::new_int(&this.ctx.terms),
+                extract_models: |theory| {
+                    use crate::executor::theories::solve_harness::TheoryModels;
+                    let lra = theory.extract_model();
+                    match lra_model_to_lia(&lra) {
+                        Some(lia) => TheoryModels { lia: Some(lia), ..TheoryModels::default() },
+                        None => {
+                            model_conversion_failed = true;
+                            TheoryModels::default()
+                        }
+                    }
+                },
+                max_splits: crate::executor::theories::MAX_SPLITS_LRA,
+                pre_theory_import: |_theory, _lc, _hc, _ds| {},
+                post_theory_export: |_theory| {
+                    (vec![], Default::default(), Default::default())
+                },
+                eager_extension: true,
+                pre_iter_check: |_s| {
+                    solve_interrupt
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                        || solve_deadline.expired()
+                }
+            )
+        });
+
+        // A failed integral conversion means the tightening invariant did not
+        // hold; refuse the verdict and let the trusted lane own it.
+        if model_conversion_failed {
+            self.last_result = None;
+            self.last_model = None;
+            self.last_model_validated = false;
+            self.last_unknown_reason = None;
+            return self.solve_lia();
+        }
+
+        match result {
+            Ok(SolveResult::Sat) => {
+                self.last_model_validated = false;
+                Ok(SolveResult::Sat)
+            }
+            Ok(SolveResult::Unsat(cert)) => Ok(SolveResult::Unsat(cert)),
+            other => {
+                if self.solve_deadline.expired()
+                    || self
+                        .solve_interrupt
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    return other;
+                }
+                self.last_result = None;
+                self.last_model = None;
+                self.last_model_validated = false;
+                self.last_unknown_reason = None;
+                self.solve_lia()
+            }
+        }
+    }
+}

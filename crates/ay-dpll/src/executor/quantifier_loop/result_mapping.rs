@@ -82,6 +82,19 @@ use ay_core::kani_compat::DetHashMap as HashMap;
 
 use super::super::MAX_INTERLEAVED_EMATCHING_ROUNDS;
 
+/// Exact constructor-site provenance for recursive NNF normalization inside a
+/// positive universal.
+///
+/// This record is observational: it does not grant authority by itself.
+/// `fold_quantified_linear_eqs` installs it only when `source_forall` is an
+/// immutable authored assertion root, and the proof tracker still validates
+/// exact binders/triggers/substitution plus every changed arithmetic literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuantifiedLinearNnfProvenance {
+    source_forall: TermId,
+    normalized_forall: TermId,
+}
+
 /// Mutable state threaded through interleaved E-matching refinement.
 struct InterleavedEmatchingState {
     result: Result<SolveResult>,
@@ -4467,8 +4480,8 @@ impl Executor {
     /// soundness surface: a mistaken De Morgan partition, a shadowed
     /// builtin-looking symbol, or an underspecified operation can at worst
     /// produce an unhelpful `k` whose whole-body verification is SAT/Unknown.
-    /// Restricting binders to fixed-width BitVectors makes every candidate value
-    /// exactly materializable as a model-independent literal.
+    /// Restricting binders to fixed-width BitVectors and Bool makes every
+    /// candidate value exactly materializable as a model-independent literal.
     ///
     /// Both solves use fresh executors over cloned contexts. This is
     /// load-bearing: the old in-place probe changed quantified/QF routing state,
@@ -4479,7 +4492,15 @@ impl Executor {
         foralls: &[TermId],
         snapshot: &[TermId],
     ) -> Option<Result<SolveResult>> {
-        const MAX_QPF_CONTEXT_TERMS: usize = 100_000;
+        // Industrial UFBV routinely exceeds 100k terms: of the 12 wintersteiger
+        // `fixpoint` wrong-SATs found by the 2026-07-25 corpus scoreboard, four
+        // tripped this cap alone (ethernet-1 101,710; cache-coherence-3-1
+        // 102,105; cache-coherence-3-2 252,741; pi-bus-2 310,022) — barely, in
+        // two cases. The cap bounds sub-solve WORK, not soundness: the probe
+        // returns UNSAT only after independently ground-solving the whole
+        // substituted body at concrete literals, so a wider admission can add
+        // decided UNSATs or waste time, never a wrong answer.
+        const MAX_QPF_CONTEXT_TERMS: usize = 500_000;
         if self.ctx.terms.len() > MAX_QPF_CONTEXT_TERMS || !self.qpf_probe_preflight() {
             return None;
         }
@@ -4495,7 +4516,17 @@ impl Executor {
             if vars.is_empty()
                 || vars
                     .iter()
-                    .any(|(_, sort)| !matches!(sort, ay_core::Sort::BitVec(_)))
+                    // Bool is admitted alongside fixed-width BitVec: the
+                    // soundness argument in this function's doc comment is
+                    // "every candidate value is exactly materializable as a
+                    // model-independent literal", and `pin_eval_const_for_sort`
+                    // already materializes `Sort::Bool` exactly (two values).
+                    // Excluding it was stricter than its own justification and
+                    // lost 9 of the 12 UFBV wrong-SATs before premise recovery
+                    // was even attempted.
+                    .any(|(_, sort)| {
+                        !matches!(sort, ay_core::Sort::BitVec(_) | ay_core::Sort::Bool)
+                    })
                 || contains_quantifier(&self.ctx.terms, body)
             {
                 continue;
@@ -4634,6 +4665,72 @@ impl Executor {
     /// name-oriented completion classifier, not a semantic partition oracle.
     /// Mispartitioning is harmless here because this term only proposes concrete
     /// binder values; [`Self::premise_forced_binder_refutation`] verifies the
+    /// Probe-local: does `term` mention a user-DECLARED function symbol?
+    ///
+    /// Replaces `term_mentions_completable_uf` when `forall_premise_candidate`
+    /// decides which `or` disjuncts form the CONCLUSION rather than premise
+    /// conjuncts. That predicate bottoms out in
+    /// `is_mbqi_completable_uf_symbol`, a hardcoded exclusion list plus
+    /// `!name.starts_with("bv")`. SMT-LIB's structural bit-vector operators are
+    /// named `concat`, `extract`, `zero_extend`, `sign_extend`, `rotate_left`,
+    /// `rotate_right` and `repeat` — none of which start with `bv` — so every
+    /// one was misread as a user UF. A premise conjunct mentioning one was then
+    /// booked as conclusion and discarded, the binders it pins stayed free, the
+    /// disposable candidate solve returned an arbitrary value for them, the
+    /// substituted body was vacuously SAT on a false premise, and the probe
+    /// returned None. That is how small-synabs-fixpoint-2/3/9 were lost: their
+    /// `ite` conditions read `(= ((_ zero_extend 26) v) (_ bvN 32))`.
+    ///
+    /// It also failed in the other direction — a genuine user UF whose name
+    /// happens to start with `bv` was not recognised as a UF at all.
+    ///
+    /// This asks the semantic question instead: is the head a user-declared
+    /// symbol of arity > 0, per `ctx.symbol_iter()` — the same source
+    /// `quantified_conjunct_defer_eligible` consults. Deliberately probe-local:
+    /// `is_mbqi_completable_uf_symbol` is read by several other MBQI
+    /// certificates and by `quantifier_consumer_ground_assertion_supported_by_completion`,
+    /// so changing it globally would perturb quantified classification across
+    /// every division and needs its own differential run.
+    fn disjunct_mentions_declared_uf(&self, term: TermId) -> bool {
+        use ay_core::kani_compat::DetHashSet as HashSet;
+        let declared: HashSet<String> = self
+            .ctx
+            .symbol_iter()
+            .filter(|(_, info)| !info.arg_sorts.is_empty())
+            .map(|(name, info)| self.ctx.symbol_identity_name(name, info).to_string())
+            .collect();
+        let mut visited: HashSet<TermId> = HashSet::default();
+        let mut stack = vec![term];
+        while let Some(t) = stack.pop() {
+            if !visited.insert(t) {
+                continue;
+            }
+            match self.ctx.terms.get(t) {
+                TermData::App(sym, args) => {
+                    if !args.is_empty() && declared.contains(sym.name()) {
+                        return true;
+                    }
+                    stack.extend(args.iter().copied());
+                }
+                TermData::Not(inner) => stack.push(*inner),
+                TermData::Ite(c, th, el) => {
+                    stack.push(*c);
+                    stack.push(*th);
+                    stack.push(*el);
+                }
+                TermData::Let(bindings, body) => {
+                    for (_, v) in bindings {
+                        stack.push(*v);
+                    }
+                    stack.push(*body);
+                }
+                TermData::Forall(_, body, _) | TermData::Exists(_, body, _) => stack.push(*body),
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// whole universal instance and never treats this candidate as an asserted
     /// fact.
     fn forall_premise_candidate(&mut self, body: TermId) -> Option<TermId> {
@@ -4649,7 +4746,7 @@ impl Executor {
                 let mut conjs: Vec<TermId> = Vec::new();
                 let mut has_uf_disjunct = false;
                 for &d in &args {
-                    if self.term_mentions_completable_uf(d) {
+                    if self.disjunct_mentions_declared_uf(d) {
                         has_uf_disjunct = true;
                     } else {
                         conjs.push(self.ctx.terms.mk_not(d));
@@ -5839,6 +5936,7 @@ impl Executor {
     /// real shape. Restricted to quantified assertions so ground problems (and
     /// their proof structure) are untouched.
     pub(in crate::executor) fn fold_quantified_linear_eqs(&mut self) {
+        let mut forall_provenance = Vec::new();
         for i in 0..self.ctx.assertions.len() {
             let a = self.ctx.assertions[i];
             if contains_quantifier(&self.ctx.terms, a) {
@@ -5867,8 +5965,33 @@ impl Executor {
                 if preserve_certified_skolem_source {
                     continue;
                 }
-                let folded = self.fold_linear_eqs(a);
+                let folded = self.fold_linear_eqs(a, &mut forall_provenance);
                 self.ctx.assertions[i] = folded;
+            }
+        }
+        if !self.produce_proofs_enabled() || forall_provenance.is_empty() {
+            return;
+        }
+        let Some(assertion_provenance) = self.proof_problem_assertion_provenance.as_mut() else {
+            return;
+        };
+        for record in forall_provenance {
+            // A nested/derived forall is not a free problem premise. Only an
+            // exact constructor record rooted at an immutable authored
+            // assertion may be consulted by E-matching proof registration.
+            if !assertion_provenance
+                .original_problem_assertions
+                .contains(&record.source_forall)
+            {
+                continue;
+            }
+            let source_set = vec![record.source_forall];
+            let entry = assertion_provenance
+                .assertion_sources
+                .entry(record.normalized_forall)
+                .or_default();
+            if !entry.contains(&source_set) {
+                entry.push(source_set);
             }
         }
     }
@@ -6683,7 +6806,11 @@ impl Executor {
         false
     }
 
-    fn fold_linear_eqs(&mut self, term: TermId) -> TermId {
+    fn fold_linear_eqs(
+        &mut self,
+        term: TermId,
+        provenance: &mut Vec<QuantifiedLinearNnfProvenance>,
+    ) -> TermId {
         match self.ctx.terms.get(term).clone() {
             // Fold a comparison over Int whose two sides differ by a CONSTANT to
             // its truth value (`(= (- x 0) (- x 1))` -> false, `(> 2 (- c0 c0))`
@@ -6724,16 +6851,16 @@ impl Executor {
             // downstream FM projection / instantiation see a flat conjunction of
             // comparison atoms rather than `(not (or (distinct a b) p))`.
             TermData::Not(inner) => match self.ctx.terms.get(inner).clone() {
-                TermData::Not(inner2) => self.fold_linear_eqs(inner2),
+                TermData::Not(inner2) => self.fold_linear_eqs(inner2, provenance),
                 TermData::App(s, a) if s.name() == "and" => {
                     let neg: Vec<TermId> = a.iter().map(|&x| self.ctx.terms.mk_not(x)).collect();
                     let or = self.ctx.terms.mk_or(neg);
-                    self.fold_linear_eqs(or)
+                    self.fold_linear_eqs(or, provenance)
                 }
                 TermData::App(s, a) if s.name() == "or" => {
                     let neg: Vec<TermId> = a.iter().map(|&x| self.ctx.terms.mk_not(x)).collect();
                     let and = self.ctx.terms.mk_and(neg);
-                    self.fold_linear_eqs(and)
+                    self.fold_linear_eqs(and, provenance)
                 }
                 TermData::App(s, a)
                     if a.len() == 2 && matches!(self.ctx.terms.sort(a[0]), ay_core::Sort::Int) =>
@@ -6747,20 +6874,23 @@ impl Executor {
                         _ => None,
                     };
                     match flipped {
-                        Some(f) => self.fold_linear_eqs(f),
+                        Some(f) => self.fold_linear_eqs(f, provenance),
                         None => {
-                            let i = self.fold_linear_eqs(inner);
+                            let i = self.fold_linear_eqs(inner, provenance);
                             self.ctx.terms.mk_not(i)
                         }
                     }
                 }
                 _ => {
-                    let i = self.fold_linear_eqs(inner);
+                    let i = self.fold_linear_eqs(inner, provenance);
                     self.ctx.terms.mk_not(i)
                 }
             },
             TermData::App(sym, args) if matches!(sym.name(), "and" | "or") => {
-                let new: Vec<TermId> = args.iter().map(|&a| self.fold_linear_eqs(a)).collect();
+                let new: Vec<TermId> = args
+                    .iter()
+                    .map(|&a| self.fold_linear_eqs(a, provenance))
+                    .collect();
                 if sym.name() == "and" {
                     self.ctx.terms.mk_and(new)
                 } else {
@@ -6768,26 +6898,31 @@ impl Executor {
                 }
             }
             TermData::App(sym, args) if sym.name() == "=>" && args.len() == 2 => {
-                let a = self.fold_linear_eqs(args[0]);
-                let b = self.fold_linear_eqs(args[1]);
+                let a = self.fold_linear_eqs(args[0], provenance);
+                let b = self.fold_linear_eqs(args[1], provenance);
                 self.ctx.terms.mk_implies(a, b)
             }
             TermData::Ite(c, t, e) => {
-                let c2 = self.fold_linear_eqs(c);
-                let t2 = self.fold_linear_eqs(t);
-                let e2 = self.fold_linear_eqs(e);
+                let c2 = self.fold_linear_eqs(c, provenance);
+                let t2 = self.fold_linear_eqs(t, provenance);
+                let e2 = self.fold_linear_eqs(e, provenance);
                 self.ctx.terms.mk_ite(c2, t2, e2)
             }
             TermData::Forall(vars, body, trig) => {
-                let b = self.fold_linear_eqs(body);
+                let b = self.fold_linear_eqs(body, provenance);
                 if b == body {
                     term
                 } else {
-                    self.ctx.terms.mk_forall_with_triggers(vars, b, trig)
+                    let normalized_forall = self.ctx.terms.mk_forall_with_triggers(vars, b, trig);
+                    provenance.push(QuantifiedLinearNnfProvenance {
+                        source_forall: term,
+                        normalized_forall,
+                    });
+                    normalized_forall
                 }
             }
             TermData::Exists(vars, body, trig) => {
-                let b = self.fold_linear_eqs(body);
+                let b = self.fold_linear_eqs(body, provenance);
                 if b == body {
                     term
                 } else {

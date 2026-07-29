@@ -317,6 +317,16 @@ impl DemandStats {
     }
 }
 
+/// Exact provenance for a ground instance of an unconditionally asserted
+/// universal. This is proof metadata only; solver decisions continue to use
+/// [`EMatchingResult::instantiations`].
+#[derive(Clone, Debug)]
+pub(crate) struct ForallInstantiationProvenance {
+    pub quantifier: TermId,
+    pub binding: Vec<TermId>,
+    pub instance: TermId,
+}
+
 /// Result of E-matching: instantiations plus soundness info.
 pub(crate) struct EMatchingResult {
     /// Ground instantiations derived from quantified formulas.
@@ -345,6 +355,10 @@ pub(crate) struct EMatchingResult {
     /// is a `TermData::Forall` (Exists excluded) that is NOT nested under any
     /// `or`/`ite`/`=>`/`not` (disjunction/conditional Foralls excluded).
     pub unconditional_forall_roots: HashSet<TermId>,
+    /// Source quantifier and positional binding for the sound subset above.
+    /// A downstream proof producer still must authenticate the source as a
+    /// direct problem assertion and re-check the exact substitution.
+    pub unconditional_forall_instantiations: Vec<ForallInstantiationProvenance>,
     /// M0' demand-campaign instrumentation for THIS round (pure observation; see
     /// [`DemandStats`]). Never consulted by any solver decision.
     pub demand: DemandStats,
@@ -524,6 +538,7 @@ pub(crate) fn perform_ematching_with_generations(
             deferred: vec![],
             generation_tracker: tracker,
             unconditional_forall_roots: HashSet::default(),
+            unconditional_forall_instantiations: Vec::new(),
             demand: DemandStats::default(),
         };
     }
@@ -578,6 +593,7 @@ pub(crate) fn perform_ematching_with_generations(
     let mut instantiations = Vec::new();
     let mut deferred = Vec::new();
     let mut instantiated_quantifiers: HashSet<TermId> = HashSet::default();
+    let mut unconditional_forall_instantiations = Vec::new();
     let mut per_quantifier_count: HashMap<TermId, usize> = HashMap::default();
     let mut reached_limit = false;
     // M0' demand-campaign instrumentation for this round. Written ONLY at the
@@ -593,18 +609,50 @@ pub(crate) fn perform_ematching_with_generations(
 
     'outer: for &quant in &quantifiers {
         let trigger_groups = extract_patterns_with_fallback(terms, quant);
-        let (quant_vars, body, quant_is_forall) = match terms.get(quant) {
-            TermData::Forall(v, b, _) => (v.clone(), *b, true),
-            TermData::Exists(v, b, _) => (v.clone(), *b, false),
+        let (quant_vars, body) = match terms.get(quant) {
+            TermData::Forall(v, b, _) => (v.clone(), *b),
+            // NEVER instantiate an existential here. Universal instantiation is
+            // sound (`∀x.P(x) ⊨ P(t)`); existential instantiation is NOT
+            // (`∃x.P(x) ⊭ P(t)` — it pins an arbitrary term as the witness).
+            // Every caller of this function appends the returned instances to
+            // `ctx.assertions` as top-level CONJUNCTS, so an existential
+            // instance silently strengthens the problem and any UNSAT derived
+            // from it may be a wrong answer.
+            //
+            // This produced a real one: the AUFLIA 20170829-Rodin file
+            // `smt4579745768945200905.smt2` returns `unsat` where z3 and the
+            // benchmark's own declared `:status` both say `sat`, with
+            // `conflicts=0, decisions=0` — the refutation comes entirely from
+            // conjoined instances, not from search. Found by the 2026-07-25
+            // corpus scoreboard.
+            //
+            // Skipping is fail-closed in BOTH directions. The quantifier gets no
+            // ground match, so it lands in `uninstantiated_quantifiers`, which
+            // (a) leaves `ematching_has_exists` false — now truthful, since no
+            // existential was instantiated — and (b) sets `has_uninstantiated`,
+            // which blocks the `full_ematching_coverage` SAT certificate in
+            // `result_mapping.rs`. So neither an unsound UNSAT nor an unsound
+            // SAT can be built on top of it.
+            //
+            // The downstream `QuantifierEmatchingExistsIncomplete` guard
+            // (#3593, result_mapping.rs:1503) stays as defense in depth; it was
+            // a mitigation for instances that should never have been created.
+            //
+            // These existentials reach here only because the NNF Skolemizer has
+            // no arm for a Boolean `=`/`xor`/`distinct` or an `ite` condition,
+            // so an `exists` nested in one survives verbatim with no tracked
+            // polarity. Handling those arms is the completeness follow-up;
+            // refusing to instantiate is the soundness floor.
+            TermData::Exists(..) => continue,
             _ => continue,
         };
         // Only ground instances of an UNCONDITIONALLY-asserted Forall are sound
         // to thread as conflict-verification support (the strict `and`-only walk
         // in `collect_unconditional_foralls` populates `unconditional_foralls`).
-        // Exists (`quant_is_forall == false`) and any disjunction/ite-nested
-        // Forall (absent from `unconditional_foralls`) are both excluded here.
-        let quant_is_unconditional_forall =
-            quant_is_forall && unconditional_foralls.contains(&quant);
+        // Any disjunction/ite-nested Forall is absent from `unconditional_foralls`
+        // and excluded here. (Exists no longer needs excluding: it is skipped
+        // outright above, so everything reaching this point is a Forall.)
+        let quant_is_unconditional_forall = unconditional_foralls.contains(&quant);
         // Sorts of the bound variables, aligned with the trigger-group binding
         // indices (which follow the quantifier's declared var order — see
         // `extract_patterns_with_fallback`). Used by the matcher's sort-
@@ -926,6 +974,11 @@ pub(crate) fn perform_ematching_with_generations(
                              unconditionally-asserted Forall (soundness invariant)"
                         );
                         unconditional_forall_roots.insert(inst);
+                        unconditional_forall_instantiations.push(ForallInstantiationProvenance {
+                            quantifier: quant,
+                            binding: binding.clone(),
+                            instance: inst,
+                        });
                     }
                     *quant_count += 1;
                 }
@@ -987,6 +1040,7 @@ pub(crate) fn perform_ematching_with_generations(
         deferred,
         generation_tracker: tracker,
         unconditional_forall_roots,
+        unconditional_forall_instantiations,
         demand,
     }
 }

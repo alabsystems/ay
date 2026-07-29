@@ -10,6 +10,7 @@ use ay_fp::FpSolver;
 use crate::executor_types::Result;
 
 use super::super::super::Executor;
+use super::congruence;
 use super::support::FpPredicateResult;
 use super::to_real::{build_lra_model_from_fp_to_real, offset_cnf_lit, FpEncoding, FpToRealSite};
 
@@ -62,9 +63,33 @@ impl Executor {
                         term_to_fp,
                         var_offset: 0,
                         total_vars: 0,
+                        congruence_incomplete: false,
                     });
                 }
             }
+        }
+
+        // Congruence for symbols this encoder does not interpret — the same
+        // obligation `solve_fp` discharges, on the `fp.to_real` two-phase path
+        // (SMT-LIB 2.6 §5.2: `=` is identity and function symbols are total).
+        // See the `congruence` module.
+        let foreign = congruence::scan_foreign(&self.ctx.terms, fp_assertions);
+        let mut congruence_clauses = Vec::new();
+        let mut congruence_incomplete = false;
+        if !foreign.is_empty() {
+            let plan = congruence::plan_congruence(
+                &self.ctx.terms,
+                &mut fp_solver,
+                &tseitin_result,
+                &foreign,
+            );
+            congruence_clauses = plan.clauses;
+            // Only the congruence obligations themselves gate this path. The
+            // scan's blanket sort check does not apply: `partition_fp_assertions`
+            // leaves the Real-sorted assertions of a QF_FPLRA query on this side
+            // even though the mixed subproblem — not this encoder — decides
+            // them, so a sort this encoder cannot represent is expected here.
+            congruence_incomplete = plan.incomplete;
         }
 
         if fp_solver.has_encoding_gap() {
@@ -76,6 +101,7 @@ impl Executor {
                 term_to_fp,
                 var_offset: 0,
                 total_vars: 0,
+                congruence_incomplete: false,
             });
         }
 
@@ -105,6 +131,16 @@ impl Executor {
             base_clauses.push(CnfClause::binary(-tseitin_lit, fp_lit_offset));
             base_clauses.push(CnfClause::binary(tseitin_lit, -fp_lit_offset));
         }
+        for clause in congruence_clauses {
+            let lits: Vec<i32> = clause
+                .into_iter()
+                .map(|lit| match lit {
+                    congruence::PlanLit::Fp(fp_lit) => offset_cnf_lit(fp_lit, var_offset),
+                    congruence::PlanLit::Tseitin(tseitin_lit) => tseitin_lit,
+                })
+                .collect();
+            base_clauses.push(CnfClause::new(lits));
+        }
 
         let total_vars = (tseitin_result.num_vars + fp_num_vars) as usize;
 
@@ -114,6 +150,7 @@ impl Executor {
             term_to_fp,
             var_offset,
             total_vars,
+            congruence_incomplete,
         })
     }
 
@@ -130,6 +167,7 @@ impl Executor {
             term_to_fp,
             var_offset,
             total_vars,
+            congruence_incomplete,
         } = encoding;
 
         if base_clauses.is_empty() && total_vars == 0 {
@@ -165,8 +203,19 @@ impl Executor {
         }
 
         let should_stop = self.make_should_stop();
-        let result = solver.solve_interruptible(should_stop).into_inner();
+        let mut result = solver.solve_interruptible(should_stop).into_inner();
         collect_sat_stats!(self, &solver);
+
+        // Structure the encoder had to drop makes its models unusable as
+        // witnesses; keep `unsat` (a relaxation's refutation transfers) and
+        // report an honest `unknown` instead of the `sat`.
+        if congruence_incomplete && matches!(result, ay_sat::SatResult::Sat(_)) {
+            tracing::warn!(
+                "FP path could not encode all uninterpreted structure — degrading sat to unknown"
+            );
+            result = ay_sat::SatResult::Unknown;
+            self.last_unknown_reason = Some(crate::executor_types::UnknownReason::Incomplete);
+        }
 
         match result {
             ay_sat::SatResult::Sat(ref sat_model) => {

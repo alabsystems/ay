@@ -74,5 +74,7 @@ mod skolemization_5840;
 mod ufbv_deferred_selfcheck_failclosed;
 #[path = "group_quantifiers/ufbv_fixpoint_premise_forced_unsat.rs"]
 mod ufbv_fixpoint_premise_forced_unsat;
+#[path = "group_quantifiers/ufbv_fixpoint_probe_admission.rs"]
+mod ufbv_fixpoint_probe_admission;
 #[path = "group_quantifiers/vacuous_trigger_completeness.rs"]
 mod vacuous_trigger_completeness;

@@ -286,9 +286,7 @@
         "AY_SAT_COMPETITION_PROFILE": "experimental",
         "AY_SAT_PROFILE_ID": "ay-sat-experimental",
         "AY_SAT_VARIANT": "probe",
-        "AY_COMPETITION_JIT_MODE": "profile-only",
-        "AY_COMPETITION_JIT_COUNTERS": "required",
-        "AY_COMPETITION_JIT_DEOPT_LOG": "required"
+        "AY_COMPETITION_JIT_MODE": "profile-only"
       },
       "runtime_comments": {
         "ay.sat_competition_profile": "experimental",
@@ -355,8 +353,7 @@
         "AY_SAT_COMPETITION_PROFILE": "parallel",
         "AY_SAT_PROFILE_ID": "ay-sat-parallel",
         "AY_SAT_VARIANT": "default",
-        "AY_COMPETITION_JIT_MODE": "profile-only",
-        "AY_COMPETITION_ASYNC_COMPILE_BUDGET_MS": "1000"
+        "AY_COMPETITION_JIT_MODE": "profile-only"
       },
       "runtime_comments": {
         "ay.sat_competition_profile": "parallel",
@@ -424,8 +421,7 @@
         "AY_SAT_COMPETITION_PROFILE": "cloud",
         "AY_SAT_PROFILE_ID": "ay-sat-cloud",
         "AY_SAT_VARIANT": "default",
-        "AY_COMPETITION_JIT_MODE": "profile-only",
-        "AY_COMPETITION_ASYNC_COMPILE_BUDGET_MS": "2500"
+        "AY_COMPETITION_JIT_MODE": "profile-only"
       },
       "runtime_comments": {
         "ay.sat_competition_profile": "cloud",

@@ -377,6 +377,43 @@ impl Executor {
     /// shared `persistent_sat` field used by the assume/EUF/LRA pipelines is
     /// untouched, and `ctx.assertions` is temporarily extended exactly like
     /// the BV assume path does (assumption_solving.rs).
+    /// Whether the eager probe should DECLINE a certified UNSAT so the lazy
+    /// assume-split arm can harvest a real failed-assumption core, rather than
+    /// publishing the padded all-assumptions core (see the call site).
+    ///
+    /// Two conditions make declining safe, and both are load-bearing:
+    ///
+    /// 1. **Only when cores are being produced.** This probe sits on the
+    ///    GENERAL assumption path (`solve_lia_with_assumptions`), not a
+    ///    UC-only one. Outside core production the unsat ANSWER is the entire
+    ///    value, and declining stakes it on the lazy arm re-deriving what we
+    ///    already proved — a real risk for no gain, since nothing reads the
+    ///    core. Under `produce-unsat-cores` the padded core is worth zero, so
+    ///    there is genuinely nothing to lose. The plain path therefore keeps
+    ///    today's behaviour bit-for-bit.
+    /// 2. **Only with budget to spare.** `r1` has already been paid once and
+    ///    the lazy arm re-solves from scratch, so require the caller's restored
+    ///    deadline to cover several more solves of that size. Note `r1`
+    ///    returned UNSAT, so it completed inside its own 40%-of-remaining cap
+    ///    and `r1_elapsed` is a true measure of the work rather than a
+    ///    truncated one — a capped-out probe would have returned Unknown and
+    ///    taken the earlier `!matches!(r1, Unsat)` exit.
+    ///
+    /// `AY_NO_UC_LIA_PROBE_FALLTHROUGH=1` restores the previous behaviour.
+    fn uc_probe_should_decline(
+        &self,
+        r1_elapsed: std::time::Duration,
+        deadline: Option<Instant>,
+    ) -> bool {
+        if !self.produce_unsat_cores_enabled() {
+            return false;
+        }
+        if std::env::var_os("AY_NO_UC_LIA_PROBE_FALLTHROUGH").is_some() {
+            return false;
+        }
+        deadline.is_none_or(|dl| Instant::now() + r1_elapsed.saturating_mul(4) < dl)
+    }
+
     fn try_lia_eager_assume_unsat_probe(
         &mut self,
         assumptions: &[TermId],
@@ -487,6 +524,23 @@ impl Executor {
                     }
                 }
             }
+        } else if self.uc_probe_should_decline(r1_elapsed, saved_deadline) {
+            // We cannot afford to minimize, so the only core this arm can
+            // publish is `assumptions.to_vec()` — every assumption, 100% of
+            // them. That is CORRECT but worth exactly ZERO on the UnsatCore
+            // metric, which scores `asserts - core_size`: a 100%-assumption
+            // core and no answer at all earn the same nothing. Meanwhile the
+            // lazy assume-split arm below harvests a genuine failed-assumption
+            // core from the SAT solver essentially for free — measured 8201
+            // assumptions down to a 2-element core in 0.07s, against this
+            // arm's 8001 down to 8001.
+            //
+            // So when cores are being produced, DECLINE instead of publishing
+            // the padded one and pre-empting the arm that would do better.
+            // `uc_probe_should_decline` carries the two conditions that make
+            // this safe; see its doc comment.
+            restore(self, saved_incremental, &saved_assertions);
+            return Ok(None);
         }
         restore(self, saved_incremental, &saved_assertions);
 

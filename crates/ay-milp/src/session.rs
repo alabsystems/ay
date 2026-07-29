@@ -13,6 +13,7 @@
 //! verdict.
 
 use std::mem::size_of;
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use ay_lra::rational::Rational;
@@ -605,6 +606,17 @@ fn fail_closed_for_inexact(outcome: Outcome, model: &Model) -> Outcome {
             model_values,
             incumbent_only,
             dual_bound: None,
+        },
+        // A bare `Bound` from the search is the SAME object as the `Feasible`
+        // dual bound just above, minus a primal point to keep — an NS/safe-dual
+        // number valid for the LP the rounded `f64` matrix denotes, which is not
+        // this model. There is nothing left to report once it is dropped, so the
+        // verdict degrades whole. (The `LpSession::rigorous_bound` lane does not
+        // pass through here: its NS side declines outright on an inexact model
+        // and its exact-rim side builds the `Bound` from an already-finished
+        // `Optimal`.)
+        Outcome::Bound { .. } => Outcome::Unknown {
+            reason: UnknownReason::CertificateUnavailable,
         },
         other => other,
     }
@@ -4546,6 +4558,13 @@ pub struct BabSession {
     incumbent_seed: Option<Vec<f64>>,
     branch_hints: Vec<Col>,
     root_strong_branch_shortlist: Vec<Col>,
+    /// Replay claims filed by the LAST [`Self::check`]: verdicts a device
+    /// reached by exhaustive computation with NO exportable certificate.
+    ///
+    /// Per SESSION, not per process. A process-global would let one solve's
+    /// "trust me" annotation attach to another solve's verdict, which is
+    /// precisely the failure the certificate format exists to prevent.
+    replay_claims: Vec<crate::cert_io::ReplayClaim>,
 }
 
 impl BabSession {
@@ -4584,7 +4603,21 @@ impl BabSession {
             incumbent_seed: None,
             branch_hints: Vec::new(),
             root_strong_branch_shortlist: Vec::new(),
+            replay_claims: Vec::new(),
         })
+    }
+
+    /// Replay claims filed by the last [`Self::check`].
+    ///
+    /// Each names a claim this build proved by RUNNING A COMPUTATION rather than
+    /// by producing a checkable object. A consumer that wants only certified
+    /// verdicts checks that this slice is empty; a consumer writing a
+    /// certificate emits them as `REPLAY`, which can never be reported as
+    /// verified. If this set GROWS between releases, something regressed from
+    /// provable to trusted.
+    #[must_use]
+    pub fn replay_claims(&self) -> &[crate::cert_io::ReplayClaim] {
+        &self.replay_claims
     }
 
     /// The model this session owns (Lever A accessor). Callers that used to keep
@@ -4703,6 +4736,120 @@ impl BabSession {
     /// `Feasible` where [`LpSession`] answered `Optimal { value: 0 }` on the
     /// very same model.
     pub fn check(&mut self) -> Result<Outcome, MilpError> {
+        self.check_with_shared_binary_prefix(&[], None)
+    }
+
+    /// Solve one complete binary-prefix partition inside ONE native
+    /// branch-and-bound session.
+    ///
+    /// The ordered `split_cols` define all `2^k` assignments (`0` before `1`,
+    /// first column most significant). Unlike a caller loop that clones and
+    /// fixes the model once per assignment, this path prepares presolve, root
+    /// cuts, the root LP, incumbent state, pseudocosts, and conflict learning
+    /// exactly once, then seats every assignment in the native open frontier.
+    /// It is the serial, deterministic state boundary for a later worker pool:
+    /// one thread already consumes the same shared frontier without changing
+    /// the default [`Self::check`] path.
+    ///
+    /// This API is deliberately narrow and default-dark:
+    ///
+    /// - one through four distinct, currently-live binary columns;
+    /// - native MILP lane only;
+    /// - no external incumbent seed yet (a future snapshot must define its
+    ///   replay frame rather than silently mixing ownership);
+    /// - one absolute session deadline for root preparation and every region.
+    ///
+    /// Any incomplete region leaves the common search incomplete and therefore
+    /// returns the ordinary fail-closed `Unknown`/incumbent-only outcome. An
+    /// infeasibility certificate is emitted only by the existing whole-tree
+    /// capture and is independently replay-verified against this session's
+    /// caller-frame model by [`finish`].
+    pub fn check_shared_binary_prefix(&mut self, split_cols: &[Col]) -> Result<Outcome, MilpError> {
+        self.validate_shared_binary_prefix(split_cols)?;
+        self.check_with_shared_binary_prefix(split_cols, None)
+    }
+
+    /// Solve a complete binary-prefix partition with proof-first parallel
+    /// relaxation preparation.
+    ///
+    /// This explicit path omits the ordinary root cut, symmetry, and
+    /// primal-heuristic suites. These are optional advice, while a fixed-prefix
+    /// proof first needs literal coverage and time to adjudicate every region.
+    /// It solves the root relaxation once, then gives canonical prefix ranks to
+    /// `workers` owned `FloatLp` clones under the same absolute session
+    /// deadline. Worker results are merged in rank order into the one native
+    /// tree. A worker may close a region only with the ordinary
+    /// interval-verified Farkas license; every other result remains advice for
+    /// the serial proof engine.
+    ///
+    /// The global verdict is never assembled from partial worker verdicts. Any
+    /// unresolved region remains open, so a deadline, spawn failure, panic, or
+    /// non-authoritative float result yields the ordinary fail-closed
+    /// `Unknown`/incumbent-only outcome. A complete infeasibility result still
+    /// leaves only through the existing caller-frame tree-certificate
+    /// finalization and independent replay gate.
+    pub fn check_shared_binary_prefix_proof_first(
+        &mut self,
+        split_cols: &[Col],
+        workers: NonZeroUsize,
+    ) -> Result<Outcome, MilpError> {
+        self.validate_shared_binary_prefix(split_cols)?;
+        self.check_with_shared_binary_prefix(split_cols, Some(workers))
+    }
+
+    fn validate_shared_binary_prefix(&self, split_cols: &[Col]) -> Result<(), MilpError> {
+        const MAX_SHARED_PREFIX_COLS: usize = 4;
+        if split_cols.is_empty() || split_cols.len() > MAX_SHARED_PREFIX_COLS {
+            return Err(MilpError::Session {
+                message: format!(
+                    "shared binary prefix needs 1..={MAX_SHARED_PREFIX_COLS} columns, got {}",
+                    split_cols.len()
+                ),
+            });
+        }
+        if !matches!(&self.lane, MilpLane::Native) {
+            return Err(MilpError::Session {
+                message: "shared binary prefix requires the native integral lane".to_owned(),
+            });
+        }
+        if self.incumbent_seed.is_some() {
+            return Err(MilpError::Session {
+                message:
+                    "shared binary prefix does not yet compose with an external incumbent seed"
+                        .to_owned(),
+            });
+        }
+        let mut seen = vec![false; self.model.num_cols()];
+        for &col in split_cols {
+            if col.index() >= self.model.num_cols() {
+                return Err(MilpError::Session {
+                    message: format!("shared-prefix column {} out of range", col.index()),
+                });
+            }
+            if self.model.col_kind(col) != crate::model::ColKind::Binary
+                || self.model.col_bounds(col) != (0.0, 1.0)
+            {
+                return Err(MilpError::Session {
+                    message: format!(
+                        "shared-prefix column {} is not a live binary with box [0, 1]",
+                        col.index()
+                    ),
+                });
+            }
+            if std::mem::replace(&mut seen[col.index()], true) {
+                return Err(MilpError::Session {
+                    message: format!("shared-prefix column {} is duplicated", col.index()),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn check_with_shared_binary_prefix(
+        &mut self,
+        shared_binary_prefix: &[Col],
+        proof_first_workers: Option<NonZeroUsize>,
+    ) -> Result<Outcome, MilpError> {
         // ONE deadline, fixed here, for every lane this call touches.
         //
         // `SolveOpts::time_limit` is a DURATION, and `effective_deadline(now)` turns it into an
@@ -4716,6 +4863,10 @@ impl BabSession {
         // lanes now SHARE it, and a lane handed an already-spent budget declines rather than
         // starting over.
         let started = Instant::now();
+        // Any claim left on this thread by an earlier solve is not this solve's
+        // evidence. Drop it before starting rather than risk attributing it.
+        let _ = crate::cert_io::ledger::take();
+        self.replay_claims.clear();
         self.opts.deadline = self.opts.effective_deadline(started);
         self.opts.time_limit = None;
         let expired = |o: &SolveOpts| o.deadline.is_some_and(|d| Instant::now() >= d);
@@ -4747,14 +4898,16 @@ impl BabSession {
         // the kill switch is set — so every model without a margin mark is
         // byte-identical. The mapped verdict still leaves through the shared
         // `finish` gate, which re-validates its witness against THIS model.
-        if let Some(reframed) = crate::margin::reframe(&self.model, &self.opts) {
-            let solved = SolvedObjective {
-                coeffs: &objective,
-                sense: self.model.sense(),
-                offset: self.model.objective_offset(),
-                exact: exact_objective,
-            };
-            return Ok(finish(reframed.verdict, &self.model, &solved, &self.opts));
+        if shared_binary_prefix.is_empty() {
+            if let Some(reframed) = crate::margin::reframe(&self.model, &self.opts) {
+                let solved = SolvedObjective {
+                    coeffs: &objective,
+                    sense: self.model.sense(),
+                    offset: self.model.objective_offset(),
+                    exact: exact_objective,
+                };
+                return Ok(finish(reframed.verdict, &self.model, &solved, &self.opts));
+            }
         }
         let outcome = match &mut self.lane {
             MilpLane::Native => {
@@ -4775,6 +4928,23 @@ impl BabSession {
                         &self.branch_hints,
                         &self.root_strong_branch_shortlist,
                     ),
+                    None if !shared_binary_prefix.is_empty() => match proof_first_workers {
+                        Some(workers) => crate::bab::solve_milp_shared_binary_prefix_proof_first(
+                            &self.model,
+                            &self.opts,
+                            shared_binary_prefix,
+                            workers,
+                            &self.branch_hints,
+                            &self.root_strong_branch_shortlist,
+                        ),
+                        None => crate::bab::solve_milp_shared_binary_prefix(
+                            &self.model,
+                            &self.opts,
+                            shared_binary_prefix,
+                            &self.branch_hints,
+                            &self.root_strong_branch_shortlist,
+                        ),
+                    },
                     None if self.branch_hints.is_empty()
                         && self.root_strong_branch_shortlist.is_empty() =>
                     {
@@ -4787,14 +4957,39 @@ impl BabSession {
                         &self.root_strong_branch_shortlist,
                     ),
                 };
+                // An interrupted tree that holds nothing but a rigorous dual bound
+                // now reports `Bound` rather than `Unknown` (see the no-incumbent
+                // arms of `solve_milp_in`). That is still "no primal verdict", so
+                // it must keep reaching the smt fallback exactly as `Unknown` did —
+                // otherwise the bound fix would silently COST the verdicts smt was
+                // rescuing. And if smt in turn settles nothing, the bound we set
+                // aside is strictly better than the `Unknown` smt hands back, so it
+                // is restored rather than discarded.
                 #[cfg(feature = "smt")]
-                if raw.is_unknown() && !expired(&self.opts) && self.smt_fallback_within_reach() {
+                if shared_binary_prefix.is_empty()
+                    && (raw.is_unknown() || matches!(raw, Outcome::Bound { .. }))
+                    && !expired(&self.opts)
+                    && self.smt_fallback_within_reach()
+                {
+                    let held = match &raw {
+                        Outcome::Bound {
+                            dual_bound,
+                            rigorous,
+                        } => Some((dual_bound.clone(), *rigorous)),
+                        _ => None,
+                    };
                     let mut smt = crate::smt::SmtMilp::new(&self.model, &self.opts)?;
                     raw = if has_objective {
                         smt.optimize(&self.model, &self.opts, &objective, self.model.sense())?
                     } else {
                         smt.check_feasible(&self.opts)?
                     };
+                    if let (true, Some((dual_bound, rigorous))) = (raw.is_unknown(), held) {
+                        raw = Outcome::Bound {
+                            dual_bound,
+                            rigorous,
+                        };
+                    }
                 }
                 let raw = if has_objective {
                     raw
@@ -4979,7 +5174,12 @@ impl BabSession {
             offset: self.model.objective_offset(),
             exact: exact_objective,
         };
-        Ok(finish(outcome, &self.model, &solved, &self.opts))
+        let out = finish(outcome, &self.model, &solved, &self.opts);
+        // Drain the ledger into the session that produced it. A verdict the
+        // `finish` gate withheld keeps its claims too: `--emit-cert` on an
+        // `Unknown` still reports what the device tried.
+        self.replay_claims = crate::cert_io::ledger::take();
+        Ok(out)
     }
 
     /// Decide whether the exact SMT fallback can plausibly respect the caller's
@@ -5373,6 +5573,82 @@ mod tests {
             } => assert_eq!(dual_bound, BigRational::new(1.into(), 2.into())),
             other => panic!("expected exact rigorous bound 1/2, got {other:?}"),
         }
+    }
+
+    /// THE ONE PLACE THE WITHHOLDING IS DELIBERATE, pinned on all three shapes
+    /// the dual bound can now leave the engine in.
+    ///
+    /// A Neumaier–Shcherbina or safe-dual number is a valid bound for the LP the
+    /// ROUNDED `f64` matrix denotes. On a model carrying a coefficient with no
+    /// exact `f64` that is the wrong LP, so the number bounds a different problem
+    /// and must be dropped rather than presented — the asymmetric rule this whole
+    /// area runs on: an invalid "rigorous" bound is far worse than no bound.
+    ///
+    /// Pinned here because the bound now travels paths it did not before: a bare
+    /// `Outcome::Bound` from an interrupted no-incumbent tree is a NEW shape at
+    /// this boundary, and it degrades whole (there is no primal to keep) rather
+    /// than losing a field. The `Feasible` arm is included so the pair reads as
+    /// one rule, and an exact-coefficient control is included so the test cannot
+    /// pass by the guard simply firing on everything.
+    #[test]
+    fn an_inexact_model_reports_no_dual_bound_on_any_arm() {
+        let mut m = Model::new();
+        let x = m.add_int_col(0.0, 10.0);
+        let row = m.add_row(1.0, f64::INFINITY, &[(x, 1.0)]);
+        // The stored `f64` says `x >= 1`; the TRUE row is `2x >= 1`, minimum 1/2.
+        m.record_inexact_row_coeff(row, x.0, BigRational::from_integer(2.into()));
+
+        let bound = BigRational::new(1.into(), 2.into());
+        assert!(
+            matches!(
+                fail_closed_for_inexact(
+                    Outcome::Bound {
+                        dual_bound: bound.clone(),
+                        rigorous: true
+                    },
+                    &m
+                ),
+                Outcome::Unknown {
+                    reason: UnknownReason::CertificateUnavailable
+                }
+            ),
+            "a bare rigorous Bound must degrade WHOLE on an inexact model"
+        );
+        match fail_closed_for_inexact(
+            Outcome::Feasible {
+                model_values: vec![BigRational::from_integer(1.into())],
+                incumbent_only: true,
+                dual_bound: Some(bound.clone()),
+            },
+            &m,
+        ) {
+            Outcome::Feasible { dual_bound, .. } => assert!(
+                dual_bound.is_none(),
+                "the incumbent survives (it is re-checked exactly); the bound riding \
+                 along on it does not"
+            ),
+            other => panic!("the incumbent itself must be kept, got {other:?}"),
+        }
+
+        // CONTROL: the identical outcomes on an EXACT model pass through
+        // untouched. Without this the two assertions above would also hold if
+        // the guard had been widened to fire on every model.
+        let mut exact_m = Model::new();
+        let y = exact_m.add_int_col(0.0, 10.0);
+        exact_m.add_row(1.0, f64::INFINITY, &[(y, 1.0)]);
+        assert!(
+            matches!(
+                fail_closed_for_inexact(
+                    Outcome::Bound {
+                        dual_bound: bound.clone(),
+                        rigorous: true
+                    },
+                    &exact_m
+                ),
+                Outcome::Bound { rigorous: true, .. }
+            ),
+            "an exact model must keep its bound"
+        );
     }
 
     #[test]

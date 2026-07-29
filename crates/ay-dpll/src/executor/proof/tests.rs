@@ -1879,6 +1879,38 @@ fn test_strict_proof_mode_end_to_end() {
         stats.contains(":proof-steps"),
         "Expected :proof-steps in statistics: {stats}"
     );
+    assert!(
+        exec.statistics().proof_complete,
+        "the typed proof-completeness source of truth must be set after strict validation"
+    );
+    assert_eq!(
+        exec.statistics().get_int("proof_complete"),
+        Some(1),
+        "structured consumers must observe the same complete verdict"
+    );
+}
+
+#[test]
+fn proof_quality_updates_typed_completeness_for_complete_and_incomplete_evidence() {
+    let mut exec = Executor::new();
+
+    let mut complete = ay_proof::ProofQuality::default();
+    complete.total_steps = 1;
+    exec.populate_proof_quality_stats(&complete);
+    assert!(exec.statistics().proof_complete);
+    assert_eq!(exec.statistics().get_int("proof_complete"), Some(1));
+    assert_eq!(exec.statistics().get_int("proof_trust"), Some(0));
+
+    let mut incomplete = ay_proof::ProofQuality::default();
+    incomplete.total_steps = 1;
+    incomplete.trust_count = 1;
+    exec.populate_proof_quality_stats(&incomplete);
+    assert!(
+        !exec.statistics().proof_complete,
+        "a later incomplete proof quality must clear the typed field"
+    );
+    assert_eq!(exec.statistics().get_int("proof_complete"), Some(0));
+    assert_eq!(exec.statistics().get_int("proof_trust"), Some(1));
 }
 
 /// End-to-end (#8419 / trust_count→0): a datatype constructor-distinctness

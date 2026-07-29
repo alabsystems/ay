@@ -4670,3 +4670,67 @@ fn test_model_root_selection_retries_past_unextractable_lane() {
         "the derivation must land on the SECOND (live) query, not the dead first one"
     );
 }
+
+/// A body that applies one predicate twice must never be reported `Safe`.
+///
+/// `P(0). P(1). false :- P(x), P(y), x != y.` is plainly unsafe — `P(0)` and
+/// `P(1)` with `0 != 1` derive `false`. The level-flat encoding names level
+/// arguments by `(predicate, level, index)` only, so both body occurrences of
+/// `P` share one argument tuple and the encoding silently asserts `x == y`.
+/// Every depth then comes back UNSAT for a reason that has nothing to do with
+/// the program, and an `acyclic_safe` run used to read that exhaustion as
+/// `Safe` — a wrong answer.
+///
+/// `BmcSolver::solve` now fails closed to `Unknown` on any such problem.
+#[test]
+fn repeated_body_predicate_never_reports_safe() {
+    let smt = r#"
+(set-logic HORN)
+(declare-fun P (Int) Bool)
+(assert (P 0))
+(assert (P 1))
+(assert (forall ((x Int) (y Int)) (=> (and (P x) (P y) (not (= x y))) false)))
+(check-sat)
+"#;
+    let problem = crate::parser::ChcParser::parse(smt).unwrap();
+    let solver = BmcSolver::new(
+        problem,
+        BmcConfig::default()
+            .with_max_depth(4)
+            .with_acyclic_safe(true),
+    );
+    let result = solver.solve();
+    assert!(
+        !matches!(result, ChcEngineResult::Safe(_)),
+        "a genuinely unsafe problem must never be reported Safe, got {result:?}"
+    );
+}
+
+/// The fail-closed guard must not fire on bodies it does not apply to.
+///
+/// Distinct body predicates share no level argument, so the level-flat encoding
+/// represents them exactly and `acyclic_safe` exhaustion stays sound.
+#[test]
+fn distinct_body_predicates_still_reach_safe() {
+    let smt = r#"
+(set-logic HORN)
+(declare-fun P (Int) Bool)
+(declare-fun Q (Int) Bool)
+(assert (P 0))
+(assert (Q 0))
+(assert (forall ((x Int) (y Int)) (=> (and (P x) (Q y) (> x 100) (> y 100)) false)))
+(check-sat)
+"#;
+    let problem = crate::parser::ChcParser::parse(smt).unwrap();
+    let solver = BmcSolver::new(
+        problem,
+        BmcConfig::default()
+            .with_max_depth(2)
+            .with_acyclic_safe(true),
+    );
+    let result = solver.solve();
+    assert!(
+        matches!(result, ChcEngineResult::Safe(_)),
+        "distinct body predicates are encoded exactly; this must stay Safe, got {result:?}"
+    );
+}

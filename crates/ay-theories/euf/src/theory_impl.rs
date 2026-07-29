@@ -242,12 +242,23 @@ impl TheorySolver for EufSolver<'_> {
     }
 
     fn push(&mut self) {
+        // #euf-inc-cong-undo: safe switch point — the trail is checked empty
+        // inside, so record/replay modes can never disagree for a live scope.
+        self.maybe_latch_undo();
         self.scopes.push(self.trail.len());
         // For incremental mode: save undo trail position
         self.undo_scopes.push(self.undo_trail.len());
     }
 
     fn pop(&mut self) {
+        // #euf-inc-undo-adaptive: charge the from-scratch path for what this pop
+        // is about to cost. When the incremental path is already active there is
+        // no rebuild, so nothing accrues and the crossover stays where it is.
+        if !self.cong_undo_active() {
+            self.rebuild_work = self
+                .rebuild_work
+                .saturating_add(self.func_apps.len() as u64);
+        }
         let Some(mark) = self.scopes.pop() else {
             return;
         };
@@ -539,6 +550,7 @@ impl TheorySolver for EufSolver<'_> {
         // incremental_rebuild to refill the queue and fully rescan the
         // bool-valued atoms from the surviving assignments.
         self.egraph_requeue_needed = true;
+        self.ite_sweep_full_needed = true;
         self.bool_merge_pending.clear();
     }
 
@@ -571,6 +583,7 @@ impl TheorySolver for EufSolver<'_> {
         self.undo_scopes.clear();
         // #euf-idle-rebuild: everything was discarded — full requeue + rescan.
         self.egraph_requeue_needed = true;
+        self.ite_sweep_full_needed = true;
         self.bool_merge_pending.clear();
         self.bool_true_anchor = None;
         self.bool_false_anchor = None;
@@ -661,6 +674,7 @@ impl TheorySolver for EufSolver<'_> {
         // #euf-idle-rebuild: assignments and merges were discarded/unwound —
         // full requeue + bool rescan (anchors are re-elected by the rescan).
         self.egraph_requeue_needed = true;
+        self.ite_sweep_full_needed = true;
         self.bool_merge_pending.clear();
         self.bool_true_anchor = None;
         self.bool_false_anchor = None;
@@ -1225,6 +1239,7 @@ impl EufSolver<'_> {
         self.to_merge.clear();
         // #euf-idle-rebuild: every merge was unwound — full requeue + rescan.
         self.egraph_requeue_needed = true;
+        self.ite_sweep_full_needed = true;
         self.bool_merge_pending.clear();
         self.bool_true_anchor = None;
         self.bool_false_anchor = None;
